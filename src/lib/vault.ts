@@ -1,0 +1,390 @@
+/**
+ * Vault層（File System Access API）。
+ *
+ * STORAGE.md §1.2 Markdown First / §2.4 Rebuildability Guarantee に対応する。
+ * ここで書き込むMarkdownファイルとVault内の `.tsumugi/` JSONが正（source of truth）であり、
+ * IndexedDB（db.ts）は常にこの後に書き込まれる派生キャッシュとして扱う。
+ */
+"use client";
+
+import { getAllConversations, getAllMemoryObjects, getAllSources, loadVaultHandle, saveVaultHandle } from "./db";
+import type { Conversation, MemoryObject, Source } from "./types";
+import {
+  conversationToMarkdown,
+  memoryObjectToMarkdown,
+  parseConversationMarkdown,
+  parseMemoryDayFile,
+  parseSourceMarkdown,
+  serializeMemoryDayFile,
+  sourceToMarkdown,
+} from "./markdown";
+
+const VAULT_DIRS = ["Conversations", "Memories", "People", "Themes", "Emotions", "Goals", "Ideas", "Events", "Attachments"] as const;
+
+export type VaultPermissionState = "granted" | "prompt" | "denied" | "unsupported" | "unset";
+
+function isFsAccessSupported() {
+  return typeof window !== "undefined" && "showDirectoryPicker" in window;
+}
+
+async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boolean): Promise<boolean> {
+  const options: FileSystemHandlePermissionDescriptor = { mode: forWrite ? "readwrite" : "read" };
+  if ((await handle.queryPermission(options)) === "granted") return true;
+  return false;
+}
+
+/**
+ * 起動時に呼ぶ。ユーザー操作（クリック等）を伴わないため、
+ * 許可が既に granted な場合のみハンドルを返す。それ以外は null（=再選択が必要）。
+ */
+export async function restoreVaultHandle(): Promise<FileSystemDirectoryHandle | null> {
+  if (!isFsAccessSupported()) return null;
+  const handle = await loadVaultHandle();
+  if (!handle) return null;
+  const ok = await verifyPermission(handle, true);
+  return ok ? handle : null;
+}
+
+/**
+ * ユーザーの明示的な操作（クリック）内から呼ぶ必要がある（showDirectoryPicker の仕様）。
+ */
+export async function chooseVaultDirectory(): Promise<FileSystemDirectoryHandle> {
+  if (!isFsAccessSupported()) {
+    throw new Error("このブラウザはFile System Access APIに対応していません。Chrome/Edgeでお試しください。");
+  }
+  const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+  await ensureVaultSkeleton(handle);
+  await saveVaultHandle(handle);
+  return handle;
+}
+
+async function ensureVaultSkeleton(root: FileSystemDirectoryHandle) {
+  for (const dir of VAULT_DIRS) {
+    await root.getDirectoryHandle(dir, { create: true });
+  }
+  const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
+  await writeJSONIfMissing(tsumugiDir, "schema-version.json", { schemaVersion: "0.1" });
+  await writeJSONIfMissing(tsumugiDir, "index.json", {});
+}
+
+async function writeJSONIfMissing(dir: FileSystemDirectoryHandle, name: string, value: unknown) {
+  try {
+    await dir.getFileHandle(name, { create: false });
+  } catch {
+    await writeFileInDir(dir, name, JSON.stringify(value, null, 2));
+  }
+}
+
+async function writeFileInDir(dir: FileSystemDirectoryHandle, name: string, content: string) {
+  const fileHandle = await dir.getFileHandle(name, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(content);
+  await writable.close();
+}
+
+async function readJSON<T>(dir: FileSystemDirectoryHandle, name: string, fallback: T): Promise<T> {
+  try {
+    const fileHandle = await dir.getFileHandle(name, { create: false });
+    const file = await fileHandle.getFile();
+    const text = await file.text();
+    return JSON.parse(text) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Beta C2対応：Markdown/.tsumugiへの書き込みは「そのファイルを丸ごと読み込み→一部だけ
+ * 差し替え→丸ごと書き戻す」というread-modify-writeを行う（day-file、.tsumugi/index.json共に）。
+ * これをCapture・Connect・Reflection・Source保存・flushPendingToVaultなど複数の経路から
+ * 並行に呼び出すと、後勝ちの書き込みが先勝ちの内容を丸ごと上書きし、データが消失する
+ * （実機のwriteMemoryObjectMarkdownで再現・確認済み）。
+ *
+ * 対策として、Vault書き込みの実体（writeConversationMarkdown/writeSourceMarkdown/
+ * writeMemoryObjectMarkdown）を、モジュールスコープの単一キューを通じて直列化する。
+ * 呼び出し元がどのファイル・どの日付を書こうとしているかに関わらず、常に「1つの
+ * read-modify-writeが完全に終わってから次が始まる」順序を保証する（同じファイルだけを
+ * 対象にした細かいロックにしないのは、対象ファイルの特定自体に事前のI/Oが必要で
+ * 複雑になるため。Vault書き込みは頻度が低く、全体を1本の列に直列化しても実用上の
+ * 体感速度への影響は小さいと判断した）。
+ *
+ * AI呼び出し（Capture/ConnectのGemini API呼び出し）はこのキューに含めない。直列化するのは
+ * 実際にファイルを読み書きする瞬間だけであり、Capture/Connect全体を待たせることはない。
+ *
+ * 1つの書き込みが失敗しても、キュー自体は次の書き込みへ進む（失敗を握りつぶさず、
+ * 呼び出し元へは例外をそのまま伝播させた上で、キューの直列化は継続する）。
+ */
+let vaultWriteQueue: Promise<void> = Promise.resolve();
+
+function enqueueVaultWrite<T>(task: () => Promise<T>): Promise<T> {
+  const run = vaultWriteQueue.then(task, task);
+  vaultWriteQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+async function updateIndex(root: FileSystemDirectoryHandle, id: string, relativePath: string) {
+  const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
+  const index = await readJSON<Record<string, string>>(tsumugiDir, "index.json", {});
+  index[id] = relativePath;
+  await writeFileInDir(tsumugiDir, "index.json", JSON.stringify(index, null, 2));
+}
+
+function shortId(id: string) {
+  return id.slice(-6).toLowerCase();
+}
+
+/** 旧形式（1 record = 1 file）のファイル名。Reflection/Summary（system-generated）はこの形式を維持する。 */
+function fileNameFor(id: string, isoDate: string) {
+  const datePart = isoDate.slice(0, 10);
+  return `${datePart}-${shortId(id)}.md`;
+}
+
+/** 「1日1Markdown」（通常のMemory）のファイル名。同じ日のMemoryは全てこのファイルへ統合する。 */
+function dayFileNameFor(isoDate: string) {
+  return `${isoDate.slice(0, 10)}.md`;
+}
+
+async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, conversation: Conversation) {
+  const dir = await root.getDirectoryHandle("Conversations", { create: true });
+  const fileName = fileNameFor(conversation.id, conversation.startedAt);
+  await writeFileInDir(dir, fileName, conversationToMarkdown(conversation));
+  await updateIndex(root, conversation.id, `Conversations/${fileName}`);
+}
+
+export function writeConversationMarkdown(root: FileSystemDirectoryHandle, conversation: Conversation) {
+  return enqueueVaultWrite(() => writeConversationMarkdownImpl(root, conversation));
+}
+
+/**
+ * Source基盤（最小構成）のVault保存。1 Source = 1 Markdown（既存のConversationと同じくfileNameFor、
+ * Memoryの日別統合は適用しない。STORAGE.md §3）。`Sources/`が無ければ既存パターン通り
+ * `{ create: true }`で作成する。SourceにはMemoryObjectのような`date`が無いため、`createdAt`を使う。
+ */
+async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: Source) {
+  const dir = await root.getDirectoryHandle("Sources", { create: true });
+  const fileName = fileNameFor(source.id, source.createdAt);
+  await writeFileInDir(dir, fileName, sourceToMarkdown(source));
+  await updateIndex(root, source.id, `Sources/${fileName}`);
+}
+
+export function writeSourceMarkdown(root: FileSystemDirectoryHandle, source: Source) {
+  return enqueueVaultWrite(() => writeSourceMarkdownImpl(root, source));
+}
+
+/**
+ * Reflection（「本日はここまで」）が生成する system-generated の Insight（Summary）は、
+ * 既存の1record=1fileの保存形式をそのまま維持する（日別ファイルへは統合しない）。
+ */
+function isReflectionSummary(memoryObject: MemoryObject): boolean {
+  return memoryObject.metadata.source === "system-generated";
+}
+
+async function readDayFileEntries(
+  dir: FileSystemDirectoryHandle,
+  fileName: string
+): Promise<MemoryObject[]> {
+  try {
+    const fileHandle = await dir.getFileHandle(fileName, { create: false });
+    const file = await fileHandle.getFile();
+    const text = await file.text();
+    return parseMemoryDayFile(text);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 通常のMemoryは「1日1Markdown」（Memories/YYYY-MM-DD.md）に統合する。
+ * 同じidのエントリが既にあれば置き換え、無ければ追加する（重複を作らない）。
+ * MemoryObject自体のデータ構造・idは変えない。保存単位（ファイル）だけを日単位にする。
+ */
+async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, memoryObject: MemoryObject) {
+  const dir = await root.getDirectoryHandle("Memories", { create: true });
+
+  if (isReflectionSummary(memoryObject)) {
+    const fileName = fileNameFor(memoryObject.id, memoryObject.date);
+    await writeFileInDir(dir, fileName, memoryObjectToMarkdown(memoryObject));
+    await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
+    memoryObject.metadata.obsidian = {
+      ...memoryObject.metadata.obsidian,
+      vaultPath: `Memories/${fileName}`,
+    };
+    return;
+  }
+
+  const fileName = dayFileNameFor(memoryObject.date);
+  const existingEntries = await readDayFileEntries(dir, fileName);
+  const otherEntries = existingEntries.filter((memory) => memory.id !== memoryObject.id);
+  const merged = [...otherEntries, memoryObject].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  await writeFileInDir(dir, fileName, serializeMemoryDayFile(merged));
+  await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
+  memoryObject.metadata.obsidian = {
+    ...memoryObject.metadata.obsidian,
+    vaultPath: `Memories/${fileName}`,
+  };
+}
+
+export function writeMemoryObjectMarkdown(root: FileSystemDirectoryHandle, memoryObject: MemoryObject) {
+  return enqueueVaultWrite(() => writeMemoryObjectMarkdownImpl(root, memoryObject));
+}
+
+/**
+ * Vaultが未接続の間にIndexedDBへ先行保存された記憶を、
+ * 接続確立の直後にまとめてMarkdownへ書き出す（データロス防止）。
+ * Source基盤（最小構成）も同じ扱いにする：IndexedDBにはあるがVaultに無いSourceを書き戻す。
+ */
+export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
+  const [conversations, memoryObjects, sources] = await Promise.all([
+    getAllConversations(),
+    getAllMemoryObjects(),
+    getAllSources(),
+  ]);
+  for (const conversation of conversations) {
+    await writeConversationMarkdown(root, conversation);
+  }
+  for (const memoryObject of memoryObjects) {
+    await writeMemoryObjectMarkdown(root, memoryObject);
+  }
+  for (const source of sources) {
+    await writeSourceMarkdown(root, source);
+  }
+}
+
+export function isVaultSupported() {
+  return isFsAccessSupported();
+}
+
+// ---------------------------------------------------------------------------
+// Markdown → IndexedDB 復元（STORAGE.md §2.4 Rebuildability Guarantee）
+// index.jsonは信頼せず、Conversations/ と Memories/ を直接スキャンする。
+// ---------------------------------------------------------------------------
+
+/**
+ * 「フォルダ名によるユーザーの再整理（年別・月別フォルダ等）」に耐えるための再帰探索。
+ * Vaultルート直下の`Memories`/`Conversations`だけを見るのではなく、Vault内のどこにあっても
+ * （ネストされていても）見つけられるようにする。ただし、無関係なVault内の大量のノートまで
+ * 毎回全部読みにいくと重くなるため、`folderName`という名前のフォルダに実際に入るまでは
+ * ディレクトリ一覧の走査だけに留め、ファイル本文は一切読まない（`insideTarget`がtrueになって
+ * 初めてファイルを読む）。`folderName`フォルダに入った後は、その配下は深さ制限なく辿る
+ * （その中でさらに年・月フォルダに分かれていてもよい）。
+ *
+ * ファイル本文を読む前にも、`tsumugi: true`らしいかどうかを先頭数百バイトだけで判定し
+ * （`isLikelyTsumugiFile`）、無関係なMarkdownノートの全文読み込みを避ける。
+ */
+const HIDDEN_PREFIX = ".";
+const FOLDER_SEARCH_MAX_DEPTH = 6;
+const TSUMUGI_PROBE_BYTES = 1024;
+
+async function isLikelyTsumugiFile(fileHandle: FileSystemFileHandle): Promise<boolean> {
+  const file = await fileHandle.getFile();
+  const head = await file.slice(0, TSUMUGI_PROBE_BYTES).text();
+  return head.startsWith("---\ntsumugi: true\n") || head.includes("\ntsumugi: true\n");
+}
+
+async function collectVaultMarkdown(
+  dir: FileSystemDirectoryHandle,
+  folderName: string,
+  insideTarget = false,
+  depth = 0
+): Promise<string[]> {
+  if (!insideTarget && depth > FOLDER_SEARCH_MAX_DEPTH) return [];
+
+  const contents: string[] = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (name.startsWith(HIDDEN_PREFIX)) continue;
+
+    if (handle.kind === "directory") {
+      const nowInsideTarget = insideTarget || name === folderName;
+      contents.push(...(await collectVaultMarkdown(handle, folderName, nowInsideTarget, depth + 1)));
+      continue;
+    }
+
+    if (!insideTarget || !name.endsWith(".md")) continue;
+    if (!(await isLikelyTsumugiFile(handle))) continue;
+    const file = await handle.getFile();
+    contents.push(await file.text());
+  }
+  return contents;
+}
+
+export interface VaultScanResult {
+  conversations: Conversation[];
+  memoryObjects: MemoryObject[];
+  /** Source基盤（最小構成）。他の2つと同じくid重複はupdatedAtが新しい方を採用する。 */
+  sources: Source[];
+  /** frontmatterが読めない、`tsumugi: true`が無い等で復元対象外だったファイルの数。 */
+  skippedCount: number;
+}
+
+/**
+ * Vault内を再帰的に探索し、`Conversations`という名前のフォルダ・`Memories`という名前のフォルダ・
+ * `Sources`という名前のフォルダを（ルート直下だけでなく、どこにネストされていても）見つけてスキャンする。
+ * `.tsumugi/index.json` は使わない（正本はあくまでMarkdown自身）。
+ * 同じidが複数ファイルに存在する場合は `updatedAt` が新しい方を採用する
+ * （旧形式ファイルと新形式の日別ファイルに同じidが二重に存在していても、この仕組みで自然に解決する）。
+ * 壊れたファイル・Tsumugi管理外のファイルは1件スキップして続行し、全体を止めない。
+ * Memoriesは新形式（1ファイルに複数エントリ）・旧形式（1ファイル1エントリ）のどちらも読める。
+ */
+export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Promise<VaultScanResult> {
+  let skippedCount = 0;
+
+  const [conversationFiles, memoryFiles, sourceFiles] = await Promise.all([
+    collectVaultMarkdown(root, "Conversations"),
+    collectVaultMarkdown(root, "Memories"),
+    collectVaultMarkdown(root, "Sources"),
+  ]);
+
+  const conversationsById = new Map<string, Conversation>();
+  for (const raw of conversationFiles) {
+    const parsed = parseConversationMarkdown(raw);
+    if (!parsed) {
+      skippedCount += 1;
+      continue;
+    }
+    const existing = conversationsById.get(parsed.id);
+    if (!existing || existing.updatedAt < parsed.updatedAt) {
+      conversationsById.set(parsed.id, parsed);
+    }
+  }
+
+  const memoryObjectsById = new Map<string, MemoryObject>();
+  for (const raw of memoryFiles) {
+    const parsedEntries = parseMemoryDayFile(raw);
+    if (parsedEntries.length === 0) {
+      skippedCount += 1;
+      continue;
+    }
+    for (const parsed of parsedEntries) {
+      const existing = memoryObjectsById.get(parsed.id);
+      if (!existing || existing.updatedAt < parsed.updatedAt) {
+        memoryObjectsById.set(parsed.id, parsed);
+      }
+    }
+  }
+
+  const sourcesById = new Map<string, Source>();
+  for (const raw of sourceFiles) {
+    let parsed: Source;
+    try {
+      parsed = parseSourceMarkdown(raw);
+    } catch {
+      skippedCount += 1;
+      continue;
+    }
+    const existing = sourcesById.get(parsed.id);
+    if (!existing || existing.updatedAt < parsed.updatedAt) {
+      sourcesById.set(parsed.id, parsed);
+    }
+  }
+
+  return {
+    conversations: [...conversationsById.values()],
+    memoryObjects: [...memoryObjectsById.values()],
+    sources: [...sourcesById.values()],
+    skippedCount,
+  };
+}

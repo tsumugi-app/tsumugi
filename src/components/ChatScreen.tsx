@@ -1,0 +1,1126 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import type { Conversation, ConversationTurn, MemoryObject, Persona } from "@/lib/types";
+import { appendTurn, captureConversation, createConversation, persistCapture } from "@/lib/capture";
+import {
+  chooseVaultDirectory,
+  flushPendingToVault,
+  isVaultSupported,
+  restoreVaultHandle,
+  scanVaultForRestore,
+  type VaultScanResult,
+} from "@/lib/vault";
+import {
+  clearApiKey,
+  getAllConversations,
+  getAllMemoryObjects,
+  getAllSources,
+  loadApiKey,
+  loadChatProvider,
+  putConversation,
+  putMemoryObject,
+  saveChatProvider,
+  saveSource,
+} from "@/lib/db";
+import { getGreeting } from "@/lib/greeting";
+import {
+  isReflectiveQuery,
+  REFLECTIVE_LIMIT,
+  REFLECTIVE_MAX_LINKED_ADDITIONS,
+  retrieveRelevantMemories,
+} from "@/lib/retrieval";
+import { createInsightMemoryObject, generateSessionReflection } from "@/lib/reflection";
+import { connectMemory } from "@/lib/connect";
+import { filterUnconnected } from "@/lib/connectState";
+import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHeader";
+import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
+import { useWaitingMessage } from "@/lib/useWaitingMessage";
+import ApiKeySetup from "./ApiKeySetup";
+import SettingsPanel from "./SettingsPanel";
+import ImportPanel from "./ImportPanel";
+import HistoryPanel from "./HistoryPanel";
+
+/** ApiKeySetupと同じく、chatで選べるproviderは今回この2つに限定する（Claudeは型のみ）。 */
+export type SupportedChatProvider = "gemini" | "openai";
+
+export type VaultStatus = "checking" | "connected" | "not-connected" | "unsupported";
+/** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
+export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
+type ApiKeyStatus = "checking" | "missing" | "set";
+type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
+type ReflectionStatus = "idle" | "generating" | "done" | "error" | "unavailable";
+export type RestoreStatus = "idle" | "restoring" | "done";
+type SendStatus = "idle" | "error" | "authError";
+
+export interface RestoreCandidate {
+  scan: VaultScanResult;
+  newCount: number;
+}
+
+/** 1回のアプリ起動あたり、未Connect Memoryをまとめて処理する上限（AI呼び出し回数のクォータ保護）。 */
+const STARTUP_CONNECT_LIMIT = 3;
+
+/** Beta C4：/api/chatの失敗時、ステータスだけを見てAPIキー由来かどうかをUI側で分岐するための最小限のエラー型。 */
+class ChatRequestError extends Error {
+  constructor(readonly status: number) {
+    super(`chat request failed: ${status}`);
+  }
+}
+
+const PERSONAS: {
+  value: Persona;
+  label: string;
+  hint: string;
+  placeholder: string;
+  openingMessage: string;
+}[] = [
+  {
+    value: "companion",
+    label: "日記",
+    hint: "寄り添う",
+    placeholder: "今日はどんな一日でしたか？",
+    openingMessage: "今日はどんな一日でしたか？",
+  },
+  {
+    value: "coach",
+    label: "探究",
+    hint: "問いかける",
+    placeholder: "最近、気になっていることはありますか？",
+    openingMessage: "最近、何について知りたいですか？",
+  },
+  {
+    value: "analyst",
+    label: "相談・創造",
+    hint: "整理する",
+    placeholder: "今、誰かと一緒に考えたいことはありますか？",
+    openingMessage: "今、何について一緒に考えてみたいですか？",
+  },
+];
+
+/** 通常時のコンパクト表示（`Gemini ・ test ・ ⚙`）で使うラベル。既存UIの表記（895/907行付近）に合わせる。 */
+const PROVIDER_LABEL: Record<SupportedChatProvider, string> = {
+  gemini: "Gemini",
+  openai: "OpenAI",
+};
+
+export default function ChatScreen() {
+  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus>("checking");
+  const [persona, setPersona] = useState<Persona>("companion");
+  const [entryConfirmed, setEntryConfirmed] = useState(false);
+  const [conversation, setConversation] = useState<Conversation>(() => createConversation("companion"));
+  /** そのConversationから既に生成済みの、新規/更新されたMemoryObjectの一覧（1 Conversation = 1 Memoryとは限らない）。 */
+  const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
+  const [input, setInput] = useState("");
+  const [streamingText, setStreamingText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const { message: waitingMessage, start: startWaiting, stop: stopWaiting } = useWaitingMessage();
+  const [vaultHandle, setVaultHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [vaultStatus, setVaultStatus] = useState<VaultStatus>("checking");
+  const [vaultConnectFeedback, setVaultConnectFeedback] = useState<VaultConnectFeedback | null>(null);
+  const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
+  const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
+  const [reflectionStatus, setReflectionStatus] = useState<ReflectionStatus>("idle");
+  const [reflectionText, setReflectionText] = useState("");
+  const [restoreCandidate, setRestoreCandidate] = useState<RestoreCandidate | null>(null);
+  const [restoreStatus, setRestoreStatus] = useState<RestoreStatus>("idle");
+  const [greeting] = useState(() => getGreeting());
+  /** Beta「過去からの問いかけ」。候補が無い/生成に失敗した場合はnullのままで、トップ画面は従来通りになる。 */
+  const [topPrompt, setTopPrompt] = useState<TopPrompt | null>(null);
+  const [topPromptInput, setTopPromptInput] = useState("");
+  /**
+   * 「APIキーを登録するprovider」とは別の概念：chatの送信（companion/coach/analyst）に
+   * 実際に使うprovider。既定はGemini（既存動作の完全維持のため）。Capture/Connect/
+   * Reflection/問いかけ生成はこの値を参照しない（今回のPhaseでは引き続きGemini固定）。
+   */
+  const [chatProvider, setChatProvider] = useState<SupportedChatProvider>("gemini");
+  const [keyStatusByProvider, setKeyStatusByProvider] = useState<Record<SupportedChatProvider, boolean>>({
+    gemini: false,
+    openai: false,
+  });
+  /** nullなら閉じている。値があれば、そのproviderのタブを開いた状態でApiKeySetupをオーバーレイ表示する。 */
+  const [apiKeySetupProvider, setApiKeySetupProvider] = useState<SupportedChatProvider | null>(null);
+  /** 通常時は`Gemini ・ test ・ ⚙`の1行のみ表示し、⚙で開閉するSettingsPanelの開閉状態。 */
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 入力欄の＋ボタンで開閉するImportPanelの開閉状態。 */
+  const [importOpen, setImportOpen] = useState(false);
+  /** 入力欄の↺ボタンで開閉するHistoryPanel（過去の記憶を見返す）の開閉状態。 */
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const scrollAnchorRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const startupConnectRanRef = useRef(false);
+  const topPromptRanRef = useRef(false);
+  /**
+   * Captureをチャット送信のブロッキングから切り離すためのPromiseキュー（1件ずつ直列実行）。
+   * 次のCaptureには、前のCaptureが返したmemoryObjects一覧を明示的に渡す
+   * （React stateのクロージャに依存すると、Capture同士が競合してMemoryObjectを二重生成しうるため）。
+   */
+  const captureQueueRef = useRef<Promise<MemoryObject[]>>(Promise.resolve(memoryObjects));
+  /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
+  const latestConversationRef = useRef(conversation);
+
+  useEffect(() => {
+    let cancelled = false;
+    // オンボーディングのゲート判定は、Phase 3以降も既存動作を完全に維持するため
+    // Geminiの有無だけで行う（loadApiKey()は引数省略時＝Geminiを見る）。
+    loadApiKey().then((key) => {
+      if (cancelled) return;
+      setApiKeyStatus(key ? "set" : "missing");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const refreshKeyStatus = () => {
+    Promise.all([loadApiKey("gemini"), loadApiKey("openai")]).then(([gemini, openai]) => {
+      setKeyStatusByProvider({ gemini: !!gemini, openai: !!openai });
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([loadChatProvider(), loadApiKey("gemini"), loadApiKey("openai")]).then(
+      ([savedChatProvider, gemini, openai]) => {
+        if (cancelled) return;
+        // chatProviderが"claude"で保存されている状況は現状発生し得ないが、
+        // UIが扱えるのはgemini/openaiだけなのでgeminiへ安全側にフォールバックする。
+        setChatProvider(savedChatProvider === "openai" ? "openai" : "gemini");
+        setKeyStatusByProvider({ gemini: !!gemini, openai: !!openai });
+      }
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function handleSelectChatProvider(next: SupportedChatProvider) {
+    if (next === "openai" && !keyStatusByProvider.openai) return;
+    setChatProvider(next);
+    void saveChatProvider(next);
+  }
+
+  /**
+   * Beta「過去からの問いかけ」。APIキー確定後に1回だけバックグラウンドで生成する。
+   * トップ画面自体は先に表示済みのため、ここは非ブロッキングで良い
+   * （生成が終わるまで日記/探究/相談・創造の3入口は普通に使える）。
+   */
+  useEffect(() => {
+    if (apiKeyStatus !== "set" || topPromptRanRef.current) return;
+    topPromptRanRef.current = true;
+    let cancelled = false;
+    generateTopPrompt().then((result) => {
+      if (cancelled || !result) return;
+      setTopPrompt(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKeyStatus]);
+
+  /**
+   * STORAGE.md §2.4 Rebuildability Guarantee。Vault接続直後（初回接続・変更どちらも、
+   * および起動時の自動再接続）に、IndexedDBがまだ知らない記憶がVault側のMarkdownに
+   * 存在するかを確認する。見つかっても自動では復元しない（ユーザーの確認を挟む）。
+   */
+  async function checkForRestoreCandidate(handle: FileSystemDirectoryHandle) {
+    try {
+      const scan = await scanVaultForRestore(handle);
+      const [existingConversations, existingMemoryObjects, existingSources] = await Promise.all([
+        getAllConversations(),
+        getAllMemoryObjects(),
+        getAllSources(),
+      ]);
+      const existingIds = new Set([
+        ...existingConversations.map((c) => c.id),
+        ...existingMemoryObjects.map((m) => m.id),
+        ...existingSources.map((s) => s.id),
+      ]);
+      const newCount =
+        scan.conversations.filter((c) => !existingIds.has(c.id)).length +
+        scan.memoryObjects.filter((m) => !existingIds.has(m.id)).length +
+        scan.sources.filter((s) => !existingIds.has(s.id)).length;
+
+      if (newCount > 0) {
+        setRestoreCandidate({ scan, newCount });
+        setRestoreStatus("idle");
+      }
+    } catch (error) {
+      console.error("Failed to scan vault for restore", error);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    restoreVaultHandle().then(async (handle) => {
+      if (cancelled) return;
+      if (handle) {
+        setVaultHandle(handle);
+        setVaultStatus("connected");
+
+        // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
+        // 接続許可（restoreVaultHandle）が確認できている場合、handleConnectVault()と
+        // 同じ手順（flush→scan）で復元候補チェックも行う。restoreVaultHandle()は
+        // queryPermissionのみでrequestPermissionを呼ばない設計のため、ここに来た時点で
+        // ユーザー操作なしに安全にflush/scanを実行できる。flushPendingToVault()を省略
+        // すると、IndexedDB側にまだVaultへ書き戻されていない変更がある場合に、古い
+        // Markdownの内容でIndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
+        // 復元候補が見つかっても、この場では書き込まない。既存の確認UI・
+        // handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量のMemoryを
+        // 起動時に無言で上書きしない）。
+        try {
+          await flushPendingToVault(handle);
+          if (cancelled) return;
+          await checkForRestoreCandidate(handle);
+        } catch (error) {
+          console.error("Failed to check for restore candidates on startup", error);
+        }
+      } else {
+        setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * ROADMAP.md Phase 2「Connect」。セッション終了ボタンを押さずにブラウザを閉じた場合の
+   * 救済（未Connect Memoryのキャッチアップ）。アプリ起動のたびに一度だけ、
+   * まだConnectを試みていないMemoryを古い順に最大STARTUP_CONNECT_LIMIT件だけ
+   * バックグラウンドで処理する。チャット操作はブロックしない。
+   */
+  useEffect(() => {
+    if (vaultStatus === "checking" || startupConnectRanRef.current) return;
+    startupConnectRanRef.current = true;
+    let cancelled = false;
+    (async () => {
+      try {
+        const allMemories = await getAllMemoryObjects();
+        const unconnected = await filterUnconnected(allMemories);
+        const pending = [...unconnected]
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+          .slice(0, STARTUP_CONNECT_LIMIT);
+        for (const memory of pending) {
+          if (cancelled) return;
+          await connectMemory(vaultHandle, memory);
+        }
+      } catch (error) {
+        console.error("Failed to run startup connect catch-up", error);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultStatus, vaultHandle]);
+
+  useEffect(() => {
+    scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [conversation.turns.length, streamingText]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
+
+  useEffect(() => {
+    const el = topPromptTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [topPromptInput]);
+
+  async function handleDeleteApiKey(deleteTarget: SupportedChatProvider) {
+    await clearApiKey(deleteTarget);
+    // Geminiの削除だけは既存動作通り、オンボーディング（全画面）へ戻す。
+    if (deleteTarget === "gemini") {
+      setApiKeyStatus("missing");
+    }
+    refreshKeyStatus();
+    if (chatProvider === deleteTarget) {
+      handleSelectChatProvider("gemini");
+    }
+  }
+
+  async function handleConnectVault() {
+    setVaultConnectFeedback(null);
+    try {
+      const handle = await chooseVaultDirectory();
+      setVaultHandle(handle);
+      setVaultStatus("connected");
+      await flushPendingToVault(handle);
+      await checkForRestoreCandidate(handle);
+    } catch (error) {
+      const feedback: VaultConnectFeedback =
+        error instanceof DOMException && error.name === "AbortError"
+          ? { kind: "cancelled", message: "Vault接続をキャンセルしました。" }
+          : { kind: "error", message: "Vaultに接続できませんでした。" };
+      if (feedback.kind === "error") {
+        console.error("Failed to connect vault", error);
+      }
+      setVaultConnectFeedback(feedback);
+      window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+    }
+  }
+
+  async function handleRestoreFromVault() {
+    if (!restoreCandidate) return;
+    setRestoreStatus("restoring");
+    try {
+      for (const restoredConversation of restoreCandidate.scan.conversations) {
+        await putConversation(restoredConversation);
+      }
+      for (const restoredMemoryObject of restoreCandidate.scan.memoryObjects) {
+        await putMemoryObject(restoredMemoryObject);
+      }
+      // Test 34：Conversation/MemoryObjectと同じ扱いで、Vaultにしか存在しないSourceも
+      // 復元する（従来はscan.sourcesが読み取られるだけで復元されずに失われていた）。
+      for (const restoredSource of restoreCandidate.scan.sources) {
+        await saveSource(restoredSource);
+      }
+      setRestoreStatus("done");
+      setRestoreCandidate(null);
+    } catch (error) {
+      console.error("Failed to restore from vault", error);
+      setRestoreStatus("idle");
+    }
+  }
+
+  /**
+   * Captureをキューへ積む。awaitせずバックグラウンドで実行され、チャット送信をブロックしない。
+   * snapshotはenqueue時点のconversationに固定する（ターンNのCaptureが、後から追加された
+   * ターンN+1を勝手に取り込まないようにするため）。
+   */
+  function enqueueCapture(snapshot: Conversation) {
+    captureQueueRef.current = captureQueueRef.current.then(async (prevMemoryObjects) => {
+      try {
+        setCaptureStatus("saving");
+        const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects } = await captureConversation(
+          snapshot,
+          prevMemoryObjects
+        );
+        const { conversationFailed, failedMemoryIds } = await persistCapture(
+          vaultHandle,
+          capturedDelta,
+          touchedMemoryObjects
+        );
+        // 保存に成功したMemoryだけを以降の処理（revisitPrompt生成・state反映）へ進める。
+        // IndexedDB書き込み自体が失敗したMemoryは、成功した他のMemoryを巻き込まないよう
+        // ここで除外する（Beta修正：以前はここで1件でも失敗すると全件が失われていた）。
+        const persistedMemoryObjects = touchedMemoryObjects.filter(
+          (memory) => !failedMemoryIds.includes(memory.id)
+        );
+
+        // Beta「過去からの問いかけ」。revisitPromptをまだ持たないMemory（＝今回新しく
+        // 生成された、または初めてCaptureされたMemory）だけを対象に、そのMemory単体を
+        // 材料として再訪用の問いかけを1回だけ生成し、保存し直す。既にrevisitPromptを
+        // 持つMemoryは再生成しない。ここで失敗しても既存のCapture結果自体は失わない
+        // （revisitPromptが付かないだけで、次にこのMemoryが更新された際に再度試みられる）。
+        const memoriesWithRevisitPrompt = await Promise.all(
+          persistedMemoryObjects.map(async (memory) => {
+            if (memory.revisitPrompt) return memory;
+            try {
+              const revisitPrompt = await generateRevisitPrompt(memory);
+              if (!revisitPrompt) return memory;
+              const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
+              await putMemoryObject(memoryWithPrompt);
+              return memoryWithPrompt;
+            } catch (error) {
+              console.error("Failed to generate revisit prompt", error);
+              return memory;
+            }
+          })
+        );
+
+        const touchedIds = new Set(memoriesWithRevisitPrompt.map((memory) => memory.id));
+        const mergedMemoryObjects = [
+          ...prevMemoryObjects.filter((memory) => !touchedIds.has(memory.id)),
+          ...memoriesWithRevisitPrompt,
+        ];
+
+        // このCaptureが対象にしていたConversationが、実行中に「本日はここまで」→新規会話開始等で
+        // 既に切り替わっていた場合は、古い結果を今のstateへ書き戻さない（別会話の汚染防止）。
+        // setStateのfunctional updaterはこの時点で同期的に実行される保証が無いため、
+        // 常に同期的に最新値を持つlatestConversationRefで判定する。
+        if (latestConversationRef.current.id !== capturedDelta.id) {
+          return prevMemoryObjects;
+        }
+
+        const merged: Conversation = {
+          ...latestConversationRef.current,
+          status: capturedDelta.status,
+          // 保存に失敗したMemoryのidは、conversation.memoryObjectIdsからも除く
+          // （実際にIndexedDBへ保存できたものだけを指すようにする）。
+          memoryObjectIds: capturedDelta.memoryObjectIds.filter((id) => !failedMemoryIds.includes(id)),
+          updatedAt: capturedDelta.updatedAt,
+        };
+        latestConversationRef.current = merged;
+        setConversation(merged);
+        setMemoryObjects(mergedMemoryObjects);
+
+        // Beta修正：一部のMemoryだけ保存に失敗した場合も、成功した分は反映した上で、
+        // 失敗があったことをユーザーへ明示する（黙って"saved"にしない）。
+        if (conversationFailed || failedMemoryIds.length > 0) {
+          console.error("Partial capture failure", { conversationFailed, failedMemoryIds });
+          setCaptureStatus("partial");
+        } else {
+          setCaptureStatus("saved");
+          window.setTimeout(() => setCaptureStatus("idle"), 2500);
+        }
+        return mergedMemoryObjects;
+      } catch (error) {
+        console.error("Failed to capture memory", error);
+        setCaptureStatus("error");
+        // 失敗しても次のCaptureへ、直前まで有効だったmemoryObjects一覧をそのまま引き継ぐ。
+        return prevMemoryObjects;
+      }
+    });
+  }
+
+  /**
+   * 「本日はここまで」。UI_UX.md「Users never press Save」の"Save"ではない
+   * （保存は既にCaptureが自動で行っている）。あくまで任意の締めくくりの操作。
+   * 既存のCaptureは呼ばない。既存のmemoryObjectを材料に、別のinsight MemoryObjectを1つ作る。
+   */
+  async function handleEndSession() {
+    // バックグラウンドで実行中のCaptureが残っていれば、ここで完了を待つ
+    // （memoryObjectsが最新状態になってから振り返りの材料として使うため）。
+    const latestMemoryObjects = await captureQueueRef.current;
+
+    if (latestMemoryObjects.length === 0) {
+      // Captureがまだ一度も成功していない（進行中 or 失敗）。
+      // 無反応にはせず、ユーザーに次にどうすればよいか分かる状態にする。
+      setReflectionStatus("unavailable");
+      return;
+    }
+
+    setReflectionStatus("generating");
+    try {
+      // 振り返り（/api/reflect）はMemoryObjectを1件受け取る既存の設計のため、
+      // 今回のConversationから生まれた複数Memoryを1つにまとめた材料として渡す
+      // （reflection.ts / /api/reflect側は変更しない）。
+      const reflectionSource: MemoryObject = {
+        ...latestMemoryObjects[0],
+        summary: latestMemoryObjects.map((memory) => memory.summary).join(" / "),
+        content: latestMemoryObjects.map((memory) => memory.content).join("\n\n"),
+        keywords: [...new Set(latestMemoryObjects.flatMap((memory) => memory.keywords))],
+      };
+
+      const text = await generateSessionReflection(persona, reflectionSource);
+      const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
+      const endedConversation: Conversation = {
+        ...conversation,
+        endedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        memoryObjectIds: [...conversation.memoryObjectIds, insightMemory.id],
+      };
+
+      // 既存のwriteConversationMarkdown / writeMemoryObjectMarkdown / putConversation / putMemoryObjectを
+      // そのまま再利用する（persistCaptureは会話1件+MemoryObject複数件を書き出す処理として、
+      // Capture専用ではなくそのまま使い回せる）。
+      const { failedMemoryIds: reflectionFailedIds } = await persistCapture(vaultHandle, endedConversation, [
+        insightMemory,
+      ]);
+      if (reflectionFailedIds.length > 0) {
+        // insight MemoryのIndexedDB保存自体が失敗した場合は、Reflectionを「完了」として
+        // 表示しない（黙って失われた記憶を「保存できた」と伝えないため）。
+        console.error("Reflection insight memory failed to persist", reflectionFailedIds);
+        setReflectionStatus("error");
+        return;
+      }
+
+      setConversation(endedConversation);
+      latestConversationRef.current = endedConversation;
+      setReflectionText(text);
+      setReflectionStatus("done");
+
+      // Connect（ROADMAP.md Phase 2）。Reflection表示をブロックしないよう非同期で走らせる。
+      // 失敗してもReflection自体は成功しているため、reflectionStatusには影響させない
+      // （未Connectのまま残り、次回起動時のキャッチアップで再試行される）。
+      void (async () => {
+        try {
+          for (const memory of latestMemoryObjects) {
+            await connectMemory(vaultHandle, memory);
+          }
+          await connectMemory(vaultHandle, insightMemory);
+        } catch (connectError) {
+          console.error("Failed to connect session memories", connectError);
+        }
+      })();
+    } catch (error) {
+      console.error("Failed to generate session reflection", error);
+      setReflectionStatus("error");
+    }
+  }
+
+  /**
+   * 会話境界（ペルソナ切り替え・トップへ戻る・終了済みConversationからの新規開始）で、
+   * 離れる直前のConversationのMemoryをConnect対象にする。handleEndSession()が
+   * セッション終了時に行っているのと同じパターン（画面遷移をブロックしないfire-and-forget）
+   * をそのまま再利用するだけで、新しいConnect機構・新しいタイマーは作らない。
+   *
+   * pendingMemoryObjectsには、呼び出し時点（=captureQueueRef.currentを次の値へ
+   * 上書きする直前）のcaptureQueueRef.currentをそのまま渡す。これは進行中のCaptureが
+   * 完了した後の最終的なMemoryObject一覧を指すPromiseであり、state変数のmemoryObjects
+   * （再レンダーを挟まないと最新にならない）ではなくこちらを使うことで、画面遷移で参照が
+   * 失われる前に対象を確実に確保できる。
+   *
+   * 会話中のMemory（まだCaptureで更新され続けている途中のもの）はConnect対象にしない
+   * ——という設計方針は、この関数が「離れる」操作からしか呼ばれないことで担保される
+   * （enqueueCapture成功直後などからは呼ばない）。
+   *
+   * 同じMemoryが「本日はここまで」・起動時キャッチアップ・この会話境界Connectの
+   * 複数経路から対象になっても、connectMemory()内のtryClaimMemoryForConnect()による
+   * 既存のクレーム機構がそのまま重複実行を防ぐ。
+   */
+  function connectConversationBoundary(pendingMemoryObjects: Promise<MemoryObject[]>) {
+    void (async () => {
+      try {
+        const memories = await pendingMemoryObjects;
+        for (const memory of memories) {
+          await connectMemory(vaultHandle, memory);
+        }
+      } catch (error) {
+        console.error("Failed to connect conversation-boundary memories", error);
+      }
+    })();
+  }
+
+  /**
+   * 会話中の「日記／探究／相談・創造」。Personaを途中で切り替えるのではなく、
+   * 新しいConversationを始めるボタンとして扱う（トップ画面の入口と同じPersonaを使う）。
+   * 画面上は完全に新しい会話として始まり、古いConversationの内容は表示しない。
+   * ただし古いConversationはこれまでのCaptureで既に随時保存済みであり、ここでは
+   * IndexedDB/Vaultへの削除も上書きも行わない（React state上の参照を新しい
+   * Conversationへ切り替えるだけ）。handleSend()の「終了済みConversationへは
+   * 追記せず新規作成する」分岐と全く同じリセット処理を再利用する。
+   */
+  function handleSwitchPersona(nextPersona: Persona) {
+    connectConversationBoundary(captureQueueRef.current);
+
+    const newConversation = createConversation(nextPersona);
+    setConversation(newConversation);
+    latestConversationRef.current = newConversation;
+    setPersona(nextPersona);
+    setMemoryObjects([]);
+    captureQueueRef.current = Promise.resolve([]);
+    setReflectionStatus("idle");
+    setReflectionText("");
+    setInput("");
+    setStreamingText("");
+    setSendStatus("idle");
+  }
+
+  /**
+   * ロゴクリックでトップ画面（ペルソナ選択前）へ戻る。handleSwitchPersona()と同じく、
+   * 新しい空のConversationへReact state上の参照を切り替えるだけで、既存のConversation/
+   * MemoryObjectはIndexedDB/Vaultとも一切削除・上書きしない。ページリロードも行わない。
+   * personaはまだ選び直されていないため、既存stateの値をそのままcreateConversation()に
+   * 渡す（トップ画面自体はこの値を表示に使わない）。
+   */
+  function handleGoToTop() {
+    connectConversationBoundary(captureQueueRef.current);
+
+    const newConversation = createConversation(persona);
+    setConversation(newConversation);
+    latestConversationRef.current = newConversation;
+    setMemoryObjects([]);
+    captureQueueRef.current = Promise.resolve([]);
+    setReflectionStatus("idle");
+    setReflectionText("");
+    setInput("");
+    setStreamingText("");
+    setSendStatus("idle");
+    setEntryConfirmed(false);
+  }
+
+  /**
+   * overrideTextが渡された場合はinput stateではなくそちらを送信する（過去からの問いかけ用）。
+   * overridePersonaも同様。personaは closure変数のため、呼び出し元がsetPersona()した直後に
+   * 再レンダーを挟まず本関数を呼ぶケース（過去からの問いかけ）では、closure変数のpersonaは
+   * まだ更新前の値のままになる（baseConversationをlatestConversationRefから読む理由と同じ）。
+   */
+  async function handleSend(overrideText?: string, overridePersona?: Persona) {
+    const text = (overrideText ?? input).trim();
+    if (!text || busy) return;
+    const activePersona = overridePersona ?? persona;
+
+    setInput("");
+    setBusy(true);
+    setStreamingText("");
+    setSendStatus("idle");
+    startWaiting();
+
+    // 「本日はここまで」で終了済みのConversationへは追記しない。
+    // ページ再読み込みを挟まず、ここで新しいConversationを開始する
+    // （Conversationは会話の文脈の単位であり、話題ごとのMemory分割とは別の話）。
+    // conversation（closure変数）ではなくlatestConversationRefを読む。
+    // 「過去からの問いかけ」ではhandleTopPromptSend()がsetConversationした直後、
+    // 再レンダーを挟まずこの関数を呼ぶため、closure変数のconversationはまだ古い値のまま
+    // （問いかけ自体のturnが乗っていない）参照してしまう。
+    let baseConversation = latestConversationRef.current;
+    if (baseConversation.endedAt) {
+      connectConversationBoundary(captureQueueRef.current);
+
+      baseConversation = createConversation(activePersona);
+      setConversation(baseConversation);
+      latestConversationRef.current = baseConversation;
+      setMemoryObjects([]);
+      captureQueueRef.current = Promise.resolve([]);
+      setReflectionStatus("idle");
+      setReflectionText("");
+    }
+
+    const userTurn: ConversationTurn = {
+      role: "user",
+      content: text,
+      timestamp: new Date().toISOString(),
+    };
+    let updated = appendTurn(baseConversation, userTurn);
+    setConversation(updated);
+    latestConversationRef.current = updated;
+
+    try {
+      // Retrieval Engine（ローカルのみ・AIを呼ばない）。毎ターン実行し、
+      // 使うかどうかの判断は/api/chat側のAIに委ねる（0件ならそのまま0件で渡す）。
+      // 明示的Reflection（ROADMAP.md Phase 2）：ローカル判定のみでlimitとLink経由上限を広げる。
+      // 判定がfalseの場合は既定のまま、Phase 1からの挙動を完全に維持する。
+      const reflective = isReflectiveQuery(text);
+      const retrievedMemories = await retrieveRelevantMemories(text, {
+        excludeConversationId: baseConversation.id,
+        limit: reflective ? REFLECTIVE_LIMIT : undefined,
+        maxLinkedAdditions: reflective ? REFLECTIVE_MAX_LINKED_ADDITIONS : undefined,
+        persona: activePersona,
+        promptedMemoryId: baseConversation.promptedMemoryId,
+      });
+
+      // chatだけは選択中provider（既定Gemini）を使う。他機能（Capture/Connect/Reflection/
+      // 問いかけ生成）はloadApiKey()を引数なしで呼ぶため、常にGeminiのままである。
+      const storedApiKey = await loadApiKey(chatProvider);
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [AI_PROVIDER_HEADER]: chatProvider,
+          ...(storedApiKey ? { [API_KEY_HEADER_BY_PROVIDER[chatProvider]]: storedApiKey } : {}),
+        },
+        body: JSON.stringify({ persona: activePersona, turns: updated.turns, retrievedMemories }),
+      });
+
+      if (!res.ok || !res.body) {
+        throw new ChatRequestError(res.status);
+      }
+
+      // このAIターンの生成でWeb検索が有効化されていたか（needsWebSearch()の判定結果）。
+      // 実際に検索結果が取得できた・groundingが発生したことの証明ではない。
+      // ヘッダーが無い場合（旧サーバー等）は、既存Conversationとの互換性を優先してundefinedのままにする。
+      const webSearchRequestedHeader = res.headers.get("X-Tsumugi-Web-Search-Requested");
+      const webSearchRequested =
+        webSearchRequestedHeader === null ? undefined : webSearchRequestedHeader === "true";
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value, { stream: true });
+        setStreamingText(full);
+        stopWaiting();
+      }
+
+      const aiTurn: ConversationTurn = {
+        role: "ai",
+        content: full,
+        timestamp: new Date().toISOString(),
+        ...(webSearchRequested !== undefined ? { webSearchRequested } : {}),
+      };
+      updated = appendTurn(updated, aiTurn);
+      setConversation(updated);
+      latestConversationRef.current = updated;
+      setStreamingText("");
+
+      // Captureの完了を待たず、ここで次の入力を可能にする。Captureはバックグラウンドで継続する。
+      setBusy(false);
+      enqueueCapture(updated);
+    } catch (error) {
+      console.error("Failed to send message", error);
+      setSendStatus(error instanceof ChatRequestError && error.status === 401 ? "authError" : "error");
+    } finally {
+      setBusy(false);
+      stopWaiting();
+    }
+  }
+
+  /**
+   * 「過去からの問いかけ」への回答。既存のhandleSend()をそのまま再利用する
+   * （新しい送信ロジックは作らない）。Personaは元Memoryが属していたConversationの
+   * ものを引き継ぐ（topPrompt.persona、取得できない場合はcompanionにfallback。
+   * topPrompt.ts側で解決済み）。
+   *
+   * 画面に表示した問いかけ文を、送信前にconversation.turnsへassistant発言として
+   * 追加しておく。これをしないと、Gemini側には「ユーザーの回答」だけが渡り、
+   * 自分が直前に何を尋ねたのか分からないまま返答することになる
+   * （実際に「あまり進んでいない」→「何が進んでいないのでしょうか」という
+   * 文脈を無視した返答が発生していた）。
+   */
+  function handleTopPromptSend() {
+    const text = topPromptInput.trim();
+    if (!text || busy || !topPrompt) return;
+
+    const questionTurn: ConversationTurn = {
+      role: "ai",
+      content: topPrompt.question,
+      timestamp: new Date().toISOString(),
+    };
+    // promptedMemoryIdは「この会話がどのMemoryをきっかけに始まったか」の追跡用
+    // （Vault Markdownへは書き出さない実行時・IndexedDBの補助情報）。
+    // personaもここで明示的に上書きする。captureConversation()はconversation.personaを
+    // 参照するため（トップレベルのpersona stateとは別）、両方を揃えておく必要がある。
+    const updated: Conversation = {
+      ...appendTurn(conversation, questionTurn),
+      persona: topPrompt.persona,
+      promptedMemoryId: topPrompt.memory.id,
+    };
+    setConversation(updated);
+    latestConversationRef.current = updated;
+
+    setEntryConfirmed(true);
+    setPersona(topPrompt.persona);
+    setTopPrompt(null);
+    setTopPromptInput("");
+    void handleSend(text, topPrompt.persona);
+  }
+
+  const showPersonaSelector = conversation.turns.length === 0;
+  const showEntryScreen = showPersonaSelector && !entryConfirmed;
+
+  const vaultStatusLabel =
+    vaultStatus === "connected" && vaultHandle
+      ? vaultHandle.name
+      : vaultStatus === "unsupported"
+        ? "非対応"
+        : vaultStatus === "checking"
+          ? "確認中"
+          : "この端末のみ";
+
+  if (apiKeyStatus === "checking") {
+    return <div className="h-dvh bg-[var(--background)]" />;
+  }
+
+  if (apiKeyStatus === "missing") {
+    return (
+      <ApiKeySetup
+        provider="gemini"
+        onSaved={(savedProvider) => {
+          refreshKeyStatus();
+          if (savedProvider === "gemini") setApiKeyStatus("set");
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
+      <div className="flex items-center justify-center px-4 pt-8 pb-3">
+        <button
+          type="button"
+          onClick={handleGoToTop}
+          aria-label="トップ画面へ戻る"
+          className="w-[min(220px,100%)] rounded-lg"
+        >
+          <img
+            src="/logo.png"
+            alt="Tsumugi"
+            className="h-auto w-full dark:invert"
+          />
+        </button>
+      </div>
+      <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 py-8">
+        {showEntryScreen ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
+            {topPrompt && (
+              <div className="flex w-full flex-col items-center gap-3 border-b border-black/5 pb-8 dark:border-white/10">
+                <p className="whitespace-pre-wrap text-base text-stone-600 dark:text-stone-300">
+                  {topPrompt.question}
+                </p>
+                <div className="flex w-full max-w-md items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
+                  {/*
+                    Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段。
+                    以前このボックスがinputだった際、IME変換確定のEnterで意図せず送信される
+                    問題があったため、Enterへの特別な処理自体を持たせない設計にする
+                    （通常のChat入力欄＝textareaRefも同じ方針に統一済み。Enterで送信する
+                    処理はどちらの入力欄にも無い）。
+                  */}
+                  <textarea
+                    ref={topPromptTextareaRef}
+                    rows={1}
+                    value={topPromptInput}
+                    onChange={(event) => setTopPromptInput(event.target.value)}
+                    placeholder="ここに入力してください"
+                    className="max-h-64 min-h-24 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none placeholder:text-stone-400"
+                  />
+                  <button
+                    onClick={handleTopPromptSend}
+                    disabled={!topPromptInput.trim()}
+                    className="shrink-0 rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
+                  >
+                    送る
+                  </button>
+                </div>
+              </div>
+            )}
+            <p className="text-xl text-stone-500 dark:text-stone-400">今日は、どう話そう？</p>
+            <div className="flex flex-wrap justify-center gap-3">
+              {PERSONAS.map((p) => (
+                <button
+                  key={p.value}
+                  onClick={() => {
+                    setPersona(p.value);
+                    setEntryConfirmed(true);
+                  }}
+                  className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-col gap-1 text-stone-500 dark:text-stone-400">
+              <p className="text-lg">{greeting}</p>
+              <p className="text-lg">
+                {PERSONAS.find((p) => p.value === persona)?.openingMessage ?? "今日はどんな一日でしたか？"}
+              </p>
+            </div>
+
+            {conversation.turns.map((turn, index) => (
+              <TurnBubble key={index} turn={turn} />
+            ))}
+
+            {busy && streamingText && (
+              <TurnBubble turn={{ role: "ai", content: streamingText, timestamp: "" }} />
+            )}
+
+            {busy && !streamingText && waitingMessage && (
+              <p className="text-sm text-stone-400 dark:text-stone-500">{waitingMessage}</p>
+            )}
+          </>
+        )}
+
+        {persona === "companion" &&
+          conversation.turns[conversation.turns.length - 1]?.role === "ai" &&
+          !conversation.endedAt && (
+          <div className="flex flex-col items-center gap-2 pt-4 text-center">
+            <button
+              onClick={() => void handleEndSession()}
+              disabled={reflectionStatus === "generating"}
+              className="text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 disabled:opacity-50 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
+            >
+              本日はここまで
+            </button>
+            {reflectionStatus === "generating" && (
+              <p className="text-xs text-stone-400 dark:text-stone-500">今日を振り返っています…</p>
+            )}
+            {reflectionStatus === "error" && (
+              <p className="text-xs text-red-600 dark:text-red-400">振り返りの生成に失敗しました。</p>
+            )}
+            {reflectionStatus === "unavailable" && (
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                まだ記憶として保存できていないようです。少し待ってからもう一度お試しください。
+              </p>
+            )}
+          </div>
+        )}
+
+        {reflectionStatus === "done" && (
+          <div className="rounded-2xl border border-stone-300/60 bg-stone-100/60 px-5 py-4 dark:border-stone-700/60 dark:bg-stone-900/40">
+            <p className="mb-2 text-xs text-stone-400 dark:text-stone-500">今日の振り返り</p>
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
+              {reflectionText}
+            </p>
+          </div>
+        )}
+
+        {/*
+          この3ボタンは「Personaを切り替えるナビゲーション」ではなく、過去からの問いかけ
+          （revisitPrompt）をきっかけに始まったConversationからだけ出す入口。判定は
+          turnsの文字列内容からの推測ではなく、Conversation生成時に明示的に立てる
+          promptedMemoryId（handleTopPromptSendが設定、通常のPersona選択や
+          handleSwitchPersonaが作るConversationには付かない）で行う。
+        */}
+        {!showEntryScreen && !busy && conversation.turns.length > 0 && !!conversation.promptedMemoryId && (
+          <div className="flex flex-col items-center gap-3 pt-6 text-center">
+            <p className="text-sm text-stone-500 dark:text-stone-400">今日は、どう話そう？</p>
+            <div className="flex flex-wrap justify-center gap-3">
+              {PERSONAS.map((p) => (
+                <button
+                  key={p.value}
+                  onClick={() => handleSwitchPersona(p.value)}
+                  className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div ref={scrollAnchorRef} />
+      </main>
+
+      {!showEntryScreen && (
+      <footer className="mx-auto w-full max-w-2xl px-5 pb-6">
+        <div className="flex items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
+          {/*
+            Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段（過去からの
+            問いかけ用textareaと統一）。日本語IME変換確定のEnterで誤送信される問題を
+            避けるため、Enterへの特別な処理自体を持たせない。
+          */}
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            placeholder={
+              PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
+            }
+            disabled={busy}
+            className="max-h-64 min-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none placeholder:text-stone-400 disabled:opacity-60"
+          />
+          <button
+            type="button"
+            onClick={() => setHistoryOpen(true)}
+            aria-label="これまでの記憶を見る"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300"
+          >
+            ↺
+          </button>
+          <button
+            type="button"
+            onClick={() => setImportOpen(true)}
+            aria-label="読み込む"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300"
+          >
+            ＋
+          </button>
+          <button
+            onClick={() => void handleSend()}
+            disabled={busy || !input.trim()}
+            className="shrink-0 rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
+          >
+            送る
+          </button>
+        </div>
+
+        <p
+          className={`mt-2 h-4 text-xs transition-opacity ${
+            captureStatus === "error" || captureStatus === "partial"
+              ? "text-red-600 dark:text-red-400"
+              : "text-stone-400 dark:text-stone-500"
+          }`}
+        >
+          {captureStatus === "saving" && "記憶に残しています…"}
+          {captureStatus === "saved" &&
+            (vaultStatus === "connected" ? "記憶に残しました。" : "この端末にのみ保存しました。")}
+          {captureStatus === "partial" && "一部の記憶を保存できませんでした。会話は続けられます。"}
+          {captureStatus === "error" && "記憶の保存に失敗しました。"}
+        </p>
+        {sendStatus === "authError" && (
+          <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+            APIキーが無効または期限切れの可能性があります。設定を確認してください。
+          </p>
+        )}
+        {sendStatus === "error" && (
+          <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+            メッセージの送信に失敗しました。しばらくしてからもう一度お試しください。
+          </p>
+        )}
+      </footer>
+      )}
+
+      {/* 通常時は1行のみ（現在使用するAI・保存先・設定を開く⚙）。詳細はSettingsPanelへ集約する。 */}
+      <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pb-4 pt-1 text-xs text-stone-400 dark:text-stone-500">
+        <span>{PROVIDER_LABEL[chatProvider]}</span>
+        <span aria-hidden="true">・</span>
+        <span>{vaultStatusLabel}</span>
+        <span aria-hidden="true">・</span>
+        <button
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          aria-label="設定"
+          className="-my-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300"
+        >
+          ⚙
+        </button>
+      </div>
+
+      {settingsOpen && (
+        <div className="fixed inset-0 z-40">
+          <SettingsPanel
+            chatProvider={chatProvider}
+            keyStatusByProvider={keyStatusByProvider}
+            vaultStatus={vaultStatus}
+            vaultHandle={vaultHandle}
+            vaultConnectFeedback={vaultConnectFeedback}
+            restoreCandidate={restoreCandidate}
+            restoreStatus={restoreStatus}
+            onClose={() => setSettingsOpen(false)}
+            onChangeGeminiKey={() => setApiKeyStatus("missing")}
+            onDeleteApiKey={(deleteTarget) => void handleDeleteApiKey(deleteTarget)}
+            onOpenApiKeySetup={(provider) => setApiKeySetupProvider(provider)}
+            onSelectChatProvider={handleSelectChatProvider}
+            onConnectVault={() => void handleConnectVault()}
+            onRestoreFromVault={() => void handleRestoreFromVault()}
+          />
+        </div>
+      )}
+
+      {importOpen && (
+        <div className="fixed inset-0 z-40">
+          <ImportPanel vaultHandle={vaultHandle} onClose={() => setImportOpen(false)} />
+        </div>
+      )}
+
+      {historyOpen && (
+        <div className="fixed inset-0 z-40">
+          <HistoryPanel onClose={() => setHistoryOpen(false)} />
+        </div>
+      )}
+
+      {apiKeySetupProvider && (
+        <div className="fixed inset-0 z-50">
+          <ApiKeySetup
+            provider={apiKeySetupProvider}
+            onClose={() => setApiKeySetupProvider(null)}
+            onSaved={(savedProvider) => {
+              setApiKeySetupProvider(null);
+              refreshKeyStatus();
+              if (savedProvider === "openai") handleSelectChatProvider("openai");
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TurnBubble({ turn }: { turn: ConversationTurn }) {
+  if (turn.role === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] rounded-2xl bg-stone-800 px-4 py-2 text-sm text-stone-50 dark:bg-stone-200 dark:text-stone-900">
+          {turn.content}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="max-w-[85%] whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
+      {turn.content}
+    </div>
+  );
+}
