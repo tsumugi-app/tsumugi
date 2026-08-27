@@ -22,11 +22,12 @@ const PROVIDER_INFO: Record<
 > = {
   gemini: {
     label: "Gemini",
-    intro: "会話の生成にはGoogleのGemini APIを使います。あなた自身のGemini APIキーが必要です。",
+    intro:
+      "Geminiは既定でTsumugiが用意したAPIキーを使うため、あなた自身のAPIキーは必須ではありません。自分のキーを使いたい場合のみ、ここから設定できます。",
     getKeyUrl: "https://aistudio.google.com/apikey",
     getKeyLabel: "Google AI StudioでAPIキーを取得する",
-    inputPlaceholder: "Gemini APIキーを入力",
-    accountNote: "APIキーはあなた自身のGoogleアカウントで取得します",
+    inputPlaceholder: "Gemini APIキーを入力（任意）",
+    accountNote: "自分のAPIキーは、あなた自身のGoogleアカウントで取得します",
   },
   openai: {
     label: "OpenAI",
@@ -46,7 +47,7 @@ export default function ApiKeySetup({
   /** 最初に選択されているタブ（＝どのproviderのキーを登録しようとしているか）。 */
   provider: SupportedProvider;
   onSaved: (provider: SupportedProvider) => void;
-  /** 指定した場合のみ閉じるボタンを出す（オンボーディング時は必須入力のため出さない）。 */
+  /** Beta：常に設定画面（任意）からのみ開かれるため、基本的に閉じるボタンは常に渡される。 */
   onClose?: () => void;
 }) {
   const [activeProvider, setActiveProvider] = useState<SupportedProvider>(provider);
@@ -126,11 +127,8 @@ export default function ApiKeySetup({
     <div className="flex h-dvh flex-col items-center justify-center gap-8 bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
       <div className="flex w-full max-w-md flex-col gap-6">
         <div className="flex flex-col gap-2 text-center">
-          <p className="text-xl text-stone-800 dark:text-stone-100">Tsumugiへようこそ</p>
-          <p className="text-sm leading-relaxed text-stone-500 dark:text-stone-400">
-            Tsumugiは、話した内容をあなたのPC上にだけ記憶として残していく、個人向けの対話アプリです。
-            {info.intro}
-          </p>
+          <p className="text-xl text-stone-800 dark:text-stone-100">APIキーの設定</p>
+          <p className="text-sm leading-relaxed text-stone-500 dark:text-stone-400">{info.intro}</p>
         </div>
 
         <div className="flex justify-center gap-2">
@@ -153,8 +151,8 @@ export default function ApiKeySetup({
 
         <div className="flex flex-col gap-1.5 rounded-2xl border border-stone-300/70 bg-white/70 px-4 py-3 text-xs leading-relaxed text-stone-500 dark:border-stone-700/70 dark:bg-stone-900/60 dark:text-stone-400">
           <p>・{info.accountNote}</p>
-          <p>・TsumugiはAPIキーをサーバーに保存しません（このブラウザにのみ保存されます）</p>
-          <p>・API利用料金・クォータはあなたのアカウントに紐づきます</p>
+          <p>・ここで入力したAPIキーはTsumugiのサーバーには送信・保存されず、このブラウザにのみ保存されます</p>
+          <p>・自分のAPIキーを設定した場合、その利用料金・クォータはあなたのアカウントに紐づきます</p>
         </div>
 
         <div className="flex items-center justify-center gap-4">
@@ -247,8 +245,10 @@ export default function ApiKeySetup({
             <div className="flex flex-col gap-1">
               <p className="text-stone-800 dark:text-stone-100">料金について</p>
               <p>
-                Tsumugiはあなた自身のAPIキーを使ってAIモデルを呼び出す仕組みのため、
-                Tsumugiの利用自体に料金は発生しませんが、AIサービス側の利用料金は
+                Beta版のGeminiは、既定ではTsumugiが用意したAPIキーで動作するため、
+                自分でAPIキーを用意しなくても利用できます。OpenAIを使う場合や、
+                自分自身のGemini APIキーを使いたい場合は、あなた自身のAPIキーが必要です。
+                その場合、Tsumugiの利用自体に料金は発生しませんが、AIサービス側の利用料金は
                 Tsumugiの利用料金とは別に発生します。OpenAIのAPIは基本的に有料利用で
                 あり、利用にあたって支払い方法の登録が必要になる場合があります。
                 Geminiを含め、料金体系・無料枠・利用条件はサービスによって異なるため、
@@ -260,10 +260,10 @@ export default function ApiKeySetup({
             <div className="flex flex-col gap-1">
               <p className="text-stone-800 dark:text-stone-100">安全に使うために</p>
               <p>
-                APIキーはこのブラウザのIndexedDBにのみ保存され、Tsumugiのサーバーには
-                送信・保存されません。ただし、APIキーが流出すると第三者があなたのアカウントで
-                APIを利用できてしまうため、他人と共有したり、公開されるノート・
-                リポジトリなどに貼り付けたりしないよう注意してください。
+                ここで入力したあなた自身のAPIキーは、このブラウザのIndexedDBにのみ保存され、
+                Tsumugiのサーバーには送信・保存されません。ただし、APIキーが流出すると
+                第三者があなたのアカウントでAPIを利用できてしまうため、他人と共有したり、
+                公開されるノート・リポジトリなどに貼り付けたりしないよう注意してください。
               </p>
             </div>
 

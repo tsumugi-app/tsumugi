@@ -47,7 +47,6 @@ export type SupportedChatProvider = "gemini" | "openai";
 export type VaultStatus = "checking" | "connected" | "not-connected" | "unsupported";
 /** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
 export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
-type ApiKeyStatus = "checking" | "missing" | "set";
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
 type ReflectionStatus = "idle" | "generating" | "done" | "error" | "unavailable";
 export type RestoreStatus = "idle" | "restoring" | "done";
@@ -105,7 +104,6 @@ const PROVIDER_LABEL: Record<SupportedChatProvider, string> = {
 };
 
 export default function ChatScreen() {
-  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus>("checking");
   const [persona, setPersona] = useState<Persona>("companion");
   const [entryConfirmed, setEntryConfirmed] = useState(false);
   const [conversation, setConversation] = useState<Conversation>(() => createConversation("companion"));
@@ -160,19 +158,6 @@ export default function ChatScreen() {
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
 
-  useEffect(() => {
-    let cancelled = false;
-    // オンボーディングのゲート判定は、Phase 3以降も既存動作を完全に維持するため
-    // Geminiの有無だけで行う（loadApiKey()は引数省略時＝Geminiを見る）。
-    loadApiKey().then((key) => {
-      if (cancelled) return;
-      setApiKeyStatus(key ? "set" : "missing");
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const refreshKeyStatus = () => {
     Promise.all([loadApiKey("gemini"), loadApiKey("openai")]).then(([gemini, openai]) => {
       setKeyStatusByProvider({ gemini: !!gemini, openai: !!openai });
@@ -202,12 +187,12 @@ export default function ChatScreen() {
   }
 
   /**
-   * Beta「過去からの問いかけ」。APIキー確定後に1回だけバックグラウンドで生成する。
+   * Beta「過去からの問いかけ」。マウント後に1回だけバックグラウンドで生成する。
    * トップ画面自体は先に表示済みのため、ここは非ブロッキングで良い
    * （生成が終わるまで日記/探究/相談・創造の3入口は普通に使える）。
    */
   useEffect(() => {
-    if (apiKeyStatus !== "set" || topPromptRanRef.current) return;
+    if (topPromptRanRef.current) return;
     topPromptRanRef.current = true;
     let cancelled = false;
     generateTopPrompt().then((result) => {
@@ -217,7 +202,7 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, [apiKeyStatus]);
+  }, []);
 
   /**
    * STORAGE.md §2.4 Rebuildability Guarantee。Vault接続直後（初回接続・変更どちらも、
@@ -334,11 +319,9 @@ export default function ChatScreen() {
   }, [topPromptInput]);
 
   async function handleDeleteApiKey(deleteTarget: SupportedChatProvider) {
+    // Beta：Geminiキーを削除してもTsumugi提供のサーバー側キーへ自動フォールバックする
+    // ため、以前のようにオンボーディング（全画面）へ戻す必要はない。
     await clearApiKey(deleteTarget);
-    // Geminiの削除だけは既存動作通り、オンボーディング（全画面）へ戻す。
-    if (deleteTarget === "gemini") {
-      setApiKeyStatus("missing");
-    }
     refreshKeyStatus();
     if (chatProvider === deleteTarget) {
       handleSelectChatProvider("gemini");
@@ -807,22 +790,6 @@ export default function ChatScreen() {
           ? "確認中"
           : "この端末のみ";
 
-  if (apiKeyStatus === "checking") {
-    return <div className="h-dvh bg-[var(--background)]" />;
-  }
-
-  if (apiKeyStatus === "missing") {
-    return (
-      <ApiKeySetup
-        provider="gemini"
-        onSaved={(savedProvider) => {
-          refreshKeyStatus();
-          if (savedProvider === "gemini") setApiKeyStatus("set");
-        }}
-      />
-    );
-  }
-
   return (
     <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
       <div className="flex items-center justify-center px-4 pt-8 pb-3">
@@ -1069,7 +1036,6 @@ export default function ChatScreen() {
             restoreCandidate={restoreCandidate}
             restoreStatus={restoreStatus}
             onClose={() => setSettingsOpen(false)}
-            onChangeGeminiKey={() => setApiKeyStatus("missing")}
             onDeleteApiKey={(deleteTarget) => void handleDeleteApiKey(deleteTarget)}
             onOpenApiKeySetup={(provider) => setApiKeySetupProvider(provider)}
             onSelectChatProvider={handleSelectChatProvider}

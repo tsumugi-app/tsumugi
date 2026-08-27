@@ -16,7 +16,6 @@ export default function SettingsPanel({
   restoreCandidate,
   restoreStatus,
   onClose,
-  onChangeGeminiKey,
   onDeleteApiKey,
   onOpenApiKeySetup,
   onSelectChatProvider,
@@ -31,7 +30,6 @@ export default function SettingsPanel({
   restoreCandidate: RestoreCandidate | null;
   restoreStatus: RestoreStatus;
   onClose: () => void;
-  onChangeGeminiKey: () => void;
   onDeleteApiKey: (provider: SupportedChatProvider) => void;
   onOpenApiKeySetup: (provider: SupportedChatProvider) => void;
   onSelectChatProvider: (provider: SupportedChatProvider) => void;
@@ -57,22 +55,29 @@ export default function SettingsPanel({
 
           <div className="flex flex-col gap-2 text-xs text-stone-500 dark:text-stone-400">
             <div className="flex items-center justify-between gap-4">
-              <span>Gemini APIキー：設定済み</span>
+              <span>Gemini APIキー：{keyStatusByProvider.gemini ? "設定済み" : "未設定（Tsumugi提供のキーを使用中）"}</span>
               <div className="flex shrink-0 gap-3">
                 <button
-                  onClick={onChangeGeminiKey}
+                  onClick={() => onOpenApiKeySetup("gemini")}
                   className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
                 >
-                  変更する
+                  {keyStatusByProvider.gemini ? "変更する" : "設定する"}
                 </button>
-                <button
-                  onClick={() => onDeleteApiKey("gemini")}
-                  className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-                >
-                  削除
-                </button>
+                {keyStatusByProvider.gemini && (
+                  <button
+                    onClick={() => onDeleteApiKey("gemini")}
+                    className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    削除
+                  </button>
+                )}
               </div>
             </div>
+            {!keyStatusByProvider.gemini && (
+              <p className="text-[11px] text-stone-400 dark:text-stone-500">
+                Geminiは、APIキーを設定しなくてもTsumugiが用意したキーで利用できます。自分のAPIキーを使いたい場合のみ設定してください。
+              </p>
+            )}
 
             <div className="flex items-center justify-between gap-4">
               <span>OpenAI APIキー：{keyStatusByProvider.openai ? "設定済み" : "未設定"}</span>
