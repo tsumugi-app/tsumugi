@@ -6,6 +6,7 @@ import { appendTurn, captureConversation, createConversation, persistCapture } f
 import {
   chooseVaultDirectory,
   flushPendingToVault,
+  getVaultBackend,
   isVaultSupported,
   restoreVaultHandle,
   scanVaultForRestore,
@@ -781,9 +782,18 @@ export default function ChatScreen() {
   const showPersonaSelector = conversation.turns.length === 0;
   const showEntryScreen = showPersonaSelector && !entryConfirmed;
 
+  /**
+   * PCはFile System Access APIの実フォルダ、スマホ等はOPFS（navigator.storage.getDirectory()）に
+   * 自動フォールバックする（vault.ts参照）。OPFSのルートhandleは`name`が空文字のため、
+   * `vaultHandle.name`をそのまま表示するとラベルが空になる。バックエンドを判定し、
+   * OPFSの場合は固定文言に差し替える。
+   */
+  const vaultBackend = getVaultBackend();
   const vaultStatusLabel =
     vaultStatus === "connected" && vaultHandle
-      ? vaultHandle.name
+      ? vaultBackend === "opfs"
+        ? "この端末の安全な領域"
+        : vaultHandle.name
       : vaultStatus === "unsupported"
         ? "非対応"
         : vaultStatus === "checking"
@@ -1032,6 +1042,7 @@ export default function ChatScreen() {
             keyStatusByProvider={keyStatusByProvider}
             vaultStatus={vaultStatus}
             vaultHandle={vaultHandle}
+            vaultBackend={vaultBackend}
             vaultConnectFeedback={vaultConnectFeedback}
             restoreCandidate={restoreCandidate}
             restoreStatus={restoreStatus}

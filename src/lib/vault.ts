@@ -1,5 +1,14 @@
 /**
- * Vault層（File System Access API）。
+ * Vault層。バックエンドは2種類ある。
+ *
+ * - PC（File System Access API）：ユーザーが`showDirectoryPicker()`で選んだ実フォルダ。
+ * - スマホ（OPFS＝Origin Private File System）：`navigator.storage.getDirectory()`が返す、
+ *   このオリジン専有の永続領域。File System Access APIが使えない環境（iOS/iPadOS Safari、
+ *   Android Chrome等）でのみフォールバックとして使う。ユーザー操作・許可プロンプトは不要。
+ *
+ * どちらのバックエンドも同じ`FileSystemDirectoryHandle`標準インターフェースを実装しているため、
+ * Vault層より下（書き込み・Rebuildability）のロジックは一切分岐しない。バックエンドの選択は
+ * `getVaultBackend()`／`restoreVaultHandle()`の中だけに閉じる。
  *
  * STORAGE.md §1.2 Markdown First / §2.4 Rebuildability Guarantee に対応する。
  * ここで書き込むMarkdownファイルとVault内の `.tsumugi/` JSONが正（source of truth）であり、
@@ -23,8 +32,30 @@ const VAULT_DIRS = ["Conversations", "Memories", "People", "Themes", "Emotions",
 
 export type VaultPermissionState = "granted" | "prompt" | "denied" | "unsupported" | "unset";
 
+/** "file-system-access" = PCの既存Vault（最優先）。"opfs" = スマホ等でのフォールバック。 */
+export type VaultBackend = "file-system-access" | "opfs";
+
 function isFsAccessSupported() {
   return typeof window !== "undefined" && "showDirectoryPicker" in window;
+}
+
+function isOpfsSupported() {
+  return (
+    typeof navigator !== "undefined" &&
+    typeof navigator.storage !== "undefined" &&
+    typeof navigator.storage.getDirectory === "function"
+  );
+}
+
+/**
+ * このブラウザで実際に使えるVaultバックエンドを返す。File System Access APIが使えれば
+ * 必ずそちらを優先する（PCで既にVaultを接続しているユーザーを、意図せずOPFSへ切り替えない
+ * ため）。使えない場合のみOPFSへフォールバックする。どちらも使えなければnull。
+ */
+export function getVaultBackend(): VaultBackend | null {
+  if (isFsAccessSupported()) return "file-system-access";
+  if (isOpfsSupported()) return "opfs";
+  return null;
 }
 
 async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boolean): Promise<boolean> {
@@ -34,11 +65,24 @@ async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boo
 }
 
 /**
- * 起動時に呼ぶ。ユーザー操作（クリック等）を伴わないため、
- * 許可が既に granted な場合のみハンドルを返す。それ以外は null（=再選択が必要）。
+ * 起動時に呼ぶ。ユーザー操作（クリック等）を伴わないため、File System Access APIパスでは
+ * 許可が既に granted な場合のみハンドルを返す（それ以外はnull＝再選択が必要）。
+ *
+ * OPFSパスでは、ユーザー操作も許可確認も不要（`navigator.storage.getDirectory()`は
+ * オリジン専有領域を無条件に返す）。毎回同じルートを指すため、保存済みhandleの
+ * 読み込み（loadVaultHandle）は行わない。初回アクセス時はensureVaultSkeleton()で
+ * 骨組みを作る（既に存在する場合は何もしない、以後の起動でも安全に呼べる）。
  */
 export async function restoreVaultHandle(): Promise<FileSystemDirectoryHandle | null> {
-  if (!isFsAccessSupported()) return null;
+  const backend = getVaultBackend();
+  if (backend === null) return null;
+
+  if (backend === "opfs") {
+    const root = await navigator.storage.getDirectory();
+    await ensureVaultSkeleton(root);
+    return root;
+  }
+
   const handle = await loadVaultHandle();
   if (!handle) return null;
   const ok = await verifyPermission(handle, true);
@@ -255,7 +299,7 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
 }
 
 export function isVaultSupported() {
-  return isFsAccessSupported();
+  return getVaultBackend() !== null;
 }
 
 // ---------------------------------------------------------------------------

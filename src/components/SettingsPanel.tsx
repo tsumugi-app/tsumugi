@@ -1,6 +1,7 @@
 "use client";
 
 import type { RestoreCandidate, RestoreStatus, SupportedChatProvider, VaultConnectFeedback, VaultStatus } from "./ChatScreen";
+import type { VaultBackend } from "@/lib/vault";
 
 /**
  * ChatScreen.tsx下部にあった設定領域（APIキー・保存先）を、⚙から開くオーバーレイへ移した表示専用コンポーネント。
@@ -12,6 +13,7 @@ export default function SettingsPanel({
   keyStatusByProvider,
   vaultStatus,
   vaultHandle,
+  vaultBackend,
   vaultConnectFeedback,
   restoreCandidate,
   restoreStatus,
@@ -26,6 +28,8 @@ export default function SettingsPanel({
   keyStatusByProvider: Record<SupportedChatProvider, boolean>;
   vaultStatus: VaultStatus;
   vaultHandle: FileSystemDirectoryHandle | null;
+  /** "opfs"の場合、PCのフォルダ選択とは異なり選び直す先が無いため「変更する」を出さない。 */
+  vaultBackend: VaultBackend | null;
   vaultConnectFeedback: VaultConnectFeedback | null;
   restoreCandidate: RestoreCandidate | null;
   restoreStatus: RestoreStatus;
@@ -146,13 +150,21 @@ export default function SettingsPanel({
 
           {vaultStatus === "connected" && vaultHandle && (
             <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
-              <span>保存先：{vaultHandle.name}</span>
-              <button
-                onClick={onConnectVault}
-                className="shrink-0 rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-              >
-                変更する
-              </button>
+              <span>保存先：{vaultBackend === "opfs" ? "この端末の安全な領域" : vaultHandle.name}</span>
+              {/*
+                OPFS（スマホ等のフォールバック）には、PCのようにユーザーが選び直せる
+                別のフォルダという概念が無い（navigator.storage.getDirectory()は常に同じ
+                オリジン専有領域を返す）。フォルダ選択ダイアログを持たないため「変更する」
+                ボタンはFile System Access APIバックエンド（PC）の時だけ表示する。
+              */}
+              {vaultBackend !== "opfs" && (
+                <button
+                  onClick={onConnectVault}
+                  className="shrink-0 rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                >
+                  変更する
+                </button>
+              )}
             </div>
           )}
 
