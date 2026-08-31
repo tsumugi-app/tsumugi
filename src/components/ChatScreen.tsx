@@ -118,6 +118,12 @@ export default function ChatScreen() {
   const [vaultHandle, setVaultHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus>("checking");
   const [vaultConnectFeedback, setVaultConnectFeedback] = useState<VaultConnectFeedback | null>(null);
+  /**
+   * トップ画面の「アクセスを再許可」カードの「あとで」で非表示にしたかどうか。
+   * ページセッション中のみ有効（stateなのでリロードで自動的にfalseへ戻り、
+   * needs-permissionが続いていれば再度カードが表示される）。
+   */
+  const [vaultReauthDismissed, setVaultReauthDismissed] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
   const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
   const [reflectionStatus, setReflectionStatus] = useState<ReflectionStatus>("idle");
@@ -861,6 +867,47 @@ export default function ChatScreen() {
           />
         </button>
       </div>
+
+      {/*
+        Android等：File System Access Vaultのhandle自体はIndexedDBに残っているが、
+        readwrite許可がリロードで失効している状態（vaultStatus === "needs-permission"）。
+        設定画面（⚙）まで移動しないと再許可できないと、ユーザーが「保存先を失った」と
+        誤認しやすいため、トップ画面にも同じ再許可導線を出す。呼び出す処理は
+        SettingsPanelと同じhandleReauthorizeVault()そのもの（新しい許可取得処理は作らない）。
+        OPFS（iPadOS等）はvaultStatusが"connected"のままなのでこの条件には入らない。
+      */}
+      {vaultStatus === "needs-permission" && vaultHandle && !vaultReauthDismissed && (
+        <div className="mx-auto w-full max-w-2xl px-5">
+          <div className="flex flex-col gap-3 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+            <div className="flex flex-col gap-1">
+              <p>保存先へのアクセスが必要です</p>
+              <p className="text-xs text-stone-500 dark:text-stone-400">
+                前回選択したVaultへのアクセスをもう一度許可してください。会話やMemoryを正しく保存するために必要です。
+              </p>
+              {vaultConnectFeedback && (
+                <p className="text-xs text-stone-500 dark:text-stone-400">{vaultConnectFeedback.message}</p>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleReauthorizeVault()}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+              >
+                アクセスを再許可
+              </button>
+              <button
+                type="button"
+                onClick={() => setVaultReauthDismissed(true)}
+                className="shrink-0 rounded-full px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:text-stone-400 dark:hover:bg-white/5"
+              >
+                あとで
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 py-8">
         {showEntryScreen ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
