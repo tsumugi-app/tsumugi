@@ -8,6 +8,7 @@ import {
   flushPendingToVault,
   getVaultBackend,
   isVaultSupported,
+  requestVaultPermission,
   restoreVaultHandle,
   scanVaultForRestore,
   type VaultScanResult,
@@ -45,7 +46,7 @@ import HistoryPanel from "./HistoryPanel";
 /** ApiKeySetupと同じく、chatで選べるproviderは今回この2つに限定する（Claudeは型のみ）。 */
 export type SupportedChatProvider = "gemini" | "openai";
 
-export type VaultStatus = "checking" | "connected" | "not-connected" | "unsupported";
+export type VaultStatus = "checking" | "connected" | "not-connected" | "unsupported" | "needs-permission";
 /** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
 export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
@@ -239,10 +240,10 @@ export default function ChatScreen() {
 
   useEffect(() => {
     let cancelled = false;
-    restoreVaultHandle().then(async (handle) => {
+    restoreVaultHandle().then(async (result) => {
       if (cancelled) return;
-      if (handle) {
-        setVaultHandle(handle);
+      if (result.status === "connected") {
+        setVaultHandle(result.handle);
         setVaultStatus("connected");
 
         // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
@@ -256,12 +257,20 @@ export default function ChatScreen() {
         // handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量のMemoryを
         // 起動時に無言で上書きしない）。
         try {
-          await flushPendingToVault(handle);
+          await flushPendingToVault(result.handle);
           if (cancelled) return;
-          await checkForRestoreCandidate(handle);
+          await checkForRestoreCandidate(result.handle);
         } catch (error) {
           console.error("Failed to check for restore candidates on startup", error);
         }
+      } else if (result.status === "needs-permission") {
+        // Android等：以前選択したフォルダのFileSystemDirectoryHandle自体はIndexedDBに
+        // 有効なまま残っているが、ブラウザ管理の書き込み許可がリロードで失効している状態。
+        // ここではrequestPermission()を呼ばない（ユーザー操作を伴わないmount effectの
+        // ため呼べない）。handleは保持しつつ、UI側で「アクセスを再許可」ボタンを出し、
+        // ユーザーのクリック（handleReauthorizeVault）を起点に再許可を試みる。
+        setVaultHandle(result.handle);
+        setVaultStatus("needs-permission");
       } else {
         setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
       }
@@ -346,6 +355,37 @@ export default function ChatScreen() {
         console.error("Failed to connect vault", error);
       }
       setVaultConnectFeedback(feedback);
+      window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+    }
+  }
+
+  /**
+   * Android等、`restoreVaultHandle()`が"needs-permission"を返した状態
+   * （＝以前選択したフォルダのFileSystemDirectoryHandleはIndexedDBに残っているが、
+   * ブラウザ管理の書き込み許可がリロードで失効している）から、ユーザーの明示的な
+   * クリック（このボタン自体がユーザー操作＝ジェスチャーとなる）を起点に、
+   * 同じhandleへrequestPermission()で再許可を求める。
+   *
+   * 新しいshowDirectoryPicker()は一切呼ばない（＝別フォルダの選び直しにはならない）。
+   * 許可が下りなかった場合も、handle・IndexedDBのデータには一切触れず、
+   * vaultStatusを"needs-permission"のまま維持し、いつでも再試行できるようにする。
+   */
+  async function handleReauthorizeVault() {
+    if (!vaultHandle) return;
+    setVaultConnectFeedback(null);
+    try {
+      const granted = await requestVaultPermission(vaultHandle);
+      if (!granted) {
+        setVaultConnectFeedback({ kind: "cancelled", message: "アクセスを許可できませんでした。" });
+        window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+        return;
+      }
+      setVaultStatus("connected");
+      await flushPendingToVault(vaultHandle);
+      await checkForRestoreCandidate(vaultHandle);
+    } catch (error) {
+      console.error("Failed to reauthorize vault", error);
+      setVaultConnectFeedback({ kind: "error", message: "アクセスを再許可できませんでした。" });
       window.setTimeout(() => setVaultConnectFeedback(null), 4000);
     }
   }
@@ -794,11 +834,16 @@ export default function ChatScreen() {
       ? vaultBackend === "opfs"
         ? "この端末の安全な領域"
         : vaultHandle.name
-      : vaultStatus === "unsupported"
-        ? "非対応"
-        : vaultStatus === "checking"
-          ? "確認中"
-          : "この端末のみ";
+      : vaultStatus === "needs-permission" && vaultHandle
+        ? // Android等：以前の保存先フォルダは存在するが、書き込み許可がリロードで失効した状態。
+          // 「この端末のみ」と表示すると接続が失われたかのように見えてしまうため、
+          // 前回選択したフォルダ名を明示した上で要許可であることを示す。
+          `${vaultHandle.name}（要許可）`
+        : vaultStatus === "unsupported"
+          ? "非対応"
+          : vaultStatus === "checking"
+            ? "確認中"
+            : "この端末のみ";
 
   return (
     <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
@@ -1051,6 +1096,7 @@ export default function ChatScreen() {
             onOpenApiKeySetup={(provider) => setApiKeySetupProvider(provider)}
             onSelectChatProvider={handleSelectChatProvider}
             onConnectVault={() => void handleConnectVault()}
+            onReauthorizeVault={() => void handleReauthorizeVault()}
             onRestoreFromVault={() => void handleRestoreFromVault()}
           />
         </div>

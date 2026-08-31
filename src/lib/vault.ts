@@ -65,28 +65,59 @@ async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boo
 }
 
 /**
+ * restoreVaultHandle()の結果。File System Access APIパスでは、保存済みhandleが
+ * あってもreadwrite許可が切れていることがある（Android Chrome等、ページリロードのたびに
+ * 許可がリセットされる既知の仕様。Chrome公式ドキュメントが明記する「ハンドル自体は
+ * IndexedDBを介してリロードをまたいで有効だが、書き込みにはrequestPermission()の
+ * 再呼び出しが必要」という挙動）。この場合、以前はhandleごと捨てて「この端末のみ」に
+ * 黙ってfallbackしていたが、それではユーザーが「フォルダが消えた」と誤認する。
+ * ここではhandleを捨てずに"needs-permission"として返し、呼び出し側（UI）が
+ * 「以前のフォルダ名」を示した上で、ユーザー操作を経た再許可を促せるようにする。
+ */
+export type VaultRestoreResult =
+  | { status: "connected"; handle: FileSystemDirectoryHandle }
+  | { status: "needs-permission"; handle: FileSystemDirectoryHandle }
+  | { status: "none" };
+
+/**
  * 起動時に呼ぶ。ユーザー操作（クリック等）を伴わないため、File System Access APIパスでは
- * 許可が既に granted な場合のみハンドルを返す（それ以外はnull＝再選択が必要）。
+ * 許可の確認（queryPermission）までしか行わない。ここではrequestPermission()を
+ * 絶対に呼ばない（ユーザージェスチャーが必要なAPIのため、起動時の自動処理からは
+ * 意図的に分離する。再許可はrequestVaultPermission()を、ボタンクリック等の
+ * ユーザー操作の文脈から呼び出す形にする）。
  *
  * OPFSパスでは、ユーザー操作も許可確認も不要（`navigator.storage.getDirectory()`は
  * オリジン専有領域を無条件に返す）。毎回同じルートを指すため、保存済みhandleの
  * 読み込み（loadVaultHandle）は行わない。初回アクセス時はensureVaultSkeleton()で
  * 骨組みを作る（既に存在する場合は何もしない、以後の起動でも安全に呼べる）。
  */
-export async function restoreVaultHandle(): Promise<FileSystemDirectoryHandle | null> {
+export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
   const backend = getVaultBackend();
-  if (backend === null) return null;
+  if (backend === null) return { status: "none" };
 
   if (backend === "opfs") {
     const root = await navigator.storage.getDirectory();
     await ensureVaultSkeleton(root);
-    return root;
+    return { status: "connected", handle: root };
   }
 
   const handle = await loadVaultHandle();
-  if (!handle) return null;
-  const ok = await verifyPermission(handle, true);
-  return ok ? handle : null;
+  if (!handle) return { status: "none" };
+  const granted = await verifyPermission(handle, true);
+  return granted ? { status: "connected", handle } : { status: "needs-permission", handle };
+}
+
+/**
+ * 「アクセスを再許可」ボタンのクリックなど、明確なユーザージェスチャーの文脈からのみ
+ * 呼び出すこと（requestPermission()の仕様上の制約）。新しいshowDirectoryPicker()は
+ * 一切開かない。以前と同じhandle（＝同じフォルダ）に対して、readwrite許可だけを
+ * 再度要求する。許可された場合のみtrueを返す。拒否・失敗時はfalseを返すのみで、
+ * handle自体には一切触れない（IndexedDBの保存内容もそのまま残る）。
+ */
+export async function requestVaultPermission(handle: FileSystemDirectoryHandle): Promise<boolean> {
+  const options: FileSystemHandlePermissionDescriptor = { mode: "readwrite" };
+  const result = await handle.requestPermission(options);
+  return result === "granted";
 }
 
 /**

@@ -22,6 +22,7 @@ export default function SettingsPanel({
   onOpenApiKeySetup,
   onSelectChatProvider,
   onConnectVault,
+  onReauthorizeVault,
   onRestoreFromVault,
 }: {
   chatProvider: SupportedChatProvider;
@@ -38,6 +39,8 @@ export default function SettingsPanel({
   onOpenApiKeySetup: (provider: SupportedChatProvider) => void;
   onSelectChatProvider: (provider: SupportedChatProvider) => void;
   onConnectVault: () => void;
+  /** Android等：以前選択したフォルダへの書き込み許可がリロードで失効した状態から、同じhandleへ再許可を求める。 */
+  onReauthorizeVault: () => void;
   onRestoreFromVault: () => void;
 }) {
   return (
@@ -165,6 +168,24 @@ export default function SettingsPanel({
                   変更する
                 </button>
               )}
+            </div>
+          )}
+
+          {vaultStatus === "needs-permission" && vaultHandle && (
+            <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              {/*
+                以前選んだフォルダ（vaultHandle）自体はIndexedDBに残っているが、ブラウザ管理の
+                書き込み許可がリロードで失効している状態（Android Chrome等で発生）。
+                「保存先が失われた」ように見せないため、フォルダ名を出した上で再許可を促す。
+                新しいフォルダの選び直し（「変更する」ボタン）は今回のスコープ外のため出さない。
+              */}
+              <span>「{vaultHandle.name}」への保存アクセスが必要です。</span>
+              <button
+                onClick={onReauthorizeVault}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+              >
+                アクセスを再許可
+              </button>
             </div>
           )}
 
