@@ -152,6 +152,13 @@ export default function ChatScreen() {
   const [importOpen, setImportOpen] = useState(false);
   /** 入力欄の↺ボタンで開閉するHistoryPanel（過去の記憶を見返す）の開閉状態。 */
   const [historyOpen, setHistoryOpen] = useState(false);
+  /**
+   * スマホでソフトウェアキーボードが表示中かどうか。footer・下部アイコン行の
+   * 余白圧縮だけに使う表示専用state（Vault/Memory等の既存ロジックには一切関係しない）。
+   * PC幅ではCSS側（各所の`sm:`）が常にこのstateの値を上書きするため、たとえこのstateが
+   * 誤ってtrueになってもPCの見た目には影響しない。
+   */
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -333,6 +340,37 @@ export default function ChatScreen() {
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
   }, [topPromptInput]);
+
+  /**
+   * スマホでのソフトウェアキーボード表示検知。window.innerHeight（レイアウトビューポート）
+   * とvisualViewport.height（実際に見えている領域）の差が一定以上ならキーボード表示中と
+   * みなす。CSSの`sm:`ブレークポイント（幅ベース）では区別できないため、高さの実測に
+   * 依存するJS側の検知が必要（詳細は調査報告のとおり）。
+   *
+   * KEYBOARD_HEIGHT_THRESHOLD_PXは、iOS Safariのツールバー表示/非表示や、ブラウザの
+   * アドレスバー収縮といった「キーボードではない」高さ変化（数十px程度）を誤検知しない
+   * ための余裕を持たせた値。実際のソフトウェアキーボードは通常200px以上あるため、
+   * 150pxを閾値にする。
+   *
+   * ちらつき対策：判定結果（true/false）が実際に変わったときだけsetStateする
+   * （resizeイベント自体はキーボードのアニメーション中に何度も発火しうるが、
+   * 真偽値が変化しない限り再レンダリングは発生しない）。
+   */
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.visualViewport) return;
+    const vv = window.visualViewport;
+    const KEYBOARD_HEIGHT_THRESHOLD_PX = 150;
+
+    function handleViewportResize() {
+      const heightDiff = window.innerHeight - vv.height;
+      const isKeyboardVisible = heightDiff > KEYBOARD_HEIGHT_THRESHOLD_PX;
+      setKeyboardVisible((prev) => (prev === isKeyboardVisible ? prev : isKeyboardVisible));
+    }
+
+    handleViewportResize();
+    vv.addEventListener("resize", handleViewportResize);
+    return () => vv.removeEventListener("resize", handleViewportResize);
+  }, []);
 
   async function handleDeleteApiKey(deleteTarget: SupportedChatProvider) {
     // Beta：Geminiキーを削除してもTsumugi提供のサーバー側キーへ自動フォールバックする
@@ -1048,7 +1086,9 @@ export default function ChatScreen() {
         アイコンのタップ領域自体（各40×40px）は変更しない。
       */}
       {!showEntryScreen && (
-      <footer className="mx-auto w-full max-w-2xl px-5 pb-2 sm:pb-6">
+      <footer
+        className={`mx-auto w-full max-w-2xl px-5 sm:pb-6 ${keyboardVisible ? "pb-0" : "pb-2"}`}
+      >
         <div className="flex items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
           {/*
             Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段（過去からの
@@ -1110,7 +1150,7 @@ export default function ChatScreen() {
         </div>
 
         <p
-          className={`mt-1 h-4 text-xs transition-opacity sm:mt-2 ${
+          className={`h-4 text-xs transition-opacity sm:mt-2 ${keyboardVisible ? "mt-0" : "mt-1"} ${
             captureStatus === "error" || captureStatus === "partial"
               ? "text-red-600 dark:text-red-400"
               : "text-stone-400 dark:text-stone-500"
@@ -1142,8 +1182,15 @@ export default function ChatScreen() {
         履歴・Importは入力欄から出した分をここへ移し、スマホでもタップ1つでアクセス
         できるようにする（handlerは footer 側と同じもの＝setHistoryOpen/setImportOpenを
         再利用するだけで、新しい処理・stateは追加しない）。
+        キーボード表示時（keyboardVisible）はpt/pbだけをさらに圧縮する。sm:pb-4・sm:pt-1は
+        常に指定したままにしているため、PC幅では常にこちらが優先され、keyboardVisibleの
+        値に関わらずPCの見た目は変化しない。↺・＋・⚙自体のサイズ・-my-3は変更しない。
       */}
-      <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pb-2 pt-1 text-xs text-stone-400 dark:text-stone-500 sm:pb-4">
+      <div
+        className={`mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 text-xs text-stone-400 dark:text-stone-500 sm:pb-4 sm:pt-1 ${
+          keyboardVisible ? "pb-0 pt-0" : "pb-2 pt-1"
+        }`}
+      >
         <span className="hidden sm:inline">{PROVIDER_LABEL[chatProvider]}</span>
         <span aria-hidden="true" className="hidden sm:inline">・</span>
         <span className="hidden sm:inline">{vaultStatusLabel}</span>
