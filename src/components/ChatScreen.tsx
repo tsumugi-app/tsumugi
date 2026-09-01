@@ -1042,8 +1042,13 @@ export default function ChatScreen() {
         <div ref={scrollAnchorRef} />
       </main>
 
+      {/*
+        スマホ（sm未満）では「入力欄→ステータス文言→下部アイコン行」の3段が画面の
+        1割近くを占めてしまっていたため、footer末尾のpaddingを圧縮する（PC=pb-6は維持）。
+        アイコンのタップ領域自体（各40×40px）は変更しない。
+      */}
       {!showEntryScreen && (
-      <footer className="mx-auto w-full max-w-2xl px-5 pb-6">
+      <footer className="mx-auto w-full max-w-2xl px-5 pb-2 sm:pb-6">
         <div className="flex items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
           {/*
             Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段（過去からの
@@ -1105,7 +1110,7 @@ export default function ChatScreen() {
         </div>
 
         <p
-          className={`mt-2 h-4 text-xs transition-opacity ${
+          className={`mt-1 h-4 text-xs transition-opacity sm:mt-2 ${
             captureStatus === "error" || captureStatus === "partial"
               ? "text-red-600 dark:text-red-400"
               : "text-stone-400 dark:text-stone-500"
@@ -1138,7 +1143,7 @@ export default function ChatScreen() {
         できるようにする（handlerは footer 側と同じもの＝setHistoryOpen/setImportOpenを
         再利用するだけで、新しい処理・stateは追加しない）。
       */}
-      <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pb-4 pt-1 text-xs text-stone-400 dark:text-stone-500">
+      <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pb-2 pt-1 text-xs text-stone-400 dark:text-stone-500 sm:pb-4">
         <span className="hidden sm:inline">{PROVIDER_LABEL[chatProvider]}</span>
         <span aria-hidden="true" className="hidden sm:inline">・</span>
         <span className="hidden sm:inline">{vaultStatusLabel}</span>
