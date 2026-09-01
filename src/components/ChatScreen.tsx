@@ -946,7 +946,16 @@ export default function ChatScreen() {
         </div>
       )}
 
-      <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 py-8">
+      {/*
+        スマホでは、スクロール末尾（＝会話の最後の文章）とfooter（入力欄）の境界が
+        近すぎて、文章が入力欄に隠れて見える／「Webフォーム感」が出るという指摘があった。
+        入力欄自体を動かすのではなく、会話領域（main）の下端に呼吸できる余白を
+        追加することで解決する：pb-8(32px)→pb-12(48px)。PCは元のpy-8のまま
+        （sm:pb-8で32pxに戻す）で変更しない。キーボード表示・非表示のどちらでも
+        一定の余白が効くよう、keyboardVisibleでは分岐させない（今回の追加は
+        ごく小さい固定値のため、キーボード表示時の高さへの影響は軽微）。
+      */}
+      <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pt-8 pb-12 sm:pb-8">
         {showEntryScreen ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
             {topPrompt && (
@@ -1149,8 +1158,14 @@ export default function ChatScreen() {
           </button>
         </div>
 
+        {/*
+          入力欄→ステータス文言の間隔（mt-1）は、キーボード表示時も含めて常に一定にする。
+          以前はkeyboardVisible時にmt-0まで詰めていたが、実機確認の結果「入力欄と
+          ステータスが近すぎる」という不自然さが出たため、ここは圧縮対象から外す
+          （余白を削るのは下記bottom navigationの下端側に限定する）。
+        */}
         <p
-          className={`h-4 text-xs transition-opacity sm:mt-2 ${keyboardVisible ? "mt-0" : "mt-1"} ${
+          className={`mt-1 h-4 text-xs transition-opacity sm:mt-2 ${
             captureStatus === "error" || captureStatus === "partial"
               ? "text-red-600 dark:text-red-400"
               : "text-stone-400 dark:text-stone-500"
@@ -1182,13 +1197,17 @@ export default function ChatScreen() {
         履歴・Importは入力欄から出した分をここへ移し、スマホでもタップ1つでアクセス
         できるようにする（handlerは footer 側と同じもの＝setHistoryOpen/setImportOpenを
         再利用するだけで、新しい処理・stateは追加しない）。
-        キーボード表示時（keyboardVisible）はpt/pbだけをさらに圧縮する。sm:pb-4・sm:pt-1は
-        常に指定したままにしているため、PC幅では常にこちらが優先され、keyboardVisibleの
-        値に関わらずPCの見た目は変化しない。↺・＋・⚙自体のサイズ・-my-3は変更しない。
+        キーボード表示時（keyboardVisible）はpb（アイコン行→キーボードの間隔）だけを
+        圧縮する。pt-1（ステータス→アイコンの間隔）は常に一定にする：実機確認の結果、
+        pt側まで詰めるとステータスとアイコンが近づきすぎる一方、pb側（アイコンの下、
+        キーボードとの間）には不自然な余白が残ってバランスが悪かったため、「上を詰める」
+        のではなく「下を詰める」方針に変更した。sm:pb-4は常に指定したままにしているため、
+        PC幅では常にこちらが優先され、keyboardVisibleの値に関わらずPCの見た目は変化しない。
+        ↺・＋・⚙自体のサイズ・-my-3は変更しない。
       */}
       <div
-        className={`mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 text-xs text-stone-400 dark:text-stone-500 sm:pb-4 sm:pt-1 ${
-          keyboardVisible ? "pb-0 pt-0" : "pb-2 pt-1"
+        className={`mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pt-1 text-xs text-stone-400 dark:text-stone-500 sm:pb-4 ${
+          keyboardVisible ? "pb-0" : "pb-2"
         }`}
       >
         <span className="hidden sm:inline">{PROVIDER_LABEL[chatProvider]}</span>
