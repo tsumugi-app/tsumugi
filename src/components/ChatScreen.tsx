@@ -1060,11 +1060,17 @@ export default function ChatScreen() {
             disabled={busy}
             className="max-h-64 min-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none placeholder:text-stone-400 disabled:opacity-60"
           />
+          {/*
+            スマホ（sm未満）では入力欄から履歴・Importボタンを外し、textareaの横幅を
+            最大限確保する（送るボタンのみ残す）。PC（sm以上）では既存どおり表示する。
+            機能・handlerは変更せず、表示のみをブレークポイントで切り替える
+            （同じ操作はスマホでは下部のアイコン行から行える。7-2参照）。
+          */}
           <button
             type="button"
             onClick={() => setHistoryOpen(true)}
             aria-label="これまでの記憶を見る"
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300"
+            className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
           >
             ↺
           </button>
@@ -1072,7 +1078,7 @@ export default function ChatScreen() {
             type="button"
             onClick={() => setImportOpen(true)}
             aria-label="読み込む"
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300"
+            className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
           >
             ＋
           </button>
@@ -1111,12 +1117,35 @@ export default function ChatScreen() {
       </footer>
       )}
 
-      {/* 通常時は1行のみ（現在使用するAI・保存先・設定を開く⚙）。詳細はSettingsPanelへ集約する。 */}
+      {/*
+        PC（sm以上）は現状どおり1行（現在使用するAI・保存先・設定を開く⚙）。
+        スマホ（sm未満）はAI名・保存先の常時表示テキストを外し、アイコンのみの行にする
+        （情報自体は⚙から開くSettingsPanelで確認できるため、会話画面下部の占有を減らす）。
+        履歴・Importは入力欄から出した分をここへ移し、スマホでもタップ1つでアクセス
+        できるようにする（handlerは footer 側と同じもの＝setHistoryOpen/setImportOpenを
+        再利用するだけで、新しい処理・stateは追加しない）。
+      */}
       <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pb-4 pt-1 text-xs text-stone-400 dark:text-stone-500">
-        <span>{PROVIDER_LABEL[chatProvider]}</span>
-        <span aria-hidden="true">・</span>
-        <span>{vaultStatusLabel}</span>
-        <span aria-hidden="true">・</span>
+        <span className="hidden sm:inline">{PROVIDER_LABEL[chatProvider]}</span>
+        <span aria-hidden="true" className="hidden sm:inline">・</span>
+        <span className="hidden sm:inline">{vaultStatusLabel}</span>
+        <span aria-hidden="true" className="hidden sm:inline">・</span>
+        <button
+          type="button"
+          onClick={() => setHistoryOpen(true)}
+          aria-label="これまでの記憶を見る"
+          className="-my-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:hidden"
+        >
+          ↺
+        </button>
+        <button
+          type="button"
+          onClick={() => setImportOpen(true)}
+          aria-label="読み込む"
+          className="-my-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:hidden"
+        >
+          ＋
+        </button>
         <button
           type="button"
           onClick={() => setSettingsOpen(true)}
