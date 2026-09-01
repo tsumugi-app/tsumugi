@@ -1090,14 +1090,29 @@ export default function ChatScreen() {
       </main>
 
       {/*
-        スマホ（sm未満）では「入力欄→ステータス文言→下部アイコン行」の3段が画面の
-        1割近くを占めてしまっていたため、footer末尾のpaddingを圧縮する（PC=pb-6は維持）。
-        アイコンのタップ領域自体（各40×40px）は変更しない。
+        「入力欄（footer）」と「AI/保存先・↺＋⚙（bottom navigation）」を、視覚的にも
+        構造的にも1つの下部UI（bottomUI）としてまとめる。
+        以前はfooter自身のpb・bottom navigation自身のpt/pbという3つの独立した余白が
+        「status→アイコン」「アイコン→画面下端」の間隔を分担していたため、片方だけ
+        調整するともう片方との継ぎ目がズレて見える問題があった（詳細は前回の構造分析）。
+        今回はそれらを、このラッパー1つが持つ`gap-*`（footer塊とbottom navigation塊の
+        間隔）と`pb-*`（bottom navigationの下＝画面/キーボードとの間隔）の2つだけに
+        集約し、値の出どころを一本化する。footer・bottom navigation自身はもう独自の
+        pt/pbを持たない（下記それぞれの開始タグを参照）。
+        keyboardVisible時はラッパーのpbだけを圧縮する（アイコン下の余白を詰める）。
+        gap（status→アイコンの間隔）はkeyboardVisibleに関わらず常に一定にし、
+        「上を詰めすぎない」という実機フィードバックを反映する。
+        PCはsm:gap-7・sm:pb-4で、これまでの実測値（footer pb-6=24px + bottomNav pt-1=4px
+        → 計28px＝gap-7と一致／bottomNav pb-4=16px→そのままpb-4）と完全に一致させており、
+        PC側の見た目は一切変化しない。
+        アイコンのタップ領域自体（各40×40px）・-my-3・入力欄の1〜4行仕様・
+        visualViewportによるkeyboard detectionロジックは変更しない。
       */}
-      {!showEntryScreen && (
-      <footer
-        className={`mx-auto w-full max-w-2xl px-5 sm:pb-6 ${keyboardVisible ? "pb-0" : "pb-2"}`}
+      <div
+        className={`flex flex-col gap-2 sm:gap-7 ${keyboardVisible ? "pb-0" : "pb-2"} sm:pb-4`}
       >
+      {!showEntryScreen && (
+      <footer className="mx-auto w-full max-w-2xl px-5">
         <div className="flex items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
           {/*
             Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段（過去からの
@@ -1197,19 +1212,10 @@ export default function ChatScreen() {
         履歴・Importは入力欄から出した分をここへ移し、スマホでもタップ1つでアクセス
         できるようにする（handlerは footer 側と同じもの＝setHistoryOpen/setImportOpenを
         再利用するだけで、新しい処理・stateは追加しない）。
-        キーボード表示時（keyboardVisible）はpb（アイコン行→キーボードの間隔）だけを
-        圧縮する。pt-1（ステータス→アイコンの間隔）は常に一定にする：実機確認の結果、
-        pt側まで詰めるとステータスとアイコンが近づきすぎる一方、pb側（アイコンの下、
-        キーボードとの間）には不自然な余白が残ってバランスが悪かったため、「上を詰める」
-        のではなく「下を詰める」方針に変更した。sm:pb-4は常に指定したままにしているため、
-        PC幅では常にこちらが優先され、keyboardVisibleの値に関わらずPCの見た目は変化しない。
-        ↺・＋・⚙自体のサイズ・-my-3は変更しない。
+        pt/pbはもう持たない（footerとの間隔・画面下端との間隔は、この行を包む
+        bottomUIラッパー側のgap/pbに一本化した。上のコメント参照）。
       */}
-      <div
-        className={`mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 pt-1 text-xs text-stone-400 dark:text-stone-500 sm:pb-4 ${
-          keyboardVisible ? "pb-0" : "pb-2"
-        }`}
-      >
+      <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 text-xs text-stone-400 dark:text-stone-500">
         <span className="hidden sm:inline">{PROVIDER_LABEL[chatProvider]}</span>
         <span aria-hidden="true" className="hidden sm:inline">・</span>
         <span className="hidden sm:inline">{vaultStatusLabel}</span>
@@ -1238,6 +1244,7 @@ export default function ChatScreen() {
         >
           ⚙
         </button>
+      </div>
       </div>
 
       {settingsOpen && (
