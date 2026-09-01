@@ -87,14 +87,14 @@ const PERSONAS: {
     value: "coach",
     label: "探究",
     hint: "問いかける",
-    placeholder: "最近、気になっていることはありますか？",
+    placeholder: "最近、気になることは？",
     openingMessage: "最近、何について知りたいですか？",
   },
   {
     value: "analyst",
     label: "相談・創造",
     hint: "整理する",
-    placeholder: "今、誰かと一緒に考えたいことはありますか？",
+    placeholder: "今、一緒に考えたいことは？",
     openingMessage: "今、何について一緒に考えてみたいですか？",
   },
 ];
@@ -1051,13 +1051,16 @@ export default function ChatScreen() {
             避けるため、Enterへの特別な処理自体を持たせない。
           */}
           {/*
-            スマホ（sm未満）では最初から大きな入力欄にしない：min-heightを1〜2行程度
+            スマホ（sm未満）では最初から大きな入力欄にしない：min-heightを1行程度
             （min-h-10）に下げ、入力量に応じて上へ伸びるようにする（items-endの行内で
             テキストエリアの高さだけが増える＝下端は送るボタンと揃ったまま、上端だけが
-            上に伸びる）。PC（sm以上）はmin-h-24のまま、既存の見た目を変えない。
+            上に伸びる）。ソフトウェアキーボード表示中に本文が読めなくなるのを避けるため、
+            スマホのmax-heightは4行相当（max-h-24＝96px。実測：1行40px→2行56px→3行76px→
+            4行96px、以降1行20pxずつ増加）に抑え、それ以上は画面下方向へ広がらせず
+            textarea内部を縦スクロールさせる（overflow-y-autoは既存のまま）。
+            PC（sm以上）はmin-h-24・max-h-64のまま、既存の見た目を変えない。
             自動リサイズ自体は下のuseEffect（[input]に依存、325行目付近）が既に
             El.scrollHeightで行っており、新しいstate・新しいロジックは追加していない。
-            max-h-64・overflow-y-autoは既存のまま＝最大高さ到達後は内部スクロールになる。
           */}
           <textarea
             ref={textareaRef}
@@ -1068,7 +1071,7 @@ export default function ChatScreen() {
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
             disabled={busy}
-            className="min-h-10 max-h-64 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24"
+            className="min-h-10 max-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24 sm:max-h-64"
           />
           {/*
             スマホ（sm未満）では入力欄から履歴・Importボタンを外し、textareaの横幅を
