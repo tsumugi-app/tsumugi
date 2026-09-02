@@ -1090,41 +1090,62 @@ export default function ChatScreen() {
 
         {/*
           スマホでは、会話本文が下部の入力UIに近づいたときに、境界で唐突に切れるのではなく
-          下方向へ徐々に背景へ溶けて見えるようにするための装飾オーバーレイ。
+          下方向へ徐々に背景へ溶け、その先は完全に不透明な背景色で覆われるようにするための
+          装飾オーバーレイ。「グラデーションで薄くする層」と「完全不透明で覆う層」を分離した
+          2層構造にしている（詳細は各層のコメント参照）。
           （検証の結果、position: absoluteだけではmain内のスクロールと一緒に動いてしまい
-          「常にmainの可視下端に留まる」効果にならないことが判明したため、sticky＋二重構造
-          にしている。）
+          「常にmainの可視下端に留まる」効果にならないことが判明したため、sticky＋
+          absoluteの組み合わせにしている。）
           外側：sticky bottom-0のゼロ高さ（h-0）要素。stickyなのでスクロールしても常に
-          mainのcontent box下端（＝padding-bottomの内側）に留まる基準点になる。h-0の
-          ため、それ自体はscrollHeightに高さを追加しない。ただしflex-colの子である以上、
-          直前の要素（scrollAnchorRef）との間にgap-6（24px）が自動的に入ってしまうため、
-          -mt-6でちょうど打ち消し、scrollHeight・maxScrollTopへの影響を実質ゼロにする。
+          mainのcontent box下端（＝padding-bottomの内側、main pb-12の始まる位置）に
+          留まる基準点になる。h-0のため、それ自体はscrollHeightに高さを追加しない。
+          ただしflex-colの子である以上、直前の要素（scrollAnchorRef）との間にgap-6
+          （24px）が自動的に入ってしまうため、-mt-6でちょうど打ち消し、scrollHeight・
+          maxScrollTopへの影響を実質ゼロにする。
           （外側のbottomをbottom-0以外の値にする、つまりcontent box下端より外側で
           stickyさせようとすると、最大スクロール時にscrollAnchorRefの自然なフロー位置
           そのものがcontent box下端に来てしまい、その位置がstickyの固定先より内側に
-          あるためstickyが機能せず自然位置へ戻ってしまう＝スクロール位置によって
-          フェードの位置が変わってしまう不具合を実機確認で踏んだため、外側は
-          content box下端に固定する素直なbottom-0のままにしている。）
-          内側：absolute inset-x-0 h-[72px]のグラデーション本体。`-bottom-6`（-24px）
-          を指定し、外側（content box下端＝main pb-12の内側）から見た目だけさらに
-          24px下へずらしている。当初はmain pb-12（48px）ぶんフルに下げてborder-box
-          下端ぴったりに合わせていたが、それだと最大スクロール時に最後の吹き出し自体は
-          フェードにほぼ重ならず（gap-6+pb-12=72pxの空白ゾーン幅とフェード高さが一致し、
-          フェードが本文より下の空白にしかかからない）、「文章が徐々に薄くなる」という
-          目的のUXにならなかった（実機確認で判明）。24pxだけ浅くすることで、最後の
-          吹き出しの下部約24pxがフェードに重なりつつ、フェード終端（bottomUIまで残り
-          24px）は`from-[var(--background)]`側で既に完全な背景色に達しているため、
-          そこから先の素の背景と地続きに見える。absolute要素はdocumentフローの外に
-          あるため、sticky特有の「自然位置の上限」制約を受けず、常に安定した基準点を
-          保てる（実測でスクロール位置に関わらず一定であることを確認済み）。40pxでは
-          最後の吹き出しの手前で終わってしまっていたため72pxに拡大。
-          pointer-events-noneで本文の閲覧・スクロール・選択を一切妨げない。
+          あるためstickyが機能せず自然位置へ戻ってしまう＝スクロール位置によって位置が
+          変わってしまう不具合を実機確認で踏んだため、外側は常にcontent box下端に
+          固定する素直なbottom-0のままにしている。この基準点＝main pb-12の始点から、
+          pb-12の値そのもの（48px）だけ下へ行けば、必ずmainのborder-box下端＝bottomUI
+          との実際の境界に一致する。この48pxという関係はスクロール量にも会話内容にも
+          左右されない固定値なので、以下の2層はこれを使って正確に位置決めしている。）
+          内側1（完全不透明の背景色レイヤー、bottomUIとの境界に一番近い側）：
+          absolute inset-x-0 -bottom-12 h-6。基準点から48px下＝border-box下端
+          （bottomUIとの境界）にぴったり届くように配置し、そこから24px分（h-6）を
+          グラデーションなしの完全不透明なbg-[var(--background)]で塗りつぶす。
+          「フェードの先が透明のまま残らないように」という要件に対し、以前は
+          グラデーションのfrom側が実質的に不透明になる性質に頼っていたが、今回は
+          明示的に不透明な単色レイヤーとして分離し、会話テキストが入力UI付近で
+          透けて見える余地を構造的になくす。
+          内側2（グラデーションレイヤー、本文を徐々に薄くする側）：
+          absolute inset-x-0 -bottom-6 h-[72px]。内側1のすぐ上（内側1の上端＝
+          基準点から24px下の位置）に、下端をぴったり接続させる形で配置し、
+          そこから72px分を`from-[var(--background)] to-transparent`のグラデーション
+          にする。最下部までスクロールした状態で、最後の吹き出しの下部約24pxが
+          このグラデーションと重なり、「文章→薄くなる→内側1の完全な背景色」へ
+          自然につながるように高さ・位置を実測のうえ決定している（数値の最小化が
+          目的ではなく、「本文が背景へ溶けて、その先は完全に覆われる」という見た目を
+          優先した結果の値）。
+          両レイヤーとも、documentフローの外にあるabsolute配置のため、sticky特有の
+          「自然位置の上限」制約を受けず、常に安定した基準点を保てる（実測でスクロール
+          位置に関わらず一定であることを確認済み）。
+          両レイヤーとも境界がmainのborder-box下端（＝bottomUIとの実際の境界）を
+          超えないよう正確に計算しているため、bottomUI自体の領域には一切重ならず、
+          pointer-events-noneも付与しているため、万一のsubpixelなズレがあっても
+          入力欄・送信ボタン・↺・＋・⚙のクリック/タップ/フォーカスを妨げない。
           色は`var(--background)`を使うため、ライト/ダーク双方の背景色へ自動的に溶け込む
           （他パネル：SettingsPanel等と同じ変数を使用）。
           PCでは見た目を変えないため`sm:hidden`でスマホのみに限定する。
-          会話本文・scrollAnchorRef・streamingText・main pb-12/gap-6には一切変更なし。
+          会話本文・scrollAnchorRef・streamingText・main pb-12/gap-6・bottomUI・
+          textarea・40×40pxボタン・keyboardVisibleロジックには一切変更なし。
         */}
         <div className="sticky bottom-0 -mt-6 h-0 sm:hidden">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 -bottom-12 h-6 bg-[var(--background)]"
+          />
           <div
             aria-hidden="true"
             className="pointer-events-none absolute inset-x-0 -bottom-6 h-[72px] bg-gradient-to-t from-[var(--background)] to-transparent"
