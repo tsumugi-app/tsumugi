@@ -1095,12 +1095,29 @@ export default function ChatScreen() {
           「常にmainの可視下端に留まる」効果にならないことが判明したため、sticky＋二重構造
           にしている。）
           外側：sticky bottom-0のゼロ高さ（h-0）要素。stickyなのでスクロールしても常に
-          main可視範囲の下端に留まる基準点になる。h-0のため、それ自体はscrollHeightに
-          高さを追加しない。ただしflex-colの子である以上、直前の要素（scrollAnchorRef）
-          との間にgap-6（24px）が自動的に入ってしまうため、-mt-6でちょうど打ち消し、
-          scrollHeight・maxScrollTopへの影響を実質ゼロにする。
-          内側：ご指定どおりのabsolute inset-x-0 bottom-0 h-10のグラデーション本体。
-          外側（sticky、ゼロ高さ）のbottom edgeを基準に、見た目だけ上方向へ40pxはみ出す。
+          mainのcontent box下端（＝padding-bottomの内側）に留まる基準点になる。h-0の
+          ため、それ自体はscrollHeightに高さを追加しない。ただしflex-colの子である以上、
+          直前の要素（scrollAnchorRef）との間にgap-6（24px）が自動的に入ってしまうため、
+          -mt-6でちょうど打ち消し、scrollHeight・maxScrollTopへの影響を実質ゼロにする。
+          （外側のbottomをbottom-0以外の値にする、つまりcontent box下端より外側で
+          stickyさせようとすると、最大スクロール時にscrollAnchorRefの自然なフロー位置
+          そのものがcontent box下端に来てしまい、その位置がstickyの固定先より内側に
+          あるためstickyが機能せず自然位置へ戻ってしまう＝スクロール位置によって
+          フェードの位置が変わってしまう不具合を実機確認で踏んだため、外側は
+          content box下端に固定する素直なbottom-0のままにしている。）
+          内側：absolute inset-x-0 h-[72px]のグラデーション本体。`-bottom-6`（-24px）
+          を指定し、外側（content box下端＝main pb-12の内側）から見た目だけさらに
+          24px下へずらしている。当初はmain pb-12（48px）ぶんフルに下げてborder-box
+          下端ぴったりに合わせていたが、それだと最大スクロール時に最後の吹き出し自体は
+          フェードにほぼ重ならず（gap-6+pb-12=72pxの空白ゾーン幅とフェード高さが一致し、
+          フェードが本文より下の空白にしかかからない）、「文章が徐々に薄くなる」という
+          目的のUXにならなかった（実機確認で判明）。24pxだけ浅くすることで、最後の
+          吹き出しの下部約24pxがフェードに重なりつつ、フェード終端（bottomUIまで残り
+          24px）は`from-[var(--background)]`側で既に完全な背景色に達しているため、
+          そこから先の素の背景と地続きに見える。absolute要素はdocumentフローの外に
+          あるため、sticky特有の「自然位置の上限」制約を受けず、常に安定した基準点を
+          保てる（実測でスクロール位置に関わらず一定であることを確認済み）。40pxでは
+          最後の吹き出しの手前で終わってしまっていたため72pxに拡大。
           pointer-events-noneで本文の閲覧・スクロール・選択を一切妨げない。
           色は`var(--background)`を使うため、ライト/ダーク双方の背景色へ自動的に溶け込む
           （他パネル：SettingsPanel等と同じ変数を使用）。
@@ -1110,7 +1127,7 @@ export default function ChatScreen() {
         <div className="sticky bottom-0 -mt-6 h-0 sm:hidden">
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-[var(--background)] to-transparent"
+            className="pointer-events-none absolute inset-x-0 -bottom-6 h-[72px] bg-gradient-to-t from-[var(--background)] to-transparent"
           />
         </div>
       </main>
