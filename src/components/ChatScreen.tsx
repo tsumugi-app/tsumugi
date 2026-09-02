@@ -1087,6 +1087,32 @@ export default function ChatScreen() {
         )}
 
         <div ref={scrollAnchorRef} />
+
+        {/*
+          スマホでは、会話本文が下部の入力UIに近づいたときに、境界で唐突に切れるのではなく
+          下方向へ徐々に背景へ溶けて見えるようにするための装飾オーバーレイ。
+          （検証の結果、position: absoluteだけではmain内のスクロールと一緒に動いてしまい
+          「常にmainの可視下端に留まる」効果にならないことが判明したため、sticky＋二重構造
+          にしている。）
+          外側：sticky bottom-0のゼロ高さ（h-0）要素。stickyなのでスクロールしても常に
+          main可視範囲の下端に留まる基準点になる。h-0のため、それ自体はscrollHeightに
+          高さを追加しない。ただしflex-colの子である以上、直前の要素（scrollAnchorRef）
+          との間にgap-6（24px）が自動的に入ってしまうため、-mt-6でちょうど打ち消し、
+          scrollHeight・maxScrollTopへの影響を実質ゼロにする。
+          内側：ご指定どおりのabsolute inset-x-0 bottom-0 h-10のグラデーション本体。
+          外側（sticky、ゼロ高さ）のbottom edgeを基準に、見た目だけ上方向へ40pxはみ出す。
+          pointer-events-noneで本文の閲覧・スクロール・選択を一切妨げない。
+          色は`var(--background)`を使うため、ライト/ダーク双方の背景色へ自動的に溶け込む
+          （他パネル：SettingsPanel等と同じ変数を使用）。
+          PCでは見た目を変えないため`sm:hidden`でスマホのみに限定する。
+          会話本文・scrollAnchorRef・streamingText・main pb-12/gap-6には一切変更なし。
+        */}
+        <div className="sticky bottom-0 -mt-6 h-0 sm:hidden">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-[var(--background)] to-transparent"
+          />
+        </div>
       </main>
 
       {/*
