@@ -5,6 +5,8 @@ import type { Conversation, ConversationTurn, MemoryObject, Persona } from "@/li
 import { appendTurn, captureConversation, createConversation, persistCapture } from "@/lib/capture";
 import {
   chooseVaultDirectory,
+  clearOpfsVault,
+  collectAllMarkdownFiles,
   flushPendingToVault,
   getVaultBackend,
   isVaultSupported,
@@ -15,6 +17,7 @@ import {
 } from "@/lib/vault";
 import {
   clearApiKey,
+  clearMemoryData,
   getAllConversations,
   getAllMemoryObjects,
   getAllSources,
@@ -25,6 +28,7 @@ import {
   saveChatProvider,
   saveSource,
 } from "@/lib/db";
+import { createZipBlob } from "@/lib/zip";
 import { getGreeting } from "@/lib/greeting";
 import {
   isReflectiveQuery,
@@ -52,6 +56,12 @@ export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: strin
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
 type ReflectionStatus = "idle" | "generating" | "done" | "error" | "unavailable";
 export type RestoreStatus = "idle" | "restoring" | "done";
+/**
+ * 「Markdownをエクスポート」「この端末のデータを削除」（iPhone/iPad＝OPFSが対象）の
+ * 進行状況・結果表示用。busy中はボタンをdisabledにし、他の結果（success/empty/error）は
+ * 既存のvaultConnectFeedback等と同じく数秒後に自動で消す。
+ */
+export type DataActionFeedback = { kind: "busy" | "success" | "empty" | "error"; message: string };
 type SendStatus = "idle" | "error" | "authError";
 
 export interface RestoreCandidate {
@@ -128,6 +138,9 @@ export default function ChatScreen() {
   const [vaultHandle, setVaultHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus>("checking");
   const [vaultConnectFeedback, setVaultConnectFeedback] = useState<VaultConnectFeedback | null>(null);
+  /** 「Markdownをエクスポート」「この端末のデータを削除」（SettingsPanelのデータ欄）の状態。 */
+  const [exportDataFeedback, setExportDataFeedback] = useState<DataActionFeedback | null>(null);
+  const [deleteDataFeedback, setDeleteDataFeedback] = useState<DataActionFeedback | null>(null);
   /**
    * トップ画面の「アクセスを再許可」カードの「あとで」で非表示にしたかどうか。
    * ページセッション中のみ有効（stateなのでリロードで自動的にfalseへ戻り、
@@ -463,6 +476,100 @@ export default function ChatScreen() {
     } catch (error) {
       console.error("Failed to restore from vault", error);
       setRestoreStatus("idle");
+    }
+  }
+
+  /**
+   * 「Markdownをエクスポート」（データ管理機能・iPhone/iPad等のOPFSバックエンドのみ）。
+   * PC/AndroidのFile System Access API Vaultは、ユーザーが選んだ実フォルダを
+   * Finder/エクスプローラーから直接読み書きできるため、この機能自体をSettingsPanel側で
+   * 表示しない（vaultBackend === "opfs"の場合だけ呼ばれる想定。この関数自体もそれを
+   * 前提にガードする）。
+   *
+   * Vault内の全Markdownを集めてZIPへまとめ、iOS/iPadOS Web環境で実際に動作する
+   * 経路（Web Share API→ファイル共有、対応していなければ<a download>）で端末外へ
+   * 出せるようにする。「安全な領域」から直接どこかへ移動する必要はなく、あくまで
+   * ユーザー自身がOSの共有・保存UIを使って選んだ先へコピーを渡すだけ。
+   */
+  async function handleExportData() {
+    if (vaultBackend !== "opfs" || !vaultHandle) return;
+    setExportDataFeedback({ kind: "busy", message: "エクスポートを準備しています…" });
+    try {
+      const files = await collectAllMarkdownFiles(vaultHandle);
+      if (files.length === 0) {
+        setExportDataFeedback({ kind: "empty", message: "エクスポートするデータがありません。" });
+        window.setTimeout(() => setExportDataFeedback(null), 4000);
+        return;
+      }
+
+      const blob = createZipBlob(files);
+      const fileName = `tsumugi-export-${new Date().toISOString().slice(0, 10)}.zip`;
+      const zipFile = new File([blob], fileName, { type: "application/zip" });
+
+      let shared = false;
+      if (typeof navigator.canShare === "function" && navigator.canShare({ files: [zipFile] })) {
+        try {
+          await navigator.share({ files: [zipFile], title: "tsumugiのMarkdownエクスポート" });
+          shared = true;
+        } catch (shareError) {
+          if (shareError instanceof DOMException && shareError.name === "AbortError") {
+            // ユーザーが共有シートをキャンセルしただけなので、エラーとしては扱わない。
+            setExportDataFeedback(null);
+            return;
+          }
+          // 共有自体に失敗した場合は、下のダウンロードへフォールバックする。
+        }
+      }
+
+      if (!shared) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+
+      setExportDataFeedback({ kind: "success", message: "エクスポートしました。" });
+      window.setTimeout(() => setExportDataFeedback(null), 4000);
+    } catch (error) {
+      console.error("Failed to export data", error);
+      setExportDataFeedback({ kind: "error", message: "データのエクスポートに失敗しました。" });
+      window.setTimeout(() => setExportDataFeedback(null), 4000);
+    }
+  }
+
+  /**
+   * 「この端末に保存されているデータを削除」（データ管理機能・OPFSバックエンドのみ）。
+   * 削除するのはtsumugiが自分で作成・管理しているデータだけ：
+   *   - OPFS Vault本体（Conversations/Memories/Sources等のMarkdown一式）
+   *   - IndexedDBの派生キャッシュ（conversations/memoryObjects/sources/connectState）
+   * ブラウザ全体のデータ・他アプリのデータ・OSのストレージ・PC/Androidのユーザー選択
+   * Vault・APIキー等の設定（settings）・Vaultフォルダの参照（handles）には一切触れない
+   * （clearOpfsVault/clearMemoryDataそれぞれのコメント参照）。
+   *
+   * 実行前に必ずwindow.confirm()で明示的な確認を挟み、キャンセルされた場合は何もしない。
+   * 削除に成功したら、Vault・IndexedDB双方から復元されるはずの古いstate（会話・Memory等）
+   * が画面に残り続けないよう、ページごとリロードする。
+   */
+  async function handleDeleteData() {
+    if (vaultBackend !== "opfs" || !vaultHandle) return;
+    const confirmed = window.confirm(
+      "この端末に保存されているtsumugiのデータを削除します。\nこの操作は元に戻せません。\n本当に削除しますか？"
+    );
+    if (!confirmed) return;
+
+    setDeleteDataFeedback({ kind: "busy", message: "削除しています…" });
+    try {
+      await clearOpfsVault(vaultHandle);
+      await clearMemoryData();
+      window.location.reload();
+    } catch (error) {
+      console.error("Failed to delete data", error);
+      setDeleteDataFeedback({ kind: "error", message: "データの削除に失敗しました。" });
+      window.setTimeout(() => setDeleteDataFeedback(null), 4000);
     }
   }
 
@@ -1318,6 +1425,10 @@ export default function ChatScreen() {
             onConnectVault={() => void handleConnectVault()}
             onReauthorizeVault={() => void handleReauthorizeVault()}
             onRestoreFromVault={() => void handleRestoreFromVault()}
+            exportDataFeedback={exportDataFeedback}
+            deleteDataFeedback={deleteDataFeedback}
+            onExportData={() => void handleExportData()}
+            onDeleteData={() => void handleDeleteData()}
           />
         </div>
       )}

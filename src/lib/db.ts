@@ -149,6 +149,26 @@ export async function deleteSource(id: string) {
   await db.delete("sources", id);
 }
 
+/**
+ * 「この端末に保存されているtsumugiのデータを削除」機能に伴い、IndexedDB側の
+ * 派生キャッシュ（Vault Markdownと同じデータを検索・結合用に複製したもの）も
+ * 揃えて空にする。`settings`（APIキー・使用するAI・chatProvider等のブラウザ設定）と
+ * `handles`（PC/Android用Vaultフォルダの参照）はここでは削除しない。
+ * これらはMemory/Conversationの記憶データではなく、ユーザーの「保存先・接続設定」
+ * そのものであり、「保存されているデータを削除する」の対象外と判断したため
+ * （呼び出し元はOPFSバックエンド時のみ使う想定。PC/Androidの`handles`ストアには
+ * この関数自体は一切触れない）。
+ */
+export async function clearMemoryData() {
+  const db = await getDB();
+  await Promise.all([
+    db.clear("conversations"),
+    db.clear("memoryObjects"),
+    db.clear("sources"),
+    db.clear("connectState"),
+  ]);
+}
+
 export async function saveVaultHandle(handle: FileSystemDirectoryHandle) {
   const db = await getDB();
   await db.put("handles", handle, "vaultRoot");

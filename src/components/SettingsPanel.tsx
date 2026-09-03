@@ -1,6 +1,13 @@
 "use client";
 
-import type { RestoreCandidate, RestoreStatus, SupportedChatProvider, VaultConnectFeedback, VaultStatus } from "./ChatScreen";
+import type {
+  DataActionFeedback,
+  RestoreCandidate,
+  RestoreStatus,
+  SupportedChatProvider,
+  VaultConnectFeedback,
+  VaultStatus,
+} from "./ChatScreen";
 import type { VaultBackend } from "@/lib/vault";
 
 /**
@@ -24,6 +31,10 @@ export default function SettingsPanel({
   onConnectVault,
   onReauthorizeVault,
   onRestoreFromVault,
+  exportDataFeedback,
+  deleteDataFeedback,
+  onExportData,
+  onDeleteData,
 }: {
   chatProvider: SupportedChatProvider;
   keyStatusByProvider: Record<SupportedChatProvider, boolean>;
@@ -42,6 +53,11 @@ export default function SettingsPanel({
   /** Android等：以前選択したフォルダへの書き込み許可がリロードで失効した状態から、同じhandleへ再許可を求める。 */
   onReauthorizeVault: () => void;
   onRestoreFromVault: () => void;
+  /** データ管理（エクスポート/削除）。iPhone/iPad等のOPFSバックエンド時のみUIを表示する。 */
+  exportDataFeedback: DataActionFeedback | null;
+  deleteDataFeedback: DataActionFeedback | null;
+  onExportData: () => void;
+  onDeleteData: () => void;
 }) {
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
@@ -224,6 +240,64 @@ export default function SettingsPanel({
             <div className="text-xs text-stone-500 dark:text-stone-400">記憶を復元しました。</div>
           )}
         </section>
+
+        {/*
+          データ管理（エクスポート・削除）。iPhone/iPad等、OPFS（この端末の安全な領域）に
+          保存している場合のみ表示する。PC/AndroidのFile System Access API Vault
+          （ユーザーが選んだ実フォルダ）は、Finder/エクスプローラーから直接読み書き
+          できるため、この導線自体を出さない（vaultBackend !== "opfs"では非表示）。
+        */}
+        {vaultBackend === "opfs" && (
+          <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
+            <p className="text-sm text-stone-500 dark:text-stone-400">データ</p>
+
+            <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
+              <div className="flex flex-col gap-0.5">
+                <span>Markdownをエクスポート</span>
+                <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                  この端末に保存されているtsumugiのデータを外部へ保存します。
+                </span>
+              </div>
+              <button
+                onClick={onExportData}
+                disabled={exportDataFeedback?.kind === "busy"}
+                className="shrink-0 rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+              >
+                {exportDataFeedback?.kind === "busy" ? "エクスポート中…" : "エクスポート"}
+              </button>
+            </div>
+            {exportDataFeedback && exportDataFeedback.kind !== "busy" && (
+              <p
+                className={`text-xs ${
+                  exportDataFeedback.kind === "error"
+                    ? "text-red-600 dark:text-red-400"
+                    : "text-stone-500 dark:text-stone-400"
+                }`}
+              >
+                {exportDataFeedback.message}
+              </p>
+            )}
+
+            <div className="flex items-center justify-between gap-4 pt-1 text-xs text-stone-500 dark:text-stone-400">
+              <div className="flex flex-col gap-0.5">
+                <span>この端末のデータを削除</span>
+                <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                  この端末に保存されているtsumugiのデータを削除します。
+                </span>
+              </div>
+              <button
+                onClick={onDeleteData}
+                disabled={deleteDataFeedback?.kind === "busy"}
+                className="shrink-0 rounded-full border border-red-300/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-500/10 disabled:opacity-50 dark:border-red-700/60 dark:text-red-400 dark:hover:bg-red-500/10"
+              >
+                {deleteDataFeedback?.kind === "busy" ? "削除中…" : "削除する"}
+              </button>
+            </div>
+            {deleteDataFeedback && deleteDataFeedback.kind !== "busy" && (
+              <p className="text-xs text-red-600 dark:text-red-400">{deleteDataFeedback.message}</p>
+            )}
+          </section>
+        )}
       </div>
     </div>
   );

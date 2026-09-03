@@ -334,6 +334,67 @@ export function isVaultSupported() {
 }
 
 // ---------------------------------------------------------------------------
+// データ管理（エクスポート・削除）：iPhone/iPad等、OPFS（この端末の安全な領域）に
+// 保存されたMarkdownを、ユーザーが端末外へ取り出したり削除したりできるようにする。
+// PC/AndroidのFile System Access API Vault（ユーザーが選んだ実フォルダ）は、
+// Finder/エクスプローラーから直接読み書きできるため対象外（呼び出し側で
+// vaultBackend === "opfs" の場合のみ使うこと。この2関数自体はバックエンドを
+// 判定しない）。
+// ---------------------------------------------------------------------------
+
+export interface VaultFileEntry {
+  /** Vaultルートからの相対パス（例："Memories/2026-07-26.md"）。 */
+  path: string;
+  content: string;
+}
+
+/**
+ * Vaultルート配下の`.md`ファイルをすべて再帰的に収集する（エクスポート用）。
+ * `scanVaultForRestore`（復元用）と違い、"Conversations"/"Memories"のような
+ * 特定フォルダ名には絞り込まず、Vault全体を対象にする（エクスポートは「保存されて
+ * いる全Markdown」を過不足なく取り出すことが目的のため）。`.tsumugi/`のような
+ * 隠しディレクトリ・隠しファイル（`.`始まり）は内部管理用データであり
+ * ユーザー向けのMarkdownではないため対象外にする。
+ */
+export async function collectAllMarkdownFiles(
+  dir: FileSystemDirectoryHandle,
+  prefix = ""
+): Promise<VaultFileEntry[]> {
+  const entries: VaultFileEntry[] = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (name.startsWith(HIDDEN_PREFIX)) continue;
+    const path = prefix ? `${prefix}/${name}` : name;
+    if (handle.kind === "directory") {
+      entries.push(...(await collectAllMarkdownFiles(handle, path)));
+      continue;
+    }
+    if (!name.endsWith(".md")) continue;
+    const file = await handle.getFile();
+    entries.push({ path, content: await file.text() });
+  }
+  return entries;
+}
+
+/**
+ * OPFS（この端末の安全な領域）に保存されているtsumugiのVaultデータを削除する。
+ * `root`自体（`navigator.storage.getDirectory()`が返すオリジン専有領域そのもの）は
+ * 削除できないため、その直下の全エントリ（`Conversations`等の各フォルダ・
+ * `.tsumugi/`）だけを再帰的に削除する。OPFSはブラウザによってオリジンごとに
+ * サンドボックスされた領域であり、この呼び出しが他のサイト・他アプリ・OSの
+ * ストレージへ影響することは構造上あり得ない。
+ *
+ * PC/AndroidのFile System Access API Vault（ユーザーが選んだ実フォルダ）に対しては
+ * 絶対に呼び出さないこと。呼び出し側で`vaultBackend === "opfs"`を確認してから
+ * 使う想定（この関数自体はどちらのhandleを渡されても同じように動作してしまうため、
+ * ガードは呼び出し元の責務にしている）。
+ */
+export async function clearOpfsVault(root: FileSystemDirectoryHandle) {
+  for await (const [name] of root.entries()) {
+    await root.removeEntry(name, { recursive: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Markdown → IndexedDB 復元（STORAGE.md §2.4 Rebuildability Guarantee）
 // index.jsonは信頼せず、Conversations/ と Memories/ を直接スキャンする。
 // ---------------------------------------------------------------------------
