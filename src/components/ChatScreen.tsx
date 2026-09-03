@@ -327,11 +327,51 @@ export default function ChatScreen() {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversation.turns.length, streamingText]);
 
+  /**
+   * iPad Chrome（実質WebKit）で、1文字入力・Backspaceのたびに反映がワンテンポ遅れる
+   * 問題の調査結果を踏まえた最小修正。requestAnimationFrame化はせず、従来どおり
+   * 同期的にこのeffect内で高さを確定させる（見た目・タイミングの仕様は変えない）。
+   *
+   * 元の実装は毎回必ず
+   *   height="auto" を書く（WRITE） → scrollHeightを読む（READ、強制同期レイアウト）
+   *   → height=Npx を書く（WRITE）
+   * という2回の書き込みを行っていたが、"height=auto"への書き戻しは、
+   * textareaが「入力量に応じて大きくなる」場面（＝行が増えて折り返す等）では
+   * 本来不要だった：scrollHeightは、現在のheightがそれより小さく制約されていても
+   * （＝あふれている状態でも）常に「実際に必要なコンテンツの高さ」を正しく返す仕様
+   * のため、"auto"へ一旦戻さなくても、現在のheightより大きいscrollHeightをそのまま
+   * 使える。
+   * 一方、「入力量が減って小さくなる」場面（Backspaceで行が減る等）は、heightが
+   * 現在すでにコンテンツより大きく確保されている状態なので、scrollHeightは
+   * （あふれていないため）現在のheight止まりの値しか返さない。この場合だけは、
+   * 元の実装どおり一旦"auto"に戻して再計測する必要がある。
+   *
+   * そのため、まず現在のheightに対してscrollHeightがそれを超えているか（＝大きく
+   * する必要があるか）を先に確認し、
+   *   - 超えている（成長方向）：height=auto への書き込みを省略し、scrollHeightを
+   *     そのままheightへ設定する1回の書き込みで済ませる
+   *   - 超えていない（縮小 or 変化なしの可能性）：従来どおりheight="auto"で
+   *     一旦リセットしてから再計測する
+   * という分岐にし、成長方向のケースでは無駄な書き込み（height="auto"）を1回減らす。
+   * 縮小・変化なしのケースは元の処理と同じ回数のまま（scrollHeightの仕様上、
+   * "auto"に戻さずに縮小を検知する安全な方法がないため）。
+   * 値が変わらない場合はstyle.heightへの書き込み自体もスキップする。
+   *
+   * 1〜4行のauto-resize挙動・min-h-10/max-h-24等の見た目の仕様・onChange/IME処理は
+   * 一切変更していない。
+   */
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
+    const currentHeightPx = el.style.height ? parseFloat(el.style.height) : el.clientHeight;
+    if (el.scrollHeight > currentHeightPx) {
+      const next = `${el.scrollHeight}px`;
+      if (el.style.height !== next) el.style.height = next;
+      return;
+    }
     el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    const next = `${el.scrollHeight}px`;
+    if (el.style.height !== next) el.style.height = next;
   }, [input]);
 
   useEffect(() => {
