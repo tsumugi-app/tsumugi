@@ -1194,6 +1194,12 @@ export default function ChatScreen() {
             PC（sm以上）はmin-h-24・max-h-64のまま、既存の見た目を変えない。
             自動リサイズ自体は下のuseEffect（[input]に依存、325行目付近）が既に
             El.scrollHeightで行っており、新しいstate・新しいロジックは追加していない。
+            フォントサイズはスマホ（sm未満）でtext-base（16px）にする。iOS Safariは
+            input/textareaのフォントサイズが16px未満だとフォーカス時に自動でページ
+            全体をズームし、ズームしたまま戻らない挙動があるため、それを避ける
+            （viewport metaでズーム自体を禁止する方法は今回使わない）。PC（sm以上）は
+            sm:text-smで既存の14pxのまま維持する。高さ（min-h-10/max-h-24等）・
+            余白・下部UI・フェード・keyboardVisibleのロジックには変更なし。
           */}
           <textarea
             ref={textareaRef}
@@ -1204,7 +1210,7 @@ export default function ChatScreen() {
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
             disabled={busy}
-            className="min-h-10 max-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24 sm:max-h-64"
+            className="min-h-10 max-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-base outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24 sm:max-h-64 sm:text-sm"
           />
           {/*
             スマホ（sm未満）では入力欄から履歴・Importボタンを外し、textareaの横幅を
