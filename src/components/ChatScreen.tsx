@@ -122,6 +122,14 @@ export default function ChatScreen() {
   /** そのConversationから既に生成済みの、新規/更新されたMemoryObjectの一覧（1 Conversation = 1 Memoryとは限らない）。 */
   const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
   /**
+   * 「記憶しました」カード用。mergedMemoryObjects（Memory全件）とは別に、
+   * 直近1回のCaptureで実際に保存が確定した（新規作成・既存更新どちらも含む）
+   * MemoryObjectだけを保持する。次のCaptureが成功するたびに丸ごと置き換わる
+   * （積み重ねない）。会話境界（ペルソナ切替・トップへ戻る・終了済み会話からの
+   * 新規開始）ではmemoryObjectsと同じタイミングで空配列にリセットする。
+   */
+  const [lastCapturedMemories, setLastCapturedMemories] = useState<MemoryObject[]>([]);
+  /**
    * 入力中のテキスト自体は`ChatInput`（下部で定義する子コンポーネント）が自分の
    * ローカルstateとして持つ（1文字ごとのsetStateがChatScreen全体の再レンダリングを
    * 引き起こさないようにするため。詳細はChatInputのコメント参照）。
@@ -175,6 +183,14 @@ export default function ChatScreen() {
   const [importOpen, setImportOpen] = useState(false);
   /** 入力欄の↺ボタンで開閉するHistoryPanel（過去の記憶を見返す）の開閉状態。 */
   const [historyOpen, setHistoryOpen] = useState(false);
+  /**
+   * 「記憶しました」カードの「詳細を見る」から開いた場合だけ、そのMemoryの詳細へ
+   * 直接ジャンプするために使う（HistoryPanelのinitialMemoryId propへ渡す）。
+   * 通常の↺ボタンから開く場合はundefinedのまま（従来どおりの挙動）。
+   * HistoryPanelを閉じるたびに必ずundefinedへ戻す（次に↺ボタンから開いたときに
+   * 古いジャンプ先が残らないようにするため）。
+   */
+  const [historyInitialMemoryId, setHistoryInitialMemoryId] = useState<string | undefined>(undefined);
   /**
    * スマホでソフトウェアキーボードが表示中かどうか。footer・下部アイコン行の
    * 余白圧縮だけに使う表示専用state（Vault/Memory等の既存ロジックには一切関係しない）。
@@ -644,6 +660,11 @@ export default function ChatScreen() {
         latestConversationRef.current = merged;
         setConversation(merged);
         setMemoryObjects(mergedMemoryObjects);
+        // 「記憶しました」カード用：今回のCaptureで実際に保存が確定したMemoryだけを
+        // セットする（mergedMemoryObjects＝全件ではなく、memoriesWithRevisitPrompt＝
+        // 今回触れられた分のみ）。常に置き換える（積み重ねない）。0件ならそのまま
+        // 空配列になり、カードは表示されなくなる。
+        setLastCapturedMemories(memoriesWithRevisitPrompt);
 
         // Beta修正：一部のMemoryだけ保存に失敗した場合も、成功した分は反映した上で、
         // 失敗があったことをユーザーへ明示する（黙って"saved"にしない）。
@@ -790,6 +811,7 @@ export default function ChatScreen() {
     latestConversationRef.current = newConversation;
     setPersona(nextPersona);
     setMemoryObjects([]);
+    setLastCapturedMemories([]);
     captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
@@ -812,6 +834,7 @@ export default function ChatScreen() {
     setConversation(newConversation);
     latestConversationRef.current = newConversation;
     setMemoryObjects([]);
+    setLastCapturedMemories([]);
     captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
@@ -855,6 +878,7 @@ export default function ChatScreen() {
       setConversation(baseConversation);
       latestConversationRef.current = baseConversation;
       setMemoryObjects([]);
+      setLastCapturedMemories([]);
       captureQueueRef.current = Promise.resolve([]);
       setReflectionStatus("idle");
       setReflectionText("");
@@ -1162,6 +1186,36 @@ export default function ChatScreen() {
           </>
         )}
 
+        {/*
+          「記憶しました」カード。直近のAI回答の直後（会話の通常のスクロールフロー内）
+          に表示する。bottomUI・入力欄・モバイル下部フェードの余白計算には一切触れない
+          （main内の他のコンテンツと同じ、gap-6で自動的に間隔が付く1要素として振る舞う）。
+          lastCapturedMemoriesは直近1回のCapture結果だけを持つ（enqueueCapture側で
+          常に置き換える。積み重ねない）ため、ここでは単に0件かどうかを見るだけでよい。
+          大きな通知にしないため、控えめな枠線カード＋テキストのみで構成する
+          （SettingsPanel等の既存トーンに合わせる）。
+        */}
+        {lastCapturedMemories.length > 0 && (
+          <div className="flex flex-col gap-2 rounded-2xl border border-stone-300/60 bg-stone-100/60 px-4 py-3 text-sm dark:border-stone-700/60 dark:bg-stone-900/40">
+            <p className="text-stone-500 dark:text-stone-400">記憶しました</p>
+            <ul className="flex flex-col gap-1 text-stone-700 dark:text-stone-300">
+              {lastCapturedMemories.slice(0, 3).map((memory) => (
+                <li key={memory.id}>・{memory.summary}</li>
+              ))}
+            </ul>
+            <button
+              type="button"
+              onClick={() => {
+                setHistoryInitialMemoryId(lastCapturedMemories[0]?.id);
+                setHistoryOpen(true);
+              }}
+              className="self-start text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
+            >
+              詳細を見る
+            </button>
+          </div>
+        )}
+
         {persona === "companion" &&
           conversation.turns[conversation.turns.length - 1]?.role === "ai" &&
           !conversation.endedAt && (
@@ -1441,7 +1495,13 @@ export default function ChatScreen() {
 
       {historyOpen && (
         <div className="fixed inset-0 z-40">
-          <HistoryPanel onClose={() => setHistoryOpen(false)} />
+          <HistoryPanel
+            initialMemoryId={historyInitialMemoryId}
+            onClose={() => {
+              setHistoryOpen(false);
+              setHistoryInitialMemoryId(undefined);
+            }}
+          />
         </div>
       )}
 

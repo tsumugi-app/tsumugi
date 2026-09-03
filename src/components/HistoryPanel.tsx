@@ -52,7 +52,20 @@ const PERSONA_LABEL: Record<Persona, string> = {
  * 日付順のソート・グルーピングは`date`（この記憶が指す時点）を基準にする。
  * `createdAt`/`updatedAt`（Tsumugiがレコードを作成・更新した時刻）とは混同しない。
  */
-export default function HistoryPanel({ onClose }: { onClose: () => void }) {
+export default function HistoryPanel({
+  onClose,
+  initialMemoryId,
+}: {
+  onClose: () => void;
+  /**
+   * 「記憶しました」カード（ChatScreen.tsx）の「詳細を見る」から開かれた場合のみ渡される。
+   * 渡された場合はMemoryタブを初期状態にし、該当するMemoryObjectの詳細を直接開く。
+   * 渡されない通常の履歴表示（↺ボタン）では、これまでどおり日記タブの一覧から始まる
+   * （このprop追加以外、日記／Memory／会話タブ・Memory詳細・会話詳細の既存ロジックは
+   * 一切変更していない）。
+   */
+  initialMemoryId?: string;
+}) {
   const [tab, setTab] = useState<HistoryTab>("diary");
   const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -75,15 +88,27 @@ export default function HistoryPanel({ onClose }: { onClose: () => void }) {
     Promise.all([getAllMemoryObjects(), getAllConversations()]).then(([allMemory, allConversations]) => {
       if (cancelled) return;
       // dateの新しい順。createdAt/updatedAtではなくdate（記憶が指す時点）で並べる。
-      setMemoryObjects([...allMemory].sort((a, b) => b.date.localeCompare(a.date)));
+      const sortedMemory = [...allMemory].sort((a, b) => b.date.localeCompare(a.date));
+      setMemoryObjects(sortedMemory);
       // startedAtの新しい順。
       setConversations([...allConversations].sort((a, b) => b.startedAt.localeCompare(a.startedAt)));
       setLoading(false);
+
+      // initialMemoryIdが渡されていれば、Memoryタブの該当詳細を直接開く。
+      // データ読み込み完了直後（sortedMemoryが確定した時点）にだけ行う一度きりの処理。
+      if (initialMemoryId) {
+        const target = sortedMemory.find((memory) => memory.id === initialMemoryId);
+        if (target) {
+          setTab("memory");
+          setMemorySelected(target);
+          setMemoryView("detail");
+        }
+      }
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [initialMemoryId]);
 
   // MemoryのconversationIdから、由来会話（日時・ペルソナ）を引くための索引。
   // 追加のDB呼び出しはせず、既に読み込み済みのconversationsから作るだけ。
