@@ -891,31 +891,58 @@ export default function ChatScreen() {
 
   return (
     <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
-      <div className="flex items-center justify-center px-4 pt-8 pb-3">
-        <button
-          type="button"
-          onClick={handleGoToTop}
-          aria-label="トップ画面へ戻る"
-          className="w-[min(220px,100%)] rounded-lg"
-        >
-          <img
-            src="/logo.png"
-            alt="Tsumugi"
-            className="h-auto w-full dark:invert"
-          />
-        </button>
-      </div>
-
       {/*
-        Android等：File System Access Vaultのhandle自体はIndexedDBに残っているが、
-        readwrite許可がリロードで失効している状態（vaultStatus === "needs-permission"）。
-        設定画面（⚙）まで移動しないと再許可できないと、ユーザーが「保存先を失った」と
-        誤認しやすいため、トップ画面にも同じ再許可導線を出す。呼び出す処理は
-        SettingsPanelと同じhandleReauthorizeVault()そのもの（新しい許可取得処理は作らない）。
-        OPFS（iPadOS等）はvaultStatusが"connected"のままなのでこの条件には入らない。
+        スマホでは、スクロール末尾（＝会話の最後の文章）とfooter（入力欄）の境界が
+        近すぎて、文章が入力欄に隠れて見える／「Webフォーム感」が出るという指摘があった。
+        入力欄自体を動かすのではなく、会話領域（main）の下端に呼吸できる余白を
+        追加することで解決する：pb-8(32px)→pb-12(48px)。PCは元のpy-8のまま
+        （sm:pb-8で32pxに戻す）で変更しない。キーボード表示・非表示のどちらでも
+        一定の余白が効くよう、keyboardVisibleでは分岐させない（今回の追加は
+        ごく小さい固定値のため、キーボード表示時の高さへの影響は軽微）。
       */}
-      {vaultStatus === "needs-permission" && vaultHandle && !vaultReauthDismissed && (
-        <div className="mx-auto w-full max-w-2xl px-5">
+      <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pt-8 pb-12 sm:pb-8">
+        {/*
+          ロゴ（header）とneeds-permissionカードは、以前はroot直下・main（スクロール
+          コンテナ）の外にあり、会話をスクロールしても画面上部に残り続けていた。
+          「ロゴ→必要ならpermissionカード→会話」を1つの自然なスクロール領域にするため、
+          両方をmainの最初の子要素としてここへ移動した。
+          headerのclassNameからpx-4/pt-8を外しているのは、main自身が既にpx-5/pt-8を
+          持っており、二重に効いてしまうため（main内部に入った以上、水平・上方向の
+          余白はmain側のpx-5/pt-8に一本化する）。pb-3も外している：main自身のgap-6が
+          flex-colの子同士（header→次の要素）の間隔を自動的に担うため、pb-3を残すと
+          gap-6(24px)+pb-3(12px)の二重の余白になってしまう。結果、ロゴ下の余白は
+          以前の12px（header自身のpb-3のみ）からgap-6の24pxへ変わるが、これはgap-6
+          自体を変更せずmain内部へ移動したことによる自然な帰結であり、意図的な調整。
+          ロゴ画像自体（img・button）のクラスは一切変更していない。
+        */}
+        <div className="flex items-center justify-center">
+          <button
+            type="button"
+            onClick={handleGoToTop}
+            aria-label="トップ画面へ戻る"
+            className="w-[min(220px,100%)] rounded-lg"
+          >
+            <img
+              src="/logo.png"
+              alt="Tsumugi"
+              className="h-auto w-full dark:invert"
+            />
+          </button>
+        </div>
+
+        {/*
+          Android等：File System Access Vaultのhandle自体はIndexedDBに残っているが、
+          readwrite許可がリロードで失効している状態（vaultStatus === "needs-permission"）。
+          設定画面（⚙）まで移動しないと再許可できないと、ユーザーが「保存先を失った」と
+          誤認しやすいため、トップ画面にも同じ再許可導線を出す。呼び出す処理は
+          SettingsPanelと同じhandleReauthorizeVault()そのもの（新しい許可取得処理は作らない）。
+          OPFS（iPadOS等）はvaultStatusが"connected"のままなのでこの条件には入らない。
+          以前はmx-auto w-full max-w-2xl px-5のラッパーで自前にセンタリング・横paddingを
+          持っていたが、main内部へ移動した今はmain自身が既にそれを提供しているため、
+          そのラッパーを外し、カード本体のdivをそのまま返す（見た目・内容・表示条件・
+          再許可ロジックは一切変更していない）。
+        */}
+        {vaultStatus === "needs-permission" && vaultHandle && !vaultReauthDismissed && (
           <div className="flex flex-col gap-3 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
             <div className="flex flex-col gap-1">
               <p>保存先へのアクセスが必要です</p>
@@ -943,19 +970,8 @@ export default function ChatScreen() {
               </button>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/*
-        スマホでは、スクロール末尾（＝会話の最後の文章）とfooter（入力欄）の境界が
-        近すぎて、文章が入力欄に隠れて見える／「Webフォーム感」が出るという指摘があった。
-        入力欄自体を動かすのではなく、会話領域（main）の下端に呼吸できる余白を
-        追加することで解決する：pb-8(32px)→pb-12(48px)。PCは元のpy-8のまま
-        （sm:pb-8で32pxに戻す）で変更しない。キーボード表示・非表示のどちらでも
-        一定の余白が効くよう、keyboardVisibleでは分岐させない（今回の追加は
-        ごく小さい固定値のため、キーボード表示時の高さへの影響は軽微）。
-      */}
-      <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pt-8 pb-12 sm:pb-8">
         {showEntryScreen ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
             {topPrompt && (
