@@ -111,7 +111,17 @@ export default function ChatScreen() {
   const [conversation, setConversation] = useState<Conversation>(() => createConversation("companion"));
   /** そのConversationから既に生成済みの、新規/更新されたMemoryObjectの一覧（1 Conversation = 1 Memoryとは限らない）。 */
   const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
-  const [input, setInput] = useState("");
+  /**
+   * 入力中のテキスト自体は`ChatInput`（下部で定義する子コンポーネント）が自分の
+   * ローカルstateとして持つ（1文字ごとのsetStateがChatScreen全体の再レンダリングを
+   * 引き起こさないようにするため。詳細はChatInputのコメント参照）。
+   * ChatScreen側にはもう`input`のuseStateは無い。ペルソナ切替・トップへ戻る際に
+   * 「入力中の下書きをクリアする」という既存仕様だけは、ChatInputの外側から
+   * リセットする必要があるため、`key`をインクリメントしてChatInputごと
+   * 再マウントさせることで実現する（Reactの標準的な「keyでstateをリセットする」
+   * パターン。ChatInput自身のuseStateを直接いじる手段は持たせない）。
+   */
+  const [inputResetKey, setInputResetKey] = useState(0);
   const [streamingText, setStreamingText] = useState("");
   const [busy, setBusy] = useState(false);
   const { message: waitingMessage, start: startWaiting, stop: stopWaiting } = useWaitingMessage();
@@ -160,7 +170,6 @@ export default function ChatScreen() {
    */
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const startupConnectRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
@@ -327,52 +336,12 @@ export default function ChatScreen() {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversation.turns.length, streamingText]);
 
-  /**
-   * iPad Chrome（実質WebKit）で、1文字入力・Backspaceのたびに反映がワンテンポ遅れる
-   * 問題の調査結果を踏まえた最小修正。requestAnimationFrame化はせず、従来どおり
-   * 同期的にこのeffect内で高さを確定させる（見た目・タイミングの仕様は変えない）。
-   *
-   * 元の実装は毎回必ず
-   *   height="auto" を書く（WRITE） → scrollHeightを読む（READ、強制同期レイアウト）
-   *   → height=Npx を書く（WRITE）
-   * という2回の書き込みを行っていたが、"height=auto"への書き戻しは、
-   * textareaが「入力量に応じて大きくなる」場面（＝行が増えて折り返す等）では
-   * 本来不要だった：scrollHeightは、現在のheightがそれより小さく制約されていても
-   * （＝あふれている状態でも）常に「実際に必要なコンテンツの高さ」を正しく返す仕様
-   * のため、"auto"へ一旦戻さなくても、現在のheightより大きいscrollHeightをそのまま
-   * 使える。
-   * 一方、「入力量が減って小さくなる」場面（Backspaceで行が減る等）は、heightが
-   * 現在すでにコンテンツより大きく確保されている状態なので、scrollHeightは
-   * （あふれていないため）現在のheight止まりの値しか返さない。この場合だけは、
-   * 元の実装どおり一旦"auto"に戻して再計測する必要がある。
-   *
-   * そのため、まず現在のheightに対してscrollHeightがそれを超えているか（＝大きく
-   * する必要があるか）を先に確認し、
-   *   - 超えている（成長方向）：height=auto への書き込みを省略し、scrollHeightを
-   *     そのままheightへ設定する1回の書き込みで済ませる
-   *   - 超えていない（縮小 or 変化なしの可能性）：従来どおりheight="auto"で
-   *     一旦リセットしてから再計測する
-   * という分岐にし、成長方向のケースでは無駄な書き込み（height="auto"）を1回減らす。
-   * 縮小・変化なしのケースは元の処理と同じ回数のまま（scrollHeightの仕様上、
-   * "auto"に戻さずに縮小を検知する安全な方法がないため）。
-   * 値が変わらない場合はstyle.heightへの書き込み自体もスキップする。
-   *
-   * 1〜4行のauto-resize挙動・min-h-10/max-h-24等の見た目の仕様・onChange/IME処理は
-   * 一切変更していない。
-   */
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const currentHeightPx = el.style.height ? parseFloat(el.style.height) : el.clientHeight;
-    if (el.scrollHeight > currentHeightPx) {
-      const next = `${el.scrollHeight}px`;
-      if (el.style.height !== next) el.style.height = next;
-      return;
-    }
-    el.style.height = "auto";
-    const next = `${el.scrollHeight}px`;
-    if (el.style.height !== next) el.style.height = next;
-  }, [input]);
+  /*
+    メインチャット入力欄の自動リサイズ処理（旧: `[input]`依存のuseEffect、
+    iPad Chrome向けの強制リフロー削減最適化を含む）は、`input` state自体とともに
+    下部で定義する`ChatInput`コンポーネント側へ移動した。理由・詳細はChatInputの
+    コメントを参照。処理内容そのものは変更していない。
+  */
 
   useEffect(() => {
     const el = topPromptTextareaRef.current;
@@ -717,7 +686,7 @@ export default function ChatScreen() {
     captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
-    setInput("");
+    setInputResetKey((k) => k + 1);
     setStreamingText("");
     setSendStatus("idle");
   }
@@ -739,7 +708,7 @@ export default function ChatScreen() {
     captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
-    setInput("");
+    setInputResetKey((k) => k + 1);
     setStreamingText("");
     setSendStatus("idle");
     setEntryConfirmed(false);
@@ -750,13 +719,15 @@ export default function ChatScreen() {
    * overridePersonaも同様。personaは closure変数のため、呼び出し元がsetPersona()した直後に
    * 再レンダーを挟まず本関数を呼ぶケース（過去からの問いかけ）では、closure変数のpersonaは
    * まだ更新前の値のままになる（baseConversationをlatestConversationRefから読む理由と同じ）。
+   * メインの入力欄（ChatInput）は常にoverrideTextを渡して呼ぶため、ここで`input`状態を
+   * 読む必要はない（`input`自体がもうChatScreenには存在しない。ChatInputが送信成功後に
+   * 自分のローカルstateをクリアする）。
    */
   async function handleSend(overrideText?: string, overridePersona?: Persona) {
-    const text = (overrideText ?? input).trim();
+    const text = (overrideText ?? "").trim();
     if (!text || busy) return;
     const activePersona = overridePersona ?? persona;
 
-    setInput("");
     setBusy(true);
     setStreamingText("");
     setSendStatus("idle");
@@ -1235,68 +1206,24 @@ export default function ChatScreen() {
       <footer className="mx-auto w-full max-w-2xl px-5">
         <div className="flex items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
           {/*
-            Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段（過去からの
-            問いかけ用textareaと統一）。日本語IME変換確定のEnterで誤送信される問題を
-            避けるため、Enterへの特別な処理自体を持たせない。
+            入力欄（textarea・自動リサイズ・↺/＋/送るボタン）はChatInputへ切り出して
+            いる。理由・詳細はChatInpu本体のコメントを参照（iPad ChromeでBackspace
+            長押しが連続削除にならない問題の調査を踏まえ、1文字ごとのsetStateで
+            ChatScreen全体が再レンダリングされないようにするため）。
+            key={inputResetKey}：ペルソナ切替・トップへ戻る際に「入力中の下書きを
+            クリアする」という既存仕様を、ChatInputのローカルstateへ外部から
+            触れずに実現するため、keyを変えてChatInputごと再マウントさせている。
           */}
-          {/*
-            スマホ（sm未満）では最初から大きな入力欄にしない：min-heightを1行程度
-            （min-h-10）に下げ、入力量に応じて上へ伸びるようにする（items-endの行内で
-            テキストエリアの高さだけが増える＝下端は送るボタンと揃ったまま、上端だけが
-            上に伸びる）。ソフトウェアキーボード表示中に本文が読めなくなるのを避けるため、
-            スマホのmax-heightは4行相当（max-h-24＝96px。実測：1行40px→2行56px→3行76px→
-            4行96px、以降1行20pxずつ増加）に抑え、それ以上は画面下方向へ広がらせず
-            textarea内部を縦スクロールさせる（overflow-y-autoは既存のまま）。
-            PC（sm以上）はmin-h-24・max-h-64のまま、既存の見た目を変えない。
-            自動リサイズ自体は下のuseEffect（[input]に依存、325行目付近）が既に
-            El.scrollHeightで行っており、新しいstate・新しいロジックは追加していない。
-            フォントサイズはスマホ（sm未満）でtext-base（16px）にする。iOS Safariは
-            input/textareaのフォントサイズが16px未満だとフォーカス時に自動でページ
-            全体をズームし、ズームしたまま戻らない挙動があるため、それを避ける
-            （viewport metaでズーム自体を禁止する方法は今回使わない）。PC（sm以上）は
-            sm:text-smで既存の14pxのまま維持する。高さ（min-h-10/max-h-24等）・
-            余白・下部UI・フェード・keyboardVisibleのロジックには変更なし。
-          */}
-          <textarea
-            ref={textareaRef}
-            rows={1}
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
+          <ChatInput
+            key={inputResetKey}
+            disabled={busy}
             placeholder={
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
-            disabled={busy}
-            className="min-h-10 max-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-base outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24 sm:max-h-64 sm:text-sm"
+            onSend={(text) => void handleSend(text)}
+            onOpenHistory={() => setHistoryOpen(true)}
+            onOpenImport={() => setImportOpen(true)}
           />
-          {/*
-            スマホ（sm未満）では入力欄から履歴・Importボタンを外し、textareaの横幅を
-            最大限確保する（送るボタンのみ残す）。PC（sm以上）では既存どおり表示する。
-            機能・handlerは変更せず、表示のみをブレークポイントで切り替える
-            （同じ操作はスマホでは下部のアイコン行から行える。7-2参照）。
-          */}
-          <button
-            type="button"
-            onClick={() => setHistoryOpen(true)}
-            aria-label="これまでの記憶を見る"
-            className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
-          >
-            ↺
-          </button>
-          <button
-            type="button"
-            onClick={() => setImportOpen(true)}
-            aria-label="読み込む"
-            className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
-          >
-            ＋
-          </button>
-          <button
-            onClick={() => void handleSend()}
-            disabled={busy || !input.trim()}
-            className="shrink-0 rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
-          >
-            送る
-          </button>
         </div>
 
         {/*
@@ -1421,6 +1348,127 @@ export default function ChatScreen() {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * メインチャットの入力欄（textarea + 履歴/Import/送るボタン）を、ChatScreen本体から
+ * 切り出した子コンポーネント。
+ *
+ * 経緯：iPad Chrome（実質WebKit）実機で「Backspaceを押しっぱなしにしても連続削除に
+ * ならない」という不具合が報告された。調査の結果、以前は`input`（入力中のテキスト）が
+ * ChatScreen本体のuseStateだったため、1文字ごとの`setInput()`のたびにChatScreen
+ * コンポーネント全体（会話ターン一覧のmapを含む巨大なJSXツリー全体の差分計算・
+ * 他の多数のuseEffect等）が再レンダリングされる構造になっていた。PC Chrome・
+ * Android Chromeでは体感できるほどの遅延にならないが、iPad上のWebKit
+ * （JavaScriptCore）はこの種の頻繁な再レンダリングに弱く、OSのキーリピート間隔に
+ * 再レンダリングが追いつかないと、ネイティブ側のBackspace長押し連続削除そのものが
+ * 途中で止まってしまう（＝2文字目以降のinputイベントに対する反映が間に合わず、
+ * ブラウザ側が「反応がない」と判断してリピートを継続しない）と考えられる。
+ *
+ * 対策として、入力中のテキスト自体をこのChatInputコンポーネントの中だけで完結する
+ * ローカルstateにした。1文字ごとのsetStateはChatInput自身だけを再レンダリングし、
+ * ChatScreen本体（会話ターン一覧等）は一切再レンダリングされなくなる。
+ *
+ * ChatScreen側が知る必要があるのは「送信された最終的なテキスト」だけなので、
+ * 送信は`onSend(text: string)`というコールバックで親へ通知する（親のhandleSend()は
+ * 既存のoverrideText引数をそのまま使えるため、ロジック自体は変更していない）。
+ * 送信後はこのコンポーネント自身がローカルstateを空文字へ戻す。
+ *
+ * 「ペルソナ切替・トップへ戻る際に入力中の下書きをクリアする」という既存仕様は、
+ * 親（ChatScreen）がこのコンポーネントに渡す`key`を変えることで実現する
+ * （keyが変わるとReactはこのコンポーネントを丸ごと再マウントし、ローカルstateは
+ * 初期値の空文字に戻る。ChatScreen側からローカルstateへ直接触る手段は持たせない）。
+ *
+ * 履歴（↺）・Import（＋）ボタンも、DOM上の見た目の並び順（textarea→↺→＋→送る）を
+ * 崩さずに済むよう、そのままこのコンポーネント内に含めている。ただし
+ * historyOpen/importOpenのstate自体は従来どおりChatScreen側が持っており、
+ * このコンポーネントはonOpenHistory/onOpenImportコールバックを呼ぶだけ
+ * （表示の委譲のみで、状態のオーナーシップは変更していない）。
+ *
+ * textareaのauto-resize処理（iPad向け強制リフロー削減の最適化を含む）は、
+ * 元のChatScreen側のuseEffectから処理内容を変更せずそのまま移設している。
+ * min-h-10/max-h-24/sm:min-h-24/sm:max-h-64/text-base sm:text-sm等の見た目の仕様、
+ * rows={1}、Enterで送信しない（IME変換確定のEnterで誤送信しない）という既存仕様も
+ * 一切変更していない。
+ */
+function ChatInput({
+  disabled,
+  placeholder,
+  onSend,
+  onOpenHistory,
+  onOpenImport,
+}: {
+  disabled: boolean;
+  placeholder: string;
+  onSend: (text: string) => void;
+  onOpenHistory: () => void;
+  onOpenImport: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const currentHeightPx = el.style.height ? parseFloat(el.style.height) : el.clientHeight;
+    if (el.scrollHeight > currentHeightPx) {
+      const next = `${el.scrollHeight}px`;
+      if (el.style.height !== next) el.style.height = next;
+      return;
+    }
+    el.style.height = "auto";
+    const next = `${el.scrollHeight}px`;
+    if (el.style.height !== next) el.style.height = next;
+  }, [value]);
+
+  function handleSendClick() {
+    const text = value.trim();
+    if (!text || disabled) return;
+    onSend(text);
+    setValue("");
+  }
+
+  return (
+    <>
+      {/*
+        Enterは常に改行（送信しない）。「送る」ボタンのみが送信手段（過去からの
+        問いかけ用textareaと統一）。日本語IME変換確定のEnterで誤送信される問題を
+        避けるため、Enterへの特別な処理自体を持たせない。
+      */}
+      <textarea
+        ref={textareaRef}
+        rows={1}
+        value={value}
+        onChange={(event) => setValue(event.target.value)}
+        placeholder={placeholder}
+        disabled={disabled}
+        className="min-h-10 max-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-base outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24 sm:max-h-64 sm:text-sm"
+      />
+      <button
+        type="button"
+        onClick={onOpenHistory}
+        aria-label="これまでの記憶を見る"
+        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
+      >
+        ↺
+      </button>
+      <button
+        type="button"
+        onClick={onOpenImport}
+        aria-label="読み込む"
+        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
+      >
+        ＋
+      </button>
+      <button
+        onClick={handleSendClick}
+        disabled={disabled || !value.trim()}
+        className="shrink-0 rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
+      >
+        送る
+      </button>
+    </>
   );
 }
 
