@@ -122,13 +122,19 @@ export default function ChatScreen() {
   /** そのConversationから既に生成済みの、新規/更新されたMemoryObjectの一覧（1 Conversation = 1 Memoryとは限らない）。 */
   const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
   /**
-   * 「記憶しました」カード用。mergedMemoryObjects（Memory全件）とは別に、
-   * 直近1回のCaptureで実際に保存が確定した（新規作成・既存更新どちらも含む）
-   * MemoryObjectだけを保持する。次のCaptureが成功するたびに丸ごと置き換わる
-   * （積み重ねない）。会話境界（ペルソナ切替・トップへ戻る・終了済み会話からの
-   * 新規開始）ではmemoryObjectsと同じタイミングで空配列にリセットする。
+   * 「この会話を終える」（handleEndConversation）を押した直後だけ表示する、
+   * 「ここまでを記憶しました。」カード用のstate。
+   * null＝まだ会話中（カードは出さない。会話中に常時Memoryの保存状況を表示する
+   * UXは今回廃止した）。配列（0件を含む）＝会話がちょうど終わり、その時点での
+   * memoryObjects（このConversationで生成・更新された全Memory、累積）をそのまま
+   * 保持している状態。0件の場合は「今回は新しく記憶したことはありませんでした。」
+   * のような、嘘にならない表示に出し分ける（呼び出し側で判定）。
+   * 会話境界（ペルソナ切替・トップへ戻る・終了済み会話からの新規開始）では
+   * memoryObjectsと同じタイミングでnullへリセットする。
    */
-  const [lastCapturedMemories, setLastCapturedMemories] = useState<MemoryObject[]>([]);
+  const [endedConversationMemories, setEndedConversationMemories] = useState<MemoryObject[] | null>(null);
+  /** handleEndConversation実行中、ボタンの連打を防ぐためだけの表示用フラグ。 */
+  const [endingConversation, setEndingConversation] = useState(false);
   /**
    * 入力中のテキスト自体は`ChatInput`（下部で定義する子コンポーネント）が自分の
    * ローカルstateとして持つ（1文字ごとのsetStateがChatScreen全体の再レンダリングを
@@ -660,11 +666,11 @@ export default function ChatScreen() {
         latestConversationRef.current = merged;
         setConversation(merged);
         setMemoryObjects(mergedMemoryObjects);
-        // 「記憶しました」カード用：今回のCaptureで実際に保存が確定したMemoryだけを
-        // セットする（mergedMemoryObjects＝全件ではなく、memoriesWithRevisitPrompt＝
-        // 今回触れられた分のみ）。常に置き換える（積み重ねない）。0件ならそのまま
-        // 空配列になり、カードは表示されなくなる。
-        setLastCapturedMemories(memoriesWithRevisitPrompt);
+        // 会話中はMemoryの保存状況をUIに常時表示しない方針（今回のUX変更）。
+        // 「ここまでを記憶しました。」はhandleEndConversation（この会話を終える）を
+        // 押したときにだけ、その時点のmemoryObjects（＝mergedMemoryObjects）を見て
+        // 表示する。ここでは表示用stateには一切触れない
+        // （Capture自体・IndexedDB/Vaultへの保存はこれまでどおりバックグラウンドで継続する）。
 
         // Beta修正：一部のMemoryだけ保存に失敗した場合も、成功した分は反映した上で、
         // 失敗があったことをユーザーへ明示する（黙って"saved"にしない）。
@@ -795,6 +801,58 @@ export default function ChatScreen() {
   }
 
   /**
+   * 「この会話を終える」。「今日はここまで」（handleEndSession、日記＝persona==="companion"
+   * 専用、AIに1日の振り返り文＝insight MemoryObjectを新しく生成させる重い処理）とは別の、
+   * 「会話」（companion以外のpersona）向けの軽量な区切り操作。
+   *
+   * これは「保存」ボタンではない。CaptureはMemoryが生成されるたびにこれまでどおり
+   * バックグラウンドで自動的に走り続けており、このボタンを押さなくても会話・Memoryは
+   * 通常どおり保存され続ける。ここで新たに行うのは次の2つだけ：
+   *   1. conversation.endedAtをセットして、このConversationに区切りをつける
+   *      （handleSend()の「endedAtが立っている会話には追記せず新規作成する」分岐が
+   *      既に存在するため、これだけで「次に話しかけたら新しい会話になる」が成立する。
+   *      新しいstate・新しい判定ロジックは増やさない）。
+   *   2. その時点のmemoryObjects（＝このConversationで生成・更新された全Memory。
+   *      Conversation境界のたびに空配列へリセットされるstateなので、常に「今の会話の
+   *      分だけ」を表す）を、ユーザーが確認できるようendedConversationMemoriesへ渡す。
+   * 新しいMemoryObjectは作らない（handleEndSessionのinsight生成とは異なる）。
+   *
+   * 会話境界からの離脱という点でhandleSwitchPersona/handleGoToTop/handleSend内の
+   * 終了済み会話からの新規開始と同じ性質を持つため、同様にconnectConversationBoundary()
+   * を呼ぶ（Connect自体の実装・重複排除の仕組みには一切触れない）。
+   */
+  async function handleEndConversation() {
+    setEndingConversation(true);
+    try {
+      // バックグラウンドで実行中のCaptureが残っていれば完了を待つ（memoryObjectsが
+      // 最新状態になってから確認できるようにするため）。この時点ではまだ新しい
+      // Conversationへ切り替えないため、captureQueueRef.current自体は上書きしない。
+      const latestMemoryObjects = await captureQueueRef.current;
+
+      const endedConversation: Conversation = {
+        ...latestConversationRef.current,
+        endedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      latestConversationRef.current = endedConversation;
+      setConversation(endedConversation);
+
+      // 新しいMemoryObjectは作らない。既存のConversation保存だけを行う
+      // （persistCaptureはMemoryObject配列が空でも問題なく動く既存関数で、
+      // Capture専用ではなく会話の保存処理として素直に再利用できる）。
+      await persistCapture(vaultHandle, endedConversation, []);
+
+      connectConversationBoundary(captureQueueRef.current);
+
+      setEndedConversationMemories(latestMemoryObjects);
+    } catch (error) {
+      console.error("Failed to end conversation", error);
+    } finally {
+      setEndingConversation(false);
+    }
+  }
+
+  /**
    * 会話中の「日記／探究／相談・創造」。Personaを途中で切り替えるのではなく、
    * 新しいConversationを始めるボタンとして扱う（トップ画面の入口と同じPersonaを使う）。
    * 画面上は完全に新しい会話として始まり、古いConversationの内容は表示しない。
@@ -811,7 +869,7 @@ export default function ChatScreen() {
     latestConversationRef.current = newConversation;
     setPersona(nextPersona);
     setMemoryObjects([]);
-    setLastCapturedMemories([]);
+    setEndedConversationMemories(null);
     captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
@@ -834,7 +892,7 @@ export default function ChatScreen() {
     setConversation(newConversation);
     latestConversationRef.current = newConversation;
     setMemoryObjects([]);
-    setLastCapturedMemories([]);
+    setEndedConversationMemories(null);
     captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
@@ -878,7 +936,7 @@ export default function ChatScreen() {
       setConversation(baseConversation);
       latestConversationRef.current = baseConversation;
       setMemoryObjects([]);
-      setLastCapturedMemories([]);
+      setEndedConversationMemories(null);
       captureQueueRef.current = Promise.resolve([]);
       setReflectionStatus("idle");
       setReflectionText("");
@@ -1148,19 +1206,27 @@ export default function ChatScreen() {
               </div>
             )}
             <p className="text-xl text-stone-500 dark:text-stone-400">今日は、どう話そう？</p>
+            {/*
+              「探求」「相談・創造」をユーザー向けの別モードとして選ばせず、すべて
+              「会話」に統合する（今回のUX変更）。以前はここにPERSONASの3ボタン
+              （日記／探究／相談・創造）が並んでいたが、単一の入口ボタン1つにし、
+              内部的には常にpersona="companion"で会話を開始する。
+              persona自体の型・/api/chat・/api/reflectのペルソナ別プロンプト分岐、
+              Retrievalの分岐等は一切変更していない（内部ロジックは現状維持）。
+              「過去からの問いかけ」経由（handleTopPromptSend）や、その会話が終わった
+              後の継続選択（下記、promptedMemoryId起点の3ボタン）は、この変更の対象外
+              として従来どおり残している（会話境界を大きく作り直さないため）。
+            */}
             <div className="flex flex-wrap justify-center gap-3">
-              {PERSONAS.map((p) => (
-                <button
-                  key={p.value}
-                  onClick={() => {
-                    setPersona(p.value);
-                    setEntryConfirmed(true);
-                  }}
-                  className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
-                >
-                  {p.label}
-                </button>
-              ))}
+              <button
+                onClick={() => {
+                  setPersona("companion");
+                  setEntryConfirmed(true);
+                }}
+                className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+              >
+                会話をはじめる
+              </button>
             </div>
           </div>
         ) : (
@@ -1187,35 +1253,15 @@ export default function ChatScreen() {
         )}
 
         {/*
-          「記憶しました」カード。直近のAI回答の直後（会話の通常のスクロールフロー内）
-          に表示する。bottomUI・入力欄・モバイル下部フェードの余白計算には一切触れない
-          （main内の他のコンテンツと同じ、gap-6で自動的に間隔が付く1要素として振る舞う）。
-          lastCapturedMemoriesは直近1回のCapture結果だけを持つ（enqueueCapture側で
-          常に置き換える。積み重ねない）ため、ここでは単に0件かどうかを見るだけでよい。
-          大きな通知にしないため、控えめな枠線カード＋テキストのみで構成する
-          （SettingsPanel等の既存トーンに合わせる）。
+          終了アクションはpersonaで出し分ける（今回のUX変更）。
+          - persona==="companion"（＝日記）：これまでどおり「本日はここまで」
+            （handleEndSession。AIが1日の振り返り＝insight MemoryObjectを新しく生成する）。
+          - persona!=="companion"（＝それ以外、UI上はすべて「会話」として扱う）：
+            新しい「この会話を終える」（handleEndConversation。振り返り生成はせず、
+            conversation.endedAtで区切りをつけ、今回のMemoryを確認できるようにするだけ）。
+          会話中に常時表示していた「記憶しました」カードは撤去した（Capture自体・
+          IndexedDB/Vaultへの保存は変更なくバックグラウンドで継続する。表示だけをやめた）。
         */}
-        {lastCapturedMemories.length > 0 && (
-          <div className="flex flex-col gap-2 rounded-2xl border border-stone-300/60 bg-stone-100/60 px-4 py-3 text-sm dark:border-stone-700/60 dark:bg-stone-900/40">
-            <p className="text-stone-500 dark:text-stone-400">記憶しました</p>
-            <ul className="flex flex-col gap-1 text-stone-700 dark:text-stone-300">
-              {lastCapturedMemories.slice(0, 3).map((memory) => (
-                <li key={memory.id}>・{memory.summary}</li>
-              ))}
-            </ul>
-            <button
-              type="button"
-              onClick={() => {
-                setHistoryInitialMemoryId(lastCapturedMemories[0]?.id);
-                setHistoryOpen(true);
-              }}
-              className="self-start text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
-            >
-              詳細を見る
-            </button>
-          </div>
-        )}
-
         {persona === "companion" &&
           conversation.turns[conversation.turns.length - 1]?.role === "ai" &&
           !conversation.endedAt && (
@@ -1241,12 +1287,58 @@ export default function ChatScreen() {
           </div>
         )}
 
+        {persona !== "companion" &&
+          conversation.turns[conversation.turns.length - 1]?.role === "ai" &&
+          !conversation.endedAt && (
+          <div className="flex flex-col items-center gap-2 pt-4 text-center">
+            <button
+              onClick={() => void handleEndConversation()}
+              disabled={endingConversation}
+              className="text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 disabled:opacity-50 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
+            >
+              この会話を終える
+            </button>
+          </div>
+        )}
+
         {reflectionStatus === "done" && (
           <div className="rounded-2xl border border-stone-300/60 bg-stone-100/60 px-5 py-4 dark:border-stone-700/60 dark:bg-stone-900/40">
             <p className="mb-2 text-xs text-stone-400 dark:text-stone-500">今日の振り返り</p>
             <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
               {reflectionText}
             </p>
+          </div>
+        )}
+
+        {/*
+          「この会話を終える」を押した直後だけ表示する結果カード。endedConversationMemoriesは
+          null＝会話中（非表示）、配列＝ちょうど終えた直後（0件を含む）。0件の場合に
+          「記憶しました」と偽らないよう、有無で文言ごと出し分ける（3.の要件）。
+        */}
+        {endedConversationMemories !== null && (
+          <div className="flex flex-col gap-2 rounded-2xl border border-stone-300/60 bg-stone-100/60 px-4 py-3 text-sm dark:border-stone-700/60 dark:bg-stone-900/40">
+            {endedConversationMemories.length > 0 ? (
+              <>
+                <p className="text-stone-500 dark:text-stone-400">ここまでを記憶しました。</p>
+                <ul className="flex flex-col gap-1 text-stone-700 dark:text-stone-300">
+                  {endedConversationMemories.slice(0, 3).map((memory) => (
+                    <li key={memory.id}>・{memory.summary}</li>
+                  ))}
+                </ul>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHistoryInitialMemoryId(endedConversationMemories[0]?.id);
+                    setHistoryOpen(true);
+                  }}
+                  className="self-start text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
+                >
+                  詳細を見る
+                </button>
+              </>
+            ) : (
+              <p className="text-stone-500 dark:text-stone-400">今回は新しく記憶したことはありませんでした。</p>
+            )}
           </div>
         )}
 
@@ -1393,6 +1485,14 @@ export default function ChatScreen() {
           ステータスが近すぎる」という不自然さが出たため、ここは圧縮対象から外す
           （余白を削るのは下記bottom navigationの下端側に限定する）。
         */}
+        {/*
+          「記憶に残しています…」「記憶に残しました。」という会話中常時表示の
+          ポジティブなフィードバックは今回のUX変更で廃止した（『ここまでを記憶しました。』は
+          「この会話を終える」を押した時だけ表示する別のカードに一本化）。
+          保存に問題がある場合（partial/error）だけは、引き続きその場で知らせる
+          （captureStatus自体・Capture/保存処理は一切変更していない。表示の一部を
+          間引いただけ）。
+        */}
         <p
           className={`mt-1 h-4 text-xs transition-opacity sm:mt-2 ${
             captureStatus === "error" || captureStatus === "partial"
@@ -1400,9 +1500,6 @@ export default function ChatScreen() {
               : "text-stone-400 dark:text-stone-500"
           }`}
         >
-          {captureStatus === "saving" && "記憶に残しています…"}
-          {captureStatus === "saved" &&
-            (vaultStatus === "connected" ? "記憶に残しました。" : "この端末にのみ保存しました。")}
           {captureStatus === "partial" && "一部の記憶を保存できませんでした。会話は続けられます。"}
           {captureStatus === "error" && "記憶の保存に失敗しました。"}
         </p>
