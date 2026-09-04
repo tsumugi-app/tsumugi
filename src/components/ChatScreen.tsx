@@ -54,7 +54,14 @@ export type VaultStatus = "checking" | "connected" | "not-connected" | "unsuppor
 /** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
 export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
-type ReflectionStatus = "idle" | "generating" | "done" | "error" | "unavailable";
+/**
+ * "capturing"：「本日はここまで」を押した直後〜captureQueueRef.currentの解決待ちの間。
+ * 実際にはこの間、新しいAI呼び出しはしておらず、直前の会話ターンで既に自動発火している
+ * Capture（/api/capture・IndexedDB/Vault保存）の完了を待っているだけだが、ボタン押下から
+ * ここまで画面上に一切表示が無かったため追加した（UI改善のみ。待機対象・処理内容は
+ * 変更していない）。
+ */
+type ReflectionStatus = "idle" | "capturing" | "generating" | "done" | "error" | "unavailable";
 export type RestoreStatus = "idle" | "restoring" | "done";
 /**
  * 「Markdownをエクスポート」「この端末のデータを削除」（iPhone/iPad＝OPFSが対象）の
@@ -722,6 +729,9 @@ export default function ChatScreen() {
    * 既存のCaptureは呼ばない。既存のmemoryObjectを材料に、別のinsight MemoryObjectを1つ作る。
    */
   async function handleEndSession() {
+    // UI改善：ボタン押下の直後、captureQueueRef.currentの解決を待つ前から
+    // 状態を表示する（待機対象・処理順序自体は変更していない）。
+    setReflectionStatus("capturing");
     // バックグラウンドで実行中のCaptureが残っていれば、ここで完了を待つ
     // （memoryObjectsが最新状態になってから振り返りの材料として使うため）。
     const latestMemoryObjects = await captureQueueRef.current;
@@ -859,13 +869,19 @@ export default function ChatScreen() {
         endedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      latestConversationRef.current = endedConversation;
-      setConversation(endedConversation);
 
       // 新しいMemoryObjectは作らない。既存のConversation保存だけを行う
       // （persistCaptureはMemoryObject配列が空でも問題なく動く既存関数で、
       // Capture専用ではなく会話の保存処理として素直に再利用できる）。
       await persistCapture(vaultHandle, endedConversation, []);
+
+      // UI改善：endedAtの反映（＝ボタンをJSXから消す条件）を、persistCapture成功後・
+      // 結果カード表示の直前まで遅らせる。以前はpersistCapture完了前にsetConversationして
+      // いたため、「ボタンが消えてから結果カードが出るまで」に何も表示されない空白区間が
+      // 生じていた（処理中なのか押せたのかエラーなのか分からない、という指摘）。
+      // 待機対象・保存処理の順序は変更していない（保存完了前に何かを表示することはない）。
+      latestConversationRef.current = endedConversation;
+      setConversation(endedConversation);
 
       connectConversationBoundary(captureQueueRef.current);
 
@@ -1341,11 +1357,23 @@ export default function ChatScreen() {
           <div className="flex flex-col items-center gap-2 pt-4 text-center">
             <button
               onClick={() => void handleEndSession()}
-              disabled={reflectionStatus === "generating"}
+              disabled={reflectionStatus === "capturing" || reflectionStatus === "generating"}
               className="text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 disabled:opacity-50 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
             >
               本日はここまで
             </button>
+            {/*
+              UI改善（速度改善ではない）：以前はreflectionStatus==="generating"の
+              区間（＝captureQueueRef.currentの解決後、/api/reflect呼び出し中）だけに
+              テキストを出していたため、ボタン押下からcapture待ちが終わるまでの数秒間、
+              画面が完全に無反応に見えていた。"capturing"を追加し、ボタン押下の直後から
+              何かしらの文言を出し続けるようにした。文言は段階で変える：capture待ち中は
+              「記憶を確認しています…」（実際に振り返りをまだ生成していないため）、
+              /api/reflect呼び出し中だけ「今日を振り返っています…」のまま。
+            */}
+            {reflectionStatus === "capturing" && (
+              <p className="text-xs text-stone-400 dark:text-stone-500">記憶を確認しています…</p>
+            )}
             {reflectionStatus === "generating" && (
               <p className="text-xs text-stone-400 dark:text-stone-500">今日を振り返っています…</p>
             )}
@@ -1371,6 +1399,16 @@ export default function ChatScreen() {
             >
               この会話を終える
             </button>
+            {/*
+              UI改善（速度改善ではない）：以前はendingConversation中でもボタン自体は
+              disabledになるだけでテキストが無く、その後endedAtが確定した瞬間にボタンが
+              DOMから消え、結果カードが出るまでの間「何も無い」空白区間があった
+              （処理中／押せた／エラーか分からない、という指摘）。ボタンが消えるタイミングを
+              persistCapture成功後まで遅らせた上で、処理中はこのテキストを表示する。
+            */}
+            {endingConversation && (
+              <p className="text-xs text-stone-400 dark:text-stone-500">終えています…</p>
+            )}
           </div>
         )}
 
@@ -1559,12 +1597,19 @@ export default function ChatScreen() {
           （余白を削るのは下記bottom navigationの下端側に限定する）。
         */}
         {/*
-          「記憶に残しています…」「記憶に残しました。」という会話中常時表示の
-          ポジティブなフィードバックは今回のUX変更で廃止した（『ここまでを記憶しました。』は
-          「この会話を終える」を押した時だけ表示する別のカードに一本化）。
-          保存に問題がある場合（partial/error）だけは、引き続きその場で知らせる
-          （captureStatus自体・Capture/保存処理は一切変更していない。表示の一部を
-          間引いただけ）。
+          「記憶に残しています…」「記憶に残しました。」は、以前dd7c62eで一度廃止し
+          （『ここまでを記憶しました。』を「この会話を終える」時だけの別カードに一本化した
+          ため）、その後常時無表示になっていた。今回、会話が裏で自動保存され続けている
+          ことがユーザーから一切見えず、「本当に保存されているのか」が終了操作まで
+          分からないという指摘を受け、Memory保存の進行状態を伝える控えめな文言として復活
+          させる。表示先はcaptureStatusのみで、新しいstate・新しい判定は追加していない
+          （captureStatus自体・Capture/保存処理・保存タイミングは一切変更していない。
+          表示するかどうかを戻しただけ）。
+          役割の違い：この行は「今、裏で保存処理が動いているか」を示す一時的なステータス
+          （会話中、ターンのたびに一瞬だけ出ては消える）。一方「ここまでを記憶しました。」
+          カードは「この会話を終える」を押した時だけ出る、今回のConversation全体の
+          Memoryの一覧（summary込み）。前者は経過、後者は結果のまとめであり、役割は
+          重複しない。
         */}
         <p
           className={`mt-1 h-4 text-xs transition-opacity sm:mt-2 ${
@@ -1573,6 +1618,8 @@ export default function ChatScreen() {
               : "text-stone-400 dark:text-stone-500"
           }`}
         >
+          {captureStatus === "saving" && "記憶しています…"}
+          {captureStatus === "saved" && "記憶しました。"}
           {captureStatus === "partial" && "一部の記憶を保存できませんでした。会話は続けられます。"}
           {captureStatus === "error" && "記憶の保存に失敗しました。"}
         </p>
