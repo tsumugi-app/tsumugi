@@ -596,6 +596,42 @@ export default function ChatScreen() {
   }
 
   /**
+   * Beta「過去からの問いかけ」用のrevisitPrompt生成を、captureQueueRef.currentの
+   * 解決を待たせないバックグラウンド処理として切り出したもの。
+   *
+   * 背景：以前はenqueueCapture内でrevisitPrompt生成（/api/prompt、Memoryごとに1回）の
+   * 完了までcaptureQueueRef.currentが解決されなかったため、「本日はここまで」
+   * 「この会話を終える」がこの生成の完了を待たされ、終了画面の表示が遅くなっていた。
+   * revisitPromptはトップ画面の「過去からの問いかけ」でのみ使われ、
+   * 「ここまでを記憶しました」・終了時に表示するMemory・日記の振り返り・
+   * conversationの終了状態のいずれにも必要ないため、終了処理の待機対象から外す。
+   *
+   * revisitPromptをまだ持たないMemory（＝今回新しく生成された、または初めてCaptureされた
+   * Memory）だけを対象に、そのMemory単体を材料として再訪用の問いかけを1回だけ生成し、
+   * 保存し直す（既にrevisitPromptを持つMemoryは再生成しない、失敗しても既存のCapture
+   * 結果自体は失わない——という既存の挙動・粒度は変更していない）。
+   * 生成が完了したMemoryはmemoryObjects stateへも反映する（画面に既に表示されている
+   * Memoryへ、revisitPromptだけが後から追記される形になる）。
+   */
+  function enqueueRevisitPromptGeneration(memories: MemoryObject[]) {
+    const targets = memories.filter((memory) => !memory.revisitPrompt);
+    if (targets.length === 0) return;
+    void Promise.all(
+      targets.map(async (memory) => {
+        try {
+          const revisitPrompt = await generateRevisitPrompt(memory);
+          if (!revisitPrompt) return;
+          const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
+          await putMemoryObject(memoryWithPrompt);
+          setMemoryObjects((prev) => prev.map((m) => (m.id === memoryWithPrompt.id ? memoryWithPrompt : m)));
+        } catch (error) {
+          console.error("Failed to generate revisit prompt", error);
+        }
+      })
+    );
+  }
+
+  /**
    * Captureをキューへ積む。awaitせずバックグラウンドで実行され、チャット送信をブロックしない。
    * snapshotはenqueue時点のconversationに固定する（ターンNのCaptureが、後から追加された
    * ターンN+1を勝手に取り込まないようにするため）。
@@ -613,38 +649,17 @@ export default function ChatScreen() {
           capturedDelta,
           touchedMemoryObjects
         );
-        // 保存に成功したMemoryだけを以降の処理（revisitPrompt生成・state反映）へ進める。
-        // IndexedDB書き込み自体が失敗したMemoryは、成功した他のMemoryを巻き込まないよう
-        // ここで除外する（Beta修正：以前はここで1件でも失敗すると全件が失われていた）。
+        // 保存に成功したMemoryだけを以降の処理（state反映）へ進める。IndexedDB書き込み
+        // 自体が失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する
+        // （Beta修正：以前はここで1件でも失敗すると全件が失われていた）。
         const persistedMemoryObjects = touchedMemoryObjects.filter(
           (memory) => !failedMemoryIds.includes(memory.id)
         );
 
-        // Beta「過去からの問いかけ」。revisitPromptをまだ持たないMemory（＝今回新しく
-        // 生成された、または初めてCaptureされたMemory）だけを対象に、そのMemory単体を
-        // 材料として再訪用の問いかけを1回だけ生成し、保存し直す。既にrevisitPromptを
-        // 持つMemoryは再生成しない。ここで失敗しても既存のCapture結果自体は失わない
-        // （revisitPromptが付かないだけで、次にこのMemoryが更新された際に再度試みられる）。
-        const memoriesWithRevisitPrompt = await Promise.all(
-          persistedMemoryObjects.map(async (memory) => {
-            if (memory.revisitPrompt) return memory;
-            try {
-              const revisitPrompt = await generateRevisitPrompt(memory);
-              if (!revisitPrompt) return memory;
-              const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
-              await putMemoryObject(memoryWithPrompt);
-              return memoryWithPrompt;
-            } catch (error) {
-              console.error("Failed to generate revisit prompt", error);
-              return memory;
-            }
-          })
-        );
-
-        const touchedIds = new Set(memoriesWithRevisitPrompt.map((memory) => memory.id));
+        const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
         const mergedMemoryObjects = [
           ...prevMemoryObjects.filter((memory) => !touchedIds.has(memory.id)),
-          ...memoriesWithRevisitPrompt,
+          ...persistedMemoryObjects,
         ];
 
         // このCaptureが対象にしていたConversationが、実行中に「本日はここまで」→新規会話開始等で
@@ -652,6 +667,11 @@ export default function ChatScreen() {
         // setStateのfunctional updaterはこの時点で同期的に実行される保証が無いため、
         // 常に同期的に最新値を持つlatestConversationRefで判定する。
         if (latestConversationRef.current.id !== capturedDelta.id) {
+          // revisitPrompt生成自体は、Conversationが切り替わっていてもMemory単体としては
+          // 引き続き有効なので実行する（対象Memoryが既に画面から外れていても、
+          // setMemoryObjectsのfunctional updaterが該当idを持たない配列に対しては
+          // 何もしないため、古い画面を汚染することはない）。
+          enqueueRevisitPromptGeneration(persistedMemoryObjects);
           return prevMemoryObjects;
         }
 
@@ -681,6 +701,11 @@ export default function ChatScreen() {
           setCaptureStatus("saved");
           window.setTimeout(() => setCaptureStatus("idle"), 2500);
         }
+
+        // revisitPrompt生成はここで初めて着手する（captureQueueRef.currentの解決＝
+        // 「本日はここまで」「この会話を終える」の待機対象には含めない）。
+        enqueueRevisitPromptGeneration(persistedMemoryObjects);
+
         return mergedMemoryObjects;
       } catch (error) {
         console.error("Failed to capture memory", error);
