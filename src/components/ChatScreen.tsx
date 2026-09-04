@@ -1207,12 +1207,16 @@ export default function ChatScreen() {
             )}
             <p className="text-xl text-stone-500 dark:text-stone-400">今日は、どう話そう？</p>
             {/*
-              「探求」「相談・創造」をユーザー向けの別モードとして選ばせず、すべて
-              「会話」に統合する（今回のUX変更）。以前はここにPERSONASの3ボタン
-              （日記／探究／相談・創造）が並んでいたが、単一の入口ボタン1つにし、
-              内部的には常にpersona="companion"で会話を開始する。
-              persona自体の型・/api/chat・/api/reflectのペルソナ別プロンプト分岐、
-              Retrievalの分岐等は一切変更していない（内部ロジックは現状維持）。
+              「日記」＋「会話」の2本立て（今回のUX変更）。以前はここにPERSONASの
+              3ボタン（日記／探究／相談・創造）が並んでいたが、「探求」「相談・創造」を
+              ユーザー向けの別モードとして表示するのをやめ、1つの「会話」ボタンへ
+              まとめる。「日記」はこれまでどおりpersona="companion"のまま独立して残す。
+              「会話」はpersona="analyst"（既存の「相談・創造」の体験）を使う
+              （※coach/analystのどちらを割り当てても内部ロジック上は等価。ユーザーの
+              例示（相談・アイデア・整理）に近いanalystを選んだ）。
+              persona自体の型・/api/chat・/api/reflectのペルソナ別プロンプト分岐・
+              Retrievalの分岐・coach自体のロジックは一切削除・変更していない
+              （表示上の入口を2つにまとめただけ。内部ロジックは現状維持）。
               「過去からの問いかけ」経由（handleTopPromptSend）や、その会話が終わった
               後の継続選択（下記、promptedMemoryId起点の3ボタン）は、この変更の対象外
               として従来どおり残している（会話境界を大きく作り直さないため）。
@@ -1225,7 +1229,16 @@ export default function ChatScreen() {
                 }}
                 className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
               >
-                会話をはじめる
+                日記
+              </button>
+              <button
+                onClick={() => {
+                  setPersona("analyst");
+                  setEntryConfirmed(true);
+                }}
+                className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+              >
+                会話
               </button>
             </div>
           </div>
