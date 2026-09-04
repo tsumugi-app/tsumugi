@@ -1090,7 +1090,23 @@ export default function ChatScreen() {
             : "この端末のみ";
 
   return (
-    <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
+    <div className="flex h-dvh flex-col overflow-hidden bg-[var(--background)] text-[var(--foreground)]">
+      {/*
+        footer下部の「これまでの記憶を見る／読み込む／設定」アイコンは、視覚的には
+        16px程度の行の中に40×40pxのタップ領域を`-my-3`（負のmargin）で確保している。
+        このボタン自身のボックスは意図的にこのroot（h-dvh、画面と同じ高さ）の下端より
+        約4px下にはみ出す構造になっており、他に祖先でclipする要素がないと、その4pxが
+        document全体のscrollable overflow（documentElement.scrollHeightがclientHeightより
+        4px大きくなる）として現れ、画面が本来不要な4pxだけ縦スクロール可能になっていた
+        （会話画面では、この4px分だけ自動的にscrollYがずれてページ全体が上に4pxシフトして
+        見える症状も確認されている）。
+        この`overflow-hidden`は、はみ出したその4px（＝そもそも画面外で実際には
+        タップできていなかった範囲）だけをrootの外周でclipするためのもの。
+        rootの上端(y=0)はボタンの上端(-my-3で上にもはみ出す分)より十分上にあるため、
+        現在画面内で実際にタップできている40pxのタップ領域（上下とも）には影響しない
+        （実機・サンドボックス双方で計測済み）。ボタンのサイズ・`-my-3`・padding/gap・
+        mobile fade・PTR関連コードは一切変更していない。
+      */}
       {/*
         スマホでは、スクロール末尾（＝会話の最後の文章）とfooter（入力欄）の境界が
         近すぎて、文章が入力欄に隠れて見える／「Webフォーム感」が出るという指摘があった。
