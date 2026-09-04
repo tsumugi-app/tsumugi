@@ -1090,7 +1090,11 @@ export default function ChatScreen() {
             : "この端末のみ";
 
   return (
-    <div className="flex h-dvh flex-col overflow-hidden bg-[var(--background)] text-[var(--foreground)]">
+    <div
+      className={`flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)] ${
+        keyboardVisible ? "" : "overflow-hidden"
+      }`}
+    >
       {/*
         footer下部の「これまでの記憶を見る／読み込む／設定」アイコンは、視覚的には
         16px程度の行の中に40×40pxのタップ領域を`-my-3`（負のmargin）で確保している。
@@ -1100,12 +1104,27 @@ export default function ChatScreen() {
         4px大きくなる）として現れ、画面が本来不要な4pxだけ縦スクロール可能になっていた
         （会話画面では、この4px分だけ自動的にscrollYがずれてページ全体が上に4pxシフトして
         見える症状も確認されている）。
-        この`overflow-hidden`は、はみ出したその4px（＝そもそも画面外で実際には
+        `overflow-hidden`は、はみ出したその4px（＝そもそも画面外で実際には
         タップできていなかった範囲）だけをrootの外周でclipするためのもの。
         rootの上端(y=0)はボタンの上端(-my-3で上にもはみ出す分)より十分上にあるため、
-        現在画面内で実際にタップできている40pxのタップ領域（上下とも）には影響しない
-        （実機・サンドボックス双方で計測済み）。ボタンのサイズ・`-my-3`・padding/gap・
-        mobile fade・PTR関連コードは一切変更していない。
+        通常時に画面内で実際にタップできている40pxのタップ領域（上下とも）には影響しない
+        （実機・サンドボックス双方で計測済み）。
+
+        ただし、これを常時適用すると別の問題が起きることが分かった：Android Chromeの
+        「フォーカスした入力欄が隠れる場合に自動でその要素が見えるようスクロールする」
+        というネイティブ挙動は、ページ（このroot）がスクロール可能であることに依存して
+        いる。ソフトウェアキーボード表示でビューポートが縮み、main＋footerの実コンテンツが
+        縮んだビューポートに収まりきらなくなった場合、常時overflow-hiddenだとこの
+        ネイティブスクロールが起動できず、入力欄がキーボードの下に隠れたまま
+        フォーカスできてしまう（実機で確認された回帰）。
+
+        そのため、既存の`keyboardVisible`（389〜417行目のvisualViewport差分検知、
+        検知ロジック自体は変更していない）に連動させ、キーボード表示中だけ
+        `overflow-hidden`を外してページのスクロールを許可し、キーボードを閉じたら
+        即座に`overflow-hidden`を再適用して4px overflow対策に戻す。
+        ボタンのサイズ・`-my-3`・padding/gap・mobile fade・PTR関連コード・
+        keyboardVisibleの検知ロジック本体・visualViewport処理・mainのoverflow-y-auto・
+        ChatInputの構造は一切変更していない。
       */}
       {/*
         スマホでは、スクロール末尾（＝会話の最後の文章）とfooter（入力欄）の境界が
