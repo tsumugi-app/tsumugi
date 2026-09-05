@@ -267,9 +267,57 @@ export interface PersistCaptureResult {
   failedMemoryIds: string[];
 }
 
+export interface PersistConversationResult {
+  /** conversation自体のIndexedDB書き込みが失敗したか（Markdown書き込み失敗は含まない）。 */
+  conversationFailed: boolean;
+}
+
 /**
+ * Conversation本文だけを保存する（Memory生成・Captureの成否とは完全に独立）。
+ *
+ * 設計方針（Conversation本文保存とMemory生成の責務分離）：
+ * このConversation Boundary再設計の目的そのものが「会話本文の保存」と「Memory生成
+ * （Capture）」を明確に分けることにあるため、Conversation本文の保存はこの専用関数に
+ * 一本化する。呼び出し元は2種類：
+ *   - ChatScreen.tsx側：AI返信を受け取った直後、毎ターン呼ぶ（Captureの成否を待たない）
+ *   - persistCapture（このファイル内）：Boundary Capture時、Memory保存とあわせて呼ぶ
+ * どちらの経路でも実装は完全に同一（重複させない）。
+ *
  * STORAGE.md §2.3「書き込みは常にMarkdown/.tsumugiが先、IndexedDBが後」を実装として守る。
  * vaultHandleがまだ無い場合はIndexedDBにのみ保存し、Vault接続後にflushPendingToVaultで書き戻す。
+ * Markdown書き込みの失敗はIndexedDB保存をブロックしない（Markdownには残らないが、
+ * IndexedDBには残るので、次にVaultへ接続・再接続した際のflushPendingToVaultが自動的に
+ * 書き戻す。つまりMarkdown書き込み失敗は「失われる」のではなく「vaultへの反映が
+ * 次回に持ち越される」だけにする）。IndexedDBへの書き込み自体が失敗した場合のみ、
+ * 本当に失敗として扱いconversationFailedをtrueで返す。
+ */
+export async function persistConversation(
+  vaultHandle: FileSystemDirectoryHandle | null,
+  conversation: Conversation
+): Promise<PersistConversationResult> {
+  if (vaultHandle) {
+    try {
+      await writeConversationMarkdown(vaultHandle, conversation);
+    } catch (error) {
+      console.error("[Tsumugi] conversation markdown write failed (will retry on next vault flush):", error);
+    }
+  }
+
+  let conversationFailed = false;
+  try {
+    await putConversation(conversation);
+  } catch (error) {
+    console.error("[Tsumugi] conversation IndexedDB write failed:", error);
+    conversationFailed = true;
+  }
+
+  return { conversationFailed };
+}
+
+/**
+ * STORAGE.md §2.3「書き込みは常にMarkdown/.tsumugiが先、IndexedDBが後」を実装として守る
+ * （Conversation本文の保存自体はpersistConversationへ委譲。ここではそれにMemoryObjectの
+ * 保存を組み合わせる）。
  *
  * 各書き込みを個別のtry/catchで分離する（Beta修正）。以前はMemoryObjectのMarkdown書き込みが
  * 1件でも失敗すると関数全体が例外を投げ、それ以前に成功していたMemoryも含めて一切
@@ -279,7 +327,7 @@ export interface PersistCaptureResult {
  *   自動的に書き戻す。つまりMarkdown書き込み失敗は「失われる」のではなく「vaultへの反映が
  *   次回に持ち越される」だけにする）。
  * - IndexedDBへの書き込み自体が失敗した場合のみ、そのMemoryを本当に失敗として扱い、
- *   呼び出し元（enqueueCapture）が画面に表示できるようfailedMemoryIdsで返す。
+ *   呼び出し元（runConversationBoundary）が画面に表示できるようfailedMemoryIdsで返す。
  * - 1件の失敗が他の件の処理を止めない（ループを継続する）。
  */
 export async function persistCapture(
@@ -287,21 +335,7 @@ export async function persistCapture(
   conversation: Conversation,
   memoryObjects: MemoryObject[]
 ): Promise<PersistCaptureResult> {
-  if (vaultHandle) {
-    try {
-      await writeConversationMarkdown(vaultHandle, conversation);
-    } catch (error) {
-      console.error("[Tsumugi Capture] conversation markdown write failed (will retry on next vault flush):", error);
-    }
-  }
-
-  let conversationFailed = false;
-  try {
-    await putConversation(conversation);
-  } catch (error) {
-    console.error("[Tsumugi Capture] conversation IndexedDB write failed:", error);
-    conversationFailed = true;
-  }
+  const { conversationFailed } = await persistConversation(vaultHandle, conversation);
 
   const failedMemoryIds: string[] = [];
   for (const memoryObject of memoryObjects) {

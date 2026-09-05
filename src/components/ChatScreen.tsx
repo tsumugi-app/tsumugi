@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, Persona } from "@/lib/types";
-import { appendTurn, captureConversation, createConversation, persistCapture } from "@/lib/capture";
+import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
   chooseVaultDirectory,
   clearOpfsVault,
@@ -55,11 +55,10 @@ export type VaultStatus = "checking" | "connected" | "not-connected" | "unsuppor
 export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
 /**
- * "capturing"：「本日はここまで」を押した直後〜captureQueueRef.currentの解決待ちの間。
- * 実際にはこの間、新しいAI呼び出しはしておらず、直前の会話ターンで既に自動発火している
- * Capture（/api/capture・IndexedDB/Vault保存）の完了を待っているだけだが、ボタン押下から
- * ここまで画面上に一切表示が無かったため追加した（UI改善のみ。待機対象・処理内容は
- * 変更していない）。
+ * "capturing"：「本日はここまで」を押した直後〜runConversationBoundary()の解決待ちの間。
+ * このConversationがまだCaptureされていなければ、ここで初めて/api/captureが呼ばれる
+ * （会話中は毎ターンCaptureしていないため）。ボタン押下からここまで画面上に一切表示が
+ * 無かったため追加した（UI改善のみ）。
  */
 type ReflectionStatus = "idle" | "capturing" | "generating" | "done" | "error" | "unavailable";
 export type RestoreStatus = "idle" | "restoring" | "done";
@@ -78,6 +77,13 @@ export interface RestoreCandidate {
 
 /** 1回のアプリ起動あたり、未Connect Memoryをまとめて処理する上限（AI呼び出し回数のクォータ保護）。 */
 const STARTUP_CONNECT_LIMIT = 3;
+
+/**
+ * 1回のアプリ起動あたり、未Capture Conversation（明示的な終了操作をせずブラウザ/タブを
+ * 閉じた等で、status==="active"のまま残ったもの）をまとめて処理する上限。
+ * STARTUP_CONNECT_LIMITと同じ考え方（AI呼び出し回数のクォータ保護）。
+ */
+const STARTUP_CAPTURE_LIMIT = 3;
 
 /** Beta C4：/api/chatの失敗時、ステータスだけを見てAPIキー由来かどうかをUI側で分岐するための最小限のエラー型。 */
 class ChatRequestError extends Error {
@@ -126,8 +132,13 @@ export default function ChatScreen() {
   const [persona, setPersona] = useState<Persona>("companion");
   const [entryConfirmed, setEntryConfirmed] = useState(false);
   const [conversation, setConversation] = useState<Conversation>(() => createConversation("companion"));
-  /** そのConversationから既に生成済みの、新規/更新されたMemoryObjectの一覧（1 Conversation = 1 Memoryとは限らない）。 */
-  const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
+  /**
+   * そのConversationから既に生成済みの、新規/更新されたMemoryObjectの一覧
+   * （1 Conversation = 1 Memoryとは限らない）。値自体を直接読む箇所は無いが、
+   * runConversationBoundary・enqueueRevisitPromptGenerationが更新し続ける
+   * （将来の機能・デバッグ用に、常に最新の状態を保つ）。
+   */
+  const [, setMemoryObjects] = useState<MemoryObject[]>([]);
   /**
    * 「この会話を終える」（handleEndConversation）を押した直後だけ表示する、
    * 「ここまでを記憶しました。」カード用のstate。
@@ -214,15 +225,154 @@ export default function ChatScreen() {
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const startupConnectRanRef = useRef(false);
+  const startupCaptureRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
-  /**
-   * Captureをチャット送信のブロッキングから切り離すためのPromiseキュー（1件ずつ直列実行）。
-   * 次のCaptureには、前のCaptureが返したmemoryObjects一覧を明示的に渡す
-   * （React stateのクロージャに依存すると、Capture同士が競合してMemoryObjectを二重生成しうるため）。
-   */
-  const captureQueueRef = useRef<Promise<MemoryObject[]>>(Promise.resolve(memoryObjects));
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
+
+  /**
+   * Beta「過去からの問いかけ」用のrevisitPrompt生成を、runConversationBoundary()の
+   * 解決を待たせないバックグラウンド処理として切り出したもの。
+   *
+   * 背景：以前はCapture処理内でrevisitPrompt生成（/api/prompt、Memoryごとに1回）の
+   * 完了まで、終了処理が待たされていたため、「本日はここまで」「この会話を終える」の
+   * 表示が遅くなっていた。revisitPromptはトップ画面の「過去からの問いかけ」でのみ使われ、
+   * 「ここまでを記憶しました」・終了時に表示するMemory・日記の振り返り・
+   * conversationの終了状態のいずれにも必要ないため、終了処理の待機対象から外す。
+   *
+   * revisitPromptをまだ持たないMemory（＝今回新しく生成された、または初めてCaptureされた
+   * Memory）だけを対象に、そのMemory単体を材料として再訪用の問いかけを1回だけ生成し、
+   * 保存し直す（既にrevisitPromptを持つMemoryは再生成しない、失敗しても既存のCapture
+   * 結果自体は失わない——という既存の挙動・粒度は変更していない）。
+   * 生成が完了したMemoryはmemoryObjects stateへも反映する（画面に既に表示されている
+   * Memoryへ、revisitPromptだけが後から追記される形になる）。
+   */
+  function enqueueRevisitPromptGeneration(memories: MemoryObject[]) {
+    const targets = memories.filter((memory) => !memory.revisitPrompt);
+    if (targets.length === 0) return;
+    void Promise.all(
+      targets.map(async (memory) => {
+        try {
+          const revisitPrompt = await generateRevisitPrompt(memory);
+          if (!revisitPrompt) return;
+          const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
+          await putMemoryObject(memoryWithPrompt);
+          setMemoryObjects((prev) => prev.map((m) => (m.id === memoryWithPrompt.id ? memoryWithPrompt : m)));
+        } catch (error) {
+          console.error("Failed to generate revisit prompt", error);
+        }
+      })
+    );
+  }
+
+  /**
+   * 渡されたMemory一覧をConnect対象にする、共通のfire-and-forgetヘルパー。
+   * runConversationBoundary()の最後で必ず呼ばれるほか、handleEndSession()が
+   * insightMemory（Reflection自体）だけを追加でConnectする際にもそのまま再利用する。
+   * 新しいConnect機構・新しいタイマーは作らない。
+   *
+   * 同じMemoryが複数の経路（Boundary Capture・起動時キャッチアップ等）から対象になっても、
+   * connectMemory()内のtryClaimMemoryForConnect()による既存のクレーム機構がそのまま
+   * 重複実行を防ぐ。
+   */
+  function connectConversationBoundary(pendingMemoryObjects: Promise<MemoryObject[]>) {
+    void (async () => {
+      try {
+        const memories = await pendingMemoryObjects;
+        for (const memory of memories) {
+          await connectMemory(vaultHandle, memory);
+        }
+      } catch (error) {
+        console.error("Failed to connect conversation-boundary memories", error);
+      }
+    })();
+  }
+
+  /**
+   * Conversation Boundary（会話の区切り）でのCapture→Memory保存→revisitPrompt発火→Connect。
+   * 「本日はここまで」「この会話を終える」・persona切替・トップへ戻る・終了済み
+   * Conversationからの新規開始・起動時の未Capture救済、全ての離脱経路からこの1つの
+   * 関数を呼ぶ（docs/MEMORY_ENGINE.md「会話が終わると、Memory Engineは会話をMemory
+   * Objectへ変換する」という原案に沿った再設計。以前は毎ターン自動発火していたが、
+   * Captureは今回からConversationごとに1回、この関数が呼ばれた時だけ実行する）。
+   *
+   * targetが既にstatus==="captured"、またはturnsが空なら何もせず空配列を返す
+   * （二重Captureを防ぐ。Conversation.status自体を「Captureしたか」のマーカーとして使い、
+   * connectStateのような別のクレーム機構は導入しない）。
+   *
+   * 戻り値は、このConversationから新規生成・更新されたMemoryObjectの一覧
+   * （Captureが実行されなかった場合は空配列）。呼び出し元は、結果を使う場合はawaitし
+   * （handleEndSession/handleEndConversation）、画面遷移をブロックしたくない場合は
+   * voidで発火するだけでよい（handleSwitchPersona/handleGoToTop/handleSend内の
+   * 新規Conversation分岐・起動時の未Capture救済）。
+   *
+   * Conversation本文自体は、ここが呼ばれるより前（AI返信を受け取った直後、
+   * persistConversationで毎ターン）に既に保存済みという前提のため、ここでは
+   * Conversation本文の保存は行わない（persistCaptureの中でconversationも改めて
+   * 書き込まれるが、内容は既に保存済みのものと同じか、Capture結果でstatus等が
+   * 更新されたものになる）。
+   */
+  async function runConversationBoundary(target: Conversation): Promise<MemoryObject[]> {
+    if (target.status === "captured" || target.turns.length === 0) {
+      connectConversationBoundary(Promise.resolve([]));
+      return [];
+    }
+    try {
+      setCaptureStatus("saving");
+      // 境界Captureは会話ごとに1回だけなので、このConversation自身からの
+      // 既存Memory（existingMemoryObjects）は常に空でよい（前のターンでのCaptureが
+      // 無いため、このConversation発の既存Memoryはまだ存在しない）。
+      const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects } = await captureConversation(
+        target,
+        []
+      );
+      const { conversationFailed, failedMemoryIds } = await persistCapture(
+        vaultHandle,
+        capturedDelta,
+        touchedMemoryObjects
+      );
+      // 保存に成功したMemoryだけを以降の処理へ進める。IndexedDB書き込み自体が
+      // 失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する。
+      const persistedMemoryObjects = touchedMemoryObjects.filter(
+        (memory) => !failedMemoryIds.includes(memory.id)
+      );
+
+      // このCaptureが対象にしていたConversationが、実行中に既に別のConversationへ
+      // 切り替わっていた場合（fire-and-forget呼び出し元で、切り替え自体は同期的に
+      // 先に進むケース）は、古い結果を今のstateへ書き戻さない（別会話の汚染防止）。
+      if (latestConversationRef.current.id === capturedDelta.id) {
+        const merged: Conversation = {
+          ...latestConversationRef.current,
+          status: capturedDelta.status,
+          memoryObjectIds: capturedDelta.memoryObjectIds.filter((id) => !failedMemoryIds.includes(id)),
+          updatedAt: capturedDelta.updatedAt,
+        };
+        latestConversationRef.current = merged;
+        setConversation(merged);
+      }
+      setMemoryObjects((prev) => {
+        const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
+        return [...prev.filter((memory) => !touchedIds.has(memory.id)), ...persistedMemoryObjects];
+      });
+
+      if (conversationFailed || failedMemoryIds.length > 0) {
+        console.error("Partial capture failure", { conversationFailed, failedMemoryIds });
+        setCaptureStatus("partial");
+      } else {
+        setCaptureStatus("saved");
+        window.setTimeout(() => setCaptureStatus("idle"), 2500);
+      }
+
+      enqueueRevisitPromptGeneration(persistedMemoryObjects);
+      connectConversationBoundary(Promise.resolve(persistedMemoryObjects));
+      return persistedMemoryObjects;
+    } catch (error) {
+      console.error("Failed to capture memory at conversation boundary", error);
+      setCaptureStatus("error");
+      connectConversationBoundary(Promise.resolve([]));
+      return [];
+    }
+  }
 
   const refreshKeyStatus = () => {
     Promise.all([loadApiKey("gemini"), loadApiKey("openai")]).then(([gemini, openai]) => {
@@ -373,6 +523,45 @@ export default function ChatScreen() {
       cancelled = true;
     };
   }, [vaultStatus, vaultHandle]);
+
+  /**
+   * 未Capture Conversationのキャッチアップ。上のstartup connect catch-upと全く同じ
+   * パターン（アプリ起動のたびに一度だけ、対象を古い順に少数だけバックグラウンドで
+   * 処理する。チャット操作はブロックしない）を、Connectの代わりにCaptureに適用したもの。
+   *
+   * 「明示的な終了操作（本日はここまで／この会話を終える）をせずブラウザ・タブ・PWAを
+   * 閉じた場合、そのConversationは今回の再設計で毎ターンCaptureをやめたことにより、
+   * Memory生成（Capture）が一度も行われないまま残る」という状況への救済。Conversation
+   * 本文自体はAI返信のたびにpersistConversationで既に保存済みのため失われないが、
+   * Memory（要約・キーワード）はまだ無い状態になる。
+   *
+   * 「Captureを試みたかどうか」は、connectStateのような別の状態管理を新設せず、
+   * Conversation自身が持つ既存のstatusフィールド（"active"＝未Capture、"captured"＝
+   * 済み）だけで判定する（新しいクレーム機構は作らない）。
+   */
+  useEffect(() => {
+    if (vaultStatus === "checking" || startupCaptureRanRef.current) return;
+    startupCaptureRanRef.current = true;
+    let cancelled = false;
+    (async () => {
+      try {
+        const allConversations = await getAllConversations();
+        const uncaptured = allConversations
+          .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0)
+          .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+          .slice(0, STARTUP_CAPTURE_LIMIT);
+        for (const conversationRecord of uncaptured) {
+          if (cancelled) return;
+          await runConversationBoundary(conversationRecord);
+        }
+      } catch (error) {
+        console.error("Failed to run startup capture catch-up", error);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultStatus, vaultHandle, runConversationBoundary]);
 
   useEffect(() => {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -603,138 +792,27 @@ export default function ChatScreen() {
   }
 
   /**
-   * Beta「過去からの問いかけ」用のrevisitPrompt生成を、captureQueueRef.currentの
-   * 解決を待たせないバックグラウンド処理として切り出したもの。
-   *
-   * 背景：以前はenqueueCapture内でrevisitPrompt生成（/api/prompt、Memoryごとに1回）の
-   * 完了までcaptureQueueRef.currentが解決されなかったため、「本日はここまで」
-   * 「この会話を終える」がこの生成の完了を待たされ、終了画面の表示が遅くなっていた。
-   * revisitPromptはトップ画面の「過去からの問いかけ」でのみ使われ、
-   * 「ここまでを記憶しました」・終了時に表示するMemory・日記の振り返り・
-   * conversationの終了状態のいずれにも必要ないため、終了処理の待機対象から外す。
-   *
-   * revisitPromptをまだ持たないMemory（＝今回新しく生成された、または初めてCaptureされた
-   * Memory）だけを対象に、そのMemory単体を材料として再訪用の問いかけを1回だけ生成し、
-   * 保存し直す（既にrevisitPromptを持つMemoryは再生成しない、失敗しても既存のCapture
-   * 結果自体は失わない——という既存の挙動・粒度は変更していない）。
-   * 生成が完了したMemoryはmemoryObjects stateへも反映する（画面に既に表示されている
-   * Memoryへ、revisitPromptだけが後から追記される形になる）。
-   */
-  function enqueueRevisitPromptGeneration(memories: MemoryObject[]) {
-    const targets = memories.filter((memory) => !memory.revisitPrompt);
-    if (targets.length === 0) return;
-    void Promise.all(
-      targets.map(async (memory) => {
-        try {
-          const revisitPrompt = await generateRevisitPrompt(memory);
-          if (!revisitPrompt) return;
-          const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
-          await putMemoryObject(memoryWithPrompt);
-          setMemoryObjects((prev) => prev.map((m) => (m.id === memoryWithPrompt.id ? memoryWithPrompt : m)));
-        } catch (error) {
-          console.error("Failed to generate revisit prompt", error);
-        }
-      })
-    );
-  }
-
-  /**
-   * Captureをキューへ積む。awaitせずバックグラウンドで実行され、チャット送信をブロックしない。
-   * snapshotはenqueue時点のconversationに固定する（ターンNのCaptureが、後から追加された
-   * ターンN+1を勝手に取り込まないようにするため）。
-   */
-  function enqueueCapture(snapshot: Conversation) {
-    captureQueueRef.current = captureQueueRef.current.then(async (prevMemoryObjects) => {
-      try {
-        setCaptureStatus("saving");
-        const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects } = await captureConversation(
-          snapshot,
-          prevMemoryObjects
-        );
-        const { conversationFailed, failedMemoryIds } = await persistCapture(
-          vaultHandle,
-          capturedDelta,
-          touchedMemoryObjects
-        );
-        // 保存に成功したMemoryだけを以降の処理（state反映）へ進める。IndexedDB書き込み
-        // 自体が失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する
-        // （Beta修正：以前はここで1件でも失敗すると全件が失われていた）。
-        const persistedMemoryObjects = touchedMemoryObjects.filter(
-          (memory) => !failedMemoryIds.includes(memory.id)
-        );
-
-        const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
-        const mergedMemoryObjects = [
-          ...prevMemoryObjects.filter((memory) => !touchedIds.has(memory.id)),
-          ...persistedMemoryObjects,
-        ];
-
-        // このCaptureが対象にしていたConversationが、実行中に「本日はここまで」→新規会話開始等で
-        // 既に切り替わっていた場合は、古い結果を今のstateへ書き戻さない（別会話の汚染防止）。
-        // setStateのfunctional updaterはこの時点で同期的に実行される保証が無いため、
-        // 常に同期的に最新値を持つlatestConversationRefで判定する。
-        if (latestConversationRef.current.id !== capturedDelta.id) {
-          // revisitPrompt生成自体は、Conversationが切り替わっていてもMemory単体としては
-          // 引き続き有効なので実行する（対象Memoryが既に画面から外れていても、
-          // setMemoryObjectsのfunctional updaterが該当idを持たない配列に対しては
-          // 何もしないため、古い画面を汚染することはない）。
-          enqueueRevisitPromptGeneration(persistedMemoryObjects);
-          return prevMemoryObjects;
-        }
-
-        const merged: Conversation = {
-          ...latestConversationRef.current,
-          status: capturedDelta.status,
-          // 保存に失敗したMemoryのidは、conversation.memoryObjectIdsからも除く
-          // （実際にIndexedDBへ保存できたものだけを指すようにする）。
-          memoryObjectIds: capturedDelta.memoryObjectIds.filter((id) => !failedMemoryIds.includes(id)),
-          updatedAt: capturedDelta.updatedAt,
-        };
-        latestConversationRef.current = merged;
-        setConversation(merged);
-        setMemoryObjects(mergedMemoryObjects);
-        // 会話中はMemoryの保存状況をUIに常時表示しない方針（今回のUX変更）。
-        // 「ここまでを記憶しました。」はhandleEndConversation（この会話を終える）を
-        // 押したときにだけ、その時点のmemoryObjects（＝mergedMemoryObjects）を見て
-        // 表示する。ここでは表示用stateには一切触れない
-        // （Capture自体・IndexedDB/Vaultへの保存はこれまでどおりバックグラウンドで継続する）。
-
-        // Beta修正：一部のMemoryだけ保存に失敗した場合も、成功した分は反映した上で、
-        // 失敗があったことをユーザーへ明示する（黙って"saved"にしない）。
-        if (conversationFailed || failedMemoryIds.length > 0) {
-          console.error("Partial capture failure", { conversationFailed, failedMemoryIds });
-          setCaptureStatus("partial");
-        } else {
-          setCaptureStatus("saved");
-          window.setTimeout(() => setCaptureStatus("idle"), 2500);
-        }
-
-        // revisitPrompt生成はここで初めて着手する（captureQueueRef.currentの解決＝
-        // 「本日はここまで」「この会話を終える」の待機対象には含めない）。
-        enqueueRevisitPromptGeneration(persistedMemoryObjects);
-
-        return mergedMemoryObjects;
-      } catch (error) {
-        console.error("Failed to capture memory", error);
-        setCaptureStatus("error");
-        // 失敗しても次のCaptureへ、直前まで有効だったmemoryObjects一覧をそのまま引き継ぐ。
-        return prevMemoryObjects;
-      }
-    });
-  }
-
-  /**
    * 「本日はここまで」。UI_UX.md「Users never press Save」の"Save"ではない
    * （保存は既にCaptureが自動で行っている）。あくまで任意の締めくくりの操作。
    * 既存のCaptureは呼ばない。既存のmemoryObjectを材料に、別のinsight MemoryObjectを1つ作る。
+   *
+   * 順序について（handleEndConversationとの違い）：handleEndConversationとは異なり、
+   * ここではendedAtをCaptureより先に確定させない。conversation.endedAtは、
+   * Reflection生成（/api/reflect）・insight Memoryの保存まで全て成功した最後の時点
+   * （下記）でのみセットする。理由：Reflectionが失敗した場合（reflectionStatus==="error"）
+   * でも会話を「未終了」のまま残し、ユーザーが同じ会話に対してもう一度「本日はここまで」を
+   * 押して再試行できるようにするため。もしendedAtを先に確定させてしまうと、Reflection失敗時に
+   * 「終了したのに振り返りが無い」という中途半端な状態になり、再試行の手段も無くなる。
+   * Conversation本文自体（会話のターン）はendedAtの有無に関わらずAI返信のたびに既に
+   * persistConversationで保存済みのため、この順序でもConversation本文が失われることはない。
    */
   async function handleEndSession() {
-    // UI改善：ボタン押下の直後、captureQueueRef.currentの解決を待つ前から
-    // 状態を表示する（待機対象・処理順序自体は変更していない）。
+    // UI改善：ボタン押下の直後、Boundary Captureの解決を待つ前から状態を表示する。
     setReflectionStatus("capturing");
-    // バックグラウンドで実行中のCaptureが残っていれば、ここで完了を待つ
-    // （memoryObjectsが最新状態になってから振り返りの材料として使うため）。
-    const latestMemoryObjects = await captureQueueRef.current;
+    // Conversation Boundary（このConversationの唯一のCapture機会）をここで実行する。
+    // 会話中は毎ターンCaptureしていないため、ここで初めて/api/captureが呼ばれる
+    // （runConversationBoundaryが内部でMemory保存・Connectまで完了させる）。
+    const latestMemoryObjects = await runConversationBoundary(latestConversationRef.current);
 
     if (latestMemoryObjects.length === 0) {
       // Captureがまだ一度も成功していない（進行中 or 失敗）。
@@ -783,19 +861,12 @@ export default function ChatScreen() {
       setReflectionText(text);
       setReflectionStatus("done");
 
-      // Connect（ROADMAP.md Phase 2）。Reflection表示をブロックしないよう非同期で走らせる。
-      // 失敗してもReflection自体は成功しているため、reflectionStatusには影響させない
-      // （未Connectのまま残り、次回起動時のキャッチアップで再試行される）。
-      void (async () => {
-        try {
-          for (const memory of latestMemoryObjects) {
-            await connectMemory(vaultHandle, memory);
-          }
-          await connectMemory(vaultHandle, insightMemory);
-        } catch (connectError) {
-          console.error("Failed to connect session memories", connectError);
-        }
-      })();
+      // Connect（ROADMAP.md Phase 2）。latestMemoryObjects分は既にrunConversationBoundary内で
+      // Connect済みのため、ここではこのReflection自体（insightMemory）だけを追加でConnectする。
+      // Reflection表示をブロックしないよう非同期で走らせる（connectConversationBoundaryを
+      // そのまま再利用。失敗してもReflection自体は成功しているためreflectionStatusには
+      // 影響させない。未Connectのまま残っても次回起動時のキャッチアップで再試行される）。
+      connectConversationBoundary(Promise.resolve([insightMemory]));
     } catch (error) {
       console.error("Failed to generate session reflection", error);
       setReflectionStatus("error");
@@ -803,87 +874,64 @@ export default function ChatScreen() {
   }
 
   /**
-   * 会話境界（ペルソナ切り替え・トップへ戻る・終了済みConversationからの新規開始）で、
-   * 離れる直前のConversationのMemoryをConnect対象にする。handleEndSession()が
-   * セッション終了時に行っているのと同じパターン（画面遷移をブロックしないfire-and-forget）
-   * をそのまま再利用するだけで、新しいConnect機構・新しいタイマーは作らない。
-   *
-   * pendingMemoryObjectsには、呼び出し時点（=captureQueueRef.currentを次の値へ
-   * 上書きする直前）のcaptureQueueRef.currentをそのまま渡す。これは進行中のCaptureが
-   * 完了した後の最終的なMemoryObject一覧を指すPromiseであり、state変数のmemoryObjects
-   * （再レンダーを挟まないと最新にならない）ではなくこちらを使うことで、画面遷移で参照が
-   * 失われる前に対象を確実に確保できる。
-   *
-   * 会話中のMemory（まだCaptureで更新され続けている途中のもの）はConnect対象にしない
-   * ——という設計方針は、この関数が「離れる」操作からしか呼ばれないことで担保される
-   * （enqueueCapture成功直後などからは呼ばない）。
-   *
-   * 同じMemoryが「本日はここまで」・起動時キャッチアップ・この会話境界Connectの
-   * 複数経路から対象になっても、connectMemory()内のtryClaimMemoryForConnect()による
-   * 既存のクレーム機構がそのまま重複実行を防ぐ。
-   */
-  function connectConversationBoundary(pendingMemoryObjects: Promise<MemoryObject[]>) {
-    void (async () => {
-      try {
-        const memories = await pendingMemoryObjects;
-        for (const memory of memories) {
-          await connectMemory(vaultHandle, memory);
-        }
-      } catch (error) {
-        console.error("Failed to connect conversation-boundary memories", error);
-      }
-    })();
-  }
-
-  /**
    * 「この会話を終える」。「今日はここまで」（handleEndSession、日記＝persona==="companion"
    * 専用、AIに1日の振り返り文＝insight MemoryObjectを新しく生成させる重い処理）とは別の、
    * 「会話」（companion以外のpersona）向けの軽量な区切り操作。
    *
-   * これは「保存」ボタンではない。CaptureはMemoryが生成されるたびにこれまでどおり
-   * バックグラウンドで自動的に走り続けており、このボタンを押さなくても会話・Memoryは
-   * 通常どおり保存され続ける。ここで新たに行うのは次の2つだけ：
+   * これは「保存」ボタンではない。Conversation本文はAI返信のたびに既に
+   * persistConversationで保存され続けている。ここで新たに行うのは次の2つだけ：
    *   1. conversation.endedAtをセットして、このConversationに区切りをつける
    *      （handleSend()の「endedAtが立っている会話には追記せず新規作成する」分岐が
    *      既に存在するため、これだけで「次に話しかけたら新しい会話になる」が成立する。
    *      新しいstate・新しい判定ロジックは増やさない）。
-   *   2. その時点のmemoryObjects（＝このConversationで生成・更新された全Memory。
-   *      Conversation境界のたびに空配列へリセットされるstateなので、常に「今の会話の
-   *      分だけ」を表す）を、ユーザーが確認できるようendedConversationMemoriesへ渡す。
+   *   2. Conversation Boundaryとして、まだCaptureされていなければここでCaptureする
+   *      （runConversationBoundary。会話中は毎ターンCaptureしていないため、多くの場合
+   *      ここが唯一のCapture機会になる）。
    * 新しいMemoryObjectは作らない（handleEndSessionのinsight生成とは異なる）。
    *
+   * 順序について（Conversation保存とCapture/Memory生成の責務分離）：endedAt付き
+   * Conversationの保存を、Captureより先に行う。これにより、直後のCapture
+   * （AI呼び出し）が失敗したりブラウザが閉じられたりしても、会話が「終了した」
+   * 状態のままConversation本文自体は確実に保存されている状態を作る。ただし、
+   * 画面上でボタンが消える（conversation state更新）タイミングはCapture完了後まで
+   * 据え置く（UI改善。処理中にボタンだけ消えて結果が出るまで空白になる問題への対策）。
+   *
    * 会話境界からの離脱という点でhandleSwitchPersona/handleGoToTop/handleSend内の
-   * 終了済み会話からの新規開始と同じ性質を持つため、同様にconnectConversationBoundary()
-   * を呼ぶ（Connect自体の実装・重複排除の仕組みには一切触れない）。
+   * 終了済み会話からの新規開始と同じ性質を持つため、同様にrunConversationBoundary()
+   * を呼ぶ（Capture・Connect自体の実装には一切触れない）。
    */
   async function handleEndConversation() {
     setEndingConversation(true);
     try {
-      // バックグラウンドで実行中のCaptureが残っていれば完了を待つ（memoryObjectsが
-      // 最新状態になってから確認できるようにするため）。この時点ではまだ新しい
-      // Conversationへ切り替えないため、captureQueueRef.current自体は上書きしない。
-      const latestMemoryObjects = await captureQueueRef.current;
-
       const endedConversation: Conversation = {
         ...latestConversationRef.current,
         endedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
-      // 新しいMemoryObjectは作らない。既存のConversation保存だけを行う
-      // （persistCaptureはMemoryObject配列が空でも問題なく動く既存関数で、
-      // Capture専用ではなく会話の保存処理として素直に再利用できる）。
-      await persistCapture(vaultHandle, endedConversation, []);
-
-      // UI改善：endedAtの反映（＝ボタンをJSXから消す条件）を、persistCapture成功後・
-      // 結果カード表示の直前まで遅らせる。以前はpersistCapture完了前にsetConversationして
-      // いたため、「ボタンが消えてから結果カードが出るまで」に何も表示されない空白区間が
-      // 生じていた（処理中なのか押せたのかエラーなのか分からない、という指摘）。
-      // 待機対象・保存処理の順序は変更していない（保存完了前に何かを表示することはない）。
+      // Conversation本文（endedAt付き）をCaptureより先に保存する。これにより、
+      // 直後のCapture（AI呼び出し）が失敗したりブラウザが閉じられたりしても、
+      // 会話は「終了した」状態のままConversation本文自体は確実に保存されている
+      // （Capture＝Memory生成の成否とは独立した保存。今回のConversation保存/Capture
+      // 責務分離の目的そのもの）。
+      await persistConversation(vaultHandle, endedConversation);
+      // refだけ先に更新する（React stateはまだここでは更新しない）。
+      // runConversationBoundaryはこのrefをCapture対象・成功時のマージ元として読むため、
+      // 先にendedAt付きにしておく必要がある（そうしないと、Capture成功時に
+      // runConversationBoundaryが書き戻すConversationからendedAtが消えてしまう）。
       latestConversationRef.current = endedConversation;
-      setConversation(endedConversation);
 
-      connectConversationBoundary(captureQueueRef.current);
+      // Conversation Boundary。runConversationBoundaryが内部でCapture・Memory保存・
+      // Connectまで完了させる（未Captureの場合のみ実行、既にCapture済みなら何もしない）。
+      const latestMemoryObjects = await runConversationBoundary(endedConversation);
+
+      // UI改善：conversation stateへの反映（＝ボタンをJSXから消す条件）を、ここまで
+      // 遅らせる。以前はendedAtの反映がCapture開始前に起きていたため、「ボタンが
+      // 消えてから結果カードが出るまで」に何も表示されない空白区間が生じていた
+      // （処理中なのか押せたのかエラーなのか分からない、という指摘）。
+      // latestConversationRef.currentをそのまま読むことで、runConversationBoundaryが
+      // Capture成功時に書き戻したstatus/memoryObjectIds等も含めて反映する。
+      setConversation(latestConversationRef.current);
 
       setEndedConversationMemories(latestMemoryObjects);
     } catch (error) {
@@ -903,7 +951,7 @@ export default function ChatScreen() {
    * 追記せず新規作成する」分岐と全く同じリセット処理を再利用する。
    */
   function handleSwitchPersona(nextPersona: Persona) {
-    connectConversationBoundary(captureQueueRef.current);
+    void runConversationBoundary(latestConversationRef.current);
 
     const newConversation = createConversation(nextPersona);
     setConversation(newConversation);
@@ -911,7 +959,6 @@ export default function ChatScreen() {
     setPersona(nextPersona);
     setMemoryObjects([]);
     setEndedConversationMemories(null);
-    captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
     setInputResetKey((k) => k + 1);
@@ -927,14 +974,13 @@ export default function ChatScreen() {
    * 渡す（トップ画面自体はこの値を表示に使わない）。
    */
   function handleGoToTop() {
-    connectConversationBoundary(captureQueueRef.current);
+    void runConversationBoundary(latestConversationRef.current);
 
     const newConversation = createConversation(persona);
     setConversation(newConversation);
     latestConversationRef.current = newConversation;
     setMemoryObjects([]);
     setEndedConversationMemories(null);
-    captureQueueRef.current = Promise.resolve([]);
     setReflectionStatus("idle");
     setReflectionText("");
     setInputResetKey((k) => k + 1);
@@ -971,14 +1017,13 @@ export default function ChatScreen() {
     // （問いかけ自体のturnが乗っていない）参照してしまう。
     let baseConversation = latestConversationRef.current;
     if (baseConversation.endedAt) {
-      connectConversationBoundary(captureQueueRef.current);
+      void runConversationBoundary(baseConversation);
 
       baseConversation = createConversation(activePersona);
       setConversation(baseConversation);
       latestConversationRef.current = baseConversation;
       setMemoryObjects([]);
       setEndedConversationMemories(null);
-      captureQueueRef.current = Promise.resolve([]);
       setReflectionStatus("idle");
       setReflectionText("");
     }
@@ -1052,9 +1097,13 @@ export default function ChatScreen() {
       latestConversationRef.current = updated;
       setStreamingText("");
 
-      // Captureの完了を待たず、ここで次の入力を可能にする。Captureはバックグラウンドで継続する。
+      // Conversation本文の保存とMemory生成（Capture）は分離する（今回の再設計）。
+      // ここではConversation本文だけを保存し、Captureの成否とは無関係に会話が
+      // 必ず残るようにする。Memory生成はConversation Boundary（終了操作・persona切替・
+      // トップへ戻る等）でのみrunConversationBoundaryが行う（毎ターンは呼ばない）。
+      // 保存の完了を待たず、ここで次の入力を可能にする。
       setBusy(false);
-      enqueueCapture(updated);
+      void persistConversation(vaultHandle, updated);
     } catch (error) {
       console.error("Failed to send message", error);
       setSendStatus(error instanceof ChatRequestError && error.status === 401 ? "authError" : "error");
@@ -1131,41 +1180,25 @@ export default function ChatScreen() {
             : "この端末のみ";
 
   return (
-    <div
-      className={`flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)] ${
-        keyboardVisible ? "" : "overflow-hidden"
-      }`}
-    >
+    <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
       {/*
-        footer下部の「これまでの記憶を見る／読み込む／設定」アイコンは、視覚的には
-        16px程度の行の中に40×40pxのタップ領域を`-my-3`（負のmargin）で確保している。
-        このボタン自身のボックスは意図的にこのroot（h-dvh、画面と同じ高さ）の下端より
-        約4px下にはみ出す構造になっており、他に祖先でclipする要素がないと、その4pxが
-        document全体のscrollable overflow（documentElement.scrollHeightがclientHeightより
-        4px大きくなる）として現れ、画面が本来不要な4pxだけ縦スクロール可能になっていた
-        （会話画面では、この4px分だけ自動的にscrollYがずれてページ全体が上に4pxシフトして
-        見える症状も確認されている）。
-        `overflow-hidden`は、はみ出したその4px（＝そもそも画面外で実際には
-        タップできていなかった範囲）だけをrootの外周でclipするためのもの。
-        rootの上端(y=0)はボタンの上端(-my-3で上にもはみ出す分)より十分上にあるため、
-        通常時に画面内で実際にタップできている40pxのタップ領域（上下とも）には影響しない
-        （実機・サンドボックス双方で計測済み）。
-
-        ただし、これを常時適用すると別の問題が起きることが分かった：Android Chromeの
-        「フォーカスした入力欄が隠れる場合に自動でその要素が見えるようスクロールする」
-        というネイティブ挙動は、ページ（このroot）がスクロール可能であることに依存して
-        いる。ソフトウェアキーボード表示でビューポートが縮み、main＋footerの実コンテンツが
-        縮んだビューポートに収まりきらなくなった場合、常時overflow-hiddenだとこの
-        ネイティブスクロールが起動できず、入力欄がキーボードの下に隠れたまま
-        フォーカスできてしまう（実機で確認された回帰）。
-
-        そのため、既存の`keyboardVisible`（389〜417行目のvisualViewport差分検知、
-        検知ロジック自体は変更していない）に連動させ、キーボード表示中だけ
-        `overflow-hidden`を外してページのスクロールを許可し、キーボードを閉じたら
-        即座に`overflow-hidden`を再適用して4px overflow対策に戻す。
-        ボタンのサイズ・`-my-3`・padding/gap・mobile fade・PTR関連コード・
-        keyboardVisibleの検知ロジック本体・visualViewport処理・mainのoverflow-y-auto・
-        ChatInputの構造は一切変更していない。
+        Phase A（Android実機キーボード入力の完全復旧）：rootのoverflowは
+        f818292時点の状態（overflow制限なし）へ戻した。
+        経緯：footerアイコンの`-my-3`による4pxの静的overflow対策として、一時
+        `overflow-hidden`を常時（aac828f）→keyboardVisible時のみ解除（0a5ed37）
+        という形で追加していたが、実機検証の結果、ソフトウェアキーボード表示時に
+        Android Chromeの「フォーカスした入力欄が隠れる場合に自動でその要素が
+        見えるようスクロールする」というネイティブ挙動を阻害する回帰が発生した
+        （keyboardVisible判定はvisualViewportのresizeイベント後に非同期で確定するため、
+        フォーカス直後にブラウザが一度だけ試みるスクロールの瞬間には、まだ
+        overflow-hiddenが効いており、ネイティブスクロールが失敗する。ブラウザは
+        失敗したスクロールを後から再試行しないため、入力欄がキーボードの下に
+        隠れたままになっていた）。
+        4px overflow問題そのものはPhase Aとは切り離し、キーボード入力の完全復旧を
+        最優先として、rootのoverflow制御は撤去した。footerボタンの`-my-3`・
+        keyboardVisibleの検知ロジック本体・visualViewport処理・mainの
+        overflow-y-auto・padding/gap・mobile fade・ChatInputの構造は
+        一切変更していない。
       */}
       {/*
         スマホでは、スクロール末尾（＝会話の最後の文章）とfooter（入力欄）の境界が
@@ -1363,11 +1396,11 @@ export default function ChatScreen() {
               本日はここまで
             </button>
             {/*
-              UI改善（速度改善ではない）：以前はreflectionStatus==="generating"の
-              区間（＝captureQueueRef.currentの解決後、/api/reflect呼び出し中）だけに
-              テキストを出していたため、ボタン押下からcapture待ちが終わるまでの数秒間、
-              画面が完全に無反応に見えていた。"capturing"を追加し、ボタン押下の直後から
-              何かしらの文言を出し続けるようにした。文言は段階で変える：capture待ち中は
+              UI改善（速度改善ではない）：以前はreflectionStatus==="generating"の区間
+              （＝runConversationBoundaryの解決後、/api/reflect呼び出し中）だけにテキストを
+              出していたため、ボタン押下からcapture待ちが終わるまでの数秒間、画面が完全に
+              無反応に見えていた。"capturing"を追加し、ボタン押下の直後から何かしらの文言を
+              出し続けるようにした。文言は段階で変える：capture待ち中は
               「記憶を確認しています…」（実際に振り返りをまだ生成していないため）、
               /api/reflect呼び出し中だけ「今日を振り返っています…」のまま。
             */}
