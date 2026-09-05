@@ -17,6 +17,7 @@
 "use client";
 
 import { getAllConversations, getAllMemoryObjects, getAllSources, loadVaultHandle, saveVaultHandle } from "./db";
+import { logTimingEvent } from "./debugTimingLog";
 import type { Conversation, MemoryObject, Source } from "./types";
 import {
   conversationToMarkdown,
@@ -205,15 +206,19 @@ function enqueueVaultWrite<T>(task: () => Promise<T>): Promise<T> {
   const seq = ++vaultWriteSeq;
   const enqueuedAt = Date.now();
   console.log(`[Vault] write:enqueue seq=${seq}`);
+  logTimingEvent("Vault write:enqueue", { seq });
 
   const timedTask = async () => {
     const waitMs = Date.now() - enqueuedAt;
     console.log(`[Vault] write:start seq=${seq} waitMs=${waitMs}`);
+    logTimingEvent("Vault write:start", { seq, waitMs });
     const startedAt = Date.now();
     try {
       return await task();
     } finally {
-      console.log(`[Vault] write:end seq=${seq} durationMs=${Date.now() - startedAt}`);
+      const durationMs = Date.now() - startedAt;
+      console.log(`[Vault] write:end seq=${seq} durationMs=${durationMs}`);
+      logTimingEvent("Vault write:end", { seq, durationMs });
     }
   };
 
@@ -346,6 +351,7 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   ]);
   const totalCount = conversations.length + memoryObjects.length + sources.length;
   console.log(`[Vault] flush:start count=${totalCount}`);
+  logTimingEvent("Vault flush:start", { count: totalCount });
   for (const conversation of conversations) {
     await writeConversationMarkdown(root, conversation);
   }
@@ -355,7 +361,9 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   for (const source of sources) {
     await writeSourceMarkdown(root, source);
   }
-  console.log(`[Vault] flush:end count=${totalCount} durationMs=${Date.now() - flushStart}`);
+  const flushDurationMs = Date.now() - flushStart;
+  console.log(`[Vault] flush:end count=${totalCount} durationMs=${flushDurationMs}`);
+  logTimingEvent("Vault flush:end", { count: totalCount, durationMs: flushDurationMs });
 }
 
 export function isVaultSupported() {
@@ -497,6 +505,7 @@ export interface VaultScanResult {
 export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Promise<VaultScanResult> {
   const scanStart = Date.now();
   console.log(`[Vault] scan:start`);
+  logTimingEvent("Vault scan:start");
   let skippedCount = 0;
 
   const [conversationFiles, memoryFiles, sourceFiles] = await Promise.all([
@@ -504,9 +513,10 @@ export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Prom
     collectVaultMarkdown(root, "Memories"),
     collectVaultMarkdown(root, "Sources"),
   ]);
-  console.log(
-    `[Vault] scan:end fileCount=${conversationFiles.length + memoryFiles.length + sourceFiles.length} durationMs=${Date.now() - scanStart}`
-  );
+  const scanFileCount = conversationFiles.length + memoryFiles.length + sourceFiles.length;
+  const scanDurationMs = Date.now() - scanStart;
+  console.log(`[Vault] scan:end fileCount=${scanFileCount} durationMs=${scanDurationMs}`);
+  logTimingEvent("Vault scan:end", { fileCount: scanFileCount, durationMs: scanDurationMs });
 
   const conversationsById = new Map<string, Conversation>();
   for (const raw of conversationFiles) {

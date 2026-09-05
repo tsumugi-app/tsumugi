@@ -8,6 +8,7 @@
 
 import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObject } from "./db";
+import { logTimingEvent } from "./debugTimingLog";
 import { writeConversationMarkdown, writeMemoryObjectMarkdown } from "./vault";
 import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "./retrieval";
 import { SCHEMA_VERSION } from "./types";
@@ -132,6 +133,7 @@ async function extractMemories(
   });
   // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。原因調査が終わり次第削除すること。
   console.log(`[Capture] request:start`);
+  logTimingEvent("Capture request:start");
   const res = await fetch("/api/capture", {
     method: "POST",
     headers: {
@@ -301,6 +303,7 @@ export async function persistConversation(
   // 原因調査が終わり次第削除すること。
   const persistStart = Date.now();
   console.log(`[Conversation] persist:start`);
+  logTimingEvent("Conversation persist:start");
   if (vaultHandle) {
     try {
       await writeConversationMarkdown(vaultHandle, conversation);
@@ -317,7 +320,9 @@ export async function persistConversation(
     conversationFailed = true;
   }
 
-  console.log(`[Conversation] persist:end durationMs=${Date.now() - persistStart}`);
+  const persistDurationMs = Date.now() - persistStart;
+  console.log(`[Conversation] persist:end durationMs=${persistDurationMs}`);
+  logTimingEvent("Conversation persist:end", { durationMs: persistDurationMs });
   return { conversationFailed };
 }
 

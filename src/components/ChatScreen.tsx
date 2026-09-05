@@ -45,6 +45,8 @@ import { useWaitingMessage } from "@/lib/useWaitingMessage";
 import ApiKeySetup from "./ApiKeySetup";
 import SettingsPanel from "./SettingsPanel";
 import ImportPanel from "./ImportPanel";
+// TEMP-TEST：20〜40秒の異常遅延の原因切り分け用診断パネル。`?debugLog=1`以外では何も描画しない。
+import DebugTimingPanel from "./DebugTimingPanel";
 import HistoryPanel from "./HistoryPanel";
 
 /** ApiKeySetupと同じく、chatで選べるproviderは今回この2つに限定する（Claudeは型のみ）。 */
@@ -1768,6 +1770,7 @@ export default function ChatScreen() {
           />
         </div>
       )}
+      <DebugTimingPanel />
     </div>
   );
 }
