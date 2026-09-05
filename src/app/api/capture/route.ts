@@ -172,6 +172,23 @@ function computeThinkingBudget(transcript: string): number {
   return 768;
 }
 
+/**
+ * TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用。
+ * 「Function内部の前処理」「Gemini呼び出し」「Gemini後の後処理」の3区間の
+ * 所要ミリ秒だけをServer-Timing応答ヘッダとして返す（標準のResponse Timing API・
+ * ブラウザのNetworkタブから確認できる）。区間名と数値以外は一切含めない
+ * （会話内容・transcript・Memory本文・summary・keyword・prompt本文・APIキー・
+ * 個人情報は絶対に含めない）。計測対象はcapture/reflectの2 routeのみ
+ * （chat/prompt/connectは今回対象外）。原因調査が終わり次第削除すること。
+ */
+function buildServerTimingHeader(requestStart: number, geminiCallStart: number, geminiCallEnd: number): string {
+  const responseReturn = Date.now();
+  const preGemini = geminiCallStart - requestStart;
+  const gemini = geminiCallEnd - geminiCallStart;
+  const postGemini = responseReturn - geminiCallEnd;
+  return `pre-gemini;dur=${preGemini}, gemini;dur=${gemini}, post-gemini;dur=${postGemini}`;
+}
+
 const MEMORIES_SCHEMA: AISchema = {
   type: "object",
   properties: {
@@ -217,6 +234,13 @@ const MEMORIES_SCHEMA: AISchema = {
 
 export async function POST(request: Request) {
   const providerName = resolveProviderForFeature("capture");
+  // TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用に、
+  // Function内部処理／Gemini呼び出し／後処理の3区間だけを計測する。会話内容・
+  // transcript・Memory本文・summary・keyword・prompt本文・APIキー・個人情報は
+  // 一切含めず、区間ごとの経過ミリ秒だけをServer-Timing応答ヘッダとして返す
+  // （buildServerTimingHeader参照）。thinkingBudget・プロンプト・処理順序・
+  // ロジック自体は一切変更していない。
+  const requestStart = Date.now();
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
     return Response.json(
@@ -240,6 +264,7 @@ export async function POST(request: Request) {
 
   const provider = getProvider(providerName);
   let response: { text: string };
+  const geminiCallStart = Date.now();
   try {
     response = await provider.generateStructured({
       model: resolveModel(providerName),
@@ -256,6 +281,7 @@ export async function POST(request: Request) {
       { status: 502 }
     );
   }
+  const geminiCallEnd = Date.now();
 
   const text = response.text;
   if (!text) {
@@ -267,7 +293,9 @@ export async function POST(request: Request) {
 
   try {
     const parsed = JSON.parse(text);
-    return Response.json(parsed);
+    return Response.json(parsed, {
+      headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) },
+    });
   } catch {
     return Response.json(
       { error: "Failed to parse AI response as JSON." },

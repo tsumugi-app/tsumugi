@@ -71,7 +71,25 @@ const PERSONA_TONE: Record<Persona, string> = {
   analyst: "冷静に、事実を丁寧に見つめるような文体で書いてください。",
 };
 
+/**
+ * TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用。
+ * 「Function内部の前処理」「Gemini呼び出し」「Gemini後の後処理」の3区間の
+ * 所要ミリ秒だけをServer-Timing応答ヘッダとして返す（標準のResponse Timing API・
+ * ブラウザのNetworkタブから確認できる）。区間名と数値以外は一切含めない
+ * （会話内容・summary・content・keyword・APIキー・個人情報は絶対に含めない）。
+ * 計測対象はcapture/reflectの2 routeのみ（chat/prompt/connectは今回対象外）。
+ * 原因調査が終わり次第削除すること。
+ */
+function buildServerTimingHeader(requestStart: number, geminiCallStart: number, geminiCallEnd: number): string {
+  const responseReturn = Date.now();
+  const preGemini = geminiCallStart - requestStart;
+  const gemini = geminiCallEnd - geminiCallStart;
+  const postGemini = responseReturn - geminiCallEnd;
+  return `pre-gemini;dur=${preGemini}, gemini;dur=${gemini}, post-gemini;dur=${postGemini}`;
+}
+
 export async function POST(request: Request) {
+  const requestStart = Date.now();
   const providerName = resolveProviderForFeature("reflection");
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
@@ -97,6 +115,7 @@ export async function POST(request: Request) {
 
   const provider = getProvider(providerName);
   let response: { text: string };
+  const geminiCallStart = Date.now();
   try {
     response = await provider.generateText({
       model: resolveModel(providerName),
@@ -113,11 +132,15 @@ export async function POST(request: Request) {
       { status: 502 }
     );
   }
+  const geminiCallEnd = Date.now();
 
   const reflection = response.text?.trim();
   if (!reflection) {
     return Response.json({ error: "AI did not return a reflection." }, { status: 502 });
   }
 
-  return Response.json({ reflection });
+  return Response.json(
+    { reflection },
+    { headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) } }
+  );
 }
