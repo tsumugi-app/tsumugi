@@ -191,8 +191,33 @@ async function readJSON<T>(dir: FileSystemDirectoryHandle, name: string, fallbac
  */
 let vaultWriteQueue: Promise<void> = Promise.resolve();
 
+/**
+ * TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用。
+ * Vault書き込みキュー（vaultWriteQueue）のFIFO直列化そのものが、モバイルでの
+ * 終了処理を待たせているのではないかという仮説を実測で検証するための、
+ * enqueue時刻・実際のwrite開始時刻・完了時刻だけを出す最小限のログ。
+ * 会話内容・Memory本文・ファイルパス・IDは一切出さない（件数・経過時間のみ）。
+ * 原因調査が終わり次第削除すること。
+ */
+let vaultWriteSeq = 0;
+
 function enqueueVaultWrite<T>(task: () => Promise<T>): Promise<T> {
-  const run = vaultWriteQueue.then(task, task);
+  const seq = ++vaultWriteSeq;
+  const enqueuedAt = Date.now();
+  console.log(`[Vault] write:enqueue seq=${seq}`);
+
+  const timedTask = async () => {
+    const waitMs = Date.now() - enqueuedAt;
+    console.log(`[Vault] write:start seq=${seq} waitMs=${waitMs}`);
+    const startedAt = Date.now();
+    try {
+      return await task();
+    } finally {
+      console.log(`[Vault] write:end seq=${seq} durationMs=${Date.now() - startedAt}`);
+    }
+  };
+
+  const run = vaultWriteQueue.then(timedTask, timedTask);
   vaultWriteQueue = run.then(
     () => undefined,
     () => undefined
@@ -313,11 +338,14 @@ export function writeMemoryObjectMarkdown(root: FileSystemDirectoryHandle, memor
  * Source基盤（最小構成）も同じ扱いにする：IndexedDBにはあるがVaultに無いSourceを書き戻す。
  */
 export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
+  const flushStart = Date.now();
   const [conversations, memoryObjects, sources] = await Promise.all([
     getAllConversations(),
     getAllMemoryObjects(),
     getAllSources(),
   ]);
+  const totalCount = conversations.length + memoryObjects.length + sources.length;
+  console.log(`[Vault] flush:start count=${totalCount}`);
   for (const conversation of conversations) {
     await writeConversationMarkdown(root, conversation);
   }
@@ -327,6 +355,7 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   for (const source of sources) {
     await writeSourceMarkdown(root, source);
   }
+  console.log(`[Vault] flush:end count=${totalCount} durationMs=${Date.now() - flushStart}`);
 }
 
 export function isVaultSupported() {
@@ -466,6 +495,8 @@ export interface VaultScanResult {
  * Memoriesは新形式（1ファイルに複数エントリ）・旧形式（1ファイル1エントリ）のどちらも読める。
  */
 export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Promise<VaultScanResult> {
+  const scanStart = Date.now();
+  console.log(`[Vault] scan:start`);
   let skippedCount = 0;
 
   const [conversationFiles, memoryFiles, sourceFiles] = await Promise.all([
@@ -473,6 +504,9 @@ export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Prom
     collectVaultMarkdown(root, "Memories"),
     collectVaultMarkdown(root, "Sources"),
   ]);
+  console.log(
+    `[Vault] scan:end fileCount=${conversationFiles.length + memoryFiles.length + sourceFiles.length} durationMs=${Date.now() - scanStart}`
+  );
 
   const conversationsById = new Map<string, Conversation>();
   for (const raw of conversationFiles) {

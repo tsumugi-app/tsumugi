@@ -130,6 +130,8 @@ async function extractMemories(
     summary: memory.summary,
     keywords: memory.keywords,
   });
+  // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。原因調査が終わり次第削除すること。
+  console.log(`[Capture] request:start`);
   const res = await fetch("/api/capture", {
     method: "POST",
     headers: {
@@ -295,6 +297,10 @@ export async function persistConversation(
   vaultHandle: FileSystemDirectoryHandle | null,
   conversation: Conversation
 ): Promise<PersistConversationResult> {
+  // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。件数・経過時間のみ（会話内容は出さない）。
+  // 原因調査が終わり次第削除すること。
+  const persistStart = Date.now();
+  console.log(`[Conversation] persist:start`);
   if (vaultHandle) {
     try {
       await writeConversationMarkdown(vaultHandle, conversation);
@@ -311,6 +317,7 @@ export async function persistConversation(
     conversationFailed = true;
   }
 
+  console.log(`[Conversation] persist:end durationMs=${Date.now() - persistStart}`);
   return { conversationFailed };
 }
 
