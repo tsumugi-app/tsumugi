@@ -51,6 +51,19 @@ interface TsumugiDB extends DBSchema {
     key: string;
     value: string;
   };
+  /**
+   * TEMP-TEST：Android実機で確認された「起動時flushPendingToVaultが、変更の無い
+   * データまで毎回無条件で全件Vaultへ書き直し、ユーザー操作の保存を待たせる」問題への対応。
+   * 「このid（Conversation/MemoryObject/Source）は、どのupdatedAtまでは確実にVaultへの
+   * 書き込みに成功したか」だけを記録する台帳。Vault Markdown自体の内容は一切読まない
+   * （読んで比較するとAndroidの遅いI/Oで新たなコストになるため）。
+   * key: `conversation:<id>` / `memory:<id>` / `source:<id>`。value: 成功時のupdatedAt。
+   * 必ずVaultへの書き込みが実際に成功した後にのみ書き込むこと（楽観的な事前記録は禁止）。
+   */
+  vaultSyncState: {
+    key: string;
+    value: string;
+  };
 }
 
 export interface ConnectStateRecord {
@@ -62,7 +75,7 @@ let dbPromise: Promise<IDBPDatabase<TsumugiDB>> | null = null;
 
 function getDB() {
   if (!dbPromise) {
-    dbPromise = openDB<TsumugiDB>("tsumugi", 4, {
+    dbPromise = openDB<TsumugiDB>("tsumugi", 5, {
       upgrade(db, oldVersion) {
         if (oldVersion < 1) {
           const conversations = db.createObjectStore("conversations", {
@@ -88,6 +101,9 @@ function getDB() {
             keyPath: "id",
           });
           sources.createIndex("by-createdAt", "createdAt");
+        }
+        if (oldVersion < 5) {
+          db.createObjectStore("vaultSyncState");
         }
       },
     });
@@ -166,7 +182,34 @@ export async function clearMemoryData() {
     db.clear("memoryObjects"),
     db.clear("sources"),
     db.clear("connectState"),
+    db.clear("vaultSyncState"),
   ]);
+}
+
+/**
+ * TEMP-TEST：Vault同期済み台帳（vaultSyncState）のCRUD。key/valueの意味は
+ * TsumugiDBのvaultSyncStoreのコメントを参照。呼び出し元（vault.ts）の責務として、
+ * setVaultSyncStateは必ずVaultへの実書き込みが成功した後にのみ呼ぶこと。
+ */
+export async function getVaultSyncState(key: string): Promise<string | undefined> {
+  const db = await getDB();
+  return db.get("vaultSyncState", key);
+}
+
+export async function setVaultSyncState(key: string, updatedAt: string): Promise<void> {
+  const db = await getDB();
+  await db.put("vaultSyncState", updatedAt, key);
+}
+
+/**
+ * 新しいVaultフォルダを選択した直後にのみ呼ぶこと（同じVaultへの再認可では呼ばない）。
+ * 台帳はどのフォルダに対する同期状況かを区別しないため、フォルダが変わった場合に
+ * クリアしないと「新フォルダには実際は書き込まれていないのに同期済み」と誤判定し、
+ * 書き込みが漏れる事故につながる。
+ */
+export async function clearVaultSyncState(): Promise<void> {
+  const db = await getDB();
+  await db.clear("vaultSyncState");
 }
 
 export async function saveVaultHandle(handle: FileSystemDirectoryHandle) {

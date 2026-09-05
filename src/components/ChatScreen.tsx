@@ -18,6 +18,7 @@ import {
 import {
   clearApiKey,
   clearMemoryData,
+  clearVaultSyncState,
   getAllConversations,
   getAllMemoryObjects,
   getAllSources,
@@ -630,6 +631,12 @@ export default function ChatScreen() {
       const handle = await chooseVaultDirectory();
       setVaultHandle(handle);
       setVaultStatus("connected");
+      // 新しいVaultフォルダを選択した場合のみクリアする（同じVaultへの再認可＝
+      // handleReauthorizeVaultでは呼ばない）。Vault同期済み台帳はどのフォルダに対する
+      // 同期状況かを区別しないため、フォルダが変わったのにクリアしないと、
+      // 新フォルダには実際は書き込まれていないデータを「同期済み」と誤判定し、
+      // flushPendingToVaultがそのitemの書き込みをスキップしてしまう（データ消失事故）。
+      await clearVaultSyncState();
       await flushPendingToVault(handle);
       await checkForRestoreCandidate(handle);
     } catch (error) {

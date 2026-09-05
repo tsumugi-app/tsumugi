@@ -16,7 +16,15 @@
  */
 "use client";
 
-import { getAllConversations, getAllMemoryObjects, getAllSources, loadVaultHandle, saveVaultHandle } from "./db";
+import {
+  getAllConversations,
+  getAllMemoryObjects,
+  getAllSources,
+  getVaultSyncState,
+  loadVaultHandle,
+  saveVaultHandle,
+  setVaultSyncState,
+} from "./db";
 import { logTimingEvent } from "./debugTimingLog";
 import type { Conversation, MemoryObject, Source } from "./types";
 import {
@@ -177,57 +185,150 @@ async function readJSON<T>(dir: FileSystemDirectoryHandle, name: string, fallbac
  * （実機のwriteMemoryObjectMarkdownで再現・確認済み）。
  *
  * 対策として、Vault書き込みの実体（writeConversationMarkdown/writeSourceMarkdown/
- * writeMemoryObjectMarkdown）を、モジュールスコープの単一キューを通じて直列化する。
- * 呼び出し元がどのファイル・どの日付を書こうとしているかに関わらず、常に「1つの
- * read-modify-writeが完全に終わってから次が始まる」順序を保証する（同じファイルだけを
- * 対象にした細かいロックにしないのは、対象ファイルの特定自体に事前のI/Oが必要で
- * 複雑になるため。Vault書き込みは頻度が低く、全体を1本の列に直列化しても実用上の
- * 体感速度への影響は小さいと判断した）。
+ * writeMemoryObjectMarkdown）を、モジュールスコープの単一の実行主体を通じて直列化する。
+ * 呼び出し元がどのファイル・どの日付を書こうとしているかに関わらず、「同時に実行される
+ * Vault writeは常に1件だけ」であることを保証する（同じファイルだけを対象にした細かい
+ * ロックにしないのは、対象ファイルの特定自体に事前のI/Oが必要で複雑になるため）。
  *
  * AI呼び出し（Capture/ConnectのGemini API呼び出し）はこのキューに含めない。直列化するのは
  * 実際にファイルを読み書きする瞬間だけであり、Capture/Connect全体を待たせることはない。
  *
  * 1つの書き込みが失敗しても、キュー自体は次の書き込みへ進む（失敗を握りつぶさず、
- * 呼び出し元へは例外をそのまま伝播させた上で、キューの直列化は継続する）。
+ * 呼び出し元へは例外をそのまま伝播させた上で、キューの処理は継続する）。
+ *
+ * 優先度付きキュー（Beta修正）：Android実機で、起動時のflushPendingToVault（背景同期、
+ * 変更が無くても毎回全件）が、ユーザーの終了操作によるConversation保存と同じ列に並び、
+ * 数秒〜数十秒待たされる問題が実測で確認された。対策として、実行順を選ぶ際だけ
+ * "interactive"を"background"より優先する（実行中の1件を中断・追い越しすることはない。
+ * File System Access APIの書き込みを安全に中断する方法が無いため）。
+ * 「同時に実行されるのは常に1件だけ」という同時書き込み衝突防止の性質は変更しない
+ * （index.json・Memoryの日別ファイルのような複数呼び出し元が共有するファイルへ、
+ * 2つの書き込みが並行してread-modify-writeする事故は、この方式でも発生しない）。
+ *
+ * 同一id優先順位の保護：もし「起動時flushが捕まえた古いスナップショット」と「その後の
+ * ユーザー操作による新しい保存」が、たまたま同じConversation/MemoryObject/Sourceを
+ * 対象にしていた場合、優先度だけで単純にinteractiveを先に実行すると、後から実行される
+ * 古いbackground write（stale snapshot）が新しい内容を上書きしてしまう（データの
+ * 逆行）。これを防ぐため、各itemは対象の`conflictKey`（`kind:id`）を持ち、同じ
+ * conflictKeyを持つ、より早くenqueueされたitemが存在する場合は、interactiveであっても
+ * 追い越しを許可しない（enqueue順を維持する）。無関係なid同士でのみ優先度が効く。
  */
-let vaultWriteQueue: Promise<void> = Promise.resolve();
+export type VaultWritePriority = "interactive" | "background";
+
+interface VaultWriteQueueItem {
+  priority: VaultWritePriority;
+  /** 同一の対象（同じConversation/MemoryObject/Source）を識別するキー。無ければnull。 */
+  conflictKey: string | null;
+  run: () => Promise<void>;
+}
+
+const vaultWriteQueueItems: VaultWriteQueueItem[] = [];
+let vaultWriteProcessing = false;
+
+/**
+ * interactiveを優先しつつ、同じconflictKeyを持つより古いitemを追い越さない。
+ * 適格なinteractiveが無ければ、先頭（＝最も古いitem）をFIFOで選ぶ。
+ */
+function pickNextVaultWriteIndex(): number {
+  const seenConflictKeys = new Set<string>();
+  for (let i = 0; i < vaultWriteQueueItems.length; i++) {
+    const item = vaultWriteQueueItems[i];
+    const blockedBySameTarget = item.conflictKey !== null && seenConflictKeys.has(item.conflictKey);
+    if (item.priority === "interactive" && !blockedBySameTarget) {
+      return i;
+    }
+    if (item.conflictKey !== null) seenConflictKeys.add(item.conflictKey);
+  }
+  return vaultWriteQueueItems.length > 0 ? 0 : -1;
+}
+
+function processVaultWriteQueue(): void {
+  if (vaultWriteProcessing) return;
+  const index = pickNextVaultWriteIndex();
+  if (index === -1) return;
+
+  const [item] = vaultWriteQueueItems.splice(index, 1);
+  vaultWriteProcessing = true;
+  // item.run()自体は内部で例外を握りつぶし（reject/resolveは外側のPromiseへ伝える）、
+  // ここでは常にfulfillするため、1件の失敗がキューの進行を止めることはない。
+  void item.run().finally(() => {
+    vaultWriteProcessing = false;
+    processVaultWriteQueue();
+  });
+}
 
 /**
  * TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用。
- * Vault書き込みキュー（vaultWriteQueue）のFIFO直列化そのものが、モバイルでの
- * 終了処理を待たせているのではないかという仮説を実測で検証するための、
  * enqueue時刻・実際のwrite開始時刻・完了時刻だけを出す最小限のログ。
  * 会話内容・Memory本文・ファイルパス・IDは一切出さない（件数・経過時間のみ）。
  * 原因調査が終わり次第削除すること。
  */
 let vaultWriteSeq = 0;
 
-function enqueueVaultWrite<T>(task: () => Promise<T>): Promise<T> {
+function enqueueVaultWrite<T>(
+  task: () => Promise<T>,
+  priority: VaultWritePriority = "interactive",
+  conflictKey: string | null = null
+): Promise<T> {
   const seq = ++vaultWriteSeq;
   const enqueuedAt = Date.now();
-  console.log(`[Vault] write:enqueue seq=${seq}`);
-  logTimingEvent("Vault write:enqueue", { seq });
+  console.log(`[Vault] write:enqueue seq=${seq} priority=${priority}`);
+  logTimingEvent("Vault write:enqueue", { seq, background: priority === "background" ? 1 : 0 });
 
-  const timedTask = async () => {
-    const waitMs = Date.now() - enqueuedAt;
-    console.log(`[Vault] write:start seq=${seq} waitMs=${waitMs}`);
-    logTimingEvent("Vault write:start", { seq, waitMs });
-    const startedAt = Date.now();
-    try {
-      return await task();
-    } finally {
-      const durationMs = Date.now() - startedAt;
-      console.log(`[Vault] write:end seq=${seq} durationMs=${durationMs}`);
-      logTimingEvent("Vault write:end", { seq, durationMs });
-    }
-  };
+  return new Promise<T>((resolve, reject) => {
+    const run = async () => {
+      const waitMs = Date.now() - enqueuedAt;
+      console.log(`[Vault] write:start seq=${seq} waitMs=${waitMs} priority=${priority}`);
+      logTimingEvent("Vault write:start", { seq, waitMs });
+      const startedAt = Date.now();
+      try {
+        const result = await task();
+        resolve(result);
+      } catch (error) {
+        reject(error);
+      } finally {
+        const durationMs = Date.now() - startedAt;
+        console.log(`[Vault] write:end seq=${seq} durationMs=${durationMs}`);
+        logTimingEvent("Vault write:end", { seq, durationMs });
+      }
+    };
+    vaultWriteQueueItems.push({ priority, conflictKey, run });
+    processVaultWriteQueue();
+  });
+}
 
-  const run = vaultWriteQueue.then(timedTask, timedTask);
-  vaultWriteQueue = run.then(
-    () => undefined,
-    () => undefined
-  );
-  return run;
+type VaultSyncKind = "conversation" | "memory" | "source";
+
+function vaultSyncKeyFor(kind: VaultSyncKind, id: string): string {
+  return `${kind}:${id}`;
+}
+
+/**
+ * 同期済み台帳（vaultSyncState）へ、実際にVaultへの書き込みが成功した後にのみ記録する。
+ * 台帳の書き込み自体が失敗しても、Markdown書き込み自体は既に成功しているため、
+ * その成功をこの関数の失敗で握りつぶさない（ログに残すだけで例外は投げない）。
+ */
+async function markVaultSynced(kind: VaultSyncKind, id: string, updatedAt: string): Promise<void> {
+  try {
+    await setVaultSyncState(vaultSyncKeyFor(kind, id), updatedAt);
+  } catch (error) {
+    console.error(`[Tsumugi] failed to record vault sync state for ${kind}:`, error);
+  }
+}
+
+/**
+ * 台帳を確認し、既に同じupdatedAtで書き込み済みなら true（＝この項目のVault writeを
+ * スキップしてよい）を返す。台帳の読み取り自体に失敗した場合は「未同期」として安全側に
+ * 倒し、必ず書き込む（falseを返す）。Vault側のMarkdownファイルは一切読まない。
+ */
+async function isAlreadySyncedToVault(kind: VaultSyncKind, id: string, updatedAt: string): Promise<boolean> {
+  try {
+    const recorded = await getVaultSyncState(vaultSyncKeyFor(kind, id));
+    return recorded === updatedAt;
+  } catch (error) {
+    console.error(`[Tsumugi] failed to read vault sync state for ${kind}:`, error);
+    return false;
+  }
 }
 
 async function updateIndex(root: FileSystemDirectoryHandle, id: string, relativePath: string) {
@@ -259,8 +360,17 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
   await updateIndex(root, conversation.id, `Conversations/${fileName}`);
 }
 
-export function writeConversationMarkdown(root: FileSystemDirectoryHandle, conversation: Conversation) {
-  return enqueueVaultWrite(() => writeConversationMarkdownImpl(root, conversation));
+export async function writeConversationMarkdown(
+  root: FileSystemDirectoryHandle,
+  conversation: Conversation,
+  priority: VaultWritePriority = "interactive"
+): Promise<void> {
+  await enqueueVaultWrite(
+    () => writeConversationMarkdownImpl(root, conversation),
+    priority,
+    vaultSyncKeyFor("conversation", conversation.id)
+  );
+  await markVaultSynced("conversation", conversation.id, conversation.updatedAt);
 }
 
 /**
@@ -275,8 +385,13 @@ async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: 
   await updateIndex(root, source.id, `Sources/${fileName}`);
 }
 
-export function writeSourceMarkdown(root: FileSystemDirectoryHandle, source: Source) {
-  return enqueueVaultWrite(() => writeSourceMarkdownImpl(root, source));
+export async function writeSourceMarkdown(
+  root: FileSystemDirectoryHandle,
+  source: Source,
+  priority: VaultWritePriority = "interactive"
+): Promise<void> {
+  await enqueueVaultWrite(() => writeSourceMarkdownImpl(root, source), priority, vaultSyncKeyFor("source", source.id));
+  await markVaultSynced("source", source.id, source.updatedAt);
 }
 
 /**
@@ -333,14 +448,36 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
   };
 }
 
-export function writeMemoryObjectMarkdown(root: FileSystemDirectoryHandle, memoryObject: MemoryObject) {
-  return enqueueVaultWrite(() => writeMemoryObjectMarkdownImpl(root, memoryObject));
+export async function writeMemoryObjectMarkdown(
+  root: FileSystemDirectoryHandle,
+  memoryObject: MemoryObject,
+  priority: VaultWritePriority = "interactive"
+): Promise<void> {
+  await enqueueVaultWrite(
+    () => writeMemoryObjectMarkdownImpl(root, memoryObject),
+    priority,
+    vaultSyncKeyFor("memory", memoryObject.id)
+  );
+  await markVaultSynced("memory", memoryObject.id, memoryObject.updatedAt);
 }
 
 /**
  * Vaultが未接続の間にIndexedDBへ先行保存された記憶を、
  * 接続確立の直後にまとめてMarkdownへ書き出す（データロス防止）。
  * Source基盤（最小構成）も同じ扱いにする：IndexedDBにはあるがVaultに無いSourceを書き戻す。
+ *
+ * Beta修正：起動のたびに全件を無条件で書き直すと、Android実機ではVault write 1回が
+ * 1.3〜2.8秒かかることもあり、蓄積データ量に比例して起動直後に長い背景処理が発生する。
+ * さらにこの背景処理がユーザー操作の保存と同じ列に並ぶことで、終了操作の保存が
+ * 数秒〜数十秒待たされる問題が実測で確認された（詳細は本ファイル冒頭の優先度付き
+ * キューのコメント参照）。
+ *
+ * 対策：各itemについて、同期済み台帳（vaultSyncState）のupdatedAtと現在のupdatedAtが
+ * 一致する場合はVaultへのwrite自体を行わない（Vault側のMarkdownは読まず、IndexedDB内の
+ * 軽量な台帳だけで判定する）。台帳に記録が無い・値が異なる場合は、これまで通り
+ * 書き込む。ここから発行されるwriteは全て`"background"`優先度にし、ユーザー操作由来の
+ * writeが後ろに並ばされないようにする（同時実行は引き続き1件だけなので、
+ * index.json・Memory日別ファイルへの同時書き込み事故は発生しない）。
  */
 export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   const flushStart = Date.now();
@@ -352,18 +489,27 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   const totalCount = conversations.length + memoryObjects.length + sources.length;
   console.log(`[Vault] flush:start count=${totalCount}`);
   logTimingEvent("Vault flush:start", { count: totalCount });
+
+  let writtenCount = 0;
   for (const conversation of conversations) {
-    await writeConversationMarkdown(root, conversation);
+    if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
+    await writeConversationMarkdown(root, conversation, "background");
+    writtenCount += 1;
   }
   for (const memoryObject of memoryObjects) {
-    await writeMemoryObjectMarkdown(root, memoryObject);
+    if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
+    await writeMemoryObjectMarkdown(root, memoryObject, "background");
+    writtenCount += 1;
   }
   for (const source of sources) {
-    await writeSourceMarkdown(root, source);
+    if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
+    await writeSourceMarkdown(root, source, "background");
+    writtenCount += 1;
   }
+
   const flushDurationMs = Date.now() - flushStart;
-  console.log(`[Vault] flush:end count=${totalCount} durationMs=${flushDurationMs}`);
-  logTimingEvent("Vault flush:end", { count: totalCount, durationMs: flushDurationMs });
+  console.log(`[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} durationMs=${flushDurationMs}`);
+  logTimingEvent("Vault flush:end", { count: totalCount, writtenCount, durationMs: flushDurationMs });
 }
 
 export function isVaultSupported() {
