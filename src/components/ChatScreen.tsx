@@ -320,10 +320,17 @@ export default function ChatScreen() {
    * Conversation本文の保存は行わない（persistCaptureの中でconversationも改めて
    * 書き込まれるが、内容は既に保存済みのものと同じか、Capture結果でstatus等が
    * 更新されたものになる）。
+   *
+   * `awaitVaultSync`（デフォルト`true`＝従来通り）：falseを渡すと、persistCaptureが
+   * 行うVault書き込みをawaitせずfire-and-forgetにする（IndexedDB保存の成功だけを
+   * 「保存完了」として返す）。起動時キャッチアップ（startupCaptureRanRef）は
+   * 今回もこの引数を渡さず、既存のawaitする挙動を維持する（Gemini呼び出し回数の
+   * クォータ保護を目的とした逐次処理のペースを変えないため）。
    */
   async function runConversationBoundary(
     target: Conversation,
-    priority: VaultWritePriority = "interactive"
+    priority: VaultWritePriority = "interactive",
+    awaitVaultSync: boolean = true
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
       connectConversationBoundary(Promise.resolve([]), priority);
@@ -342,7 +349,8 @@ export default function ChatScreen() {
         vaultHandle,
         capturedDelta,
         touchedMemoryObjects,
-        priority
+        priority,
+        awaitVaultSync
       );
       // 保存に成功したMemoryだけを以降の処理へ進める。IndexedDB書き込み自体が
       // 失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する。
@@ -858,7 +866,9 @@ export default function ChatScreen() {
     // Conversation Boundary（このConversationの唯一のCapture機会）をここで実行する。
     // 会話中は毎ターンCaptureしていないため、ここで初めて/api/captureが呼ばれる
     // （runConversationBoundaryが内部でMemory保存・Connectまで完了させる）。
-    const latestMemoryObjects = await runConversationBoundary(latestConversationRef.current);
+    // awaitVaultSync=false：ユーザー操作の完了をIndexedDB保存で確定させ、Vaultへの
+    // 反映は待たない（Beta修正。詳細はcapture.tsのpersistCapture/persistConversation参照）。
+    const latestMemoryObjects = await runConversationBoundary(latestConversationRef.current, "interactive", false);
 
     if (latestMemoryObjects.length === 0) {
       // Captureがまだ一度も成功していない（進行中 or 失敗）。
@@ -891,9 +901,16 @@ export default function ChatScreen() {
       // 既存のwriteConversationMarkdown / writeMemoryObjectMarkdown / putConversation / putMemoryObjectを
       // そのまま再利用する（persistCaptureは会話1件+MemoryObject複数件を書き出す処理として、
       // Capture専用ではなくそのまま使い回せる）。
-      const { failedMemoryIds: reflectionFailedIds } = await persistCapture(vaultHandle, endedConversation, [
-        insightMemory,
-      ]);
+      // awaitVaultSync=false：ユーザー操作の完了をIndexedDB保存で確定させ、Vaultへの
+      // 反映は待たない（reflectionFailedIdsはIndexedDB保存の成否のみを表すため、
+      // この変更でも判定の意味は変わらない）。
+      const { failedMemoryIds: reflectionFailedIds } = await persistCapture(
+        vaultHandle,
+        endedConversation,
+        [insightMemory],
+        "interactive",
+        false
+      );
       if (reflectionFailedIds.length > 0) {
         // insight MemoryのIndexedDB保存自体が失敗した場合は、Reflectionを「完了」として
         // 表示しない（黙って失われた記憶を「保存できた」と伝えないため）。
@@ -960,7 +977,9 @@ export default function ChatScreen() {
       // 会話は「終了した」状態のままConversation本文自体は確実に保存されている
       // （Capture＝Memory生成の成否とは独立した保存。今回のConversation保存/Capture
       // 責務分離の目的そのもの）。
-      await persistConversation(vaultHandle, endedConversation);
+      // awaitVaultSync=false：ここでの「保存完了」はIndexedDBへの保存成功のみで確定させ、
+      // Vaultへの反映は待たない（Beta修正。ユーザー操作をVault I/Oの遅さから切り離す）。
+      await persistConversation(vaultHandle, endedConversation, "interactive", false);
       // refだけ先に更新する（React stateはまだここでは更新しない）。
       // runConversationBoundaryはこのrefをCapture対象・成功時のマージ元として読むため、
       // 先にendedAt付きにしておく必要がある（そうしないと、Capture成功時に
@@ -969,7 +988,8 @@ export default function ChatScreen() {
 
       // Conversation Boundary。runConversationBoundaryが内部でCapture・Memory保存・
       // Connectまで完了させる（未Captureの場合のみ実行、既にCapture済みなら何もしない）。
-      const latestMemoryObjects = await runConversationBoundary(endedConversation);
+      // awaitVaultSync=false：同様にIndexedDB保存の成功だけを待ち、Vaultへの反映は待たない。
+      const latestMemoryObjects = await runConversationBoundary(endedConversation, "interactive", false);
 
       // UI改善：conversation stateへの反映（＝ボタンをJSXから消す条件）を、ここまで
       // 遅らせる。以前はendedAtの反映がCapture開始前に起きていたため、「ボタンが

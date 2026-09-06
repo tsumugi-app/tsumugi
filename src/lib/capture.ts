@@ -287,31 +287,31 @@ export interface PersistConversationResult {
  *   - persistCapture（このファイル内）：Boundary Capture時、Memory保存とあわせて呼ぶ
  * どちらの経路でも実装は完全に同一（重複させない）。
  *
- * STORAGE.md §2.3「書き込みは常にMarkdown/.tsumugiが先、IndexedDBが後」を実装として守る。
- * vaultHandleがまだ無い場合はIndexedDBにのみ保存し、Vault接続後にflushPendingToVaultで書き戻す。
- * Markdown書き込みの失敗はIndexedDB保存をブロックしない（Markdownには残らないが、
- * IndexedDBには残るので、次にVaultへ接続・再接続した際のflushPendingToVaultが自動的に
- * 書き戻す。つまりMarkdown書き込み失敗は「失われる」のではなく「vaultへの反映が
- * 次回に持ち越される」だけにする）。IndexedDBへの書き込み自体が失敗した場合のみ、
- * 本当に失敗として扱いconversationFailedをtrueで返す。
+ * IndexedDBへの保存成功を「ユーザー操作上の保存完了」とする（Beta修正）。
+ * 以前は「Markdown/.tsumugiが先、IndexedDBが後」の順で、かつ両方をawaitしていたため、
+ * Android実機でVault write（Markdown書き込み）が遅い場合、ユーザー操作（「この会話を
+ * 終える」等）がその完了まで待たされていた。今回、書き込み順序をIndexedDB→Vaultへ
+ * 入れ替えた上で、`awaitVaultSync`が`false`のときはVault書き込みをawaitせず
+ * fire-and-forgetで開始するだけにする（デフォルトは`true`＝従来通り両方awaitする。
+ * 起動時キャッチアップ等、既存の呼び出し元の挙動を変えないため）。
+ *
+ * Vault書き込みが失敗しても例外を外へ投げない（内部でtry/catch済みのため、
+ * fire-and-forgetにしても未処理Promise rejectionは発生しない）。失敗時はsync ledgerが
+ * 更新されないため（vault.ts側の既存の仕組み）、次回のflushPendingToVaultで自然に
+ * 再試行される。IndexedDBへの書き込み自体が失敗した場合のみ、本当に失敗として扱い
+ * conversationFailedをtrueで返す。
  */
 export async function persistConversation(
   vaultHandle: FileSystemDirectoryHandle | null,
   conversation: Conversation,
-  priority: VaultWritePriority = "interactive"
+  priority: VaultWritePriority = "interactive",
+  awaitVaultSync: boolean = true
 ): Promise<PersistConversationResult> {
   // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。件数・経過時間のみ（会話内容は出さない）。
   // 原因調査が終わり次第削除すること。
   const persistStart = Date.now();
   console.log(`[Conversation] persist:start`);
   logTimingEvent("Conversation persist:start");
-  if (vaultHandle) {
-    try {
-      await writeConversationMarkdown(vaultHandle, conversation, priority);
-    } catch (error) {
-      console.error("[Tsumugi] conversation markdown write failed (will retry on next vault flush):", error);
-    }
-  }
 
   let conversationFailed = false;
   try {
@@ -321,6 +321,21 @@ export async function persistConversation(
     conversationFailed = true;
   }
 
+  if (vaultHandle) {
+    const syncToVault = async () => {
+      try {
+        await writeConversationMarkdown(vaultHandle, conversation, priority);
+      } catch (error) {
+        console.error("[Tsumugi] conversation markdown write failed (will retry on next vault flush):", error);
+      }
+    };
+    if (awaitVaultSync) {
+      await syncToVault();
+    } else {
+      void syncToVault();
+    }
+  }
+
   const persistDurationMs = Date.now() - persistStart;
   console.log(`[Conversation] persist:end durationMs=${persistDurationMs}`);
   logTimingEvent("Conversation persist:end", { durationMs: persistDurationMs });
@@ -328,9 +343,8 @@ export async function persistConversation(
 }
 
 /**
- * STORAGE.md §2.3「書き込みは常にMarkdown/.tsumugiが先、IndexedDBが後」を実装として守る
- * （Conversation本文の保存自体はpersistConversationへ委譲。ここではそれにMemoryObjectの
- * 保存を組み合わせる）。
+ * Conversation本文の保存自体はpersistConversationへ委譲。ここではそれにMemoryObjectの
+ * 保存を組み合わせる。
  *
  * 各書き込みを個別のtry/catchで分離する（Beta修正）。以前はMemoryObjectのMarkdown書き込みが
  * 1件でも失敗すると関数全体が例外を投げ、それ以前に成功していたMemoryも含めて一切
@@ -342,32 +356,48 @@ export async function persistConversation(
  * - IndexedDBへの書き込み自体が失敗した場合のみ、そのMemoryを本当に失敗として扱い、
  *   呼び出し元（runConversationBoundary）が画面に表示できるようfailedMemoryIdsで返す。
  * - 1件の失敗が他の件の処理を止めない（ループを継続する）。
+ *
+ * IndexedDBへの保存成功を「ユーザー操作上の保存完了」とする（Beta修正）。各Memoryも
+ * ConversationならびにIndexedDBへのputを先に行い、Vaultへの書き込みはその後にする。
+ * `awaitVaultSync`が`false`のときは、そのVault書き込みをawaitせずfire-and-forgetで
+ * 開始するだけにする（デフォルトは`true`＝従来通り。起動時キャッチアップ等、既存の
+ * 呼び出し元の挙動を変えないため）。Vault書き込みの失敗は内部でtry/catch済みのため、
+ * fire-and-forgetにしても未処理Promise rejectionは発生しない。
  */
 export async function persistCapture(
   vaultHandle: FileSystemDirectoryHandle | null,
   conversation: Conversation,
   memoryObjects: MemoryObject[],
-  priority: VaultWritePriority = "interactive"
+  priority: VaultWritePriority = "interactive",
+  awaitVaultSync: boolean = true
 ): Promise<PersistCaptureResult> {
-  const { conversationFailed } = await persistConversation(vaultHandle, conversation, priority);
+  const { conversationFailed } = await persistConversation(vaultHandle, conversation, priority, awaitVaultSync);
 
   const failedMemoryIds: string[] = [];
   for (const memoryObject of memoryObjects) {
-    if (vaultHandle) {
-      try {
-        await writeMemoryObjectMarkdown(vaultHandle, memoryObject, priority);
-      } catch (error) {
-        console.error(
-          `[Tsumugi Capture] memory markdown write failed for ${memoryObject.id} (will retry on next vault flush):`,
-          error
-        );
-      }
-    }
     try {
       await putMemoryObject(memoryObject);
     } catch (error) {
       console.error(`[Tsumugi Capture] memory IndexedDB write failed for ${memoryObject.id}:`, error);
       failedMemoryIds.push(memoryObject.id);
+    }
+
+    if (vaultHandle) {
+      const syncToVault = async () => {
+        try {
+          await writeMemoryObjectMarkdown(vaultHandle, memoryObject, priority);
+        } catch (error) {
+          console.error(
+            `[Tsumugi Capture] memory markdown write failed for ${memoryObject.id} (will retry on next vault flush):`,
+            error
+          );
+        }
+      };
+      if (awaitVaultSync) {
+        await syncToVault();
+      } else {
+        void syncToVault();
+      }
     }
   }
 
