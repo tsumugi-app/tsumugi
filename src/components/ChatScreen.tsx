@@ -43,6 +43,8 @@ import { filterUnconnected } from "@/lib/connectState";
 import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHeader";
 import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
 import { useWaitingMessage } from "@/lib/useWaitingMessage";
+// TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
+import { logStartupCatchupEnd, logStartupCatchupStart, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
 import ApiKeySetup from "./ApiKeySetup";
 import SettingsPanel from "./SettingsPanel";
 import ImportPanel from "./ImportPanel";
@@ -457,6 +459,10 @@ export default function ChatScreen() {
 
   useEffect(() => {
     let cancelled = false;
+    // TEMP-TEST：起動処理全体（Vault復元+flush+scan／起動時Connect／起動時Capture、
+    // 3フェーズ）の開始点。page:hidden/page:loadとの因果関係切り分け用の計測のみで、
+    // 以下の処理内容・順序には一切影響しない。
+    markBootStart();
     restoreVaultHandle().then(async (result) => {
       if (cancelled) return;
       if (result.status === "connected") {
@@ -491,6 +497,9 @@ export default function ChatScreen() {
       } else {
         setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
       }
+      // TEMP-TEST：起動処理フェーズ①（Vault復元+flush+scan）完了。分岐・成否に関わらず
+      // ここに到達する（catchが例外を握りつぶし再送出しないため）。
+      markBootPhaseDone();
     });
     return () => {
       cancelled = true;
@@ -508,18 +517,26 @@ export default function ChatScreen() {
     startupConnectRanRef.current = true;
     let cancelled = false;
     (async () => {
+      // TEMP-TEST：起動時Connectキャッチアップの計測のみ。処理内容・順序は無変更。
+      const catchupStart = Date.now();
       try {
         const allMemories = await getAllMemoryObjects();
         const unconnected = await filterUnconnected(allMemories);
         const pending = [...unconnected]
           .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
           .slice(0, STARTUP_CONNECT_LIMIT);
+        logStartupCatchupStart("connectCatchup", pending.length);
         for (const memory of pending) {
           if (cancelled) return;
           await connectMemory(vaultHandle, memory);
         }
       } catch (error) {
         console.error("Failed to run startup connect catch-up", error);
+      } finally {
+        // finallyのため、途中でのcancelled return・エラーどちらの経路でも必ず記録される
+        // （既存のtry/catch自体の分岐・処理順序は変更していない）。
+        logStartupCatchupEnd("connectCatchup", Date.now() - catchupStart);
+        markBootPhaseDone();
       }
     })();
     return () => {
@@ -547,18 +564,26 @@ export default function ChatScreen() {
     startupCaptureRanRef.current = true;
     let cancelled = false;
     (async () => {
+      // TEMP-TEST：起動時Captureキャッチアップの計測のみ。処理内容・順序は無変更。
+      const catchupStart = Date.now();
       try {
         const allConversations = await getAllConversations();
         const uncaptured = allConversations
           .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0)
           .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
           .slice(0, STARTUP_CAPTURE_LIMIT);
+        logStartupCatchupStart("captureCatchup", uncaptured.length);
         for (const conversationRecord of uncaptured) {
           if (cancelled) return;
           await runConversationBoundary(conversationRecord);
         }
       } catch (error) {
         console.error("Failed to run startup capture catch-up", error);
+      } finally {
+        // finallyのため、途中でのcancelled return・エラーどちらの経路でも必ず記録される
+        // （既存のtry/catch自体の分岐・処理順序は変更していない）。
+        logStartupCatchupEnd("captureCatchup", Date.now() - catchupStart);
+        markBootPhaseDone();
       }
     })();
     return () => {

@@ -74,6 +74,51 @@ export function clearTimingLog(): void {
   }
 }
 
+function hiddenFlag(): number {
+  if (typeof document === "undefined") return 0;
+  return document.hidden ? 1 : 0;
+}
+
+let bootStartAt: number | null = null;
+let bootPhasesDone = 0;
+/** ChatScreen起動時の3つの起動処理（①Vault復元+flush+scan／②起動時Connectキャッチアップ／
+ * ③起動時Captureキャッチアップ）を数える。処理内容・順序は一切変更せず、それぞれの
+ * 開始・終了地点にログ呼び出しを1行ずつ追加するだけ。 */
+const BOOT_TOTAL_PHASES = 3;
+
+/**
+ * ChatScreenマウント時、起動処理の一番最初（Vault復元effectの先頭）で1回だけ呼ぶこと。
+ * 3つの起動処理が全て完了した時点で自動的にboot:endを記録する。
+ */
+export function markBootStart(): void {
+  bootStartAt = Date.now();
+  bootPhasesDone = 0;
+  console.log(`[Startup] boot:start hidden=${hiddenFlag()}`);
+  logTimingEvent("Startup boot:start", { hidden: hiddenFlag() });
+}
+
+/** 3つの起動処理のうち1つが完了するたびに呼ぶこと（成功・失敗どちらの経路でも）。 */
+export function markBootPhaseDone(): void {
+  bootPhasesDone += 1;
+  if (bootPhasesDone >= BOOT_TOTAL_PHASES && bootStartAt !== null) {
+    const totalMs = Date.now() - bootStartAt;
+    console.log(`[Startup] boot:end totalMs=${totalMs} hidden=${hiddenFlag()}`);
+    logTimingEvent("Startup boot:end", { totalMs, hidden: hiddenFlag() });
+    bootStartAt = null;
+  }
+}
+
+/** 起動時Connect/Captureキャッチアップの開始・終了だけを記録する最小限のログ。 */
+export function logStartupCatchupStart(label: "connectCatchup" | "captureCatchup", count: number): void {
+  console.log(`[Startup] ${label}:start count=${count} hidden=${hiddenFlag()}`);
+  logTimingEvent(`Startup ${label}:start`, { count, hidden: hiddenFlag() });
+}
+
+export function logStartupCatchupEnd(label: "connectCatchup" | "captureCatchup", durationMs: number): void {
+  console.log(`[Startup] ${label}:end durationMs=${durationMs} hidden=${hiddenFlag()}`);
+  logTimingEvent(`Startup ${label}:end`, { durationMs, hidden: hiddenFlag() });
+}
+
 /**
  * ページのライフサイクル（load/visible/hidden）を記録するだけの、監視専用の副作用。
  * 既存のアプリロジックには一切影響しない（新しいイベントリスナーを追加するだけで、
