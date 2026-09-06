@@ -478,6 +478,14 @@ export async function writeMemoryObjectMarkdown(
  * 書き込む。ここから発行されるwriteは全て`"background"`優先度にし、ユーザー操作由来の
  * writeが後ろに並ばされないようにする（同時実行は引き続き1件だけなので、
  * index.json・Memory日別ファイルへの同時書き込み事故は発生しない）。
+ *
+ * Beta修正：各itemのwriteを個別のtry/catchで分離する。以前は1件のwriteが失敗すると
+ * flushPendingToVault全体が例外を投げて終了し、それ以降の全item（同じ種別の残り・
+ * 後続の種別すべて）が一切試行されなかった（＝sync ledgerへも記録されず、次回起動時も
+ * 同じitemが未同期のまま残り続けてしまう）。1件の失敗は握りつぶさずログに残しつつ、
+ * 他のitemの処理は必ず継続する（write成功時だけledgerが更新される、という既存の
+ * 安全性は変更しない。失敗したitemは今回もledgerがsynced扱いにならないため、
+ * 次回起動時のflushで自然に再試行される）。
  */
 export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   const flushStart = Date.now();
@@ -493,18 +501,30 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   let writtenCount = 0;
   for (const conversation of conversations) {
     if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
-    await writeConversationMarkdown(root, conversation, "background");
-    writtenCount += 1;
+    try {
+      await writeConversationMarkdown(root, conversation, "background");
+      writtenCount += 1;
+    } catch (error) {
+      console.error("[Tsumugi] flush: conversation write failed (will retry on next flush):", error);
+    }
   }
   for (const memoryObject of memoryObjects) {
     if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
-    await writeMemoryObjectMarkdown(root, memoryObject, "background");
-    writtenCount += 1;
+    try {
+      await writeMemoryObjectMarkdown(root, memoryObject, "background");
+      writtenCount += 1;
+    } catch (error) {
+      console.error("[Tsumugi] flush: memory write failed (will retry on next flush):", error);
+    }
   }
   for (const source of sources) {
     if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
-    await writeSourceMarkdown(root, source, "background");
-    writtenCount += 1;
+    try {
+      await writeSourceMarkdown(root, source, "background");
+      writtenCount += 1;
+    } catch (error) {
+      console.error("[Tsumugi] flush: source write failed (will retry on next flush):", error);
+    }
   }
 
   const flushDurationMs = Date.now() - flushStart;

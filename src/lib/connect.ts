@@ -15,7 +15,7 @@
 
 import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putMemoryObject } from "./db";
-import { writeMemoryObjectMarkdown } from "./vault";
+import { writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import { retrieveRelevantMemories } from "./retrieval";
 import { markMemoryConnected, releaseMemoryConnectClaim, tryClaimMemoryForConnect } from "./connectState";
 import type { Link, LinkAxis, MemoryObject } from "./types";
@@ -75,7 +75,8 @@ async function judgeCandidates(
  */
 export async function connectMemory(
   vaultHandle: FileSystemDirectoryHandle | null,
-  newMemory: MemoryObject
+  newMemory: MemoryObject,
+  priority: VaultWritePriority = "interactive"
 ): Promise<void> {
   const claimed = await tryClaimMemoryForConnect(newMemory.id);
   if (!claimed) return;
@@ -145,13 +146,13 @@ export async function connectMemory(
         updatedAt: now,
       };
       if (vaultHandle) {
-        await writeMemoryObjectMarkdown(vaultHandle, updatedTarget);
+        await writeMemoryObjectMarkdown(vaultHandle, updatedTarget, priority);
       }
       await putMemoryObject(updatedTarget);
     }
 
     if (vaultHandle) {
-      await writeMemoryObjectMarkdown(vaultHandle, updatedNewMemory);
+      await writeMemoryObjectMarkdown(vaultHandle, updatedNewMemory, priority);
     }
     await putMemoryObject(updatedNewMemory);
     await markMemoryConnected(newMemory.id);

@@ -14,6 +14,7 @@ import {
   restoreVaultHandle,
   scanVaultForRestore,
   type VaultScanResult,
+  type VaultWritePriority,
 } from "@/lib/vault";
 import {
   clearApiKey,
@@ -280,12 +281,15 @@ export default function ChatScreen() {
    * connectMemory()内のtryClaimMemoryForConnect()による既存のクレーム機構がそのまま
    * 重複実行を防ぐ。
    */
-  function connectConversationBoundary(pendingMemoryObjects: Promise<MemoryObject[]>) {
+  function connectConversationBoundary(
+    pendingMemoryObjects: Promise<MemoryObject[]>,
+    priority: VaultWritePriority = "interactive"
+  ) {
     void (async () => {
       try {
         const memories = await pendingMemoryObjects;
         for (const memory of memories) {
-          await connectMemory(vaultHandle, memory);
+          await connectMemory(vaultHandle, memory, priority);
         }
       } catch (error) {
         console.error("Failed to connect conversation-boundary memories", error);
@@ -317,9 +321,12 @@ export default function ChatScreen() {
    * 書き込まれるが、内容は既に保存済みのものと同じか、Capture結果でstatus等が
    * 更新されたものになる）。
    */
-  async function runConversationBoundary(target: Conversation): Promise<MemoryObject[]> {
+  async function runConversationBoundary(
+    target: Conversation,
+    priority: VaultWritePriority = "interactive"
+  ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
-      connectConversationBoundary(Promise.resolve([]));
+      connectConversationBoundary(Promise.resolve([]), priority);
       return [];
     }
     try {
@@ -334,7 +341,8 @@ export default function ChatScreen() {
       const { conversationFailed, failedMemoryIds } = await persistCapture(
         vaultHandle,
         capturedDelta,
-        touchedMemoryObjects
+        touchedMemoryObjects,
+        priority
       );
       // 保存に成功したMemoryだけを以降の処理へ進める。IndexedDB書き込み自体が
       // 失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する。
@@ -369,12 +377,12 @@ export default function ChatScreen() {
       }
 
       enqueueRevisitPromptGeneration(persistedMemoryObjects);
-      connectConversationBoundary(Promise.resolve(persistedMemoryObjects));
+      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority);
       return persistedMemoryObjects;
     } catch (error) {
       console.error("Failed to capture memory at conversation boundary", error);
       setCaptureStatus("error");
-      connectConversationBoundary(Promise.resolve([]));
+      connectConversationBoundary(Promise.resolve([]), priority);
       return [];
     }
   }
@@ -528,7 +536,9 @@ export default function ChatScreen() {
         logStartupCatchupStart("connectCatchup", pending.length);
         for (const memory of pending) {
           if (cancelled) return;
-          await connectMemory(vaultHandle, memory);
+          // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
+          // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
+          await connectMemory(vaultHandle, memory, "background");
         }
       } catch (error) {
         console.error("Failed to run startup connect catch-up", error);
@@ -575,7 +585,9 @@ export default function ChatScreen() {
         logStartupCatchupStart("captureCatchup", uncaptured.length);
         for (const conversationRecord of uncaptured) {
           if (cancelled) return;
-          await runConversationBoundary(conversationRecord);
+          // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
+          // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
+          await runConversationBoundary(conversationRecord, "background");
         }
       } catch (error) {
         console.error("Failed to run startup capture catch-up", error);

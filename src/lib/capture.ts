@@ -9,7 +9,7 @@
 import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObject } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
-import { writeConversationMarkdown, writeMemoryObjectMarkdown } from "./vault";
+import { writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "./retrieval";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "./types";
@@ -297,7 +297,8 @@ export interface PersistConversationResult {
  */
 export async function persistConversation(
   vaultHandle: FileSystemDirectoryHandle | null,
-  conversation: Conversation
+  conversation: Conversation,
+  priority: VaultWritePriority = "interactive"
 ): Promise<PersistConversationResult> {
   // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。件数・経過時間のみ（会話内容は出さない）。
   // 原因調査が終わり次第削除すること。
@@ -306,7 +307,7 @@ export async function persistConversation(
   logTimingEvent("Conversation persist:start");
   if (vaultHandle) {
     try {
-      await writeConversationMarkdown(vaultHandle, conversation);
+      await writeConversationMarkdown(vaultHandle, conversation, priority);
     } catch (error) {
       console.error("[Tsumugi] conversation markdown write failed (will retry on next vault flush):", error);
     }
@@ -345,15 +346,16 @@ export async function persistConversation(
 export async function persistCapture(
   vaultHandle: FileSystemDirectoryHandle | null,
   conversation: Conversation,
-  memoryObjects: MemoryObject[]
+  memoryObjects: MemoryObject[],
+  priority: VaultWritePriority = "interactive"
 ): Promise<PersistCaptureResult> {
-  const { conversationFailed } = await persistConversation(vaultHandle, conversation);
+  const { conversationFailed } = await persistConversation(vaultHandle, conversation, priority);
 
   const failedMemoryIds: string[] = [];
   for (const memoryObject of memoryObjects) {
     if (vaultHandle) {
       try {
-        await writeMemoryObjectMarkdown(vaultHandle, memoryObject);
+        await writeMemoryObjectMarkdown(vaultHandle, memoryObject, priority);
       } catch (error) {
         console.error(
           `[Tsumugi Capture] memory markdown write failed for ${memoryObject.id} (will retry on next vault flush):`,
