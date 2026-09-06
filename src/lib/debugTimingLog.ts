@@ -74,7 +74,8 @@ export function clearTimingLog(): void {
   }
 }
 
-function hiddenFlag(): number {
+/** 他モジュール（db.ts等）の計測ログでも同じ`document.hidden`表現を使えるようexport。 */
+export function hiddenFlag(): number {
   if (typeof document === "undefined") return 0;
   return document.hidden ? 1 : 0;
 }

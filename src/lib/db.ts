@@ -6,6 +6,7 @@
 "use client";
 
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
+import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
 import type { Conversation, MemoryObject, Source } from "./types";
 import type { AIProviderName } from "./ai/types";
 
@@ -73,8 +74,19 @@ export interface ConnectStateRecord {
 
 let dbPromise: Promise<IDBPDatabase<TsumugiDB>> | null = null;
 
+/**
+ * TEMP-TEST：Android実機で`boot:start`の後に`boot:end`まで到達しない事象の原因切り分け用。
+ * IndexedDBのバージョンアップグレード（4→5）が、同一originの別接続（別タブ・古いページ
+ * インスタンス等）によって"blocked"状態のまま止まっていないかを直接確認するための
+ * 最小限のログ。db.ts・upgrade処理・Vault/Chat処理には一切手を加えない
+ * （openDB呼び出しの前後にログを追加するだけ）。原因調査が終わり次第削除すること。
+ */
 function getDB() {
   if (!dbPromise) {
+    const openStart = Date.now();
+    console.log(`[DB] open:start hidden=${hiddenFlag()}`);
+    logTimingEvent("DB open:start", { hidden: hiddenFlag() });
+
     dbPromise = openDB<TsumugiDB>("tsumugi", 5, {
       upgrade(db, oldVersion) {
         if (oldVersion < 1) {
@@ -106,7 +118,41 @@ function getDB() {
           db.createObjectStore("vaultSyncState");
         }
       },
+      // 同一originの別接続（古いバージョンを開いたままの別タブ・ページインスタンス等）が
+      // 存在し、このアップグレードが待たされている間に発火する。
+      blocked() {
+        const durationMs = Date.now() - openStart;
+        console.log(`[DB] open:blocked hidden=${hiddenFlag()} durationMs=${durationMs}`);
+        logTimingEvent("DB open:blocked", { hidden: hiddenFlag(), durationMs });
+      },
+      // 逆に、この接続（古いバージョン側）が新しいバージョンの接続をblockしている場合に
+      // 発火する。ここでは何もクローズしない（回復処理はしない、計測のみ）。
+      blocking() {
+        const durationMs = Date.now() - openStart;
+        console.log(`[DB] open:blocking hidden=${hiddenFlag()} durationMs=${durationMs}`);
+        logTimingEvent("DB open:blocking", { hidden: hiddenFlag(), durationMs });
+      },
+      terminated() {
+        const durationMs = Date.now() - openStart;
+        console.log(`[DB] open:terminated hidden=${hiddenFlag()} durationMs=${durationMs}`);
+        logTimingEvent("DB open:terminated", { hidden: hiddenFlag(), durationMs });
+      },
     });
+
+    // dbPromise自体は書き換えない（既存の戻り値・失敗時の伝播は無変更）。
+    // ここでは成功/失敗を観測してログを残すだけの別購読。
+    dbPromise.then(
+      () => {
+        const durationMs = Date.now() - openStart;
+        console.log(`[DB] open:success hidden=${hiddenFlag()} durationMs=${durationMs}`);
+        logTimingEvent("DB open:success", { hidden: hiddenFlag(), durationMs });
+      },
+      () => {
+        const durationMs = Date.now() - openStart;
+        console.log(`[DB] open:error hidden=${hiddenFlag()} durationMs=${durationMs}`);
+        logTimingEvent("DB open:error", { hidden: hiddenFlag(), durationMs });
+      }
+    );
   }
   return dbPromise;
 }
