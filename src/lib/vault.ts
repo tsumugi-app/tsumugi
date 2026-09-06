@@ -159,18 +159,44 @@ async function writeJSONIfMissing(dir: FileSystemDirectoryHandle, name: string, 
   }
 }
 
-async function writeFileInDir(dir: FileSystemDirectoryHandle, name: string, content: string) {
-  const fileHandle = await dir.getFileHandle(name, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(content);
-  await writable.close();
+/**
+ * TEMP-TEST：Android実機でVault write 1回が8〜11秒まで悪化した事象の原因切り分け用。
+ * write:start〜write:endの内部を区間ごとに分解するための最小限の計測ヘルパー。
+ * 動作・戻り値・エラー伝播には一切影響しない（taskを素通しして時間を計るだけ）。
+ * 会話内容・Memory本文・APIキー・ファイル内容は一切出さない（区間名と経過時間だけ）。
+ * 原因調査が終わり次第、このヘルパーと呼び出し箇所ごと削除すること。
+ */
+async function timedIOStep<T>(label: string, task: () => Promise<T>): Promise<T> {
+  const start = Date.now();
+  console.log(`[VaultIO] ${label}:start`);
+  logTimingEvent(`VaultIO ${label}:start`);
+  try {
+    return await task();
+  } finally {
+    const durationMs = Date.now() - start;
+    console.log(`[VaultIO] ${label}:end durationMs=${durationMs}`);
+    logTimingEvent(`VaultIO ${label}:end`, { durationMs });
+  }
 }
 
-async function readJSON<T>(dir: FileSystemDirectoryHandle, name: string, fallback: T): Promise<T> {
+/** 同期処理（Markdown/JSON生成等）の所要時間だけを記録する。task自体はtimedIOStepを使わず直接呼ぶ。 */
+function logSyncStep(label: string, durationMs: number): void {
+  console.log(`[VaultIO] ${label} durationMs=${durationMs}`);
+  logTimingEvent(`VaultIO ${label}`, { durationMs });
+}
+
+async function writeFileInDir(dir: FileSystemDirectoryHandle, name: string, content: string, label = "file") {
+  const fileHandle = await timedIOStep(`${label} fileHandle`, () => dir.getFileHandle(name, { create: true }));
+  const writable = await timedIOStep(`${label} createWritable`, () => fileHandle.createWritable());
+  await timedIOStep(`${label} write`, () => writable.write(content));
+  await timedIOStep(`${label} close`, () => writable.close());
+}
+
+async function readJSON<T>(dir: FileSystemDirectoryHandle, name: string, fallback: T, label = "json"): Promise<T> {
   try {
-    const fileHandle = await dir.getFileHandle(name, { create: false });
-    const file = await fileHandle.getFile();
-    const text = await file.text();
+    const fileHandle = await timedIOStep(`${label} fileHandle`, () => dir.getFileHandle(name, { create: false }));
+    const file = await timedIOStep(`${label} getFile`, () => fileHandle.getFile());
+    const text = await timedIOStep(`${label} readText`, () => file.text());
     return JSON.parse(text) as T;
   } catch {
     return fallback;
@@ -310,7 +336,7 @@ function vaultSyncKeyFor(kind: VaultSyncKind, id: string): string {
  */
 async function markVaultSynced(kind: VaultSyncKind, id: string, updatedAt: string): Promise<void> {
   try {
-    await setVaultSyncState(vaultSyncKeyFor(kind, id), updatedAt);
+    await timedIOStep(`${kind} ledger`, () => setVaultSyncState(vaultSyncKeyFor(kind, id), updatedAt));
   } catch (error) {
     console.error(`[Tsumugi] failed to record vault sync state for ${kind}:`, error);
   }
@@ -332,10 +358,18 @@ async function isAlreadySyncedToVault(kind: VaultSyncKind, id: string, updatedAt
 }
 
 async function updateIndex(root: FileSystemDirectoryHandle, id: string, relativePath: string) {
-  const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
-  const index = await readJSON<Record<string, string>>(tsumugiDir, "index.json", {});
+  const indexStart = Date.now();
+  console.log(`[VaultIO] index:start`);
+  logTimingEvent("VaultIO index:start");
+
+  const tsumugiDir = await timedIOStep("index dirHandle", () => root.getDirectoryHandle(".tsumugi", { create: true }));
+  const index = await readJSON<Record<string, string>>(tsumugiDir, "index.json", {}, "index read");
   index[id] = relativePath;
-  await writeFileInDir(tsumugiDir, "index.json", JSON.stringify(index, null, 2));
+  await writeFileInDir(tsumugiDir, "index.json", JSON.stringify(index, null, 2), "index write");
+
+  const indexDurationMs = Date.now() - indexStart;
+  console.log(`[VaultIO] index:end durationMs=${indexDurationMs}`);
+  logTimingEvent("VaultIO index:end", { durationMs: indexDurationMs });
 }
 
 function shortId(id: string) {
@@ -354,9 +388,12 @@ function dayFileNameFor(isoDate: string) {
 }
 
 async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, conversation: Conversation) {
-  const dir = await root.getDirectoryHandle("Conversations", { create: true });
+  const dir = await timedIOStep("conversation dirHandle", () => root.getDirectoryHandle("Conversations", { create: true }));
   const fileName = fileNameFor(conversation.id, conversation.startedAt);
-  await writeFileInDir(dir, fileName, conversationToMarkdown(conversation));
+  const renderStart = Date.now();
+  const content = conversationToMarkdown(conversation);
+  logSyncStep("conversation render", Date.now() - renderStart);
+  await writeFileInDir(dir, fileName, content, "conversation");
   await updateIndex(root, conversation.id, `Conversations/${fileName}`);
 }
 
@@ -379,9 +416,12 @@ export async function writeConversationMarkdown(
  * `{ create: true }`で作成する。SourceにはMemoryObjectのような`date`が無いため、`createdAt`を使う。
  */
 async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: Source) {
-  const dir = await root.getDirectoryHandle("Sources", { create: true });
+  const dir = await timedIOStep("source dirHandle", () => root.getDirectoryHandle("Sources", { create: true }));
   const fileName = fileNameFor(source.id, source.createdAt);
-  await writeFileInDir(dir, fileName, sourceToMarkdown(source));
+  const renderStart = Date.now();
+  const content = sourceToMarkdown(source);
+  logSyncStep("source render", Date.now() - renderStart);
+  await writeFileInDir(dir, fileName, content, "source");
   await updateIndex(root, source.id, `Sources/${fileName}`);
 }
 
@@ -422,11 +462,14 @@ async function readDayFileEntries(
  * MemoryObject自体のデータ構造・idは変えない。保存単位（ファイル）だけを日単位にする。
  */
 async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, memoryObject: MemoryObject) {
-  const dir = await root.getDirectoryHandle("Memories", { create: true });
+  const dir = await timedIOStep("memory dirHandle", () => root.getDirectoryHandle("Memories", { create: true }));
 
   if (isReflectionSummary(memoryObject)) {
     const fileName = fileNameFor(memoryObject.id, memoryObject.date);
-    await writeFileInDir(dir, fileName, memoryObjectToMarkdown(memoryObject));
+    const renderStart = Date.now();
+    const content = memoryObjectToMarkdown(memoryObject);
+    logSyncStep("memory render", Date.now() - renderStart);
+    await writeFileInDir(dir, fileName, content, "memory");
     await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
     memoryObject.metadata.obsidian = {
       ...memoryObject.metadata.obsidian,
@@ -436,11 +479,14 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
   }
 
   const fileName = dayFileNameFor(memoryObject.date);
-  const existingEntries = await readDayFileEntries(dir, fileName);
+  const existingEntries = await timedIOStep("memory existingRead", () => readDayFileEntries(dir, fileName));
   const otherEntries = existingEntries.filter((memory) => memory.id !== memoryObject.id);
+  const mergeStart = Date.now();
   const merged = [...otherEntries, memoryObject].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const serialized = serializeMemoryDayFile(merged);
+  logSyncStep("memory render", Date.now() - mergeStart);
 
-  await writeFileInDir(dir, fileName, serializeMemoryDayFile(merged));
+  await writeFileInDir(dir, fileName, serialized, "memory");
   await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
   memoryObject.metadata.obsidian = {
     ...memoryObject.metadata.obsidian,
