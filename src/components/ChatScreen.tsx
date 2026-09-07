@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { Conversation, ConversationTurn, MemoryObject, Persona } from "@/lib/types";
+import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
   chooseVaultDirectory,
@@ -134,6 +134,22 @@ const PROVIDER_LABEL: Record<SupportedChatProvider, string> = {
   openai: "OpenAI",
 };
 
+/**
+ * MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う
+ * （HistoryPanel.tsxのMEMORY_TYPE_LABELと同じ値。循環import・新規ファイルを避けるためここでも
+ * 個別に持つ）。終了画面の補助ラベル表示専用（Fact/Interpretation等の新しい分類は追加しない）。
+ */
+const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
+  conversation: "会話",
+  diary: "日記",
+  idea: "アイデア",
+  emotion: "感情",
+  goal: "目標",
+  person: "人物",
+  event: "出来事",
+  insight: "気づき",
+};
+
 export default function ChatScreen() {
   const [persona, setPersona] = useState<Persona>("companion");
   const [entryConfirmed, setEntryConfirmed] = useState(false);
@@ -159,6 +175,14 @@ export default function ChatScreen() {
   const [endedConversationMemories, setEndedConversationMemories] = useState<MemoryObject[] | null>(null);
   /** handleEndConversation実行中、ボタンの連打を防ぐためだけの表示用フラグ。 */
   const [endingConversation, setEndingConversation] = useState(false);
+  /**
+   * 「本日はここまで」（handleEndSession）が成功した際、「今日の振り返り」カードの下に
+   * 「今日、こんなことを覚えました」として表示するための、今回Captureで生成・更新された
+   * Memoryの一覧（endedConversationMemoriesの日記版、UI表示専用）。新しいAPI呼び出し・
+   * DB読み込みは追加せず、handleEndSession内で既に取得済みのlatestMemoryObjectsを
+   * そのまま保持するだけ。reflectionStatus==="done"のときだけ描画に使う。
+   */
+  const [sessionCapturedMemories, setSessionCapturedMemories] = useState<MemoryObject[]>([]);
   /**
    * 入力中のテキスト自体は`ChatInput`（下部で定義する子コンポーネント）が自分の
    * ローカルstateとして持つ（1文字ごとのsetStateがChatScreen全体の再レンダリングを
@@ -922,6 +946,9 @@ export default function ChatScreen() {
       setConversation(endedConversation);
       latestConversationRef.current = endedConversation;
       setReflectionText(text);
+      // UI改善：「今日、こんなことを覚えました」用。今回のCaptureで生成・更新された
+      // Memory（latestMemoryObjects、insight Memory自体は含まない）をそのまま保持する。
+      setSessionCapturedMemories(latestMemoryObjects);
       setReflectionStatus("done");
 
       // Connect（ROADMAP.md Phase 2）。latestMemoryObjects分は既にrunConversationBoundary内で
@@ -1027,6 +1054,7 @@ export default function ChatScreen() {
     setEndedConversationMemories(null);
     setReflectionStatus("idle");
     setReflectionText("");
+    setSessionCapturedMemories([]);
     setInputResetKey((k) => k + 1);
     setStreamingText("");
     setSendStatus("idle");
@@ -1049,6 +1077,7 @@ export default function ChatScreen() {
     setEndedConversationMemories(null);
     setReflectionStatus("idle");
     setReflectionText("");
+    setSessionCapturedMemories([]);
     setInputResetKey((k) => k + 1);
     setStreamingText("");
     setSendStatus("idle");
@@ -1092,6 +1121,7 @@ export default function ChatScreen() {
       setEndedConversationMemories(null);
       setReflectionStatus("idle");
       setReflectionText("");
+      setSessionCapturedMemories([]);
     }
 
     const userTurn: ConversationTurn = {
@@ -1517,6 +1547,33 @@ export default function ChatScreen() {
             <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
               {reflectionText}
             </p>
+            {/*
+              UI改善：「保存した」ではなく「理解して覚えた」と感じられるよう、今回
+              Captureで生成・更新されたMemoryをsummary＋types（既存のMEMORY_TYPE_LABEL、
+              HistoryPanel.tsxと同じ表記）だけの静かな形で添える。content・keywords・
+              confidence・links等は表示しない（新しいAPI呼び出し・DB読み込みも無し。
+              handleEndSessionで既に取得済みのlatestMemoryObjectsをそのまま使う）。
+            */}
+            {sessionCapturedMemories.length > 0 && (
+              <div className="mt-3 border-t border-stone-300/60 pt-3 dark:border-stone-700/60">
+                <p className="mb-1.5 text-xs text-stone-400 dark:text-stone-500">今日、こんなことを覚えました</p>
+                <ul className="flex flex-col gap-1.5 text-sm text-stone-700 dark:text-stone-300">
+                  {sessionCapturedMemories.slice(0, 3).map((memory) => (
+                    <li key={memory.id} className="flex flex-wrap items-center gap-2">
+                      <span>・{memory.summary}</span>
+                      {memory.types.map((type) => (
+                        <span
+                          key={type}
+                          className="rounded-full border border-stone-300/60 px-2 py-0.5 text-[11px] text-stone-400 dark:border-stone-600/60 dark:text-stone-500"
+                        >
+                          {MEMORY_TYPE_LABEL[type] ?? type}
+                        </span>
+                      ))}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
 
@@ -1530,9 +1587,25 @@ export default function ChatScreen() {
             {endedConversationMemories.length > 0 ? (
               <>
                 <p className="text-stone-500 dark:text-stone-400">ここまでを記憶しました。</p>
-                <ul className="flex flex-col gap-1 text-stone-700 dark:text-stone-300">
+                {/*
+                  UI改善：summaryに加えて、既存のMEMORY_TYPE_LABEL（HistoryPanel.tsxと同じ
+                  表記）をtypesの補助ラベルとして添える。「保存した」ではなく「理解して
+                  分類し、覚えた」と感じられるようにする。content・keywords・confidence・
+                  links等は表示しない（新しいAPI呼び出し・DB読み込みは無し）。
+                */}
+                <ul className="flex flex-col gap-1.5 text-stone-700 dark:text-stone-300">
                   {endedConversationMemories.slice(0, 3).map((memory) => (
-                    <li key={memory.id}>・{memory.summary}</li>
+                    <li key={memory.id} className="flex flex-wrap items-center gap-2">
+                      <span>・{memory.summary}</span>
+                      {memory.types.map((type) => (
+                        <span
+                          key={type}
+                          className="rounded-full border border-stone-300/60 px-2 py-0.5 text-[11px] text-stone-400 dark:border-stone-600/60 dark:text-stone-500"
+                        >
+                          {MEMORY_TYPE_LABEL[type] ?? type}
+                        </span>
+                      ))}
+                    </li>
                   ))}
                 </ul>
                 <button
