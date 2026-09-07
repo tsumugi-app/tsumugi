@@ -52,6 +52,15 @@ import ImportPanel from "./ImportPanel";
 // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用診断パネル。`?debugLog=1`以外では何も描画しない。
 import DebugTimingPanel from "./DebugTimingPanel";
 import HistoryPanel from "./HistoryPanel";
+import {
+  computeLeafProgress,
+  computeTreeSignals,
+  computeTreeStage,
+  LEAF_ANCHORS_BY_STAGE,
+  LEAF_SPRITE_PATH,
+  TREE_STAGE_IMAGE_PATH,
+  type TreeSignals,
+} from "@/lib/tree";
 
 /** ApiKeySetupと同じく、chatで選べるproviderは今回この2つに限定する（Claudeは型のみ）。 */
 export type SupportedChatProvider = "gemini" | "openai";
@@ -151,6 +160,22 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
 };
 
 export default function ChatScreen() {
+  /**
+   * 起動時（ページの新規読み込み・リロード直後）にだけ「つむぎの木」を表示するための
+   * 画面遷移state。useState(true)の初期値により、ページが新しく読み込まれるたびに
+   * 必ずtrueから始まる（Reactのstateはページ再読み込みで自然にリセットされるため、
+   * 「起動時かどうか」を判定する専用の永続化・別ロジックを新たに作る必要が無い）。
+   * ロゴタップ（handleGoToTop）等、既存の「どう話す？」への遷移では、この値を
+   * 一切変更しない＝そちらの経路では木は再表示されない。
+   */
+  const [showLaunchTree, setShowLaunchTree] = useState(true);
+  /**
+   * 起動時の木の判定材料（MemoryObjectから計算したTreeSignals）。読み込みが終わる
+   * まではnull（つむぎの木の画像はまだ出さない）。段階（TreeStage）自体・段階内の
+   * 葉の枚数（leafProgress）は、いずれもLaunchTreeScreen側でこの値から都度計算する
+   * （signalsという1つの値だけを保持し、派生値を二重に持たない）。
+   */
+  const [launchTreeSignals, setLaunchTreeSignals] = useState<TreeSignals | null>(null);
   const [persona, setPersona] = useState<Persona>("companion");
   const [entryConfirmed, setEntryConfirmed] = useState(false);
   const [conversation, setConversation] = useState<Conversation>(() => createConversation("companion"));
@@ -424,6 +449,25 @@ export default function ChatScreen() {
       setKeyStatusByProvider({ gemini: !!gemini, openai: !!openai });
     });
   };
+
+  /**
+   * 起動時の「つむぎの木」表示用。showLaunchTreeがtrueの間（＝起動直後）だけ、
+   * 既存のgetAllMemoryObjects()（IndexedDBのみ、新しいDB読み込みは追加しない）を
+   * 1回読み、TreeSignalsを計算する。段階判定・段階内の葉の枚数の計算ロジック自体は
+   * 全て@/lib/treeへ委譲する（このコンポーネントはしきい値を一切持たない）。
+   * Vault/Capture/Connectのいずれにも触れない、読み取り専用の処理。
+   */
+  useEffect(() => {
+    if (!showLaunchTree) return;
+    let cancelled = false;
+    getAllMemoryObjects().then((memoryObjects) => {
+      if (cancelled) return;
+      setLaunchTreeSignals(computeTreeSignals(memoryObjects));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [showLaunchTree]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1275,6 +1319,19 @@ export default function ChatScreen() {
             ? "確認中"
             : "この端末のみ";
 
+  /*
+    起動時（showLaunchTreeがtrueの間）は、通常の画面（どう話す？／会話画面）を
+    一切描画せず、木＋ロゴだけのLaunchTreeScreenに差し替える。
+    ここまでの全てのuseState/useEffectは既に呼び出し済みのため（Hooksのルール上、
+    条件分岐して良いのはこの「何を返すか」だけ）、Vault復元・startup Capture/Connect
+    キャッチアップ等の既存の起動処理はshowLaunchTreeの値に関わらず変わらず動く。
+    ロゴタップ（handleGoToTop）等の既存の「どう話す？」への遷移はshowLaunchTreeに
+    一切触れないため、起動時以外にこの画面が再び現れることはない。
+  */
+  if (showLaunchTree) {
+    return <LaunchTreeScreen signals={launchTreeSignals} onProceed={() => setShowLaunchTree(false)} />;
+  }
+
   return (
     <div className="flex h-dvh flex-col bg-[var(--background)] text-[var(--foreground)]">
       {/*
@@ -1908,6 +1965,124 @@ export default function ChatScreen() {
         </div>
       )}
       <DebugTimingPanel />
+    </div>
+  );
+}
+
+/**
+ * 起動時（アプリを新しく開いた／リロードした直後）にだけ表示する「つむぎの木」画面。
+ * ChatScreen.tsxのshowLaunchTreeがtrueの間だけ、通常の画面（どう話す？／会話画面）の
+ * 代わりにこれが描画される（ChatScreen側の早期returnで差し替える。ChatScreen.tsx
+ * のコメント参照）。
+ *
+ * 添付デザインの成長段階画像＋tsumugiロゴだけで構成する。「どう話す？」ボタン・
+ * Memory件数や成長段階等の数値情報は一切表示しない（ダッシュボード化しない、という
+ * つむぎの木の設計方針をここでも踏襲する）。
+ *
+ * アイコンから開く既存のTreePanel（src/components/TreePanel.tsx）とは別の、
+ * 起動導線専用の最小コンポーネント。TreePanel自体は変更していない
+ * （見出し・閉じるボタン・静かな一文を持つ、独立した画面として維持）。
+ *
+ * 進める操作は、既存のロゴタップ（ChatScreen側のhandleGoToTop等）と同じ「ロゴをタップする」
+ * という既存の操作感をそのまま踏襲する（新しいジェスチャー・全画面タップ等は導入しない）。
+ *
+ * 画像アセット（public/tree/配下、public/tree/leaves/配下）はこの実装時点ではまだ
+ * リポジトリに存在しないため、読み込みに失敗した場合（onError）はそれぞれ静かに
+ * 諦める（ベース画像が失敗すればロゴだけの表示、葉1枚が失敗すればその葉だけを
+ * 表示しない。壊れた画像アイコンは見せない。TreePanel.tsxと同じ方針）。
+ *
+ * 段階内リーフ成長（Beta、stage 01〜03のみ）：ベース画像はそのまま使い、その上へ
+ * @/lib/treeのLEAF_ANCHORS_BY_STAGE（段階ごとに独立した固定%座標）に従って、
+ * Memoryの蓄積に応じた枚数だけ葉を重ねる。位置・見た目（回転/拡縮/反転）は全て
+ * 事前に決めた固定値で、実行時のランダム要素は無い。表示対象の葉は、この画面が
+ * マウントされた直後に一度だけ、opacity＋ごくわずかなscaleで静かにfade-inする
+ * （新しく増えた葉だけを区別してアニメーションさせる、という機構は今回のスコープ外。
+ * この画面自体が起動のたびに一度だけ現れる「今日の木を見る」場であるため、
+ * 表示対象全体が揃って静かに現れる形にとどめている）。
+ */
+function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null; onProceed: () => void }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const [failedLeafSprites, setFailedLeafSprites] = useState<Set<string>>(new Set());
+  const [leavesVisible, setLeavesVisible] = useState(false);
+
+  const stage = signals ? computeTreeStage(signals) : null;
+  const imagePath = stage !== null && stage !== 0 ? TREE_STAGE_IMAGE_PATH[stage] : null;
+  const leafStage = stage === 1 || stage === 2 || stage === 3 ? stage : null;
+  const leafCount = signals && leafStage !== null ? computeLeafProgress(signals, leafStage) : 0;
+  const leafAnchors = leafStage !== null ? LEAF_ANCHORS_BY_STAGE[leafStage].slice(0, leafCount) : [];
+
+  // 表示対象の葉が確定した直後、次の描画フレームでopacityを1へ切り替えることで
+  // CSS transitionを発火させる（マウント直後にいきなり不透明で出現しないようにする）。
+  useEffect(() => {
+    if (leafCount === 0) return;
+    const id = requestAnimationFrame(() => setLeavesVisible(true));
+    return () => cancelAnimationFrame(id);
+  }, [leafCount]);
+
+  return (
+    <div className="flex h-dvh w-full flex-col items-center justify-center gap-10 bg-[var(--background)] px-6 text-[var(--foreground)]">
+      {imagePath && !imageFailed && (
+        /*
+          6段階の画像は「同じ一本の木」に見える必要があるため、実際の画像ファイルの
+          縦横比に関わらず、常に同じ大きさ・同じ位置の箱の中に収める（aspect-[1205/1054]＋
+          object-contain）。画像側の余白・トリミングだけで木の見た目の大きさが
+          段階ごとにばらつくと、「育っている」という連続性が壊れるため。
+          aspect-[1205/1054]は、納品された6段階PNG（stage-01〜06、全て1205×1054px）の
+          実際の縦横比そのもの。正方形（aspect-square）ではなく画像の実比率に箱を
+          合わせることで、object-containが余白（レターボックス）を作らず画像を
+          箱いっぱいに描画する。これにより、下記の葉のxPercent/yPercentが
+          「箱を基準にした%」と「画像そのものを基準にした%」の両方を同時に満たし、
+          ズレが生じない（正方形の箱だと、画像側に上下の余白ができ、葉の位置が
+          実際の枝からズレて見える）。
+          relativeは、葉の%座標がこの箱を基準に配置されるようにするため（下記）。
+          max-h-[50dvh]は、横幅の狭い低い画面（横向きスマホ等）でロゴが画面外に
+          押し出されないための保険（通常の縦持ちスマホ/PCでは効かない）。
+        */
+        <div className="relative aspect-[1205/1054] w-full max-w-xs max-h-[50dvh]">
+          <img
+            src={imagePath}
+            alt=""
+            className="h-full w-full object-contain"
+            onError={() => setImageFailed(true)}
+          />
+          {leafAnchors.map((anchor, index) => {
+            const spritePath = LEAF_SPRITE_PATH[anchor.spriteId];
+            if (!spritePath || failedLeafSprites.has(anchor.spriteId)) return null;
+            const restingScale = anchor.scale ?? 1;
+            const transformParts = [
+              "translate(-50%, -50%)",
+              anchor.flip ? "scaleX(-1)" : "",
+              anchor.rotateDeg ? `rotate(${anchor.rotateDeg}deg)` : "",
+              `scale(${leavesVisible ? restingScale : restingScale * 0.85})`,
+            ].filter(Boolean);
+            return (
+              <img
+                key={`${anchor.spriteId}-${index}`}
+                src={spritePath}
+                alt=""
+                onError={() =>
+                  setFailedLeafSprites((prev) => {
+                    const next = new Set(prev);
+                    next.add(anchor.spriteId);
+                    return next;
+                  })
+                }
+                className="absolute w-[14%] max-w-[42px]"
+                style={{
+                  left: `${anchor.xPercent}%`,
+                  top: `${anchor.yPercent}%`,
+                  transform: transformParts.join(" "),
+                  opacity: leavesVisible ? 1 : 0,
+                  transition: "opacity 0.75s ease-out, transform 0.75s ease-out",
+                }}
+              />
+            );
+          })}
+        </div>
+      )}
+      <button type="button" onClick={onProceed} aria-label="tsumugiを開く" className="w-[min(220px,60%)] rounded-lg">
+        <img src="/logo.png" alt="Tsumugi" className="h-auto w-full dark:invert" />
+      </button>
     </div>
   );
 }
