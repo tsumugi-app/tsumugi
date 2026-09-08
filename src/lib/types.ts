@@ -262,6 +262,15 @@ export interface RetrievedMemory {
    * 後方互換性のためoptional（未設定＝由来不明として扱う）。
    */
   source?: MemorySource;
+  /**
+   * Retrievalのノイズ抑制（analyst向け）。このMemoryが今回のクエリとの関連度で選ばれた
+   * "direct"（scoreMemoryベースの直接一致）か、関連度とは無関係に「あえて遠いMemory」として
+   * 選ばれた"divergent"（retrieval.tsのselectDivergentMemories、既定では自動投入しない）か。
+   * companion/coach（retrieveRelevantMemories本体）が返すMemoryには常にdirectしか無いため、
+   * 後方互換性のためoptional（未設定＝direct相当として扱ってよい）。Gemini向けのprompt本文
+   * （buildRetrievedMemoriesSection）には現時点では渡していない、調査・表示用の内部情報。
+   */
+  matchType?: "direct" | "divergent";
 }
 
 export const SCHEMA_VERSION = "0.1";

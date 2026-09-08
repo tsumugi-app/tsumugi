@@ -1207,6 +1207,7 @@ export default function ChatScreen() {
         latestUserMessage: text,
         vaultBackend: getVaultBackend(),
         vaultStatus,
+        excludeConversationId: baseConversation.id,
       });
 
       // chatだけは選択中provider（既定Gemini）を使う。他機能（Capture/Connect/Reflection/

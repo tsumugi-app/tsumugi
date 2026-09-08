@@ -20,7 +20,7 @@
  * プライバシー方針（厳守）：
  * - APIキー・system prompt本文・persona prompt本文は一切出力しない
  * - Memory本文（MemoryObject.content）は出力しない。出すのはid・summary・keywords・
- *   スコア・取得理由（direct/linked）・linkReasonの短い文字列だけ
+ *   スコア・取得理由（direct/divergent/linked）・linkReasonの短い文字列だけ
  * - 会話本文（turns[].content）はそのまま出力せず、件数と直近ユーザー発言の文字数だけを出す
  *
  * 注意（意図的な近似値であり、実際のサーバー側計算のミラーではない）：
@@ -30,16 +30,20 @@
  *   （route.ts側は変更しないため、値を返送する仕組み自体を今回追加していない）。
  *   route.ts側の定数を変更した場合、この表示値は追随しないため、調査結果を見る際は
  *   その前提を踏まえること。
- * - スコアは、retrieval.tsの`scoreMemory()`（companion/coach用の直接一致スコアリング）を
- *   このログのためだけに再計算したものである。persona===analystのRetrievedMemoryは
- *   retrieveCreativeMemories()という別ロジック（直接一致＋あえて遠いMemoryの2部構成）で
- *   選ばれているため、ここで表示するスコアは「参考値」であり、実際の選定順位を
- *   保証するものではない（analystの「あえて遠いMemory」はスコアが低く出て当然）。
+ * - スコアは、retrieval.tsの`scoreMemory()`（direct一致のスコアリング）を、このログの
+ *   ためだけに再計算したものである。retrievedMemories自体が持つ`matchType`
+ *   （"direct"/"divergent"、retrieval.ts参照）は実際の選定結果そのものなので、
+ *   sourceの表示にはこちらを優先して使う。
+ * - persona===analystのときだけ、retrieveCreativeMemories()と同じ絞り込み（
+ *   scoreDirectCandidates→applyRelativeStrengthFilter、どちらもretrieval.tsから
+ *   そのままimportして再利用。ロジックの複製はしていない）をこのログのためだけに
+ *   再実行し、「候補には挙がったが、1位との相対的な強さが足りず落とされたMemory」を
+ *   表示する。これは実際にRetrievedMemoriesへ含まれることは無い、調査専用の情報。
  */
 "use client";
 
 import { getAllMemoryObjects } from "./db";
-import { scoreMemory } from "./retrieval";
+import { applyRelativeStrengthFilter, DEFAULT_LIMIT, isSameConversation, scoreDirectCandidates, scoreMemory } from "./retrieval";
 import { needsWebSearch } from "./needsWebSearch";
 import type { ConversationTurn, MemoryObject, Persona, RetrievedMemory } from "./types";
 import type { VaultBackend } from "./vault";
@@ -132,6 +136,9 @@ export interface ConversationDebugParams {
   latestUserMessage: string;
   vaultBackend: VaultBackend | null;
   vaultStatus: VaultStatusForDebug;
+  /** persona===analystのとき、落とされたdirect候補を再現するために使う
+   * （retrieveRelevantMemories()へ渡しているexcludeConversationIdと同じ値）。 */
+  excludeConversationId?: string;
 }
 
 /**
@@ -143,7 +150,7 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
   if (!debugLogEnabled()) return;
 
   try {
-    const { persona, turns, retrievedMemories, latestUserMessage, vaultBackend, vaultStatus } = params;
+    const { persona, turns, retrievedMemories, latestUserMessage, vaultBackend, vaultStatus, excludeConversationId } = params;
 
     // memoryCount・スコア再計算のためだけの読み取り専用アクセス（既存のgetAllMemoryObjects()を
     // 呼び直すだけで、retrieveRelevantMemories()自体の呼び出し回数・挙動は変えない）。
@@ -154,18 +161,40 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
     const retrieved = retrievedMemories.map((memory) => {
       const full = byId.get(memory.id);
       const score = full ? Number(scoreMemory(full, trimmed).toFixed(2)) : null;
+      // sourceは、実際の選定結果であるmatchType（"direct"/"divergent"）を優先する。
+      // matchTypeが無い（companion/coach、またはpromptedMemoryId経由）場合のみ、
+      // 従来通りlinkReasonの有無で"linked"/"direct"を判定する。
+      const source = memory.matchType ?? (memory.linkReason ? "linked" : "direct");
       return {
         id: memory.id,
         score,
         summary: memory.summary,
-        source: memory.linkReason ? "linked" : "direct",
+        source,
         isOriginMemory: memory.isOriginMemory === true,
         linkReason: memory.linkReason ?? null,
       };
     });
 
     const directCount = retrieved.filter((r) => r.source === "direct").length;
+    const divergentCount = retrieved.filter((r) => r.source === "divergent").length;
     const linkedCount = retrieved.filter((r) => r.source === "linked").length;
+
+    // persona===analystのときだけ、「候補には挙がったが相対的な強さが足りず落とされたMemory」を
+    // retrieval.tsの既存関数（scoreDirectCandidates／applyRelativeStrengthFilter）を
+    // そのまま再利用して再現する。ロジックの複製ではなく、同じ関数の再呼び出し。
+    let droppedDirectLines: string[] = [];
+    if (persona === "analyst") {
+      const pool = allMemories.filter((memory) => !isSameConversation(memory.conversationId, excludeConversationId));
+      const scoredDirect = scoreDirectCandidates(pool, trimmed, DEFAULT_LIMIT);
+      const keptIds = new Set(applyRelativeStrengthFilter(scoredDirect).map((entry) => entry.memory.id));
+      const dropped = scoredDirect.filter((entry) => !keptIds.has(entry.memory.id));
+      droppedDirectLines = [
+        `directCandidatesConsidered: ${scoredDirect.length} (kept=${scoredDirect.length - dropped.length}, droppedByRelativeStrength=${dropped.length})`,
+        ...dropped.map(
+          (entry) => `  dropped: id=${entry.memory.id} score=${entry.score.toFixed(2)} summary="${entry.memory.summary}"`
+        ),
+      ];
+    }
 
     const lines = [
       "[ConversationDebug]",
@@ -175,12 +204,13 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
       `latestUserMessageLength: ${trimmed.length}`,
       `historyCount(turns): ${turns.length}`,
       `memoryCount(total, this device's IndexedDB): ${allMemories.length}`,
-      `retrievedCount: ${retrievedMemories.length} (direct=${directCount}, linked=${linkedCount})`,
+      `retrievedCount: ${retrievedMemories.length} (direct=${directCount}, divergent=${divergentCount}, linked=${linkedCount})`,
       "retrieved:",
       ...retrieved.map(
         (r, i) =>
           `  [${i}] id=${r.id} score=${r.score ?? "n/a"} source=${r.source}${r.isOriginMemory ? " origin=true" : ""} summary="${r.summary}"${r.linkReason ? ` linkReason="${r.linkReason}"` : ""}`
       ),
+      ...droppedDirectLines,
       `finalContextSummary: retrievedMemoriesSectionPresent=${retrievedMemories.length > 0} charLenOfSummaries=${retrieved.reduce((sum, r) => sum + r.summary.length, 0)}`,
       `generationConfig(mirrored from route.ts constants, not the actual server-reported value): thinkingBudget=${mirrorThinkingBudget(trimmed)} maxOutputTokens=${MIRROR_MAX_OUTPUT_TOKENS} enableWebSearch=${needsWebSearch(trimmed)}`,
     ];

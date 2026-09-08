@@ -202,35 +202,97 @@ export function isSameConversation(conversationId: string | undefined, excludeCo
 }
 
 /**
- * クリエイト（analyst）専用のMemory取得。「直接関連するMemory」＋「あえて遠いMemory」の
- * 2部構成にする。companion/coachが使う既存のretrieveRelevantMemoriesの
+ * Retrievalのノイズ抑制（Conversation品質改善 第1修正）。
+ *
+ * 「候補があれば上限件数まで機械的に埋める」のではなく、1位の候補との相対的な強さを見て、
+ * 弱い候補は最初から返さない。1位が圧倒的に強く2位以降が大きく劣る場合は1件だけ、
+ * 2位・3位が1位に近い強さを持つ場合はそのまま複数件を返す。既存のscoreMemory自体は
+ * 変更しない（スコアの計算方法ではなく、計算済みスコアの「使い方」だけを変える）。
+ *
+ * ルール（意図的に単純にしてある。説明可能であることを優先）：
+ * - 1位（最高スコア）は、score > 0 である限り常に残す。
+ * - 2位以降は、そのスコアが「1位のスコア × DIRECT_RELATIVE_KEEP_RATIO」以上の場合だけ残す。
+ *   例：1位が8.88点なら、2位以降は4.44点未満（8.88の半分未満）なら落とす。
+ * - 候補が1件も無い（score > 0が1件も無い）場合は空配列を返す（0件は正常な結果）。
+ *
+ * 実データでの確認（PC）：8.88 / 2.88 / 2.12 → 2.88, 2.12 はどちらも8.88の半分(4.44)未満のため
+ * 1位だけが残る。（スマホ）：8.73 / 1.52 / 1.52 → 同様に1位だけが残る。
+ * 一方、1位・2位が近い強さ（例：8 / 7 / 6）の場合は3件とも残る。
+ *
+ * companion/coachが使うretrieveRelevantMemories本体のロジックには一切手を加えない
+ * （このフィルタはretrieveCreativeMemories＝analyst専用の経路にだけ適用する）。
+ */
+export const DIRECT_RELATIVE_KEEP_RATIO = 0.5;
+
+/**
+ * pool（対象Memory群）を既存のscoreMemoryでスコアリングし、スコア>0のものを降順ソートして
+ * 上位limit件までに絞る（相対的な強さでの絞り込みはまだ行わない、単なる「候補集め」の段階）。
+ * retrieveCreativeMemoriesの内部処理を、ConversationDebugでの再利用のために独立した
+ * 関数として切り出しただけで、計算内容自体は変更していない。
+ */
+export function scoreDirectCandidates(
+  pool: MemoryObject[],
+  trimmed: string,
+  limit: number
+): { memory: MemoryObject; score: number }[] {
+  return pool
+    .map((memory) => ({ memory, score: scoreMemory(memory, trimmed) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+/**
+ * scoreDirectCandidates()が返した「上位limit件」の中から、1位との相対的な強さで
+ * さらに絞り込む（上のファイル冒頭コメント参照）。sortedScoredはスコア降順である前提。
+ */
+export function applyRelativeStrengthFilter(
+  sortedScored: { memory: MemoryObject; score: number }[]
+): { memory: MemoryObject; score: number }[] {
+  if (sortedScored.length === 0) return [];
+  const topScore = sortedScored[0].score;
+  return sortedScored.filter((entry, index) => index === 0 || entry.score >= topScore * DIRECT_RELATIVE_KEEP_RATIO);
+}
+
+/**
+ * クリエイト（analyst）専用のMemory取得。companion/coachが使う既存のretrieveRelevantMemoriesの
  * スコアリング・件数ロジックには一切影響しない（別関数として完全に分離）。
  * Link経由の追加（pickLinkedAdditions）はここでは行わない（既存のConnect機能とは別軸のため）。
+ *
+ * 「あえて遠いMemory」（selectDivergentMemories、創造的な飛躍のための材料）は、
+ * options.includeDivergentがtrueの場合にのみ追加する。通常のanalyst会話
+ * （ChatScreen.tsxからの既定の呼び出し）ではこのオプションを渡していないため、
+ * 現時点では自動投入されない。将来「別の視点がほしい」「意外なつながりを探して」等の
+ * 明示的な要求を検出する仕組みを追加する際に、そこからoptions.includeDivergent:trueで
+ * 呼び出せるよう、ロジック自体（selectDivergentMemories等）は削除せずそのまま残してある。
  */
 async function retrieveCreativeMemories(
   trimmed: string,
-  options: { excludeConversationId?: string; limit?: number }
+  options: { excludeConversationId?: string; limit?: number; includeDivergent?: boolean }
 ): Promise<RetrievedMemory[]> {
   const directLimit = options.limit ?? DEFAULT_LIMIT;
   const all = await getAllMemoryObjects();
   const pool = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
 
-  const directMatches = pool
-    .map((memory) => ({ memory, score: scoreMemory(memory, trimmed) }))
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, directLimit)
-    .map((entry) => entry.memory);
+  const scoredDirect = scoreDirectCandidates(pool, trimmed, directLimit);
+  const keptDirect = applyRelativeStrengthFilter(scoredDirect);
+  const directMatches = keptDirect.map((entry) => entry.memory);
 
-  const directIds = new Set(directMatches.map((memory) => memory.id));
-  const divergentPool = pool.filter((memory) => !directIds.has(memory.id));
-  const keywordFrequency = computeKeywordFrequency(all);
-  const divergentMatches = selectDivergentMemories(divergentPool, keywordFrequency, CREATIVE_DIVERGENT_COUNT);
+  let divergentMatches: MemoryObject[] = [];
+  if (options.includeDivergent) {
+    const directIds = new Set(directMatches.map((memory) => memory.id));
+    const divergentPool = pool.filter((memory) => !directIds.has(memory.id));
+    const keywordFrequency = computeKeywordFrequency(all);
+    divergentMatches = selectDivergentMemories(divergentPool, keywordFrequency, CREATIVE_DIVERGENT_COUNT);
+  }
 
-  return [...directMatches, ...divergentMatches].map((memory) => toRetrievedMemory(memory));
+  return [
+    ...directMatches.map((memory) => toRetrievedMemory(memory, undefined, "direct")),
+    ...divergentMatches.map((memory) => toRetrievedMemory(memory, undefined, "divergent")),
+  ];
 }
 
-function toRetrievedMemory(memory: MemoryObject, linkReason?: string): RetrievedMemory {
+function toRetrievedMemory(memory: MemoryObject, linkReason?: string, matchType?: "direct" | "divergent"): RetrievedMemory {
   return {
     id: memory.id,
     date: memory.date,
@@ -238,6 +300,7 @@ function toRetrievedMemory(memory: MemoryObject, linkReason?: string): Retrieved
     keywords: memory.keywords,
     linkReason,
     source: memory.metadata.source,
+    matchType,
   };
 }
 
@@ -318,6 +381,12 @@ export async function retrieveRelevantMemories(
     maxLinkedAdditions?: number;
     persona?: Persona;
     promptedMemoryId?: string;
+    /**
+     * analyst専用。「あえて遠いMemory」（creative divergent）を追加するかどうか。
+     * 既定はfalse相当（未指定）＝追加しない。companion/coachには影響しない
+     * （retrieveCreativeMemories自体がanalystのときにしか呼ばれないため）。
+     */
+    includeDivergent?: boolean;
   } = {}
 ): Promise<RetrievedMemory[]> {
   const trimmed = queryText.trim();
