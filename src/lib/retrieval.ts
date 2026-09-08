@@ -124,7 +124,7 @@ export function scoreMemory(memory: MemoryObject, trimmed: string): number {
  * 形態素解析・固有名詞抽出は導入せず（MVPとしての割り切りを踏襲）、
  * 「keywordがコーパス全体でどれだけ珍しいか」を独自語らしさの代理指標として使う。
  */
-function computeKeywordFrequency(all: MemoryObject[]): Map<string, number> {
+export function computeKeywordFrequency(all: MemoryObject[]): Map<string, number> {
   const freq = new Map<string, number>();
   for (const memory of all) {
     for (const keyword of memory.keywords) {
@@ -255,34 +255,252 @@ export function applyRelativeStrengthFilter(
 }
 
 /**
+ * Conversation Retrieval（Conversation品質改善 第2修正）。
+ *
+ * 「候補同士の相対的な強さ」（applyRelativeStrengthFilter）だけでは、1位の候補自体が
+ * 「時間」「自分」のような一般語の偶然の一致だけでfalse positiveになるケースを防げない
+ * （調査ラウンドで実データから確認済み：1位は常に無条件採用される設計のため）。
+ * このセクションは、既存のscoreMemory()自体は一切変更せず、その計算結果を
+ * 「使う前に補正する」薄いレイヤーとして追加する：
+ *
+ *   conversationScore = scoreMemory()の値
+ *                        - genericKeywordPenalty（コーパス内で頻出する一般的なkeywordの
+ *                          寄与を、既存のcomputeKeywordFrequencyと同じ考え方で減衰させる）
+ *                        + conversationAnchorScore（直近の同一Conversation内user turnsで
+ *                          繰り返し出現している、かつ一般的でないkeywordを持つMemoryを補強する）
+ *
+ * turns全文を1つの文字列に連結してbigram検索することはしない（一般語・ノイズが
+ * 増えるだけのため、調査ラウンドで明示的に避けると判断した設計）。直近turns本文は
+ * 「Memoryのkeywordがそのturnに含まれるか」というkeyword単位の存在判定だけに使う
+ * （deriveConversationTopicAnchors参照）。
+ *
+ * companion/coachが使うretrieveRelevantMemories本体の非analystブランチ、および
+ * scoreMemory()自体には一切変更を加えない。analystのdivergent選定
+ * （selectDivergentMemories等）にも影響しない（将来のBroad/Divergent Retrievalのために
+ * そのまま温存する）。
+ *
+ * 【暫定値について】CONVERSATION_MIN_SCORE・CONVERSATION_ANCHOR_WEIGHT・
+ * CONVERSATION_RECENT_TURNS_WINDOWの3つは、実データが無い状態で設計時に決めた暫定値。
+ * 実機BetaのConversation Debug Log（queryScore/genericPenalty/anchorBonus/
+ * conversationScoreの内訳、floor未満での除外理由）を見ながら調整する前提で、
+ * 変更しやすいようこのファイル内の1箇所にまとめてexportしてある。
+ */
+
+/** 直接一致候補として最低限必要な補正後スコア（暫定値）。これ未満の候補は
+ * 1位であっても採用しない（0件を許容する。無理に埋めない。MEMORY_ENGINE.md 7.4）。 */
+export const CONVERSATION_MIN_SCORE = KEYWORD_WEIGHT; // 暫定値=3。実データで調整する
+
+/** 直近turnsで継続しているtopic anchor 1件あたりの重み（暫定値）。 */
+export const CONVERSATION_ANCHOR_WEIGHT = 4; // 暫定値。実データで調整する
+
+/** topic anchor抽出の対象とする、直近の同一Conversation内user turnsの件数（暫定値）。 */
+export const CONVERSATION_RECENT_TURNS_WINDOW = 6; // 暫定値。実データで調整する
+
+/**
+ * topic anchorとして扱うために必要な最低distinctiveness（暫定値）。
+ * 「自分」「時間」のような一般語は、直近turns内で何度再出現しても、コーパス全体では
+ * 多くのMemoryのkeywordsに含まれているためdistinctivenessが低い。turnsContaining
+ * （再出現回数）だけでanchor化すると、一般語がConversation内で繰り返されただけで
+ * anchor扱いされてしまう（実装後の合成データ検証で確認した不具合）。この閾値未満の
+ * keywordはanchor候補にしない（重み付けだけでなくgate自体をかける）。
+ * 例：0.5は「コーパス内で高々2件のMemoryにしか使われていないkeyword」に相当。
+ */
+export const CONVERSATION_ANCHOR_MIN_DISTINCTIVENESS = 0.5; // 暫定値。実データで調整する
+
+/**
+ * keywordがコーパス内でどれだけ珍しいかの重み（1に近いほど珍しい＝1件程度のMemoryでしか
+ * 使われていない＝distinctive、0に近いほど多くのMemoryで使われる一般語）。
+ * distinctivenessScore()と同じ考え方の再利用だが、あちらは「Memoryが持つ複数keywordの
+ * うち最も珍しいもの」を返す集約関数のため、ここではkeyword単体の重みとして独立させる。
+ */
+function keywordRarityWeight(keyword: string, keywordFrequency: Map<string, number>): number {
+  const freq = keywordFrequency.get(keyword) ?? 1;
+  return freq > 0 ? 1 / freq : 1;
+}
+
+export interface ConversationTopicAnchor {
+  keyword: string;
+  /** keywordRarityWeightと同じ値（1に近いほど珍しい＝話題を決める語らしい）。 */
+  distinctiveness: number;
+  /** 直近turnsウィンドウのうち、このkeywordを含んでいたturnの数。 */
+  turnsContaining: number;
+}
+
+/**
+ * 直近の同一Conversation内user turns本文から、既存Memory keyword語彙（keywordFrequencyの
+ * キー集合＝既存Captureが既に抽出済みのkeywordだけ）と照合してtopic anchorを導出する。
+ * AI/APIによる新規Topic抽出は行わない。
+ *
+ * turns全文を連結してbigram化することはしない。各keywordについて「直近turnsのうち
+ * このkeywordを含むものが何件あるか」を`turn.includes(keyword)`で個別に数えるだけであり、
+ * turn本文の助詞・一般語の量そのものがスコアへ混入することはない。
+ */
+export function deriveConversationTopicAnchors(
+  recentUserTurnsTexts: string[],
+  keywordFrequency: Map<string, number>
+): ConversationTopicAnchor[] {
+  const window = recentUserTurnsTexts.slice(-CONVERSATION_RECENT_TURNS_WINDOW);
+  const anchors: ConversationTopicAnchor[] = [];
+  for (const keyword of keywordFrequency.keys()) {
+    if (!keyword) continue;
+    const turnsContaining = window.filter((text) => text.includes(keyword)).length;
+    if (turnsContaining === 0) continue;
+    const distinctiveness = keywordRarityWeight(keyword, keywordFrequency);
+    // 一般語はConversation内で何度再出現してもanchor化しない（CONVERSATION_ANCHOR_MIN_DISTINCTIVENESS参照）。
+    if (distinctiveness < CONVERSATION_ANCHOR_MIN_DISTINCTIVENESS) continue;
+    anchors.push({ keyword, distinctiveness, turnsContaining });
+  }
+  return anchors;
+}
+
+/**
+ * scoreMemory()のkeywordHit寄与（keywordHits * KEYWORD_WEIGHT）のうち、一般的な
+ * （コーパス内で頻出する）keywordの分だけを差し引く補正値。scoreMemory自体は
+ * 読み取り専用で呼ぶだけで変更しない。1件のみで使われる珍しいkeywordの一致は
+ * 減衰させない（keywordRarityWeightが1に近いためpenaltyはほぼ0になる）。
+ */
+function genericKeywordPenalty(memory: MemoryObject, trimmed: string, keywordFrequency: Map<string, number>): number {
+  const hits = memory.keywords.filter((keyword) => keyword && trimmed.includes(keyword));
+  return hits.reduce((sum, keyword) => sum + KEYWORD_WEIGHT * (1 - keywordRarityWeight(keyword, keywordFrequency)), 0);
+}
+
+/**
+ * 直近turnsで継続しているtopic anchor（一般的でない、繰り返し出現しているkeyword）を
+ * 持つMemoryを補強するボーナス値。anchorsに無いkeywordは寄与0。
+ */
+function conversationAnchorScore(memory: MemoryObject, anchors: ConversationTopicAnchor[]): number {
+  if (anchors.length === 0) return 0;
+  const anchorByKeyword = new Map(anchors.map((anchor) => [anchor.keyword, anchor]));
+  let score = 0;
+  for (const keyword of memory.keywords) {
+    if (!keyword) continue;
+    const anchor = anchorByKeyword.get(keyword);
+    if (anchor) score += CONVERSATION_ANCHOR_WEIGHT * anchor.distinctiveness;
+  }
+  return score;
+}
+
+export interface ConversationCandidateScore {
+  memory: MemoryObject;
+  /** 既存scoreMemory()の生値（未補正）。 */
+  queryScore: number;
+  /** 一般的なkeywordの寄与を減衰させた分（正の値。scoreからはこの分を引く）。 */
+  genericPenalty: number;
+  /** 直近turnsでの継続によるボーナス（加点）。 */
+  anchorBonus: number;
+  /** queryScore - genericPenalty + anchorBonus。実際の順位付け・floor判定に使う値。 */
+  conversationScore: number;
+}
+
+/**
+ * poolの各Memoryについて、Conversation Retrieval用の補正後スコアと内訳を計算する。
+ * scoreMemory()は変更せず読み取り専用で呼ぶだけ。ConversationDebugからも
+ * 同じ関数を再利用し、実際の選定ロジックとログの内訳を常に一致させる。
+ */
+export function scoreConversationCandidates(
+  pool: MemoryObject[],
+  trimmed: string,
+  anchors: ConversationTopicAnchor[],
+  keywordFrequency: Map<string, number>
+): ConversationCandidateScore[] {
+  return pool.map((memory) => {
+    const queryScore = scoreMemory(memory, trimmed);
+    const genericPenalty = genericKeywordPenalty(memory, trimmed, keywordFrequency);
+    const anchorBonus = conversationAnchorScore(memory, anchors);
+    return { memory, queryScore, genericPenalty, anchorBonus, conversationScore: queryScore - genericPenalty + anchorBonus };
+  });
+}
+
+export interface ConversationDirectSelection {
+  anchors: ConversationTopicAnchor[];
+  /** floor判定前の全候補数（デバッグ表示用）。 */
+  consideredCount: number;
+  kept: ConversationCandidateScore[];
+  /** CONVERSATION_MIN_SCORE未満で除外された候補（正の値を持つもののみ、スコア降順）。 */
+  droppedByFloor: ConversationCandidateScore[];
+  /** floorは超えたが、相対的な強さが足りず除外された候補。 */
+  droppedByRelativeStrength: ConversationCandidateScore[];
+}
+
+/**
+ * Conversation Retrievalの直接一致選定：scoreConversationCandidatesで補正後スコアを計算し、
+ * (1) 暫定の絶対floor（CONVERSATION_MIN_SCORE）未満を除外 → (2) 上位limit件に絞り →
+ * (3) 既存のapplyRelativeStrengthFilter（変更なし）をそのまま適用、の3段階で絞り込む。
+ * floorを超える候補が1件も無ければ空配列を返す（0件を許容し、divergentや無関係な
+ * Memoryでの穴埋めは行わない）。
+ */
+export function selectConversationDirectMatches(
+  pool: MemoryObject[],
+  trimmed: string,
+  recentUserTurnsTexts: string[],
+  keywordFrequency: Map<string, number>,
+  limit: number
+): ConversationDirectSelection {
+  const anchors = deriveConversationTopicAnchors(recentUserTurnsTexts, keywordFrequency);
+  const allScored = scoreConversationCandidates(pool, trimmed, anchors, keywordFrequency);
+
+  const aboveFloor = allScored.filter((entry) => entry.conversationScore >= CONVERSATION_MIN_SCORE);
+  const droppedByFloor = allScored
+    .filter((entry) => entry.conversationScore > 0 && entry.conversationScore < CONVERSATION_MIN_SCORE)
+    .sort((a, b) => b.conversationScore - a.conversationScore);
+
+  const sorted = [...aboveFloor].sort((a, b) => b.conversationScore - a.conversationScore).slice(0, limit);
+
+  const relativeInput = sorted.map((entry) => ({ memory: entry.memory, score: entry.conversationScore }));
+  const keptIds = new Set(applyRelativeStrengthFilter(relativeInput).map((entry) => entry.memory.id));
+  const kept = sorted.filter((entry) => keptIds.has(entry.memory.id));
+  const droppedByRelativeStrength = sorted.filter((entry) => !keptIds.has(entry.memory.id));
+
+  return { anchors, consideredCount: allScored.length, kept, droppedByFloor, droppedByRelativeStrength };
+}
+
+/**
  * クリエイト（analyst）専用のMemory取得。companion/coachが使う既存のretrieveRelevantMemoriesの
  * スコアリング・件数ロジックには一切影響しない（別関数として完全に分離）。
  * Link経由の追加（pickLinkedAdditions）はここでは行わない（既存のConnect機能とは別軸のため）。
+ *
+ * 直接一致の選定は、Conversation Retrieval（selectConversationDirectMatches、上のセクション参照）に
+ * 委譲する。scoreDirectCandidates + applyRelativeStrengthFilterだけを使っていた旧実装は、
+ * 1位の候補自体が一般語一致だけのfalse positiveになるケースを防げなかったため、
+ * このConversation品質改善 第2修正で置き換えた。
  *
  * 「あえて遠いMemory」（selectDivergentMemories、創造的な飛躍のための材料）は、
  * options.includeDivergentがtrueの場合にのみ追加する。通常のanalyst会話
  * （ChatScreen.tsxからの既定の呼び出し）ではこのオプションを渡していないため、
  * 現時点では自動投入されない。将来「別の視点がほしい」「意外なつながりを探して」等の
  * 明示的な要求を検出する仕組みを追加する際に、そこからoptions.includeDivergent:trueで
- * 呼び出せるよう、ロジック自体（selectDivergentMemories等）は削除せずそのまま残してある。
+ * 呼び出せるよう、ロジック自体（selectDivergentMemories等）は削除せずそのまま残してある
+ * （Conversation Retrievalの変更はdivergent選定に一切影響しない）。
  */
 async function retrieveCreativeMemories(
   trimmed: string,
-  options: { excludeConversationId?: string; limit?: number; includeDivergent?: boolean }
+  options: {
+    excludeConversationId?: string;
+    limit?: number;
+    includeDivergent?: boolean;
+    /** Conversation Retrieval用。直近の同一Conversation内user turns本文（最新発言含む）。
+     * 未指定時は空配列扱い＝anchorボーナス無しでgenericKeywordPenaltyのみ効く。 */
+    recentUserTurnsTexts?: string[];
+  }
 ): Promise<RetrievedMemory[]> {
   const directLimit = options.limit ?? DEFAULT_LIMIT;
   const all = await getAllMemoryObjects();
   const pool = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
+  const keywordFrequency = computeKeywordFrequency(all);
 
-  const scoredDirect = scoreDirectCandidates(pool, trimmed, directLimit);
-  const keptDirect = applyRelativeStrengthFilter(scoredDirect);
-  const directMatches = keptDirect.map((entry) => entry.memory);
+  const { kept } = selectConversationDirectMatches(
+    pool,
+    trimmed,
+    options.recentUserTurnsTexts ?? [],
+    keywordFrequency,
+    directLimit
+  );
+  const directMatches = kept.map((entry) => entry.memory);
 
   let divergentMatches: MemoryObject[] = [];
   if (options.includeDivergent) {
     const directIds = new Set(directMatches.map((memory) => memory.id));
     const divergentPool = pool.filter((memory) => !directIds.has(memory.id));
-    const keywordFrequency = computeKeywordFrequency(all);
     divergentMatches = selectDivergentMemories(divergentPool, keywordFrequency, CREATIVE_DIVERGENT_COUNT);
   }
 
@@ -387,6 +605,13 @@ export async function retrieveRelevantMemories(
      * （retrieveCreativeMemories自体がanalystのときにしか呼ばれないため）。
      */
     includeDivergent?: boolean;
+    /**
+     * Conversation Retrieval用（analyst専用）。直近の同一Conversation内user turns本文
+     * （最新発言含む）。deriveConversationTopicAnchorsでtopic anchor抽出にのみ使い、
+     * turns全文を検索クエリへ連結することはしない。companion/coachのブランチは
+     * このフィールドを読まないため、渡しても渡さなくても挙動に影響しない。
+     */
+    recentUserTurnsTexts?: string[];
   } = {}
 ): Promise<RetrievedMemory[]> {
   const trimmed = queryText.trim();

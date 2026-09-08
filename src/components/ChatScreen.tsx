@@ -1189,12 +1189,21 @@ export default function ChatScreen() {
       // 明示的Reflection（ROADMAP.md Phase 2）：ローカル判定のみでlimitとLink経由上限を広げる。
       // 判定がfalseの場合は既定のまま、Phase 1からの挙動を完全に維持する。
       const reflective = isReflectiveQuery(text);
+      // Conversation Retrieval（analyst専用、Conversation品質改善 第2修正）が使う、
+      // 直近の同一Conversation内user turns本文。turns全文を検索クエリへ連結するのではなく、
+      // retrieval.ts側でkeyword単位の存在判定だけに使う（deriveConversationTopicAnchors参照）。
+      // companion/coachはこのフィールドを読まないため、常に渡しても挙動に影響しない。
+      const recentUserTurnsTexts = updated.turns
+        .filter((turn) => turn.role === "user")
+        .map((turn) => turn.content.trim())
+        .filter(Boolean);
       const retrievedMemories = await retrieveRelevantMemories(text, {
         excludeConversationId: baseConversation.id,
         limit: reflective ? REFLECTIVE_LIMIT : undefined,
         maxLinkedAdditions: reflective ? REFLECTIVE_MAX_LINKED_ADDITIONS : undefined,
         persona: activePersona,
         promptedMemoryId: baseConversation.promptedMemoryId,
+        recentUserTurnsTexts,
       });
 
       // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用。`?debugLog=1`が

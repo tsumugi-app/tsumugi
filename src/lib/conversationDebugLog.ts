@@ -34,16 +34,29 @@
  *   ためだけに再計算したものである。retrievedMemories自体が持つ`matchType`
  *   （"direct"/"divergent"、retrieval.ts参照）は実際の選定結果そのものなので、
  *   sourceの表示にはこちらを優先して使う。
- * - persona===analystのときだけ、retrieveCreativeMemories()と同じ絞り込み（
- *   scoreDirectCandidates→applyRelativeStrengthFilter、どちらもretrieval.tsから
- *   そのままimportして再利用。ロジックの複製はしていない）をこのログのためだけに
- *   再実行し、「候補には挙がったが、1位との相対的な強さが足りず落とされたMemory」を
- *   表示する。これは実際にRetrievedMemoriesへ含まれることは無い、調査専用の情報。
+ * - persona===analystのときだけ、retrieveCreativeMemories()の直接一致選定と同じ処理
+ *   （selectConversationDirectMatches、retrieval.tsからそのままimportして再利用。
+ *   ロジックの複製はしていない）をこのログのためだけに再実行し、Conversation Retrieval
+ *  （Conversation品質改善 第2修正）のtopic anchor・スコア内訳（queryScore/genericPenalty/
+ *   anchorBonus/conversationScore）・floor未満で除外された候補・相対的な強さが
+ *   足りず落とされた候補を表示する。これは実際にRetrievedMemoriesへ含まれることは
+ *   無い、調査・チューニング専用の情報。表示するkeyword（topic anchor）は既存
+ *   memory.keywords語彙由来の短い単語のみで、turns本文そのもの（会話全文）は
+ *   ログへ出さない。
  */
 "use client";
 
 import { getAllMemoryObjects } from "./db";
-import { applyRelativeStrengthFilter, DEFAULT_LIMIT, isSameConversation, scoreDirectCandidates, scoreMemory } from "./retrieval";
+import {
+  CONVERSATION_MIN_SCORE,
+  CONVERSATION_RECENT_TURNS_WINDOW,
+  DEFAULT_LIMIT,
+  computeKeywordFrequency,
+  isSameConversation,
+  scoreMemory,
+  selectConversationDirectMatches,
+  type ConversationCandidateScore,
+} from "./retrieval";
 import { needsWebSearch } from "./needsWebSearch";
 import type { ConversationTurn, MemoryObject, Persona, RetrievedMemory } from "./types";
 import type { VaultBackend } from "./vault";
@@ -179,20 +192,41 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
     const divergentCount = retrieved.filter((r) => r.source === "divergent").length;
     const linkedCount = retrieved.filter((r) => r.source === "linked").length;
 
-    // persona===analystのときだけ、「候補には挙がったが相対的な強さが足りず落とされたMemory」を
-    // retrieval.tsの既存関数（scoreDirectCandidates／applyRelativeStrengthFilter）を
-    // そのまま再利用して再現する。ロジックの複製ではなく、同じ関数の再呼び出し。
-    let droppedDirectLines: string[] = [];
+    // persona===analystのときだけ、retrieveCreativeMemories()と全く同じ関数
+    // （selectConversationDirectMatches）を読み取り専用で再実行し、Conversation Retrieval
+    // のtopic anchor・スコア内訳・floor/相対フィルタでの除外理由を再現する。
+    // ロジックの複製ではなく、同じ関数の再呼び出し（実際の選定結果とログの内訳が
+    // 常に一致することを保証するため）。
+    let conversationRetrievalLines: string[] = [];
     if (persona === "analyst") {
       const pool = allMemories.filter((memory) => !isSameConversation(memory.conversationId, excludeConversationId));
-      const scoredDirect = scoreDirectCandidates(pool, trimmed, DEFAULT_LIMIT);
-      const keptIds = new Set(applyRelativeStrengthFilter(scoredDirect).map((entry) => entry.memory.id));
-      const dropped = scoredDirect.filter((entry) => !keptIds.has(entry.memory.id));
-      droppedDirectLines = [
-        `directCandidatesConsidered: ${scoredDirect.length} (kept=${scoredDirect.length - dropped.length}, droppedByRelativeStrength=${dropped.length})`,
-        ...dropped.map(
-          (entry) => `  dropped: id=${entry.memory.id} score=${entry.score.toFixed(2)} summary="${entry.memory.summary}"`
-        ),
+      const keywordFrequency = computeKeywordFrequency(allMemories);
+      // 実際の送信呼び出し（ChatScreen.tsx）と同じ抽出方法で揃える（role==="user"のcontentをtrim）。
+      // turns本文はkeyword存在判定だけに使い、ログへ生のturn本文を出すことはしない。
+      const recentUserTurnsTexts = turns
+        .filter((turn) => turn.role === "user")
+        .map((turn) => turn.content.trim())
+        .filter(Boolean);
+
+      const selection = selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, DEFAULT_LIMIT);
+
+      const fmt = (entry: ConversationCandidateScore) =>
+        `id=${entry.memory.id} conversationScore=${entry.conversationScore.toFixed(2)} ` +
+        `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)}) ` +
+        `summary="${entry.memory.summary}"`;
+
+      conversationRetrievalLines = [
+        `conversationTopicAnchors(直近user turns${recentUserTurnsTexts.length}件のうち、window上限${CONVERSATION_RECENT_TURNS_WINDOW}件(暫定値)から抽出): ${
+          selection.anchors.length === 0
+            ? "(なし)"
+            : selection.anchors
+                .map((a) => `${a.keyword}(distinctiveness=${a.distinctiveness.toFixed(2)}, turnsContaining=${a.turnsContaining})`)
+                .join(", ")
+        }`,
+        `conversationRetrieval: floor=${CONVERSATION_MIN_SCORE}(暫定値) considered=${selection.consideredCount} kept=${selection.kept.length} droppedByFloor=${selection.droppedByFloor.length} droppedByRelativeStrength=${selection.droppedByRelativeStrength.length}`,
+        ...selection.kept.map((entry) => `  kept: ${fmt(entry)}`),
+        ...selection.droppedByFloor.map((entry) => `  droppedByFloor: ${fmt(entry)}`),
+        ...selection.droppedByRelativeStrength.map((entry) => `  droppedByRelativeStrength: ${fmt(entry)}`),
       ];
     }
 
@@ -210,7 +244,7 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
         (r, i) =>
           `  [${i}] id=${r.id} score=${r.score ?? "n/a"} source=${r.source}${r.isOriginMemory ? " origin=true" : ""} summary="${r.summary}"${r.linkReason ? ` linkReason="${r.linkReason}"` : ""}`
       ),
-      ...droppedDirectLines,
+      ...conversationRetrievalLines,
       `finalContextSummary: retrievedMemoriesSectionPresent=${retrievedMemories.length > 0} charLenOfSummaries=${retrieved.reduce((sum, r) => sum + r.summary.length, 0)}`,
       `generationConfig(mirrored from route.ts constants, not the actual server-reported value): thinkingBudget=${mirrorThinkingBudget(trimmed)} maxOutputTokens=${MIRROR_MAX_OUTPUT_TOKENS} enableWebSearch=${needsWebSearch(trimmed)}`,
     ];
