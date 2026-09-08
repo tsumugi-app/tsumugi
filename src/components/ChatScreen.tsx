@@ -53,6 +53,7 @@ import ImportPanel from "./ImportPanel";
 import DebugTimingPanel from "./DebugTimingPanel";
 import HistoryPanel from "./HistoryPanel";
 import {
+  computeLeafColorProgress,
   computeLeafProgress,
   computeTreeSignals,
   computeTreeStage,
@@ -1385,7 +1386,7 @@ export default function ChatScreen() {
             className="w-[min(220px,100%)] rounded-lg"
           >
             <img
-              src="/logo.png"
+              src="/logo.svg"
               alt="Tsumugi"
               className="h-auto w-full dark:invert"
             />
@@ -2010,6 +2011,11 @@ function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null;
   const leafStage = stage === 1 || stage === 2 || stage === 3 ? stage : null;
   const leafCount = signals && leafStage !== null ? computeLeafProgress(signals, leafStage) : 0;
   const leafAnchors = leafStage !== null ? LEAF_ANCHORS_BY_STAGE[leafStage].slice(0, leafCount) : [];
+  // Stage 01・02の追加葉は常にモノトーン、Stage 03だけがStage内の進捗に応じて
+  // ゆっくり色づく（0＝モノトーン〜1＝葉素材本来のフルカラー）。新しい画像は作らず、
+  // 既存のleaf-a〜dへCSS filterのgrayscaleをかけるだけで表現する（下記style参照）。
+  const leafColorProgress = signals && leafStage !== null ? computeLeafColorProgress(signals, leafStage) : 0;
+  const leafGrayscalePercent = Math.round((1 - leafColorProgress) * 100);
 
   // 表示対象の葉が確定した直後、次の描画フレームでopacityを1へ切り替えることで
   // CSS transitionを発火させる（マウント直後にいきなり不透明で出現しないようにする）。
@@ -2073,7 +2079,8 @@ function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null;
                   top: `${anchor.yPercent}%`,
                   transform: transformParts.join(" "),
                   opacity: leavesVisible ? 1 : 0,
-                  transition: "opacity 0.75s ease-out, transform 0.75s ease-out",
+                  filter: `grayscale(${leafGrayscalePercent}%)`,
+                  transition: "opacity 0.75s ease-out, transform 0.75s ease-out, filter 0.75s ease-out",
                 }}
               />
             );
@@ -2081,7 +2088,7 @@ function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null;
         </div>
       )}
       <button type="button" onClick={onProceed} aria-label="tsumugiを開く" className="w-[min(220px,60%)] rounded-lg">
-        <img src="/logo.png" alt="Tsumugi" className="h-auto w-full dark:invert" />
+        <img src="/logo.svg" alt="Tsumugi" className="h-auto w-full dark:invert" />
       </button>
     </div>
   );
