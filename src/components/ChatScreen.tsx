@@ -4,12 +4,14 @@ import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
-  chooseVaultDirectory,
+  checkVaultIdentity,
   clearOpfsVault,
   collectAllMarkdownFiles,
+  ensureVaultSkeleton,
   flushPendingToVault,
   getVaultBackend,
   isVaultSupported,
+  pickVaultDirectory,
   requestVaultPermission,
   restoreVaultHandle,
   scanVaultForRestore,
@@ -25,10 +27,12 @@ import {
   getAllSources,
   loadApiKey,
   loadChatProvider,
+  loadVaultHandle,
   putConversation,
   putMemoryObject,
   saveChatProvider,
   saveSource,
+  saveVaultHandle,
 } from "@/lib/db";
 import { createZipBlob } from "@/lib/zip";
 import { getGreeting } from "@/lib/greeting";
@@ -744,20 +748,103 @@ export default function ChatScreen() {
     }
   }
 
+  /**
+   * Vault境界の安全性（別々のMemory Worldを混在させない）。
+   *
+   * 新しいフォルダを選んだだけでは、それが「同じVaultの選び直し」なのか「別Vaultへの
+   * 明示的な切替」なのかが分からない。まず`checkVaultIdentity()`で判定し、
+   * "different"（＝別Vaultへの切替）と判定された場合だけ、ユーザー確認を挟んだ上で
+   * 「現在のMemory World（IndexedDB）をclearしてから新Vaultへコミットする」という
+   * 別経路を通る。"same"（同じVaultを選び直した）・"first-connection"（初めての接続）は
+   * 現状維持（IndexedDBには一切触れない）。
+   *
+   * 別Vaultへの切替経路では、以下の順序を厳守する（詳細はvault.tsのcheckVaultIdentity/
+   * flushPendingToVault/ensureVaultSkeletonのコメント参照）：
+   *   ユーザー確認 → 新Vaultの到達性確認(ensureVaultSkeleton) →
+   *   旧Vault"自身"への未同期データのflush（新Vaultへは絶対にflushしない） →
+   *   （flush全件成功後にのみ）IndexedDBをclear → 新Vaultへコミット(saveVaultHandle) → scan/restore。
+   * どのステップかで失敗した場合も、それより後のステップ（特にIndexedDBのclear）は
+   * 一切実行しない（＝現在のVault・IndexedDBは無傷のまま）。
+   */
   async function handleConnectVault() {
     setVaultConnectFeedback(null);
     try {
-      const handle = await chooseVaultDirectory();
-      setVaultHandle(handle);
+      const newHandle = await pickVaultDirectory();
+      const previousHandle = await loadVaultHandle();
+      const identity = await checkVaultIdentity(previousHandle, newHandle);
+
+      if (identity !== "different") {
+        // CASE1（初めての接続）・同じVaultを選び直した場合：Memory World切替としては
+        // 扱わない。現状維持（既存のhandleConnectVaultの挙動と完全に同じ）。
+        await ensureVaultSkeleton(newHandle);
+        await saveVaultHandle(newHandle);
+        setVaultHandle(newHandle);
+        setVaultStatus("connected");
+        // 新しいVaultフォルダを選択した場合のみクリアする（同じVaultへの再認可＝
+        // handleReauthorizeVaultでは呼ばない）。Vault同期済み台帳はどのフォルダに対する
+        // 同期状況かを区別しないため、フォルダが変わったのにクリアしないと、
+        // 新フォルダには実際は書き込まれていないデータを「同期済み」と誤判定し、
+        // flushPendingToVaultがそのitemの書き込みをスキップしてしまう（データ消失事故）。
+        await clearVaultSyncState();
+        await flushPendingToVault(newHandle);
+        await checkForRestoreCandidate(newHandle);
+        return;
+      }
+
+      // ここから別Vaultへの明示的な切替。この時点まで、IndexedDB・現在のVault・
+      // sync stateのいずれにも一切触れていない（newHandle自体はshowDirectoryPickerで
+      // 取得済みだが、まだフォルダへの書き込みは一切行っていない）。
+      const confirmed = window.confirm(
+        "保存先を切り替えますか？\n\n選んだフォルダの記憶に切り替わります。これまでの記憶は、現在の保存先に残ります。"
+      );
+      if (!confirmed) {
+        // 「やめる」：IndexedDB・現在のVault・sync stateには一切変更を加えない。
+        setVaultConnectFeedback({ kind: "cancelled", message: "保存先の切り替えをキャンセルしました。" });
+        window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+        return;
+      }
+
+      // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。ここで失敗すれば、
+      // 現在のVault・IndexedDBには一切影響しない（空フォルダの作成以外の副作用は無い）。
+      await ensureVaultSkeleton(newHandle);
+
+      // 現在のVault（旧）に未同期のデータがあれば、新Vaultではなく旧Vault自身へ保存する
+      // （絶対にnewHandleへflushしない）。1件でも失敗した場合はデータ消失を避けるため、
+      // ここで切替を中止する（IndexedDBはclearしない・別Vaultへ切り替えない）。
+      if (vaultStatus === "connected" && vaultHandle) {
+        const flushResult = await flushPendingToVault(vaultHandle, "interactive");
+        if (flushResult.failedCount > 0) {
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "今のデータの保存に失敗したため、切り替えを中止しました。もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+          return;
+        }
+      }
+
+      // ここまで来て初めて、現在のMemory World（IndexedDB）をclearする。
+      try {
+        await clearMemoryData();
+      } catch (clearError) {
+        console.error("Failed to clear local data before vault switch", clearError);
+        setVaultConnectFeedback({
+          kind: "error",
+          message: "切り替えに失敗しました。ページを再読み込みしてからもう一度お試しください。",
+        });
+        window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+        return;
+      }
+      setRestoreCandidate(null);
+      setRestoreStatus("idle");
+
+      // clear成功後に初めて新Vaultへコミットする。
+      await saveVaultHandle(newHandle);
+      setVaultHandle(newHandle);
       setVaultStatus("connected");
-      // 新しいVaultフォルダを選択した場合のみクリアする（同じVaultへの再認可＝
-      // handleReauthorizeVaultでは呼ばない）。Vault同期済み台帳はどのフォルダに対する
-      // 同期状況かを区別しないため、フォルダが変わったのにクリアしないと、
-      // 新フォルダには実際は書き込まれていないデータを「同期済み」と誤判定し、
-      // flushPendingToVaultがそのitemの書き込みをスキップしてしまう（データ消失事故）。
-      await clearVaultSyncState();
-      await flushPendingToVault(handle);
-      await checkForRestoreCandidate(handle);
+
+      // 新Vault（B）をscanし、既存データがあれば復元候補として提示する（自動では書き込まない）。
+      await checkForRestoreCandidate(newHandle);
     } catch (error) {
       const feedback: VaultConnectFeedback =
         error instanceof DOMException && error.name === "AbortError"

@@ -22,7 +22,6 @@ import {
   getAllSources,
   getVaultSyncState,
   loadVaultHandle,
-  saveVaultHandle,
   setVaultSyncState,
 } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
@@ -131,18 +130,59 @@ export async function requestVaultPermission(handle: FileSystemDirectoryHandle):
 
 /**
  * ユーザーの明示的な操作（クリック）内から呼ぶ必要がある（showDirectoryPicker の仕様）。
+ *
+ * フォルダの選択のみを行う（骨組み作成・handle保存は行わない）。以前はこの関数が
+ * ensureVaultSkeleton・saveVaultHandleまで一括で行っていたが、Vault切替時に
+ * 「別Vaultかどうかをまず判定し、別Vaultの場合はユーザー確認を挟んでから初めて
+ * 骨組みを作る」という順序（checkVaultIdentity、ChatScreen.tsx参照）が必要になったため、
+ * 「選ぶ」と「実際にそのVaultとして使い始める」を分離した。骨組み作成・handle保存は
+ * 呼び出し元が、Vault識別判定の結果に応じたタイミングで`ensureVaultSkeleton`/
+ * `saveVaultHandle`を個別に呼ぶこと。
  */
-export async function chooseVaultDirectory(): Promise<FileSystemDirectoryHandle> {
+export async function pickVaultDirectory(): Promise<FileSystemDirectoryHandle> {
   if (!isFsAccessSupported()) {
     throw new Error("このブラウザはFile System Access APIに対応していません。Chrome/Edgeでお試しください。");
   }
-  const handle = await window.showDirectoryPicker({ mode: "readwrite" });
-  await ensureVaultSkeleton(handle);
-  await saveVaultHandle(handle);
-  return handle;
+  return window.showDirectoryPicker({ mode: "readwrite" });
 }
 
-async function ensureVaultSkeleton(root: FileSystemDirectoryHandle) {
+/**
+ * 保存済みの旧handle（previousHandle）と、今回選択した新しいhandle（newHandle）が
+ * 同じVault（同じフォルダエントリ）を指すかどうかを判定する。
+ *
+ * - previousHandleが無い（＝これまで一度もVaultへ接続したことが無い）場合は
+ *   "first-connection" を返す。これは「別のVaultへの切替」ではなく「今まで
+ *   ローカルにあったデータへ、初めて保存先を割り当てる」操作として扱うべきケース
+ *   （STORAGE.md §2.4 / 今回のVault境界設計のCASE 1）。
+ * - `FileSystemHandle.isSameEntry()`で比較する（MDN: 同じエントリを指す2つのhandleを
+ *   比較するための標準API。Chrome 86+で利用可能、tsumugiのFile System Access
+ *   バックエンド自体がChrome/Edge限定のため対象範囲内）。
+ * - 比較自体が例外を投げた場合（handleが失効している等、判定不能な場合）は、
+ *   「同じVaultだろう」と推測せず、安全側に倒して"different"を返す。誤って
+ *   別々のMemory Worldを同一とみなし混在させるリスクの方を、常に重く見る。
+ */
+export type VaultIdentity = "first-connection" | "same" | "different";
+
+export async function checkVaultIdentity(
+  previousHandle: FileSystemDirectoryHandle | undefined,
+  newHandle: FileSystemDirectoryHandle
+): Promise<VaultIdentity> {
+  if (!previousHandle) return "first-connection";
+  try {
+    const same = await previousHandle.isSameEntry(newHandle);
+    return same ? "same" : "different";
+  } catch {
+    return "different";
+  }
+}
+
+/**
+ * exportしてChatScreen.tsx側からも呼べるようにした（Vault切替時、ユーザー確認の後、
+ * IndexedDBをclearする前に「新しいVaultが実際に使えるか」を確認する目的で使う。
+ * 副作用は空のディレクトリ（VAULT_DIRS各種・.tsumugi/）の作成と、存在しない場合のみの
+ * schema-version.json / index.json の作成のみで、既存ファイルの上書き・削除は行わない）。
+ */
+export async function ensureVaultSkeleton(root: FileSystemDirectoryHandle) {
   for (const dir of VAULT_DIRS) {
     await root.getDirectoryHandle(dir, { create: true });
   }
@@ -532,8 +572,25 @@ export async function writeMemoryObjectMarkdown(
  * 他のitemの処理は必ず継続する（write成功時だけledgerが更新される、という既存の
  * 安全性は変更しない。失敗したitemは今回もledgerがsynced扱いにならないため、
  * 次回起動時のflushで自然に再試行される）。
+ *
+ * Vault境界の安全な切替（Conversation品質改善とは別軸）：呼び出し元（ChatScreen.tsxの
+ * Vault切替フロー）が「Aへの書き戻しが本当に全件成功したか」を判定できるよう、
+ * `writtenCount`に加えて`failedCount`も返すようにした（既存の3呼び出し元は戻り値を
+ * 使っていないため、返す値を増やしても後方互換）。1件でも失敗があれば、呼び出し元は
+ * 「IndexedDBをclearしない・別Vaultへ切り替えない」という安全側の判断に使う。
+ * `priority`はデフォルト"background"のまま（既存の挙動を変えない）。Vault切替の
+ * ユーザー確認直後のような、応答性が求められる文脈からは"interactive"を渡せるようにした。
  */
-export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
+export interface FlushResult {
+  totalCount: number;
+  writtenCount: number;
+  failedCount: number;
+}
+
+export async function flushPendingToVault(
+  root: FileSystemDirectoryHandle,
+  priority: VaultWritePriority = "background"
+): Promise<FlushResult> {
   const flushStart = Date.now();
   const [conversations, memoryObjects, sources] = await Promise.all([
     getAllConversations(),
@@ -545,37 +602,44 @@ export async function flushPendingToVault(root: FileSystemDirectoryHandle) {
   logTimingEvent("Vault flush:start", { count: totalCount });
 
   let writtenCount = 0;
+  let failedCount = 0;
   for (const conversation of conversations) {
     if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
     try {
-      await writeConversationMarkdown(root, conversation, "background");
+      await writeConversationMarkdown(root, conversation, priority);
       writtenCount += 1;
     } catch (error) {
+      failedCount += 1;
       console.error("[Tsumugi] flush: conversation write failed (will retry on next flush):", error);
     }
   }
   for (const memoryObject of memoryObjects) {
     if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
     try {
-      await writeMemoryObjectMarkdown(root, memoryObject, "background");
+      await writeMemoryObjectMarkdown(root, memoryObject, priority);
       writtenCount += 1;
     } catch (error) {
+      failedCount += 1;
       console.error("[Tsumugi] flush: memory write failed (will retry on next flush):", error);
     }
   }
   for (const source of sources) {
     if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
     try {
-      await writeSourceMarkdown(root, source, "background");
+      await writeSourceMarkdown(root, source, priority);
       writtenCount += 1;
     } catch (error) {
+      failedCount += 1;
       console.error("[Tsumugi] flush: source write failed (will retry on next flush):", error);
     }
   }
 
   const flushDurationMs = Date.now() - flushStart;
-  console.log(`[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} durationMs=${flushDurationMs}`);
+  console.log(
+    `[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} failedCount=${failedCount} durationMs=${flushDurationMs}`
+  );
   logTimingEvent("Vault flush:end", { count: totalCount, writtenCount, durationMs: flushDurationMs });
+  return { totalCount, writtenCount, failedCount };
 }
 
 export function isVaultSupported() {
