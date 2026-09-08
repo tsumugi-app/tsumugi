@@ -46,11 +46,16 @@ import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/
 import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
 import { logStartupCatchupEnd, logStartupCatchupStart, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
+// TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用（`?debugLog=1`のときだけ出力）。
+import { logConversationDebug } from "@/lib/conversationDebugLog";
 import ApiKeySetup from "./ApiKeySetup";
 import SettingsPanel from "./SettingsPanel";
 import ImportPanel from "./ImportPanel";
 // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用診断パネル。`?debugLog=1`以外では何も描画しない。
 import DebugTimingPanel from "./DebugTimingPanel";
+// TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用診断パネル。
+// `?debugLog=1`以外では何も描画しない（DebugTimingPanelと同じ設計）。
+import ConversationDebugPanel from "./ConversationDebugPanel";
 import HistoryPanel from "./HistoryPanel";
 import {
   computeLeafColorProgress,
@@ -1192,6 +1197,18 @@ export default function ChatScreen() {
         promptedMemoryId: baseConversation.promptedMemoryId,
       });
 
+      // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用。`?debugLog=1`が
+      // 無い場合は即returnするため（conversationDebugLog.ts参照）、通常のユーザーには
+      // 一切影響しない。会話送信そのものを待たせない・失敗させないためvoidで発火するだけにする。
+      void logConversationDebug({
+        persona: activePersona,
+        turns: updated.turns,
+        retrievedMemories,
+        latestUserMessage: text,
+        vaultBackend: getVaultBackend(),
+        vaultStatus,
+      });
+
       // chatだけは選択中provider（既定Gemini）を使う。他機能（Capture/Connect/Reflection/
       // 問いかけ生成）はloadApiKey()を引数なしで呼ぶため、常にGeminiのままである。
       const storedApiKey = await loadApiKey(chatProvider);
@@ -1966,6 +1983,7 @@ export default function ChatScreen() {
         </div>
       )}
       <DebugTimingPanel />
+      <ConversationDebugPanel />
     </div>
   );
 }
