@@ -760,11 +760,20 @@ export default function ChatScreen() {
    *
    * 別Vaultへの切替経路では、以下の順序を厳守する（詳細はvault.tsのcheckVaultIdentity/
    * flushPendingToVault/ensureVaultSkeletonのコメント参照）：
+   *   旧Vaultが書き込み可能か確認(vaultStatus==="connected") →
    *   ユーザー確認 → 新Vaultの到達性確認(ensureVaultSkeleton) →
    *   旧Vault"自身"への未同期データのflush（新Vaultへは絶対にflushしない） →
    *   （flush全件成功後にのみ）IndexedDBをclear → 新Vaultへコミット(saveVaultHandle) → scan/restore。
    * どのステップかで失敗した場合も、それより後のステップ（特にIndexedDBのclear）は
    * 一切実行しない（＝現在のVault・IndexedDBは無傷のまま）。
+   *
+   * 「旧Vaultが書き込み可能か確認」を最初の関門にしているのは、旧Vaultが
+   * needs-permission等で書き込めない状態のままBへ切り替えると、IndexedDBにしか
+   * 存在しない未同期データ（旧Vaultへ一度も書き込まれていないConversation/Memory等）が
+   * この後のclearMemoryData()で永久に失われてしまうため（実際に存在した経路）。
+   * 「未同期データが実際にあるかどうか」を事前判定する複雑さを避け、旧Vaultが
+   * 書き込み可能でない限り一律で切替そのものを中止し、ユーザーに旧Vaultの再許可
+   * （既存のhandleReauthorizeVault、変更なし）を促す方針に統一する。
    */
   async function handleConnectVault() {
     setVaultConnectFeedback(null);
@@ -794,6 +803,29 @@ export default function ChatScreen() {
       // ここから別Vaultへの明示的な切替。この時点まで、IndexedDB・現在のVault・
       // sync stateのいずれにも一切触れていない（newHandle自体はshowDirectoryPickerで
       // 取得済みだが、まだフォルダへの書き込みは一切行っていない）。
+
+      // 安全原則：「別Vaultへ切り替える前に、現在のMemory World（旧Vault）のローカル
+      // データが旧Vaultへ安全に保存されたことを確認する」。previousHandleが存在する
+      // （＝これは初回接続ではなく既存のMemory Worldからの切替である）以上、旧Vaultが
+      // 今書き込み可能（vaultStatus === "connected"）でなければ、そもそも未同期データを
+      // 安全に保存できたか確認しようが無い。例えば「Vault Aがneeds-permissionのまま
+      // IndexedDBだけで会話を継続し、その未同期データがVault Aへ一度も書き込まれていない」
+      // 状態でBへ切り替えると、この後のclearMemoryData()でそのデータが永久に失われる
+      // （実際に存在した経路。過去のコードでは`vaultStatus === "connected" && vaultHandle`の
+      // 条件でflushPendingToVault自体をスキップしてしまい、そのままclearへ進んでいた）。
+      // 「実際に未同期データがあるかどうか」を事前判定する複雑さを避け、旧Vaultが
+      // 書き込み可能でない限り一律で切替そのものを中止する（安全側に統一する）。
+      // ここで中断すればensureVaultSkeleton(newHandle)すら呼ばないため、Bへ余計な
+      // フォルダも作らない。
+      if (vaultStatus !== "connected" || !vaultHandle) {
+        setVaultConnectFeedback({
+          kind: "error",
+          message: "現在の記憶を保存してから保存先を切り替える必要があります。現在の保存先へのアクセスを許可してください。",
+        });
+        window.setTimeout(() => setVaultConnectFeedback(null), 6000);
+        return;
+      }
+
       const confirmed = window.confirm(
         "保存先を切り替えますか？\n\n選んだフォルダの記憶に切り替わります。これまでの記憶は、現在の保存先に残ります。"
       );
@@ -809,18 +841,17 @@ export default function ChatScreen() {
       await ensureVaultSkeleton(newHandle);
 
       // 現在のVault（旧）に未同期のデータがあれば、新Vaultではなく旧Vault自身へ保存する
-      // （絶対にnewHandleへflushしない）。1件でも失敗した場合はデータ消失を避けるため、
-      // ここで切替を中止する（IndexedDBはclearしない・別Vaultへ切り替えない）。
-      if (vaultStatus === "connected" && vaultHandle) {
-        const flushResult = await flushPendingToVault(vaultHandle, "interactive");
-        if (flushResult.failedCount > 0) {
-          setVaultConnectFeedback({
-            kind: "error",
-            message: "今のデータの保存に失敗したため、切り替えを中止しました。もう一度お試しください。",
-          });
-          window.setTimeout(() => setVaultConnectFeedback(null), 4000);
-          return;
-        }
+      // （絶対にnewHandleへflushしない）。上のガードにより、この時点でvaultStatusは
+      // 必ず"connected"かつvaultHandleが存在する。1件でも失敗した場合はデータ消失を
+      // 避けるため、ここで切替を中止する（IndexedDBはclearしない・別Vaultへ切り替えない）。
+      const flushResult = await flushPendingToVault(vaultHandle, "interactive");
+      if (flushResult.failedCount > 0) {
+        setVaultConnectFeedback({
+          kind: "error",
+          message: "今のデータの保存に失敗したため、切り替えを中止しました。もう一度お試しください。",
+        });
+        window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+        return;
       }
 
       // ここまで来て初めて、現在のMemory World（IndexedDB）をclearする。
