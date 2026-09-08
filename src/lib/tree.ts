@@ -215,97 +215,126 @@ export const LEAF_SPRITE_PATH: Record<string, string> = {
  * 段階が進むほど配置数（＝上限枠）を増やし、「01は少なく、02は徐々に、
  * 03はかなり茂る」という密度の違いを表現する（01:18箇所、02:23箇所、03:28箇所）。
  *
- * 生成方法（v2で密度を大幅増加した際に採用。乱数は一切使っていない）：
- * 納品された実画像（1205×1054px）のアルファチャンネル＋輝度を解析し、各候補点の
- * 半径3%圏内に「葉らしい明るい画素（アルファ>80かつ輝度>140、＝暗い幹・枝の線画では
- * ない）」が2点以上存在する場所だけを配置候補として採用（＝既存の葉群のすぐそば、
- * または枝先の葉が茂っている位置にしか置かれない。何も描かれていない余白や、幹だけが
- * 見えている場所には置かれない）。そこから、既に選ばれた点との最小距離が最大になる点を
- * 順に選ぶ「Farthest Point Sampling」で必要数を選出（中心・外周・内側の隙間へ均等に
- * 埋まっていき、1箇所に固まったり隣同士が重なったりしない。選出順＝配列の並び順＝葉が
- * 増えていく表示順のため、Memoryが増えるにつれて木の外周から内側まで均等に埋まっていく
- * ように見える）。回転・スケール・spriteId・flipは配列内インデックスから決まる固定式
- * （`((i*37)%41)-20`等）で機械的に割り当てており、実行時の乱数要素は無い
- * （同じインデックス＝同じ見た目が常に再現される）。
+ * 生成方法（v3：配置・向き・大きさを「枝から生えて見える」ことを目的に再設計。
+ * 乱数は一切使っていない）：
  *
- * 実機（375×812のスマホ幅／1440×900のデスクトップ幅）で表示確認済み。追加調整が
- * 必要な場合はこの配列の数値だけを変更すればよい（他のロジックには影響しない）。
+ * 1. 配置候補の抽出（v3で二段階に強化。「幹の上に葉が乗る」問題への直接対策）：
+ *    実画像（1205×1054px）のアルファチャンネル＋輝度を解析し、
+ *    (a) 候補点そのものの直近（半径0.9%）が幹・枝の線画（暗い色）に支配されている
+ *        場合は除外する（＝葉の中心を幹・枝そのものの上に置かない）。
+ *    (b) その上で、周囲（半径2.4%）に「葉らしい明るい画素（アルファ>80かつ輝度>140）」
+ *        が3点以上ある場所だけを候補として採用する（＝既存の葉群のすぐそば、または
+ *        枝先の葉が茂っている位置にしか置かれない。何も描かれていない余白にも
+ *        置かれない）。
+ * 2. 選出：候補群から「Farthest Point Sampling」で必要数（01:18／02:23／03:28）を選出し、
+ *    木全体（外周〜内側）へ均等に配置する（座標そのものへの補正・吸着は行わない。
+ *    実測で「枝へ寄せる」補正を試したところ、かえって幹寄りへ引っ張られて1で除外した
+ *    はずの重なりが再発したため、v3ではこの吸着ステップを廃止した）。
+ * 3. 向き（rotateDeg）：各点の周囲半径5%以内にある幹・枝の暗い画素についてPCA
+ *    （主成分分析）を行い、その場所の枝が実際にどの角度を向いているか（＝枝の軸）を
+ *    検出する。木の中心から見た放射方向（外向き）でこの180度の向きの曖昧さを解消し、
+ *    「外向きの放射方向」と65:35でブレンドすることで、ノイズに強く、かつ「左の枝は
+ *    左外側へ、右の枝は右外側へ、上部は上方向へ」という自然な流れになるようにしている。
+ *    周囲に幹・枝の画素が十分見つからない場合（密な葉群の内部など）は、放射方向のみを
+ *    使う。
+ * 4. spriteId固有の「根元→先端」方向：leaf-a〜dそれぞれの実画像をPCA解析し、各素材が
+ *    画像内でどちら向きに描かれているか（根元＝葉の幅が広い側、先端＝細く尖った側）を
+ *    実測（leaf-a:-75.6°／leaf-b:-118.0°／leaf-c:-48.2°／leaf-d:-63.9°、
+ *    0°=右向き・90°=下向きの座標系）。rotateDegは、上記3で求めた「その場所で葉が
+ *    向くべき方向」に、この素材固有の向きを差し引くことで、常に葉の先端が正しい方向へ
+ *    向くように機械的に計算している（見た目の勘や固定パターンでは決めていない）。
+ * 5. flip：葉の先端の向きはrotateDegだけで360度どこへでも向けられるため、flipは
+ *    「木の中心より左側か右側か」だけで機械的に決める（左側の点は`flip: true`）。
+ *    これにより、素材が持つ左右非対称な曲がり（完全な左右対称の卵形ではない）が、
+ *    木の左右それぞれの自然な向きに合わせて反転される。
+ * 6. scale：0.55〜0.75の範囲（v2の0.72〜0.94より縮小）。既存の木本体に描かれている
+ *   1枚1枚の葉より追加葉が明らかに大きく見えないよう、全体的に小さくした上で、
+ *   配列インデックスから決まる固定式でわずかな大小差を付けている（規則的に同じ
+ *   大きさが並んで見えないようにするため。極端な大小差は付けていない）。
+ * 7. 出現順（配列順）：各点を「上/中/下」×「左/右」×「外周/内側」で分類し、
+ *   上→中→下の各段で外周→内側、左→右を交互に一巡させる固定した巡回順で
+ *   並べている（ランダムではない）。これにより、Memoryが増えるにつれて左右どちらかに
+ *   偏らず、木全体が少しずつ均等に茂っていくように見える。
+ *
+ * 実機（375×812のスマホ幅／1440×900のデスクトップ幅）で、各Stageの序盤・中盤・終盤
+ * の見た目を確認済み。追加調整が必要な場合はこの配列の数値だけを変更すればよい
+ * （他のロジックには影響しない）。
  */
 export const LEAF_ANCHORS_BY_STAGE: Record<1 | 2 | 3, LeafAnchor[]> = {
   1: [
-    { xPercent: 57.8, yPercent: 78.7, spriteId: "leaf-c", rotateDeg: -20, scale: 0.72, flip: true },
-    { xPercent: 36.2, yPercent: 66.7, spriteId: "leaf-a", rotateDeg: 17, scale: 0.85 },
-    { xPercent: 60.2, yPercent: 60.7, spriteId: "leaf-b", rotateDeg: 13, scale: 0.75 },
-    { xPercent: 47.0, yPercent: 59.5, spriteId: "leaf-d", rotateDeg: 9, scale: 0.88, flip: true },
-    { xPercent: 47.0, yPercent: 72.7, spriteId: "leaf-c", rotateDeg: 5, scale: 0.78 },
-    { xPercent: 37.4, yPercent: 55.9, spriteId: "leaf-a", rotateDeg: 1, scale: 0.91 },
-    { xPercent: 55.4, yPercent: 69.1, spriteId: "leaf-b", rotateDeg: -3, scale: 0.81, flip: true },
-    { xPercent: 56.6, yPercent: 52.3, spriteId: "leaf-d", rotateDeg: -7, scale: 0.94 },
-    { xPercent: 41.0, yPercent: 48.7, spriteId: "leaf-c", rotateDeg: -11, scale: 0.84 },
-    { xPercent: 49.4, yPercent: 79.9, spriteId: "leaf-a", rotateDeg: -15, scale: 0.74, flip: true },
-    { xPercent: 39.8, yPercent: 73.9, spriteId: "leaf-b", rotateDeg: -19, scale: 0.87 },
-    { xPercent: 43.4, yPercent: 65.5, spriteId: "leaf-d", rotateDeg: 18, scale: 0.77 },
-    { xPercent: 49.4, yPercent: 53.5, spriteId: "leaf-c", rotateDeg: 14, scale: 0.9, flip: true },
-    { xPercent: 53.0, yPercent: 61.9, spriteId: "leaf-a", rotateDeg: 10, scale: 0.8 },
-    { xPercent: 33.8, yPercent: 60.7, spriteId: "leaf-b", rotateDeg: 6, scale: 0.93 },
-    { xPercent: 43.4, yPercent: 54.7, spriteId: "leaf-d", rotateDeg: 2, scale: 0.83, flip: true },
-    { xPercent: 53.0, yPercent: 75.1, spriteId: "leaf-c", rotateDeg: -2, scale: 0.73 },
-    { xPercent: 39.8, yPercent: 60.7, spriteId: "leaf-a", rotateDeg: -6, scale: 0.86 },
+    { xPercent: 37.4, yPercent: 55.9, spriteId: "leaf-c", rotateDeg: -3, scale: 0.55, flip: true },
+    { xPercent: 61.4, yPercent: 62.3, spriteId: "leaf-a", rotateDeg: 57, scale: 0.66 },
+    { xPercent: 46.2, yPercent: 58.3, spriteId: "leaf-b", rotateDeg: -34, scale: 0.56, flip: true },
+    { xPercent: 53.4, yPercent: 59.9, spriteId: "leaf-d", rotateDeg: -44, scale: 0.67 },
+    { xPercent: 36.6, yPercent: 68.7, spriteId: "leaf-c", rotateDeg: -54, scale: 0.57, flip: true },
+    { xPercent: 43.8, yPercent: 68.7, spriteId: "leaf-a", rotateDeg: -46, scale: 0.68, flip: true },
+    { xPercent: 50.2, yPercent: 66.3, spriteId: "leaf-b", rotateDeg: 47, scale: 0.58 },
+    { xPercent: 56.6, yPercent: 79.1, spriteId: "leaf-d", rotateDeg: 121, scale: 0.69 },
+    { xPercent: 45.4, yPercent: 75.9, spriteId: "leaf-c", rotateDeg: -132, scale: 0.59, flip: true },
+    { xPercent: 49.4, yPercent: 79.9, spriteId: "leaf-a", rotateDeg: 166, scale: 0.7 },
+    { xPercent: 41.4, yPercent: 47.9, spriteId: "leaf-b", rotateDeg: -49, scale: 0.6, flip: true },
+    { xPercent: 57.4, yPercent: 53.5, spriteId: "leaf-d", rotateDeg: 5, scale: 0.71 },
+    { xPercent: 40.6, yPercent: 62.3, spriteId: "leaf-c", rotateDeg: -18, scale: 0.61, flip: true },
+    { xPercent: 51.0, yPercent: 54.3, spriteId: "leaf-a", rotateDeg: -1, scale: 0.72 },
+    { xPercent: 57.4, yPercent: 69.5, spriteId: "leaf-b", rotateDeg: 132, scale: 0.62 },
+    { xPercent: 39.0, yPercent: 74.3, spriteId: "leaf-d", rotateDeg: -99, scale: 0.73, flip: true },
+    { xPercent: 33.4, yPercent: 61.5, spriteId: "leaf-c", rotateDeg: -27, scale: 0.63, flip: true },
+    { xPercent: 44.6, yPercent: 52.7, spriteId: "leaf-a", rotateDeg: 9, scale: 0.74, flip: true },
   ],
   2: [
-    { xPercent: 47.6, yPercent: 79.0, spriteId: "leaf-c", rotateDeg: -20, scale: 0.72, flip: true },
-    { xPercent: 69.2, yPercent: 56.2, spriteId: "leaf-a", rotateDeg: 17, scale: 0.85 },
-    { xPercent: 28.4, yPercent: 55.0, spriteId: "leaf-b", rotateDeg: 13, scale: 0.75 },
-    { xPercent: 48.8, yPercent: 53.8, spriteId: "leaf-d", rotateDeg: 9, scale: 0.88, flip: true },
-    { xPercent: 69.2, yPercent: 38.2, spriteId: "leaf-c", rotateDeg: 5, scale: 0.78 },
-    { xPercent: 63.2, yPercent: 73.0, spriteId: "leaf-a", rotateDeg: 1, scale: 0.91 },
-    { xPercent: 33.2, yPercent: 38.2, spriteId: "leaf-b", rotateDeg: -3, scale: 0.81, flip: true },
-    { xPercent: 35.6, yPercent: 69.4, spriteId: "leaf-d", rotateDeg: -7, scale: 0.94 },
-    { xPercent: 57.2, yPercent: 43.0, spriteId: "leaf-c", rotateDeg: -11, scale: 0.84 },
-    { xPercent: 51.2, yPercent: 67.0, spriteId: "leaf-a", rotateDeg: -15, scale: 0.74, flip: true },
-    { xPercent: 39.2, yPercent: 47.8, spriteId: "leaf-b", rotateDeg: -19, scale: 0.87 },
-    { xPercent: 39.2, yPercent: 58.6, spriteId: "leaf-d", rotateDeg: 18, scale: 0.77 },
-    { xPercent: 58.4, yPercent: 58.6, spriteId: "leaf-c", rotateDeg: 14, scale: 0.9, flip: true },
-    { xPercent: 60.8, yPercent: 33.4, spriteId: "leaf-a", rotateDeg: 10, scale: 0.8 },
-    { xPercent: 47.6, yPercent: 43.0, spriteId: "leaf-b", rotateDeg: 6, scale: 0.93 },
-    { xPercent: 65.6, yPercent: 47.8, spriteId: "leaf-d", rotateDeg: 2, scale: 0.83, flip: true },
-    { xPercent: 65.6, yPercent: 64.6, spriteId: "leaf-c", rotateDeg: -2, scale: 0.73 },
-    { xPercent: 28.4, yPercent: 45.4, spriteId: "leaf-a", rotateDeg: -6, scale: 0.86 },
-    { xPercent: 40.4, yPercent: 32.2, spriteId: "leaf-b", rotateDeg: -10, scale: 0.76, flip: true },
-    { xPercent: 29.6, yPercent: 63.4, spriteId: "leaf-d", rotateDeg: -14, scale: 0.89 },
-    { xPercent: 42.8, yPercent: 65.8, spriteId: "leaf-c", rotateDeg: -18, scale: 0.79 },
-    { xPercent: 56.0, yPercent: 51.4, spriteId: "leaf-a", rotateDeg: 19, scale: 0.92, flip: true },
-    { xPercent: 40.4, yPercent: 40.6, spriteId: "leaf-b", rotateDeg: 15, scale: 0.82 },
+    { xPercent: 28.4, yPercent: 42.6, spriteId: "leaf-c", rotateDeg: -10, scale: 0.55, flip: true },
+    { xPercent: 69.2, yPercent: 51.4, spriteId: "leaf-a", rotateDeg: 23, scale: 0.66 },
+    { xPercent: 40.4, yPercent: 46.6, spriteId: "leaf-b", rotateDeg: -27, scale: 0.56, flip: true },
+    { xPercent: 54.8, yPercent: 46.6, spriteId: "leaf-d", rotateDeg: -5, scale: 0.67 },
+    { xPercent: 67.6, yPercent: 58.6, spriteId: "leaf-c", rotateDeg: 43, scale: 0.57 },
+    { xPercent: 48.4, yPercent: 57.0, spriteId: "leaf-a", rotateDeg: -24, scale: 0.68, flip: true },
+    { xPercent: 54.8, yPercent: 61.0, spriteId: "leaf-b", rotateDeg: 156, scale: 0.58 },
+    { xPercent: 28.4, yPercent: 64.2, spriteId: "leaf-d", rotateDeg: -79, scale: 0.69, flip: true },
+    { xPercent: 60.4, yPercent: 77.0, spriteId: "leaf-c", rotateDeg: 106, scale: 0.59 },
+    { xPercent: 42.0, yPercent: 70.6, spriteId: "leaf-a", rotateDeg: -93, scale: 0.7, flip: true },
+    { xPercent: 62.0, yPercent: 63.4, spriteId: "leaf-b", rotateDeg: 135, scale: 0.6 },
+    { xPercent: 37.2, yPercent: 35.4, spriteId: "leaf-d", rotateDeg: -1, scale: 0.71, flip: true },
+    { xPercent: 63.6, yPercent: 37.8, spriteId: "leaf-c", rotateDeg: 47, scale: 0.61 },
+    { xPercent: 47.6, yPercent: 43.4, spriteId: "leaf-a", rotateDeg: 30, scale: 0.72, flip: true },
+    { xPercent: 59.6, yPercent: 54.6, spriteId: "leaf-b", rotateDeg: 50, scale: 0.62 },
+    { xPercent: 37.2, yPercent: 57.8, spriteId: "leaf-d", rotateDeg: -53, scale: 0.73, flip: true },
+    { xPercent: 35.6, yPercent: 66.6, spriteId: "leaf-c", rotateDeg: -122, scale: 0.63, flip: true },
+    { xPercent: 45.2, yPercent: 63.4, spriteId: "leaf-a", rotateDeg: -127, scale: 0.74, flip: true },
+    { xPercent: 53.2, yPercent: 68.2, spriteId: "leaf-b", rotateDeg: -128, scale: 0.64 },
+    { xPercent: 28.4, yPercent: 53.0, spriteId: "leaf-d", rotateDeg: -17, scale: 0.75, flip: true },
+    { xPercent: 57.2, yPercent: 32.2, spriteId: "leaf-c", rotateDeg: -34, scale: 0.65 },
+    { xPercent: 62.8, yPercent: 45.8, spriteId: "leaf-a", rotateDeg: 54, scale: 0.55 },
+    { xPercent: 55.6, yPercent: 39.4, spriteId: "leaf-b", rotateDeg: 24, scale: 0.66 },
   ],
   3: [
-    { xPercent: 63.0, yPercent: 79.2, spriteId: "leaf-c", rotateDeg: -20, scale: 0.72, flip: true },
-    { xPercent: 18.6, yPercent: 62.4, spriteId: "leaf-a", rotateDeg: 17, scale: 0.85 },
-    { xPercent: 73.8, yPercent: 45.6, spriteId: "leaf-b", rotateDeg: 13, scale: 0.75 },
-    { xPercent: 46.2, yPercent: 54.0, spriteId: "leaf-d", rotateDeg: 9, scale: 0.88, flip: true },
-    { xPercent: 18.6, yPercent: 33.6, spriteId: "leaf-c", rotateDeg: 5, scale: 0.78 },
-    { xPercent: 67.8, yPercent: 25.2, spriteId: "leaf-a", rotateDeg: 1, scale: 0.91 },
-    { xPercent: 37.8, yPercent: 73.2, spriteId: "leaf-b", rotateDeg: -3, scale: 0.81, flip: true },
-    { xPercent: 72.6, yPercent: 63.6, spriteId: "leaf-d", rotateDeg: -7, scale: 0.94 },
-    { xPercent: 57.0, yPercent: 39.6, spriteId: "leaf-c", rotateDeg: -11, scale: 0.84 },
-    { xPercent: 29.4, yPercent: 48.0, spriteId: "leaf-a", rotateDeg: -15, scale: 0.74, flip: true },
-    { xPercent: 41.4, yPercent: 38.4, spriteId: "leaf-b", rotateDeg: -19, scale: 0.87 },
-    { xPercent: 31.8, yPercent: 26.4, spriteId: "leaf-d", rotateDeg: 18, scale: 0.77 },
-    { xPercent: 54.6, yPercent: 67.2, spriteId: "leaf-c", rotateDeg: 14, scale: 0.9, flip: true },
-    { xPercent: 61.8, yPercent: 54.0, spriteId: "leaf-a", rotateDeg: 10, scale: 0.8 },
-    { xPercent: 31.8, yPercent: 61.2, spriteId: "leaf-b", rotateDeg: 6, scale: 0.93 },
-    { xPercent: 47.4, yPercent: 80.4, spriteId: "leaf-d", rotateDeg: 2, scale: 0.83, flip: true },
-    { xPercent: 18.6, yPercent: 45.6, spriteId: "leaf-c", rotateDeg: -2, scale: 0.73 },
-    { xPercent: 57.0, yPercent: 27.6, spriteId: "leaf-a", rotateDeg: -6, scale: 0.86 },
-    { xPercent: 30.6, yPercent: 37.2, spriteId: "leaf-b", rotateDeg: -10, scale: 0.76, flip: true },
-    { xPercent: 73.8, yPercent: 34.8, spriteId: "leaf-d", rotateDeg: -14, scale: 0.89 },
-    { xPercent: 25.8, yPercent: 69.6, spriteId: "leaf-c", rotateDeg: -18, scale: 0.79 },
-    { xPercent: 64.2, yPercent: 69.6, spriteId: "leaf-a", rotateDeg: 19, scale: 0.92, flip: true },
-    { xPercent: 41.4, yPercent: 62.4, spriteId: "leaf-b", rotateDeg: 15, scale: 0.82 },
-    { xPercent: 39.0, yPercent: 48.0, spriteId: "leaf-d", rotateDeg: 11, scale: 0.72 },
-    { xPercent: 48.6, yPercent: 44.4, spriteId: "leaf-c", rotateDeg: 7, scale: 0.85, flip: true },
-    { xPercent: 49.8, yPercent: 33.6, spriteId: "leaf-a", rotateDeg: 3, scale: 0.75 },
-    { xPercent: 22.2, yPercent: 54.0, spriteId: "leaf-b", rotateDeg: -1, scale: 0.88 },
-    { xPercent: 29.4, yPercent: 78.0, spriteId: "leaf-d", rotateDeg: -5, scale: 0.78, flip: true },
+    { xPercent: 23.4, yPercent: 32.0, spriteId: "leaf-c", rotateDeg: -3, scale: 0.55, flip: true },
+    { xPercent: 69.8, yPercent: 33.6, spriteId: "leaf-a", rotateDeg: 32, scale: 0.66 },
+    { xPercent: 37.0, yPercent: 42.4, spriteId: "leaf-b", rotateDeg: -108, scale: 0.56, flip: true },
+    { xPercent: 56.2, yPercent: 42.4, spriteId: "leaf-d", rotateDeg: 5, scale: 0.67 },
+    { xPercent: 18.6, yPercent: 54.4, spriteId: "leaf-c", rotateDeg: -47, scale: 0.57, flip: true },
+    { xPercent: 74.6, yPercent: 56.8, spriteId: "leaf-a", rotateDeg: 30, scale: 0.68 },
+    { xPercent: 33.0, yPercent: 56.8, spriteId: "leaf-b", rotateDeg: -110, scale: 0.58, flip: true },
+    { xPercent: 47.4, yPercent: 56.0, spriteId: "leaf-d", rotateDeg: 91, scale: 0.69 },
+    { xPercent: 44.2, yPercent: 82.4, spriteId: "leaf-c", rotateDeg: -134, scale: 0.59, flip: true },
+    { xPercent: 65.0, yPercent: 76.8, spriteId: "leaf-a", rotateDeg: 125, scale: 0.7 },
+    { xPercent: 41.0, yPercent: 68.0, spriteId: "leaf-b", rotateDeg: 119, scale: 0.6, flip: true },
+    { xPercent: 61.0, yPercent: 62.4, spriteId: "leaf-d", rotateDeg: 110, scale: 0.71 },
+    { xPercent: 33.8, yPercent: 24.0, spriteId: "leaf-c", rotateDeg: 15, scale: 0.61, flip: true },
+    { xPercent: 59.4, yPercent: 24.0, spriteId: "leaf-a", rotateDeg: 8, scale: 0.72 },
+    { xPercent: 46.6, yPercent: 38.4, spriteId: "leaf-b", rotateDeg: 10, scale: 0.62, flip: true },
+    { xPercent: 48.2, yPercent: 47.2, spriteId: "leaf-d", rotateDeg: -15, scale: 0.73 },
+    { xPercent: 57.0, yPercent: 52.8, spriteId: "leaf-c", rotateDeg: 19, scale: 0.63 },
+    { xPercent: 28.2, yPercent: 71.2, spriteId: "leaf-a", rotateDeg: -163, scale: 0.74, flip: true },
+    { xPercent: 73.0, yPercent: 68.8, spriteId: "leaf-b", rotateDeg: 110, scale: 0.64 },
+    { xPercent: 53.0, yPercent: 70.4, spriteId: "leaf-d", rotateDeg: 180, scale: 0.75 },
+    { xPercent: 25.0, yPercent: 44.0, spriteId: "leaf-c", rotateDeg: -23, scale: 0.65, flip: true },
+    { xPercent: 68.2, yPercent: 46.4, spriteId: "leaf-a", rotateDeg: -6, scale: 0.55 },
+    { xPercent: 40.2, yPercent: 50.4, spriteId: "leaf-b", rotateDeg: -76, scale: 0.66, flip: true },
+    { xPercent: 65.8, yPercent: 55.2, spriteId: "leaf-d", rotateDeg: 99, scale: 0.56 },
+    { xPercent: 21.0, yPercent: 64.0, spriteId: "leaf-c", rotateDeg: -70, scale: 0.67, flip: true },
+    { xPercent: 33.0, yPercent: 33.6, spriteId: "leaf-a", rotateDeg: -13, scale: 0.57, flip: true },
+    { xPercent: 55.4, yPercent: 32.8, spriteId: "leaf-b", rotateDeg: 68, scale: 0.68 },
+    { xPercent: 33.0, yPercent: 78.4, spriteId: "leaf-d", rotateDeg: -121, scale: 0.58, flip: true },
   ],
 };
 
