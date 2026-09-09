@@ -19,9 +19,19 @@ type SaveStatus = "idle" | "saving" | "saved" | "error";
 export default function ImportPanel({
   vaultHandle,
   onClose,
+  disabled = false,
+  trackTask,
 }: {
   vaultHandle: FileSystemDirectoryHandle | null;
   onClose: () => void;
+  /** Vault境界の安全性：親（ChatScreen.tsx）が切替処理中のときtrue。保存ボタンを無効化する。 */
+  disabled?: boolean;
+  /**
+   * Vault境界の安全性：Source保存（persistSource）をMemory Worldへ影響する非同期処理として
+   * 親（ChatScreen.tsx）へ追跡させるためのフック。渡さなかった場合は追跡しない
+   * （後方互換。呼び出し元を限定しないよう任意にしている）。
+   */
+  trackTask?: <T>(promise: Promise<T>) => Promise<T>;
 }) {
   const [view, setView] = useState<ImportView>("menu");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
@@ -39,13 +49,25 @@ export default function ImportPanel({
   }
 
   async function handleSaveText() {
-    if (!textContent.trim() || saveStatus === "saving") return;
+    if (!textContent.trim() || saveStatus === "saving" || disabled) return;
     setSaveStatus("saving");
     setErrorMessage("");
-    try {
+    // Vault境界の安全性（Codexレビュー指摘High-2対応）：importText（パース）→
+    // createSource → persistSourceまでの一連の流れを、1つのMemory World taskとして
+    // 最初のawaitより前から追跡する（persistSourceの呼び出しだけを追跡すると、
+    // importText実行中にVault切替が始められてしまう）。trackTask()はこのIIFE呼び出しの
+    // 直後・同期的に呼ぶため、内部の最初のawait（importText）が解決するより前に
+    // 追跡対象へ登録される。ImportPanelがこの後アンマウントされても、
+    // taskはChatScreen側のpendingMemoryTasksRef（このコンポーネントのstateではない）に
+    // 留まり続けるため、追跡から外れない。
+    const task = (async () => {
       const draft = await importText({ text: textContent, title: textTitle });
       const source = createSource(draft);
-      const { indexedDbFailed } = await persistSource(vaultHandle, source);
+      return persistSource(vaultHandle, source);
+    })();
+    const tracked = trackTask ? trackTask(task) : task;
+    try {
+      const { indexedDbFailed } = await tracked;
       if (indexedDbFailed) {
         setSaveStatus("error");
         setErrorMessage("保存に失敗しました。もう一度お試しください。");
@@ -62,14 +84,21 @@ export default function ImportPanel({
   }
 
   async function handleSaveMarkdown() {
-    if (!markdownFile || saveStatus === "saving") return;
+    if (!markdownFile || saveStatus === "saving" || disabled) return;
     setSaveStatus("saving");
     setErrorMessage("");
-    try {
+    // Vault境界の安全性（Codexレビュー指摘High-2対応）：ファイル読み込み（file.text()）
+    // →importMarkdown（パース）→createSource→persistSourceまでの一連の流れを、
+    // 1つのMemory World taskとして最初のawaitより前から追跡する（handleSaveText参照）。
+    const task = (async () => {
       const text = await markdownFile.text();
       const draft = await importMarkdown({ markdown: text, fileName: markdownFile.name });
       const source = createSource(draft);
-      const { indexedDbFailed } = await persistSource(vaultHandle, source);
+      return persistSource(vaultHandle, source);
+    })();
+    const tracked = trackTask ? trackTask(task) : task;
+    try {
+      const { indexedDbFailed } = await tracked;
       if (indexedDbFailed) {
         setSaveStatus("error");
         setErrorMessage("ファイルの読み込みまたは保存に失敗しました。");
@@ -144,7 +173,7 @@ export default function ImportPanel({
               <button
                 type="button"
                 onClick={() => void handleSaveText()}
-                disabled={!textContent.trim() || saveStatus === "saving"}
+                disabled={!textContent.trim() || saveStatus === "saving" || disabled}
                 className="rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
               >
                 {saveStatus === "saving" ? "保存しています…" : "保存する"}
@@ -185,7 +214,7 @@ export default function ImportPanel({
               <button
                 type="button"
                 onClick={() => void handleSaveMarkdown()}
-                disabled={!markdownFile || saveStatus === "saving"}
+                disabled={!markdownFile || saveStatus === "saving" || disabled}
                 className="rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
               >
                 {saveStatus === "saving" ? "保存しています…" : "保存する"}

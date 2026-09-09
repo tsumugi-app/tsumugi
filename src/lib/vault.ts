@@ -324,6 +324,43 @@ function processVaultWriteQueue(): void {
 }
 
 /**
+ * Vault境界の安全性（Codexレビュー指摘H3対応）：呼び出し時点までにVault write queueへ
+ * 積まれた書き込み（実行中の1件を含む）が、すべて完了するまで待つ。新しく積まれる
+ * 書き込みまでは追いかけて待たない（無限に終わらなくなるのを避けるため。呼び出し元
+ * ＝Vault切替フローが、これを呼ぶ前に新規のMemory系処理の開始を止めている前提）。
+ *
+ * 既存のキュー実装（vaultWriteQueueItems・vaultWriteProcessing・
+ * pickNextVaultWriteIndex・processVaultWriteQueue）は一切変更しない。ここでは
+ * その状態を外側から軽量にポーリングして待つだけで、書き込み順序・優先度・
+ * 同時実行数（常に1件）といった既存の保証には一切手を加えない。
+ *
+ * `timeoutMs`（省略時は無期限）：Codexレビュー指摘（永久待機フェイルセーフ）対応。
+ * 何らかの理由でキューが収束しない場合に、呼び出し元（Vault切替フロー）が
+ * 「安全側に倒して切替を中止する」判断をできるよう、`{ timedOut: true }`を返す
+ * （キュー自体の状態は変更しない＝待つのを諦めるだけで、書き込み自体は裏で続行される）。
+ * 既存の呼び出し元（タイムアウト無し）は戻り値の`timedOut`を見なければ従来と同じ意味。
+ */
+export function waitForVaultWrites(timeoutMs?: number): Promise<{ timedOut: boolean }> {
+  const isDrained = () => vaultWriteQueueItems.length === 0 && !vaultWriteProcessing;
+  if (isDrained()) return Promise.resolve({ timedOut: false });
+  const deadline = timeoutMs !== undefined ? Date.now() + timeoutMs : undefined;
+  return new Promise((resolve) => {
+    const check = () => {
+      if (isDrained()) {
+        resolve({ timedOut: false });
+        return;
+      }
+      if (deadline !== undefined && Date.now() > deadline) {
+        resolve({ timedOut: true });
+        return;
+      }
+      setTimeout(check, 20);
+    };
+    check();
+  });
+}
+
+/**
  * TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用。
  * enqueue時刻・実際のwrite開始時刻・完了時刻だけを出す最小限のログ。
  * 会話内容・Memory本文・ファイルパス・IDは一切出さない（件数・経過時間のみ）。

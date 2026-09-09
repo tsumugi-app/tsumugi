@@ -31,6 +31,7 @@ export default function SettingsPanel({
   onConnectVault,
   onReauthorizeVault,
   onRestoreFromVault,
+  vaultActionsDisabled = false,
   exportDataFeedback,
   deleteDataFeedback,
   onExportData,
@@ -53,6 +54,9 @@ export default function SettingsPanel({
   /** Android等：以前選択したフォルダへの書き込み許可がリロードで失効した状態から、同じhandleへ再許可を求める。 */
   onReauthorizeVault: () => void;
   onRestoreFromVault: () => void;
+  /** Vault境界の安全性：別Vaultへの切替処理中はtrue。切替中は「変更する」「保存先を選ぶ」
+   * 「アクセスを再許可」「復元する」を無効化する（新規のVault操作の開始を防ぐ）。既定false。 */
+  vaultActionsDisabled?: boolean;
   /** データ管理（エクスポート/削除）。iPhone/iPad等のOPFSバックエンド時のみUIを表示する。 */
   exportDataFeedback: DataActionFeedback | null;
   deleteDataFeedback: DataActionFeedback | null;
@@ -179,7 +183,8 @@ export default function SettingsPanel({
               {vaultBackend !== "opfs" && (
                 <button
                   onClick={onConnectVault}
-                  className="shrink-0 rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  disabled={vaultActionsDisabled}
+                  className="shrink-0 rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
                 >
                   変更する
                 </button>
@@ -198,7 +203,8 @@ export default function SettingsPanel({
               <span>「{vaultHandle.name}」への保存アクセスが必要です。</span>
               <button
                 onClick={onReauthorizeVault}
-                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                disabled={vaultActionsDisabled}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
               >
                 アクセスを再許可
               </button>
@@ -210,7 +216,8 @@ export default function SettingsPanel({
               <span>記憶を保存する場所を選んでください。</span>
               <button
                 onClick={onConnectVault}
-                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                disabled={vaultActionsDisabled}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
               >
                 保存先を選ぶ
               </button>
@@ -228,7 +235,7 @@ export default function SettingsPanel({
               <span>このVaultには以前の記憶が見つかりました（{restoreCandidate.newCount}件）。復元しますか？</span>
               <button
                 onClick={onRestoreFromVault}
-                disabled={restoreStatus === "restoring"}
+                disabled={restoreStatus === "restoring" || vaultActionsDisabled}
                 className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
               >
                 {restoreStatus === "restoring" ? "復元中…" : "復元する"}

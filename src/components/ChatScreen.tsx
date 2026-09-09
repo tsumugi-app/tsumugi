@@ -15,6 +15,7 @@ import {
   requestVaultPermission,
   restoreVaultHandle,
   scanVaultForRestore,
+  waitForVaultWrites,
   type VaultScanResult,
   type VaultWritePriority,
 } from "@/lib/vault";
@@ -109,6 +110,15 @@ const STARTUP_CONNECT_LIMIT = 3;
  * STARTUP_CONNECT_LIMITと同じ考え方（AI呼び出し回数のクォータ保護）。
  */
 const STARTUP_CAPTURE_LIMIT = 3;
+
+/**
+ * Vault境界の安全性（Codexレビュー指摘：永久待機フェイルセーフ）。別Vaultへの切替時、
+ * 「実行中のMemory World task・Vault write queueが収束するまで待つ」フェーズ全体に
+ * 与える上限時間。これを超えても収束しない場合は、安全側（切替を中止・旧Vaultを
+ * 維持・ロック解除・エラー表示）へ倒す。「収束しないまま安全確認なしでclearへ進む」
+ * ことは絶対にしない。
+ */
+const VAULT_SWITCH_SETTLE_TIMEOUT_MS = 20000;
 
 /** Beta C4：/api/chatの失敗時、ステータスだけを見てAPIキー由来かどうかをUI側で分岐するための最小限のエラー型。 */
 class ChatRequestError extends Error {
@@ -296,6 +306,175 @@ export default function ChatScreen() {
   const latestConversationRef = useRef(conversation);
 
   /**
+   * Vault境界の安全性（Codexレビュー指摘H1〜H3対応）。
+   *
+   * 別Vaultへの切替中（handleConnectVaultの"different"経路）だけtrueになる。
+   * useState版（isVaultSwitching、UIのdisabled表示・再レンダー用）とuseRef版
+   * （isVaultSwitchingRef、非同期関数の中で「今まさに切替中か」を同期的に読むため。
+   * setState後の再レンダーを待たずに、各handlerの冒頭ガードとして即座に参照できる）
+   * の両方を常にセットで更新する。
+   */
+  const [isVaultSwitching, setIsVaultSwitching] = useState(false);
+  const isVaultSwitchingRef = useRef(false);
+  /**
+   * Vault操作の排他（Codexレビュー指摘：Vault操作同士の競合防止）。
+   *
+   * isVaultSwitchingRefとは別の、より軽いロック。handleConnectVault/
+   * handleReauthorizeVault/handleRestoreFromVaultの冒頭（folder picker・
+   * requestPermission・DB書き込みの前）で即座に取得し、この3つが互いに同時実行
+   * されないことだけを保証する。isVaultSwitchingRefのように会話送信やCapture等の
+   * 通常操作までは止めない（folder pickerが開いている間、通常会話まで不必要に
+   * 長時間止める設計は避ける、という判断）。
+   * handleConnectVaultが実際に別Vaultへの切替（"different"）と判定した場合のみ、
+   * この上にさらにisVaultSwitchingRefの重いロックを重ねて取得する。
+   */
+  const vaultOperationLockRef = useRef(false);
+  /**
+   * Memory World（Conversation/MemoryObject/Source等）へ影響しうる非同期処理
+   * （Capture/Reflection/Connect/Source保存/問いかけ生成等）を、実行中の間だけ
+   * このSetへ入れておく。Vault切替時、新規開始を止めた後にこのSetが空になるまで
+   * `Promise.allSettled`で待つことで、「flush開始後に新しい未同期データが発生する」
+   * （H3）・「切替後に旧処理が完了して共有IndexedDBへ書き戻す」（H2）を防ぐ。
+   * trackMemoryTask/beginMemoryTaskの2つのヘルパーがこのSetへの出し入れを行う
+   * （呼び出し側は個別にSetを操作しない）。
+   */
+  const pendingMemoryTasksRef = useRef(new Set<Promise<unknown>>());
+  /**
+   * Vault切替の「世代」。切替を確定させる直前（旧Memory World由来のReact stateを
+   * resetする直前）にインクリメントする。pending task待ち（上記）が主対策であり、
+   * これはその保険：待ちきれなかった・追跡漏れの非同期処理が、古い世代のまま
+   * React state（conversation等）へ書き戻そうとした場合に、書き込み直前で
+   * 世代が一致するかを確認して破棄させる（保存が必要な未同期データそのものを
+   * 捨てるわけではなく、あくまで「今の画面に古いVaultの内容を表示させない」ための
+   * 最終防御。IndexedDB/Vaultへの保存自体はpending task待ちで守る）。
+   */
+  const vaultGenerationRef = useRef(0);
+
+  /**
+   * 既に開始されている非同期処理（Promise）を、完了/失敗のどちらでも自動的に
+   * pendingMemoryTasksRef から取り除かれる形で追跡する。呼び出し元は返り値を
+   * そのまま使ってよい（await・戻り値の型ともに元のpromiseと同じ）。
+   */
+  function trackMemoryTask<T>(promise: Promise<T>): Promise<T> {
+    pendingMemoryTasksRef.current.add(promise);
+    const cleanup = () => {
+      pendingMemoryTasksRef.current.delete(promise);
+    };
+    promise.then(cleanup, cleanup);
+    return promise;
+  }
+
+  /**
+   * trackMemoryTaskの「関数内から自分自身を登録する」版。呼び出し元は処理の冒頭で
+   * `const endTask = beginMemoryTask();`しておき、既存のtry/finally（無ければ追加する）の
+   * finallyで必ず`endTask();`を呼ぶこと（handleSend/handleEndConversation/
+   * handleEndSession等、複数のreturn経路を持つ関数はfinallyでの解放が安全）。
+   */
+  function beginMemoryTask(): () => void {
+    let resolveFn: () => void = () => {};
+    const marker = new Promise<void>((resolve) => {
+      resolveFn = resolve;
+    });
+    pendingMemoryTasksRef.current.add(marker);
+    return () => {
+      pendingMemoryTasksRef.current.delete(marker);
+      resolveFn();
+    };
+  }
+
+  /**
+   * Vault境界の安全性（Codexレビュー指摘High-1対応）：pendingMemoryTasksRefが
+   * 「本当に空になるまで」drainする。
+   *
+   * 1回だけ`Promise.allSettled([...pendingMemoryTasksRef.current])`を呼ぶ設計だと、
+   * 「Capture実行中 → 待機開始 → Captureがその終了直前にConnect/revisitPrompt生成を
+   * 新しくpending登録 → 最初のallSettledはCapture自身の完了だけで解決 → 子task
+   * （Connect/revisitPrompt）が待たれないまま残る」という取りこぼしが起こる
+   * （connectConversationBoundary/enqueueRevisitPromptGenerationは、親であるCaptureの
+   * 処理内で同期的にpendingMemoryTasksRefへ追加されるため、親のPromiseが解決する
+   * 直前には既にSetへ入っている＝が、`Promise.allSettled([親])`は親のPromiseだけを
+   * 見ており、Setに新しく入った子までは自動的に待たない）。
+   *
+   * ここではwhileループで「集合のスナップショットを取って待つ→また残っていれば
+   * 次のスナップショットを取って待つ」を、Setが空になるまで繰り返す。busy loopには
+   * ならない：ループの各周は必ず本物の非同期待機（Promise.allSettled）を経由し、
+   * 待つ対象が無くなった瞬間にだけ即座にfalseで返る。
+   *
+   * レース（「pendingが0になった直後に新規taskが登録される」）について：この関数を
+   * 呼ぶのは必ずisVaultSwitchingRef（重いロック）取得後であり、trackMemoryTask/
+   * beginMemoryTaskの全呼び出し元（handleSend・handleEndConversation・
+   * handleEndSession・handleSwitchPersona・handleGoToTop・handleRestoreFromVault・
+   * handleReauthorizeVault・起動時Connect/Captureキャッチアップ・Import保存等）は
+   * いずれも冒頭でisVaultSwitchingRef.currentを確認し、trueなら何も登録せずに
+   * 早期returnする。ロック成立後にpendingMemoryTasksRefへ新規追加されうるのは、
+   * 「既にロック成立前から実行中だった処理が、その内部で（connectConversationBoundary・
+   * enqueueRevisitPromptGeneration・checkForRestoreCandidateのように）子task を
+   * 追加する」場合だけであり、これは常に「既に待機対象になっている親task」の
+   * 子として登録されるため、whileループの次周で必ず拾われる（この関数の呼び出し元が
+   * 新たに増える＝ロックの外から新規top-levelなtaskが増えることはない）。
+   *
+   * `deadline`（Date.now()基準のミリ秒）を過ぎても収束しない場合はtrueを返す
+   * （フェイルセーフ）。呼び出し元は「タイムアウトしたから安全確認なしでclearへ進む」
+   * のではなく、必ず「切替を中止・旧Vaultを維持・ロック解除・エラー表示」の側へ倒すこと。
+   *
+   * 実装上の注意（検証で見つけた不具合の修正）：単に「ループの先頭でdeadlineを見る」
+   * だけだと、1周の`Promise.allSettled(tasks)`自体がdeadlineをまたぐほど長時間かかる
+   * task（例：締切100msに対して300msかかるtask）に対して機能しない（allSettled自体は
+   * 締切を知らないため、そのtaskが実際に終わるまでその1周を抜けられず、結果として
+   * 締切を大きく超過してから初めて次周のdeadlineチェックに到達してしまう）。
+   * これを防ぐため、各周の`Promise.allSettled(tasks)`を「残り時間で発火するタイマー」と
+   * `Promise.race`させ、締切に達した時点でtrueを返せるようにしている
+   * （タイマーに負けた場合でも、allSettled自体の完了は裏で続くだけで実害は無い）。
+   */
+  async function drainPendingMemoryTasks(deadline: number): Promise<boolean> {
+    while (pendingMemoryTasksRef.current.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return true;
+      const tasks = [...pendingMemoryTasksRef.current];
+      const timedOutThisRound = await Promise.race([
+        Promise.allSettled(tasks).then(() => false),
+        new Promise<boolean>((resolve) => {
+          window.setTimeout(() => resolve(true), remaining);
+        }),
+      ]);
+      if (timedOutThisRound) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Vault境界の安全性：別Vaultへ切り替える直前に、旧Memory World由来のReact state/refを
+   * まとめて初期化する（H1対応：Aのconversation stateがBへ保存されるのを防ぐ）。
+   * API key・chatProvider・テーマ・キーボード表示状態等、Memory Worldに属さない
+   * 端末設定・UI設定は対象に含めない（意図的に触れない）。
+   */
+  function resetMemoryWorldState() {
+    const freshConversation = createConversation(persona);
+    setConversation(freshConversation);
+    latestConversationRef.current = freshConversation;
+    setMemoryObjects([]);
+    setEndedConversationMemories(null);
+    setEndingConversation(false);
+    setSessionCapturedMemories([]);
+    setStreamingText("");
+    setBusy(false);
+    setCaptureStatus("idle");
+    setSendStatus("idle");
+    setReflectionStatus("idle");
+    setReflectionText("");
+    setRestoreCandidate(null);
+    setRestoreStatus("idle");
+    setTopPrompt(null);
+    setTopPromptInput("");
+    setHistoryInitialMemoryId(undefined);
+    setHistoryOpen(false);
+    setImportOpen(false);
+    setLaunchTreeSignals(null);
+    setEntryConfirmed(false);
+    setInputResetKey((key) => key + 1);
+  }
+
+  /**
    * Beta「過去からの問いかけ」用のrevisitPrompt生成を、runConversationBoundary()の
    * 解決を待たせないバックグラウンド処理として切り出したもの。
    *
@@ -315,18 +494,27 @@ export default function ChatScreen() {
   function enqueueRevisitPromptGeneration(memories: MemoryObject[]) {
     const targets = memories.filter((memory) => !memory.revisitPrompt);
     if (targets.length === 0) return;
-    void Promise.all(
-      targets.map(async (memory) => {
-        try {
-          const revisitPrompt = await generateRevisitPrompt(memory);
-          if (!revisitPrompt) return;
-          const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
-          await putMemoryObject(memoryWithPrompt);
-          setMemoryObjects((prev) => prev.map((m) => (m.id === memoryWithPrompt.id ? memoryWithPrompt : m)));
-        } catch (error) {
-          console.error("Failed to generate revisit prompt", error);
-        }
-      })
+    // Vault境界の安全性：Memory Worldへ影響する非同期処理として追跡する
+    // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
+    const generation = vaultGenerationRef.current;
+    void trackMemoryTask(
+      Promise.all(
+        targets.map(async (memory) => {
+          try {
+            const revisitPrompt = await generateRevisitPrompt(memory);
+            if (!revisitPrompt) return;
+            const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
+            await putMemoryObject(memoryWithPrompt);
+            // 保険（generation check）：待ちきれずVault切替が確定した後に完了した場合、
+            // 既にIndexedDBへは保存済み（旧Vaultへの安全策はpending task待ちが担う）だが、
+            // 新しいMemory Worldの画面へ古いMemoryObjectを書き戻さない。
+            if (generation !== vaultGenerationRef.current) return;
+            setMemoryObjects((prev) => prev.map((m) => (m.id === memoryWithPrompt.id ? memoryWithPrompt : m)));
+          } catch (error) {
+            console.error("Failed to generate revisit prompt", error);
+          }
+        })
+      )
     );
   }
 
@@ -344,16 +532,23 @@ export default function ChatScreen() {
     pendingMemoryObjects: Promise<MemoryObject[]>,
     priority: VaultWritePriority = "interactive"
   ) {
-    void (async () => {
-      try {
-        const memories = await pendingMemoryObjects;
-        for (const memory of memories) {
-          await connectMemory(vaultHandle, memory, priority);
+    // Vault境界の安全性：Connect自体もMemory Worldへ影響する非同期処理として追跡する
+    // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
+    // vaultHandleはこの関数が定義された時点のReactクロージャの値を使い続けるため
+    // （React stateの後続の更新を追いかけない）、実行中に別Vaultへ切り替わっても
+    // 書き込み先が新Vaultへすり替わることはない。
+    void trackMemoryTask(
+      (async () => {
+        try {
+          const memories = await pendingMemoryObjects;
+          for (const memory of memories) {
+            await connectMemory(vaultHandle, memory, priority);
+          }
+        } catch (error) {
+          console.error("Failed to connect conversation-boundary memories", error);
         }
-      } catch (error) {
-        console.error("Failed to connect conversation-boundary memories", error);
-      }
-    })();
+      })()
+    );
   }
 
   /**
@@ -395,6 +590,12 @@ export default function ChatScreen() {
       connectConversationBoundary(Promise.resolve([]), priority);
       return [];
     }
+    // Vault境界の安全性（保険）：呼び出し開始時点のVault世代を覚えておく。
+    // awaitCapture中にVault切替が確定した場合、その後のReact state書き戻しを
+    // スキップする（IndexedDB保存自体はこの後の`await persistCapture`が既に
+    // 完了させている。主対策はVault切替側がこの関数の呼び出し元を
+    // pending taskとして待つこと。ここはその保険）。
+    const generation = vaultGenerationRef.current;
     try {
       setCaptureStatus("saving");
       // 境界Captureは会話ごとに1回だけなので、このConversation自身からの
@@ -420,7 +621,10 @@ export default function ChatScreen() {
       // このCaptureが対象にしていたConversationが、実行中に既に別のConversationへ
       // 切り替わっていた場合（fire-and-forget呼び出し元で、切り替え自体は同期的に
       // 先に進むケース）は、古い結果を今のstateへ書き戻さない（別会話の汚染防止）。
-      if (latestConversationRef.current.id === capturedDelta.id) {
+      // 加えて、Vault世代が変わっていた場合（別Vaultへの切替が確定した後）も同様に
+      // 書き戻さない（保険。IndexedDB保存自体は既に上のpersistCaptureで完了済み）。
+      const staleGeneration = generation !== vaultGenerationRef.current;
+      if (!staleGeneration && latestConversationRef.current.id === capturedDelta.id) {
         const merged: Conversation = {
           ...latestConversationRef.current,
           status: capturedDelta.status,
@@ -430,10 +634,12 @@ export default function ChatScreen() {
         latestConversationRef.current = merged;
         setConversation(merged);
       }
-      setMemoryObjects((prev) => {
-        const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
-        return [...prev.filter((memory) => !touchedIds.has(memory.id)), ...persistedMemoryObjects];
-      });
+      if (!staleGeneration) {
+        setMemoryObjects((prev) => {
+          const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
+          return [...prev.filter((memory) => !touchedIds.has(memory.id)), ...persistedMemoryObjects];
+        });
+      }
 
       if (conversationFailed || failedMemoryIds.length > 0) {
         console.error("Partial capture failure", { conversationFailed, failedMemoryIds });
@@ -510,10 +716,15 @@ export default function ChatScreen() {
     if (topPromptRanRef.current) return;
     topPromptRanRef.current = true;
     let cancelled = false;
-    generateTopPrompt().then((result) => {
-      if (cancelled || !result) return;
-      setTopPrompt(result);
-    });
+    // Vault境界の安全性：問いかけ生成もMemory Worldへ影響する非同期処理として追跡する
+    // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
+    const generation = vaultGenerationRef.current;
+    void trackMemoryTask(
+      generateTopPrompt().then((result) => {
+        if (cancelled || !result || generation !== vaultGenerationRef.current) return;
+        setTopPrompt(result);
+      })
+    );
     return () => {
       cancelled = true;
     };
@@ -525,6 +736,16 @@ export default function ChatScreen() {
    * 存在するかを確認する。見つかっても自動では復元しない（ユーザーの確認を挟む）。
    */
   async function checkForRestoreCandidate(handle: FileSystemDirectoryHandle) {
+    // Vault境界の安全性（Codexレビュー指摘High-3対応）：scanもMemory Worldへ影響する
+    // 非同期処理として追跡する（Vault切替時、この完了を待ってからIndexedDBをclearする）。
+    // isVaultSwitchingRefでの入口ガードは意図的に付けない：handleConnectVaultの
+    // 別Vault切替経路自身が、ロック成立中に新Vault（B）をscanするためにこの関数を
+    // 呼ぶ（そこだけは許可する必要がある）。旧Vault（A）由来の古いscan（起動時・
+    // 再許可時等に開始したもの）が浮遊しないようにする役目は、trackMemoryTaskによる
+    // 追跡（＝切替側のdrainPendingMemoryTasksが完了を待つ）と、下のgeneration checkの
+    // 2段構えで担う。
+    const generation = vaultGenerationRef.current;
+    const endTask = beginMemoryTask();
     try {
       const scan = await scanVaultForRestore(handle);
       const [existingConversations, existingMemoryObjects, existingSources] = await Promise.all([
@@ -542,12 +763,19 @@ export default function ChatScreen() {
         scan.memoryObjects.filter((m) => !existingIds.has(m.id)).length +
         scan.sources.filter((s) => !existingIds.has(s.id)).length;
 
+      // 保険（generation check）：このscanが開始された後にVault世代が進んでいた場合
+      // （＝旧Vault由来のscanが、待たれないまま切替後まで生き残っていた場合）、
+      // 古いVaultのrestore候補を新しいMemory World（B）の画面へ出さない。
+      if (generation !== vaultGenerationRef.current) return;
+
       if (newCount > 0) {
         setRestoreCandidate({ scan, newCount });
         setRestoreStatus("idle");
       }
     } catch (error) {
       console.error("Failed to scan vault for restore", error);
+    } finally {
+      endTask();
     }
   }
 
@@ -557,44 +785,73 @@ export default function ChatScreen() {
     // 3フェーズ）の開始点。page:hidden/page:loadとの因果関係切り分け用の計測のみで、
     // 以下の処理内容・順序には一切影響しない。
     markBootStart();
-    restoreVaultHandle().then(async (result) => {
-      if (cancelled) return;
-      if (result.status === "connected") {
-        setVaultHandle(result.handle);
-        setVaultStatus("connected");
 
-        // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
-        // 接続許可（restoreVaultHandle）が確認できている場合、handleConnectVault()と
-        // 同じ手順（flush→scan）で復元候補チェックも行う。restoreVaultHandle()は
-        // queryPermissionのみでrequestPermissionを呼ばない設計のため、ここに来た時点で
-        // ユーザー操作なしに安全にflush/scanを実行できる。flushPendingToVault()を省略
-        // すると、IndexedDB側にまだVaultへ書き戻されていない変更がある場合に、古い
-        // Markdownの内容でIndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
-        // 復元候補が見つかっても、この場では書き込まない。既存の確認UI・
-        // handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量のMemoryを
-        // 起動時に無言で上書きしない）。
-        try {
-          await flushPendingToVault(result.handle);
-          if (cancelled) return;
-          await checkForRestoreCandidate(result.handle);
-        } catch (error) {
-          console.error("Failed to check for restore candidates on startup", error);
+    // Vault境界の安全性（Codexレビュー指摘：残存High対応）。
+    //
+    // 「起動時のVault復元→flush→scan」という一連の親処理が、開始してからflushの
+    // 完了を待つ間にVault切替（A→B）が完了し、世代（vaultGenerationRef）が
+    // 進んでしまうケースへの対応。checkForRestoreCandidate単体が自分の呼び出し
+    // 時点の世代を見るだけでは不十分（そのcheckForRestoreCandidate自体が「もう
+    // 別Vaultへ切り替わった後の世代」で新規に呼ばれてしまえば、旧Vault(A)の
+    // handleを使ったscan結果が、正しく見えてしまう形でB世代のrestoreCandidateへ
+    // 設定されてしまう）。
+    //
+    // ここでは、この親処理が開始した時点のVault世代を`startupGeneration`として
+    // 固定し、flush完了後・scan開始前に「今の世代と一致するか」を確認する。
+    // 一致しなければ、この親処理はもう別Vaultへの切替が確定した後に動いている
+    // ことになるため、旧Vault(A)のhandleを使ったscanを新規に開始せず終了する。
+    const startupGeneration = vaultGenerationRef.current;
+    // この親処理全体（handle復元→flush→scan）もMemory World taskとして追跡する。
+    // Vault切替側のdrainPendingMemoryTasksが、この処理の完了（＝flush・scanが
+    // 安全に終わる、またはgeneration不一致で早期終了する）を待ってから
+    // 先へ進めるようにするため。checkForRestoreCandidate自身も自己追跡している
+    // （trackMemoryTask/beginMemoryTaskは何重に登録しても、それぞれ独立して
+    // Setへ出し入れされるだけなので、親子で二重に追跡しても循環待機にはならない）。
+    const endStartupTask = beginMemoryTask();
+    restoreVaultHandle()
+      .then(async (result) => {
+        if (cancelled) return;
+        if (result.status === "connected") {
+          setVaultHandle(result.handle);
+          setVaultStatus("connected");
+
+          // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
+          // 接続許可（restoreVaultHandle）が確認できている場合、handleConnectVault()と
+          // 同じ手順（flush→scan）で復元候補チェックも行う。restoreVaultHandle()は
+          // queryPermissionのみでrequestPermissionを呼ばない設計のため、ここに来た時点で
+          // ユーザー操作なしに安全にflush/scanを実行できる。flushPendingToVault()を省略
+          // すると、IndexedDB側にまだVaultへ書き戻されていない変更がある場合に、古い
+          // Markdownの内容でIndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
+          // 復元候補が見つかっても、この場では書き込まない。既存の確認UI・
+          // handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量のMemoryを
+          // 起動時に無言で上書きしない）。
+          try {
+            await flushPendingToVault(result.handle);
+            if (cancelled) return;
+            // 親generationの固定チェック（上のコメント参照）。
+            if (startupGeneration !== vaultGenerationRef.current) return;
+            await checkForRestoreCandidate(result.handle);
+          } catch (error) {
+            console.error("Failed to check for restore candidates on startup", error);
+          }
+        } else if (result.status === "needs-permission") {
+          // Android等：以前選択したフォルダのFileSystemDirectoryHandle自体はIndexedDBに
+          // 有効なまま残っているが、ブラウザ管理の書き込み許可がリロードで失効している状態。
+          // ここではrequestPermission()を呼ばない（ユーザー操作を伴わないmount effectの
+          // ため呼べない）。handleは保持しつつ、UI側で「アクセスを再許可」ボタンを出し、
+          // ユーザーのクリック（handleReauthorizeVault）を起点に再許可を試みる。
+          setVaultHandle(result.handle);
+          setVaultStatus("needs-permission");
+        } else {
+          setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
         }
-      } else if (result.status === "needs-permission") {
-        // Android等：以前選択したフォルダのFileSystemDirectoryHandle自体はIndexedDBに
-        // 有効なまま残っているが、ブラウザ管理の書き込み許可がリロードで失効している状態。
-        // ここではrequestPermission()を呼ばない（ユーザー操作を伴わないmount effectの
-        // ため呼べない）。handleは保持しつつ、UI側で「アクセスを再許可」ボタンを出し、
-        // ユーザーのクリック（handleReauthorizeVault）を起点に再許可を試みる。
-        setVaultHandle(result.handle);
-        setVaultStatus("needs-permission");
-      } else {
-        setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
-      }
-      // TEMP-TEST：起動処理フェーズ①（Vault復元+flush+scan）完了。分岐・成否に関わらず
-      // ここに到達する（catchが例外を握りつぶし再送出しないため）。
-      markBootPhaseDone();
-    });
+        // TEMP-TEST：起動処理フェーズ①（Vault復元+flush+scan）完了。分岐・成否に関わらず
+        // ここに到達する（catchが例外を握りつぶし再送出しないため）。
+        markBootPhaseDone();
+      })
+      .finally(() => {
+        endStartupTask();
+      });
     return () => {
       cancelled = true;
     };
@@ -610,31 +867,36 @@ export default function ChatScreen() {
     if (vaultStatus === "checking" || startupConnectRanRef.current) return;
     startupConnectRanRef.current = true;
     let cancelled = false;
-    (async () => {
-      // TEMP-TEST：起動時Connectキャッチアップの計測のみ。処理内容・順序は無変更。
-      const catchupStart = Date.now();
-      try {
-        const allMemories = await getAllMemoryObjects();
-        const unconnected = await filterUnconnected(allMemories);
-        const pending = [...unconnected]
-          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-          .slice(0, STARTUP_CONNECT_LIMIT);
-        logStartupCatchupStart("connectCatchup", pending.length);
-        for (const memory of pending) {
-          if (cancelled) return;
-          // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
-          // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
-          await connectMemory(vaultHandle, memory, "background");
+    // Vault境界の安全性：起動時キャッチアップもMemory Worldへ影響する非同期処理として
+    // 追跡する（Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
+    void trackMemoryTask(
+      (async () => {
+        // TEMP-TEST：起動時Connectキャッチアップの計測のみ。処理内容・順序は無変更。
+        const catchupStart = Date.now();
+        try {
+          const allMemories = await getAllMemoryObjects();
+          const unconnected = await filterUnconnected(allMemories);
+          const pending = [...unconnected]
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+            .slice(0, STARTUP_CONNECT_LIMIT);
+          logStartupCatchupStart("connectCatchup", pending.length);
+          for (const memory of pending) {
+            // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
+            if (cancelled || isVaultSwitchingRef.current) return;
+            // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
+            // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
+            await connectMemory(vaultHandle, memory, "background");
+          }
+        } catch (error) {
+          console.error("Failed to run startup connect catch-up", error);
+        } finally {
+          // finallyのため、途中でのcancelled return・エラーどちらの経路でも必ず記録される
+          // （既存のtry/catch自体の分岐・処理順序は変更していない）。
+          logStartupCatchupEnd("connectCatchup", Date.now() - catchupStart);
+          markBootPhaseDone();
         }
-      } catch (error) {
-        console.error("Failed to run startup connect catch-up", error);
-      } finally {
-        // finallyのため、途中でのcancelled return・エラーどちらの経路でも必ず記録される
-        // （既存のtry/catch自体の分岐・処理順序は変更していない）。
-        logStartupCatchupEnd("connectCatchup", Date.now() - catchupStart);
-        markBootPhaseDone();
-      }
-    })();
+      })()
+    );
     return () => {
       cancelled = true;
     };
@@ -659,31 +921,36 @@ export default function ChatScreen() {
     if (vaultStatus === "checking" || startupCaptureRanRef.current) return;
     startupCaptureRanRef.current = true;
     let cancelled = false;
-    (async () => {
-      // TEMP-TEST：起動時Captureキャッチアップの計測のみ。処理内容・順序は無変更。
-      const catchupStart = Date.now();
-      try {
-        const allConversations = await getAllConversations();
-        const uncaptured = allConversations
-          .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0)
-          .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
-          .slice(0, STARTUP_CAPTURE_LIMIT);
-        logStartupCatchupStart("captureCatchup", uncaptured.length);
-        for (const conversationRecord of uncaptured) {
-          if (cancelled) return;
-          // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
-          // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
-          await runConversationBoundary(conversationRecord, "background");
+    // Vault境界の安全性：起動時キャッチアップもMemory Worldへ影響する非同期処理として
+    // 追跡する（Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
+    void trackMemoryTask(
+      (async () => {
+        // TEMP-TEST：起動時Captureキャッチアップの計測のみ。処理内容・順序は無変更。
+        const catchupStart = Date.now();
+        try {
+          const allConversations = await getAllConversations();
+          const uncaptured = allConversations
+            .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0)
+            .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+            .slice(0, STARTUP_CAPTURE_LIMIT);
+          logStartupCatchupStart("captureCatchup", uncaptured.length);
+          for (const conversationRecord of uncaptured) {
+            // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
+            if (cancelled || isVaultSwitchingRef.current) return;
+            // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
+            // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
+            await runConversationBoundary(conversationRecord, "background");
+          }
+        } catch (error) {
+          console.error("Failed to run startup capture catch-up", error);
+        } finally {
+          // finallyのため、途中でのcancelled return・エラーどちらの経路でも必ず記録される
+          // （既存のtry/catch自体の分岐・処理順序は変更していない）。
+          logStartupCatchupEnd("captureCatchup", Date.now() - catchupStart);
+          markBootPhaseDone();
         }
-      } catch (error) {
-        console.error("Failed to run startup capture catch-up", error);
-      } finally {
-        // finallyのため、途中でのcancelled return・エラーどちらの経路でも必ず記録される
-        // （既存のtry/catch自体の分岐・処理順序は変更していない）。
-        logStartupCatchupEnd("captureCatchup", Date.now() - catchupStart);
-        markBootPhaseDone();
-      }
-    })();
+      })()
+    );
     return () => {
       cancelled = true;
     };
@@ -776,6 +1043,14 @@ export default function ChatScreen() {
    * （既存のhandleReauthorizeVault、変更なし）を促す方針に統一する。
    */
   async function handleConnectVault() {
+    // Vault境界の安全性（Codexレビュー指摘H1〜H3対応）：既に切替処理が進行中なら
+    // 新規に開始しない（再入防止。「Vault再選択」も新規開始を止める対象の一つ）。
+    // vaultOperationLockRefは、handleReauthorizeVault/handleRestoreFromVaultとの
+    // 同時実行も防ぐ（Vault操作同士の排他）。folder pickerが開いている間も含めて
+    // この関数の実行中はずっと保持するが、isVaultSwitchingRef（重いロック）とは違い
+    // 通常の会話送信等までは止めない。
+    if (isVaultSwitchingRef.current || vaultOperationLockRef.current) return;
+    vaultOperationLockRef.current = true;
     setVaultConnectFeedback(null);
     try {
       const newHandle = await pickVaultDirectory();
@@ -784,7 +1059,8 @@ export default function ChatScreen() {
 
       if (identity !== "different") {
         // CASE1（初めての接続）・同じVaultを選び直した場合：Memory World切替としては
-        // 扱わない。現状維持（既存のhandleConnectVaultの挙動と完全に同じ）。
+        // 扱わない。現状維持（既存のhandleConnectVaultの挙動と完全に同じ、ロックも
+        // 取得しない＝pending taskの待機やIndexedDBのclearは一切発生しない）。
         await ensureVaultSkeleton(newHandle);
         await saveVaultHandle(newHandle);
         setVaultHandle(newHandle);
@@ -811,12 +1087,11 @@ export default function ChatScreen() {
       // 安全に保存できたか確認しようが無い。例えば「Vault Aがneeds-permissionのまま
       // IndexedDBだけで会話を継続し、その未同期データがVault Aへ一度も書き込まれていない」
       // 状態でBへ切り替えると、この後のclearMemoryData()でそのデータが永久に失われる
-      // （実際に存在した経路。過去のコードでは`vaultStatus === "connected" && vaultHandle`の
-      // 条件でflushPendingToVault自体をスキップしてしまい、そのままclearへ進んでいた）。
-      // 「実際に未同期データがあるかどうか」を事前判定する複雑さを避け、旧Vaultが
-      // 書き込み可能でない限り一律で切替そのものを中止する（安全側に統一する）。
-      // ここで中断すればensureVaultSkeleton(newHandle)すら呼ばないため、Bへ余計な
-      // フォルダも作らない。
+      // （実際に存在した経路）。「実際に未同期データがあるかどうか」を事前判定する
+      // 複雑さを避け、旧Vaultが書き込み可能でない限り一律で切替そのものを中止する
+      // （安全側に統一する）。ここで中断すればensureVaultSkeleton(newHandle)すら
+      // 呼ばないため、Bへ余計なフォルダも作らない。ロックもまだ取得しない
+      // （確認ダイアログの前後・この時点でのabortはロック無しで安全に完結する）。
       if (vaultStatus !== "connected" || !vaultHandle) {
         setVaultConnectFeedback({
           kind: "error",
@@ -830,52 +1105,169 @@ export default function ChatScreen() {
         "保存先を切り替えますか？\n\n選んだフォルダの記憶に切り替わります。これまでの記憶は、現在の保存先に残ります。"
       );
       if (!confirmed) {
-        // 「やめる」：IndexedDB・現在のVault・sync stateには一切変更を加えない。
+        // 「やめる」：IndexedDB・現在のVault・sync state・ロックのいずれにも
+        // 一切変更を加えない（Test 6：切替キャンセル）。
         setVaultConnectFeedback({ kind: "cancelled", message: "保存先の切り替えをキャンセルしました。" });
         window.setTimeout(() => setVaultConnectFeedback(null), 4000);
         return;
       }
 
-      // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。ここで失敗すれば、
-      // 現在のVault・IndexedDBには一切影響しない（空フォルダの作成以外の副作用は無い）。
-      await ensureVaultSkeleton(newHandle);
-
-      // 現在のVault（旧）に未同期のデータがあれば、新Vaultではなく旧Vault自身へ保存する
-      // （絶対にnewHandleへflushしない）。上のガードにより、この時点でvaultStatusは
-      // 必ず"connected"かつvaultHandleが存在する。1件でも失敗した場合はデータ消失を
-      // 避けるため、ここで切替を中止する（IndexedDBはclearしない・別Vaultへ切り替えない）。
-      const flushResult = await flushPendingToVault(vaultHandle, "interactive");
-      if (flushResult.failedCount > 0) {
-        setVaultConnectFeedback({
-          kind: "error",
-          message: "今のデータの保存に失敗したため、切り替えを中止しました。もう一度お試しください。",
-        });
-        window.setTimeout(() => setVaultConnectFeedback(null), 4000);
-        return;
-      }
-
-      // ここまで来て初めて、現在のMemory World（IndexedDB）をclearする。
+      // ここから先だけロックを取得する（切替ロック開始 → 新規Memory系処理の開始を停止）。
+      // 各handler（handleSend/会話終了/日記終了/Reflection/Capture/Connect/Source保存/
+      // 問いかけ生成/Restore開始/Vault再選択）は冒頭でisVaultSwitchingRef.currentを
+      // チェックしており、この時点から新規開始を拒否するようになる。
+      const savedVaultHandleForFlush = vaultHandle;
+      setIsVaultSwitching(true);
+      isVaultSwitchingRef.current = true;
       try {
-        await clearMemoryData();
-      } catch (clearError) {
-        console.error("Failed to clear local data before vault switch", clearError);
-        setVaultConnectFeedback({
-          kind: "error",
-          message: "切り替えに失敗しました。ページを再読み込みしてからもう一度お試しください。",
-        });
-        window.setTimeout(() => setVaultConnectFeedback(null), 4000);
-        return;
+        // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。ここで失敗すれば、
+        // 現在のVault・IndexedDBには一切影響しない（空フォルダの作成以外の副作用は無い）。
+        await ensureVaultSkeleton(newHandle);
+
+        // Codexレビュー指摘対応：ここから「収束待ち」フェーズ全体に共有の締切を設ける
+        // （個々のstepごとに別々のtimeoutを与えると合計で際限なく伸びうるため）。
+        const settleDeadline = Date.now() + VAULT_SWITCH_SETTLE_TIMEOUT_MS;
+        const abortAsTimeout = () => {
+          console.error("Vault switch: settle phase timed out, aborting switch and keeping current vault");
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "処理に時間がかかっているため、切り替えを中止しました。もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 6000);
+        };
+
+        // 3. 実行中のCapture / Reflection / Connect / Source保存 / 問いかけ生成等
+        // （pendingMemoryTasksRef）を、途中で強制破棄することなく完全にdrainする
+        // （High-1対応：1回のスナップショット待ちでは、待機中に登録された子task
+        // ＝親のCapture完了直前にConnect/revisitPromptが新規登録されるケースを
+        // 取りこぼすため、Setが本当に空になるまでwhileループで待つ）。
+        if (await drainPendingMemoryTasks(settleDeadline)) {
+          abortAsTimeout();
+          return;
+        }
+
+        // 4. 上のpending taskがVault write queueへ積んだ書き込み（awaitVaultSync=falseの
+        // fire-and-forget書き込みを含む）が、実際に完了するまで待つ。
+        if ((await waitForVaultWrites(Math.max(0, settleDeadline - Date.now()))).timedOut) {
+          abortAsTimeout();
+          return;
+        }
+
+        // 5. 現在のVault（旧）に未同期のデータがあれば、新Vaultではなく旧Vault自身へ保存する
+        // （絶対にnewHandleへflushしない）。上のガードにより、この時点でvaultStatusは
+        // 必ず"connected"かつvaultHandleが存在する。
+        //
+        // Codex指摘（Medium：final flush自体が無期限await）対応：flushPendingToVault()を
+        // 直接awaitするのではなく、まずtrackMemoryTaskでMemory World taskとして登録した上で、
+        // 残り締切時間とPromise.raceさせる。「タイムアウトしたからflushを放置してclearへ
+        // 進む」ことは絶対にしない：raceに負けて待つのを諦めた場合でも、flush自体は
+        // trackMemoryTaskの登録によりpendingMemoryTasksRefへ残ったまま裏で継続する
+        // （実際に完了した時点でtrackMemoryTaskのcleanupが自動的に取り除く）。この状態で
+        // 切替を中止する（下のabortAsTimeout()）ため、後続の別のVault切替の試行があっても、
+        // 次のdrainPendingMemoryTasksが必ずこのflushの完了を待つことになり、追い越されない。
+        const flushDeadlineRemaining = Math.max(0, settleDeadline - Date.now());
+        const flushTask = trackMemoryTask(flushPendingToVault(savedVaultHandleForFlush, "interactive"));
+        const flushOutcome = await Promise.race([
+          flushTask.then((result) => ({ timedOut: false as const, result })),
+          new Promise<{ timedOut: true }>((resolve) => {
+            window.setTimeout(() => resolve({ timedOut: true }), flushDeadlineRemaining);
+          }),
+        ]);
+        if (flushOutcome.timedOut) {
+          abortAsTimeout();
+          return;
+        }
+        const flushResult = flushOutcome.result;
+
+        // 6. flushPendingToVault自身が積んだ書き込みが完了するまで待つ。
+        if ((await waitForVaultWrites(Math.max(0, settleDeadline - Date.now()))).timedOut) {
+          abortAsTimeout();
+          return;
+        }
+
+        if (flushResult.failedCount > 0) {
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "今のデータの保存に失敗したため、切り替えを中止しました。もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+          return;
+        }
+
+        // 7. final flush後に新しいMemory World taskが発生していないことの最終確認。
+        // 通常はステップ3で既にpendingMemoryTasksRefは空であり（新規開始は上の
+        // ロックで止めている、flushPendingToVault自体はpendingMemoryTasksRefへ
+        // 何も登録しない）、ここは即座に0で返るはず。万一何かが残っていれば
+        // 同じdrain処理でもう一度待ち、それでも収束しなければ安全側で中止する
+        // （「final flush開始後に、A由来のデータを新規にIndexedDBへ保存できる経路が
+        // 無い」ことを、待ち切ることで保証する。書き込み経路自体を塞ぐのではなく、
+        // 経路が実行され得る余地（ロック未取得の新規開始）を無くした上で、
+        // 万一の取りこぼしをここで検出する設計）。
+        if (await drainPendingMemoryTasks(settleDeadline)) {
+          abortAsTimeout();
+          return;
+        }
+        if (pendingMemoryTasksRef.current.size > 0) {
+          // 理論上到達しないはずのフェイルセーフ（drainPendingMemoryTasksがtimedOutを
+          // 返さずに0件未満で抜けることは無いため）。念のため明示的に中止する。
+          console.error("Vault switch: pendingMemoryTasksRef unexpectedly non-empty after drain, aborting");
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "切り替えを中止しました。もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+          return;
+        }
+
+        // ここまでで、旧Vaultへの保存が確認でき、かつ新しいMemory World taskが
+        // 一切残っていないことも確認できた。Vault世代を進める（遅れて完了する
+        // 旧処理からの書き戻しを無効化する保険。上のdrainが主対策）。
+        vaultGenerationRef.current += 1;
+
+        // 8. 現在のMemory World（IndexedDB）をclearする。
+        // reset失敗時の扱い：resetMemoryWorldState()（下書き等、DBから完全復元できない
+        // UI stateを含む）は、clear・saveVaultHandleの両方が成功するまで呼ばない。
+        // clearまたはsaveVaultHandleが失敗した場合、旧Vault Aを使い続けられる状態を
+        // 維持したまま中止する（Aの画面stateだけを先に失うことを避ける）。
+        try {
+          await clearMemoryData();
+        } catch (clearError) {
+          console.error("Failed to clear local data before vault switch", clearError);
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "切り替えに失敗しました。ページを再読み込みしてからもう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+          return;
+        }
+
+        try {
+          await saveVaultHandle(newHandle);
+        } catch (saveHandleError) {
+          console.error("Failed to save new vault handle after clearing local data", saveHandleError);
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "切り替えに失敗しました。ページを再読み込みしてからもう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+          return;
+        }
+
+        // clear・新Vaulthandleの永続化の両方が成功して初めて、旧Memory World由来の
+        // React state/refを初期化し（H1対応）、新Vaultへコミットする。
+        resetMemoryWorldState();
+        setVaultHandle(newHandle);
+        setVaultStatus("connected");
+
+        // 9〜10. 新Vault（B）をscanし、既存データがあれば復元候補として提示する
+        // （自動では書き込まない。checkForRestoreCandidate自体もMemory World taskとして
+        // 追跡され、世代チェックも内部で行う）。
+        await checkForRestoreCandidate(newHandle);
+      } finally {
+        // 11. 切替ロック解除（成功・中止・例外いずれの経路でも必ず解除する）。
+        setIsVaultSwitching(false);
+        isVaultSwitchingRef.current = false;
       }
-      setRestoreCandidate(null);
-      setRestoreStatus("idle");
-
-      // clear成功後に初めて新Vaultへコミットする。
-      await saveVaultHandle(newHandle);
-      setVaultHandle(newHandle);
-      setVaultStatus("connected");
-
-      // 新Vault（B）をscanし、既存データがあれば復元候補として提示する（自動では書き込まない）。
-      await checkForRestoreCandidate(newHandle);
     } catch (error) {
       const feedback: VaultConnectFeedback =
         error instanceof DOMException && error.name === "AbortError"
@@ -886,6 +1278,8 @@ export default function ChatScreen() {
       }
       setVaultConnectFeedback(feedback);
       window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+    } finally {
+      vaultOperationLockRef.current = false;
     }
   }
 
@@ -901,7 +1295,12 @@ export default function ChatScreen() {
    * vaultStatusを"needs-permission"のまま維持し、いつでも再試行できるようにする。
    */
   async function handleReauthorizeVault() {
-    if (!vaultHandle) return;
+    // Vault境界の安全性：別Vaultへの切替処理中は、旧Vaultの再許可を同時に走らせない
+    // （新規Memory系処理の開始停止の一つ。切替完了後に改めて再許可できる）。
+    // vaultOperationLockRefで、handleConnectVault/handleRestoreFromVaultとの
+    // 同時実行も防ぐ（Vault操作同士の排他）。
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current) return;
+    vaultOperationLockRef.current = true;
     setVaultConnectFeedback(null);
     try {
       const granted = await requestVaultPermission(vaultHandle);
@@ -917,29 +1316,47 @@ export default function ChatScreen() {
       console.error("Failed to reauthorize vault", error);
       setVaultConnectFeedback({ kind: "error", message: "アクセスを再許可できませんでした。" });
       window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+    } finally {
+      vaultOperationLockRef.current = false;
     }
   }
 
   async function handleRestoreFromVault() {
-    if (!restoreCandidate) return;
+    // Vault境界の安全性：Vault操作同士の排他＋切替処理中は新規のRestore開始をさせない。
+    if (!restoreCandidate || isVaultSwitchingRef.current || vaultOperationLockRef.current) return;
+    vaultOperationLockRef.current = true;
+    // Codexレビュー指摘High-3：Restore全体（全put完了・state反映まで）をMemory World
+    // taskとして追跡する。開始時点のVault世代を覚えておき、各DB書き込みの直前で
+    // 世代が変わっていないかを確認する（「旧generationならDBへ書く前に停止できる
+    // ようにする」という指摘への対応：UI stateだけでなくIndexedDBへのput自体を、
+    // 世代が変わった時点で止める）。
+    const generation = vaultGenerationRef.current;
+    const endTask = beginMemoryTask();
     setRestoreStatus("restoring");
     try {
       for (const restoredConversation of restoreCandidate.scan.conversations) {
+        if (generation !== vaultGenerationRef.current) return;
         await putConversation(restoredConversation);
       }
       for (const restoredMemoryObject of restoreCandidate.scan.memoryObjects) {
+        if (generation !== vaultGenerationRef.current) return;
         await putMemoryObject(restoredMemoryObject);
       }
       // Test 34：Conversation/MemoryObjectと同じ扱いで、Vaultにしか存在しないSourceも
       // 復元する（従来はscan.sourcesが読み取られるだけで復元されずに失われていた）。
       for (const restoredSource of restoreCandidate.scan.sources) {
+        if (generation !== vaultGenerationRef.current) return;
         await saveSource(restoredSource);
       }
+      if (generation !== vaultGenerationRef.current) return;
       setRestoreStatus("done");
       setRestoreCandidate(null);
     } catch (error) {
       console.error("Failed to restore from vault", error);
-      setRestoreStatus("idle");
+      if (generation === vaultGenerationRef.current) setRestoreStatus("idle");
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
     }
   }
 
@@ -1053,81 +1470,88 @@ export default function ChatScreen() {
    * persistConversationで保存済みのため、この順序でもConversation本文が失われることはない。
    */
   async function handleEndSession() {
-    // UI改善：ボタン押下の直後、Boundary Captureの解決を待つ前から状態を表示する。
-    setReflectionStatus("capturing");
-    // Conversation Boundary（このConversationの唯一のCapture機会）をここで実行する。
-    // 会話中は毎ターンCaptureしていないため、ここで初めて/api/captureが呼ばれる
-    // （runConversationBoundaryが内部でMemory保存・Connectまで完了させる）。
-    // awaitVaultSync=false：ユーザー操作の完了をIndexedDB保存で確定させ、Vaultへの
-    // 反映は待たない（Beta修正。詳細はcapture.tsのpersistCapture/persistConversation参照）。
-    const latestMemoryObjects = await runConversationBoundary(latestConversationRef.current, "interactive", false);
-
-    if (latestMemoryObjects.length === 0) {
-      // Captureがまだ一度も成功していない（進行中 or 失敗）。
-      // 無反応にはせず、ユーザーに次にどうすればよいか分かる状態にする。
-      setReflectionStatus("unavailable");
-      return;
-    }
-
-    setReflectionStatus("generating");
+    // Vault境界の安全性：切替処理中は新規のReflection開始をさせない。
+    if (isVaultSwitchingRef.current) return;
+    const endTask = beginMemoryTask();
     try {
-      // 振り返り（/api/reflect）はMemoryObjectを1件受け取る既存の設計のため、
-      // 今回のConversationから生まれた複数Memoryを1つにまとめた材料として渡す
-      // （reflection.ts / /api/reflect側は変更しない）。
-      const reflectionSource: MemoryObject = {
-        ...latestMemoryObjects[0],
-        summary: latestMemoryObjects.map((memory) => memory.summary).join(" / "),
-        content: latestMemoryObjects.map((memory) => memory.content).join("\n\n"),
-        keywords: [...new Set(latestMemoryObjects.flatMap((memory) => memory.keywords))],
-      };
-
-      const text = await generateSessionReflection(persona, reflectionSource);
-      const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
-      const endedConversation: Conversation = {
-        ...conversation,
-        endedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        memoryObjectIds: [...conversation.memoryObjectIds, insightMemory.id],
-      };
-
-      // 既存のwriteConversationMarkdown / writeMemoryObjectMarkdown / putConversation / putMemoryObjectを
-      // そのまま再利用する（persistCaptureは会話1件+MemoryObject複数件を書き出す処理として、
-      // Capture専用ではなくそのまま使い回せる）。
+      // UI改善：ボタン押下の直後、Boundary Captureの解決を待つ前から状態を表示する。
+      setReflectionStatus("capturing");
+      // Conversation Boundary（このConversationの唯一のCapture機会）をここで実行する。
+      // 会話中は毎ターンCaptureしていないため、ここで初めて/api/captureが呼ばれる
+      // （runConversationBoundaryが内部でMemory保存・Connectまで完了させる）。
       // awaitVaultSync=false：ユーザー操作の完了をIndexedDB保存で確定させ、Vaultへの
-      // 反映は待たない（reflectionFailedIdsはIndexedDB保存の成否のみを表すため、
-      // この変更でも判定の意味は変わらない）。
-      const { failedMemoryIds: reflectionFailedIds } = await persistCapture(
-        vaultHandle,
-        endedConversation,
-        [insightMemory],
-        "interactive",
-        false
-      );
-      if (reflectionFailedIds.length > 0) {
-        // insight MemoryのIndexedDB保存自体が失敗した場合は、Reflectionを「完了」として
-        // 表示しない（黙って失われた記憶を「保存できた」と伝えないため）。
-        console.error("Reflection insight memory failed to persist", reflectionFailedIds);
-        setReflectionStatus("error");
+      // 反映は待たない（Beta修正。詳細はcapture.tsのpersistCapture/persistConversation参照）。
+      const latestMemoryObjects = await runConversationBoundary(latestConversationRef.current, "interactive", false);
+
+      if (latestMemoryObjects.length === 0) {
+        // Captureがまだ一度も成功していない（進行中 or 失敗）。
+        // 無反応にはせず、ユーザーに次にどうすればよいか分かる状態にする。
+        setReflectionStatus("unavailable");
         return;
       }
 
-      setConversation(endedConversation);
-      latestConversationRef.current = endedConversation;
-      setReflectionText(text);
-      // UI改善：「今日、こんなことを覚えました」用。今回のCaptureで生成・更新された
-      // Memory（latestMemoryObjects、insight Memory自体は含まない）をそのまま保持する。
-      setSessionCapturedMemories(latestMemoryObjects);
-      setReflectionStatus("done");
+      setReflectionStatus("generating");
+      try {
+        // 振り返り（/api/reflect）はMemoryObjectを1件受け取る既存の設計のため、
+        // 今回のConversationから生まれた複数Memoryを1つにまとめた材料として渡す
+        // （reflection.ts / /api/reflect側は変更しない）。
+        const reflectionSource: MemoryObject = {
+          ...latestMemoryObjects[0],
+          summary: latestMemoryObjects.map((memory) => memory.summary).join(" / "),
+          content: latestMemoryObjects.map((memory) => memory.content).join("\n\n"),
+          keywords: [...new Set(latestMemoryObjects.flatMap((memory) => memory.keywords))],
+        };
 
-      // Connect（ROADMAP.md Phase 2）。latestMemoryObjects分は既にrunConversationBoundary内で
-      // Connect済みのため、ここではこのReflection自体（insightMemory）だけを追加でConnectする。
-      // Reflection表示をブロックしないよう非同期で走らせる（connectConversationBoundaryを
-      // そのまま再利用。失敗してもReflection自体は成功しているためreflectionStatusには
-      // 影響させない。未Connectのまま残っても次回起動時のキャッチアップで再試行される）。
-      connectConversationBoundary(Promise.resolve([insightMemory]));
-    } catch (error) {
-      console.error("Failed to generate session reflection", error);
-      setReflectionStatus("error");
+        const text = await generateSessionReflection(persona, reflectionSource);
+        const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
+        const endedConversation: Conversation = {
+          ...conversation,
+          endedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          memoryObjectIds: [...conversation.memoryObjectIds, insightMemory.id],
+        };
+
+        // 既存のwriteConversationMarkdown / writeMemoryObjectMarkdown / putConversation / putMemoryObjectを
+        // そのまま再利用する（persistCaptureは会話1件+MemoryObject複数件を書き出す処理として、
+        // Capture専用ではなくそのまま使い回せる）。
+        // awaitVaultSync=false：ユーザー操作の完了をIndexedDB保存で確定させ、Vaultへの
+        // 反映は待たない（reflectionFailedIdsはIndexedDB保存の成否のみを表すため、
+        // この変更でも判定の意味は変わらない）。
+        const { failedMemoryIds: reflectionFailedIds } = await persistCapture(
+          vaultHandle,
+          endedConversation,
+          [insightMemory],
+          "interactive",
+          false
+        );
+        if (reflectionFailedIds.length > 0) {
+          // insight MemoryのIndexedDB保存自体が失敗した場合は、Reflectionを「完了」として
+          // 表示しない（黙って失われた記憶を「保存できた」と伝えないため）。
+          console.error("Reflection insight memory failed to persist", reflectionFailedIds);
+          setReflectionStatus("error");
+          return;
+        }
+
+        setConversation(endedConversation);
+        latestConversationRef.current = endedConversation;
+        setReflectionText(text);
+        // UI改善：「今日、こんなことを覚えました」用。今回のCaptureで生成・更新された
+        // Memory（latestMemoryObjects、insight Memory自体は含まない）をそのまま保持する。
+        setSessionCapturedMemories(latestMemoryObjects);
+        setReflectionStatus("done");
+
+        // Connect（ROADMAP.md Phase 2）。latestMemoryObjects分は既にrunConversationBoundary内で
+        // Connect済みのため、ここではこのReflection自体（insightMemory）だけを追加でConnectする。
+        // Reflection表示をブロックしないよう非同期で走らせる（connectConversationBoundaryを
+        // そのまま再利用。失敗してもReflection自体は成功しているためreflectionStatusには
+        // 影響させない。未Connectのまま残っても次回起動時のキャッチアップで再試行される）。
+        connectConversationBoundary(Promise.resolve([insightMemory]));
+      } catch (error) {
+        console.error("Failed to generate session reflection", error);
+        setReflectionStatus("error");
+      }
+    } finally {
+      endTask();
     }
   }
 
@@ -1159,6 +1583,9 @@ export default function ChatScreen() {
    * を呼ぶ（Capture・Connect自体の実装には一切触れない）。
    */
   async function handleEndConversation() {
+    // Vault境界の安全性：切替処理中は新規の会話終了（Capture）開始をさせない。
+    if (isVaultSwitchingRef.current) return;
+    const endTask = beginMemoryTask();
     setEndingConversation(true);
     try {
       const endedConversation: Conversation = {
@@ -1199,6 +1626,7 @@ export default function ChatScreen() {
       console.error("Failed to end conversation", error);
     } finally {
       setEndingConversation(false);
+      endTask();
     }
   }
 
@@ -1212,7 +1640,9 @@ export default function ChatScreen() {
    * 追記せず新規作成する」分岐と全く同じリセット処理を再利用する。
    */
   function handleSwitchPersona(nextPersona: Persona) {
-    void runConversationBoundary(latestConversationRef.current);
+    // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
+    if (isVaultSwitchingRef.current) return;
+    void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
     const newConversation = createConversation(nextPersona);
     setConversation(newConversation);
@@ -1236,7 +1666,9 @@ export default function ChatScreen() {
    * 渡す（トップ画面自体はこの値を表示に使わない）。
    */
   function handleGoToTop() {
-    void runConversationBoundary(latestConversationRef.current);
+    // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
+    if (isVaultSwitchingRef.current) return;
+    void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
     const newConversation = createConversation(persona);
     setConversation(newConversation);
@@ -1263,8 +1695,10 @@ export default function ChatScreen() {
    */
   async function handleSend(overrideText?: string, overridePersona?: Persona) {
     const text = (overrideText ?? "").trim();
-    if (!text || busy) return;
+    // Vault境界の安全性：切替処理中は新規の送信を開始させない。
+    if (!text || busy || isVaultSwitchingRef.current) return;
     const activePersona = overridePersona ?? persona;
+    const endTask = beginMemoryTask();
 
     setBusy(true);
     setStreamingText("");
@@ -1280,7 +1714,7 @@ export default function ChatScreen() {
     // （問いかけ自体のturnが乗っていない）参照してしまう。
     let baseConversation = latestConversationRef.current;
     if (baseConversation.endedAt) {
-      void runConversationBoundary(baseConversation);
+      void trackMemoryTask(runConversationBoundary(baseConversation));
 
       baseConversation = createConversation(activePersona);
       setConversation(baseConversation);
@@ -1388,14 +1822,17 @@ export default function ChatScreen() {
       // 必ず残るようにする。Memory生成はConversation Boundary（終了操作・persona切替・
       // トップへ戻る等）でのみrunConversationBoundaryが行う（毎ターンは呼ばない）。
       // 保存の完了を待たず、ここで次の入力を可能にする。
+      // Vault境界の安全性：fire-and-forgetのままだと、この保存が完了する前にVault切替の
+      // pending task待ちを素通りしてしまう（H1/H3対応）。trackMemoryTaskで追跡する。
       setBusy(false);
-      void persistConversation(vaultHandle, updated);
+      void trackMemoryTask(persistConversation(vaultHandle, updated));
     } catch (error) {
       console.error("Failed to send message", error);
       setSendStatus(error instanceof ChatRequestError && error.status === 401 ? "authError" : "error");
     } finally {
       setBusy(false);
       stopWaiting();
+      endTask();
     }
   }
 
@@ -1413,7 +1850,9 @@ export default function ChatScreen() {
    */
   function handleTopPromptSend() {
     const text = topPromptInput.trim();
-    if (!text || busy || !topPrompt) return;
+    // Vault境界の安全性：切替処理中は新規の送信を開始させない
+    // （handleSend側でも同じガードを持つが、ここで早期returnして無駄なstate更新もしない）。
+    if (!text || busy || !topPrompt || isVaultSwitchingRef.current) return;
 
     const questionTurn: ConversationTurn = {
       role: "ai",
@@ -1605,7 +2044,7 @@ export default function ChatScreen() {
                   />
                   <button
                     onClick={handleTopPromptSend}
-                    disabled={!topPromptInput.trim()}
+                    disabled={!topPromptInput.trim() || isVaultSwitching}
                     className="shrink-0 rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
                   >
                     送る
@@ -1689,7 +2128,7 @@ export default function ChatScreen() {
           <div className="flex flex-col items-center gap-2 pt-4 text-center">
             <button
               onClick={() => void handleEndSession()}
-              disabled={reflectionStatus === "capturing" || reflectionStatus === "generating"}
+              disabled={reflectionStatus === "capturing" || reflectionStatus === "generating" || isVaultSwitching}
               className="text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 disabled:opacity-50 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
             >
               本日はここまで
@@ -1726,7 +2165,7 @@ export default function ChatScreen() {
           <div className="flex flex-col items-center gap-2 pt-4 text-center">
             <button
               onClick={() => void handleEndConversation()}
-              disabled={endingConversation}
+              disabled={endingConversation || isVaultSwitching}
               className="text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 disabled:opacity-50 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
             >
               この会話を終える
@@ -1955,13 +2394,17 @@ export default function ChatScreen() {
           */}
           <ChatInput
             key={inputResetKey}
-            disabled={busy}
+            disabled={busy || isVaultSwitching}
             placeholder={
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
             onSend={(text) => void handleSend(text)}
             onOpenHistory={() => setHistoryOpen(true)}
-            onOpenImport={() => setImportOpen(true)}
+            onOpenImport={() => {
+              // Vault境界の安全性：切替処理中はSource保存（Import）を新規に開始させない。
+              if (isVaultSwitchingRef.current) return;
+              setImportOpen(true);
+            }}
           />
         </div>
 
@@ -2071,6 +2514,7 @@ export default function ChatScreen() {
             onConnectVault={() => void handleConnectVault()}
             onReauthorizeVault={() => void handleReauthorizeVault()}
             onRestoreFromVault={() => void handleRestoreFromVault()}
+            vaultActionsDisabled={isVaultSwitching}
             exportDataFeedback={exportDataFeedback}
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}
@@ -2081,7 +2525,12 @@ export default function ChatScreen() {
 
       {importOpen && (
         <div className="fixed inset-0 z-40">
-          <ImportPanel vaultHandle={vaultHandle} onClose={() => setImportOpen(false)} />
+          <ImportPanel
+            vaultHandle={vaultHandle}
+            onClose={() => setImportOpen(false)}
+            disabled={isVaultSwitching}
+            trackTask={trackMemoryTask}
+          />
         </div>
       )}
 
