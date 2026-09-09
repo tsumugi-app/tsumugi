@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getAllConversations, getAllMemoryObjects } from "@/lib/db";
+import { StaleVaultTabError, withVaultWorldRead } from "@/lib/vaultWorldLock";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 
 type HistoryTab = "diary" | "memory" | "conversation";
@@ -70,6 +71,9 @@ export default function HistoryPanel({
   const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loading, setLoading] = useState(true);
+  /** Vault境界の安全性（H4対応）：別タブでのVault切替により、このタブが古い保存先の
+   * ままだと判定された場合。trueの間は一覧・詳細のいずれもMemory内容を描画しない。 */
+  const [stale, setStale] = useState(false);
 
   // 日記タブ：既存のview/selectedをそのまま維持（挙動は無変更）。
   const [diaryView, setDiaryView] = useState<SubView>("list");
@@ -85,26 +89,38 @@ export default function HistoryPanel({
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([getAllMemoryObjects(), getAllConversations()]).then(([allMemory, allConversations]) => {
-      if (cancelled) return;
-      // dateの新しい順。createdAt/updatedAtではなくdate（記憶が指す時点）で並べる。
-      const sortedMemory = [...allMemory].sort((a, b) => b.date.localeCompare(a.date));
-      setMemoryObjects(sortedMemory);
-      // startedAtの新しい順。
-      setConversations([...allConversations].sort((a, b) => b.startedAt.localeCompare(a.startedAt)));
-      setLoading(false);
+    // Vault境界の安全性（H4対応）：Memory World読み取りをロック＋epoch確認で包む。
+    // staleなタブでは別Vaultの内容を一切取得・描画しない。
+    withVaultWorldRead(() => Promise.all([getAllMemoryObjects(), getAllConversations()]))
+      .then(([allMemory, allConversations]) => {
+        if (cancelled) return;
+        // dateの新しい順。createdAt/updatedAtではなくdate（記憶が指す時点）で並べる。
+        const sortedMemory = [...allMemory].sort((a, b) => b.date.localeCompare(a.date));
+        setMemoryObjects(sortedMemory);
+        // startedAtの新しい順。
+        setConversations([...allConversations].sort((a, b) => b.startedAt.localeCompare(a.startedAt)));
+        setLoading(false);
 
-      // initialMemoryIdが渡されていれば、Memoryタブの該当詳細を直接開く。
-      // データ読み込み完了直後（sortedMemoryが確定した時点）にだけ行う一度きりの処理。
-      if (initialMemoryId) {
-        const target = sortedMemory.find((memory) => memory.id === initialMemoryId);
-        if (target) {
-          setTab("memory");
-          setMemorySelected(target);
-          setMemoryView("detail");
+        // initialMemoryIdが渡されていれば、Memoryタブの該当詳細を直接開く。
+        // データ読み込み完了直後（sortedMemoryが確定した時点）にだけ行う一度きりの処理。
+        if (initialMemoryId) {
+          const target = sortedMemory.find((memory) => memory.id === initialMemoryId);
+          if (target) {
+            setTab("memory");
+            setMemorySelected(target);
+            setMemoryView("detail");
+          }
         }
-      }
-    });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setLoading(false);
+        if (error instanceof StaleVaultTabError) {
+          setStale(true);
+        } else {
+          console.error("Failed to load history", error);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -152,6 +168,25 @@ export default function HistoryPanel({
     } else {
       diaryGroups.push({ dateLabel, items: [memory] });
     }
+  }
+
+  // Vault境界の安全性（H4対応）：staleと判定された場合、Memory/Conversationの
+  // 一覧・詳細のいずれも一切描画しない（別Vaultの内容を絶対に表示しないため）。
+  if (stale) {
+    return (
+      <div className="flex h-dvh flex-col items-center justify-center gap-4 bg-[var(--background)] px-5 py-8 text-center text-[var(--foreground)]">
+        <p className="text-sm text-stone-700 dark:text-stone-300">
+          別のタブで保存先が変更されました。再読み込みしてください。
+        </p>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded-full border border-stone-300/70 px-4 py-1.5 text-xs text-stone-600 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-300 dark:hover:bg-white/5"
+        >
+          閉じる
+        </button>
+      </div>
+    );
   }
 
   return (

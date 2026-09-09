@@ -23,6 +23,7 @@ import {
   saveLastPromptedMemoryIds,
 } from "./db";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { withVaultWorldRead } from "./vaultWorldLock";
 import type { MemoryObject, Persona } from "./types";
 
 export interface TopPrompt {
@@ -139,7 +140,15 @@ const TOP_PROMPT_SHOW_PROBABILITY = 0.45;
  * 問いかけブロックを一切表示せず、従来のトップ画面のままにする。
  * 45%の確率でのみ生成を試みる（55%は候補選定・AI生成を一切呼ばずに即座にundefinedを返す）。
  */
+/**
+ * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
+ * `generateTopPromptImpl`（ロックを取得しない内部専用版）。
+ */
 export async function generateTopPrompt(): Promise<TopPrompt | undefined> {
+  return withVaultWorldRead(() => generateTopPromptImpl());
+}
+
+async function generateTopPromptImpl(): Promise<TopPrompt | undefined> {
   if (Math.random() > TOP_PROMPT_SHOW_PROBABILITY) return undefined;
   try {
     const selection = await selectCandidateMemory();

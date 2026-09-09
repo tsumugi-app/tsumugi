@@ -323,6 +323,43 @@ export async function loadChatProvider(): Promise<AIProviderName> {
   return value === "openai" || value === "claude" ? value : "gemini";
 }
 
+/**
+ * Vault境界の安全性（H4：複数タブ間でのVault privacy boundary対応）。
+ *
+ * 「現在アクティブなVaultの世代」を表す単調増加のカウンタ。既存の`settings`ストア
+ * （汎用KVストア）へ1キー追加するだけで、DB schemaの変更は行わない。
+ * 別Vaultへの切替が確定した瞬間（`navigator.locks`の排他ロック内、IndexedDBの
+ * clearより前）にのみ`bumpActiveVaultEpoch()`でインクリメントする。
+ *
+ * 各タブは、この値を自分の「タブローカルな信じているepoch」（vaultWorldLock.tsの
+ * `tabVaultEpoch`）と比較することで、「自分のVault世界は今も共有ストレージの
+ * アクティブなVaultと一致しているか」を、Memory Worldへの読み書きの直前に
+ * 都度確認する（`withVaultWorldRead`/`runVaultSwitchExclusive`参照）。
+ *
+ * 未設定（アプリ初回起動、一度もVault操作をしていない状態）は0として扱う。
+ */
+const ACTIVE_VAULT_EPOCH_KEY = "activeVaultEpoch";
+
+export async function getActiveVaultEpoch(): Promise<number> {
+  const db = await getDB();
+  const raw = await db.get("settings", ACTIVE_VAULT_EPOCH_KEY);
+  const parsed = raw === undefined ? 0 : Number(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * 別Vaultへの切替コミット（`navigator.locks`の排他ロック内）からのみ呼ぶこと。
+ * 複数タブから同時に呼ばれないことは、呼び出し元が排他ロックで保証する
+ * （このカウンタ自体はcompare-and-swapを行わない、単純なget→+1→put）。
+ */
+export async function bumpActiveVaultEpoch(): Promise<number> {
+  const db = await getDB();
+  const current = await getActiveVaultEpoch();
+  const next = current + 1;
+  await db.put("settings", String(next), ACTIVE_VAULT_EPOCH_KEY);
+  return next;
+}
+
 /** 「過去からの問いかけ」機能が直近に表示したMemory IDの一覧（新しいものが末尾）。同じMemoryの連続表示を避けるためだけに使う。 */
 const LAST_PROMPTED_MEMORY_IDS_KEY = "lastPromptedMemoryIds";
 const MAX_LAST_PROMPTED_MEMORY_IDS = 5;

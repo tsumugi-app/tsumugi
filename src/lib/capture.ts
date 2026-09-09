@@ -11,6 +11,7 @@ import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObject } fro
 import { logTimingEvent } from "./debugTimingLog";
 import { writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "./retrieval";
+import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "./types";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
@@ -170,7 +171,21 @@ export interface CaptureResult {
  * 意味を一致させる）。既存Memoryの更新（同一Conversation由来・別Conversation由来の
  * どちらも）では、更新対象のMemoryのidをmemoryObjectIdsへ追加しない。
  */
+/**
+ * Vault境界の安全性（H4対応）：Memory World（他Conversation由来の類似Memory探索を含む）を
+ * 読むため、共有ロック＋epoch確認で包んだ公開版。実処理は`captureConversationImpl`
+ * （ロックを取得しない内部専用版）に committed。このImpl版は、既にロックを保持している
+ * 呼び出し元（今のところ無い）から直接呼べるよう分離してある（デッドロック回避の原則、
+ * vaultWorldLock.ts参照）。
+ */
 export async function captureConversation(
+  conversation: Conversation,
+  existingMemoryObjects: MemoryObject[]
+): Promise<CaptureResult> {
+  return withVaultWorldRead(() => captureConversationImpl(conversation, existingMemoryObjects));
+}
+
+async function captureConversationImpl(
   conversation: Conversation,
   existingMemoryObjects: MemoryObject[]
 ): Promise<CaptureResult> {
@@ -301,7 +316,24 @@ export interface PersistConversationResult {
  * 再試行される。IndexedDBへの書き込み自体が失敗した場合のみ、本当に失敗として扱い
  * conversationFailedをtrueで返す。
  */
+/**
+ * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
+ * `persistConversationImpl`（ロックを取得しない内部専用版）。`persistCapture`は
+ * 自身の公開版がロックを保持したまま、この公開版を呼ぶとネストしてしまうため
+ * （デッドロックの危険。vaultWorldLock.ts参照）、`persistCaptureImpl`からは
+ * 必ず`persistConversationImpl`を直接呼ぶこと（公開版`persistConversation`を
+ * 呼ばない）。
+ */
 export async function persistConversation(
+  vaultHandle: FileSystemDirectoryHandle | null,
+  conversation: Conversation,
+  priority: VaultWritePriority = "interactive",
+  awaitVaultSync: boolean = true
+): Promise<PersistConversationResult> {
+  return withVaultWorldRead(() => persistConversationImpl(vaultHandle, conversation, priority, awaitVaultSync));
+}
+
+async function persistConversationImpl(
   vaultHandle: FileSystemDirectoryHandle | null,
   conversation: Conversation,
   priority: VaultWritePriority = "interactive",
@@ -364,6 +396,10 @@ export async function persistConversation(
  * 呼び出し元の挙動を変えないため）。Vault書き込みの失敗は内部でtry/catch済みのため、
  * fire-and-forgetにしても未処理Promise rejectionは発生しない。
  */
+/**
+ * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
+ * `persistCaptureImpl`（ロックを取得しない内部専用版）。
+ */
 export async function persistCapture(
   vaultHandle: FileSystemDirectoryHandle | null,
   conversation: Conversation,
@@ -371,7 +407,21 @@ export async function persistCapture(
   priority: VaultWritePriority = "interactive",
   awaitVaultSync: boolean = true
 ): Promise<PersistCaptureResult> {
-  const { conversationFailed } = await persistConversation(vaultHandle, conversation, priority, awaitVaultSync);
+  return withVaultWorldRead(() =>
+    persistCaptureImpl(vaultHandle, conversation, memoryObjects, priority, awaitVaultSync)
+  );
+}
+
+async function persistCaptureImpl(
+  vaultHandle: FileSystemDirectoryHandle | null,
+  conversation: Conversation,
+  memoryObjects: MemoryObject[],
+  priority: VaultWritePriority = "interactive",
+  awaitVaultSync: boolean = true
+): Promise<PersistCaptureResult> {
+  // ネスト回避のため、公開版persistConversation（ロック付き）ではなく
+  // persistConversationImpl（ロック無し）を直接呼ぶ（vaultWorldLock.ts参照）。
+  const { conversationFailed } = await persistConversationImpl(vaultHandle, conversation, priority, awaitVaultSync);
 
   const failedMemoryIds: string[] = [];
   for (const memoryObject of memoryObjects) {

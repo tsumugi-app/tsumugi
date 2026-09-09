@@ -13,6 +13,7 @@
 import { ulid } from "ulid";
 import { saveSource } from "./db";
 import { writeSourceMarkdown } from "./vault";
+import { withVaultWorldRead } from "./vaultWorldLock";
 import type { Source, SourceDraft } from "./types";
 
 function nowISO(): string {
@@ -45,7 +46,18 @@ export interface PersistSourceResult {
  * 次回flushPendingToVaultで自然に書き戻される＝失われてはいないため、ここでは呼び出し元へ
  * 伝えない。IndexedDB書き込み失敗だけをindexedDbFailedとして呼び出し元へ返す。
  */
+/**
+ * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
+ * `persistSourceImpl`（ロックを取得しない内部専用版）。
+ */
 export async function persistSource(
+  vaultHandle: FileSystemDirectoryHandle | null,
+  source: Source
+): Promise<PersistSourceResult> {
+  return withVaultWorldRead(() => persistSourceImpl(vaultHandle, source));
+}
+
+async function persistSourceImpl(
   vaultHandle: FileSystemDirectoryHandle | null,
   source: Source
 ): Promise<PersistSourceResult> {

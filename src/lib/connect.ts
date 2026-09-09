@@ -16,7 +16,8 @@
 import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putMemoryObject } from "./db";
 import { writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
-import { retrieveRelevantMemories } from "./retrieval";
+import { retrieveRelevantMemoriesImpl } from "./retrieval";
+import { withVaultWorldRead } from "./vaultWorldLock";
 import { markMemoryConnected, releaseMemoryConnectClaim, tryClaimMemoryForConnect } from "./connectState";
 import type { Link, LinkAxis, MemoryObject } from "./types";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
@@ -73,7 +74,19 @@ async function judgeCandidates(
  * 成功した1回だけになる（connectStateへの完了記録は処理の最後にしか起きないため、
  * それだけでは開始時点の競合を防げない）。
  */
+/**
+ * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
+ * `connectMemoryImpl`（ロックを取得しない内部専用版）。
+ */
 export async function connectMemory(
+  vaultHandle: FileSystemDirectoryHandle | null,
+  newMemory: MemoryObject,
+  priority: VaultWritePriority = "interactive"
+): Promise<void> {
+  return withVaultWorldRead(() => connectMemoryImpl(vaultHandle, newMemory, priority));
+}
+
+async function connectMemoryImpl(
   vaultHandle: FileSystemDirectoryHandle | null,
   newMemory: MemoryObject,
   priority: VaultWritePriority = "interactive"
@@ -88,7 +101,9 @@ export async function connectMemory(
       return;
     }
 
-    const candidates = await retrieveRelevantMemories(queryText, {
+    // ネスト回避のため、公開版retrieveRelevantMemories（ロック付き）ではなく
+    // retrieveRelevantMemoriesImpl（ロック無し）を直接呼ぶ（vaultWorldLock.ts参照）。
+    const candidates = await retrieveRelevantMemoriesImpl(queryText, {
       excludeConversationId: newMemory.conversationId,
       limit: CANDIDATE_LIMIT,
     });

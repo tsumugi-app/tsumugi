@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getAllMemoryObjects } from "@/lib/db";
+import { StaleVaultTabError, withVaultWorldRead } from "@/lib/vaultWorldLock";
 import { computeTreeSignals, computeTreeStage, TREE_STAGE_IMAGE_PATH, TREE_STAGE_MESSAGE, type TreeStage } from "@/lib/tree";
 
 /**
@@ -27,15 +28,29 @@ export default function TreePanel({ onClose }: { onClose: () => void }) {
   const [loading, setLoading] = useState(true);
   const [stage, setStage] = useState<TreeStage>(0);
   const [imageFailed, setImageFailed] = useState(false);
+  /** Vault境界の安全性（H4対応）：別タブでのVault切替により、このタブが古い保存先の
+   * ままだと判定された場合。trueの間は木の段階を一切描画しない。 */
+  const [stale, setStale] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    getAllMemoryObjects().then((memoryObjects) => {
-      if (cancelled) return;
-      const signals = computeTreeSignals(memoryObjects);
-      setStage(computeTreeStage(signals));
-      setLoading(false);
-    });
+    // Vault境界の安全性（H4対応）：Memory World読み取りをロック＋epoch確認で包む。
+    withVaultWorldRead(() => getAllMemoryObjects())
+      .then((memoryObjects) => {
+        if (cancelled) return;
+        const signals = computeTreeSignals(memoryObjects);
+        setStage(computeTreeStage(signals));
+        setLoading(false);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setLoading(false);
+        if (error instanceof StaleVaultTabError) {
+          setStale(true);
+        } else {
+          console.error("Failed to load memory objects for tree", error);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -57,7 +72,11 @@ export default function TreePanel({ onClose }: { onClose: () => void }) {
           </button>
         </div>
 
-        {loading ? (
+        {stale ? (
+          <p className="text-center text-sm text-stone-700 dark:text-stone-300">
+            別のタブで保存先が変更されました。再読み込みしてください。
+          </p>
+        ) : loading ? (
           <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>
         ) : (
           <>

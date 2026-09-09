@@ -26,6 +26,7 @@
 "use client";
 
 import { getAllMemoryObjects, getMemoryObject } from "./db";
+import { withVaultWorldRead } from "./vaultWorldLock";
 import type { MemoryObject, Persona, RetrievedMemory } from "./types";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
@@ -591,28 +592,43 @@ async function ensureOriginMemoryIncluded(
   return [...results, { ...toRetrievedMemory(originMemory), isOriginMemory: true }];
 }
 
+export interface RetrieveRelevantMemoriesOptions {
+  excludeConversationId?: string;
+  limit?: number;
+  maxLinkedAdditions?: number;
+  persona?: Persona;
+  promptedMemoryId?: string;
+  /**
+   * analyst専用。「あえて遠いMemory」（creative divergent）を追加するかどうか。
+   * 既定はfalse相当（未指定）＝追加しない。companion/coachには影響しない
+   * （retrieveCreativeMemories自体がanalystのときにしか呼ばれないため）。
+   */
+  includeDivergent?: boolean;
+  /**
+   * Conversation Retrieval用（analyst専用）。直近の同一Conversation内user turns本文
+   * （最新発言含む）。deriveConversationTopicAnchorsでtopic anchor抽出にのみ使い、
+   * turns全文を検索クエリへ連結することはしない。companion/coachのブランチは
+   * このフィールドを読まないため、渡しても渡さなくても挙動に影響しない。
+   */
+  recentUserTurnsTexts?: string[];
+}
+
+/**
+ * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
+ * `retrieveRelevantMemoriesImpl`（ロックを取得しない内部専用版）。connect.tsの
+ * connectMemory()は、自身が既にロックを保持している間はこの公開版ではなく
+ * `retrieveRelevantMemoriesImpl`を直接呼ぶこと（ネスト回避。vaultWorldLock.ts参照）。
+ */
 export async function retrieveRelevantMemories(
   queryText: string,
-  options: {
-    excludeConversationId?: string;
-    limit?: number;
-    maxLinkedAdditions?: number;
-    persona?: Persona;
-    promptedMemoryId?: string;
-    /**
-     * analyst専用。「あえて遠いMemory」（creative divergent）を追加するかどうか。
-     * 既定はfalse相当（未指定）＝追加しない。companion/coachには影響しない
-     * （retrieveCreativeMemories自体がanalystのときにしか呼ばれないため）。
-     */
-    includeDivergent?: boolean;
-    /**
-     * Conversation Retrieval用（analyst専用）。直近の同一Conversation内user turns本文
-     * （最新発言含む）。deriveConversationTopicAnchorsでtopic anchor抽出にのみ使い、
-     * turns全文を検索クエリへ連結することはしない。companion/coachのブランチは
-     * このフィールドを読まないため、渡しても渡さなくても挙動に影響しない。
-     */
-    recentUserTurnsTexts?: string[];
-  } = {}
+  options: RetrieveRelevantMemoriesOptions = {}
+): Promise<RetrievedMemory[]> {
+  return withVaultWorldRead(() => retrieveRelevantMemoriesImpl(queryText, options));
+}
+
+export async function retrieveRelevantMemoriesImpl(
+  queryText: string,
+  options: RetrieveRelevantMemoriesOptions = {}
 ): Promise<RetrievedMemory[]> {
   const trimmed = queryText.trim();
   if (!trimmed) return [];
