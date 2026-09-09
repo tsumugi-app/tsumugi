@@ -230,6 +230,38 @@ export default function SettingsPanel({
             </div>
           )}
 
+          {/*
+            Codexレビュー指摘（journal lifecycle）対応：直前のVault切替が完了しないまま
+            終了した形跡がある状態。通常の"not-connected"（一度も接続したことが無い）とは
+            文言を分け、以前のフォルダが単に「消えた」のではなく再接続が必要であることを
+            伝える。ボタン自体はonConnectVaultをそのまま使う（ChatScreen.tsx側で
+            vaultStatus==="incomplete-switch"を見て専用recoveryへ自動的に振り分ける）。
+          */}
+          {vaultStatus === "incomplete-switch" && (
+            <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <span>保存先の切替が完了していません。保存先を選び直してください。</span>
+              <button
+                onClick={onConnectVault}
+                disabled={vaultActionsDisabled}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+              >
+                保存先を選び直す
+              </button>
+            </div>
+          )}
+
+          {/*
+            Codexレビュー指摘（unexpected version recovery方針）対応：journal
+            versionが想定と異なる状態。"incomplete-switch"とは別扱い——専用recovery
+            （onConnectVault経由）はversion自体を書き換えないため、ボタンを出しても
+            復旧できない。再読み込みを促すだけの読み取り専用表示にする（ボタン無し）。
+          */}
+          {vaultStatus === "unsupported-journal-version" && (
+            <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              保存データのバージョンを確認できません。ページを再読み込みしてください。
+            </div>
+          )}
+
           {restoreCandidate && (
             <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               <span>このVaultには以前の記憶が見つかりました（{restoreCandidate.newCount}件）。復元しますか？</span>

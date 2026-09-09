@@ -31,7 +31,14 @@
  */
 "use client";
 
-import { bumpActiveVaultEpoch, getActiveVaultEpoch } from "./db";
+import {
+  bumpActiveVaultEpoch,
+  getActiveVaultEpoch,
+  getCommittedVaultEpoch,
+  getVaultWorldJournalVersion,
+  markVaultEpochCommitted,
+  markVaultWorldJournalMigrated,
+} from "./db";
 
 const LOCK_NAME = "tsumugi-vault-world";
 /** 排他ロック（Vault切替）取得の安全なタイムアウト。他タブがsleep中などで応答が
@@ -43,6 +50,23 @@ export class StaleVaultTabError extends Error {
   constructor(message = "このタブの保存先は、別のタブでの変更により古くなっています。") {
     super(message);
     this.name = "StaleVaultTabError";
+  }
+}
+
+/**
+ * Codexレビュー指摘（journal lifecycle）対応：`activeVaultEpoch`と
+ * `committedVaultEpoch`が一致しない（＝直前のVault切替が完了しないまま終了した
+ * 形跡がある）場合に、Memory World操作を拒否するためのエラー。`StaleVaultTabError`
+ * （＝別タブが切り替えた"だけ"で、このタブがそれを知らない状態）とは意味が異なる
+ * ため区別する——こちらは「どのタブから見ても、今のworldの状態自体が不確定」を表す。
+ * ChatScreen.tsx側は`vaultStatus`を"incomplete-switch"へ設定し、専用の再接続
+ * recoveryフローへ誘導する（通常のcrossTabStale「再読み込みしてください」バナーとは
+ * 別扱いにする——再読み込みだけでは直らないため）。
+ */
+export class IncompleteVaultWorldError extends Error {
+  constructor(message = "保存先の切替が完了していません。保存先を選び直してください。") {
+    super(message);
+    this.name = "IncompleteVaultWorldError";
   }
 }
 
@@ -88,9 +112,20 @@ async function withRawLock<T>(
  * 通常のMemory World READ/WRITE操作用。共有ロックを取得し、その中で
  * activeVaultEpoch（共有IndexedDB）を読み直し、自タブが信じているepochと
  * 一致するかを確認してからfnを実行する。
- * - epochが読めない（IndexedDBエラー等） → fail-safeとして拒否（StaleVaultTabError）。
+ * - epoch/journalが読めない（IndexedDBエラー等） → fail-safeとして拒否（StaleVaultTabError）。
  * - tabVaultEpochが未確定（起動時のスナップショットがまだ済んでいない） → 拒否。
- * - 不一致 → 拒否。
+ * - tabVaultEpoch !== activeVaultEpoch（別タブが切り替えた等） → 拒否（StaleVaultTabError）。
+ * - activeVaultEpoch !== committedVaultEpoch（journal未確定/不整合＝直前のswitchが
+ *   完了しないまま終了した形跡） → 拒否（IncompleteVaultWorldError）。
+ * - vaultWorldJournalVersionがcurrent以外（missing/unexpected） → 拒否
+ *   （IncompleteVaultWorldError）。Codexレビュー指摘（Medium：unexpected version
+ *   core guard）対応：以前はcommitted===activeさえ成立すれば、version自体が
+ *   unexpectedでも（tab===active===committedの3つが偶然揃えば）通ってしまう
+ *   隙間があった。正常操作条件を「tabEpoch===activeEpoch AND
+ *   committed.status===valid AND committedEpoch===activeEpoch AND
+ *   journalVersion.status===current」の4条件全てへ拡張する。
+ *   Codexレビュー指摘（journal lifecycle、High）対応：UIガード（vaultStatus等）だけに
+ *   依存せず、Memory World操作の共通入口自体でこれを確認する。
  * fnを呼ぶのはこれら全てを通過した場合のみ。
  *
  * 呼び出し元がこの関数の"内部"から、同じ名前のロックを再要求しないこと
@@ -99,14 +134,27 @@ async function withRawLock<T>(
 export async function withVaultWorldRead<T>(fn: () => Promise<T>): Promise<T> {
   return withRawLock("shared", async () => {
     let sharedEpoch: number;
+    let committedStatus: Awaited<ReturnType<typeof getCommittedVaultEpoch>>;
+    let versionStatus: Awaited<ReturnType<typeof getVaultWorldJournalVersion>>;
     try {
       sharedEpoch = await getActiveVaultEpoch();
+      committedStatus = await getCommittedVaultEpoch();
+      versionStatus = await getVaultWorldJournalVersion();
     } catch (error) {
-      console.error("[Tsumugi] failed to read activeVaultEpoch, refusing Memory World operation:", error);
+      console.error(
+        "[Tsumugi] failed to read activeVaultEpoch/committedVaultEpoch/vaultWorldJournalVersion, refusing Memory World operation:",
+        error
+      );
       throw new StaleVaultTabError("保存先の状態を確認できなかったため、操作を中止しました。");
     }
     if (tabVaultEpoch === null || sharedEpoch !== tabVaultEpoch) {
       throw new StaleVaultTabError();
+    }
+    if (versionStatus.status !== "current") {
+      throw new IncompleteVaultWorldError();
+    }
+    if (committedStatus.status !== "valid" || committedStatus.epoch !== sharedEpoch) {
+      throw new IncompleteVaultWorldError();
     }
     return fn();
   });
@@ -129,37 +177,147 @@ export interface VaultSwitchExclusiveResult<T> {
 }
 
 /**
- * 別Vaultへの切替コミット専用：排他ロックを取得し、タイムアウト付きでfnを実行する。
- * タイムアウトした場合は必ず`{timedOut: true}`を返す（「安全確認なしで先へ進める」ことは
- * 絶対にしない。呼び出し元は切替を中止し、旧Vaultを維持したままロックを解放すること）。
+ * Codexレビュー指摘High（再発）対応：`ctx.timedOutAlready()`を毎回読み直すだけの
+ * 方式は、「読んだ直後（まだfalse）〜実際にcommitを終えるまで」の間にタイマーが
+ * 割り込むTOCTOUを残していた（UIは`{timedOut:true}`を返したのに、その後の
+ * awaitの最中に裏でcommitが完了してしまう）。ここでは明示的な状態機械にする：
+ *
+ *   preparing → committing → finished
+ *            \→ timed-out
+ *
+ * - "preparing"→"timed-out"、"preparing"→"committing"の遷移は、どちらも
+ *   「今のphaseがpreparingか」を確認してからphaseを書き換える、という
+ *   *同期的な*1手順（間にawaitを挟まない）でしか行わない。JSはシングルスレッドで
+ *   awaitを挟まない処理の途中に他のコードが割り込むことはないため、この2つの
+ *   遷移は構造的に排他になる（後から読み直す形のTOCTOUチェックを再導入しない）。
+ * - 一度"committing"に入ったら、その後にタイマーが発火しても何もしない
+ *   （UIへtimeoutを返さない。fnが実際に完了するのを待ち、その結果をそのまま
+ *   UIへ返す＝UI-facingな結果と内部commit結果が食い違わない）。
+ * - 一度"timed-out"になったら、その後fnが（まだcommitを始めていなければ）
+ *   何をしても結果はUIへ伝わらない。
+ */
+type VaultSwitchPhase = "preparing" | "committing" | "timed-out" | "finished";
+
+/**
+ * fnへ渡すコンテキスト。`beginCommit()`は、activeVaultEpochの更新・IndexedDBの
+ * clear・新Vault handleの保存など「取り消せない副作用」を開始する直前に、
+ * fnが必ず一度だけ呼ぶこと。
+ * - 戻り値がtrueの場合のみ、実際にcommitを行ってよい（以後、このrunVaultSwitchExclusive
+ *   呼び出しがUIへ`{timedOut:true}`を返すことは無い。fnが返す結果がそのままUIへ返る）。
+ * - falseの場合（＝呼び出し時点で既にtimed-outへ遷移済み）は、それらの副作用を
+ *   一切行わずに中止すること（呼び出し元は既にこの切替を諦めているため、今さら
+ *   バックグラウンドで成立させると、画面表示とストレージの実状態が食い違ってしまう）。
+ * この呼び出し自体がphaseの遷移を同期的に確定させるため、呼び出し元は
+ * 「呼ぶ→（awaitを挟まず）戻り値で分岐する」という順序を守ること。
+ */
+export interface VaultSwitchExclusiveContext {
+  beginCommit: () => boolean;
+}
+
+/**
+ * 別Vaultへの切替コミット専用：排他ロックを取得し、fnを実行する。
+ *
+ * 「呼び出し元（UI）へいつ結果を返すか」と「実際に排他ロックを保持しfnを実行し続ける
+ * 期間」を分離する。timeoutMsが経過してもfnが"committing"へ入っていなければ、
+ * 呼び出し元へ直ちに`{timedOut: true}`を返す——ただしfn自体の実行・排他ロックの
+ * 保持は中断しない。fnが実際に完了する（成功・失敗いずれか）まで、引き続き
+ * 排他ロックを保持し続ける（他タブの共有/排他ロック取得は、fnが実際に終わるまで
+ * 正しく待たされ続ける）。逆に、fnが既に`ctx.beginCommit()`で"committing"へ入って
+ * いた場合は、以後タイマーが発火してもUIへtimeoutを返さない——fnの実際の結果を
+ * 待って、それをそのままUIへ返す。
+ *
+ * ロック取得待ちの間に（まだfn自体が一度も呼ばれる前に）timeoutが先に成立していた
+ * 場合、後からロックが取得できても、fn自体を一切呼び出さない（old-world flush・
+ * queue drain・epoch read等を不要に開始しない）。
+ *
+ * `timeoutMs`省略時は`EXCLUSIVE_LOCK_TIMEOUT_MS`（他タブがsleep中などでロック取得
+ * 自体が進まない場合の既定フェイルセーフ）。呼び出し元が既により短い/長い締切
+ * （例：既存の収束待ちフェーズの残り時間）を持っている場合はそれを渡せる。
+ *
  * `navigator.locks`が使えない環境では、タブ間の排他を保証できないため、実行せず
  * timedOut扱いにする（安全側）。
  */
-export async function runVaultSwitchExclusive<T>(fn: () => Promise<T>): Promise<VaultSwitchExclusiveResult<T>> {
+export function runVaultSwitchExclusive<T>(
+  fn: (ctx: VaultSwitchExclusiveContext) => Promise<T>,
+  timeoutMs: number = EXCLUSIVE_LOCK_TIMEOUT_MS
+): Promise<VaultSwitchExclusiveResult<T>> {
   if (!locksSupported()) {
     console.error("[Tsumugi] navigator.locks is unavailable; refusing cross-tab vault switch for safety.");
-    return { timedOut: true };
+    return Promise.resolve({ timedOut: true });
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), EXCLUSIVE_LOCK_TIMEOUT_MS);
-  try {
-    const result = await navigator.locks.request(
-      LOCK_NAME,
-      { mode: "exclusive", signal: controller.signal },
-      fn
-    );
-    return { timedOut: false, result };
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      return { timedOut: true };
+
+  let phase: VaultSwitchPhase = "preparing";
+  let settleOuter: ((value: VaultSwitchExclusiveResult<T>) => void) | null = null;
+  let failOuter: ((error: unknown) => void) | null = null;
+  const outer = new Promise<VaultSwitchExclusiveResult<T>>((resolve, reject) => {
+    settleOuter = resolve;
+    failOuter = reject;
+  });
+
+  const ctx: VaultSwitchExclusiveContext = {
+    beginCommit: () => {
+      // 同期的な1手順（間にawaitを挟まない）：この判定と書き換えの間に他の
+      // コードが割り込むことは無い（JSはシングルスレッド）。
+      if (phase !== "preparing") return false;
+      phase = "committing";
+      return true;
+    },
+  };
+
+  const timer = setTimeout(() => {
+    // 同様に同期的な1手順。既に"committing"（またはそれ以降）へ遷移済みなら、
+    // ここでは何もしない（＝UIへtimeoutを返さない。fnの実際の完了を待つ）。
+    if (phase === "preparing") {
+      phase = "timed-out";
+      settleOuter!({ timedOut: true });
     }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+  }, timeoutMs);
+
+  void navigator.locks
+    .request(LOCK_NAME, { mode: "exclusive" }, async () => {
+      // ロック取得待ちの間に既にtimed-outへ遷移していた場合、fn自体を一切呼ばない
+      // （old-world flush・queue drain・epoch read/bump・clear・handle保存等の
+      // 一切を不要に開始しない）。
+      if (phase === "timed-out") return undefined;
+      return fn(ctx);
+    })
+    .then((result) => {
+      clearTimeout(timer);
+      if (phase === "timed-out") {
+        // 既にUIへtimeoutを返し終えている（fnはbeginCommit()を呼ばずに、または
+        // 呼ぶ前にここへ来た＝committingへは入っていない）。UIへは何も伝えない。
+        return;
+      }
+      phase = "finished";
+      settleOuter!({ timedOut: false, result: result as T });
+    })
+    .catch((error) => {
+      clearTimeout(timer);
+      if (phase === "timed-out") {
+        // 呼び出し元へは既にtimeout結果を返し終えている。ここで投げ直しても
+        // 誰にも拾われずunhandled rejectionになるだけなので、ログにだけ残す。
+        console.error(
+          "[Tsumugi] vault switch exclusive task failed after timeout was already reported to caller:",
+          error
+        );
+        return;
+      }
+      phase = "finished";
+      failOuter!(error);
+    });
+
+  return outer;
 }
 
-export { getActiveVaultEpoch, bumpActiveVaultEpoch };
+export {
+  getActiveVaultEpoch,
+  bumpActiveVaultEpoch,
+  getCommittedVaultEpoch,
+  markVaultEpochCommitted,
+  getVaultWorldJournalVersion,
+  markVaultWorldJournalMigrated,
+};
+export type { CommittedVaultEpochStatus, VaultEpochStatus, VaultWorldJournalVersionStatus } from "./db";
 
 // ---------------------------------------------------------------------------
 // BroadcastChannel：UXの即時通知専用（安全性の根拠には使わない）。

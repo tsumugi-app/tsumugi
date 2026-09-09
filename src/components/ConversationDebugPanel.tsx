@@ -28,10 +28,19 @@ export default function ConversationDebugPanel() {
 
   useEffect(() => {
     if (!enabled) return;
-    const refresh = () => setEntries([...getConversationDebugLog()].reverse());
+    let cancelled = false;
+    // H4 Codexレビュー指摘High-2対応：getConversationDebugLog()がepoch確認のため非同期化。
+    const refresh = () => {
+      void getConversationDebugLog().then((result) => {
+        if (!cancelled) setEntries([...result].reverse());
+      });
+    };
     refresh();
     const id = window.setInterval(refresh, 1000);
-    return () => window.clearInterval(id);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, [enabled]);
 
   if (!enabled) return null;

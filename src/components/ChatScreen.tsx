@@ -16,6 +16,7 @@ import {
   restoreVaultHandle,
   scanVaultForRestore,
   waitForVaultWrites,
+  type VaultRestoreResult,
   type VaultScanResult,
   type VaultWritePriority,
 } from "@/lib/vault";
@@ -47,10 +48,15 @@ import { createInsightMemoryObject, generateSessionReflection } from "@/lib/refl
 import { connectMemory } from "@/lib/connect";
 import { filterUnconnected } from "@/lib/connectState";
 import {
+  IncompleteVaultWorldError,
   StaleVaultTabError,
   bumpActiveVaultEpoch,
   getActiveVaultEpoch,
+  getCommittedVaultEpoch,
   getTabVaultEpoch,
+  getVaultWorldJournalVersion,
+  markVaultEpochCommitted,
+  markVaultWorldJournalMigrated,
   notifyVaultSwitched,
   runVaultSwitchExclusive,
   setTabVaultEpoch,
@@ -88,7 +94,34 @@ import {
 /** ApiKeySetupと同じく、chatで選べるproviderは今回この2つに限定する（Claudeは型のみ）。 */
 export type SupportedChatProvider = "gemini" | "openai";
 
-export type VaultStatus = "checking" | "connected" | "not-connected" | "unsupported" | "needs-permission";
+/**
+ * "incomplete-switch"：Codexレビュー指摘（journal lifecycle）対応。journal
+ * version===currentであることは確認できているが、activeVaultEpochと
+ * committedVaultEpochが一致しない（＝直前のVault切替が完了しないまま終了した形跡が
+ * ある）状態。通常の"not-connected"（一度もVaultへ接続したことが無い、または
+ * ユーザーが未接続を選んでいる）とは意味が異なるため区別する——保存済みhandle自体は
+ * 信用できない可能性があるが、それを「単に未接続」として見せると、なぜ以前接続していた
+ * はずのVaultが消えたのか伝わらない。専用の再接続recoveryフロー
+ * （handleConnectVaultのincomplete分岐）でのみ復旧できる。
+ *
+ * "unsupported-journal-version"：Codexレビュー指摘（unexpected version recovery方針）
+ * 対応。vaultWorldJournalVersionが想定する値（current）と一致しない
+ * （missing状態でcommittedとactiveが不一致/invalidの場合を含む）状態。
+ * "incomplete-switch"とは意図的に区別する——通常のincomplete-switch recoveryは
+ * 「今のjournal方式のまま、committed/handleだけを再確定する」処理であり、version
+ * 自体を黙ってcurrentへ上書きする権限は持たせない（将来のversion番号の可能性がある
+ * ため。今のコードが理解できないデータを誤って現行version扱いにしないようにする）。
+ * 通常の保存先再選択・専用recoveryのいずれからも復旧できない、真に読み取り専用の
+ * fail-closed状態（再読み込みを促すメッセージのみ表示する）。
+ */
+export type VaultStatus =
+  | "checking"
+  | "connected"
+  | "not-connected"
+  | "unsupported"
+  | "needs-permission"
+  | "incomplete-switch"
+  | "unsupported-journal-version";
 /** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
 export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
@@ -190,6 +223,89 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
   event: "出来事",
   insight: "気づき",
 };
+
+/**
+ * Codexレビュー指摘（journal lifecycle：legacy/partial migrationの厳密な区別）対応。
+ * 起動時、保存済みのVault worldをどう扱うべきかを、副作用を一切持たない純粋な
+ * 判定として分離する（読みやすさのため。実際の副作用＝restoreVaultHandle呼び出しや
+ * React state更新は、起動effect側でこの判定結果に基づいて行う）。
+ *
+ * 区別する状態（vaultWorldJournalVersion, committedVaultEpoch, activeVaultEpochの
+ * 組み合わせ）：
+ * - "legacy-migrate"：version missing AND committed missing。
+ *   9c07299以前から使っている既存Betaユーザーの初回起動を含む、journal方式自体が
+ *   まだ一度も有効化されていない状態。現在のactiveVaultEpochをbaselineとして
+ *   両方のjournalキーを新規に書く。
+ * - "complete-version-marker"：version missing AND committed valid AND
+ *   committed===active。committedVaultEpoch保存は成功したがversion marker保存が
+ *   失敗した、という途中状態である可能性が高い（migration自体は途中で中断した後
+ *   一度もversion markerを書けていない）。committedは既に正しい値のため上書きせず、
+ *   version markerだけを補完する。
+ * - "fail-closed"：version===current AND committedがinvalid/missing/active不一致。
+ *   直前のswitchが完了しないまま終了した形跡があるため、保存済みhandleを一切
+ *   信用しない（専用recovery＝handleConnectVaultのincomplete分岐で復旧できる）。
+ * - "unsupported-version"：version missingでcommittedがactiveと不一致/invalid
+ *   （legacy扱い禁止・committed上書き禁止）、またはversionが存在するのに
+ *   current以外（invalid/unexpected値＝壊れた値、または今のコードが対応していない
+ *   将来のversion番号）。Codexレビュー指摘（unexpected version recovery方針）対応：
+ *   "fail-closed"（incomplete-switch）とは意図的に区別する——通常のincomplete-switch
+ *   recoveryは「今のjournal方式のまま、committed/handleだけを再確定する」処理であり、
+ *   version自体が想定外の場合にversionを黙ってcurrentへ上書きしてよい保証は無い
+ *   （将来のversion番号のデータを、今のコードの理解のまま上書きすると危険なため）。
+ *   このkindはrecoverFromIncompleteSwitchへは絶対に渡さない。
+ * - "normal"：version===current AND committed valid AND committed===active。
+ *   通常の起動（既存のrestoreVaultHandle経路をそのまま使う）。
+ */
+type VaultWorldStartupDecision =
+  | { kind: "legacy-migrate"; epoch: number }
+  | { kind: "complete-version-marker"; epoch: number }
+  | { kind: "fail-closed"; epoch: number; reason: string }
+  | { kind: "unsupported-version"; epoch: number; reason: string }
+  | { kind: "normal"; epoch: number };
+
+async function resolveVaultWorldStartupDecision(): Promise<VaultWorldStartupDecision> {
+  // getActiveVaultEpoch()は、保存値が存在するのに壊れている場合は例外を投げる
+  // （db.ts参照）。呼び出し元（起動effect）が必ずcatchし、fail-closedへ倒すこと。
+  const epoch = await getActiveVaultEpoch();
+  const versionStatus = await getVaultWorldJournalVersion();
+  const committedStatus = await getCommittedVaultEpoch();
+
+  const committedDescription =
+    committedStatus.status === "valid" ? String(committedStatus.epoch) : committedStatus.status;
+
+  if (versionStatus.status === "missing") {
+    if (committedStatus.status === "missing") {
+      return { kind: "legacy-migrate", epoch };
+    }
+    if (committedStatus.status === "valid" && committedStatus.epoch === epoch) {
+      return { kind: "complete-version-marker", epoch };
+    }
+    return {
+      kind: "unsupported-version",
+      epoch,
+      reason: `partial journal migration cannot be trusted (journal version missing, committedVaultEpoch=${committedDescription}, activeVaultEpoch=${epoch})`,
+    };
+  }
+
+  if (versionStatus.status === "unexpected") {
+    return {
+      kind: "unsupported-version",
+      epoch,
+      reason: `unsupported vault world journal version (raw=${versionStatus.raw})`,
+    };
+  }
+
+  // versionStatus.status === "current" がここで確定。
+  if (committedStatus.status !== "valid" || committedStatus.epoch !== epoch) {
+    return {
+      kind: "fail-closed",
+      epoch,
+      reason: `incomplete vault switch (activeVaultEpoch=${epoch}, committedVaultEpoch=${committedDescription}, journalVersion=current)`,
+    };
+  }
+
+  return { kind: "normal", epoch };
+}
 
 export default function ChatScreen() {
   /**
@@ -479,15 +595,29 @@ export default function ChatScreen() {
   }
 
   /**
-   * Vault境界の安全性（H4対応）：withVaultWorldRead等がスローするStaleVaultTabErrorを
-   * 捕捉した場合の共通処理。crossTabStaleバナーを表示し、trueを返す（呼び出し元は
-   * これを見て、既存のエラー表示処理を上書きせずそのままreturnすること）。
-   * StaleVaultTabError以外のエラーにはfalseを返す（既存のcatch処理へそのまま委ねる）。
+   * Vault境界の安全性（H4対応）：withVaultWorldRead等がスローする
+   * StaleVaultTabError／IncompleteVaultWorldErrorを捕捉した場合の共通処理。
+   * 呼び出し元のほぼ全て（既存の多数のcatch節）がこの1関数を経由するため、
+   * ここで両方のエラー型を区別して適切なUI状態へ倒す（個々の呼び出し元を
+   * 書き換える必要が無い）。
+   * - StaleVaultTabError：別タブが切り替えた"だけ"（このworld自体は正常）。
+   *   crossTabStaleバナーを表示する（再読み込みで直る）。
+   * - IncompleteVaultWorldError：journal不整合（このworld自体が不確定）。
+   *   vaultStatusを"incomplete-switch"へ設定する（再読み込みでは直らない。
+   *   専用recoveryが必要）。
+   * どちらかを処理した場合はtrueを返す（呼び出し元は、既存のエラー表示処理を
+   * 上書きせずそのままreturnすること）。どちらでもない場合はfalseを返す
+   * （既存のcatch処理へそのまま委ねる）。
    */
   function handleStaleVaultTabError(error: unknown): boolean {
     if (error instanceof StaleVaultTabError) {
       console.error("[Tsumugi] Memory World operation refused: this tab is stale relative to the active vault.", error);
       setCrossTabStale(true);
+      return true;
+    }
+    if (error instanceof IncompleteVaultWorldError) {
+      console.error("[Tsumugi] Memory World operation refused: the vault switch journal is incomplete.", error);
+      setVaultStatus("incomplete-switch");
       return true;
     }
     return false;
@@ -658,13 +788,18 @@ export default function ChatScreen() {
         target,
         []
       );
-      const { conversationFailed, failedMemoryIds } = await persistCapture(
+      const { conversationFailed, failedMemoryIds, backgroundSyncPromise } = await persistCapture(
         vaultHandle,
         capturedDelta,
         touchedMemoryObjects,
         priority,
         awaitVaultSync
       );
+      // H4 Codexレビュー指摘High-2対応：awaitVaultSync=falseのとき、まだ完了していない
+      // 背景Vault write（別の共有ロックで自ら保護される）をpendingMemoryTasksRefへ追跡する。
+      // 既にトラック中の親task（このrunConversationBoundary自体）の内部から、実行中の
+      // 間に登録する子taskであるため、drainPendingMemoryTasksのwhileループが確実に拾う。
+      if (backgroundSyncPromise) trackMemoryTask(backgroundSyncPromise);
       // 保存に成功したMemoryだけを以降の処理へ進める。IndexedDB書き込み自体が
       // 失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する。
       const persistedMemoryObjects = touchedMemoryObjects.filter(
@@ -726,9 +861,18 @@ export default function ChatScreen() {
    * 1回読み、TreeSignalsを計算する。段階判定・段階内の葉の枚数の計算ロジック自体は
    * 全て@/lib/treeへ委譲する（このコンポーネントはしきい値を一切持たない）。
    * Vault/Capture/Connectのいずれにも触れない、読み取り専用の処理。
+   *
+   * Critical回帰修正（startup race）：`vaultStatus === "checking"`の間は実行しない。
+   * 起動effect（下のuseEffect）は、activeVaultEpoch取得→restoreVaultHandle→
+   * setTabVaultEpoch(latestEpoch)→vaultStatus更新、という順序で完了するが、
+   * このeffectがそれを待たずに動くと、setTabVaultEpoch()が終わる前に
+   * withVaultWorldReadのepoch確認へ到達し、tabVaultEpochがまだnullのまま
+   * StaleVaultTabErrorとなって誤ってcrossTabStale=trueにしてしまう
+   * （実際のepoch不一致ではなく、単に確認が早すぎるだけの誤検知）。
+   * Connect/Captureキャッチアップeffectと同じ「起動完了待ち」ガードに揃える。
    */
   useEffect(() => {
-    if (!showLaunchTree) return;
+    if (!showLaunchTree || vaultStatus === "checking" || vaultStatus === "incomplete-switch" || vaultStatus === "unsupported-journal-version") return;
     let cancelled = false;
     // Vault境界の安全性（H4対応）：Memory World読み取りをロック＋epoch確認で包む。
     withVaultWorldRead(() => getAllMemoryObjects())
@@ -744,7 +888,7 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, [showLaunchTree]);
+  }, [showLaunchTree, vaultStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -772,9 +916,14 @@ export default function ChatScreen() {
    * Beta「過去からの問いかけ」。マウント後に1回だけバックグラウンドで生成する。
    * トップ画面自体は先に表示済みのため、ここは非ブロッキングで良い
    * （生成が終わるまで日記/探究/相談・創造の3入口は普通に使える）。
+   *
+   * Critical回帰修正（startup race）：Launch Tree effectと同じ理由で
+   * `vaultStatus === "checking"`の間は実行しない（起動effectがtabVaultEpochを
+   * 確定させる前にgenerateTopPrompt()のwithVaultWorldReadが走ると、誤って
+   * StaleVaultTabErrorとなりcrossTabStale=trueにしてしまうため）。
    */
   useEffect(() => {
-    if (topPromptRanRef.current) return;
+    if (vaultStatus === "checking" || vaultStatus === "incomplete-switch" || vaultStatus === "unsupported-journal-version" || topPromptRanRef.current) return;
     topPromptRanRef.current = true;
     let cancelled = false;
     // Vault境界の安全性：問いかけ生成もMemory Worldへ影響する非同期処理として追跡する
@@ -795,7 +944,7 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [vaultStatus]);
 
   /**
    * STORAGE.md §2.4 Rebuildability Guarantee。Vault接続直後（初回接続・変更どちらも、
@@ -892,13 +1041,13 @@ export default function ChatScreen() {
     // queryPermission()のみの非対話的な確認に留まることをコードで確認済みのため
     // （vault.ts参照）、この一連の処理を共有ロック内で行っても長時間の保持にはならない。
     const endStartupTask = beginMemoryTask();
-    withStartupSharedLock(async () => {
-      const epoch = await getActiveVaultEpoch();
-      const result = await restoreVaultHandle();
-      if (cancelled) return;
-      // タブローカルな不変条件をここで確定させる（ロックを抜ける前）。
-      setTabVaultEpoch(epoch);
 
+    // Codexレビュー指摘（journal lifecycle／既存Beta migration）対応：
+    // restoreVaultHandleの結果を「connected/needs-permission/その他」で
+    // React stateへ反映し、connectedの場合のみflush→scanまで行う処理。
+    // legacy migrationパスと通常パスの両方から呼ぶ（重複を避けるための共通化。
+    // 分岐ロジック自体は元の実装から一切変更していない）。
+    async function applyRestoredHandle(result: VaultRestoreResult) {
       if (result.status === "connected") {
         setVaultHandle(result.handle);
         setVaultStatus("connected");
@@ -931,6 +1080,97 @@ export default function ChatScreen() {
       } else {
         setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
       }
+    }
+
+    withStartupSharedLock(async () => {
+      // Codexレビュー指摘（journal lifecycle：legacy/partial migrationの厳密な区別）
+      // 対応：判定自体はresolveVaultWorldStartupDecision（副作用無し）に分離してある。
+      // ここではその結果に基づいて副作用（restoreVaultHandle呼び出し・journal書き込み・
+      // React state更新）を行う。
+      let decision: VaultWorldStartupDecision;
+      try {
+        decision = await resolveVaultWorldStartupDecision();
+      } catch (error) {
+        // activeVaultEpoch自体が壊れている等、判定そのものができなかった場合。
+        // tabVaultEpochは一切設定しない（null のままにする＝withVaultWorldReadの
+        // 最初のチェックで、以後の通常Memory操作は全て拒否される。安全側）。
+        console.error("[Tsumugi] failed to resolve vault world startup state; refusing to trust any saved vault state.", error);
+        setVaultStatus("incomplete-switch");
+        markBootPhaseDone();
+        return;
+      }
+      if (cancelled) return;
+
+      if (decision.kind === "fail-closed") {
+        console.error(`[Tsumugi] ${decision.reason}; refusing to trust the saved handle. Please reconnect the vault.`);
+        // epoch自体（カウンタ値）は信頼できる——壊れている可能性があるのは
+        // あくまで「このepochに対応するhandle／その副作用」の方なので、
+        // tabVaultEpochはここで確定させてよい（不変条件の"epoch"半分）。
+        // これにより、ユーザーが再接続recoveryを行う際、通常のepoch一致チェックが
+        // 正しく機能する（tabVaultEpoch===activeVaultEpochとして扱われるため）。
+        setTabVaultEpoch(decision.epoch);
+        setVaultStatus("incomplete-switch");
+        markBootPhaseDone();
+        return;
+      }
+
+      if (decision.kind === "unsupported-version") {
+        // Codexレビュー指摘（unexpected version recovery方針）対応：
+        // "incomplete-switch"とは別状態として扱う。専用recovery
+        // （recoverFromIncompleteSwitch）はversion自体を書き換えないため、
+        // ここへ誘導しても復旧できない——真に読み取り専用のfail-closedとして
+        // 「再読み込みしてください」だけを案内する（UI側、SettingsPanel.tsx参照）。
+        console.error(`[Tsumugi] ${decision.reason}; refusing to trust any saved vault state.`);
+        setTabVaultEpoch(decision.epoch);
+        setVaultStatus("unsupported-journal-version");
+        markBootPhaseDone();
+        return;
+      }
+
+      if (decision.kind === "legacy-migrate" || decision.kind === "complete-version-marker") {
+        // Codexレビュー指摘（既存Beta migration／partial migration）対応：
+        // 現在保存されているVault handle／backend状態を既存9c07299互換の方法
+        // （restoreVaultHandle）でそのまま確認し、それが正常に確認できた（例外を
+        // 投げずに完了した）ことをもって、現在のactiveVaultEpochをjournalの
+        // baselineとして採用する。Vault未接続（handleが無い/needs-permission）の
+        // 既存ユーザーも、その状態自体を正常なbaselineとして問題なく移行できる
+        // （journalが見ているのは「epochとhandleの対応が取れているか」であり、
+        // 「今Vaultに接続できているか」ではないため）。
+        //
+        // 重要（Codexレビュー指摘：migration中は通常Memory操作を許可しない）対応：
+        // journal書き込み（committed baseline確立＋version marker確立）の両方が
+        // 揃って初めてtabVaultEpochを設定する。途中で失敗した場合は
+        // tabVaultEpochを一切設定しない（＝この起動セッション中は、committedだけ
+        // 先に成功していたとしても、withVaultWorldReadの最初のチェック
+        // （tabVaultEpoch===null）で通常Memory操作を必ず拒否できる）。
+        const legacyResult = await restoreVaultHandle();
+        if (cancelled) return;
+        try {
+          if (decision.kind === "legacy-migrate") {
+            // committedVaultEpochキー自体が無い場合のみ新規に書く（partial migrationの
+            // "committed valid AND committed===active"ケースでは、committedは既に
+            // 正しい値のため上書きしない＝要求通り）。
+            await markVaultEpochCommitted(decision.epoch);
+          }
+          await markVaultWorldJournalMigrated();
+        } catch (error) {
+          console.error("[Tsumugi] failed to establish vault world journal baseline", error);
+          setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
+          markBootPhaseDone();
+          return;
+        }
+        setTabVaultEpoch(decision.epoch);
+        await applyRestoredHandle(legacyResult);
+        markBootPhaseDone();
+        return;
+      }
+
+      // decision.kind === "normal"：通常の起動。
+      const result = await restoreVaultHandle();
+      if (cancelled) return;
+      // タブローカルな不変条件をここで確定させる（ロックを抜ける前）。
+      setTabVaultEpoch(decision.epoch);
+      await applyRestoredHandle(result);
       // TEMP-TEST：起動処理フェーズ①（Vault復元+flush+scan）完了。分岐・成否に関わらず
       // ここに到達する（catchが例外を握りつぶし再送出しないため）。
       markBootPhaseDone();
@@ -949,7 +1189,7 @@ export default function ChatScreen() {
    * バックグラウンドで処理する。チャット操作はブロックしない。
    */
   useEffect(() => {
-    if (vaultStatus === "checking" || startupConnectRanRef.current) return;
+    if (vaultStatus === "checking" || vaultStatus === "incomplete-switch" || vaultStatus === "unsupported-journal-version" || startupConnectRanRef.current) return;
     startupConnectRanRef.current = true;
     let cancelled = false;
     // Vault境界の安全性：起動時キャッチアップもMemory Worldへ影響する非同期処理として
@@ -1008,7 +1248,7 @@ export default function ChatScreen() {
    * 済み）だけで判定する（新しいクレーム機構は作らない）。
    */
   useEffect(() => {
-    if (vaultStatus === "checking" || startupCaptureRanRef.current) return;
+    if (vaultStatus === "checking" || vaultStatus === "incomplete-switch" || vaultStatus === "unsupported-journal-version" || startupCaptureRanRef.current) return;
     startupCaptureRanRef.current = true;
     let cancelled = false;
     // Vault境界の安全性：起動時キャッチアップもMemory Worldへ影響する非同期処理として
@@ -1147,27 +1387,126 @@ export default function ChatScreen() {
     vaultOperationLockRef.current = true;
     setVaultConnectFeedback(null);
     try {
+      // Codexレビュー指摘（journal lifecycle／incomplete専用recovery）対応：
+      // activeVaultEpochとcommittedVaultEpochが一致しない状態からは、通常の
+      // same/different識別（checkVaultIdentity）を使わない——previousHandle
+      // （IndexedDB "handles"ストアの現在値）自体が、直前の中断したswitchの
+      // どの段階まで進んだか不明な状態で書かれたものかもしれず、信用できない
+      // ため。専用のrecoveryフローへ委譲する（詳細は関数コメント参照）。
+      //
+      // Codexレビュー指摘（OPFS incomplete recovery）対応：pickVaultDirectory()は
+      // File System Access専用（OPFS非対応環境では常に例外を投げる）。backendに
+      // 応じて分岐し、OPFS環境ではpickerを一切呼ばない——既存のrestoreVaultHandle()の
+      // OPFS経路（root取得＋ensureVaultSkeleton、常にstatus:"connected"を返す）を
+      // そのまま再利用する（新しい保存方式は作らない）。
+      if (vaultStatus === "incomplete-switch") {
+        const backend = getVaultBackend();
+        if (backend === "opfs") {
+          const opfsResult = await restoreVaultHandle();
+          if (opfsResult.status !== "connected") {
+            // OPFSは常にconnectedを返す設計のため、通常ここには来ない想定
+            // （念のためのfail-safe）。
+            setVaultConnectFeedback({ kind: "error", message: "再接続に失敗しました。もう一度お試しください。" });
+            window.setTimeout(() => setVaultConnectFeedback(null), 6000);
+            return;
+          }
+          await recoverFromIncompleteSwitch(opfsResult.handle);
+          return;
+        }
+        // FSA（またはbackend===null＝非対応。その場合はpickVaultDirectory自体が
+        // 例外を投げ、既存の外側catchで「Vaultに接続できませんでした」表示になる）：
+        // ユーザーにVaultを選び直してもらう。
+        const newHandle = await pickVaultDirectory();
+        await recoverFromIncompleteSwitch(newHandle);
+        return;
+      }
+
       const newHandle = await pickVaultDirectory();
       const previousHandle = await loadVaultHandle();
       const identity = await checkVaultIdentity(previousHandle, newHandle);
 
       if (identity !== "different") {
         // CASE1（初めての接続）・同じVaultを選び直した場合：Memory World切替としては
-        // 扱わない。現状維持（既存のhandleConnectVaultの挙動と完全に同じ、ロックも
-        // 取得しない＝pending taskの待機やIndexedDBのclearは一切発生しない）。
+        // 扱わない（IndexedDBのclearやpending taskの待機は発生しない）。
+        //
+        // H4 Codexレビュー指摘High-1対応：ただしsaveVaultHandle/clearVaultSyncStateは
+        // 「active handle / sync ledgerを変更する」操作であるため、この分岐でも
+        // 排他ロック（"handle commit"として、別Vaultへの切替と同じ扱いに統一）＋
+        // epoch再確認の下でのみ行う。これが無いと、別タブが既にA→B切替を完了した後に
+        // このタブ（旧epochのまま）がAを選び直して`saveVaultHandle(A)`を書き戻し、
+        // 「activeVaultEpoch=B世代・saved handle=A」という不整合を作れてしまう
+        // （savedVaultHandleGeneration===activeVaultEpochの不変条件が壊れる）。
+        // ensureVaultSkeleton自体はnewHandle（今回選んだフォルダ）だけに作用し、
+        // 共有state（IndexedDB "handles"・epoch）には触れないため、ロック取得前でも安全。
         await ensureVaultSkeleton(newHandle);
-        await saveVaultHandle(newHandle);
+
+        const tabEpochAtStart = getTabVaultEpoch();
+        type HandleCommitOutcome = { status: "success"; epoch: number } | { status: "stale" };
+        const commitResult = await runVaultSwitchExclusive<HandleCommitOutcome>(async (ctx) => {
+          const currentSharedEpoch = await getActiveVaultEpoch();
+          if (tabEpochAtStart === null || currentSharedEpoch !== tabEpochAtStart) {
+            return { status: "stale" };
+          }
+          // Codexレビュー指摘High（timeout/commit TOCTOU）対応：ctx.beginCommit()は
+          // 「preparing→committing」の遷移を同期的に確定させる（間にawaitを挟まない
+          // 1手順）。trueが返った以降は、このrunVaultSwitchExclusive呼び出しがUIへ
+          // timeoutを返すことは無い（vaultWorldLock.ts参照）。falseなら、既に呼び出し元
+          // （UI）へtimeout失敗を返してしまった後なので、以降の取り消せない副作用
+          // （handle保存・epoch更新）は一切行わず中止する。
+          if (!ctx.beginCommit()) {
+            return { status: "stale" };
+          }
+          // Codexレビュー指摘（handle/epoch/sync state failure consistency）対応：
+          // saveVaultHandle/clearVaultSyncStateより先にepochを進める（「別Vaultへの
+          // 明示的な切替」フロー＝下のexclusiveResultと同じ順序に揃える）。理由は同じ：
+          // この後saveVaultHandle・clearVaultSyncStateのいずれかが失敗しても、
+          // activeVaultEpochは既に進んでいるため、このタブ（tabVaultEpochをまだ
+          // 更新していない＝setTabVaultEpochは全て成功した後にしか呼ばない）を含む
+          // 全タブが即座に「stale」と判定され、不整合な状態（handleだけ新しいのに
+          // epochが古いまま）での書き込み継続を防げる。「1つのepochに複数handleが
+          // 対応しない」（複数タブが同時に初回接続を別フォルダへ行った場合の競合防止）
+          // という目的自体は順序を変えても変わらない。
+          const newEpoch = await bumpActiveVaultEpoch(currentSharedEpoch);
+          await saveVaultHandle(newHandle);
+          // 新しいVaultフォルダを選択した場合のみクリアする（同じVaultへの再認可＝
+          // handleReauthorizeVaultでは呼ばない）。Vault同期済み台帳はどのフォルダに対する
+          // 同期状況かを区別しないため、フォルダが変わったのにクリアしないと、
+          // 新フォルダには実際は書き込まれていないデータを「同期済み」と誤判定し、
+          // flushPendingToVaultがそのitemの書き込みをスキップしてしまう（データ消失事故）。
+          await clearVaultSyncState();
+          // ここまで（epoch更新・handle保存・sync state clear）が全て成功した最後にだけ、
+          // このepochへのswitchが完全にcommitされたことをjournalへ記録する。途中で
+          // 例外が起きた場合（この行より前でthrow）はここに到達せず、journalは
+          // 古いままになる——起動時（下の起動effect）に「activeVaultEpochと
+          // committedVaultEpochが一致しない」として検出され、fail-closedに扱われる。
+          await markVaultEpochCommitted(newEpoch);
+          setTabVaultEpoch(newEpoch);
+          notifyVaultSwitched(newEpoch);
+          return { status: "success", epoch: newEpoch };
+        });
+
+        if (commitResult.timedOut) {
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "処理に時間がかかっているため、接続を中止しました。もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 6000);
+          return;
+        }
+        if (!commitResult.result || commitResult.result.status === "stale") {
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "別のタブで既に保存先が変更されたため、この操作を中止しました。もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 6000);
+          return;
+        }
+
         setVaultHandle(newHandle);
         setVaultStatus("connected");
-        // 新しいVaultフォルダを選択した場合のみクリアする（同じVaultへの再認可＝
-        // handleReauthorizeVaultでは呼ばない）。Vault同期済み台帳はどのフォルダに対する
-        // 同期状況かを区別しないため、フォルダが変わったのにクリアしないと、
-        // 新フォルダには実際は書き込まれていないデータを「同期済み」と誤判定し、
-        // flushPendingToVaultがそのitemの書き込みをスキップしてしまう（データ消失事故）。
-        await clearVaultSyncState();
-        // H4：この分岐はMemory World自体を切り替えないため排他ロックは不要だが、
-        // flush・scanはMemory Worldへの読み書きとして共有ロック＋epoch確認で保護する
-        // （ネスト回避のため、scanはImpl版を直接呼ぶ）。
+        // H4：flush・scanはMemory Worldへの読み書きとして共有ロック＋epoch確認で保護する
+        // （ネスト回避のため、scanはImpl版を直接呼ぶ）。排他ロックは既に解放済みのため
+        // ここは通常の共有ロックでよい。
         try {
           await withVaultWorldRead(async () => {
             await flushPendingToVault(newHandle);
@@ -1274,7 +1613,7 @@ export default function ChatScreen() {
           | { status: "clear-failed" }
           | { status: "save-handle-failed" };
 
-        const exclusiveResult = await runVaultSwitchExclusive<SwitchCommitOutcome>(async () => {
+        const exclusiveResult = await runVaultSwitchExclusive<SwitchCommitOutcome>(async (ctx) => {
           // 排他ロック取得直後、真っ先にepochを再確認する。「同時にA→B / A→C」が
           // 起きた場合、後着タブがこの排他ロックを取得した時点では、共有epochは
           // 既に別タブの切替で進んでいる可能性がある（先着タブの切替がこのタブより
@@ -1287,13 +1626,20 @@ export default function ChatScreen() {
 
           // 5. 現在のVault（旧）に未同期のデータがあれば、新Vaultではなく旧Vault自身へ
           // 保存する（絶対にnewHandleへflushしない）。
+          //
+          // Codexレビュー指摘High-1対応：ここは単純にawaitする（内側でPromise.raceして
+          // 早期returnしない）。呼び出し元（UI）へのtimeout報告と、実際の排他ロック保持・
+          // flush I/Oの実行は、runVaultSwitchExclusive自体が分離して扱う——timeoutしても
+          // このfnはflushが実際に終わるまで排他ロックを保持したまま自然に完了し、
+          // 「timeoutを報告した直後にロックだけ解放し、flush I/Oが無保護のまま裏で
+          // 継続する」事故を起こさない（vaultWorldLock.ts参照）。
           const flushResult = await flushPendingToVault(savedVaultHandleForFlush, "interactive");
+          if (flushResult.failedCount > 0) {
+            return { status: "flush-failed" };
+          }
 
           // 6. flushPendingToVault自身が積んだ書き込みが完了するまで待つ。
           if ((await waitForVaultWrites(Math.max(0, settleDeadline - Date.now()))).timedOut) {
-            return { status: "flush-failed" };
-          }
-          if (flushResult.failedCount > 0) {
             return { status: "flush-failed" };
           }
 
@@ -1311,12 +1657,22 @@ export default function ChatScreen() {
             return { status: "flush-failed" };
           }
 
+          // Codexレビュー指摘High（timeout/commit TOCTOU）対応：ctx.beginCommit()は
+          // 「preparing→committing」の遷移を同期的に確定させる（間にawaitを挟まない
+          // 1手順）。trueが返った以降は、このrunVaultSwitchExclusive呼び出しがUIへ
+          // timeoutを返すことは無い（vaultWorldLock.ts参照）。falseなら、既に呼び出し元
+          // （UI）へtimeout失敗を返してしまった後なので、以降の取り消せない副作用
+          // （epoch更新・clear・handle保存）は一切行わず中止する。
+          if (!ctx.beginCommit()) {
+            return { status: "flush-failed" };
+          }
+
           // ここまでで、旧Vaultへの保存が確認でき、かつ新しいMemory World taskが
           // 一切残っていないことも確認できた。まずactiveVaultEpoch（共有・永続）を
           // 進める——clear/saveVaultHandleがこの後に失敗しても、他タブ（および
           // 自タブ自身の以降の操作）が即座に「stale」と判定して安全側に止まるように
           // するため（clear失敗時に無防備な書き込みを続けないためのfail-safe）。
-          const newEpoch = await bumpActiveVaultEpoch();
+          const newEpoch = await bumpActiveVaultEpoch(currentSharedEpoch);
           // タブローカルなVault世代も進める（遅れて完了する旧処理からの書き戻しを
           // 無効化する保険。単一タブの主対策は上のdrainPendingMemoryTasks）。
           vaultGenerationRef.current += 1;
@@ -1334,6 +1690,14 @@ export default function ChatScreen() {
 
           try {
             await saveVaultHandle(newHandle);
+            // ここまで（epoch更新・clear・handle保存）が全て成功した最後にだけ、
+            // このepochへのswitchが完全にcommitされたことをjournalへ記録する。
+            // 途中で例外が起きた場合（この行より前でthrow）はここに到達せず、
+            // journalは古いままになる——起動時（下の起動effect）に
+            // 「activeVaultEpochとcommittedVaultEpochが一致しない」として検出され、
+            // fail-closedに扱われる（Codexレビュー指摘：handle/epoch/sync state
+            // failure consistency対応）。
+            await markVaultEpochCommitted(newEpoch);
           } catch (saveHandleError) {
             console.error("Failed to save new vault handle after clearing local data", saveHandleError);
             return { status: "save-handle-failed" };
@@ -1346,7 +1710,7 @@ export default function ChatScreen() {
           // すぐにバナー表示できるよう、成功が確定した直後に送る。
           notifyVaultSwitched(newEpoch);
           return { status: "success" };
-        });
+        }, Math.max(0, settleDeadline - Date.now()));
 
         if (exclusiveResult.timedOut) {
           abortAsTimeout();
@@ -1406,6 +1770,134 @@ export default function ChatScreen() {
     } finally {
       vaultOperationLockRef.current = false;
     }
+  }
+
+  /**
+   * Codexレビュー指摘（journal lifecycle／incomplete専用recovery）対応：
+   * `vaultStatus === "incomplete-switch"`（activeVaultEpochとcommittedVaultEpochの
+   * 不一致を検出した状態）からの、専用の再接続経路。呼び出し元はhandleConnectVault
+   * （既にvaultOperationLockRef/pickVaultDirectoryを済ませた状態）のみ。
+   *
+   * 通常のhandleConnectVault（same/different識別に基づく2分岐）とは意図的に
+   * 別関数にしている。理由：
+   * - 「保存済みhandle（previousHandle）を基準に同じか違うかを判定する」という
+   *   既存の識別ロジック自体が、incomplete状態では前提から成立しない
+   *   （previousHandleがどの段階まで反映されたものか不明なため、"same"だからと
+   *   言って安全に再利用できるとは限らない）。
+   * - 「現在のIndexedDB内容をそのまま新Vaultへflushする」通常の初回接続/同一Vault
+   *   再選択フローの挙動を、ここでは意図的に行わない（IndexedDBはswitch途中で
+   *   clear済み/一部変更済みの可能性があり、何が正しいデータか分からないため）。
+   *   代わりに、IndexedDBを必ず先にclearしてから新handleを確定し、Vault側の
+   *   Markdown（既存のRebuildability Guarantee＝正）をscanして復元候補として
+   *   提示する（ユーザー確認必須、自動書き込みなし）という、既存のVault restore
+   *   semanticsに委ねる。
+   */
+  async function recoverFromIncompleteSwitch(newHandle: FileSystemDirectoryHandle) {
+    await ensureVaultSkeleton(newHandle);
+
+    const tabEpochAtStart = getTabVaultEpoch();
+    type RecoveryOutcome =
+      | { status: "success"; epoch: number; handle: FileSystemDirectoryHandle }
+      | { status: "stale" }
+      | { status: "clear-failed" }
+      | { status: "save-handle-failed" };
+
+    const commitResult = await runVaultSwitchExclusive<RecoveryOutcome>(async (ctx) => {
+      // 他タブが並行してrecoveryを試みた場合の競合防止（通常のswitchと同じ原則）。
+      const currentSharedEpoch = await getActiveVaultEpoch();
+      if (tabEpochAtStart === null || currentSharedEpoch !== tabEpochAtStart) {
+        return { status: "stale" };
+      }
+
+      // Codexレビュー指摘（recovery開始時にincompleteを再確認）対応：destructiveな
+      // 副作用（clearMemoryData等）を開始する前に、"今も本当に" journal versionが
+      // currentであり、かつ本当にincomplete（committed !== active）であることを
+      // 排他ロック内で再確認する。他タブが既にこのepochを正常commit済み
+      // （active===committed かつ version===current）だった場合、このタブは
+      // 正常worldをclearしてはいけない——何もせずstale扱いで終了する。
+      const versionStatus = await getVaultWorldJournalVersion();
+      const committedStatus = await getCommittedVaultEpoch();
+      const stillIncomplete =
+        versionStatus.status === "current" &&
+        !(committedStatus.status === "valid" && committedStatus.epoch === currentSharedEpoch);
+      if (!stillIncomplete) {
+        return { status: "stale" };
+      }
+
+      if (!ctx.beginCommit()) {
+        return { status: "stale" };
+      }
+
+      // 重要：現在のIndexedDB内容は信用しない（incomplete状態＝直前のswitchが
+      // どこまで実際に反映されたか不明なため）。「incompleteだからIndexedDBの
+      // 現在内容をそのまま新Vaultへflushする」ことはしない——必ず先にclearし、
+      // 新Vault handle確定後のscan（この関数の呼び出し元が行う
+      // checkForRestoreCandidate）だけを、実際のデータ復元経路とする。
+      try {
+        await clearMemoryData();
+      } catch (clearError) {
+        console.error("Failed to clear local data during incomplete-switch recovery", clearError);
+        return { status: "clear-failed" };
+      }
+      vaultGenerationRef.current += 1;
+
+      let newEpoch: number;
+      try {
+        newEpoch = await bumpActiveVaultEpoch(currentSharedEpoch);
+        await saveVaultHandle(newHandle);
+        await clearVaultSyncState();
+        // handle/epoch/sync state failure consistency対応：epoch更新・clear・
+        // handle保存・sync state clearが全て成功した最後にだけjournalへ記録する。
+        await markVaultEpochCommitted(newEpoch);
+      } catch (saveError) {
+        console.error("Failed to save vault handle during incomplete-switch recovery", saveError);
+        return { status: "save-handle-failed" };
+      }
+
+      setTabVaultEpoch(newEpoch);
+      notifyVaultSwitched(newEpoch);
+      return { status: "success", epoch: newEpoch, handle: newHandle };
+    });
+
+    if (commitResult.timedOut) {
+      // timeout時は背後でfnがまだ実行中の可能性がある（state machineが排他ロックを
+      // 保持し続ける）。tabVaultEpochには一切触れない——次の試行自体が排他ロックの
+      // 直列化により、そのfnの完了を正しく待つ。
+      setVaultConnectFeedback({
+        kind: "error",
+        message: "処理に時間がかかっているため、再接続を中止しました。もう一度お試しください。",
+      });
+      window.setTimeout(() => setVaultConnectFeedback(null), 6000);
+      return;
+    }
+
+    const outcome = commitResult.result;
+    if (outcome && outcome.status === "success") {
+      // Codexレビュー指摘（epoch単独再同期を禁止）対応：activeVaultEpochをlock解放後に
+      // 再読みして採用するのではなく、この排他ロック自身が確定させた結果
+      // （newEpoch・newHandle）だけをそのまま使う。tab epoch・React handle・
+      // saved handle・active/committed epochが、常に「同じrecoveryが確定させた
+      // 1つのworld」として揃う（別タブが確定した最新epochだけを後から取り込んで、
+      // 古いhandle/React stateと組み合わせる事故を防ぐ）。
+      setTabVaultEpoch(outcome.epoch);
+      resetMemoryWorldState();
+      setVaultHandle(outcome.handle);
+      setVaultStatus("connected");
+      // 新Vaultをscanし、既存データがあれば復元候補として提示する（自動では
+      // 書き込まない。IndexedDBは上でclear済みのため、ここでのflushPendingToVaultは
+      // 意味を持たない＝呼ばない。scanだけが実際のデータ復元経路になる）。
+      await checkForRestoreCandidate(outcome.handle);
+      return;
+    }
+
+    // Codexレビュー指摘（stale loser／recovery途中failure後の再試行）対応：
+    // stale（他タブが先にcommitした、または既に正常world化されていた）・
+    // clear-failed・save-handle-failedのいずれも、tabVaultEpochを単独で再同期
+    // することはしない（Phase 1：安全優先）。crossTabStale相当の状態へ移行し、
+    // 既存の「別のタブで保存先が変更されました。再読み込みしてください。」バナーへ
+    // 統一する（Vault操作ボタンも連動して無効化される）。reload後は同じstartup
+    // flowでhandle・active/committed epoch・versionを取り直す。
+    setCrossTabStale(true);
   }
 
   /**
@@ -1657,13 +2149,11 @@ export default function ChatScreen() {
         // awaitVaultSync=false：ユーザー操作の完了をIndexedDB保存で確定させ、Vaultへの
         // 反映は待たない（reflectionFailedIdsはIndexedDB保存の成否のみを表すため、
         // この変更でも判定の意味は変わらない）。
-        const { failedMemoryIds: reflectionFailedIds } = await persistCapture(
-          vaultHandle,
-          endedConversation,
-          [insightMemory],
-          "interactive",
-          false
-        );
+        const { failedMemoryIds: reflectionFailedIds, backgroundSyncPromise: reflectionBackgroundSyncPromise } =
+          await persistCapture(vaultHandle, endedConversation, [insightMemory], "interactive", false);
+        // H4 Codexレビュー指摘High-2対応：この関数自体が既にbeginMemoryTask()で追跡中の
+        // 親taskであるため、ここで子として登録すればdrainPendingMemoryTasksが確実に待てる。
+        if (reflectionBackgroundSyncPromise) trackMemoryTask(reflectionBackgroundSyncPromise);
         if (reflectionFailedIds.length > 0) {
           // insight MemoryのIndexedDB保存自体が失敗した場合は、Reflectionを「完了」として
           // 表示しない（黙って失われた記憶を「保存できた」と伝えないため）。
@@ -1745,7 +2235,15 @@ export default function ChatScreen() {
       // 責務分離の目的そのもの）。
       // awaitVaultSync=false：ここでの「保存完了」はIndexedDBへの保存成功のみで確定させ、
       // Vaultへの反映は待たない（Beta修正。ユーザー操作をVault I/Oの遅さから切り離す）。
-      await persistConversation(vaultHandle, endedConversation, "interactive", false);
+      const { backgroundSyncPromise: endedConversationBackgroundSyncPromise } = await persistConversation(
+        vaultHandle,
+        endedConversation,
+        "interactive",
+        false
+      );
+      // H4 Codexレビュー指摘High-2対応：この関数自体が既にbeginMemoryTask()で追跡中の
+      // 親taskであるため、ここで子として登録すればdrainPendingMemoryTasksが確実に待てる。
+      if (endedConversationBackgroundSyncPromise) trackMemoryTask(endedConversationBackgroundSyncPromise);
       // refだけ先に更新する（React stateはまだここでは更新しない）。
       // runConversationBoundaryはこのrefをCapture対象・成功時のマージ元として読むため、
       // 先にendedAt付きにしておく必要がある（そうしないと、Capture成功時に
@@ -2054,7 +2552,11 @@ export default function ChatScreen() {
           ? "非対応"
           : vaultStatus === "checking"
             ? "確認中"
-            : "この端末のみ";
+            : vaultStatus === "incomplete-switch"
+              ? "要再接続"
+              : vaultStatus === "unsupported-journal-version"
+                ? "確認できません"
+                : "この端末のみ";
 
   /*
     起動時（showLaunchTreeがtrueの間）は、通常の画面（どう話す？／会話画面）を
@@ -2079,6 +2581,43 @@ export default function ChatScreen() {
       {crossTabStale && (
         <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
           <span>別のタブで保存先が変更されました。再読み込みしてください。</span>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="shrink-0 rounded-full border border-amber-400/60 px-3 py-1 text-xs transition hover:bg-amber-200/60 dark:border-amber-600/60 dark:hover:bg-amber-900/60"
+          >
+            再読み込み
+          </button>
+        </div>
+      )}
+      {/*
+        Codexレビュー指摘（journal lifecycle）対応：activeVaultEpochとcommittedVaultEpochが
+        一致しない（＝直前のVault切替が完了しないまま終了した形跡がある）場合のバナー。
+        crossTabStaleとは異なり「再読み込み」では直らない（journal自体が不整合のため）。
+        保存先を選び直す専用recovery（handleConnectVaultのincomplete分岐）でのみ
+        復旧できるため、設定画面（保存先を選ぶボタン）を開く導線にする。
+      */}
+      {vaultStatus === "incomplete-switch" && (
+        <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
+          <span>保存先の切替が完了していません。保存先を選び直してください。</span>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            className="shrink-0 rounded-full border border-amber-400/60 px-3 py-1 text-xs transition hover:bg-amber-200/60 dark:border-amber-600/60 dark:hover:bg-amber-900/60"
+          >
+            設定を開く
+          </button>
+        </div>
+      )}
+      {/*
+        Codexレビュー指摘（unexpected version recovery方針）対応：journal
+        versionが想定と異なる状態専用のバナー。"incomplete-switch"とは別の文言
+        （再接続を促さない——専用recoveryはversionを書き換えないため、案内しても
+        復旧できない）。再読み込みを促すだけに留める（設定画面を開く導線も出さない）。
+      */}
+      {vaultStatus === "unsupported-journal-version" && (
+        <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
+          <span>保存データのバージョンを確認できません。再読み込みしてください。</span>
           <button
             type="button"
             onClick={() => window.location.reload()}

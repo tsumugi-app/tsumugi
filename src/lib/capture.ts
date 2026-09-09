@@ -284,11 +284,50 @@ export interface PersistCaptureResult {
    * 次のflushPendingToVaultで自然に書き戻される＝失われてはいない）。
    */
   failedMemoryIds: string[];
+  /**
+   * H4 Codexレビュー指摘High-2対応：`awaitVaultSync=false`のときのみ非null。
+   * 呼び出し元は必ず何らかの手段（ChatScreen.tsxのtrackMemoryTask等）で追跡し、
+   * Vault切替の収束待ち（drainPendingMemoryTasks）がこれの完了も待てるようにすること。
+   * 詳細は下のpersistConversation/persistCaptureのコメント参照。
+   */
+  backgroundSyncPromise: Promise<void> | null;
 }
 
 export interface PersistConversationResult {
   /** conversation自体のIndexedDB書き込みが失敗したか（Markdown書き込み失敗は含まない）。 */
   conversationFailed: boolean;
+  /** PersistCaptureResult.backgroundSyncPromiseと同じ意味・同じ注意点。 */
+  backgroundSyncPromise: Promise<void> | null;
+}
+
+/**
+ * H4 Codexレビュー指摘High-2対応：`awaitVaultSync=false`のfire-and-forget Vault write
+ * （Markdown書き込み＋sync ledger更新）が、それを開始したwithVaultWorldReadの共有ロック
+ * 保持区間の外へ「無保護のまま」逃げてしまう問題への対処。
+ *
+ * 対策の骨子：
+ * - Impl側（persistConversationImpl/persistCaptureImpl）は、awaitVaultSync=falseのときも
+ *   その場でVault writeを`void`発火しない。代わりに「まだ実行していない、実行すると
+ *   別の共有ロックを取得してからwriteとledger更新を行う」関数（サンク）だけを組み立てて
+ *   返す（ロック解放後まで実行を遅延させる）。
+ * - 公開版（persistConversation/persistCapture）が、自分自身のwithVaultWorldRead呼び出しが
+ *   完全に解決した（＝そのロックを解放し終えた）後で、初めてこのサンクを呼び出す。
+ *   ここで新しく取得するロックは、既に解放済みの別のロック要求の"後"に行う独立した
+ *   要求であり、同じロックのネスト要求（デッドロックの原因）にはならない
+ *   （vaultWorldLock.ts冒頭のデッドロック回避原則を参照）。
+ * - これにより、呼び出し元（UI側）への応答は従来通り速いまま（IndexedDB保存が終わり次第
+ *   すぐ返る）でありながら、実際のMarkdown書き込み・sync ledger更新自体は、開始から
+ *   終了まで必ずどこかの共有ロックで保護された状態になる。他タブの排他ロック
+ *   （Vault切替）取得は、Web Locks APIの標準動作により、この保護区間が終わるまで
+ *   自動的に待たされる（追加の調整コードは不要）。
+ * - 呼び出し元（ChatScreen.tsx）は、返されたbackgroundSyncPromiseを必ず
+ *   pendingMemoryTasksRef（trackMemoryTask）で追跡すること。これにより、同一タブ内での
+ *   「exclusive lock取得前に、まだ開始していないこの背景処理のロック要求を取りこぼす」
+ *   自己デッドロック（drainPendingMemoryTasksが待つべき対象を認識できないまま
+ *   排他ロックが先に要求されてしまう問題）も防げる。
+ */
+function scheduleBackgroundVaultSync(doSync: () => Promise<void>): () => Promise<void> {
+  return () => withVaultWorldRead(doSync);
 }
 
 /**
@@ -330,7 +369,18 @@ export async function persistConversation(
   priority: VaultWritePriority = "interactive",
   awaitVaultSync: boolean = true
 ): Promise<PersistConversationResult> {
-  return withVaultWorldRead(() => persistConversationImpl(vaultHandle, conversation, priority, awaitVaultSync));
+  const { conversationFailed, startBackgroundSync } = await withVaultWorldRead(() =>
+    persistConversationImpl(vaultHandle, conversation, priority, awaitVaultSync)
+  );
+  // ロックは既に解放済み。ここで初めて（ネストしない、独立した新規ロック要求として）
+  // 背景Vault writeを開始する（H4 Codexレビュー指摘High-2対応）。
+  return { conversationFailed, backgroundSyncPromise: startBackgroundSync ? startBackgroundSync() : null };
+}
+
+interface PersistConversationImplResult {
+  conversationFailed: boolean;
+  /** ロック解放後にのみ呼び出すこと（呼び出し元＝persistConversation/persistCaptureImplの責務）。 */
+  startBackgroundSync: (() => Promise<void>) | null;
 }
 
 async function persistConversationImpl(
@@ -338,7 +388,7 @@ async function persistConversationImpl(
   conversation: Conversation,
   priority: VaultWritePriority = "interactive",
   awaitVaultSync: boolean = true
-): Promise<PersistConversationResult> {
+): Promise<PersistConversationImplResult> {
   // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。件数・経過時間のみ（会話内容は出さない）。
   // 原因調査が終わり次第削除すること。
   const persistStart = Date.now();
@@ -353,6 +403,7 @@ async function persistConversationImpl(
     conversationFailed = true;
   }
 
+  let startBackgroundSync: (() => Promise<void>) | null = null;
   if (vaultHandle) {
     const syncToVault = async () => {
       try {
@@ -364,14 +415,16 @@ async function persistConversationImpl(
     if (awaitVaultSync) {
       await syncToVault();
     } else {
-      void syncToVault();
+      // H4 Codexレビュー指摘High-2対応：ここでは発火しない（まだ現在のロックの内側のため）。
+      // 呼び出し元がロック解放後に呼び出すサンクとしてのみ渡す。
+      startBackgroundSync = scheduleBackgroundVaultSync(syncToVault);
     }
   }
 
   const persistDurationMs = Date.now() - persistStart;
   console.log(`[Conversation] persist:end durationMs=${persistDurationMs}`);
   logTimingEvent("Conversation persist:end", { durationMs: persistDurationMs });
-  return { conversationFailed };
+  return { conversationFailed, startBackgroundSync };
 }
 
 /**
@@ -407,9 +460,19 @@ export async function persistCapture(
   priority: VaultWritePriority = "interactive",
   awaitVaultSync: boolean = true
 ): Promise<PersistCaptureResult> {
-  return withVaultWorldRead(() =>
+  const { conversationFailed, failedMemoryIds, startBackgroundSync } = await withVaultWorldRead(() =>
     persistCaptureImpl(vaultHandle, conversation, memoryObjects, priority, awaitVaultSync)
   );
+  // ロックは既に解放済み。ここで初めて（ネストしない、独立した新規ロック要求として）
+  // 背景Vault write群をまとめて開始する（H4 Codexレビュー指摘High-2対応）。
+  return { conversationFailed, failedMemoryIds, backgroundSyncPromise: startBackgroundSync ? startBackgroundSync() : null };
+}
+
+interface PersistCaptureImplResult {
+  conversationFailed: boolean;
+  failedMemoryIds: string[];
+  /** ロック解放後にのみ呼び出すこと（呼び出し元＝persistCaptureの責務）。 */
+  startBackgroundSync: (() => Promise<void>) | null;
 }
 
 async function persistCaptureImpl(
@@ -418,12 +481,21 @@ async function persistCaptureImpl(
   memoryObjects: MemoryObject[],
   priority: VaultWritePriority = "interactive",
   awaitVaultSync: boolean = true
-): Promise<PersistCaptureResult> {
+): Promise<PersistCaptureImplResult> {
   // ネスト回避のため、公開版persistConversation（ロック付き）ではなく
   // persistConversationImpl（ロック無し）を直接呼ぶ（vaultWorldLock.ts参照）。
-  const { conversationFailed } = await persistConversationImpl(vaultHandle, conversation, priority, awaitVaultSync);
+  const { conversationFailed, startBackgroundSync: conversationStartBackgroundSync } = await persistConversationImpl(
+    vaultHandle,
+    conversation,
+    priority,
+    awaitVaultSync
+  );
 
   const failedMemoryIds: string[] = [];
+  // H4 Codexレビュー指摘High-2対応：conversation分と合わせて、まだ実行していない
+  // 背景sync（サンク）をここへ集める。ここで`void`発火・awaitはしない
+  // （現在のロックの内側のため。呼び出し元＝persistCaptureがロック解放後にまとめて呼ぶ）。
+  const memoryStartBackgroundSyncs: (() => Promise<void>)[] = [];
   for (const memoryObject of memoryObjects) {
     try {
       await putMemoryObject(memoryObject);
@@ -446,10 +518,19 @@ async function persistCaptureImpl(
       if (awaitVaultSync) {
         await syncToVault();
       } else {
-        void syncToVault();
+        memoryStartBackgroundSyncs.push(scheduleBackgroundVaultSync(syncToVault));
       }
     }
   }
 
-  return { conversationFailed, failedMemoryIds };
+  const allStarts = [
+    ...(conversationStartBackgroundSync ? [conversationStartBackgroundSync] : []),
+    ...memoryStartBackgroundSyncs,
+  ];
+  // conversation・memoryObjects複数件ぶんの背景syncを、呼び出し元からは1つのPromiseとして
+  // 扱えるようまとめる（個々は内部でtry/catch済みのため、ここでも例外を投げない）。
+  const startBackgroundSync =
+    allStarts.length > 0 ? () => Promise.all(allStarts.map((start) => start())).then(() => undefined) : null;
+
+  return { conversationFailed, failedMemoryIds, startBackgroundSync };
 }

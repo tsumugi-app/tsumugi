@@ -340,24 +340,203 @@ export async function loadChatProvider(): Promise<AIProviderName> {
  */
 const ACTIVE_VAULT_EPOCH_KEY = "activeVaultEpoch";
 
+/**
+ * Codexレビュー指摘（journal値validation）対応：epochとして「valid」とみなすのは
+ * finite・integer・0以上・Number.isSafeInteger、かつ保存文字列が`String(parsed)`と
+ * 完全一致するもの（roundtrip確認）だけにする。roundtrip確認を入れる理由：
+ * `Number("")`は`0`、`Number(" 5")`は`5`になる等、`Number(...)`だけでは
+ * 空文字列・前後空白付き文字列・16進数表記等の「一見数値だが本来は不正な入力」を
+ * 弾けないため（`String(0) !== ""`となることを利用して弾く）。
+ */
+function isValidStoredEpochValue(raw: unknown): raw is string {
+  if (typeof raw !== "string") return false;
+  const parsed = Number(raw);
+  return (
+    Number.isFinite(parsed) &&
+    Number.isInteger(parsed) &&
+    Number.isSafeInteger(parsed) &&
+    parsed >= 0 &&
+    String(parsed) === raw
+  );
+}
+
+export type VaultEpochStatus = { status: "missing" } | { status: "valid"; epoch: number } | { status: "invalid" };
+
+function parseStoredEpoch(raw: unknown): VaultEpochStatus {
+  if (raw === undefined) return { status: "missing" };
+  if (!isValidStoredEpochValue(raw)) return { status: "invalid" };
+  return { status: "valid", epoch: Number(raw) };
+}
+
+/**
+ * Codexレビュー指摘（journal値validation）対応：未設定（一度もbumpされていない、
+ * アプリ初回起動）は0として扱う（正常な初期状態）。保存値が存在するのに壊れている
+ * （上記validationを満たさない）場合は、0へ黙って丸めず例外を投げる——呼び出し元は
+ * 必ずこれをcatchして安全側（Memory World操作の拒否）に倒すこと。既存の呼び出し元
+ * （withVaultWorldRead・各Vault切替の排他ロックコールバック等）は全てこの契約に
+ * 従って実装されている（詳細はそれぞれのコメント参照）。
+ */
 export async function getActiveVaultEpoch(): Promise<number> {
   const db = await getDB();
   const raw = await db.get("settings", ACTIVE_VAULT_EPOCH_KEY);
-  const parsed = raw === undefined ? 0 : Number(raw);
-  return Number.isFinite(parsed) ? parsed : 0;
+  const status = parseStoredEpoch(raw);
+  if (status.status === "missing") return 0;
+  if (status.status === "invalid") {
+    throw new Error(`[Tsumugi] invalid activeVaultEpoch value in storage: ${JSON.stringify(raw)}`);
+  }
+  return status.epoch;
 }
 
 /**
  * 別Vaultへの切替コミット（`navigator.locks`の排他ロック内）からのみ呼ぶこと。
- * 複数タブから同時に呼ばれないことは、呼び出し元が排他ロックで保証する
- * （このカウンタ自体はcompare-and-swapを行わない、単純なget→+1→put）。
+ * 複数タブから同時に呼ばれないことは、呼び出し元が排他ロックで保証する。
+ *
+ * Codexレビュー指摘（再発、High）対応：以前は`getActiveVaultEpoch()`が例外を
+ * 投げた場合（＝保存値が壊れている場合）に0へfallbackして1から数え直していたが、
+ * これはepochの単調増加という大前提を崩す——古いepoch世代の値を偶然にも
+ * 再利用してしまい、その古い世代を"覚えている"タブ（tabVaultEpochが偶然その値と
+ * 一致するタブ）が誤って再承認されうる。ここでは一切fallbackせず、
+ * `getActiveVaultEpoch()`の例外（IndexedDB read failure・invalid stored value等）を
+ * そのままrejectさせる（fail-fast）。
+ *
+ * `expectedEpoch`（Codexレビュー指摘：expected epoch付きbump）：呼び出し元が
+ * 排他ロック内で確認済みの「今のactiveVaultEpochはこの値のはず」を渡すこと。
+ * 内部で改めてactiveVaultEpochを読み直し、`expectedEpoch`と一致しない場合は
+ * 例外を投げる（呼び出し元はstale扱いにすること）。一致した場合のみ
+ * `expectedEpoch + 1`を書き込む。これにより「呼び出し元がepochを確認した
+ * 瞬間」と「実際にbumpする瞬間」の間に想定外の変更が入っていないかを、
+ * このAPI自体でも再確認できる（排他ロック下では通常起こらないはずだが、
+ * APIとしての安全側の設計として持たせる）。
+ *
+ * epoch overflow（`expectedEpoch + 1`が`Number.MAX_SAFE_INTEGER`を超える場合）も
+ * 例外を投げる。wrap・resetは行わない。
  */
-export async function bumpActiveVaultEpoch(): Promise<number> {
+export async function bumpActiveVaultEpoch(expectedEpoch: number): Promise<number> {
   const db = await getDB();
   const current = await getActiveVaultEpoch();
+  if (current !== expectedEpoch) {
+    throw new Error(
+      `[Tsumugi] bumpActiveVaultEpoch: expected activeVaultEpoch=${expectedEpoch} but found ${current}; refusing (stale).`
+    );
+  }
   const next = current + 1;
+  if (!Number.isSafeInteger(next)) {
+    throw new Error(`[Tsumugi] bumpActiveVaultEpoch: epoch overflow (current=${current})`);
+  }
   await db.put("settings", String(next), ACTIVE_VAULT_EPOCH_KEY);
   return next;
+}
+
+/**
+ * Codexレビュー指摘（Medium→H4クローズ条件：handle/epoch/sync state failure
+ * consistency）対応：「activeVaultEpochを何番まで、実際にhandle保存・IndexedDB
+ * clear等の副作用を含めて完全にcommitし終えたか」を表す、小さなjournal。
+ * 既存の`settings`ストアへ1キー追加するだけで、DB schemaの変更・vaultId
+ * namespace導入は行わない。
+ *
+ * 使い方（呼び出し元＝ChatScreen.tsxのVault切替コミット）：
+ * `bumpActiveVaultEpoch()`で新epochへ進めた後、そのepochに対応する副作用
+ * （IndexedDB clear・新Vault handle保存・sync state clear等）が"全て"成功した
+ * 最後にだけ`markVaultEpochCommitted(newEpoch)`を呼ぶ。途中のどこか
+ * （awaitの合間・例外・タブクラッシュ・リロード等）で中断した場合、
+ * `committedVaultEpoch`は古いままになる。
+ *
+ * 起動時（ChatScreen.tsxの起動effect）・および各Memory World操作の直前
+ * （vaultWorldLock.tsのwithVaultWorldRead）は、`getActiveVaultEpoch()`と
+ * `getCommittedVaultEpoch()`を読み比べ、一致しない場合（＝直前のswitchが
+ * 完了しないまま終了した形跡）は、保存済みhandleを信用せず「未接続」として
+ * 扱う（fail-closed。new epoch + 古い/不整合なhandleを正常worldとして採用しない）。
+ *
+ * Codexレビュー指摘（再発、High）対応：「journal keyが存在しない＝missing」を
+ * 安易に0へ変換してはいけない。missingには2つの全く異なる意味がありうる：
+ *   (a) legacy：この端末でjournal方式自体がまだ有効化されていない
+ *       （既存Betaからの初回起動。9c07299時点のユーザーはこちら）。
+ *   (b) 新方式が既に有効化された後の、最初のswitch中の失敗でjournalが
+ *       書き込まれないまま終了した（＝本物のincomplete）。
+ * (a)と(b)を区別できないまま「missing→0扱い」にすると、(b)のケースを
+ * 誤って安全な状態として通してしまう（今回Codexが指摘したHigh-2）。
+ * この区別は`isVaultWorldJournalMigrated()`（下記）という別のmigration
+ * markerで行う——`getCommittedVaultEpoch()`自体は「missing/valid/invalid」の
+ * 3状態を正直に返すだけにする（呼び出し元がmigration markerと組み合わせて
+ * legacy/incompleteを判定する）。
+ */
+const COMMITTED_VAULT_EPOCH_KEY = "committedVaultEpoch";
+
+/** activeVaultEpochと同じ意味の3状態（`VaultEpochStatus`をそのまま再利用）。 */
+export type CommittedVaultEpochStatus = VaultEpochStatus;
+
+/**
+ * Codexレビュー指摘（journal値validation）対応：activeVaultEpochと同じ厳密な
+ * validation（`parseStoredEpoch`）を使う。「missing→0」への変換は絶対に行わない
+ * （呼び出し元がmissing/valid/invalidを明示的に区別して判定する）。
+ */
+export async function getCommittedVaultEpoch(): Promise<CommittedVaultEpochStatus> {
+  const db = await getDB();
+  const raw = await db.get("settings", COMMITTED_VAULT_EPOCH_KEY);
+  return parseStoredEpoch(raw);
+}
+
+/**
+ * そのepochへのswitchに伴う副作用（IndexedDB clear・handle保存・sync state clear等）が
+ * 全て成功した後、必ず最後に（`navigator.locks`の排他ロックを保持したまま）呼ぶこと。
+ */
+export async function markVaultEpochCommitted(epoch: number): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", String(epoch), COMMITTED_VAULT_EPOCH_KEY);
+}
+
+/**
+ * Codexレビュー指摘（既存Beta migration）対応：「committedVaultEpochキー自体が
+ * まだ存在しない」を、常に安全な"legacy"とみなしてよいのは、この端末で
+ * journal方式（committedVaultEpoch）がまだ一度も有効化されていない場合だけ。
+ * 一度有効化された後にjournalが失われた（＝本物のincomplete）場合と
+ * 区別するため、journal方式自体の有効化を示す別マーカーを持つ。
+ *
+ * 値の中身自体は問わず、キーの存在だけを見る（一度でも
+ * `markVaultWorldJournalMigrated()`されていれば、二度と"legacy"扱いへは
+ * 戻さない——後述のmigration手順が「起動のたびに現在のhandleを無条件に
+ *信用し直す」という危険な繰り返しにならないようにするため）。
+ */
+const VAULT_WORLD_JOURNAL_VERSION_KEY = "vaultWorldJournalVersion";
+/** 数値として持つ（将来のmigrationで比較・分岐しやすくするため）。保存形式は他のepoch値と
+ * 同じ文字列化した数値。 */
+const CURRENT_VAULT_WORLD_JOURNAL_VERSION = 1;
+
+export type VaultWorldJournalVersionStatus =
+  | { status: "missing" }
+  | { status: "current" }
+  | { status: "unexpected"; raw: string };
+
+/**
+ * Codexレビュー指摘（migration version marker）対応：「キーが存在するか」だけでなく、
+ * 値そのものを検証する。
+ * - missing：この端末でjournal方式自体がまだ一度も有効化されていない
+ *   （legacy／partial migration判定へ進む）。
+ * - current：現在のjournal方式（version 1）が正しく有効化済み。
+ * - unexpected：キーは存在するが、想定するversion番号と一致しない
+ *   （壊れた値、または将来のversion番号だが今のコードが対応していない等）。
+ *   legacy扱いは絶対にせず、fail-closedへ倒す（「一度migrated済みの端末を
+ *   二度とlegacy扱いへ戻さない」という既存の原則の一部）。
+ */
+export async function getVaultWorldJournalVersion(): Promise<VaultWorldJournalVersionStatus> {
+  const db = await getDB();
+  const raw = await db.get("settings", VAULT_WORLD_JOURNAL_VERSION_KEY);
+  if (raw === undefined) return { status: "missing" };
+  if (raw === String(CURRENT_VAULT_WORLD_JOURNAL_VERSION)) return { status: "current" };
+  return { status: "unexpected", raw };
+}
+
+/**
+ * legacy migration（既存Betaからの初回起動）が、現在のVault world（handle/epoch）を
+ * 正常に確認し終えた最後にだけ呼ぶこと。`markVaultEpochCommitted()`より必ず後に
+ * 呼ぶこと（途中で中断した場合、"committedVaultEpochは書けたがmigrated markerは
+ * 書けていない"という状態の方が安全——次回起動時、migration処理をもう一度
+ * 現在のhandleから正しくやり直せる。逆順だと"migrated済みなのにcommitted無し"
+ * という、通常のincomplete判定と見分けが付かない状態を作ってしまう）。
+ */
+export async function markVaultWorldJournalMigrated(): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", String(CURRENT_VAULT_WORLD_JOURNAL_VERSION), VAULT_WORLD_JOURNAL_VERSION_KEY);
 }
 
 /** 「過去からの問いかけ」機能が直近に表示したMemory IDの一覧（新しいものが末尾）。同じMemoryの連続表示を避けるためだけに使う。 */
