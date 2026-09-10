@@ -219,6 +219,18 @@ export interface ConversationDebugParams {
   /** persona===analystのとき、落とされたdirect候補を再現するために使う
    * （retrieveRelevantMemories()へ渡しているexcludeConversationIdと同じ値）。 */
   excludeConversationId?: string;
+  /**
+   * Recent Conversation Continuity v1（recentConversation.ts）：今回のリクエストで
+   * /api/chat へ渡した直前Conversationの要約（メタ情報のみ）。渡さなかった場合は null。
+   * プライバシー方針に従い、turn本文そのものは複製しない（件数・概算文字数だけ）。
+   */
+  recentConversation?: {
+    id: string;
+    endedAt: string;
+    elapsedMs: number;
+    turnCount: number;
+    approxChars: number;
+  } | null;
 }
 
 /**
@@ -236,8 +248,16 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
     // 一切触れる前にStaleVaultTabErrorで拒否され、下のcatchでログ出力自体を諦める
     // （B（別Vault）のMemory summaryがconsole/localStorageへ出ることはない）。
     await withVaultWorldRead(async () => {
-      const { persona, turns, retrievedMemories, latestUserMessage, vaultBackend, vaultStatus, excludeConversationId } =
-        params;
+      const {
+        persona,
+        turns,
+        retrievedMemories,
+        latestUserMessage,
+        vaultBackend,
+        vaultStatus,
+        excludeConversationId,
+        recentConversation,
+      } = params;
 
       // H4 Codexレビュー指摘High-2対応：ここ（withVaultWorldReadのfn内）に到達した時点で
       // tabVaultEpochは必ずactiveVaultEpochと一致している（withVaultWorldRead自身が
@@ -325,6 +345,11 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
         `historyCount(turns): ${turns.length}`,
         `memoryCount(total, this device's IndexedDB): ${allMemories.length}`,
         `retrievedCount: ${retrievedMemories.length} (direct=${directCount}, divergent=${divergentCount}, linked=${linkedCount})`,
+        recentConversation
+          ? `recentConversation: id=${recentConversation.id} endedAt=${recentConversation.endedAt} elapsedMinutes=${Math.round(
+              recentConversation.elapsedMs / 60000
+            )} turnCount=${recentConversation.turnCount} approxChars=${recentConversation.approxChars}`
+          : "recentConversation: (none — no ended conversation within window)",
         "retrieved:",
         ...retrieved.map(
           (r, i) =>

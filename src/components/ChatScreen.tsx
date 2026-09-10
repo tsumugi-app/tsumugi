@@ -45,6 +45,7 @@ import {
   retrieveRelevantMemories,
 } from "@/lib/retrieval";
 import { createInsightMemoryObject, generateSessionReflection } from "@/lib/reflection";
+import { buildRecentConversationPayload, type RecentConversationPayload } from "@/lib/recentConversation";
 import { connectMemory } from "@/lib/connect";
 import { filterUnconnected } from "@/lib/connectState";
 import {
@@ -2401,6 +2402,22 @@ export default function ChatScreen() {
         recentUserTurnsTexts,
       });
 
+      // Recent Conversation Context（Current Conversation → Recent Conversation → Memory Retrieval
+      // の中間層。Recent Conversation Continuity v1）。数時間以内に終了した直前Conversationの
+      // 末尾6 turnだけを、現在turnsとは別枠として/api/chatへ渡す（recentConversation.ts参照）。
+      // Vault境界の安全性（H4対応）：getAllConversations()はロックを取らないprimitiveのため、
+      // withVaultWorldReadで包む（retrieveRelevantMemories()の内部ロックとは別個の順次取得で
+      // あり、同一ロックのネストにはならない。vaultWorldLock.ts参照）。取得失敗は
+      // StaleVaultTabErrorのみ上位へ再送出し、それ以外は会話送信をブロックせずnullで続行する。
+      let recentConversation: RecentConversationPayload | null = null;
+      try {
+        const allConversations = await withVaultWorldRead(() => getAllConversations());
+        recentConversation = buildRecentConversationPayload(allConversations, baseConversation.id, Date.now());
+      } catch (recentError) {
+        if (recentError instanceof StaleVaultTabError) throw recentError;
+        console.error("Failed to load recent conversation context", recentError);
+      }
+
       // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用。`?debugLog=1`が
       // 無い場合は即returnするため（conversationDebugLog.ts参照）、通常のユーザーには
       // 一切影響しない。会話送信そのものを待たせない・失敗させないためvoidで発火するだけにする。
@@ -2412,6 +2429,15 @@ export default function ChatScreen() {
         vaultBackend: getVaultBackend(),
         vaultStatus,
         excludeConversationId: baseConversation.id,
+        recentConversation: recentConversation
+          ? {
+              id: recentConversation.id,
+              endedAt: recentConversation.endedAt,
+              elapsedMs: recentConversation.elapsedMs,
+              turnCount: recentConversation.turns.length,
+              approxChars: recentConversation.turns.reduce((sum, turn) => sum + turn.content.length, 0),
+            }
+          : null,
       });
 
       // chatだけは選択中provider（既定Gemini）を使う。他機能（Capture/Connect/Reflection/
@@ -2424,7 +2450,12 @@ export default function ChatScreen() {
           [AI_PROVIDER_HEADER]: chatProvider,
           ...(storedApiKey ? { [API_KEY_HEADER_BY_PROVIDER[chatProvider]]: storedApiKey } : {}),
         },
-        body: JSON.stringify({ persona: activePersona, turns: updated.turns, retrievedMemories }),
+        body: JSON.stringify({
+          persona: activePersona,
+          turns: updated.turns,
+          retrievedMemories,
+          ...(recentConversation ? { recentConversation } : {}),
+        }),
       });
 
       if (!res.ok || !res.body) {

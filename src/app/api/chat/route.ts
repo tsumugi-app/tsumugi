@@ -756,9 +756,9 @@ ${buildWebSearchSection(searchAvailable)}
 ### 一貫性
 会話の中でユーザーが述べた前提や発言を保持する。過去の発言と矛盾する解釈を不用意に出さない。
 
-現在のConversation turnsとRetrieved Memoriesに含まれる範囲は、AIとユーザーが既に共有して
-きた文脈として扱ってよい。それ以外（Retrieved Memoriesに書かれていない過去の詳細）は
-推測しない。
+現在のConversation turns・「直前の会話」（提示されている場合）・Retrieved Memoriesに
+含まれる範囲は、AIとユーザーが既に共有してきた文脈として扱ってよい。それ以外
+（これらに書かれていない過去の詳細）は推測しない。
 
 主役は常に現在のユーザー発言である。過去のMemoryへ現在の発言を無理に引っ張らない。ただし、
 「関連する過去の記憶」に十分関連性のあるMemoryが実際に提示されている場合は、現在の発言を
@@ -928,10 +928,11 @@ Memoryを使う場合も、今の会話の文脈との整合性を優先する�
 ## その他の大切な姿勢
 - ユーザーは何かを「入力」しているのではなく、ただ話しているだけだと感じられるようにする
 - 構造化された回答や箇条書きを強制せず、自然な会話として応答する
-- ユーザーの人生の詳細のうち、今回のConversation turnsとRetrieved Memoriesに含まれていない
-  部分は、まだこの会話の中には無い。Retrieved Memoriesが実際に渡されている場合は、その範囲に
-  ついては「以前からこの話を知っている」という前提で応答してよい。存在しない記憶を作り出したり、
-  Retrieved Memoriesに書かれていない過去の詳細を聞いたかのように装ったりしない
+- ユーザーの人生の詳細のうち、今回のConversation turns・「直前の会話」（提示されている場合）・
+  Retrieved Memoriesのいずれにも含まれていない部分は、まだこの会話の中には無い。「直前の会話」や
+  Retrieved Memoriesが実際に渡されている場合は、その範囲については「すでに知っている・共有済み」
+  という前提で応答してよい。存在しない記憶を作り出したり、これらに書かれていない過去の詳細を
+  聞いたかのように装ったりしない
 - 簡潔に。ただし「簡潔」と「浅い」は違う。短くても、考えた跡が伝わる返答にする
 `;
 }
@@ -950,17 +951,19 @@ Memoryを使う場合も、今の会話の文脈との整合性を優先する�
  * 限って明確にbudget不足がcontinuity表示を阻害していたことを確認済み。そのため、
  * 「今回、Retrieved MemoriesがLLM contextへ実際に含まれているか」をhasRetrievedMemories
  * として追加し、その場合だけ最低512を保証する（`Math.max(baseBudget, 512)`）。
- * Memoryが無い（hasRetrievedMemories=false）ターンは、既存の文字数ベース計算を
- * 一切変更しない。既存の上限（長文で768）もMath.maxにより自然に維持される
- * （768 > 512なので長文+Memoryありでも768のまま、下がることはない）。
+ * Recent Conversation Continuity v1：直前Conversationの逐語がcontextに含まれるターンも
+ * 同様に「継続の理解」へ思考予算が要るため、hasRecentConversationでも同じfloorを適用する。
+ * どちらも無い（hasRetrievedMemories=false かつ hasRecentConversation=false）ターンは、
+ * 既存の文字数ベース計算を一切変更しない。既存の上限（長文で768）もMath.maxにより
+ * 自然に維持される（768 > 512なので長文でもfloorで下がることはない）。
  */
 function computeThinkingBudget(
   latestUserMessage: string,
-  options?: { hasRetrievedMemories?: boolean }
+  options?: { hasRetrievedMemories?: boolean; hasRecentConversation?: boolean }
 ): number {
   const length = latestUserMessage.length;
   const baseBudget = length < 120 ? 128 : length < 400 ? 384 : 768;
-  if (options?.hasRetrievedMemories) {
+  if (options?.hasRetrievedMemories || options?.hasRecentConversation) {
     return Math.max(baseBudget, 512);
   }
   return baseBudget;
@@ -1252,6 +1255,58 @@ Relevant Memoryが存在することと、それを実際に会話へ出すこ�
 ひねり出さず、素直に「記録には見当たらない」と伝えてよい。${buildLinkReasonSection(memories)}${buildOriginMemorySection(memories)}`;
 }
 
+/**
+ * Recent Conversation Continuity v1（Current Conversation → Recent Conversation → Memory
+ * Retrieval の中間層）。クライアント（recentConversation.ts / ChatScreen.handleSend）が
+ * 「endedAtが現在時刻から6時間以内の直前Conversationの末尾6 turn」を組み立てて渡す
+ * optional field。これは永続スキーマではなく1リクエストごとに破棄される。
+ *
+ * 重要な設計方針：
+ * - この逐語履歴を「現在のConversation turns」へ混ぜない（providerTurnsにも過去turnとして
+ *   混ぜない）。systemInstruction内の独立セクションとしてのみ提示する。
+ * - 「直前の会話」と「Retrieved Memories（長期的に保存された記憶）」を混同させない。
+ *   前者は要約されていない逐語、後者は要約済みの長期記憶。
+ * - Phase 1で確立した「現在のユーザー発言が常に主役」「関連がなければ使わない」「渡されて
+ *   いない過去は推測しない」という原則をそのまま踏襲する（下の文言もそれに揃える）。
+ */
+interface RecentConversationInput {
+  id: string;
+  endedAt: string;
+  elapsedMs: number;
+  turns: Array<{ role: "user" | "assistant"; content: string; timestamp?: string }>;
+}
+
+function buildRecentConversationSection(recent: RecentConversationInput | undefined): string {
+  if (!recent || recent.turns.length === 0) return "";
+
+  const elapsedMinutes = Number.isFinite(recent.elapsedMs) ? Math.max(1, Math.round(recent.elapsedMs / 60000)) : null;
+  const elapsedLabel = elapsedMinutes === null ? "" : `（約${elapsedMinutes}分前まで）`;
+
+  const transcript = recent.turns
+    .map((turn) => `${turn.role === "user" ? "ユーザー" : "Tsumugi"}：${turn.content}`)
+    .join("\n");
+
+  return `
+
+## 直前の会話${elapsedLabel}
+
+これは、少し前にユーザーと実際に交わした直前の会話の末尾の一部です。今開いている会話とは
+別のセッションだが、時間的には直前にあたる。**要約された長期記憶（下の「関連する過去の記憶」）
+とは別物であり、要約されていない逐語のやり取りそのものである。**
+
+${transcript}
+
+- ユーザーが「さっき」「さっきの◯◯」「前の話」「続き」「覚えてる？」のように直前の会話を
+  参照した場合、この内容に根拠があれば、すでに共有された文脈として自然に続きを話してよい。
+- 明示的な参照が無くても、今回の発言がこの直前の会話の延長線上にあると自然に読み取れる場合は、
+  理解の材料として使ってよい。
+- ただし今回の発言がこの直前の会話と関係が無い場合は、無理に持ち出さない（Retrieved Memories
+  と同じ判断基準）。「さっき◯◯と言っていましたね」と毎回説明することが目的ではなく、返答の
+  理解が自然に深くなることを優先する。
+- この逐語に書かれていないことを、推測で「覚えている」と言わない。ここにもRetrieved Memories
+  にも根拠が無い過去について「さっき話した」と話を作らない。`;
+}
+
 export async function POST(request: Request) {
   // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。クライアントが明示指定
   // していればそれを最終的なproviderとして使い、無ければ従来通りfeatureベースの
@@ -1266,10 +1321,11 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
+    recentConversation?: RecentConversationInput;
   };
 
   if (!turns || turns.length === 0) {
@@ -1309,7 +1365,8 @@ export async function POST(request: Request) {
     persona === "analyst" && retrievedMemoriesSection
       ? `
 
-このセクションに含まれるMemoryだけが、今回「過去のユーザー情報」として利用できる。
+今回「過去のユーザー情報」として利用してよいのは、このセクションのMemoryと、
+（提示されている場合は）上の「直前の会話」セクションの逐語だけである。現在のセッションの
 会話履歴（contents）は会話の流れを理解するためだけに使い、その中の過去のmodel発言
 （AI自身の提案・解釈・仮説）を、ユーザー自身の過去の経験・興味・事実として再利用しない。
 ここに存在しない過去情報を会話履歴から補完しない。
@@ -1361,15 +1418,22 @@ export async function POST(request: Request) {
 ===`
     : "";
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  // Recent Conversation Continuity v1：直前Conversationの逐語を独立セクションとして渡す。
+  // 現在のturns（providerTurns）へは混ぜない。memoriesSectionForPersonaの直後、
+  // webSearchInstructionの前に置く（「直前の会話」→「関連する過去の記憶」の順で提示済み）。
+  const recentConversationSection = buildRecentConversationSection(recentConversation);
 
-  // hasRetrievedMemories判定は、retrievedMemories.lengthのような取得件数ではなく、
-  // 実際にsystemInstructionへ渡ったMemory section（`retrievedMemoriesSection`。
-  // 時間依存フィルタ等で最終的に0件になった場合は空文字列）の有無を基準にする。
-  // 全persona共通で使われるsectionのため、companion/coach/analystいずれのターンでも
-  // 同じ基準で最低budgetを保証する（persona別の特別扱いは今回追加しない）。
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${recentConversationSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+
+  // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
+  // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection`。
+  // フィルタ等で最終的に空文字列になった場合は対象外）の有無を基準にする。
+  // 全persona共通のsectionのため、companion/coach/analystいずれのターンでも同じ基準で
+  // 最低budgetを保証する（persona別の特別扱いは今回追加しない）。Recent Conversationが
+  // あるターンも、Memoryがあるターンと同様に「継続の理解」に思考予算が要るため floor 512 とする。
   const thinkingBudget = computeThinkingBudget(latestUserMessage, {
     hasRetrievedMemories: retrievedMemoriesSection.length > 0,
+    hasRecentConversation: recentConversationSection.length > 0,
   });
 
   // Test 13：記録形式のAIターンがあった場合、そのターンの実本文（Markdown記録）を
