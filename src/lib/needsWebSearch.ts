@@ -42,6 +42,25 @@ const STRONG_TRIGGERS = [
   "価格",
   "値段",
   "現在の価格",
+  // 商品・作品・イベント等の「新しさ／すでに世に出たこと」を指す語。名称だけから内容を
+  // 推測して「知っている」ように話すのを防ぐため、これ単独でも現在の外部情報が必要と判定する。
+  "新型",
+  "新作",
+  "新製品",
+  "新モデル",
+  "リニューアル",
+  "発表された",
+  "発表され",
+  "発売された",
+  "公開された",
+  "開催された",
+  "リリースされ",
+  "もう発表",
+  "もう発売",
+  "もう公開",
+  "もう出た",
+  "既に発売",
+  "すでに発売",
 ];
 
 const WEAK_TRIGGERS = [
@@ -66,7 +85,61 @@ const WEAK_TRIGGERS = [
   "デート",
   "外出",
   "イベント",
+  // 現在性を示すが日常会話にも出る語。質問・要求の形（INTENT_MARKERS）を伴うときだけ検索を要すると判定する。
+  "新しい",
+  "今度",
+  "今年",
+  "去年",
+  "昨年",
 ];
+
+/**
+ * 「特定の作品・商品・イベント・企画の、具体的な一実施・一巻・一回」を指す語。
+ * 一般的な対象への雑談（「ハンターハンターってどう思う？」「ガンダムで一番好きなMSは？」）には
+ * 出ず、「39巻の渋谷ジャック」「昨日のイベント」「このキャンペーン」のような具体性のある
+ * 質問にだけ出る。これ＋INTENT_MARKERS（質問・評価要求の形）のときに、その企画・巻の
+ * 実際の内容を尋ねている可能性が高いと判断し、名称から中身を推測させず検索を優先する。
+ * 「この前の彼女の話」のような Recent Conversation / Topic 的な言及は、これらの語を含まないため
+ * 誤検出しない（「こないだ」「この前」等の時間語自体はここでもWEAK_TRIGGERSでも扱わない）。
+ */
+const SPECIFIC_INSTANCE_MARKERS = [
+  "コラボ",
+  "キャンペーン",
+  "フェア",
+  "ジャック", // 「渋谷ジャック」「駅ジャック」等の広告・空間ジャック企画
+  "新刊",
+  "最新刊",
+  "新曲",
+  "新譜",
+  "新番組",
+  "特番",
+  "催し",
+  "原画展",
+];
+
+/** 数字＋巻/話/号/期/章（「39巻」「最終話」ではなく数字前提。「この前の話」等は数字が無いので当たらない）。 */
+const NUMBERED_INSTALLMENT_PATTERN = /[0-9０-９]+\s*[巻話号期章]/;
+
+/**
+ * ユーザーがAIの述べた事実を訂正しているらしい短い発言（「それ違うよ」「全然違う」
+ * 「AじゃなくてBだよ」等）。会話履歴は参照しないが、こうした短い訂正は多くの場合
+ * 「AIの古い知識・推測が現実と食い違っている」合図なので、Webで確認可能な話題であれば
+ * 推測で会話を続けず確認してから戻れるよう、検索を要すると判定する。
+ * 「私の気持ちとは全然違う」等の長文中の語まで拾わないよう、短い発言のときだけ適用する。
+ * （「もう発表されたよ」等は上のSTRONG_TRIGGERS側で拾う。）
+ */
+const CORRECTION_MARKERS = [
+  "違うよ",
+  "違います",
+  "じゃなくて",
+  "じゃなく",
+  "そうじゃなく",
+  "そうじゃない",
+  "間違って",
+  "間違い",
+  "全然違",
+];
+const CORRECTION_MAX_LEN = 18;
 
 /**
  * 「今」は「現在」を表す語として拾いたいが、「今回」のような別の意味の語には反応させない。
@@ -119,13 +192,24 @@ export function needsWebSearch(text: string): boolean {
   const hasStrongTrigger = STRONG_TRIGGERS.some((word) => trimmed.includes(word));
   if (hasStrongTrigger) return true;
 
+  if (trimmed.length <= CORRECTION_MAX_LEN && CORRECTION_MARKERS.some((word) => trimmed.includes(word))) {
+    return true;
+  }
+
   const hasReferenceWord = REFERENCE_WORDS.some((word) => trimmed.includes(word));
   const hasFollowupWord = CURRENT_INFO_FOLLOWUP_WORDS.some((word) => trimmed.includes(word));
   if (hasReferenceWord && hasFollowupWord) return true;
 
+  const hasIntentMarker = INTENT_MARKERS.some((marker) => trimmed.includes(marker));
+
+  // 「特定の巻・企画・キャンペーン等」＋「質問・評価要求の形」＝その実際の内容を尋ねている
+  // 可能性が高い。一般的な対象への雑談（SPECIFIC_INSTANCE_MARKERSを含まない）はここを通らない。
+  const hasSpecificInstance =
+    NUMBERED_INSTALLMENT_PATTERN.test(trimmed) || SPECIFIC_INSTANCE_MARKERS.some((word) => trimmed.includes(word));
+  if (hasSpecificInstance && hasIntentMarker) return true;
+
   const hasWeakTrigger = NOW_PATTERN.test(trimmed) || WEAK_TRIGGERS.some((word) => trimmed.includes(word));
   if (!hasWeakTrigger) return false;
 
-  const hasIntentMarker = INTENT_MARKERS.some((marker) => trimmed.includes(marker));
   return hasIntentMarker;
 }
