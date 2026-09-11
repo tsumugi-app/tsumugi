@@ -61,6 +61,24 @@ const STRONG_TRIGGERS = [
   "もう出た",
   "既に発売",
   "すでに発売",
+  // 明示的な検索要求。これ自体が「AIの内部知識ではなく外部で確認してほしい」という合図。
+  "調べて",
+  "調べてみて",
+  "調べ直し",
+  "検索して",
+  "ぐぐって",
+  "ググって",
+  "確認して",
+  "確認してみて",
+  "見てみて",
+  "ちゃんと調べ",
+  "もう一度調べ",
+  // 現在価格・中古相場を尋ねる語（それ自体が「今いくら」を指す）。
+  "中古価格",
+  "中古相場",
+  "いくらくらい",
+  "いくらぐらい",
+  "おいくら",
 ];
 
 const WEAK_TRIGGERS = [
@@ -91,7 +109,60 @@ const WEAK_TRIGGERS = [
   "今年",
   "去年",
   "昨年",
+  "中古",
+  "相場",
+  "安くなって",
+  "値下がり",
+  "値下げ",
+  "現行モデル",
+  "現行機",
+  "ラインナップ",
 ];
+
+/**
+ * 特定の実在人物・会社・製品について「それが何者か／どこか／いくらか／存在するか」という
+ * 具体的な外部事実を尋ねる語。INTENT_MARKERSを伴うときに検索を要すると判定する。
+ * 「中野優作が気になる」「サイサリスかっこいい」のように固有名詞が出るだけでは当たらず、
+ * 「中野優作ってなんの人？」「今どこの会社？」「このスマホいくら？」のような具体的な
+ * 外部事実の要求のときだけ拾う。
+ */
+const EXTERNAL_FACT_QUERY_MARKERS = [
+  "なんの人",
+  "何の人",
+  "なにしてる人",
+  "何してる人",
+  "何者",
+  "どこの会社",
+  "どこ所属",
+  "現在の役職",
+  "今の役職",
+  "何て会社",
+  "発売されてる",
+  "発売してる",
+  "もう出てる",
+  "まだ出てる",
+  "存在する",
+];
+
+/**
+ * ユーザーが「現在、具体的な型番の製品が存在する／現行である」と主張している表現。
+ * 型番の言及そのもの（「15T使ってる」等）だけでは当たらず、存在・現行であることを
+ * 主張する言い方（「今17Tあるじゃん」「もう出てるよ」「現行だよね」等）と型番らしい語
+ * （数字＋英字、または英字＋数字）が両方そろったときだけ、内部知識だけで真偽を
+ * 断定させず検索対象にする。
+ */
+const CURRENT_LINEUP_ASSERTION_MARKERS = [
+  "あるじゃん",
+  "あるよね",
+  "出てるじゃん",
+  "出てるよ",
+  "現行だよね",
+  "現行でしょ",
+  "現行じゃん",
+];
+
+/** 型番らしい語（「17T」「15T」「Pro3」等、数字と英字が連続する短い語）。 */
+const MODEL_TOKEN_PATTERN = /[0-9０-９]+[A-Za-zＡ-Ｚａ-ｚ]+|[A-Za-zＡ-Ｚａ-ｚ]+[0-9０-９]+/;
 
 /**
  * 「特定の作品・商品・イベント・企画の、具体的な一実施・一巻・一回」を指す語。
@@ -138,6 +209,13 @@ const CORRECTION_MARKERS = [
   "間違って",
   "間違い",
   "全然違",
+  // AIの「存在する／した」という前提への訂正（「16Tなんて出てないけど」「そんなの無い」）
+  "なんて出て",
+  "なんてない",
+  "そんなの無い",
+  "そんなのない",
+  "存在しない",
+  "その人じゃない",
 ];
 const CORRECTION_MAX_LEN = 18;
 
@@ -201,6 +279,15 @@ export function needsWebSearch(text: string): boolean {
   if (hasReferenceWord && hasFollowupWord) return true;
 
   const hasIntentMarker = INTENT_MARKERS.some((marker) => trimmed.includes(marker));
+
+  // 実在人物・会社・製品について「何者か／どこか／存在するか」という具体的な外部事実を尋ねている。
+  const hasExternalFactQuery = EXTERNAL_FACT_QUERY_MARKERS.some((word) => trimmed.includes(word));
+  if (hasExternalFactQuery && hasIntentMarker) return true;
+
+  // 「型番らしい語」＋「現在存在する／現行だと主張する言い方」＝ユーザーが現在のラインナップの
+  // 存在を主張している。型番の言及だけ（「15T使ってる」）ではここを通らない。
+  const hasCurrentLineupAssertion = CURRENT_LINEUP_ASSERTION_MARKERS.some((word) => trimmed.includes(word));
+  if (hasCurrentLineupAssertion && MODEL_TOKEN_PATTERN.test(trimmed)) return true;
 
   // 「特定の巻・企画・キャンペーン等」＋「質問・評価要求の形」＝その実際の内容を尋ねている
   // 可能性が高い。一般的な対象への雑談（SPECIFIC_INSTANCE_MARKERSを含まない）はここを通らない。
