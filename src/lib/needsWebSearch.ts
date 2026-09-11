@@ -25,6 +25,14 @@
  *
  * 過去の出来事の相談、Memory/Tsumugi自体についての相談、一般的な知識の質問、創作の依頼などは、
  * これらの語を含まない限り自然にfalseになる（個別の除外リストは持たない）。
+ *
+ * 例外として一つだけ、会話状態を最小限参照する。「この人のこと教えて」のように、latestUserMessage
+ * 自身には対象の固有名詞が無く、指示語（この人・この会社・それ等）で直前の対象を参照しながら
+ * 外部事実を求めている発言は、latestUserMessage単体では誰・何についてか解決できない。この場合に
+ * 限り、呼び出し側（route.ts）から「今のConversationに、今回のユーザー発言より前のturnsが
+ * 存在するか」という1個のbooleanだけを受け取り、それが無ければ（＝新規Conversationでの単発の
+ * 発言）検索対象にしない（対象を特定できないまま検索させない。Recent Conversationや Retrieved
+ * Memoriesはここでは一切参照しない）。
  */
 
 const STRONG_TRIGGERS = [
@@ -142,6 +150,73 @@ const EXTERNAL_FACT_QUERY_MARKERS = [
   "もう出てる",
   "まだ出てる",
   "存在する",
+];
+
+/**
+ * 「この人」「この会社」等、直前の対象を指示語で受けている語。これ単独では検索対象にせず、
+ * EXTERNAL_FACT_REQUEST_VERBSと組み合わさり、かつ会話に前turnsが存在するときだけ使う。
+ */
+const REFERENCE_TARGET_MARKERS = [
+  "この人",
+  "このひと",
+  "この人物",
+  "この方",
+  "この会社",
+  "この企業",
+  "この製品",
+  "この商品",
+  "この機種",
+  "このモデル",
+  "こいつ",
+  "それ",
+  "あれ",
+];
+
+/**
+ * 対象の外部事実（経歴・所属・詳細）を説明してほしいという要求そのものを表す語。
+ * EXTERNAL_FACT_QUERY_MARKERSで拾いきれない、より一般的な「教えて」「知ってる？」
+ * 「詳しく知りたい」等の言い方をここに持つ。
+ */
+const EXTERNAL_FACT_REQUEST_VERBS = [
+  "教えて",
+  "詳しく知りたい",
+  "経歴は",
+  "知ってる",
+  "知ってます",
+  "どんな会社",
+  "どういう会社",
+  "どんな人",
+  "どういう人",
+  "どんな製品",
+  "どういう製品",
+  "どんな機種",
+  "どういう機種",
+];
+
+/**
+ * 対象が同じ発言内に直接書かれていて（指示語の解決も、会話の前turnsも必要としない）、かつ
+ * 明確に説明・外部事実を求めている言い方。「について」「って」で対象を受けたあと、教えて・
+ * 詳しく・どんな等の明確な説明要求が続く場合だけ拾う。「◯◯について」「◯◯が気になる」の
+ * ように話題を提示しただけで止まる発言はここに当たらない（REFERENCE_TARGET_MARKERS＋
+ * EXTERNAL_FACT_REQUEST_VERBSの組み合わせと違い、指示語も前turnsも不要＝latestUserMessage
+ * 単体で解決できるため、下のcheckは単独で成立する）。
+ */
+const EXPLICIT_EXPLANATION_REQUEST_MARKERS = [
+  "について教えて",
+  "についてもっと教えて",
+  "について詳しく",
+  "ってどんな人",
+  "ってどういう人",
+  "って何してる人",
+  "ってなにしてる人",
+  "ってどんな会社",
+  "ってどういう会社",
+  "ってどんな製品",
+  "ってどういう製品",
+  "ってどんな機体",
+  "ってどういう機体",
+  "設定上どんな",
+  "詳しく知りたい",
 ];
 
 /**
@@ -263,7 +338,7 @@ const CURRENT_INFO_FOLLOWUP_WORDS = ["何時", "いつ", "どこ", "予約"];
  * 追加すべきかを判定する。会話履歴やConversationの状態は一切参照しない
  * （毎ターン、渡された文字列単体だけで再計算する）。
  */
-export function needsWebSearch(text: string): boolean {
+export function needsWebSearch(text: string, hasPriorConversationContext = false): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
 
@@ -271,6 +346,13 @@ export function needsWebSearch(text: string): boolean {
   if (hasStrongTrigger) return true;
 
   if (trimmed.length <= CORRECTION_MAX_LEN && CORRECTION_MARKERS.some((word) => trimmed.includes(word))) {
+    return true;
+  }
+
+  // 対象が同じ発言内に直接書かれた状態で、明確に説明・外部事実を求めている
+  // （「について」「気になる」だけで止まる話題提示とは区別する）。指示語の解決も
+  // 会話の前turnsも不要なため、単独で検索対象と判定してよい。
+  if (EXPLICIT_EXPLANATION_REQUEST_MARKERS.some((word) => trimmed.includes(word))) {
     return true;
   }
 
@@ -283,6 +365,14 @@ export function needsWebSearch(text: string): boolean {
   // 実在人物・会社・製品について「何者か／どこか／存在するか」という具体的な外部事実を尋ねている。
   const hasExternalFactQuery = EXTERNAL_FACT_QUERY_MARKERS.some((word) => trimmed.includes(word));
   if (hasExternalFactQuery && hasIntentMarker) return true;
+
+  // 「この人／それ等の指示語」＋「教えて／知ってる？等の外部事実の要求」＝latestUserMessage
+  // 単体では対象を解決できないが、外部事実を求めている。会話に前turnsが無ければ（新規
+  // Conversationでの単発発言）対象を特定できないため検索対象にしない。
+  const hasReferenceTarget = REFERENCE_TARGET_MARKERS.some((word) => trimmed.includes(word));
+  const hasExternalFactRequest =
+    hasExternalFactQuery || EXTERNAL_FACT_REQUEST_VERBS.some((word) => trimmed.includes(word));
+  if (hasReferenceTarget && hasExternalFactRequest && hasPriorConversationContext) return true;
 
   // 「型番らしい語」＋「現在存在する／現行だと主張する言い方」＝ユーザーが現在のラインナップの
   // 存在を主張している。型番の言及だけ（「15T使ってる」）ではここを通らない。
