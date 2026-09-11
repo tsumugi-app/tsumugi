@@ -220,6 +220,32 @@ const EXPLICIT_EXPLANATION_REQUEST_MARKERS = [
 ];
 
 /**
+ * 対象の名前を省略し、「どんな人だっけ？」のように会話の流れだけで対象を指しながら、
+ * その正体・性質を尋ねる言い方。指示語（この人・それ等）も対象の名前も無いため、
+ * REFERENCE_TARGET_MARKERSにもEXPLICIT_EXPLANATION_REQUEST_MARKERSにも当たらない。
+ * 「だっけ」を単独のトリガーにはせず、あくまでこの意味的なカテゴリ（対象の正体・性質を
+ * 尋ねる語）＋会話に前turnsが存在するとき（＝何かを指している可能性がある）だけ使う。
+ * 「昨日何食べたっけ？」「さっき何話したっけ？」等、対象の正体を尋ねていない想起系の
+ * 発言はこのリストに含まれる語を持たないため当たらない。
+ */
+const BARE_IDENTITY_QUESTION_MARKERS = [
+  "どんな人",
+  "どういう人",
+  "何してる人",
+  "なにしてる人",
+  "何者",
+  "どんな会社",
+  "どういう会社",
+  "何の会社",
+  "どんな製品",
+  "どういう製品",
+  "どんな機体",
+  "どういう機体",
+  "どんな機種",
+  "どういう機種",
+];
+
+/**
  * ユーザーが「現在、具体的な型番の製品が存在する／現行である」と主張している表現。
  * 型番の言及そのもの（「15T使ってる」等）だけでは当たらず、存在・現行であることを
  * 主張する言い方（「今17Tあるじゃん」「もう出てるよ」「現行だよね」等）と型番らしい語
@@ -373,6 +399,11 @@ export function needsWebSearch(text: string, hasPriorConversationContext = false
   const hasExternalFactRequest =
     hasExternalFactQuery || EXTERNAL_FACT_REQUEST_VERBS.some((word) => trimmed.includes(word));
   if (hasReferenceTarget && hasExternalFactRequest && hasPriorConversationContext) return true;
+
+  // 対象の名前も指示語も省略し、会話の流れだけで対象を指しながら正体・性質を尋ねている
+  // （「どんな人だっけ？」等）。会話に前turnsが無ければ対象を特定できないため検索対象にしない。
+  const hasBareIdentityQuestion = BARE_IDENTITY_QUESTION_MARKERS.some((word) => trimmed.includes(word));
+  if (hasBareIdentityQuestion && hasPriorConversationContext) return true;
 
   // 「型番らしい語」＋「現在存在する／現行だと主張する言い方」＝ユーザーが現在のラインナップの
   // 存在を主張している。型番の言及だけ（「15T使ってる」）ではここを通らない。
