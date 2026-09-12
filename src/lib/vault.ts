@@ -812,7 +812,11 @@ async function collectVaultMarkdown(
   dir: FileSystemDirectoryHandle,
   folderName: string,
   insideTarget = false,
-  depth = 0
+  depth = 0,
+  // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。対象フォルダ内で
+  // 見つかった候補ファイルに単純な連番を振るためだけの共有カウンタ（再帰呼び出し間で
+  // 共有するためオブジェクト参照で渡す）。ファイル名・パスは持たない。
+  sequenceRef: { value: number } = { value: 0 }
 ): Promise<string[]> {
   if (!insideTarget && depth > FOLDER_SEARCH_MAX_DEPTH) return [];
 
@@ -830,14 +834,78 @@ async function collectVaultMarkdown(
 
     if (handle.kind === "directory") {
       const nowInsideTarget = insideTarget || name === folderName;
-      contents.push(...(await collectVaultMarkdown(handle, folderName, nowInsideTarget, depth + 1)));
+      contents.push(...(await collectVaultMarkdown(handle, folderName, nowInsideTarget, depth + 1, sequenceRef)));
       continue;
     }
 
     if (!insideTarget || !name.endsWith(".md")) continue;
-    if (!(await isLikelyTsumugiFile(handle))) continue;
-    const file = await handle.getFile();
-    contents.push(await file.text());
+
+    // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。対象フォルダ内の
+    // 候補ファイルについて、probe（isLikelyTsumugiFile）→getFile→file.textの各段階を
+    // 個別に計測する。ファイル名・パス・本文は一切出さず、連番（sequenceNumber）と
+    // 所要時間・サイズだけを記録する。catchは全てログ出力後に必ず同じ例外を再throwし、
+    // 既存の分岐・戻り値・エラー伝播は変更しない。
+    const seq = ++sequenceRef.value;
+
+    logTimingEvent("Vault probeFile:start", { target: folderName, sequenceNumber: seq });
+    const probeStart = Date.now();
+    let likely: boolean;
+    try {
+      likely = await isLikelyTsumugiFile(handle);
+    } catch (error) {
+      logTimingEvent("Vault probeFile:error", { target: folderName, sequenceNumber: seq });
+      throw error;
+    }
+    logTimingEvent("Vault probeFile:end", {
+      target: folderName,
+      sequenceNumber: seq,
+      durationMs: Date.now() - probeStart,
+      likely: likely ? 1 : 0,
+    });
+    if (!likely) continue;
+
+    logTimingEvent("Vault readFile:start", { target: folderName, sequenceNumber: seq });
+    const readStart = Date.now();
+
+    logTimingEvent("Vault getFile:start", { target: folderName, sequenceNumber: seq });
+    const getFileStart = Date.now();
+    let file: File;
+    try {
+      file = await handle.getFile();
+    } catch (error) {
+      logTimingEvent("Vault getFile:error", { target: folderName, sequenceNumber: seq });
+      throw error;
+    }
+    logTimingEvent("Vault getFile:end", {
+      target: folderName,
+      sequenceNumber: seq,
+      durationMs: Date.now() - getFileStart,
+      sizeBytes: file.size,
+    });
+
+    logTimingEvent("Vault fileText:start", { target: folderName, sequenceNumber: seq });
+    const textStart = Date.now();
+    let text: string;
+    try {
+      text = await file.text();
+    } catch (error) {
+      logTimingEvent("Vault fileText:error", { target: folderName, sequenceNumber: seq });
+      throw error;
+    }
+    logTimingEvent("Vault fileText:end", {
+      target: folderName,
+      sequenceNumber: seq,
+      durationMs: Date.now() - textStart,
+    });
+
+    logTimingEvent("Vault readFile:end", {
+      target: folderName,
+      sequenceNumber: seq,
+      durationMs: Date.now() - readStart,
+      sizeBytes: file.size,
+    });
+
+    contents.push(text);
   }
   logTimingEvent("Vault collectDir:exit", {
     target: folderName,
