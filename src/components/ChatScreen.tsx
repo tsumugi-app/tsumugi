@@ -147,6 +147,18 @@ export interface RestoreCandidate {
   newCount: number;
 }
 
+/**
+ * Android Vault起動高速化（missing-only auto import）：restore candidate scanが
+ * どの経路から開始されたかを表す。"startup"（通常起動時のbackground scan）だけは
+ * 無言のauto importを許可しない（無操作のまま端末が勝手にIndexedDBへ書き込むことを
+ * 避けるため）。それ以外（"connect"＝handleConnectVaultの同一Vault再接続・別Vault
+ * 明示選択、"reauthorize"＝handleReauthorizeVault、"recovery"＝
+ * recoverFromIncompleteSwitch）は、いずれもユーザーの明示的な操作
+ * （フォルダ選択・再許可クリック）を起点とするscanのため、missing recordsのみの
+ * auto importを許可する対象にする。
+ */
+type RestoreScanTrigger = "startup" | "connect" | "reauthorize" | "recovery";
+
 /** 1回のアプリ起動あたり、未Connect Memoryをまとめて処理する上限（AI呼び出し回数のクォータ保護）。 */
 const STARTUP_CONNECT_LIMIT = 3;
 
@@ -975,7 +987,10 @@ export default function ChatScreen() {
   /**
    * STORAGE.md §2.4 Rebuildability Guarantee。Vault接続直後（初回接続・変更どちらも、
    * および起動時の自動再接続）に、IndexedDBがまだ知らない記憶がVault側のMarkdownに
-   * 存在するかを確認する。見つかっても自動では復元しない（ユーザーの確認を挟む）。
+   * 存在するかを確認する。通常起動時のbackground scan（trigger==="startup"）では
+   * 見つかっても自動では復元せずユーザーの確認を挟む。それ以外（ユーザーの明示操作を
+   * 起点とするscan）では、既存IDに一切触れないmissing recordsのみ自動反映する
+   * （詳細はcheckForRestoreCandidateImpl内のコメント参照）。
    */
   /**
    * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
@@ -996,19 +1011,19 @@ export default function ChatScreen() {
    * （新しいcross-tab lockではない）。既にscanが実行中の場合は何もせず即座に返る
    * （二重にscanを開始しない。待ち合わせもしない＝呼び出し元をブロックしない）。
    */
-  async function startVaultRestoreScan(handle: FileSystemDirectoryHandle): Promise<void> {
+  async function startVaultRestoreScan(handle: FileSystemDirectoryHandle, trigger: RestoreScanTrigger): Promise<void> {
     if (vaultScanInFlightRef.current) return;
     vaultScanInFlightRef.current = true;
     try {
-      await checkForRestoreCandidate(handle);
+      await checkForRestoreCandidate(handle, trigger);
     } finally {
       vaultScanInFlightRef.current = false;
     }
   }
 
-  async function checkForRestoreCandidate(handle: FileSystemDirectoryHandle) {
+  async function checkForRestoreCandidate(handle: FileSystemDirectoryHandle, trigger: RestoreScanTrigger) {
     try {
-      await withVaultWorldRead(() => checkForRestoreCandidateImpl(handle));
+      await withVaultWorldRead(() => checkForRestoreCandidateImpl(handle, trigger));
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to scan vault for restore", error);
@@ -1016,36 +1031,67 @@ export default function ChatScreen() {
   }
 
   /**
-   * Android Vault起動高速化：scanVaultForRestoreで見つかった内容を実際にIndexedDBへ
-   * 書き込む、唯一の共通処理。手動restore（handleRestoreFromVault、ユーザーが
-   * 「復元する」を押した場合）・自動restore（checkForRestoreCandidateImpl内、
-   * target worldのIndexedDBが完全に空だった場合）の両方から呼ばれる。
+   * Android Vault起動高速化：Conversation/MemoryObject/Sourceの配列を、1件ずつ
+   * generationを再確認しながらIndexedDBへ書き込む、唯一の共通ループ処理。
    * 呼び出し元が既に適切なMemory World lock（withVaultWorldRead）を保持している
    * 前提で呼ぶこと（この関数自体は新しいlockを取得しない。ネスト回避のため）。
    * generationは呼び出し元がscan開始時点の値を渡すこと（このtask全体を通して
    * 一貫した値で比較するため）。
+   *
+   * 「どのレコードを渡すか」の判断（全件＝上書き許容 or 既存IDを除いたmissingのみ）は
+   * 一切ここでは行わない——呼び出し元（restoreScanToIndexedDB／
+   * autoImportMissingRecords）が渡す配列の中身だけに従う、純粋な書き込みループ。
    */
-  async function restoreScanToIndexedDB(
-    scan: VaultScanResult,
+  async function writeRecordsToIndexedDB(
+    records: Pick<VaultScanResult, "conversations" | "memoryObjects" | "sources">,
     generation: number
   ): Promise<{ status: "restored" | "stale" }> {
-    for (const restoredConversation of scan.conversations) {
+    for (const conversation of records.conversations) {
       if (generation !== vaultGenerationRef.current) return { status: "stale" };
-      await putConversation(restoredConversation);
+      await putConversation(conversation);
     }
-    for (const restoredMemoryObject of scan.memoryObjects) {
+    for (const memoryObject of records.memoryObjects) {
       if (generation !== vaultGenerationRef.current) return { status: "stale" };
-      await putMemoryObject(restoredMemoryObject);
+      await putMemoryObject(memoryObject);
     }
-    for (const restoredSource of scan.sources) {
+    for (const source of records.sources) {
       if (generation !== vaultGenerationRef.current) return { status: "stale" };
-      await saveSource(restoredSource);
+      await saveSource(source);
     }
     if (generation !== vaultGenerationRef.current) return { status: "stale" };
     return { status: "restored" };
   }
 
-  async function checkForRestoreCandidateImpl(handle: FileSystemDirectoryHandle) {
+  /**
+   * 手動restore（handleRestoreFromVault、ユーザーが「復元する」を押した場合）専用。
+   * 既存の挙動を一切変更しない：scan結果全体（既存IDと一致するものを含む）を
+   * そのままIndexedDBへ書き込む＝既存IDのレコードもVault側の内容で上書きされる、
+   * これまでのmanual restoreの仕様のまま（UIの確認文言「以前の記憶が見つかりました」＝
+   * 押した場合にVault側の内容を信頼して反映する、という既存の設計を変えないため）。
+   */
+  async function restoreScanToIndexedDB(
+    scan: VaultScanResult,
+    generation: number
+  ): Promise<{ status: "restored" | "stale" }> {
+    return writeRecordsToIndexedDB(scan, generation);
+  }
+
+  /**
+   * Android Vault起動高速化（missing-only auto import）：handleConnectVault・
+   * handleReauthorizeVault・recoverFromIncompleteSwitch等、ユーザーの明示操作を
+   * 起点とするscanでのみ使う自動反映専用処理。呼び出し元
+   * （checkForRestoreCandidateImpl）が、既存IndexedDBに無いレコードだけを
+   * 事前にフィルタして渡す前提——ここでは一切フィルタし直さない
+   * （既存IDのレコードは呼び出し元の時点で除外済みのため、絶対に上書きされない）。
+   */
+  async function autoImportMissingRecords(
+    missing: Pick<VaultScanResult, "conversations" | "memoryObjects" | "sources">,
+    generation: number
+  ): Promise<{ status: "restored" | "stale" }> {
+    return writeRecordsToIndexedDB(missing, generation);
+  }
+
+  async function checkForRestoreCandidateImpl(handle: FileSystemDirectoryHandle, trigger: RestoreScanTrigger) {
     // Vault境界の安全性（Codexレビュー指摘High-3対応）：scanもMemory Worldへ影響する
     // 非同期処理として追跡する（Vault切替時、この完了を待ってからIndexedDBをclearする）。
     // 旧Vault（A）由来の古いscan（起動時・再許可時等に開始したもの）が浮遊しないように
@@ -1062,15 +1108,16 @@ export default function ChatScreen() {
         getAllMemoryObjects(),
         getAllSources(),
       ]);
-      const existingIds = new Set([
-        ...existingConversations.map((c) => c.id),
-        ...existingMemoryObjects.map((m) => m.id),
-        ...existingSources.map((s) => s.id),
-      ]);
-      const newCount =
-        scan.conversations.filter((c) => !existingIds.has(c.id)).length +
-        scan.memoryObjects.filter((m) => !existingIds.has(m.id)).length +
-        scan.sources.filter((s) => !existingIds.has(s.id)).length;
+      // ストア単位で既存IDを判定する（Conversation/MemoryObject/Sourceは別ストアであり、
+      // 異なるストア間でIDが偶然一致しても互いに無関係のため、混ぜたSetで判定しない）。
+      const existingConversationIds = new Set(existingConversations.map((c) => c.id));
+      const existingMemoryObjectIds = new Set(existingMemoryObjects.map((m) => m.id));
+      const existingSourceIds = new Set(existingSources.map((s) => s.id));
+
+      const missingConversations = scan.conversations.filter((c) => !existingConversationIds.has(c.id));
+      const missingMemoryObjects = scan.memoryObjects.filter((m) => !existingMemoryObjectIds.has(m.id));
+      const missingSources = scan.sources.filter((s) => !existingSourceIds.has(s.id));
+      const newCount = missingConversations.length + missingMemoryObjects.length + missingSources.length;
 
       // 保険（generation check）：このscanが開始された後にVault世代が進んでいた場合
       // （＝旧Vault由来のscanが、待たれないまま切替後まで生き残っていた場合）、
@@ -1078,30 +1125,54 @@ export default function ChatScreen() {
       if (generation !== vaultGenerationRef.current) return;
 
       if (newCount > 0) {
-        // Android Vault起動高速化（Safe auto restore）：target world（IndexedDB）の
-        // Conversations/MemoryObjects/Sourcesが完全に0件で、かつVault scan側には
-        // 1件以上見つかっており、かつpending中のMemory World task・Vault write queueが
-        // 無い場合に限り、ユーザー確認を挟まず自動的にrestoreする。この3条件は
-        // 「新規/未使用の端末で既存Vaultフォルダを選んだ・再許可した」場合にのみ
-        // 揃う想定で、IndexedDB側に何か1件でも既存データがあれば必ず確認UI
-        // （setRestoreCandidate）へ回す（無言上書きのリスクが無い場合だけ自動化する）。
-        const targetWorldIsEmpty =
-          existingConversations.length === 0 && existingMemoryObjects.length === 0 && existingSources.length === 0;
-        const scanHasContent = scan.conversations.length > 0 || scan.memoryObjects.length > 0 || scan.sources.length > 0;
+        // Android Vault問題（missing-only auto import）：無言のauto importは、
+        // ユーザーの明示操作（フォルダ選択・再許可クリック）を起点とするscanでのみ
+        // 許可する。通常起動時のbackground scan（trigger==="startup"）では、
+        // IndexedDB側の状態に関わらず常に確認UI（setRestoreCandidate）へ回す
+        // ——端末が無操作のまま勝手にIndexedDBへ書き込むことを避けるため。
+        const autoImportAllowed = trigger !== "startup";
         const noPendingMemoryTasks = pendingMemoryTasksRef.current.size === 0;
-        const vaultWriteQueueSafe = targetWorldIsEmpty
-          ? !(await waitForVaultWrites(0)).timedOut
-          : false;
+        // Vault write queueの確認は、実際にauto importへ進む可能性がある場合だけ行う
+        // （不要な待機を避ける）。IndexedDBが空かどうかはもう条件にしない——
+        // 既存IDには一切触れないmissing-only書き込みのため、既存データの有無自体は
+        // 安全性に影響しない。
+        const vaultWriteQueueSafe =
+          autoImportAllowed && noPendingMemoryTasks ? !(await waitForVaultWrites(0)).timedOut : false;
+        const autoImportWillRun = autoImportAllowed && noPendingMemoryTasks && vaultWriteQueueSafe;
 
-        if (targetWorldIsEmpty && scanHasContent && noPendingMemoryTasks && vaultWriteQueueSafe) {
+        // Vault再接続時の取り込み判定を確認する診断ログ。件数・起動経路・判定値のみを
+        // 記録し、id・summary・content・filename等の個人データは含めない。
+        logTimingEvent("Restore candidate:evaluate", {
+          trigger,
+          existingConversations: existingConversations.length,
+          existingMemoryObjects: existingMemoryObjects.length,
+          existingSources: existingSources.length,
+          scanConversations: scan.conversations.length,
+          scanMemoryObjects: scan.memoryObjects.length,
+          scanSources: scan.sources.length,
+          newCount,
+          missingConversations: missingConversations.length,
+          missingMemoryObjects: missingMemoryObjects.length,
+          missingSources: missingSources.length,
+          autoImportAllowed: String(autoImportAllowed),
+          autoImportWillRun: String(autoImportWillRun),
+        });
+
+        if (autoImportWillRun) {
           // generationはここまでの非同期処理を経ても変わっていないかを再確認してから
-          // 実際の書き込みへ進む（restoreScanToIndexedDB自身も1件ごとに再確認する）。
+          // 実際の書き込みへ進む（autoImportMissingRecords自身も1件ごとに再確認する）。
           if (generation !== vaultGenerationRef.current) return;
-          const outcome = await restoreScanToIndexedDB(scan, generation);
+          const outcome = await autoImportMissingRecords(
+            { conversations: missingConversations, memoryObjects: missingMemoryObjects, sources: missingSources },
+            generation
+          );
           if (outcome.status === "restored") {
             setRestoreStatus("done");
             bumpHistoryRefreshToken();
           }
+          // missing recordsを全て取り込めた場合（stale以外）は、restoreCandidateを
+          // 一切設定しない＝確認UIを出さない。staleだった場合も、古いgeneration由来の
+          // 候補を新しいMemory World画面へ出さないため、同様に何も設定しない。
           return;
         }
 
@@ -1306,7 +1377,7 @@ export default function ChatScreen() {
       // IncompleteVaultWorldErrorのハンドリングを、新しいガードを一切書かずに
       // そのまま利用できる。unmount後（cancelled）は新規に開始しない。
       if (!cancelled && handleForBackgroundScan) {
-        void startVaultRestoreScan(handleForBackgroundScan);
+        void startVaultRestoreScan(handleForBackgroundScan, "startup");
       }
     }).finally(() => {
       endStartupTask();
@@ -1648,7 +1719,7 @@ export default function ChatScreen() {
           if (!handleStaleVaultTabError(error)) throw error;
           return;
         }
-        void startVaultRestoreScan(newHandle);
+        void startVaultRestoreScan(newHandle, "connect");
         return;
       }
 
@@ -1883,12 +1954,13 @@ export default function ChatScreen() {
         setVaultStatus("connected");
 
         // 9〜10. 新Vault（B）をscanし、既存データがあれば復元候補として提示する
-        // （IndexedDBが完全に空の場合のみ自動restore、それ以外は確認UI。判定は
-        // checkForRestoreCandidateImpl内で行う）。排他ロックは既に解放済みのため、
+        // （このscanはユーザーの明示選択を起点とするため、missing recordsのみ
+        // 自動反映される。判定はcheckForRestoreCandidateImpl内で行う）。
+        // 排他ロックは既に解放済みのため、
         // ここは公開版checkForRestoreCandidate（共有ロック＋epoch確認付き）を、
         // Android Vault起動高速化のためawaitせずbackgroundで呼ぶ
         // （startVaultRestoreScan経由。同一タブでの二重scanはそこでガードされる）。
-        void startVaultRestoreScan(newHandle);
+        void startVaultRestoreScan(newHandle, "connect");
       } finally {
         // 11. 切替ロック解除（成功・中止・例外いずれの経路でも必ず解除する）。
         setIsVaultSwitching(false);
@@ -2020,12 +2092,12 @@ export default function ChatScreen() {
       resetMemoryWorldState();
       setVaultHandle(outcome.handle);
       setVaultStatus("connected");
-      // 新Vaultをscanし、既存データがあれば復元候補として提示する（IndexedDBが完全に
-      // 空の場合のみ自動restore、それ以外は確認UI。判定はcheckForRestoreCandidateImpl
-      // 内で行う。IndexedDBは上でclear済みのため、ここでのflushPendingToVaultは意味を
-      // 持たない＝呼ばない）。Android Vault起動高速化のためawaitせずbackgroundで呼ぶ
-      // （startVaultRestoreScan経由）。
-      void startVaultRestoreScan(outcome.handle);
+      // 新Vaultをscanし、既存データがあれば復元候補として提示する（このscanもユーザーの
+      // 明示操作を起点とするため、missing recordsのみ自動反映される。判定は
+      // checkForRestoreCandidateImpl内で行う。IndexedDBは上でclear済みのため、
+      // ここでのflushPendingToVaultは意味を持たない＝呼ばない）。Android Vault起動
+      // 高速化のためawaitせずbackgroundで呼ぶ（startVaultRestoreScan経由）。
+      void startVaultRestoreScan(outcome.handle, "recovery");
       return;
     }
 
@@ -2070,7 +2142,7 @@ export default function ChatScreen() {
       // Android Vault起動高速化：scanはここでawaitせず、flush完了後にbackground
       // （startVaultRestoreScan経由）で行う（起動時と同じパターン）。
       await withVaultWorldRead(() => flushPendingToVault(vaultHandle));
-      void startVaultRestoreScan(vaultHandle);
+      void startVaultRestoreScan(vaultHandle, "reauthorize");
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to reauthorize vault", error);
