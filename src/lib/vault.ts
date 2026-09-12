@@ -68,8 +68,19 @@ export function getVaultBackend(): VaultBackend | null {
 
 async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boolean): Promise<boolean> {
   const options: FileSystemHandlePermissionDescriptor = { mode: forWrite ? "readwrite" : "read" };
-  if ((await handle.queryPermission(options)) === "granted") return true;
-  return false;
+  // TEMP-TEST：Android実機でのVault復元停止事象の原因切り分け用。queryPermission自体が
+  // 例外を投げるケースを観測するためのログのみを追加する（try/catch追加後も、例外は
+  // 必ず再throwし、呼び出し元から見た挙動は一切変えない）。
+  logTimingEvent("Vault queryPermission:start");
+  let result: PermissionState;
+  try {
+    result = await handle.queryPermission(options);
+  } catch (error) {
+    logTimingEvent("Vault queryPermission:error");
+    throw error;
+  }
+  logTimingEvent("Vault queryPermission:result", { result });
+  return result === "granted";
 }
 
 /**
@@ -100,19 +111,45 @@ export type VaultRestoreResult =
  * 骨組みを作る（既に存在する場合は何もしない、以後の起動でも安全に呼べる）。
  */
 export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
-  const backend = getVaultBackend();
-  if (backend === null) return { status: "none" };
+  // TEMP-TEST：Android実機でのVault復元停止事象の原因切り分け用。観測のみを目的とした
+  // ログ追加であり、既存の分岐・戻り値・エラー伝播は一切変更しない（catchは全て
+  // ログ出力後に必ず同じ例外を再throwする）。
+  logTimingEvent("Vault restoreVaultHandle:start");
+  try {
+    const backend = getVaultBackend();
+    logTimingEvent("Vault getVaultBackend:result", { backend: backend ?? "null" });
+    if (backend === null) {
+      logTimingEvent("Vault restoreVaultHandle:result", { result: "none" });
+      return { status: "none" };
+    }
 
-  if (backend === "opfs") {
-    const root = await navigator.storage.getDirectory();
-    await ensureVaultSkeleton(root);
-    return { status: "connected", handle: root };
+    if (backend === "opfs") {
+      const root = await navigator.storage.getDirectory();
+      logTimingEvent("Vault ensureVaultSkeleton:start");
+      try {
+        await ensureVaultSkeleton(root);
+      } catch (error) {
+        logTimingEvent("Vault ensureVaultSkeleton:error");
+        throw error;
+      }
+      logTimingEvent("Vault ensureVaultSkeleton:success");
+      logTimingEvent("Vault restoreVaultHandle:result", { result: "connected" });
+      return { status: "connected", handle: root };
+    }
+
+    const handle = await loadVaultHandle();
+    logTimingEvent("Vault storedHandle:result", { found: handle ? 1 : 0 });
+    if (!handle) {
+      logTimingEvent("Vault restoreVaultHandle:result", { result: "none" });
+      return { status: "none" };
+    }
+    const granted = await verifyPermission(handle, true);
+    logTimingEvent("Vault restoreVaultHandle:result", { result: granted ? "connected" : "needs-permission" });
+    return granted ? { status: "connected", handle } : { status: "needs-permission", handle };
+  } catch (error) {
+    logTimingEvent("Vault restoreVaultHandle:error");
+    throw error;
   }
-
-  const handle = await loadVaultHandle();
-  if (!handle) return { status: "none" };
-  const granted = await verifyPermission(handle, true);
-  return granted ? { status: "connected", handle } : { status: "needs-permission", handle };
 }
 
 /**

@@ -69,7 +69,7 @@ import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHead
 import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
 import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
-import { logStartupCatchupEnd, logStartupCatchupStart, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
+import { logStartupCatchupEnd, logStartupCatchupStart, logTimingEvent, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
 // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用（`?debugLog=1`のときだけ出力）。
 import { logConversationDebug } from "@/lib/conversationDebugLog";
 import ApiKeySetup from "./ApiKeySetup";
@@ -373,6 +373,12 @@ export default function ChatScreen() {
   const { message: waitingMessage, start: startWaiting, stop: stopWaiting } = useWaitingMessage();
   const [vaultHandle, setVaultHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus>("checking");
+  // TEMP-TEST：Android実機でのVault復元停止事象の原因切り分け用。vaultStatusが実際に
+  // どの値へ落ち着くか（あるいは"checking"のまま変化しないか）を観測するだけの副作用。
+  // 状態そのものの制御・UI描画には一切影響しない。
+  useEffect(() => {
+    logTimingEvent("Startup vaultStatus:change", { status: vaultStatus });
+  }, [vaultStatus]);
   const [vaultConnectFeedback, setVaultConnectFeedback] = useState<VaultConnectFeedback | null>(null);
   /** 「Markdownをエクスポート」「この端末のデータを削除」（SettingsPanelのデータ欄）の状態。 */
   const [exportDataFeedback, setExportDataFeedback] = useState<DataActionFeedback | null>(null);
@@ -1084,6 +1090,13 @@ export default function ChatScreen() {
     }
 
     withStartupSharedLock(async () => {
+      // TEMP-TEST：Android実機でのVault復元停止事象の原因切り分け用。この関数全体を
+      // 観測目的のtry/catch/finallyで包むだけで、内部の分岐・早期return・エラー処理は
+      // 一切変更しない（catchは必ずログ出力後に同じ例外を再throwする。finallyは
+      // 成否に関わらず1回だけ「end」を記録するためのもので、既存のmarkBootPhaseDone()
+      // 呼び出し箇所やendStartupTask()には影響しない）。
+      logTimingEvent("Startup vault-restore:start");
+      try {
       // Codexレビュー指摘（journal lifecycle：legacy/partial migrationの厳密な区別）
       // 対応：判定自体はresolveVaultWorldStartupDecision（副作用無し）に分離してある。
       // ここではその結果に基づいて副作用（restoreVaultHandle呼び出し・journal書き込み・
@@ -1175,6 +1188,12 @@ export default function ChatScreen() {
       // TEMP-TEST：起動処理フェーズ①（Vault復元+flush+scan）完了。分岐・成否に関わらず
       // ここに到達する（catchが例外を握りつぶし再送出しないため）。
       markBootPhaseDone();
+      } catch (error) {
+        logTimingEvent("Startup vault-restore:error");
+        throw error;
+      } finally {
+        logTimingEvent("Startup vault-restore:end");
+      }
     }).finally(() => {
       endStartupTask();
     });

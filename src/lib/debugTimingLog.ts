@@ -44,11 +44,13 @@ function writeEntries(entries: TimingLogEntry[]) {
 }
 
 /**
- * 診断ログを1件追記する。paramsには数値のみを渡すこと（会話内容・IDなどの文字列情報は
- * 渡さない想定）。localStorageへの追記に失敗しても例外を投げない（呼び出し元の
- * Vault/Capture本体処理を絶対にブロック・失敗させないため）。
+ * 診断ログを1件追記する。paramsには数値、または短い列挙値の文字列（例："granted"/
+ * "opfs"/"connected"等の状態名）のみを渡すこと。会話内容・Memory本文・ファイル名・
+ * パス・APIキー・個人情報・Memory ID等の実データは一切渡さない想定。localStorageへの
+ * 追記に失敗しても例外を投げない（呼び出し元のVault/Capture本体処理を絶対に
+ * ブロック・失敗させないため）。
  */
-export function logTimingEvent(event: string, params: Record<string, number> = {}): void {
+export function logTimingEvent(event: string, params: Record<string, number | string> = {}): void {
   if (typeof window === "undefined") return;
   try {
     const entries = readEntries();
