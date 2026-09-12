@@ -1023,7 +1023,12 @@ export default function ChatScreen() {
 
   useEffect(() => {
     let cancelled = false;
-    // TEMP-TEST：起動処理全体（Vault復元+flush+scan／起動時Connect／起動時Capture、
+    // 修正案B（Android Vault起動高速化）：restore candidate scan
+    // （checkForRestoreCandidate経由のscanVaultForRestore）は非常に低速な場合がある
+    // （Android実機で確認済み）ため、boot critical pathには含めない。connectedに
+    // なったhandleをここへ保持しておき、共有ロック解放後にbackgroundでscanを開始する。
+    let handleForBackgroundScan: FileSystemDirectoryHandle | null = null;
+    // TEMP-TEST：起動処理全体（Vault復元+flush／起動時Connect／起動時Capture、
     // 3フェーズ）の開始点。page:hidden/page:loadとの因果関係切り分け用の計測のみで、
     // 以下の処理内容・順序には一切影響しない。
     markBootStart();
@@ -1038,11 +1043,11 @@ export default function ChatScreen() {
     // 別タブの排他ロック（Vault切替コミット）は、このタブが共有ロックを保持している間
     // 一切成立し得ないため、epoch取得とhandle復元の間に他タブの切替が割り込むことは無い。
     //
-    // flush・scanも同じロック保持区間の中で続けて行う（このタブの起動処理を
-    // 1つのまとまったMemory World操作として扱う）。scanは`checkForRestoreCandidateImpl`
-    // （ロックを取得しない内部専用版）を直接呼ぶこと——公開版`checkForRestoreCandidate`
-    // （それ自体が同名ロックを要求する）を呼ぶと、同じタブ内で同名ロックをネスト要求する
-    // ことになり、デッドロックしうる（vaultWorldLock.ts冒頭のコメント参照）。
+    // flushも同じロック保持区間の中で続けて行う（このタブの起動処理を1つのまとまった
+    // Memory World操作として扱う）。ただし修正案Bにより、restore candidate scanは
+    // このロック保持区間から意図的に外し、ロック解放後にbackgroundで実行する
+    // （下の`.then(...)`参照。既存の公開版`checkForRestoreCandidate`を使うことで、
+    // epoch再確認・beginMemoryTask/endTask・generation checkをそのまま利用する）。
     //
     // restoreVaultHandle()自体はrequestPermission()（ユーザー操作必須）を呼ばず、
     // queryPermission()のみの非対話的な確認に留まることをコードで確認済みのため
@@ -1051,7 +1056,7 @@ export default function ChatScreen() {
 
     // Codexレビュー指摘（journal lifecycle／既存Beta migration）対応：
     // restoreVaultHandleの結果を「connected/needs-permission/その他」で
-    // React stateへ反映し、connectedの場合のみflush→scanまで行う処理。
+    // React stateへ反映し、connectedの場合のみflushまで行う処理。
     // legacy migrationパスと通常パスの両方から呼ぶ（重複を避けるための共通化。
     // 分岐ロジック自体は元の実装から一切変更していない）。
     async function applyRestoredHandle(result: VaultRestoreResult) {
@@ -1061,20 +1066,23 @@ export default function ChatScreen() {
 
         // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
         // 接続許可（restoreVaultHandle）が確認できている場合、handleConnectVault()と
-        // 同じ手順（flush→scan）で復元候補チェックも行う。restoreVaultHandle()は
-        // queryPermissionのみでrequestPermissionを呼ばない設計のため、ここに来た時点で
-        // ユーザー操作なしに安全にflush/scanを実行できる。flushPendingToVault()を省略
-        // すると、IndexedDB側にまだVaultへ書き戻されていない変更がある場合に、古い
-        // Markdownの内容でIndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
-        // 復元候補が見つかっても、この場では書き込まない。既存の確認UI・
-        // handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量のMemoryを
-        // 起動時に無言で上書きしない）。
+        // 同じ手順でflushを行う。restoreVaultHandle()はqueryPermissionのみで
+        // requestPermissionを呼ばない設計のため、ここに来た時点でユーザー操作なしに
+        // 安全にflushを実行できる。flushPendingToVault()を省略すると、IndexedDB側に
+        // まだVaultへ書き戻されていない変更がある場合に、古いMarkdownの内容で
+        // IndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
+        // 修正案B：restore candidate scan（checkForRestoreCandidateImpl）はここでは
+        // 呼ばない。flushが完了したこのhandleをbackground scan用に保持しておき、
+        // boot critical pathの外（共有ロック解放後）で公開版checkForRestoreCandidate
+        // 経由で実行する。復元候補が見つかっても、この場では書き込まない。既存の
+        // 確認UI・handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量の
+        // Memoryを起動時に無言で上書きしない、という既存方針は変えていない）。
         try {
           await flushPendingToVault(result.handle);
           if (cancelled) return;
-          await checkForRestoreCandidateImpl(result.handle);
+          handleForBackgroundScan = result.handle;
         } catch (error) {
-          console.error("Failed to check for restore candidates on startup", error);
+          console.error("Failed to flush pending vault writes on startup", error);
         }
       } else if (result.status === "needs-permission") {
         // Android等：以前選択したフォルダのFileSystemDirectoryHandle自体はIndexedDBに
@@ -1185,14 +1193,27 @@ export default function ChatScreen() {
       // タブローカルな不変条件をここで確定させる（ロックを抜ける前）。
       setTabVaultEpoch(decision.epoch);
       await applyRestoredHandle(result);
-      // TEMP-TEST：起動処理フェーズ①（Vault復元+flush+scan）完了。分岐・成否に関わらず
-      // ここに到達する（catchが例外を握りつぶし再送出しないため）。
+      // TEMP-TEST：起動処理フェーズ①（Vault復元+flush。修正案Bによりscanはここに
+      // 含まない）完了。分岐・成否に関わらずここに到達する（catchが例外を握りつぶし
+      // 再送出しないため）。
       markBootPhaseDone();
       } catch (error) {
         logTimingEvent("Startup vault-restore:error");
         throw error;
       } finally {
         logTimingEvent("Startup vault-restore:end");
+      }
+    }).then(() => {
+      // 修正案B：共有ロックが解放された後、boot critical pathの外でrestore candidate
+      // scanを開始する（fire-and-forget）。checkForRestoreCandidateImpl()を直接
+      // 呼ばず、必ず公開版checkForRestoreCandidate()を使うこと——これにより
+      // withVaultWorldRead（呼び出し時点でのepoch再確認）・beginMemoryTask/endTask
+      // （Vault切替時のdrainPendingMemoryTasksが正しく待つ）・generation check
+      // （古い世代のscan結果をUIへ反映しない）・StaleVaultTabError/
+      // IncompleteVaultWorldErrorのハンドリングを、新しいガードを一切書かずに
+      // そのまま利用できる。unmount後（cancelled）は新規に開始しない。
+      if (!cancelled && handleForBackgroundScan) {
+        void checkForRestoreCandidate(handleForBackgroundScan);
       }
     }).finally(() => {
       endStartupTask();
