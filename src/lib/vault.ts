@@ -802,8 +802,14 @@ const HIDDEN_PREFIX = ".";
 const FOLDER_SEARCH_MAX_DEPTH = 6;
 const TSUMUGI_PROBE_BYTES = 1024;
 
-async function isLikelyTsumugiFile(fileHandle: FileSystemFileHandle): Promise<boolean> {
-  const file = await fileHandle.getFile();
+/**
+ * 修正案A（Android Vault scan高速化）：以前はこの関数が自前で`fileHandle.getFile()`を
+ * 呼んでいたため、`collectVaultMarkdown`側が全文読み込み用に別途もう一度`getFile()`を
+ * 呼ぶ形になり、1候補ファイルにつき`getFile()`が2回発生していた。呼び出し元が既に
+ * 取得済みの同じ`File`を渡す形に変更し、`getFile()`は1ファイルにつき1回だけにする。
+ * 判定ロジック（先頭`TSUMUGI_PROBE_BYTES`バイトの内容確認）自体は変更しない。
+ */
+async function isLikelyTsumugiFile(file: File): Promise<boolean> {
   const head = await file.slice(0, TSUMUGI_PROBE_BYTES).text();
   return head.startsWith("---\ntsumugi: true\n") || head.includes("\ntsumugi: true\n");
 }
@@ -841,31 +847,14 @@ async function collectVaultMarkdown(
     if (!insideTarget || !name.endsWith(".md")) continue;
 
     // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。対象フォルダ内の
-    // 候補ファイルについて、probe（isLikelyTsumugiFile）→getFile→file.textの各段階を
+    // 候補ファイルについて、getFile→probe（isLikelyTsumugiFile）→file.textの各段階を
     // 個別に計測する。ファイル名・パス・本文は一切出さず、連番（sequenceNumber）と
     // 所要時間・サイズだけを記録する。catchは全てログ出力後に必ず同じ例外を再throwし、
     // 既存の分岐・戻り値・エラー伝播は変更しない。
+    // 修正案A：以前はisLikelyTsumugiFile内部とここでそれぞれ別々にgetFile()していた
+    // （1候補ファイルにつき2回）。ここで一度だけ取得し、probe・全文読み込みの両方で
+    // 同じFileオブジェクトを再利用する（1候補ファイルにつきgetFile()は1回）。
     const seq = ++sequenceRef.value;
-
-    logTimingEvent("Vault probeFile:start", { target: folderName, sequenceNumber: seq });
-    const probeStart = Date.now();
-    let likely: boolean;
-    try {
-      likely = await isLikelyTsumugiFile(handle);
-    } catch (error) {
-      logTimingEvent("Vault probeFile:error", { target: folderName, sequenceNumber: seq });
-      throw error;
-    }
-    logTimingEvent("Vault probeFile:end", {
-      target: folderName,
-      sequenceNumber: seq,
-      durationMs: Date.now() - probeStart,
-      likely: likely ? 1 : 0,
-    });
-    if (!likely) continue;
-
-    logTimingEvent("Vault readFile:start", { target: folderName, sequenceNumber: seq });
-    const readStart = Date.now();
 
     logTimingEvent("Vault getFile:start", { target: folderName, sequenceNumber: seq });
     const getFileStart = Date.now();
@@ -882,6 +871,26 @@ async function collectVaultMarkdown(
       durationMs: Date.now() - getFileStart,
       sizeBytes: file.size,
     });
+
+    logTimingEvent("Vault probeFile:start", { target: folderName, sequenceNumber: seq });
+    const probeStart = Date.now();
+    let likely: boolean;
+    try {
+      likely = await isLikelyTsumugiFile(file);
+    } catch (error) {
+      logTimingEvent("Vault probeFile:error", { target: folderName, sequenceNumber: seq });
+      throw error;
+    }
+    logTimingEvent("Vault probeFile:end", {
+      target: folderName,
+      sequenceNumber: seq,
+      durationMs: Date.now() - probeStart,
+      likely: likely ? 1 : 0,
+    });
+    if (!likely) continue;
+
+    logTimingEvent("Vault readFile:start", { target: folderName, sequenceNumber: seq });
+    const readStart = Date.now();
 
     logTimingEvent("Vault fileText:start", { target: folderName, sequenceNumber: seq });
     const textStart = Date.now();
