@@ -814,6 +814,31 @@ async function isLikelyTsumugiFile(file: File): Promise<boolean> {
   return head.startsWith("---\ntsumugi: true\n") || head.includes("\ntsumugi: true\n");
 }
 
+/**
+ * Android Vault問題（in-flight scanの協調的キャンセル）：呼び出し元
+ * （ChatScreen.tsxのstartVaultRestoreScan）が新しいVault切替操作の開始と同時に
+ * `abort()`した場合、ここで即座に例外を投げて呼び出し元（collectVaultMarkdown・
+ * scanVaultForRestore）を早期終了させる。`AbortError`という名前で投げることで、
+ * 呼び出し元がこれを通常のI/Oエラーと区別できるようにする。
+ */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException("Vault scan aborted", "AbortError");
+  }
+}
+
+/**
+ * Android Vault問題（allSettled後のerror優先順位）：`Promise.allSettled`で
+ * 集めた各collectorのreject理由が、このscan自身の`signal`によるキャンセル
+ * （`throwIfAborted`が投げたもの）かどうかを判別する。`error.name === "AbortError"`
+ * だけでなく、対応する`signal`が実際に`aborted === true`であることも確認する
+ * （他所由来のAbortErrorを誤って「自前cancel」として握りつぶさないため。
+ * ChatScreen.tsxの`isOwnAbortError`と同じ考え方）。
+ */
+function isSelfAbortRejection(reason: unknown, signal?: AbortSignal): boolean {
+  return reason instanceof DOMException && reason.name === "AbortError" && Boolean(signal?.aborted);
+}
+
 async function collectVaultMarkdown(
   dir: FileSystemDirectoryHandle,
   folderName: string,
@@ -822,9 +847,17 @@ async function collectVaultMarkdown(
   // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。対象フォルダ内で
   // 見つかった候補ファイルに単純な連番を振るためだけの共有カウンタ（再帰呼び出し間で
   // 共有するためオブジェクト参照で渡す）。ファイル名・パスは持たない。
-  sequenceRef: { value: number } = { value: 0 }
+  sequenceRef: { value: number } = { value: 0 },
+  // Android Vault問題（in-flight scanの協調的キャンセル）：省略時（undefined）は
+  // 常にabortされない扱い（既存の呼び出し元・挙動を変えない）。
+  signal?: AbortSignal
 ): Promise<string[]> {
   if (!insideTarget && depth > FOLDER_SEARCH_MAX_DEPTH) return [];
+
+  // Android Vault問題（in-flight scanの協調的キャンセル）：このディレクトリの処理
+  // （dir.entries()の反復）を始める直前にも確認する（各entryごとのチェックとは別に、
+  // ディレクトリそのものへ入る前のチェックポイント）。
+  throwIfAborted(signal);
 
   // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。ディレクトリ単位の
   // 開始・終了だけを記録する（フォルダ名・ファイル名・パス・Markdown本文は一切出さない）。
@@ -835,12 +868,19 @@ async function collectVaultMarkdown(
 
   const contents: string[] = [];
   for await (const [name, handle] of dir.entries()) {
+    // Android Vault問題（in-flight scanの協調的キャンセル）：各ディレクトリ・
+    // 各ファイルの処理に入る直前に確認する。abort済みなら、ここまでに集めた
+    // 部分的な`contents`は一切返さず（呼び出し元も含め、部分結果は使わない）、
+    // 即座に例外で打ち切る。
+    throwIfAborted(signal);
     entryCount += 1;
     if (name.startsWith(HIDDEN_PREFIX)) continue;
 
     if (handle.kind === "directory") {
       const nowInsideTarget = insideTarget || name === folderName;
-      contents.push(...(await collectVaultMarkdown(handle, folderName, nowInsideTarget, depth + 1, sequenceRef)));
+      contents.push(
+        ...(await collectVaultMarkdown(handle, folderName, nowInsideTarget, depth + 1, sequenceRef, signal))
+      );
       continue;
     }
 
@@ -871,6 +911,9 @@ async function collectVaultMarkdown(
       durationMs: Date.now() - getFileStart,
       sizeBytes: file.size,
     });
+    // Android Vault問題（in-flight scanの協調的キャンセル）：await handle.getFile()の
+    // 直後にも確認する。
+    throwIfAborted(signal);
 
     logTimingEvent("Vault probeFile:start", { target: folderName, sequenceNumber: seq });
     const probeStart = Date.now();
@@ -887,6 +930,8 @@ async function collectVaultMarkdown(
       durationMs: Date.now() - probeStart,
       likely: likely ? 1 : 0,
     });
+    // Android Vault問題（in-flight scanの協調的キャンセル）：probe読込の直後にも確認する。
+    throwIfAborted(signal);
     if (!likely) continue;
 
     logTimingEvent("Vault readFile:start", { target: folderName, sequenceNumber: seq });
@@ -906,6 +951,9 @@ async function collectVaultMarkdown(
       sequenceNumber: seq,
       durationMs: Date.now() - textStart,
     });
+    // Android Vault問題（in-flight scanの協調的キャンセル）：await file.text()の
+    // 直後にも確認する。
+    throwIfAborted(signal);
 
     logTimingEvent("Vault readFile:end", {
       target: folderName,
@@ -923,6 +971,9 @@ async function collectVaultMarkdown(
     entryCount,
     durationMs: Date.now() - dirStart,
   });
+  // Android Vault問題（in-flight scanの協調的キャンセル）：呼び出し元へcontentsを
+  // 返す直前にも確認する（collector return直前）。
+  throwIfAborted(signal);
   return contents;
 }
 
@@ -944,10 +995,16 @@ export interface VaultScanResult {
  * 壊れたファイル・Tsumugi管理外のファイルは1件スキップして続行し、全体を止めない。
  * Memoriesは新形式（1ファイルに複数エントリ）・旧形式（1ファイル1エントリ）のどちらも読める。
  */
-export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Promise<VaultScanResult> {
+export async function scanVaultForRestore(
+  root: FileSystemDirectoryHandle,
+  // Android Vault問題（in-flight scanの協調的キャンセル）：省略時（undefined）は
+  // 常にabortされない扱い（既存の呼び出し元・挙動を変えない）。
+  signal?: AbortSignal
+): Promise<VaultScanResult> {
   const scanStart = Date.now();
   console.log(`[Vault] scan:start`);
   logTimingEvent("Vault scan:start");
+  throwIfAborted(signal);
   let skippedCount = 0;
 
   // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。Conversations/
@@ -956,7 +1013,7 @@ export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Prom
   const collectWithPhaseLog = async (folderName: string): Promise<string[]> => {
     const phaseStart = Date.now();
     logTimingEvent("Vault collect:start", { target: folderName });
-    const result = await collectVaultMarkdown(root, folderName);
+    const result = await collectVaultMarkdown(root, folderName, false, 0, { value: 0 }, signal);
     logTimingEvent("Vault collect:end", {
       target: folderName,
       fileCount: result.length,
@@ -965,11 +1022,46 @@ export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Prom
     return result;
   };
 
-  const [conversationFiles, memoryFiles, sourceFiles] = await Promise.all([
+  // Android Vault問題（abort後の旧scanを完全に終了させる）：Promise.allではなく
+  // Promise.allSettledを使う。Promise.allは1本目がrejectした時点で（他の2本が
+  // まだ実行中でも）即座にrejectしてしまい、呼び出し元（checkForRestoreCandidateImpl）
+  // 側でこの関数のPromiseが解決したと見なされ、共有ロック・pending taskが「まだ
+  // 実際にはI/Oが続いている」うちに解放されてしまう。Conversations/Memories/
+  // Sourcesの3つ全てが（成功・失敗・abortのいずれであれ）完全に終了するのを待って
+  // から、初めてこの関数自体の結果（成功・エラー・abort）を決定する。
+  const settledResults = await Promise.allSettled([
     collectWithPhaseLog("Conversations"),
     collectWithPhaseLog("Memories"),
     collectWithPhaseLog("Sources"),
   ]);
+
+  // Android Vault問題（allSettled後のerror優先順位）：3つ全てが終了した後、
+  // 「自前abort由来と判別できないrejection＝通常I/Oエラー」を最優先で確認する。
+  // signal.abortedを先に見てしまうと、「通常のI/Oエラーが発生した直後に、たまたま
+  // 別のVault切替でabortも要求されていた」場合に、本来のI/Oエラーがabort扱いで
+  // 隠れてしまう（呼び出し元がconsole.errorへ出すべき異常を見逃す）ため、順序を
+  // 誤らないこと。
+  const rejectedResults = settledResults.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  );
+  const genuineError = rejectedResults.find((result) => !isSelfAbortRejection(result.reason, signal));
+  if (genuineError) {
+    // 1〜2. 通常I/Oエラーが1つでもあれば、abort有無に関わらずそれを最優先でthrowする。
+    throw genuineError.reason;
+  }
+
+  // 3. 通常エラーは無かった。rejectedResultsに何か残っている（＝自前abortだけが
+  // rejectしている）か、signal自体がabort済みであれば、この関数全体を自前cancelとして
+  // 終了する（一部のcollectorが偶然成功していても、その結果は一切使わない＝
+  // 呼び出し元へ部分結果を渡さない）。
+  if (rejectedResults.length > 0 || signal?.aborted) {
+    throw new DOMException("Vault scan aborted", "AbortError");
+  }
+
+  // 4. 全成功。
+  const [conversationFiles, memoryFiles, sourceFiles] = settledResults.map(
+    (result) => (result as PromiseFulfilledResult<string[]>).value
+  );
   const scanFileCount = conversationFiles.length + memoryFiles.length + sourceFiles.length;
   const scanDurationMs = Date.now() - scanStart;
   console.log(`[Vault] scan:end fileCount=${scanFileCount} durationMs=${scanDurationMs}`);

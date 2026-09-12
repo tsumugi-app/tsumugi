@@ -211,6 +211,148 @@ export async function deleteSource(id: string) {
   await db.delete("sources", id);
 }
 
+export interface MissingRecordsToImport {
+  conversations: Conversation[];
+  memoryObjects: MemoryObject[];
+  sources: Source[];
+}
+
+export interface ImportMissingRecordsResult {
+  insertedConversations: number;
+  insertedMemoryObjects: number;
+  insertedSources: number;
+  skippedConversations: number;
+  skippedMemoryObjects: number;
+  skippedSources: number;
+}
+
+/**
+ * Android Vault問題（db.ts transaction失敗時のsettle回収）：`tx.store.get()`/
+ * `tx.store.add()`のいずれかがthrowした場合、そのtransaction自体の完了/abortを
+ * 未回収のまま放置しない（`tx.done`をawaitしないまま関数を抜けると、後から
+ * transactionが自動abortして`tx.done`がrejectした際にunhandled rejectionとして
+ * 残ってしまう）。
+ *
+ * 明示的に`tx.abort()`を呼び、`tx.done`のresolve/rejectを必ず（catchして）
+ * 回収してから、元のerrorをそのまま呼び出し元へ再throwする——エラーの中身は
+ * 一切変えず、正常経路のtransaction原子性（get→addの間に何も割り込めない）にも
+ * 影響しない。`tx.abort()`自体が失敗する場合（既にtransactionが完了/abort済み等）は
+ * 無視してよい（目的はあくまで`tx.done`を確実に解決させることだけのため）。
+ */
+async function abortAndSettleTransaction(tx: { abort(): void; done: Promise<void> }, error: unknown): Promise<never> {
+  try {
+    tx.abort();
+  } catch {
+    // 既にfinished状態のtransactionへのabort()呼び出しは例外を投げることがあるが、
+    // ここでは無視してよい。
+  }
+  await tx.done.catch(() => {
+    // abortに伴うtx.doneのrejectをここで確実に回収する（unhandled rejection防止）。
+    // 元のerror自体は下でそのままthrowする。
+  });
+  throw error;
+}
+
+/**
+ * Android Vault問題（自動取り込みの原子化）専用。Vaultからの自動import
+ * （ChatScreen.tsxのautoImportMissingRecords）でだけ使う——手動restore
+ * （handleRestoreFromVault、Vault側の内容で無条件に上書きする既存仕様）は
+ * これまでどおり`putConversation`/`putMemoryObject`/`saveSource`を使い続け、
+ * この関数は一切経由しない（手動restoreの挙動を変えないため）。
+ *
+ * 「そのIDが今すでに存在するかどうかの確認」と「無ければ追加する」を、
+ * ストアごとに1つの`readwrite`トランザクション内で行う。IndexedDBの
+ * readwriteトランザクションは同一ストアに対して直列化されるため、この
+ * トランザクションが実行されている間、他のトランザクション（別のCapture・
+ * 別タブ等）がこのストアへ割り込むことはない——「missing判定の時点では
+ * 存在しなかったが、実際にinsertするまでの間に他所から作成／更新された」
+ * というレースを構造的に閉じる。
+ *
+ * 既存キーが見つかった場合は`add()`を一切呼ばず、無条件でskipする（絶対に
+ * 上書きしない）。存在しないことをこの関数自身の`get()`で確認した直後にだけ
+ * `add()`する（`put()`ではなく`add()`を使うことで、万一の実装ミスがあっても
+ * 「既存キーへの書き込みはIndexedDB自身がConstraintErrorで拒否する」という
+ * 構造的な保証を重ねる。ただし正常経路では、直前の`get()`で不在を確認済みの
+ * ため`add()`が失敗することは無い想定）。
+ *
+ * 各ストアのtransactionが途中で失敗した場合の後始末（`tx.done`の未回収防止）は
+ * `abortAndSettleTransaction`に集約している。
+ */
+export async function importMissingRecordsIfAbsent(
+  candidates: MissingRecordsToImport
+): Promise<ImportMissingRecordsResult> {
+  const db = await getDB();
+
+  let insertedConversations = 0;
+  let skippedConversations = 0;
+  if (candidates.conversations.length > 0) {
+    const tx = db.transaction("conversations", "readwrite");
+    try {
+      for (const conversation of candidates.conversations) {
+        const existing = await tx.store.get(conversation.id);
+        if (existing === undefined) {
+          await tx.store.add(conversation);
+          insertedConversations += 1;
+        } else {
+          skippedConversations += 1;
+        }
+      }
+    } catch (error) {
+      await abortAndSettleTransaction(tx, error);
+    }
+    await tx.done;
+  }
+
+  let insertedMemoryObjects = 0;
+  let skippedMemoryObjects = 0;
+  if (candidates.memoryObjects.length > 0) {
+    const tx = db.transaction("memoryObjects", "readwrite");
+    try {
+      for (const memoryObject of candidates.memoryObjects) {
+        const existing = await tx.store.get(memoryObject.id);
+        if (existing === undefined) {
+          await tx.store.add(memoryObject);
+          insertedMemoryObjects += 1;
+        } else {
+          skippedMemoryObjects += 1;
+        }
+      }
+    } catch (error) {
+      await abortAndSettleTransaction(tx, error);
+    }
+    await tx.done;
+  }
+
+  let insertedSources = 0;
+  let skippedSources = 0;
+  if (candidates.sources.length > 0) {
+    const tx = db.transaction("sources", "readwrite");
+    try {
+      for (const source of candidates.sources) {
+        const existing = await tx.store.get(source.id);
+        if (existing === undefined) {
+          await tx.store.add(source);
+          insertedSources += 1;
+        } else {
+          skippedSources += 1;
+        }
+      }
+    } catch (error) {
+      await abortAndSettleTransaction(tx, error);
+    }
+    await tx.done;
+  }
+
+  return {
+    insertedConversations,
+    insertedMemoryObjects,
+    insertedSources,
+    skippedConversations,
+    skippedMemoryObjects,
+    skippedSources,
+  };
+}
+
 /**
  * 「この端末に保存されているtsumugiのデータを削除」機能に伴い、IndexedDB側の
  * 派生キャッシュ（Vault Markdownと同じデータを検索・結合用に複製したもの）も
