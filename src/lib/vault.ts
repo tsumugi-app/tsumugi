@@ -816,8 +816,16 @@ async function collectVaultMarkdown(
 ): Promise<string[]> {
   if (!insideTarget && depth > FOLDER_SEARCH_MAX_DEPTH) return [];
 
+  // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。ディレクトリ単位の
+  // 開始・終了だけを記録する（フォルダ名・ファイル名・パス・Markdown本文は一切出さない）。
+  // 既存の分岐・戻り値は一切変更しない。
+  const dirStart = Date.now();
+  logTimingEvent("Vault collectDir:enter", { target: folderName, depth, insideTarget: insideTarget ? 1 : 0 });
+  let entryCount = 0;
+
   const contents: string[] = [];
   for await (const [name, handle] of dir.entries()) {
+    entryCount += 1;
     if (name.startsWith(HIDDEN_PREFIX)) continue;
 
     if (handle.kind === "directory") {
@@ -831,6 +839,13 @@ async function collectVaultMarkdown(
     const file = await handle.getFile();
     contents.push(await file.text());
   }
+  logTimingEvent("Vault collectDir:exit", {
+    target: folderName,
+    depth,
+    insideTarget: insideTarget ? 1 : 0,
+    entryCount,
+    durationMs: Date.now() - dirStart,
+  });
   return contents;
 }
 
@@ -858,10 +873,25 @@ export async function scanVaultForRestore(root: FileSystemDirectoryHandle): Prom
   logTimingEvent("Vault scan:start");
   let skippedCount = 0;
 
+  // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。Conversations/
+  // Memories/Sourcesのどれが完了していないかをフェーズ単位で観測するだけのラッパー。
+  // collectVaultMarkdown自体の戻り値・分岐は変更しない。
+  const collectWithPhaseLog = async (folderName: string): Promise<string[]> => {
+    const phaseStart = Date.now();
+    logTimingEvent("Vault collect:start", { target: folderName });
+    const result = await collectVaultMarkdown(root, folderName);
+    logTimingEvent("Vault collect:end", {
+      target: folderName,
+      fileCount: result.length,
+      durationMs: Date.now() - phaseStart,
+    });
+    return result;
+  };
+
   const [conversationFiles, memoryFiles, sourceFiles] = await Promise.all([
-    collectVaultMarkdown(root, "Conversations"),
-    collectVaultMarkdown(root, "Memories"),
-    collectVaultMarkdown(root, "Sources"),
+    collectWithPhaseLog("Conversations"),
+    collectWithPhaseLog("Memories"),
+    collectWithPhaseLog("Sources"),
   ]);
   const scanFileCount = conversationFiles.length + memoryFiles.length + sourceFiles.length;
   const scanDurationMs = Date.now() - scanStart;
