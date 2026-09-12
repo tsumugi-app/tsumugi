@@ -31,6 +31,7 @@ import {
   memoryObjectToMarkdown,
   parseConversationMarkdown,
   parseMemoryDayFile,
+  parseMemoryObjectMarkdown,
   parseSourceMarkdown,
   serializeMemoryDayFile,
   sourceToMarkdown,
@@ -486,6 +487,330 @@ async function updateIndex(root: FileSystemDirectoryHandle, id: string, relative
   logTimingEvent("VaultIO index:end", { durationMs: indexDurationMs });
 }
 
+/**
+ * History Index（Vault読込方式の再設計、Step 1）。
+ *
+ * 目的：Historyを「IndexedDBの全件」ではなく「Vault内の軽量な目次＋必要な日だけの
+ * Markdown読み取り」で表示できるようにするための、Vault内`.tsumugi/`配下の目次データ。
+ * 既存の`.tsumugi/index.json`（`updateIndex`、id→pathの平坦なmapで、復元処理からは
+ * 意図的に信頼されていない）とは別の、新しいファイル群として追加する
+ * （既存index.jsonの読み書きには一切手を加えない）。
+ *
+ * 配置：
+ *   .tsumugi/history-meta.json      … 極小のメタ情報（月一覧・総件数）
+ *   .tsumugi/history/YYYY-MM.json   … その月の日付ごとの目次（月単位で分割し、
+ *                                      Vault全体の件数に読み込み量が比例しないようにする）
+ *
+ * 通常Memory（1日1Markdownへ統合）は`Memories/YYYY-MM-DD.md`を1回読めば
+ * その日の全件が判る（`parseMemoryDayFile`）ため、月Indexにはid配列を持たせず
+ * `memoryCount`（数字だけ）を保持する。Reflection Summary（system-generated、
+ * 1record1file）はこの前提に乗らないため、`reflectionIds`として個別に保持し、
+ * 日付タップ時にidから直接ファイル名を再構築して読めるようにする。
+ * Conversationも1日に複数ファイルが存在しうるため`conversationIds`を保持する
+ * （`fileNameFor(id, day)`で安全にpathを再構築できる。既存の命名規則と同じ関数を
+ * そのまま使うため、Index側とファイル名生成側が食い違うことはない）。
+ */
+/**
+ * `normalMemoryCount`：通常Memory（day-fileへ統合される形式）の、そのday-file自体の
+ * 現在の実エントリ数（絶対値）。`reflectionIds`：Reflection Summary（1record1file）の
+ * id一覧。`memoryCount`は常に`normalMemoryCount + reflectionIds.length`として
+ * 再計算した絶対値であり、どちらか一方の更新時にも都度両方から算出し直す
+ * （差分加算はしない。Codexレビュー指摘：差分加算はretryで永続的にずれうるため）。
+ */
+export interface HistoryDayIndex {
+  conversationIds: string[];
+  normalMemoryCount: number;
+  reflectionIds: string[];
+  memoryCount: number;
+}
+
+export interface HistoryMonthIndex {
+  version: 1;
+  month: string;
+  days: Record<string, HistoryDayIndex>;
+}
+
+/** 1ヶ月分の集計（絶対値）。`history-meta.json`の`months[month]`として保持する。 */
+export interface HistoryMonthAggregate {
+  memories: number;
+  conversations: number;
+}
+
+export interface HistoryMeta {
+  version: 1;
+  updatedAt: string;
+  months: Record<string, HistoryMonthAggregate>;
+  totalMemories: number;
+  totalConversations: number;
+}
+
+/**
+ * 呼び出しごとに新しいオブジェクトを返すこと（`readJSON`はファイルが存在しない場合、
+ * ここで渡したfallbackをそのまま呼び出し元へ返す。呼び出し元＝`updateHistoryIndex`は
+ * その戻り値を直接書き換えるため、共有の定数オブジェクトを使うと、2回目以降の
+ * 「ファイルがまだ無い」呼び出しが、前回の呼び出しで書き換え済みの値を誤って
+ * 引き継いでしまう）。
+ */
+function emptyHistoryMeta(): HistoryMeta {
+  return { version: 1, updatedAt: "", months: {}, totalMemories: 0, totalConversations: 0 };
+}
+
+function emptyMonthIndex(month: string): HistoryMonthIndex {
+  return { version: 1, month, days: {} };
+}
+
+function emptyDayIndex(): HistoryDayIndex {
+  return { conversationIds: [], normalMemoryCount: 0, reflectionIds: [], memoryCount: 0 };
+}
+
+/**
+ * History Index専用の排他ロック名。H4（`vaultWorldLock.ts`の`"tsumugi-vault-world"`、
+ * epoch/journal/committed worldの世界isolation）とは完全に独立した、別のWeb Lock。
+ * H4のロック・epoch・journalロジックには一切触れない（このファイル・このロックの
+ * 存在自体がH4の判定に影響することも無い）。
+ *
+ * 月Index（history/YYYY-MM.json）とhistory-meta.jsonの更新は「1つの論理的な
+ * Index更新」として扱いたいため、両方の読み取り→変更→書き戻しを、この1つのロックの
+ * 保持区間内で行う（月Indexとmetaを別々のロックにすると、片方だけ更新された
+ * 中間状態が他タブから観測されうるため、今回は分けない）。
+ */
+const HISTORY_INDEX_LOCK_NAME = "tsumugi-history-index-write";
+
+/**
+ * `navigator.locks`（Web Locks API）はChrome/Edge（Android含む）・Safari 15.4+
+ * （iPhone/iPad）のいずれでも利用できる想定だが、念のため機能検出する。
+ * 使えない環境では、タブ間の排他は保証できないが、既存の`.tsumugi/index.json`・
+ * Memory day-fileも同様にタブ間排他を持たない（同一タブ内の直列化＝
+ * `enqueueVaultWrite`のみ）ため、この関数が呼ばれる時点で既に同一タブ内の
+ * 直列化は保証されている。ロックが使えない場合はそのまま関数を実行するだけの
+ * fallbackにする（新しい代替ロック機構は作らない）。
+ */
+function isHistoryIndexLockSupported(): boolean {
+  return typeof navigator !== "undefined" && typeof navigator.locks !== "undefined";
+}
+
+async function withHistoryIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+  if (!isHistoryIndexLockSupported()) return fn();
+  return navigator.locks.request(HISTORY_INDEX_LOCK_NAME, fn);
+}
+
+export type HistoryIndexUpdate =
+  | { kind: "conversation"; id: string; day: string }
+  | { kind: "reflection"; id: string; day: string }
+  /**
+   * 通常Memory（day-fileへ統合される形式）専用。`normalMemoryCount`は呼び出し元
+   * （`writeMemoryObjectMarkdownImpl`）が、day-fileへ実際に書き込んだ後のマージ済み
+   * 配列の件数（絶対値）をそのまま渡す。「新規か更新か」の判定はここでは行わない
+   * （Codexレビュー指摘：retry時、day-fileには既にそのidが存在するため「更新」と
+   * 誤判定され、差分加算方式ではIndex側の件数が永続的にずれる。絶対値を渡すことで
+   * 何度retryしても同じ正しい値へ収束する）。
+   */
+  | { kind: "memory"; day: string; normalMemoryCount: number };
+
+/**
+ * 既存のday entry（無ければ空）へ、1件の更新を反映した新しいday entryを返す
+ * （純粋関数、副作用なし）。conversationIds/reflectionIdsへの追加はidempotent
+ * （既に含まれていれば追加しない）。memoryCountは常に
+ * `normalMemoryCount + reflectionIds.length`として再計算する絶対値であり、
+ * 差分加算はしない——normalMemoryCount側の更新かreflectionIds側の更新かに
+ * 関わらず、他方の既存値はそのまま保持した上で毎回両方から算出し直す。
+ */
+function computeUpdatedDayEntry(previous: HistoryDayIndex | undefined, update: HistoryIndexUpdate): HistoryDayIndex {
+  const base: HistoryDayIndex = previous
+    ? {
+        conversationIds: [...previous.conversationIds],
+        normalMemoryCount: previous.normalMemoryCount,
+        reflectionIds: [...previous.reflectionIds],
+        memoryCount: previous.memoryCount,
+      }
+    : emptyDayIndex();
+
+  if (update.kind === "conversation") {
+    if (!base.conversationIds.includes(update.id)) {
+      base.conversationIds = [...base.conversationIds, update.id];
+    }
+  } else if (update.kind === "reflection") {
+    if (!base.reflectionIds.includes(update.id)) {
+      base.reflectionIds = [...base.reflectionIds, update.id];
+    }
+  } else {
+    base.normalMemoryCount = update.normalMemoryCount;
+  }
+
+  base.memoryCount = base.normalMemoryCount + base.reflectionIds.length;
+  return base;
+}
+
+function isDayIndexEqual(a: HistoryDayIndex, b: HistoryDayIndex): boolean {
+  return (
+    a.normalMemoryCount === b.normalMemoryCount &&
+    a.memoryCount === b.memoryCount &&
+    a.conversationIds.length === b.conversationIds.length &&
+    a.conversationIds.every((id, i) => id === b.conversationIds[i]) &&
+    a.reflectionIds.length === b.reflectionIds.length &&
+    a.reflectionIds.every((id, i) => id === b.reflectionIds[i])
+  );
+}
+
+/** 月Indexの現在の（既に書き込み済みの）状態から、その月の絶対集計を計算する。 */
+function computeMonthAggregate(monthIndex: HistoryMonthIndex): HistoryMonthAggregate {
+  let memories = 0;
+  let conversations = 0;
+  for (const day of Object.values(monthIndex.days)) {
+    memories += day.memoryCount;
+    conversations += day.conversationIds.length;
+  }
+  return { memories, conversations };
+}
+
+function isMonthAggregateEqual(a: HistoryMonthAggregate | undefined, b: HistoryMonthAggregate): boolean {
+  return !!a && a.memories === b.memories && a.conversations === b.conversations;
+}
+
+/**
+ * History Indexへ1件分の変更を反映する。Markdown本体の書き込みに成功した直後、
+ * 呼び出し元（`writeConversationMarkdownImpl`/`writeMemoryObjectMarkdownImpl`）から
+ * 必ず呼ぶこと。
+ *
+ * 冪等性（重要・Codexレビュー指摘対応）：月Index・meta双方への反映は、常に
+ * 「現在の状態から求めた絶対値」を書く設計にしている（差分加算はしない）。
+ * そのため以下のいずれのretryケースでも、最終的に正しい状態へ収束する：
+ *   - Markdown成功→月Index書き込み失敗→retry：normalMemoryCount/idはretry時も
+ *     同じ絶対値・同じidのため、同じ正しいday entryが再計算されるだけ。
+ *   - 月Index成功→meta失敗→retry：day entry自体は既に正しく書き込み済みのため
+ *     月Index書き込みはskipされるが、meta側は「月Indexの現在の絶対集計」と
+ *     「meta.monthsに既に記録済みの値」を毎回比較するため、meta側だけが
+ *     未更新のまま残っていれば、月Index書き込みの有無に関わらず必ず検出して書く。
+ *   - 同一操作の複数回retry・同一idの再write：day entry・月集計のどちらも
+ *     再計算結果が既存の保存値と一致するため、書き込み自体を毎回skipする
+ *     （件数が増え続けることはない）。
+ *
+ * 失敗時の扱い：この関数はエラーを一切catchしない。呼び出し元でもtry/catchで
+ * 握り潰さないこと。既存VaultWrite再試行の仕組み（`markVaultSynced`がwrite成功時
+ * にのみ呼ばれ、`isAlreadySyncedToVault`が次回flush時に未同期と判定して再試行する）
+ * にそのまま乗せるため、Markdown本体の書き込みが成功していてもこのIndex更新が
+ * 失敗すれば、呼び出し元の関数全体を失敗として伝播させ、台帳（vaultSyncState）を
+ * 更新させない＝次回flush時に本体・Index更新の両方が再試行される
+ * （新しい独立したretry機構は作らない）。
+ */
+async function updateHistoryIndex(root: FileSystemDirectoryHandle, update: HistoryIndexUpdate): Promise<void> {
+  const historyIndexStart = Date.now();
+  logTimingEvent("HistoryIndex update:start", { kind: update.kind });
+
+  await withHistoryIndexLock(async () => {
+    const tsumugiDir = await timedIOStep("historyIndex tsumugiDir", () => root.getDirectoryHandle(".tsumugi", { create: true }));
+    const historyDir = await timedIOStep("historyIndex historyDir", () => tsumugiDir.getDirectoryHandle("history", { create: true }));
+    const month = update.day.slice(0, 7);
+    const monthFileName = `${month}.json`;
+
+    const monthIndex = await readJSON<HistoryMonthIndex>(historyDir, monthFileName, emptyMonthIndex(month), "history month read");
+    const previousDayEntry = monthIndex.days[update.day];
+    const dayEntry = computeUpdatedDayEntry(previousDayEntry, update);
+    const dayChanged = !previousDayEntry || !isDayIndexEqual(previousDayEntry, dayEntry);
+
+    monthIndex.version = 1;
+    monthIndex.month = month;
+    monthIndex.days[update.day] = dayEntry;
+
+    if (dayChanged) {
+      await writeFileInDir(historyDir, monthFileName, JSON.stringify(monthIndex, null, 2), "history month write");
+    } else {
+      logTimingEvent("HistoryIndex update:day-unchanged", { kind: update.kind });
+    }
+
+    // metaは「月Indexの現在の絶対集計」から常に再計算し、既存metaと異なる場合だけ
+    // 書く。dayChangedの有無に関わらず必ず確認する——「月Indexは前回既に正しく
+    // 更新されていたが、metaだけ書き込みに失敗して未更新のまま残っている」という
+    // retryケースを、月Index側の変化の有無とは無関係に検出するため。
+    const monthAggregate = computeMonthAggregate(monthIndex);
+    const meta = await readJSON<HistoryMeta>(tsumugiDir, "history-meta.json", emptyHistoryMeta(), "history meta read");
+    const metaChanged = !isMonthAggregateEqual(meta.months[month], monthAggregate);
+
+    if (metaChanged) {
+      meta.version = 1;
+      meta.months[month] = monthAggregate;
+      meta.totalMemories = Object.values(meta.months).reduce((sum, m) => sum + m.memories, 0);
+      meta.totalConversations = Object.values(meta.months).reduce((sum, m) => sum + m.conversations, 0);
+      meta.updatedAt = new Date().toISOString();
+      await writeFileInDir(tsumugiDir, "history-meta.json", JSON.stringify(meta, null, 2), "history meta write");
+    } else {
+      logTimingEvent("HistoryIndex update:meta-unchanged", { kind: update.kind });
+    }
+  });
+
+  logTimingEvent("HistoryIndex update:end", { kind: update.kind, durationMs: Date.now() - historyIndexStart });
+}
+
+/**
+ * History Index読み取り側（Step 1時点では低レベルのプリミティブのみ。History UI自体は
+ * 今回のスコープ外）。読み取りはロックを取得しない——書き込みと競合しても「わずかに
+ * 古い目次を読む」だけであり、カレンダー表示用途では実害が無いため（既存の
+ * `readJSON`と同じ、存在しない/壊れている場合は安全な既定値へfallbackする方針を踏襲）。
+ */
+export async function readHistoryMeta(root: FileSystemDirectoryHandle): Promise<HistoryMeta> {
+  try {
+    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+    return await readJSON<HistoryMeta>(tsumugiDir, "history-meta.json", emptyHistoryMeta(), "history meta read");
+  } catch {
+    return emptyHistoryMeta();
+  }
+}
+
+export async function readHistoryMonthIndex(root: FileSystemDirectoryHandle, month: string): Promise<HistoryMonthIndex> {
+  try {
+    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+    const historyDir = await tsumugiDir.getDirectoryHandle("history", { create: false });
+    return await readJSON<HistoryMonthIndex>(historyDir, `${month}.json`, emptyMonthIndex(month), "history month read");
+  } catch {
+    return emptyMonthIndex(month);
+  }
+}
+
+/**
+ * 指定日のMemory（day-file統合分）だけを読む。Reflection Summary（1record1file）は
+ * 含まれない——`readReflectionById`で別途idごとに読むこと。
+ */
+export async function readMemoriesForDay(root: FileSystemDirectoryHandle, day: string): Promise<MemoryObject[]> {
+  try {
+    const dir = await root.getDirectoryHandle("Memories", { create: false });
+    return await readDayFileEntries(dir, dayFileNameFor(day));
+  } catch {
+    return [];
+  }
+}
+
+/** `HistoryDayIndex.reflectionIds`の1件を、idと日付からファイル名を再構築して読む。 */
+export async function readReflectionById(
+  root: FileSystemDirectoryHandle,
+  id: string,
+  day: string
+): Promise<MemoryObject | null> {
+  try {
+    const dir = await root.getDirectoryHandle("Memories", { create: false });
+    const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
+    const file = await fileHandle.getFile();
+    return parseMemoryObjectMarkdown(await file.text());
+  } catch {
+    return null;
+  }
+}
+
+/** `HistoryDayIndex.conversationIds`の1件を、idと日付からファイル名を再構築して読む。 */
+export async function readConversationById(
+  root: FileSystemDirectoryHandle,
+  id: string,
+  day: string
+): Promise<Conversation | null> {
+  try {
+    const dir = await root.getDirectoryHandle("Conversations", { create: false });
+    const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
+    const file = await fileHandle.getFile();
+    return parseConversationMarkdown(await file.text());
+  } catch {
+    return null;
+  }
+}
+
 function shortId(id: string) {
   return id.slice(-6).toLowerCase();
 }
@@ -509,6 +834,11 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
   logSyncStep("conversation render", Date.now() - renderStart);
   await writeFileInDir(dir, fileName, content, "conversation");
   await updateIndex(root, conversation.id, `Conversations/${fileName}`);
+  // History Index（Step 1）：Markdown本体の書き込みが成功した直後に更新する。
+  // ここでcatchして握り潰さない——失敗すればこの関数全体が失敗として呼び出し元へ
+  // 伝わり、vaultSyncStateが更新されないため、次回flush時に本体・Index更新の両方が
+  // 自然に再試行される（詳細はupdateHistoryIndexのコメント参照）。
+  await updateHistoryIndex(root, { kind: "conversation", id: conversation.id, day: conversation.startedAt.slice(0, 10) });
 }
 
 export async function writeConversationMarkdown(
@@ -585,6 +915,11 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
     logSyncStep("memory render", Date.now() - renderStart);
     await writeFileInDir(dir, fileName, content, "memory");
     await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
+    // History Index（Step 1）：Reflection Summaryは1record1fileのため、月Indexへ
+    // idを直接記録する（通常Memoryのようにday-fileの既存件数からは新規/更新を
+    // 判別できないため、`updateHistoryIndex`側でidの有無から判定させる）。
+    // ここでもcatchせず、失敗をそのまま伝播させる。
+    await updateHistoryIndex(root, { kind: "reflection", id: memoryObject.id, day: memoryObject.date.slice(0, 10) });
     memoryObject.metadata.obsidian = {
       ...memoryObject.metadata.obsidian,
       vaultPath: `Memories/${fileName}`,
@@ -602,6 +937,14 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
 
   await writeFileInDir(dir, fileName, serialized, "memory");
   await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
+  // History Index（Step 1、Codexレビュー指摘対応）：day-fileへ実際に書き込んだ後の
+  // マージ済み配列の件数（絶対値）をそのまま渡す。「新規か更新か」をここで判定して
+  // 差分加算する設計は、retry時にday-fileへ既にそのidが存在するため常に「更新」と
+  // 誤判定され、Index側の件数が永続的にずれる不具合があったため廃止した
+  // （`updateHistoryIndex`側は絶対値からmemoryCountを再計算するため、何度retryしても
+  // 同じ正しい値へ収束する）。catchせず、失敗をそのまま伝播させる
+  // （次回flushで本体・Index更新ともに再試行）。
+  await updateHistoryIndex(root, { kind: "memory", day: memoryObject.date.slice(0, 10), normalMemoryCount: merged.length });
   memoryObject.metadata.obsidian = {
     ...memoryObject.metadata.obsidian,
     vaultPath: `Memories/${fileName}`,

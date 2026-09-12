@@ -12,6 +12,7 @@ import {
   getVaultBackend,
   isVaultSupported,
   pickVaultDirectory,
+  readHistoryMeta,
   requestVaultPermission,
   restoreVaultHandle,
   scanVaultForRestore,
@@ -85,7 +86,6 @@ import HistoryPanel from "./HistoryPanel";
 import {
   computeLeafColorProgress,
   computeLeafProgress,
-  computeTreeSignals,
   computeTreeStage,
   LEAF_ANCHORS_BY_STAGE,
   LEAF_SPRITE_PATH,
@@ -994,38 +994,54 @@ export default function ChatScreen() {
 
   /**
    * 起動時の「つむぎの木」表示用。showLaunchTreeがtrueの間（＝起動直後）だけ、
-   * 既存のgetAllMemoryObjects()（IndexedDBのみ、新しいDB読み込みは追加しない）を
-   * 1回読み、TreeSignalsを計算する。段階判定・段階内の葉の枚数の計算ロジック自体は
-   * 全て@/lib/treeへ委譲する（このコンポーネントはしきい値を一切持たない）。
-   * Vault/Capture/Connectのいずれにも触れない、読み取り専用の処理。
+   * History Index（`.tsumugi/history-meta.json`、`src/lib/vault.ts`のStep 1で追加）の
+   * `totalMemories`を1回読み、TreeSignalsを組み立てる。段階判定・段階内の葉の枚数の
+   * 計算ロジック自体は全て@/lib/treeへ委譲する（このコンポーネントはしきい値を
+   * 一切持たない）。
+   *
+   * Vault読込方式の再設計（Step 2）：以前はIndexedDBの`getAllMemoryObjects()`を
+   * 全件取得して`computeTreeSignals()`へ渡していたが、Historyの表示方式自体が
+   * 「IndexedDB全件」に依存しない方針へ変わったため、Tree用のmemoryCountも
+   * History Indexの`totalMemories`（Vault内`.tsumugi/history-meta.json`の絶対値）を
+   * そのまま使う。IndexedDBへは一切アクセスしないため、H4のepoch確認
+   * （`withVaultWorldRead`）も不要になった——`vaultHandle`は既存のVault切替ロジック
+   * （変更なし）が管理するReact stateをそのまま参照するだけで、依存配列に含めれば
+   * Vault切替のたびに自動的に新しいVaultの`totalMemories`へ切り替わる。
+   * `linkCount`/`insightCount`はStage判定（`computeTreeStage`）が現状使っていないため
+   * 0固定とする（`computeTreeStage`自体は無変更）。
+   *
+   * `vaultHandle`が無い（未接続）場合はVaultへのI/O自体を行わず、
+   * `memoryCount: 0`として扱う（Stage 0＝「まだ何も話していないようです」表示）。
+   * `readHistoryMeta`はStep 1の実装により、history-meta.jsonが存在しない場合・
+   * 読み込みに失敗した場合のいずれも安全に既定値（`totalMemories: 0`等）を返す設計
+   * のため、ここでの`.catch()`は現実的にはほぼ発火しない防御的なものにとどまる
+   * （vault.ts側のこのフォールバック挙動自体は今回変更していない）。
    *
    * Critical回帰修正（startup race）：`vaultStatus === "checking"`の間は実行しない。
-   * 起動effect（下のuseEffect）は、activeVaultEpoch取得→restoreVaultHandle→
-   * setTabVaultEpoch(latestEpoch)→vaultStatus更新、という順序で完了するが、
-   * このeffectがそれを待たずに動くと、setTabVaultEpoch()が終わる前に
-   * withVaultWorldReadのepoch確認へ到達し、tabVaultEpochがまだnullのまま
-   * StaleVaultTabErrorとなって誤ってcrossTabStale=trueにしてしまう
-   * （実際のepoch不一致ではなく、単に確認が早すぎるだけの誤検知）。
-   * Connect/Captureキャッチアップeffectと同じ「起動完了待ち」ガードに揃える。
+   * 起動effect（下のuseEffect）がVault復元を終える前にこのeffectが先に動いて
+   * しまうと、`vaultHandle`がまだ確定していない（null）状態でTreeが「未接続」
+   * 扱いになってしまうため、既存のガード条件をそのまま維持する。
    */
   useEffect(() => {
     if (!showLaunchTree || vaultStatus === "checking" || vaultStatus === "incomplete-switch" || vaultStatus === "unsupported-journal-version") return;
     let cancelled = false;
-    // Vault境界の安全性（H4対応）：Memory World読み取りをロック＋epoch確認で包む。
-    withVaultWorldRead(() => getAllMemoryObjects())
-      .then((memoryObjects) => {
+    if (!vaultHandle) {
+      setLaunchTreeSignals({ memoryCount: 0, linkCount: 0, insightCount: 0 });
+      return;
+    }
+    readHistoryMeta(vaultHandle)
+      .then((meta) => {
         if (cancelled) return;
-        setLaunchTreeSignals(computeTreeSignals(memoryObjects));
+        setLaunchTreeSignals({ memoryCount: meta.totalMemories, linkCount: 0, insightCount: 0 });
       })
       .catch((error) => {
-        if (!handleStaleVaultTabError(error)) {
-          console.error("Failed to load memory objects for launch tree", error);
-        }
+        if (cancelled) return;
+        console.error("Failed to load history meta for launch tree", error);
       });
     return () => {
       cancelled = true;
     };
-  }, [showLaunchTree, vaultStatus]);
+  }, [showLaunchTree, vaultStatus, vaultHandle]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1446,11 +1462,6 @@ export default function ChatScreen() {
 
   useEffect(() => {
     let cancelled = false;
-    // 修正案B（Android Vault起動高速化）：restore candidate scan
-    // （checkForRestoreCandidate経由のscanVaultForRestore）は非常に低速な場合がある
-    // （Android実機で確認済み）ため、boot critical pathには含めない。connectedに
-    // なったhandleをここへ保持しておき、共有ロック解放後にbackgroundでscanを開始する。
-    let handleForBackgroundScan: FileSystemDirectoryHandle | null = null;
     // TEMP-TEST：起動処理全体（Vault復元+flush／起動時Connect／起動時Capture、
     // 3フェーズ）の開始点。page:hidden/page:loadとの因果関係切り分け用の計測のみで、
     // 以下の処理内容・順序には一切影響しない。
@@ -1494,16 +1505,8 @@ export default function ChatScreen() {
         // 安全にflushを実行できる。flushPendingToVault()を省略すると、IndexedDB側に
         // まだVaultへ書き戻されていない変更がある場合に、古いMarkdownの内容で
         // IndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
-        // 修正案B：restore candidate scan（checkForRestoreCandidateImpl）はここでは
-        // 呼ばない。flushが完了したこのhandleをbackground scan用に保持しておき、
-        // boot critical pathの外（共有ロック解放後）で公開版checkForRestoreCandidate
-        // 経由で実行する。復元候補が見つかっても、この場では書き込まない。既存の
-        // 確認UI・handleRestoreFromVault()を経由したユーザー確認を必ず挟む（大量の
-        // Memoryを起動時に無言で上書きしない、という既存方針は変えていない）。
         try {
           await flushPendingToVault(result.handle);
-          if (cancelled) return;
-          handleForBackgroundScan = result.handle;
         } catch (error) {
           console.error("Failed to flush pending vault writes on startup", error);
         }
@@ -1625,17 +1628,6 @@ export default function ChatScreen() {
         throw error;
       } finally {
         logTimingEvent("Startup vault-restore:end");
-      }
-    }).then(() => {
-      // 修正案B：共有ロックが解放された後、boot critical pathの外でrestore candidate
-      // scanを開始する（fire-and-forget）。startVaultRestoreScan経由で開始することで、
-      // 同一タブ内の他のscan開始経路（handleReauthorizeVault等）との二重起動を防ぐ
-      // ガードと、公開版checkForRestoreCandidate()のwithVaultWorldRead・
-      // beginMemoryTask/endTask・generation check・StaleVaultTabError/
-      // IncompleteVaultWorldErrorのハンドリングを、新しいガードを一切書かずに
-      // そのまま利用できる。unmount後（cancelled）は新規に開始しない。
-      if (!cancelled && handleForBackgroundScan) {
-        void startVaultRestoreScan(handleForBackgroundScan, "startup");
       }
     }).finally(() => {
       endStartupTask();
@@ -1911,20 +1903,7 @@ export default function ChatScreen() {
         // 奪い合わない（H4のロック・epoch判定は不変）。
         await abortInFlightVaultScanAndWait();
 
-        try {
-          await ensureVaultSkeleton(newHandle);
-        } catch (error) {
-          // ensureVaultSkeletonが失敗した場合、再接続はまだ成立していない
-          // （current VaultはvaultHandleのまま）。旧scanは既に完全に終了して
-          // いるため、現在Vaultのrestore scanを再開できるようにする（新しい
-          // 大規模schedulerは作らず、既存のstartVaultRestoreScanをそのまま
-          // 呼ぶだけ——in-flightではないため即座に開始される）。CASE1（初めての
-          // 接続）の場合はvaultHandleがnullのため何もしない。
-          if (vaultHandle) {
-            void startVaultRestoreScan(vaultHandle, "connect");
-          }
-          throw error;
-        }
+        await ensureVaultSkeleton(newHandle);
 
         const tabEpochAtStart = getTabVaultEpoch();
         type HandleCommitOutcome = { status: "success"; epoch: number } | { status: "stale" };
@@ -1992,15 +1971,12 @@ export default function ChatScreen() {
         setVaultStatus("connected");
         // H4：flushはMemory Worldへの読み書きとして共有ロック＋epoch確認で保護する。
         // 排他ロックは既に解放済みのためここは通常の共有ロックでよい。
-        // Android Vault起動高速化：scanはここでawaitせず、flush完了後に
-        // background（startVaultRestoreScan経由）で行う（起動時と同じパターン）。
         try {
           await withVaultWorldRead(() => flushPendingToVault(newHandle));
         } catch (error) {
           if (!handleStaleVaultTabError(error)) throw error;
           return;
         }
-        void startVaultRestoreScan(newHandle, "connect");
         return;
       }
 
@@ -2055,22 +2031,8 @@ export default function ChatScreen() {
         // 待ってから（固定時間のtimeoutではなく、scan自身の完了をawaitするだけ）、
         // ensureVaultSkeletonのFSA I/Oを開始する。これにより、新Vaultの確認処理が
         // 旧scanとFSA I/Oを奪い合わない。
-        await abortInFlightVaultScanAndWait();
-
-        try {
-          // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。
-          await ensureVaultSkeleton(newHandle);
-        } catch (error) {
-          // ensureVaultSkeletonが失敗した場合、切替はまだ成立していない
-          // （current VaultはsavedVaultHandleForFlushのまま）。旧scanは既に
-          // 完全に終了しているため、現在Vaultのrestore scanを再開できるように
-          // する（新しい大規模schedulerは作らず、既存のstartVaultRestoreScanを
-          // そのまま呼ぶだけ——in-flightではないため即座に開始される）。
-          if (savedVaultHandleForFlush) {
-            void startVaultRestoreScan(savedVaultHandleForFlush, "connect");
-          }
-          throw error;
-        }
+        // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。
+        await ensureVaultSkeleton(newHandle);
 
         // Codexレビュー指摘対応：ここから「収束待ち」フェーズ全体に共有の締切を設ける
         // （個々のstepごとに別々のtimeoutを与えると合計で際限なく伸びうるため）。
@@ -2253,15 +2215,6 @@ export default function ChatScreen() {
         resetMemoryWorldState();
         setVaultHandle(newHandle);
         setVaultStatus("connected");
-
-        // 9〜10. 新Vault（B）をscanし、既存データがあれば復元候補として提示する
-        // （このscanはユーザーの明示選択を起点とするため、missing recordsのみ
-        // 自動反映される。判定はcheckForRestoreCandidateImpl内で行う）。
-        // 排他ロックは既に解放済みのため、
-        // ここは公開版checkForRestoreCandidate（共有ロック＋epoch確認付き）を、
-        // Android Vault起動高速化のためawaitせずbackgroundで呼ぶ
-        // （startVaultRestoreScan経由。同一タブでの二重scanはそこでガードされる）。
-        void startVaultRestoreScan(newHandle, "connect");
       } finally {
         // 11. 切替ロック解除（成功・中止・例外いずれの経路でも必ず解除する）。
         setIsVaultSwitching(false);
@@ -2402,12 +2355,6 @@ export default function ChatScreen() {
       resetMemoryWorldState();
       setVaultHandle(outcome.handle);
       setVaultStatus("connected");
-      // 新Vaultをscanし、既存データがあれば復元候補として提示する（このscanもユーザーの
-      // 明示操作を起点とするため、missing recordsのみ自動反映される。判定は
-      // checkForRestoreCandidateImpl内で行う。IndexedDBは上でclear済みのため、
-      // ここでのflushPendingToVaultは意味を持たない＝呼ばない）。Android Vault起動
-      // 高速化のためawaitせずbackgroundで呼ぶ（startVaultRestoreScan経由）。
-      void startVaultRestoreScan(outcome.handle, "recovery");
       return;
     }
 
@@ -2449,10 +2396,7 @@ export default function ChatScreen() {
       }
       setVaultStatus("connected");
       // H4：flushをMemory Worldへの読み書きとして共有ロック＋epoch確認で保護する。
-      // Android Vault起動高速化：scanはここでawaitせず、flush完了後にbackground
-      // （startVaultRestoreScan経由）で行う（起動時と同じパターン）。
       await withVaultWorldRead(() => flushPendingToVault(vaultHandle));
-      void startVaultRestoreScan(vaultHandle, "reauthorize");
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to reauthorize vault", error);
@@ -3784,8 +3728,10 @@ export default function ChatScreen() {
       {historyOpen && (
         <div className="fixed inset-0 z-40">
           <HistoryPanel
+            vaultHandle={vaultHandle}
             initialMemoryId={historyInitialMemoryId}
             refreshToken={historyRefreshToken}
+            sessionCapturedMemories={sessionCapturedMemories}
             onClose={() => {
               setHistoryOpen(false);
               setHistoryInitialMemoryId(undefined);
