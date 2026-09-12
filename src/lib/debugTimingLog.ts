@@ -18,9 +18,23 @@
 const STORAGE_KEY = "tsumugi:debugTimingLog:v1";
 const MAX_ENTRIES = 300;
 
+/**
+ * TEMP-TEST：Android実機でのVault scan重複調査用。このモジュールが評価される
+ * （＝ページが読み込まれる）たびに1回だけ生成される、使い捨てのランダムな識別子。
+ * 同一タブ内での二重実行か、別タブ/別ウィンドウ由来かを、ログ上のinstanceIdの
+ * 一致・不一致だけで判別するためのものであり、個人情報・セッション情報・
+ * 実際のブラウザタブIDなどは一切含まない。永続化もしない（ページを読み込むたびに
+ * 新しい値になる）。
+ */
+const instanceId =
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID().slice(0, 8)
+    : Math.random().toString(36).slice(2, 10);
+
 export interface TimingLogEntry {
   ts: number;
   event: string;
+  instanceId: string;
   [key: string]: number | string;
 }
 
@@ -54,7 +68,7 @@ export function logTimingEvent(event: string, params: Record<string, number | st
   if (typeof window === "undefined") return;
   try {
     const entries = readEntries();
-    entries.push({ ts: Date.now(), event, ...params });
+    entries.push({ ts: Date.now(), event, instanceId, ...params });
     while (entries.length > MAX_ENTRIES) entries.shift();
     writeEntries(entries);
   } catch {
