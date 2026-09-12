@@ -56,6 +56,7 @@ const PERSONA_LABEL: Record<Persona, string> = {
 export default function HistoryPanel({
   onClose,
   initialMemoryId,
+  refreshToken,
 }: {
   onClose: () => void;
   /**
@@ -66,6 +67,13 @@ export default function HistoryPanel({
    * 一切変更していない）。
    */
   initialMemoryId?: string;
+  /**
+   * Android Vault起動高速化：Vault→IndexedDBのrestore（手動・自動どちらも）が
+   * このパネルを開いたまま完了した場合に、ChatScreen側でインクリメントされる
+   * カウンタ。値が変わるたびにIndexedDBを再取得するためだけのトリガーで、値自体に
+   * 意味は無い。渡されない場合は既存動作（マウント時のみ取得）のまま。
+   */
+  refreshToken?: number;
 }) {
   const [tab, setTab] = useState<HistoryTab>("diary");
   const [memoryObjects, setMemoryObjects] = useState<MemoryObject[]>([]);
@@ -124,7 +132,7 @@ export default function HistoryPanel({
     return () => {
       cancelled = true;
     };
-  }, [initialMemoryId]);
+  }, [initialMemoryId, refreshToken]);
 
   // MemoryのconversationIdから、由来会話（日時・ペルソナ）を引くための索引。
   // 追加のDB呼び出しはせず、既に読み込み済みのconversationsから作るだけ。
