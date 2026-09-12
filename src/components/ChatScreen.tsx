@@ -528,6 +528,19 @@ export default function ChatScreen() {
    */
   const vaultScanAbortControllerRef = useRef<AbortController | null>(null);
   /**
+   * Android Vault問題（scan lifecycle順序の修正）：現在実行中のrestore candidate
+   * scan（`startVaultRestoreScan`が返すPromise）そのものを保持する。
+   * `checkForRestoreCandidate`は内部で例外を握りつぶすため常にresolveし、
+   * このPromiseがresolveした時点で「scanVaultForRestore内の全collector
+   * （Conversations/Memories/Sources、7431a80のPromise.allSettled構造）が
+   * 完全に終了した」ことを意味する。Vault切替へ実際に進むことが確定した際、
+   * `abortInFlightVaultScan`でabort signalを送るだけでなく、このPromiseを
+   * 呼び出し元が`await`することで、「abortしただけで旧collectorがまだ動いている
+   * 状態のまま新しいFSA I/O（ensureVaultSkeleton）を開始してしまう」事故を防ぐ
+   * （詳細は`abortInFlightVaultScanAndWait`参照）。
+   */
+  const vaultScanInFlightPromiseRef = useRef<Promise<void> | null>(null);
+  /**
    * Android Vault問題（scan要求の取りこぼし対策／world・generationとの紐付け）：
    * `startVaultRestoreScan`が呼ばれた時点で既に別のscanが実行中
    * （`vaultScanInFlightRef.current === true`、典型的にはabort直後の後片付け中）
@@ -1122,29 +1135,40 @@ export default function ChatScreen() {
     // 参照）。
     const controller = new AbortController();
     vaultScanAbortControllerRef.current = controller;
-    try {
-      await checkForRestoreCandidate(handle, trigger, controller.signal);
-    } finally {
-      vaultScanInFlightRef.current = false;
-      if (vaultScanAbortControllerRef.current === controller) {
-        vaultScanAbortControllerRef.current = null;
+    // Android Vault問題（scan lifecycle順序の修正）：この関数が返すPromise自体を
+    // `vaultScanInFlightPromiseRef`へ保持しておく。呼び出し元（`handleConnectVault`等）が
+    // abort発火後に「旧scanの全collectorが本当に終了したか」を`await`で確認できる
+    // ようにするため（詳細はrefの定義コメント参照）。
+    const runPromise = (async () => {
+      try {
+        await checkForRestoreCandidate(handle, trigger, controller.signal);
+      } finally {
+        vaultScanInFlightRef.current = false;
+        if (vaultScanAbortControllerRef.current === controller) {
+          vaultScanAbortControllerRef.current = null;
+        }
+        if (vaultScanInFlightPromiseRef.current === runPromise) {
+          vaultScanInFlightPromiseRef.current = null;
+        }
+        // Android Vault問題（scan要求の取りこぼし対策／world・generationとの紐付け、
+        // unmount後のscan再実行防止）：このscanの実行中に新しい要求が保留されて
+        // いれば、ここで開始を検討する。ただし以下のいずれかに該当する場合は
+        // 「既に用済みの要求」として破棄し、再開しない：
+        //   - コンポーネントが既にunmountされている（isMountedRef.current === false）。
+        //   - 要求時点のgenerationと現在のgenerationが一致しない（＝要求後に
+        //     Vault切替が実際に成立していた。古いworld向けのscanを新しいworldで
+        //     実行してしまう事故を防ぐ）。
+        // 次のscanのfinallyでも同じ処理が働くため、連続して新しい要求が来ても
+        // 正しく連鎖する。
+        const pending = pendingVaultScanRequestRef.current;
+        pendingVaultScanRequestRef.current = null;
+        if (pending && isMountedRef.current && pending.generation === vaultGenerationRef.current) {
+          void startVaultRestoreScan(pending.handle, pending.trigger);
+        }
       }
-      // Android Vault問題（scan要求の取りこぼし対策／world・generationとの紐付け、
-      // unmount後のscan再実行防止）：このscanの実行中に新しい要求が保留されて
-      // いれば、ここで開始を検討する。ただし以下のいずれかに該当する場合は
-      // 「既に用済みの要求」として破棄し、再開しない：
-      //   - コンポーネントが既にunmountされている（isMountedRef.current === false）。
-      //   - 要求時点のgenerationと現在のgenerationが一致しない（＝要求後に
-      //     Vault切替が実際に成立していた。古いworld向けのscanを新しいworldで
-      //     実行してしまう事故を防ぐ）。
-      // 次のscanのfinallyでも同じ処理が働くため、連続して新しい要求が来ても
-      // 正しく連鎖する。
-      const pending = pendingVaultScanRequestRef.current;
-      pendingVaultScanRequestRef.current = null;
-      if (pending && isMountedRef.current && pending.generation === vaultGenerationRef.current) {
-        void startVaultRestoreScan(pending.handle, pending.trigger);
-      }
-    }
+    })();
+    vaultScanInFlightPromiseRef.current = runPromise;
+    return runPromise;
   }
 
   /**
@@ -1164,6 +1188,27 @@ export default function ChatScreen() {
   function abortInFlightVaultScan(): void {
     vaultScanAbortControllerRef.current?.abort();
     pendingVaultScanRequestRef.current = null;
+  }
+
+  /**
+   * Android Vault問題（scan lifecycle順序の修正）：`abortInFlightVaultScan`で
+   * abort signalを送るだけでなく、in-flight scanが実際に（7431a80の
+   * `Promise.allSettled`により全collectorが終了した上で）完了するまで待つ。
+   * `handleConnectVault`が「実際に同一Vault再接続／別Vault切替へ進むことが
+   * 確定した」直後、`ensureVaultSkeleton`を呼ぶ前にこれを使うことで、
+   * 「abortしただけで旧collectorがまだ動いている状態のまま、新しいFSA I/Oを
+   * 大量に開始してしまう」事故を防ぐ（固定時間のtimeoutは使わず、scan自身の
+   * 完了を待つだけ＝lifecycleで解決する）。
+   *
+   * `checkForRestoreCandidate`は内部で例外を握りつぶし常にresolveするため、
+   * ここでの`.catch()`は理論上到達しない防御的なものに過ぎない。
+   */
+  async function abortInFlightVaultScanAndWait(): Promise<void> {
+    const inFlight = vaultScanInFlightPromiseRef.current;
+    abortInFlightVaultScan();
+    if (inFlight) {
+      await inFlight.catch(() => {});
+    }
   }
 
   async function checkForRestoreCandidate(
@@ -1857,17 +1902,29 @@ export default function ChatScreen() {
         // ensureVaultSkeleton自体はnewHandle（今回選んだフォルダ）だけに作用し、
         // 共有state（IndexedDB "handles"・epoch）には触れないため、ロック取得前でも安全。
         //
-        // ensureVaultSkeleton自体が失敗した場合（フォルダへアクセスできない等）は、
-        // ここでthrowして外側のcatchへ委ねる——その場合まだ何も打ち切らない。
-        await ensureVaultSkeleton(newHandle);
+        // Android Vault問題（scan lifecycle順序の修正）：pickerキャンセル・
+        // identity判定はここまでに既に終わっており、実際にこの同一Vault再接続へ
+        // 進むことが確定した。ここで旧scanへ打ち切りを要求し、旧scanの全collector
+        // （Conversations/Memories/Sources）が完全に終了するのを待ってから
+        // （固定時間のtimeoutではなく、scan自身の完了をawaitするだけ）、
+        // ensureVaultSkeletonのFSA I/Oを開始する。これにより、旧scanとFSA I/Oを
+        // 奪い合わない（H4のロック・epoch判定は不変）。
+        await abortInFlightVaultScanAndWait();
 
-        // Android Vault問題（in-flight scanの協調的キャンセル、abort開始位置の修正）：
-        // 到達性確認（ensureVaultSkeleton）が成功し、実際にこの同一Vault再接続へ
-        // 進むことが確定したこの時点で初めて、古いscanへ打ち切りを要求する。
-        // pickerキャンセル・identity判定・ensureVaultSkeleton失敗のいずれでも、
-        // ここへ到達する前に既に抜けているため、現在worldのscanを無駄に打ち切らない
-        // （H4のロック・epoch判定は不変）。
-        abortInFlightVaultScan();
+        try {
+          await ensureVaultSkeleton(newHandle);
+        } catch (error) {
+          // ensureVaultSkeletonが失敗した場合、再接続はまだ成立していない
+          // （current VaultはvaultHandleのまま）。旧scanは既に完全に終了して
+          // いるため、現在Vaultのrestore scanを再開できるようにする（新しい
+          // 大規模schedulerは作らず、既存のstartVaultRestoreScanをそのまま
+          // 呼ぶだけ——in-flightではないため即座に開始される）。CASE1（初めての
+          // 接続）の場合はvaultHandleがnullのため何もしない。
+          if (vaultHandle) {
+            void startVaultRestoreScan(vaultHandle, "connect");
+          }
+          throw error;
+        }
 
         const tabEpochAtStart = getTabVaultEpoch();
         type HandleCommitOutcome = { status: "success"; epoch: number } | { status: "stale" };
@@ -1991,16 +2048,29 @@ export default function ChatScreen() {
       setIsVaultSwitching(true);
       isVaultSwitchingRef.current = true;
       try {
-        // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。ここで失敗すれば、
-        // 現在のVault・IndexedDBには一切影響しない（空フォルダの作成以外の副作用は無い）。
-        await ensureVaultSkeleton(newHandle);
+        // Android Vault問題（scan lifecycle順序の修正）：pickerキャンセル・確認
+        // ダイアログでの「やめる」はここまでに既に抜けており、実際に別Vaultへの
+        // 切替へ進むことが確定した。ここで旧scanへ打ち切りを要求し、旧scanの
+        // 全collector（Conversations/Memories/Sources）が完全に終了するのを
+        // 待ってから（固定時間のtimeoutではなく、scan自身の完了をawaitするだけ）、
+        // ensureVaultSkeletonのFSA I/Oを開始する。これにより、新Vaultの確認処理が
+        // 旧scanとFSA I/Oを奪い合わない。
+        await abortInFlightVaultScanAndWait();
 
-        // Android Vault問題（in-flight scanの協調的キャンセル、abort開始位置の修正）：
-        // ensureVaultSkeletonが成功し、実際に別Vaultへの切替へ進むことが確定した
-        // この時点で初めて、古いscanへ打ち切りを要求する（pickerキャンセル・確認
-        // ダイアログでの「やめる」・ensureVaultSkeleton失敗のいずれでも、ここへ
-        // 到達する前に既に抜けているため、現在worldのscanを無駄に打ち切らない）。
-        abortInFlightVaultScan();
+        try {
+          // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。
+          await ensureVaultSkeleton(newHandle);
+        } catch (error) {
+          // ensureVaultSkeletonが失敗した場合、切替はまだ成立していない
+          // （current VaultはsavedVaultHandleForFlushのまま）。旧scanは既に
+          // 完全に終了しているため、現在Vaultのrestore scanを再開できるように
+          // する（新しい大規模schedulerは作らず、既存のstartVaultRestoreScanを
+          // そのまま呼ぶだけ——in-flightではないため即座に開始される）。
+          if (savedVaultHandleForFlush) {
+            void startVaultRestoreScan(savedVaultHandleForFlush, "connect");
+          }
+          throw error;
+        }
 
         // Codexレビュー指摘対応：ここから「収束待ち」フェーズ全体に共有の締切を設ける
         // （個々のstepごとに別々のtimeoutを与えると合計で際限なく伸びうるため）。
