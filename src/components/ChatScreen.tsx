@@ -15,7 +15,6 @@ import {
   readHistoryMeta,
   requestVaultPermission,
   restoreVaultHandle,
-  scanVaultForRestore,
   waitForVaultWrites,
   type VaultRestoreResult,
   type VaultScanResult,
@@ -27,8 +26,6 @@ import {
   clearVaultSyncState,
   getAllConversations,
   getAllMemoryObjects,
-  getAllSources,
-  importMissingRecordsIfAbsent,
   loadApiKey,
   loadChatProvider,
   loadVaultHandle,
@@ -159,24 +156,6 @@ export interface RestoreCandidate {
  * auto importを許可する対象にする。
  */
 type RestoreScanTrigger = "startup" | "connect" | "reauthorize" | "recovery";
-
-/**
- * Android Vault問題（in-flight scanの協調的キャンセル）：`scanVaultForRestore`/
- * `collectVaultMarkdown`（vault.ts）が、渡された`AbortSignal`のabortを検知して
- * 投げる`DOMException("AbortError")`を判別する。正常な制御フロー（ユーザーが
- * 新しいVault切替操作を始めたため、古いscanが自発的に打ち切られただけ）として
- * 扱うためのヘルパーで、他の予期しないI/Oエラーとは区別してログ・UI表示を分ける。
- *
- * Codexレビュー指摘対応：`error.name === "AbortError"`だけでは、ブラウザや他の
- * Web API由来の（このscanのキャンセルとは無関係な）AbortErrorを誤って「正常な
- * 自前cancel」として握りつぶしてしまう可能性がある。そのため、判定対象の
- * `signal`自身が実際に`aborted === true`であることも併せて確認し、両方を
- * 満たす場合だけを「今回のscan cancelによるもの」として扱う（片方だけでは
- * 正常キャンセル扱いにしない＝I/O由来のAbortErrorを誤って握りつぶさない）。
- */
-function isOwnAbortError(error: unknown, signal: AbortSignal): boolean {
-  return error instanceof DOMException && error.name === "AbortError" && signal.aborted;
-}
 
 /** 1回のアプリ起動あたり、未Connect Memoryをまとめて処理する上限（AI呼び出し回数のクォータ保護）。 */
 const STARTUP_CONNECT_LIMIT = 3;
@@ -504,16 +483,6 @@ export default function ChatScreen() {
    * この上にさらにisVaultSwitchingRefの重いロックを重ねて取得する。
    */
   const vaultOperationLockRef = useRef(false);
-  /**
-   * Android Vault起動高速化：restore candidate scan（checkForRestoreCandidate経由の
-   * scanVaultForRestore）は同一タブ内で複数の経路（起動時background scan・
-   * handleReauthorizeVault・handleConnectVault・incomplete-switch復旧）から開始
-   * されうる。scanが非同期化（boot critical path外）されたことで、これらが
-   * 同一タブ内で真に並行実行される隙間が生まれたため、単純なタブローカルの
-   * ブールrefで排他する（新しいcross-tab lockではない。H4の共有ロックとは別軸）。
-   * 全てのscan開始経路は必ずstartVaultRestoreScan()を経由すること。
-   */
-  const vaultScanInFlightRef = useRef(false);
   /**
    * Android Vault問題（in-flight scanの協調的キャンセル）：現在実行中のrestore
    * candidate scanに紐づく`AbortController`。`startVaultRestoreScan`が新しいscanを
@@ -1100,94 +1069,6 @@ export default function ChatScreen() {
   }, [vaultStatus]);
 
   /**
-   * STORAGE.md §2.4 Rebuildability Guarantee。Vault接続直後（初回接続・変更どちらも、
-   * および起動時の自動再接続）に、IndexedDBがまだ知らない記憶がVault側のMarkdownに
-   * 存在するかを確認する。通常起動時のbackground scan（trigger==="startup"）では
-   * 見つかっても自動では復元せずユーザーの確認を挟む。それ以外（ユーザーの明示操作を
-   * 起点とするscan）では、既存IDに一切触れないmissing recordsのみ自動反映する
-   * （詳細はcheckForRestoreCandidateImpl内のコメント参照）。
-   */
-  /**
-   * Vault境界の安全性（H4対応）：共有ロック＋epoch確認で包んだ公開版。実処理は
-   * `checkForRestoreCandidateImpl`（ロックを取得しない内部専用版）。
-   *
-   * 起動effect（handle復元・epoch確認と同一の共有ロック保持区間内で行う必要がある）と、
-   * 別Vault切替コミットの排他ロック解放"後"のB scanは、ネスト回避のため
-   * `checkForRestoreCandidateImpl`を直接呼ぶ（この公開版は使わない。
-   * vaultWorldLock.tsのデッドロック回避原則を参照）。
-   * それ以外（handleReauthorizeVault・handleConnectVaultの同一Vault/初回接続分岐）は
-   * この公開版を呼ぶ。
-   */
-  /**
-   * Android Vault起動高速化：全てのrestore candidate scan開始経路
-   * （起動時background scan・handleReauthorizeVault・handleConnectVault・
-   * incomplete-switch復旧）が必ずここを経由する。同一タブ内での二重scan実行だけを
-   * 防ぐ、タブローカルな単純なブールref（vaultScanInFlightRef）によるガード
-   * （新しいcross-tab lockではない）。既にscanが実行中の場合は何もせず即座に返る
-   * （二重にscanを開始しない。待ち合わせもしない＝呼び出し元をブロックしない）。
-   */
-  async function startVaultRestoreScan(handle: FileSystemDirectoryHandle, trigger: RestoreScanTrigger): Promise<void> {
-    // Android Vault問題（unmount後のscan再実行防止）：新しいscanの開始・
-    // pending要求への登録のどちらよりも先にここで確認する。handleReauthorizeVault
-    // 等のawaitが完了した時点でコンポーネントが既にunmountされていた場合、
-    // 新しいscanを開始しないだけでなく、pending requestとして登録することもしない
-    // （unmount後に登録された要求は、他の同一タブ内scanの`finally`から
-    // 誤って再開されうるため）。
-    if (!isMountedRef.current) return;
-    if (vaultScanInFlightRef.current) {
-      // Android Vault問題（scan要求の取りこぼし対策）：旧scanがabort後の後片付け中
-      // （このrefがまだtrueの間）に新しい要求が来た場合、ここで即returnして
-      // 消してしまうと、connect/reauthorize/recoveryが期待するscanが一度も
-      // 実行されないまま失われる。最新の要求だけを保持しておき、実行中のscanが
-      // 終了した直後に必ず開始する（詳細はrefの定義コメント参照）。要求時点の
-      // generationも記録し、再開直前にworldが変わっていないか確認できるようにする。
-      pendingVaultScanRequestRef.current = { handle, trigger, generation: vaultGenerationRef.current };
-      return;
-    }
-    vaultScanInFlightRef.current = true;
-    // Android Vault問題（in-flight scanの協調的キャンセル）：このscan専用の
-    // AbortControllerを用意し、abortVaultRestoreScanが呼ばれた場合にだけ中断される
-    // ようにする（新しいVault切替操作の開始時にのみ呼ばれる。詳細はrefの定義コメント
-    // 参照）。
-    const controller = new AbortController();
-    vaultScanAbortControllerRef.current = controller;
-    // Android Vault問題（scan lifecycle順序の修正）：この関数が返すPromise自体を
-    // `vaultScanInFlightPromiseRef`へ保持しておく。呼び出し元（`handleConnectVault`等）が
-    // abort発火後に「旧scanの全collectorが本当に終了したか」を`await`で確認できる
-    // ようにするため（詳細はrefの定義コメント参照）。
-    const runPromise = (async () => {
-      try {
-        await checkForRestoreCandidate(handle, trigger, controller.signal);
-      } finally {
-        vaultScanInFlightRef.current = false;
-        if (vaultScanAbortControllerRef.current === controller) {
-          vaultScanAbortControllerRef.current = null;
-        }
-        if (vaultScanInFlightPromiseRef.current === runPromise) {
-          vaultScanInFlightPromiseRef.current = null;
-        }
-        // Android Vault問題（scan要求の取りこぼし対策／world・generationとの紐付け、
-        // unmount後のscan再実行防止）：このscanの実行中に新しい要求が保留されて
-        // いれば、ここで開始を検討する。ただし以下のいずれかに該当する場合は
-        // 「既に用済みの要求」として破棄し、再開しない：
-        //   - コンポーネントが既にunmountされている（isMountedRef.current === false）。
-        //   - 要求時点のgenerationと現在のgenerationが一致しない（＝要求後に
-        //     Vault切替が実際に成立していた。古いworld向けのscanを新しいworldで
-        //     実行してしまう事故を防ぐ）。
-        // 次のscanのfinallyでも同じ処理が働くため、連続して新しい要求が来ても
-        // 正しく連鎖する。
-        const pending = pendingVaultScanRequestRef.current;
-        pendingVaultScanRequestRef.current = null;
-        if (pending && isMountedRef.current && pending.generation === vaultGenerationRef.current) {
-          void startVaultRestoreScan(pending.handle, pending.trigger);
-        }
-      }
-    })();
-    vaultScanInFlightPromiseRef.current = runPromise;
-    return runPromise;
-  }
-
-  /**
    * Android Vault問題（in-flight scanの協調的キャンセル）：新しいVault切替操作
    * （`handleConnectVault`／`recoverFromIncompleteSwitch`）の開始時に呼ぶ。現在
    * scanが実行中でなければ何もしない（`vaultScanAbortControllerRef.current`は
@@ -1224,19 +1105,6 @@ export default function ChatScreen() {
     abortInFlightVaultScan();
     if (inFlight) {
       await inFlight.catch(() => {});
-    }
-  }
-
-  async function checkForRestoreCandidate(
-    handle: FileSystemDirectoryHandle,
-    trigger: RestoreScanTrigger,
-    signal: AbortSignal
-  ) {
-    try {
-      await withVaultWorldRead(() => checkForRestoreCandidateImpl(handle, trigger, signal));
-    } catch (error) {
-      if (handleStaleVaultTabError(error)) return;
-      console.error("Failed to scan vault for restore", error);
     }
   }
 
@@ -1286,178 +1154,6 @@ export default function ChatScreen() {
     generation: number
   ): Promise<{ status: "restored" | "stale" }> {
     return writeRecordsToIndexedDB(scan, generation);
-  }
-
-  /**
-   * Android Vault問題（自動取り込みの原子化）：handleConnectVault・
-   * handleReauthorizeVault・recoverFromIncompleteSwitch等、ユーザーの明示操作を
-   * 起点とするscanでのみ使う自動反映専用処理。
-   *
-   * `writeRecordsToIndexedDB`（手動restore専用、無条件put）とは意図的に別経路。
-   * 呼び出し元（checkForRestoreCandidateImpl）が事前にフィルタした「missing判定
-   * 時点では存在しなかったレコード」を渡してくるが、missing判定からこの関数が
-   * 実際にDBへ書き込むまでの間に、別のCapture処理や別タブが同じIDのrecordを
-   * 新規作成／更新している可能性はゼロではない。そのため実際の書き込みは
-   * `db.ts`の`importMissingRecordsIfAbsent`（ストアごとに1つのIndexedDB
-   * readwriteトランザクション内で「今すでに存在するか」を再確認してから
-   * 追加する）に委譲し、既存IDへは構造的に一切触れない（無条件putは行わない）。
-   *
-   * generation確認：この関数の前後で行う（H4：generationは呼び出し元が既に
-   * 保持している共有ロックの下でのみ変化しうるため、DB書き込みの最中に変化する
-   * ことは無い想定だが、他の書き込み経路との一貫性のため呼び出し前後の確認は
-   * 残す）。
-   */
-  async function autoImportMissingRecords(
-    missing: Pick<VaultScanResult, "conversations" | "memoryObjects" | "sources">,
-    generation: number
-  ): Promise<{ status: "restored" | "stale" }> {
-    if (generation !== vaultGenerationRef.current) return { status: "stale" };
-    await importMissingRecordsIfAbsent(missing);
-    if (generation !== vaultGenerationRef.current) return { status: "stale" };
-    return { status: "restored" };
-  }
-
-  async function checkForRestoreCandidateImpl(
-    handle: FileSystemDirectoryHandle,
-    trigger: RestoreScanTrigger,
-    signal: AbortSignal
-  ) {
-    // Vault境界の安全性（Codexレビュー指摘High-3対応）：scanもMemory Worldへ影響する
-    // 非同期処理として追跡する（Vault切替時、この完了を待ってからIndexedDBをclearする）。
-    // 旧Vault（A）由来の古いscan（起動時・再許可時等に開始したもの）が浮遊しないように
-    // する役目は、trackMemoryTaskによる追跡（＝切替側のdrainPendingMemoryTasksが完了を
-    // 待つ）と、下のgeneration check（単一タブの保険）、H4の共有ロック＋epoch確認
-    // （公開版checkForRestoreCandidate、または呼び出し元が既に保持している起動時/切替時の
-    // ロック）の3段構えで担う。
-    //
-    // Codexレビュー指摘High-1（このscan自身のpending markerを自己カウントしていた
-    // 不具合）対応：`beginMemoryTask()`はこの行で即座に自分自身のmarkerを
-    // `pendingMemoryTasksRef`へ登録する（`endTask()`が呼ばれる＝この関数がfinallyへ
-    // 到達するまで削除されない）。そのため、下の「他にpending taskが無いか」の判定は
-    // 必ず「自分の分を1件差し引いて」比較すること（そのまま`size === 0`で比較すると、
-    // auto importはどんな状況でも実行され得なくなる）。
-    const generation = vaultGenerationRef.current;
-    const endTask = beginMemoryTask();
-    try {
-      const scan = await scanVaultForRestore(handle, signal);
-      const [existingConversations, existingMemoryObjects, existingSources] = await Promise.all([
-        getAllConversations(),
-        getAllMemoryObjects(),
-        getAllSources(),
-      ]);
-      // ストア単位で既存IDを判定する（Conversation/MemoryObject/Sourceは別ストアであり、
-      // 異なるストア間でIDが偶然一致しても互いに無関係のため、混ぜたSetで判定しない）。
-      const existingConversationIds = new Set(existingConversations.map((c) => c.id));
-      const existingMemoryObjectIds = new Set(existingMemoryObjects.map((m) => m.id));
-      const existingSourceIds = new Set(existingSources.map((s) => s.id));
-
-      const missingConversations = scan.conversations.filter((c) => !existingConversationIds.has(c.id));
-      const missingMemoryObjects = scan.memoryObjects.filter((m) => !existingMemoryObjectIds.has(m.id));
-      const missingSources = scan.sources.filter((s) => !existingSourceIds.has(s.id));
-      const newCount = missingConversations.length + missingMemoryObjects.length + missingSources.length;
-
-      // 保険（generation check）：このscanが開始された後にVault世代が進んでいた場合
-      // （＝旧Vault由来のscanが、待たれないまま切替後まで生き残っていた場合）、
-      // 古いVaultのrestore候補を新しいMemory World（B）の画面へ出さない。
-      if (generation !== vaultGenerationRef.current) return;
-      // Android Vault問題（in-flight scanの協調的キャンセル）：restoreCandidate
-      // 評価直前にも確認する。scan自体は最後まで正常に完了していても、その直後に
-      // 新しいVault切替が始まっていればここで打ち切る（部分結果どころか完全な
-      // scan結果であっても、既に用済みのVaultのものは画面へ一切出さない）。
-      if (signal.aborted) {
-        logTimingEvent("Vault scan:aborted", { trigger });
-        return;
-      }
-
-      if (newCount > 0) {
-        // Android Vault問題（missing-only auto import）：無言のauto importは、
-        // ユーザーの明示操作（フォルダ選択・再許可クリック）を起点とするscanでのみ
-        // 許可する。通常起動時のbackground scan（trigger==="startup"）では、
-        // IndexedDB側の状態に関わらず常に確認UI（setRestoreCandidate）へ回す
-        // ——端末が無操作のまま勝手にIndexedDBへ書き込むことを避けるため。
-        const autoImportAllowed = trigger !== "startup";
-        // Codexレビュー指摘High-1対応：pendingMemoryTasksRefには、この関数自身が
-        // 冒頭で登録したmarker（endTask()未実行）が必ず1件含まれている。「他に
-        // pending taskが無いか」を知りたいので、自分の分（ちょうど1件）を差し引いて
-        // 判定する（size <= 1 ＝ 残っているのは自分自身のmarkerだけ、という意味）。
-        // 重要：この判定はあくまで「無駄にauto importを試みない」ための事前チェック
-        // （ヒューリスティック）であり、既存IDを絶対に上書きしないことの本当の保証は、
-        // この後実際に書き込む段階（autoImportMissingRecords→db.tsの
-        // importMissingRecordsIfAbsent、IndexedDB transaction内での再確認）が担う。
-        // pendingMemoryTasksRefの追跡漏れ・タイミングのズレがあったとしても、
-        // 既存レコードが上書きされることは無い。
-        const noOtherPendingMemoryTasks = pendingMemoryTasksRef.current.size <= 1;
-        // Vault write queueの確認は、実際にauto importへ進む可能性がある場合だけ行う
-        // （不要な待機を避ける）。IndexedDBが空かどうかはもう条件にしない——
-        // 既存IDには一切触れないmissing-only書き込みのため、既存データの有無自体は
-        // 安全性に影響しない。
-        const vaultWriteQueueSafe =
-          autoImportAllowed && noOtherPendingMemoryTasks ? !(await waitForVaultWrites(0)).timedOut : false;
-        const autoImportWillRun = autoImportAllowed && noOtherPendingMemoryTasks && vaultWriteQueueSafe;
-
-        // Vault再接続時の取り込み判定を確認する診断ログ。件数・起動経路・判定値のみを
-        // 記録し、id・summary・content・filename等の個人データは含めない。
-        logTimingEvent("Restore candidate:evaluate", {
-          trigger,
-          existingConversations: existingConversations.length,
-          existingMemoryObjects: existingMemoryObjects.length,
-          existingSources: existingSources.length,
-          scanConversations: scan.conversations.length,
-          scanMemoryObjects: scan.memoryObjects.length,
-          scanSources: scan.sources.length,
-          newCount,
-          missingConversations: missingConversations.length,
-          missingMemoryObjects: missingMemoryObjects.length,
-          missingSources: missingSources.length,
-          autoImportAllowed: String(autoImportAllowed),
-          noOtherPendingMemoryTasks: String(noOtherPendingMemoryTasks),
-          autoImportWillRun: String(autoImportWillRun),
-        });
-
-        if (autoImportWillRun) {
-          // generationはここまでの非同期処理を経ても変わっていないかを再確認してから
-          // 実際の書き込みへ進む（autoImportMissingRecords自身も呼び出し前後で
-          // 再確認する。既存IDを上書きしないことの保証自体は、ここでのgeneration
-          // チェックではなくdb.tsのimportMissingRecordsIfAbsent側のtransaction内
-          // 再確認が担う）。
-          if (generation !== vaultGenerationRef.current) return;
-          // Android Vault問題（in-flight scanの協調的キャンセル）：auto import開始
-          // 直前にも確認する。
-          if (signal.aborted) {
-            logTimingEvent("Vault scan:aborted", { trigger });
-            return;
-          }
-          const outcome = await autoImportMissingRecords(
-            { conversations: missingConversations, memoryObjects: missingMemoryObjects, sources: missingSources },
-            generation
-          );
-          if (outcome.status === "restored") {
-            setRestoreStatus("done");
-            bumpHistoryRefreshToken();
-          }
-          // missing recordsを全て取り込めた場合（stale以外）は、restoreCandidateを
-          // 一切設定しない＝確認UIを出さない。staleだった場合も、古いgeneration由来の
-          // 候補を新しいMemory World画面へ出さないため、同様に何も設定しない。
-          return;
-        }
-
-        setRestoreCandidate({ scan, newCount });
-        setRestoreStatus("idle");
-      }
-    } catch (error) {
-      // Android Vault問題（in-flight scanの協調的キャンセル）：ユーザーが新しい
-      // Vault切替操作を始めたことによる正常な打ち切りであり、異常なI/Oエラーとは
-      // 扱わない——console.errorに出さず、ユーザー向けエラーも表示せず、
-      // restoreCandidate/auto importのいずれも行わない（このcatchへ来た時点で
-      // どちらも未実行のまま関数を抜けるため、追加の後始末は不要）。
-      if (isOwnAbortError(error, signal)) {
-        logTimingEvent("Vault scan:aborted", { trigger });
-        return;
-      }
-      console.error("Failed to scan vault for restore", error);
-    } finally {
-      endTask();
-    }
   }
 
   useEffect(() => {
