@@ -484,6 +484,25 @@ export default function ChatScreen() {
    */
   const vaultOperationLockRef = useRef(false);
   /**
+   * Android Vault問題（「保存先を変更」がVault切替の排他ロック取得を長時間
+   * ブロックする）対応：現在実行中のbackground flush（`flushPendingToVaultInBackground`
+   * が開始したもの）に紐づく`AbortController`。新しいbackground flushを開始する
+   * たびに新しいControllerへ差し替える（同時に複数のbackground flushを走らせない
+   * ため。詳細は`flushPendingToVaultInBackground`のコメント参照）。Vault切替の
+   * 排他ロック（`runVaultSwitchExclusive`）を取得する直前に、`abortBackgroundFlushAndWait`
+   * 経由でこのControllerへ`abort()`する。
+   */
+  const backgroundFlushAbortControllerRef = useRef<AbortController | null>(null);
+  /**
+   * 現在実行中のbackground flushそのもの（`flushPendingToVaultInBackground`が
+   * 返すPromise）を保持する。`abortBackgroundFlushAndWait`は、abort signalを
+   * 送るだけでなく、このPromiseがsettleする（＝flush側が現在処理中の1itemを
+   * 最後まで終えてから早期returnし終える）まで待つことで、「abortしただけで
+   * 旧flushがまだwithVaultWorldReadの共有ロックを保持している状態のまま、
+   * 排他ロック（runVaultSwitchExclusive）を取りに行ってしまう」事故を防ぐ。
+   */
+  const backgroundFlushInFlightPromiseRef = useRef<Promise<void> | null>(null);
+  /**
    * Android Vault問題（in-flight scanの協調的キャンセル）：現在実行中のrestore
    * candidate scanに紐づく`AbortController`。`startVaultRestoreScan`が新しいscanを
    * 開始するたびに新しいControllerへ差し替える。ユーザーが明示的にVault切替操作
@@ -773,20 +792,76 @@ export default function ChatScreen() {
    *   `handleStaleVaultTabError`で既存のUI状態（crossTabStale等）へ反映する。
    *   それ以外の失敗はconsole.errorに残すのみ（呼び出し元は既に「接続成功」の
    *   UIを表示済みのため、background同期の失敗を接続失敗として見せない）。
+   *
+   * Vault切替優先化（追加対応）：background flushが`withVaultWorldRead`の共有
+   * ロックを長時間保持し続けると、直後にユーザーが別Vaultへ切り替えようとした際、
+   * `runVaultSwitchExclusive`（排他ロック）の取得がそのflush完了までブロックされ
+   * うる（Web Locks APIの仕様上、共有ロック保持中は排他ロックのfnが呼ばれない
+   * ため）。これ自体はH4の安全性としては正しい（切替中に古いflushが割り込まない）
+   * が、UI応答性の観点では「Vault切替操作をbackground flushより優先する」ことが
+   * 目標のため、`abortBackgroundFlushAndWait`（下記）を新設し、切替の排他ロックを
+   * 取得する直前に呼ぶことで、flushに現在処理中の1itemだけ完了させて早期終了させ、
+   * 共有ロックを速やかに解放させる。
    */
   function flushPendingToVaultInBackground(handle: FileSystemDirectoryHandle): void {
+    // 同時に複数のbackground flushを走らせない：直前のbackground flush
+    // （前回のconnect/reauthorize由来で、まだ終わっていないかもしれない）への
+    // 参照をここで退避してから、新しいcontroller/promiseで同期的に即座に
+    // 上書きする（awaitを挟まないため、この関数の呼び出しが短時間に重なっても
+    // 取りこぼしなく直列化できる）。
+    const previousController = backgroundFlushAbortControllerRef.current;
+    const previousInFlight = backgroundFlushInFlightPromiseRef.current;
+    const controller = new AbortController();
+    backgroundFlushAbortControllerRef.current = controller;
     const endTask = beginMemoryTask();
-    void (async () => {
+    const runPromise = (async () => {
+      // 直前のbackground flushがまだ残っていれば、まずそれを中断し、現在処理中の
+      // 1itemが終わってPromiseがsettleするまで待ってから、このflushの本体を
+      // 開始する（whole-item boundaryはflushPendingToVault側のsignal判定が
+      // 保証するため、ここでは中断→待つだけでよい）。
+      previousController?.abort();
+      if (previousInFlight) {
+        await previousInFlight.catch(() => {});
+      }
       try {
-        await withVaultWorldRead(() => flushPendingToVault(handle));
+        await withVaultWorldRead(() => flushPendingToVault(handle, "background", controller.signal));
       } catch (error) {
         if (!handleStaleVaultTabError(error)) {
           console.error("[Tsumugi] background vault flush failed (will retry on next flush):", error);
         }
       } finally {
         endTask();
+        // `controller`（このflush呼び出し内でのみ生成された、自己参照の無い変数）の
+        // 一致だけで両refのクリアを判定する。backgroundFlushAbortControllerRef／
+        // backgroundFlushInFlightPromiseRefは常にこの関数内で同期的に対で更新される
+        // ため、controllerが一致すればpromise refも必ずこのrunPromise自身を指して
+        // いる（`runPromise`自身をこの中で参照すると、TypeScriptの
+        // 「使用前に代入」エラーになるため、あえて`controller`だけで判定する）。
+        if (backgroundFlushAbortControllerRef.current === controller) {
+          backgroundFlushAbortControllerRef.current = null;
+          backgroundFlushInFlightPromiseRef.current = null;
+        }
       }
     })();
+    backgroundFlushInFlightPromiseRef.current = runPromise;
+  }
+
+  /**
+   * Vault切替（`runVaultSwitchExclusive`＝排他ロック取得）の直前に必ず呼ぶこと。
+   * 現在in-flightのbackground flushがあれば中断シグナルを送り、そのflushが
+   * （現在処理中の1itemを最後まで終えてから）実際にPromiseをsettleさせるまで
+   * 待つ。in-flightなbackground flushが無ければ即座に解決する。
+   *
+   * これにより、`withVaultWorldRead`の共有ロックが速やかに解放され、直後の
+   * `runVaultSwitchExclusive`（排他ロック）取得が、残りの未flush件数ぶんではなく
+   * 「現在処理中だった最大1item分」の待ちだけで済むようになる（H4のロック名・
+   * epochロジック・sync ledger・History Index更新ロジックはいずれも無変更）。
+   */
+  function abortBackgroundFlushAndWait(): Promise<void> {
+    const inFlight = backgroundFlushInFlightPromiseRef.current;
+    backgroundFlushAbortControllerRef.current?.abort();
+    if (!inFlight) return Promise.resolve();
+    return inFlight.catch(() => {});
   }
 
   /**
@@ -1659,6 +1734,13 @@ export default function ChatScreen() {
         // 奪い合わない（H4のロック・epoch判定は不変）。
         await abortInFlightVaultScanAndWait();
 
+        // Vault切替優先化：この後の排他ロック取得（runVaultSwitchExclusive）が、
+        // 直前のconnect/reauthorizeが始めたbackground flushの共有ロック保持で
+        // 長時間ブロックされないよう、ここでbackground flushを中断し、現在
+        // 処理中の1itemが終わるまでだけ待つ（flushPendingToVaultInBackground/
+        // abortBackgroundFlushAndWaitのコメント参照）。
+        await abortBackgroundFlushAndWait();
+
         await ensureVaultSkeleton(newHandle);
 
         const tabEpochAtStart = getTabVaultEpoch();
@@ -1782,6 +1864,13 @@ export default function ChatScreen() {
         // 待ってから（固定時間のtimeoutではなく、scan自身の完了をawaitするだけ）、
         // ensureVaultSkeletonのFSA I/Oを開始する。これにより、新Vaultの確認処理が
         // 旧scanとFSA I/Oを奪い合わない。
+        // Vault切替優先化：この後の排他ロック取得（runVaultSwitchExclusive）が、
+        // 直前のconnect/reauthorizeが始めたbackground flushの共有ロック保持で
+        // 長時間ブロックされないよう、ここでbackground flushを中断し、現在
+        // 処理中の1itemが終わるまでだけ待つ（flushPendingToVaultInBackground/
+        // abortBackgroundFlushAndWaitのコメント参照）。
+        await abortBackgroundFlushAndWait();
+
         // 新Vaultが実際に使えるかを、IndexedDBをclearする前に確認する。
         await ensureVaultSkeleton(newHandle);
 
@@ -2017,6 +2106,13 @@ export default function ChatScreen() {
     // 確定したこの時点で初めて、古いscanへ打ち切りを要求する（H4のロック・epoch
     // 判定は不変）。
     abortInFlightVaultScan();
+
+    // Vault切替優先化：この後の排他ロック取得（runVaultSwitchExclusive）が、
+    // 直前のconnect/reauthorizeが始めたbackground flushの共有ロック保持で
+    // 長時間ブロックされないよう、ここでbackground flushを中断し、現在
+    // 処理中の1itemが終わるまでだけ待つ（flushPendingToVaultInBackground/
+    // abortBackgroundFlushAndWaitのコメント参照）。
+    await abortBackgroundFlushAndWait();
 
     const tabEpochAtStart = getTabVaultEpoch();
     type RecoveryOutcome =

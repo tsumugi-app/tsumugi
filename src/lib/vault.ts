@@ -1004,9 +1004,21 @@ export interface FlushResult {
   failedCount: number;
 }
 
+/**
+ * `signal`（省略可、既存呼び出し元は省略のままで従来通り動作）：Android Vault問題
+ * （background flushがVault切替の排他ロック取得を長時間ブロックする）対応。
+ * 3つのループそれぞれで、次のitemを処理する直前にのみ`signal?.aborted`を確認し、
+ * abortされていればその時点までの集計を返して早期終了する（whole-item boundary。
+ * `writeConversationMarkdown`/`writeMemoryObjectMarkdown`本体・その内部の
+ * History Index更新・`markVaultSynced`の実行中にabortを差し込むことは無い——
+ * 既に開始した1件は必ず最後まで完了させる）。中断されたitemは`markVaultSynced`が
+ * 呼ばれないため、次回flush時に`isAlreadySyncedToVault`が未同期と正しく判定し、
+ * 自然に再試行される（sync ledger・History Indexいずれのロジックも変更しない）。
+ */
 export async function flushPendingToVault(
   root: FileSystemDirectoryHandle,
-  priority: VaultWritePriority = "background"
+  priority: VaultWritePriority = "background",
+  signal?: AbortSignal
 ): Promise<FlushResult> {
   const flushStart = Date.now();
   const [conversations, memoryObjects, sources] = await Promise.all([
@@ -1021,6 +1033,10 @@ export async function flushPendingToVault(
   let writtenCount = 0;
   let failedCount = 0;
   for (const conversation of conversations) {
+    if (signal?.aborted) {
+      logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
+      return { totalCount, writtenCount, failedCount };
+    }
     if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
     try {
       await writeConversationMarkdown(root, conversation, priority);
@@ -1031,6 +1047,10 @@ export async function flushPendingToVault(
     }
   }
   for (const memoryObject of memoryObjects) {
+    if (signal?.aborted) {
+      logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
+      return { totalCount, writtenCount, failedCount };
+    }
     if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
     try {
       await writeMemoryObjectMarkdown(root, memoryObject, priority);
@@ -1041,6 +1061,10 @@ export async function flushPendingToVault(
     }
   }
   for (const source of sources) {
+    if (signal?.aborted) {
+      logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
+      return { totalCount, writtenCount, failedCount };
+    }
     if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
     try {
       await writeSourceMarkdown(root, source, priority);
