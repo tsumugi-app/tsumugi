@@ -730,6 +730,66 @@ export default function ChatScreen() {
   }
 
   /**
+   * Android Vault問題（「保存先を変更」ボタン無反応）対応：接続・再許可が成立した
+   * 直後（`setVaultStatus("connected")`の直後）、未同期データのVault flushを
+   * `handleConnectVault`/`handleReauthorizeVault`本体からawaitせず、background
+   * （fire-and-forget）で行う。
+   *
+   * 背景：`vaultOperationLockRef`（handleConnectVault/handleReauthorizeVault/
+   * handleRestoreFromVaultの3つが共有する排他ロック）は、以前はflush完了までずっと
+   * 保持されていた。一方UIは`setVaultStatus("connected")`の時点で即座に
+   * 「変更する」ボタンをdisabledではない状態で再表示するため、その後flushが
+   * 完了するまでの間（Android実機でVault write 1回が8〜11秒かかることもあり、
+   * 未flush件数次第では長時間）、ボタンを押してもvaultOperationLockRef.currentが
+   * まだtrueのままhandleConnectVault冒頭で無音でreturnされてしまい、「見た目は
+   * 押せるが実際には反応しない」状態になっていた。この関数はflushをawaitしない
+   * ことで、呼び出し元（handleConnectVault/handleReauthorizeVault）がすぐ
+   * リターンしvaultOperationLockRefを速やかに解放できるようにする。
+   *
+   * 安全性（既存の仕組みに新しいロック機構を追加しない）：
+   * - H4（cross-tab）：flush本体は引き続き`withVaultWorldRead`で包む。共有ロックを
+   *   保持している間、別タブ・別操作からの`runVaultSwitchExclusive`（排他ロック）は
+   *   Web Locks APIの仕様上、このflushが共有ロックを解放するまで実際にfnを実行
+   *   できない。そのため、backgroundにしても「flush完了前に別Vaultへの切替が
+   *   commitされてしまう」ことは起こり得ない（この保証はReact state/refの
+   *   タイミングに依存しない、ブラウザ側のロック機構そのものが提供する）。
+   * - 同一タブ（same-tab）：`beginMemoryTask()`でこのflushをpendingMemoryTasksRefへ
+   *   同期的に登録する。これにより、直後に別Vaultへの切替（"different"分岐）が
+   *   開始された場合、その`drainPendingMemoryTasks`が既存の設計通りこのflushの
+   *   完了を待ってからIndexedDB clear／commitへ進む（新しい待機機構は追加せず、
+   *   既存のpendingMemoryTasksRef/drainPendingMemoryTasksの仕組みにそのまま乗る）。
+   *   登録は`await`を挟まず同期的に行うため、呼び出し元がreturnし
+   *   vaultOperationLockRefを解放した時点で、既にこのタスクはSetへ入っている
+   *   （取りこぼしは無い）。
+   * - 上記2つの結果として、「backgroundでflush中に別Vaultへ切り替えた場合に
+   *   古いhandleへ誤って書き込み続ける」ことは無い：切替のexclusiveロックのfn
+   *   （epoch更新・IndexedDB clear・新handle保存）は、このflushが完全に終わる
+   *   （＝共有ロックを解放する）までブラウザのロック機構によって実行されない。
+   * - sync ledger／retry：flush自体（`flushPendingToVault`）・台帳
+   *   （markVaultSynced/isAlreadySyncedToVault）・History Index更新は無変更。
+   *   このflushが丸ごと失敗しても、該当itemは未同期のまま残り、次回のflush
+   *   （次回接続時等）で自然に再試行される（既存のretry方針のまま）。
+   * - エラー処理：`StaleVaultTabError`/`IncompleteVaultWorldError`は
+   *   `handleStaleVaultTabError`で既存のUI状態（crossTabStale等）へ反映する。
+   *   それ以外の失敗はconsole.errorに残すのみ（呼び出し元は既に「接続成功」の
+   *   UIを表示済みのため、background同期の失敗を接続失敗として見せない）。
+   */
+  function flushPendingToVaultInBackground(handle: FileSystemDirectoryHandle): void {
+    const endTask = beginMemoryTask();
+    void (async () => {
+      try {
+        await withVaultWorldRead(() => flushPendingToVault(handle));
+      } catch (error) {
+        if (!handleStaleVaultTabError(error)) {
+          console.error("[Tsumugi] background vault flush failed (will retry on next flush):", error);
+        }
+      } finally {
+        endTask();
+      }
+    })();
+  }
+
+  /**
    * Vault境界の安全性：別Vaultへ切り替える直前に、旧Memory World由来のReact state/refを
    * まとめて初期化する（H1対応：Aのconversation stateがBへ保存されるのを防ぐ）。
    * API key・chatProvider・テーマ・キーボード表示状態等、Memory Worldに属さない
@@ -1665,14 +1725,9 @@ export default function ChatScreen() {
 
         setVaultHandle(newHandle);
         setVaultStatus("connected");
-        // H4：flushはMemory Worldへの読み書きとして共有ロック＋epoch確認で保護する。
-        // 排他ロックは既に解放済みのためここは通常の共有ロックでよい。
-        try {
-          await withVaultWorldRead(() => flushPendingToVault(newHandle));
-        } catch (error) {
-          if (!handleStaleVaultTabError(error)) throw error;
-          return;
-        }
+        // Android Vault問題（「保存先を変更」ボタン無反応）対応：flush完了を
+        // ここでawaitしない（flushPendingToVaultInBackgroundのコメント参照）。
+        flushPendingToVaultInBackground(newHandle);
         return;
       }
 
@@ -2091,8 +2146,9 @@ export default function ChatScreen() {
         return;
       }
       setVaultStatus("connected");
-      // H4：flushをMemory Worldへの読み書きとして共有ロック＋epoch確認で保護する。
-      await withVaultWorldRead(() => flushPendingToVault(vaultHandle));
+      // Android Vault問題（「保存先を変更」ボタン無反応）対応：flush完了を
+      // ここでawaitしない（flushPendingToVaultInBackgroundのコメント参照）。
+      flushPendingToVaultInBackground(vaultHandle);
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to reauthorize vault", error);
@@ -3492,7 +3548,16 @@ function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null;
   const [leavesVisible, setLeavesVisible] = useState(false);
 
   const stage = signals ? computeTreeStage(signals) : null;
-  const imagePath = stage !== null && stage !== 0 ? TREE_STAGE_IMAGE_PATH[stage] : null;
+  // Android Vault問題（History Index未バックフィル）：既存Vaultにはhistory-meta.jsonを
+  // バックフィルしない方針（過去データのfull scanは行わない）のため、History Index未生成の
+  // 既存Vaultでは`readHistoryMeta`がtotalMemories: 0を返し、stageが常に0になる。
+  // Stage 0は元々「画像を出さない」設計だったが、つむぎの木はトップ画面の主要UIのため、
+  // 実際にはMemoryがあるはずの既存ユーザーでも木そのものが消えて見えるのは避けたい。
+  // Stage 0でもStage 01の画像を表示の下限として使う（stage自体・しきい値・
+  // computeTreeStageは変更しない。葉の枚数はmemoryCount:0のままcomputeLeafProgressへ
+  // 渡るため、Stage 01の画像に葉0枚＝「芽生えたばかり」の見た目になるだけで、実際の
+  // 進捗計算には影響しない）。
+  const imagePath = stage !== null ? TREE_STAGE_IMAGE_PATH[stage === 0 ? 1 : stage] : null;
   const leafStage = stage === 1 || stage === 2 || stage === 3 ? stage : null;
   const leafCount = signals && leafStage !== null ? computeLeafProgress(signals, leafStage) : 0;
   const leafAnchors = leafStage !== null ? LEAF_ANCHORS_BY_STAGE[leafStage].slice(0, leafCount) : [];

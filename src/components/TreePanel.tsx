@@ -68,7 +68,10 @@ export default function TreePanel({
     };
   }, [vaultHandle]);
 
-  const imagePath = stage === 0 ? null : TREE_STAGE_IMAGE_PATH[stage];
+  // ChatScreen.tsxのLaunchTreeScreenと同じ理由・同じ最小修正：History Index未生成の
+  // 既存Vaultではstageが常に0になるため、Stage 0でもStage 01の画像を下限として表示する
+  // （stage自体・しきい値は変更しない）。
+  const imagePath = TREE_STAGE_IMAGE_PATH[stage === 0 ? 1 : stage];
 
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
