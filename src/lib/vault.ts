@@ -20,6 +20,9 @@ import {
   getAllConversations,
   getAllMemoryObjects,
   getAllSources,
+  getConversation,
+  getMemoryObject,
+  getSource,
   getVaultSyncState,
   loadVaultHandle,
   setVaultSyncState,
@@ -27,15 +30,18 @@ import {
 import { logTimingEvent } from "./debugTimingLog";
 import type { Conversation, MemoryObject, MemoryType, Source } from "./types";
 import {
+  asString,
   conversationToMarkdown,
   memoryObjectToMarkdown,
   parseConversationMarkdown,
+  parseFrontmatter,
   parseMemoryDayFile,
   parseMemoryObjectMarkdown,
   parseSourceMarkdown,
   serializeMemoryDayFile,
   sourceToMarkdown,
 } from "./markdown";
+import { runVaultWorldExclusive } from "./vaultWorldLock";
 
 const VAULT_DIRS = ["Conversations", "Memories", "People", "Themes", "Emotions", "Goals", "Ideas", "Events", "Attachments"] as const;
 
@@ -2469,4 +2475,963 @@ async function verifyVaultRegistryEntryBeforeWrite(
 
   await markVaultRegistryNeedsResync(root, registryKey);
   throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync");
+}
+
+// ---------------------------------------------------------------------------
+// Vault Registry（Step 4a：明示的Vault resync、scan＋classificationのみ）
+//
+// 目的：ユーザーが外部でTsumugi管理Markdownを移動・rename・編集・追加した場合に、
+// 「所在（actual path）」「Registry」「IndexedDB」「History Index」の食い違いを、
+// 明示的なユーザー操作でのみ検出する（起動時の自動full scanにはしない）。
+//
+// 本Stepのスコープ：Vault全体のdirectory enumeration・分類（unchanged/moved/
+// edited/added/missing/conflict/unreadable）をメモリ上で完成させるところまで。
+// IndexedDB・Registry・History Index・Markdownのいずれへも書き込みは一切行わない
+// （read onlyであることは`getConversation`/`getMemoryObject`/`getSource`/
+// `getVaultSyncState`の使用箇所が全てread専用のdb.ts関数であることからも確認できる）。
+// 実際の反映（apply）はStep 4bのスコープ。
+//
+// H4 Vault world境界の再利用：resync全体を`runVaultWorldExclusive`
+// （vaultWorldLock.ts、Step 4a新設）で"tsumugi-vault-world"の排他ロックとして
+// 包む。これにより通常のVault write（capture.ts/source.tsが`withVaultWorldRead`
+// で包んでいる共有ロック）・別tabのwrite・Vault切替（`runVaultSwitchExclusive`も
+// 同じロック名を排他要求する）の全てが、resync完了までブロックされる
+// （navigator.locksはorigin全体で共有されるためタブをまたいでも同様）。
+// この関数（`performVaultResyncScan`）の内部からは、`withVaultWorldRead`・
+// `runVaultSwitchExclusive`・`runVaultWorldExclusive`のいずれも呼び出さない
+// （同名ロックの再要求による自己デッドロックを避けるため）。IndexedDBへの
+// read（`getConversation`等）はH4ラッパーを経由せず、db.tsの生関数を直接呼ぶ
+// ——resync自体が既に"tsumugi-vault-world"を排他保持しているため、個々の
+// read時点で改めてepoch整合性を確認する必要が無い（保持している間、他タブが
+// Vaultを切り替えることは構造的に不可能なため）。
+// ---------------------------------------------------------------------------
+
+/** 1回のresync scanで得られる、1つのrecord/containerについての分類結果。 */
+export type VaultResyncOutcome = "unchanged" | "moved" | "edited" | "added" | "missing" | "conflict" | "unreadable";
+
+/** normal Memory day-file内の、1メンバー単位の分類（container自体の状態とは別に持つ）。 */
+export interface VaultResyncMemberResult {
+  id: string;
+  outcome: "unchanged" | "edited" | "added" | "conflict";
+}
+
+export interface VaultResyncRecordResult {
+  /** Conversation/Reflection/Sourceはid自身、normal Memoryは`dayFileRegistryKey(day)`。 */
+  registryKey: string;
+  recordType: VaultRegistryRecordType;
+  outcome: VaultResyncOutcome;
+  previousPath: string | null;
+  /** 今回のscanで実際に見つかったpath。missing/unreadable相当ならnull。 */
+  currentPath: string | null;
+  contentHash: string | null;
+  mtime: number | null;
+  size: number | null;
+  /** normal Memory（memory-day）のみ非null。 */
+  members: VaultResyncMemberResult[] | null;
+  /** outcome==="added"の場合のみ意味を持つ。IndexedDBに既存の同idがあり、かつ
+   *  semantic equalityで一致が確認できたことを示す（true時、Step 4bはpath登録のみ
+   *  でIndexedDBには触れない想定）。IndexedDBに既存だが内容が一致しない場合は、
+   *  この時点で既にoutcomeが"conflict"へ格上げされているため、ここには現れない。 */
+  addedIndexedDbEquivalent: boolean | null;
+  /** 診断用の短い説明（conflict理由・unreadable理由等）。無ければnull。 */
+  note: string | null;
+}
+
+export interface VaultResyncScanResult {
+  /** Vault全体のdirectory enumerationが最後まで正常完了したかどうか。falseの場合、
+   *  records内に"missing"は一切含まれない（未確定のまま、次回resyncへ持ち越す）。 */
+  scanCompleted: boolean;
+  scannedFileCount: number;
+  records: VaultResyncRecordResult[];
+  /** probeでTsumugiファイルらしいと判定されたがparseできなかった、または
+   *  getFile/text自体が失敗したファイル。分類（unchanged等）の対象にはしない。 */
+  unreadableFiles: { path: string; reason: string }[];
+}
+
+type VaultResyncSingleKind = "conversation" | "source" | "reflection";
+
+type VaultResyncParsedCandidate =
+  | { kind: "conversation"; id: string; record: Conversation }
+  | { kind: "source"; id: string; record: Source }
+  | { kind: "reflection"; id: string; record: MemoryObject }
+  | { kind: "memory-day"; day: string; members: MemoryObject[] };
+
+/**
+ * body（frontmatter直後の本文）に含まれる固定の見出し文字列から種別を判定する
+ * （B節：既存folder名に頼らないTsumugi Markdown種別判定）。
+ * - "## Transcript"：`conversationToMarkdown`のみが書き出す（Conversation専用）。
+ * - "## Content"：`sourceToMarkdown`のみが書き出す（Source専用、`sourceType`必須と
+ *   組み合わせて判定する）。
+ * - "## Summary"：`memoryObjectToMarkdown`が書き出す（normal Memory/Reflection共通、
+ *   `metadata.source`でさらに細分する）。
+ * 3つとも互いに排他的な固定文字列であり、Tsumugiの各serializerがそれぞれ1種類
+ * しか書き出さないため、この判定に曖昧さは無い。
+ */
+function classifyResyncBodyMarker(body: string): "conversation" | "source-like" | "memory-like" | null {
+  if (body.includes("## Transcript")) return "conversation";
+  if (body.includes("## Content")) return "source-like";
+  if (body.includes("## Summary")) return "memory-like";
+  return null;
+}
+
+/**
+ * 未知の`.md`を推測でimportしないための、確実にparseできるものだけを対象とする
+ * 判定＋parse。`tsumugi: true`が無い、body見出しが判定不能、実際のparserが
+ * 失敗する（Sourceは`sourceType`欠落でthrowする等）場合は全てnullを返し、
+ * 呼び出し元はunreadable/無視のいずれかとして扱う。
+ *
+ * memory-like（"## Summary"）は、通常のday-file（1ファイル複数member、
+ * `isReflectionSummary`相当がfalseのみ）とReflection（1ファイル1member、
+ * `metadata.source==="system-generated"`）が同じbody形式を共有するため、
+ * frontmatterの`source`で細分する。day-fileにReflectionが混在することは
+ * write側の設計上あり得ないため、複数member中に1件でもReflection相当が
+ * 混ざっている場合は判定不能としてnullを返す（unreadable扱いにする）。
+ */
+function parseTsumugiResyncCandidate(text: string): VaultResyncParsedCandidate | null {
+  const parsedFrontmatter = parseFrontmatter(text);
+  if (!parsedFrontmatter) return null;
+  const { frontmatter, body } = parsedFrontmatter;
+  if (frontmatter.tsumugi !== true) return null;
+
+  const bodyKind = classifyResyncBodyMarker(body);
+  if (bodyKind === "conversation") {
+    const record = parseConversationMarkdown(text);
+    if (!record) return null;
+    return { kind: "conversation", id: record.id, record };
+  }
+  if (bodyKind === "source-like") {
+    if (asString(frontmatter.sourceType) === undefined) return null;
+    try {
+      const record = parseSourceMarkdown(text);
+      return { kind: "source", id: record.id, record };
+    } catch {
+      return null;
+    }
+  }
+  if (bodyKind === "memory-like") {
+    const members = parseMemoryDayFile(text);
+    if (members.length === 0) return null;
+    const reflectionCount = members.filter((m) => m.metadata.source === "system-generated").length;
+    if (reflectionCount > 0 && members.length > 1) return null;
+    if (reflectionCount === 1 && members.length === 1) {
+      return { kind: "reflection", id: members[0].id, record: members[0] };
+    }
+    const days = new Set(members.map((m) => m.date.slice(0, 10)));
+    if (days.size !== 1) return null;
+    const [day] = days;
+    return { kind: "memory-day", day, members };
+  }
+  return null;
+}
+
+/**
+ * semantic equality（修正1・修正2対応）：raw text hashではなく、実際に永続化され
+ * Markdownとの往復で意味が保たれるフィールドだけを比較する。stable id自体の一致を
+ * 前提条件とする（一致しなければ即false）。`metadata.id`はparserが毎回新規発行
+ * するため比較対象にしない。turn単位のtimestamp・webSearchRequested・
+ * isRecordTurnはMarkdownへ保存されず往復しないため比較しない。
+ */
+function conversationsSemanticEqual(a: Conversation, b: Conversation): boolean {
+  if (a.id !== b.id) return false;
+  if (a.persona !== b.persona) return false;
+  if (a.startedAt !== b.startedAt) return false;
+  if ((a.endedAt ?? null) !== (b.endedAt ?? null)) return false;
+  if (a.status !== b.status) return false;
+  if (a.createdAt !== b.createdAt) return false;
+  if (a.updatedAt !== b.updatedAt) return false;
+  if (a.memoryObjectIds.length !== b.memoryObjectIds.length) return false;
+  if (!a.memoryObjectIds.every((id, i) => id === b.memoryObjectIds[i])) return false;
+  if (a.turns.length !== b.turns.length) return false;
+  if (!a.turns.every((turn, i) => turn.role === b.turns[i].role && turn.content === b.turns[i].content)) return false;
+  if (a.metadata.source !== b.metadata.source) return false;
+  if ((a.metadata.sourceType ?? null) !== (b.metadata.sourceType ?? null)) return false;
+  if (JSON.stringify(a.metadata.sourceDetail ?? null) !== JSON.stringify(b.metadata.sourceDetail ?? null)) return false;
+  if (a.metadata.schemaVersion !== b.metadata.schemaVersion) return false;
+  return true;
+}
+
+/**
+ * `date`は日付部分のみ比較する（frontmatterには日付のみ保存され、読込時は時刻を
+ * 一律`T00:00:00.000Z`で補完するため、時刻を含めて比較すると常に不一致になる）。
+ * `themeIds`等6配列・`revisitPrompt`・`sourceId`・`metadata.obsidian`は
+ * Markdownへ一切書き出されずparser側が復元しないため比較対象にしない
+ * （比較すると往復で失われる情報のせいで常に偽の不一致になるため）。
+ */
+function memoryObjectsSemanticEqual(a: MemoryObject, b: MemoryObject): boolean {
+  if (a.id !== b.id) return false;
+  if (a.date.slice(0, 10) !== b.date.slice(0, 10)) return false;
+  if (a.types.length !== b.types.length || !a.types.every((t, i) => t === b.types[i])) return false;
+  if (a.content !== b.content) return false;
+  if (a.summary !== b.summary) return false;
+  if (a.keywords.length !== b.keywords.length || !a.keywords.every((k, i) => k === b.keywords[i])) return false;
+  if ((a.conversationId ?? null) !== (b.conversationId ?? null)) return false;
+  if ((a.topicId ?? null) !== (b.topicId ?? null)) return false;
+  if (JSON.stringify(a.links) !== JSON.stringify(b.links)) return false;
+  if (a.createdAt !== b.createdAt) return false;
+  if (a.updatedAt !== b.updatedAt) return false;
+  if (a.metadata.source !== b.metadata.source) return false;
+  if ((a.metadata.sourceType ?? null) !== (b.metadata.sourceType ?? null)) return false;
+  if (JSON.stringify(a.metadata.sourceDetail ?? null) !== JSON.stringify(b.metadata.sourceDetail ?? null)) return false;
+  if ((a.metadata.aiProvider ?? null) !== (b.metadata.aiProvider ?? null)) return false;
+  if ((a.metadata.confidence ?? null) !== (b.metadata.confidence ?? null)) return false;
+  if (a.metadata.schemaVersion !== b.metadata.schemaVersion) return false;
+  return true;
+}
+
+/** Sourceは`metadata: Metadata`を持たない最小構成のため、全フィールドが素直に往復する。 */
+function sourcesSemanticEqual(a: Source, b: Source): boolean {
+  if (a.id !== b.id) return false;
+  if (a.sourceType !== b.sourceType) return false;
+  if (a.title !== b.title) return false;
+  if (a.content !== b.content) return false;
+  if (JSON.stringify(a.sourceDetail ?? null) !== JSON.stringify(b.sourceDetail ?? null)) return false;
+  if ((a.attachmentId ?? null) !== (b.attachmentId ?? null)) return false;
+  if (a.createdAt !== b.createdAt) return false;
+  if (a.updatedAt !== b.updatedAt) return false;
+  return true;
+}
+
+/** vaultSyncState（B）のkindは`"conversation"|"memory"|"source"`の3値のみ。
+ *  Reflectionはnormal Memoryと同じ`"memory"`扱い（既存の`markVaultSynced`が
+ *  isReflectionSummaryを区別せず一律`"memory"`で記録しているのと同じ規約）。 */
+function vaultSyncKindOf(recordType: VaultResyncSingleKind): VaultSyncKind {
+  return recordType === "reflection" ? "memory" : recordType;
+}
+
+/**
+ * 修正1：「registryに無いvalid Tsumugi recordを発見し、IndexedDBにも同じstable idが
+ * 存在し、vaultSyncStateが無い」場合の判定。raw hashではなくsemantic equality
+ * （conversationsSemanticEqual等）で比較する。IndexedDB read（`getConversation`等）
+ * のみを行い、一切書き込まない。
+ */
+async function checkIndexedDbForAdded(
+  kind: VaultResyncSingleKind,
+  id: string,
+  parsed: Conversation | Source | MemoryObject
+): Promise<{ present: boolean; equivalent: boolean }> {
+  if (kind === "conversation") {
+    const existing = await getConversation(id);
+    if (!existing) return { present: false, equivalent: false };
+    return { present: true, equivalent: conversationsSemanticEqual(existing, parsed as Conversation) };
+  }
+  if (kind === "source") {
+    const existing = await getSource(id);
+    if (!existing) return { present: false, equivalent: false };
+    return { present: true, equivalent: sourcesSemanticEqual(existing, parsed as Source) };
+  }
+  const existing = await getMemoryObject(id);
+  if (!existing) return { present: false, equivalent: false };
+  return { present: true, equivalent: memoryObjectsSemanticEqual(existing, parsed as MemoryObject) };
+}
+
+/**
+ * 修正2：明示的resyncではmtime/size一致だけでunchanged確定しない、という方針の
+ * 裏側にある「Lがbより進んでいるか（unflushedか）」の判定（D節のB/L/Fモデル）。
+ * `vaultSyncState`（B）が無い、またはIndexedDB自体が無い場合は安全側で
+ * unsynced（true）とする。IndexedDB read（`getConversation`等）・
+ * `getVaultSyncState`のみを行い、一切書き込まない。
+ */
+async function checkLocalUnsynced(kind: VaultSyncKind, id: string): Promise<boolean> {
+  const ledgerValue = await getVaultSyncState(vaultSyncKeyFor(kind, id));
+  if (ledgerValue === undefined) return true;
+  let currentUpdatedAt: string | undefined;
+  if (kind === "conversation") currentUpdatedAt = (await getConversation(id))?.updatedAt;
+  else if (kind === "source") currentUpdatedAt = (await getSource(id))?.updatedAt;
+  else currentUpdatedAt = (await getMemoryObject(id))?.updatedAt;
+  if (currentUpdatedAt === undefined) return true;
+  return currentUpdatedAt !== ledgerValue;
+}
+
+/** resync scan中に蓄積する状態。1回の`performVaultResyncScan`呼び出しにつき1つ。 */
+interface VaultResyncScanState {
+  /** registry snapshot（scan開始時点、Phase 0で構築、以後読み取り専用）。 */
+  previousByKey: Map<string, string>;
+  previousEntries: Map<string, VaultRegistryFileEntry>;
+  /** previousByKeyの逆引き（path→registryKey）。walk中に「このpathは既知
+   *  registryのどのkeyのものか」を、読み込み前に判定するために使う
+   *  （Codexレビュー指摘・High対応：missing誤判定防止）。 */
+  previousRegistryKeyByPath: Map<string, string>;
+  /** 本scan中に、そのregistryKeyが実際に見つかった全path（重複検出用）。 */
+  seenPathsByKey: Map<string, Set<string>>;
+  /**
+   * Codexレビュー指摘・High対応：「registered actual pathに何らかのfileが
+   * 物理的に存在した」というnegative evidence停止材料を保持する集合。
+   * directory enumerationでpathがpreviousRegistryKeyByPathと一致した時点で、
+   * 本文が読める・parseできるかどうかに関わらずここへ追加する。Phase 2の
+   * missing判定は「recordsByKeyに無い」だけでなく「seenKnownKeysにも無い」
+   * ことを両方満たす場合にのみ行う——既知pathに物理ファイルがあるのに
+   * 読めない/parseできないだけでmissing扱いにしない、という原則を守るため。
+   */
+  seenKnownKeys: Set<string>;
+  recordsByKey: Map<string, VaultResyncRecordResult>;
+  unreadableFiles: { path: string; reason: string }[];
+  scannedFileCount: number;
+}
+
+function markVaultResyncSeen(state: VaultResyncScanState, key: string, path: string): void {
+  let set = state.seenPathsByKey.get(key);
+  if (!set) {
+    set = new Set();
+    state.seenPathsByKey.set(key, set);
+  }
+  set.add(path);
+}
+
+/**
+ * 狙い撃ち確認（targeted check）の結果を3値で表す（Codexレビュー指摘・High対応）。
+ * - "present"：旧pathに今も対象id/dayが実在すると確認できた（duplicate候補）。
+ * - "absent"：旧pathを正常に読み・parseでき、対象id/dayが存在しないと確認できた
+ *   （NotFoundError等でファイル自体が無い場合も含む）。movedの根拠にできる。
+ * - "unknown"：旧pathに何らかのfileは存在するが、getFile/text/parseのいずれかが
+ *   失敗し、存在有無を確認できなかった。**movedの根拠にしてはいけない**——
+ *   4bがRegistry actual pathを勝手にnew pathへ変更してしまう可能性があるため、
+ *   安全側でconflict相当として保留する。
+ */
+type VaultResyncTargetedPresence = "present" | "absent" | "unknown";
+
+/** Conversation/Reflection/Source（1id=1file）の狙い撃ち確認：旧pathに今も
+ *  同じidが実在するかどうかだけを、直接1回読んで確認する（moved/duplicateの
+ *  即時判定用。Vault全体を再走査しない）。 */
+async function targetedCheckSingleRecordStillAt(
+  root: FileSystemDirectoryHandle,
+  oldPath: string,
+  kind: VaultResyncSingleKind,
+  id: string
+): Promise<VaultResyncTargetedPresence> {
+  let resolved: { dir: FileSystemDirectoryHandle; fileName: string };
+  try {
+    resolved = await resolveVaultRelativePath(root, oldPath);
+  } catch {
+    return "absent";
+  }
+  let file: File;
+  try {
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    file = await fileHandle.getFile();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "NotFoundError") return "absent";
+    return "unknown";
+  }
+  let text: string;
+  try {
+    text = await file.text();
+  } catch {
+    return "unknown";
+  }
+  if (kind === "conversation") {
+    const parsed = parseConversationMarkdown(text);
+    return parsed?.id === id ? "present" : "absent";
+  }
+  if (kind === "source") {
+    try {
+      const parsed = parseSourceMarkdown(text);
+      return parsed.id === id ? "present" : "absent";
+    } catch {
+      // sourceType欠落等は「parseに失敗した」ため安全側でunknownとする
+      // （absentと確定はしない）。
+      return "unknown";
+    }
+  }
+  const parsed = parseMemoryObjectMarkdown(text);
+  return parsed?.id === id ? "present" : "absent";
+}
+
+/** normal Memory day-fileの狙い撃ち確認：旧pathに今もその日のday-fileが
+ *  実在するかどうかを直接1回読んで確認する。 */
+async function targetedCheckMemoryDayStillAt(
+  root: FileSystemDirectoryHandle,
+  oldPath: string,
+  day: string
+): Promise<VaultResyncTargetedPresence> {
+  let resolved: { dir: FileSystemDirectoryHandle; fileName: string };
+  try {
+    resolved = await resolveVaultRelativePath(root, oldPath);
+  } catch {
+    return "absent";
+  }
+  let file: File;
+  try {
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    file = await fileHandle.getFile();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "NotFoundError") return "absent";
+    return "unknown";
+  }
+  let text: string;
+  try {
+    text = await file.text();
+  } catch {
+    return "unknown";
+  }
+  const members = parseMemoryDayFile(text);
+  if (members.length === 0) return "absent";
+  return members.every((m) => m.date.slice(0, 10) === day) ? "present" : "absent";
+}
+
+/** day-file内の各memberを個別に分類する（修正3：member removal自体はここでは
+ *  扱わない——呼び出し元がcontainer全体をconflictにするかどうかを別途判定する）。 */
+async function classifyResyncMembers(
+  members: MemoryObject[],
+  previousMemberHashes: Record<string, string>
+): Promise<VaultResyncMemberResult[]> {
+  const results: VaultResyncMemberResult[] = [];
+  for (const member of members) {
+    const memberHash = hashVaultText(memoryObjectToMarkdown(member));
+    const previousHash = previousMemberHashes[member.id];
+    if (previousHash === undefined) {
+      const { present, equivalent } = await checkIndexedDbForAdded("reflection", member.id, member);
+      results.push({ id: member.id, outcome: present && !equivalent ? "conflict" : "added" });
+      continue;
+    }
+    if (previousHash === memberHash) {
+      results.push({ id: member.id, outcome: "unchanged" });
+      continue;
+    }
+    const localUnsynced = await checkLocalUnsynced("memory", member.id);
+    results.push({ id: member.id, outcome: localUnsynced ? "conflict" : "edited" });
+  }
+  return results;
+}
+
+/** Conversation/Reflection/Source（1id=1file）1件分の分類。 */
+async function handleResyncSingleRecordCandidate(
+  root: FileSystemDirectoryHandle,
+  state: VaultResyncScanState,
+  path: string,
+  kind: VaultResyncSingleKind,
+  id: string,
+  record: Conversation | Source | MemoryObject,
+  mtime: number,
+  size: number,
+  text: string
+): Promise<void> {
+  const alreadySeenPaths = state.seenPathsByKey.get(id);
+  const isDuplicatePath = !!alreadySeenPaths && alreadySeenPaths.size > 0 && !alreadySeenPaths.has(path);
+  markVaultResyncSeen(state, id, path);
+  const contentHash = hashVaultText(text);
+  const previousPath = state.previousByKey.get(id) ?? null;
+  const previousEntry = previousPath !== null ? state.previousEntries.get(previousPath) ?? null : null;
+
+  if (isDuplicatePath) {
+    state.recordsByKey.set(id, {
+      registryKey: id,
+      recordType: kind,
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: null,
+      addedIndexedDbEquivalent: null,
+      note: "同一idが複数pathに存在します（重複）",
+    });
+    return;
+  }
+
+  if (previousPath === null) {
+    const { present, equivalent } = await checkIndexedDbForAdded(kind, id, record);
+    const outcome: VaultResyncOutcome = present && !equivalent ? "conflict" : "added";
+    state.recordsByKey.set(id, {
+      registryKey: id,
+      recordType: kind,
+      outcome,
+      previousPath: null,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: null,
+      addedIndexedDbEquivalent: outcome === "added" ? present && equivalent : null,
+      note: outcome === "conflict" ? "added: IndexedDBの既存内容と一致しません" : null,
+    });
+    return;
+  }
+
+  if (path === previousPath) {
+    if (previousEntry !== null && previousEntry.contentHash === contentHash) {
+      state.recordsByKey.set(id, {
+        registryKey: id,
+        recordType: kind,
+        outcome: "unchanged",
+        previousPath,
+        currentPath: path,
+        contentHash,
+        mtime,
+        size,
+        members: null,
+        addedIndexedDbEquivalent: null,
+        note: null,
+      });
+      return;
+    }
+    const localUnsynced = await checkLocalUnsynced(vaultSyncKindOf(kind), id);
+    state.recordsByKey.set(id, {
+      registryKey: id,
+      recordType: kind,
+      outcome: localUnsynced ? "conflict" : "edited",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: null,
+      addedIndexedDbEquivalent: null,
+      note: localUnsynced ? "edited: ローカル未flush変更と競合しています" : null,
+    });
+    return;
+  }
+
+  // pathが変わっている：旧pathを直接確認してmoved/duplicateを判定する。
+  // Codexレビュー指摘・High対応："unknown"（旧pathに何か存在するが確認不能）を
+  // movedの根拠にしない。安全側でconflict扱いにし、4bがRegistry actual pathを
+  // 勝手にnew pathへ変更しないようにする。
+  const oldPathPresence = await targetedCheckSingleRecordStillAt(root, previousPath, kind, id);
+  if (oldPathPresence === "present") {
+    markVaultResyncSeen(state, id, previousPath);
+    state.recordsByKey.set(id, {
+      registryKey: id,
+      recordType: kind,
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: null,
+      addedIndexedDbEquivalent: null,
+      note: "同一idが複数pathに存在します（重複）",
+    });
+    return;
+  }
+  if (oldPathPresence === "unknown") {
+    state.recordsByKey.set(id, {
+      registryKey: id,
+      recordType: kind,
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: null,
+      addedIndexedDbEquivalent: null,
+      note: "previous path could not be verified",
+    });
+    return;
+  }
+
+  const hashUnchanged = previousEntry !== null && previousEntry.contentHash === contentHash;
+  if (hashUnchanged) {
+    state.recordsByKey.set(id, {
+      registryKey: id,
+      recordType: kind,
+      outcome: "moved",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: null,
+      addedIndexedDbEquivalent: null,
+      note: null,
+    });
+    return;
+  }
+
+  const localUnsynced = await checkLocalUnsynced(vaultSyncKindOf(kind), id);
+  state.recordsByKey.set(id, {
+    registryKey: id,
+    recordType: kind,
+    outcome: localUnsynced ? "conflict" : "edited",
+    previousPath,
+    currentPath: path,
+    contentHash,
+    mtime,
+    size,
+    members: null,
+    addedIndexedDbEquivalent: null,
+    note: localUnsynced ? "moved+edited: ローカル未flush変更と競合しています" : "moved+edited",
+  });
+}
+
+/** normal Memory day-file 1件分の分類（container単位）。修正3：previous
+ *  memberIdsのうち今回見つからなかったものがあれば、member追加・編集の状況に
+ *  関わらずcontainer全体をconflictにし、previous memberIds/memberHashesを
+ *  そのまま維持する（現在の観測結果では上書きしない）。 */
+async function handleResyncMemoryDayCandidate(
+  root: FileSystemDirectoryHandle,
+  state: VaultResyncScanState,
+  path: string,
+  day: string,
+  members: MemoryObject[],
+  mtime: number,
+  size: number,
+  text: string
+): Promise<void> {
+  const registryKey = dayFileRegistryKey(day);
+  const alreadySeenPaths = state.seenPathsByKey.get(registryKey);
+  const isDuplicatePath = !!alreadySeenPaths && alreadySeenPaths.size > 0 && !alreadySeenPaths.has(path);
+  markVaultResyncSeen(state, registryKey, path);
+
+  const contentHash = hashVaultText(text);
+  const previousPath = state.previousByKey.get(registryKey) ?? null;
+  const previousEntry = previousPath !== null ? state.previousEntries.get(previousPath) ?? null : null;
+  const previousMemberIds = new Set(previousEntry?.memberIds ?? []);
+  const previousMemberHashes = previousEntry?.memberHashes ?? {};
+  const currentMemberIds = new Set(members.map((m) => m.id));
+  const removedMemberIds = [...previousMemberIds].filter((id) => !currentMemberIds.has(id));
+
+  if (isDuplicatePath) {
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: await classifyResyncMembers(members, previousMemberHashes),
+      addedIndexedDbEquivalent: null,
+      note: "同一day-fileが複数pathに存在します（重複）",
+    });
+    return;
+  }
+
+  if (previousPath === null) {
+    const memberResults = await classifyResyncMembers(members, {});
+    const hasConflictMember = memberResults.some((m) => m.outcome === "conflict");
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: hasConflictMember ? "conflict" : "added",
+      previousPath: null,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: memberResults,
+      addedIndexedDbEquivalent: null,
+      note: hasConflictMember ? "新規day-fileだが一部メンバーがIndexedDBの既存内容と一致しません" : null,
+    });
+    return;
+  }
+
+  // 修正3：member removalはcontainer全体をconflictにし、previousの
+  // memberIds/memberHashesをそのまま維持する（今回の観測結果で上書きしない）。
+  if (removedMemberIds.length > 0) {
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash: previousEntry?.contentHash ?? contentHash,
+      mtime: previousEntry?.mtime ?? mtime,
+      size: previousEntry?.size ?? size,
+      members: (previousEntry?.memberIds ?? []).map((id) => ({
+        id,
+        outcome: removedMemberIds.includes(id) ? ("conflict" as const) : ("unchanged" as const),
+      })),
+      addedIndexedDbEquivalent: null,
+      note: `member removal detected: ${removedMemberIds.join(", ")}`,
+    });
+    return;
+  }
+
+  if (path === previousPath) {
+    if (previousEntry !== null && previousEntry.contentHash === contentHash) {
+      state.recordsByKey.set(registryKey, {
+        registryKey,
+        recordType: "memory-day",
+        outcome: "unchanged",
+        previousPath,
+        currentPath: path,
+        contentHash,
+        mtime,
+        size,
+        members: await classifyResyncMembers(members, previousMemberHashes),
+        addedIndexedDbEquivalent: null,
+        note: null,
+      });
+      return;
+    }
+    const memberResults = await classifyResyncMembers(members, previousMemberHashes);
+    const hasConflictMember = memberResults.some((m) => m.outcome === "conflict");
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: hasConflictMember ? "conflict" : "edited",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: memberResults,
+      addedIndexedDbEquivalent: null,
+      note: hasConflictMember ? "一部メンバーがローカル未flush変更と競合しています" : null,
+    });
+    return;
+  }
+
+  // pathが変わっている：旧pathを直接確認する。Codexレビュー指摘・High対応：
+  // "unknown"をmovedの根拠にしない（安全側でconflict扱いにする）。
+  const oldPathPresence = await targetedCheckMemoryDayStillAt(root, previousPath, day);
+  if (oldPathPresence === "present") {
+    markVaultResyncSeen(state, registryKey, previousPath);
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: await classifyResyncMembers(members, previousMemberHashes),
+      addedIndexedDbEquivalent: null,
+      note: "同一day-fileが複数pathに存在します（重複）",
+    });
+    return;
+  }
+  if (oldPathPresence === "unknown") {
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: await classifyResyncMembers(members, previousMemberHashes),
+      addedIndexedDbEquivalent: null,
+      note: "previous path could not be verified",
+    });
+    return;
+  }
+
+  const hashUnchanged = previousEntry !== null && previousEntry.contentHash === contentHash;
+  if (hashUnchanged) {
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: "moved",
+      previousPath,
+      currentPath: path,
+      contentHash,
+      mtime,
+      size,
+      members: await classifyResyncMembers(members, previousMemberHashes),
+      addedIndexedDbEquivalent: null,
+      note: null,
+    });
+    return;
+  }
+
+  const memberResults = await classifyResyncMembers(members, previousMemberHashes);
+  const hasConflictMember = memberResults.some((m) => m.outcome === "conflict");
+  state.recordsByKey.set(registryKey, {
+    registryKey,
+    recordType: "memory-day",
+    outcome: hasConflictMember ? "conflict" : "edited",
+    previousPath,
+    currentPath: path,
+    contentHash,
+    mtime,
+    size,
+    members: memberResults,
+    addedIndexedDbEquivalent: null,
+    note: hasConflictMember ? "moved+edited: 一部メンバーがローカル未flush変更と競合" : "moved+edited",
+  });
+}
+
+/** 1候補ファイル（probe通過・parse成功）を分類へ振り分ける。 */
+async function processVaultResyncCandidate(
+  root: FileSystemDirectoryHandle,
+  state: VaultResyncScanState,
+  path: string,
+  file: File
+): Promise<void> {
+  let likely: boolean;
+  try {
+    likely = await isLikelyTsumugiFile(file);
+  } catch (error) {
+    state.unreadableFiles.push({ path, reason: `probe failed: ${String(error)}` });
+    return;
+  }
+  if (!likely) return; // Tsumugi管理外のMarkdown、無視（unreadableにもしない）
+
+  let text: string;
+  try {
+    text = await file.text();
+  } catch (error) {
+    state.unreadableFiles.push({ path, reason: `read failed: ${String(error)}` });
+    return;
+  }
+
+  const candidate = parseTsumugiResyncCandidate(text);
+  if (!candidate) {
+    state.unreadableFiles.push({ path, reason: "tsumugi:true is present but content could not be classified/parsed" });
+    return;
+  }
+
+  const mtime = file.lastModified;
+  const size = file.size;
+
+  if (candidate.kind === "memory-day") {
+    await handleResyncMemoryDayCandidate(root, state, path, candidate.day, candidate.members, mtime, size, text);
+  } else {
+    await handleResyncSingleRecordCandidate(root, state, path, candidate.kind, candidate.id, candidate.record, mtime, size, text);
+  }
+}
+
+/**
+ * Vault全体を再帰的に走査する（既知folder名に限定しない。B節の通り、種別は
+ * body構造から判定するため、ユーザーがどのフォルダへ再整理していても見つかる）。
+ * 隠しエントリ（`.tsumugi/`含む、既存`HIDDEN_PREFIX`と同じ規約）は全階層で除外する。
+ * 個別ファイルの`getFile()`失敗は1件のunreadableとして記録しscanを継続する。
+ * ディレクトリ列挙（`entries()`）自体が失敗した場合は例外をそのまま呼び出し元へ
+ * 伝播させる（scanCompleted=falseにするための唯一のトリガー）。
+ */
+async function walkVaultForResync(
+  root: FileSystemDirectoryHandle,
+  state: VaultResyncScanState,
+  dir: FileSystemDirectoryHandle,
+  prefix: string
+): Promise<void> {
+  for await (const [name, handle] of dir.entries()) {
+    if (name.startsWith(HIDDEN_PREFIX)) continue;
+    const path = prefix ? `${prefix}/${name}` : name;
+    if (handle.kind === "directory") {
+      await walkVaultForResync(root, state, handle, path);
+      continue;
+    }
+    if (!name.endsWith(".md")) continue;
+
+    state.scannedFileCount += 1;
+
+    // Codexレビュー指摘・High対応：このpathがregistry snapshotの既知pathと
+    // 一致する時点で、本文が読める・parseできるかどうかに関わらず
+    // negative evidence（missing）を止める。directory listingにこの名前が
+    // 存在した、という事実自体が「物理的に何かが存在した」ことの確認であり、
+    // 直後のgetFile/text/parseが失敗してもこの事実は取り消さない。
+    const knownKeyAtThisPath = state.previousRegistryKeyByPath.get(path);
+    if (knownKeyAtThisPath !== undefined) {
+      state.seenKnownKeys.add(knownKeyAtThisPath);
+    }
+
+    let file: File;
+    try {
+      file = await handle.getFile();
+    } catch (error) {
+      state.unreadableFiles.push({ path, reason: `getFile failed: ${String(error)}` });
+      continue;
+    }
+    try {
+      await processVaultResyncCandidate(root, state, path, file);
+    } catch (error) {
+      state.unreadableFiles.push({ path, reason: `processing failed: ${String(error)}` });
+    }
+  }
+}
+
+/**
+ * Step 4a本体：registry snapshot→Vault全体のenumeration＋classificationを
+ * メモリ上で完成させる（applyは一切行わない）。呼び出し元（`resyncVaultRegistry`）
+ * が既に"tsumugi-vault-world"を排他保持していることを前提とする——この関数の
+ * 内部からは`withVaultWorldRead`等のH4ロック関数を一切呼び出さない。
+ */
+async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<VaultResyncScanResult> {
+  const state: VaultResyncScanState = {
+    previousByKey: new Map(),
+    previousEntries: new Map(),
+    previousRegistryKeyByPath: new Map(),
+    seenPathsByKey: new Map(),
+    seenKnownKeys: new Set(),
+    recordsByKey: new Map(),
+    unreadableFiles: [],
+    scannedFileCount: 0,
+  };
+
+  // Phase 0：registry snapshot（実在するshardファイルだけを読む。64個を仮定して
+  // 全部読みにいかない）。.tsumugi/registry/ 自体が無い場合（既存Vault・初回）は
+  // 空のsnapshotのまま進む——このあと全てが"added"候補として扱われる（L節）。
+  try {
+    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+    const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: false });
+    for await (const [name, handle] of registryDir.entries()) {
+      if (handle.kind !== "file" || !name.endsWith(".json")) continue;
+      const bucket = Number.parseInt(name.replace(/\.json$/, ""), 16);
+      if (!Number.isFinite(bucket)) continue;
+      const shard = await readVaultRegistryShard(root, bucket);
+      for (const [key, path] of Object.entries(shard.records)) {
+        state.previousByKey.set(key, path);
+        state.previousRegistryKeyByPath.set(path, key);
+      }
+      for (const [path, entry] of Object.entries(shard.files)) {
+        state.previousEntries.set(path, entry);
+      }
+    }
+  } catch {
+    // .tsumugi/registry/ が無い：previousByKey/previousEntries/previousRegistryKeyByPathは空のまま。
+  }
+
+  // Phase 1：directory enumeration + classification。
+  let scanCompleted = false;
+  try {
+    await walkVaultForResync(root, state, root, "");
+    scanCompleted = true;
+  } catch (error) {
+    console.error("[Tsumugi] resync: directory enumeration failed, skipping missing-detection this run:", error);
+    scanCompleted = false;
+  }
+
+  // Phase 2：missing確定（scanCompleted===trueの場合だけ）。previousByKeyのうち
+  // 本scanで一度も見つからなかったregistryKeyを"missing"とする。
+  // Codexレビュー指摘・High対応：recordsByKeyに無いだけでなく、seenKnownKeysにも
+  // 無いことを両方満たす場合にのみmissingにする——registered pathに物理ファイルは
+  // あったが読めなかった/parseできなかっただけのkeyをmissing扱いにしないため
+  // （その場合、このkeyはrecords配列に一切現れず、次回resyncへ持ち越される）。
+  if (scanCompleted) {
+    for (const [key, prevPath] of state.previousByKey.entries()) {
+      if (state.recordsByKey.has(key)) continue;
+      if (state.seenKnownKeys.has(key)) continue;
+      const entry = state.previousEntries.get(prevPath);
+      if (!entry) continue;
+      state.recordsByKey.set(key, {
+        registryKey: key,
+        recordType: entry.recordType,
+        outcome: "missing",
+        previousPath: prevPath,
+        currentPath: null,
+        contentHash: null,
+        mtime: null,
+        size: null,
+        members: null,
+        addedIndexedDbEquivalent: null,
+        note: null,
+      });
+    }
+  }
+
+  return {
+    scanCompleted,
+    scannedFileCount: state.scannedFileCount,
+    records: [...state.recordsByKey.values()],
+    unreadableFiles: state.unreadableFiles,
+  };
+}
+
+/**
+ * Step 4a公開エントリポイント。"tsumugi-vault-world"を排他保持した状態で
+ * scan＋classificationを行う（`runVaultWorldExclusive`参照）。IndexedDB・
+ * Registry・History Index・Markdownのいずれへも書き込みを行わない
+ * （4bで初めてapplyを実装する）。UIからはまだ呼び出さない（Step 5）。
+ */
+export async function resyncVaultRegistry(
+  root: FileSystemDirectoryHandle
+): Promise<{ timedOut: boolean; result?: VaultResyncScanResult }> {
+  return runVaultWorldExclusive(() => performVaultResyncScan(root));
 }

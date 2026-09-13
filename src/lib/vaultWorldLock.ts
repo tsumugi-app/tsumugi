@@ -171,6 +171,91 @@ export async function withStartupSharedLock<T>(fn: () => Promise<T>): Promise<T>
   return withRawLock("shared", fn);
 }
 
+export interface VaultWorldExclusiveResult<T> {
+  timedOut: boolean;
+  result?: T;
+}
+
+/**
+ * 明示的Vault resync専用（Step 4a）。H4と同じ`LOCK_NAME`（"tsumugi-vault-world"）を
+ * 排他モードで取得し、取得直後に一度だけ`withVaultWorldRead`と同じ判定ロジックを
+ * インライン実行して（＝ロックを再要求せずに）epoch/committed/journalVersionの
+ * 整合性を確認してからfnを実行する。
+ *
+ * `runVaultSwitchExclusive`とは異なり、`beginCommit()`のような「後戻り不可点」の
+ * 状態機械は持たない——resyncには対応する概念が無いため（取り消せない副作用を
+ * 途中から始める・始めないを分ける必要が無い）。`timeoutMs`は「ロック取得待ちを
+ * どれだけ待つか」だけに使う（他タブがVault切替中・別の resync 実行中等で
+ * ロックが空くのを待つ場合の安全弁）。一度ロックが取得されてfnの実行が始まった
+ * 後は、fnがどれだけ時間をかけても打ち切らない——resyncはVault規模に応じて
+ * 正当に長時間かかりうる処理であり、runVaultSwitchExclusiveのような
+ * 「UIへ先にtimeoutを返しつつ裏でfnを完走させる」という二重状態を持たせる
+ * 必要が無いため。
+ *
+ * fnの内部から、この関数・`withVaultWorldRead`・`runVaultSwitchExclusive`の
+ * いずれも呼び出さないこと（同名ロック"tsumugi-vault-world"の再要求による
+ * 自己デッドロックを避けるため。ファイル冒頭のデッドロック回避原則を参照）。
+ * Registry専用ロック（"tsumugi-vault-registry-write"）・History Index専用ロック
+ * （"tsumugi-history-index-write"）はいずれも別名のため、fnの内部から取得しても
+ * 問題無い（既存の通常書込パイプラインも「world-lock（外側）→Registry/History
+ * ロック（内側）」という同じ順序で動いており、順序の逆転は起きない）。
+ *
+ * `navigator.locks`が使えない環境では、タブ間の排他を保証できないため実行せず
+ * timedOut扱いにする（安全側、`runVaultSwitchExclusive`と同じ方針）。
+ */
+export async function runVaultWorldExclusive<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number = EXCLUSIVE_LOCK_TIMEOUT_MS
+): Promise<VaultWorldExclusiveResult<T>> {
+  if (!locksSupported()) {
+    console.error("[Tsumugi] navigator.locks is unavailable; refusing exclusive vault-world operation for safety.");
+    return { timedOut: true };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const result = await navigator.locks.request(LOCK_NAME, { mode: "exclusive", signal: controller.signal }, async () => {
+      // ロック取得直後、一度だけ整合性確認する（withVaultWorldReadと同じ判定
+      // ロジックだが、ロックを再要求しないためここへインライン化する）。
+      let sharedEpoch: number;
+      let committedStatus: Awaited<ReturnType<typeof getCommittedVaultEpoch>>;
+      let versionStatus: Awaited<ReturnType<typeof getVaultWorldJournalVersion>>;
+      try {
+        sharedEpoch = await getActiveVaultEpoch();
+        committedStatus = await getCommittedVaultEpoch();
+        versionStatus = await getVaultWorldJournalVersion();
+      } catch (error) {
+        console.error(
+          "[Tsumugi] failed to read activeVaultEpoch/committedVaultEpoch/vaultWorldJournalVersion for resync, refusing:",
+          error
+        );
+        throw new StaleVaultTabError("保存先の状態を確認できなかったため、再同期を中止しました。");
+      }
+      if (tabVaultEpoch === null || sharedEpoch !== tabVaultEpoch) {
+        throw new StaleVaultTabError();
+      }
+      if (versionStatus.status !== "current") {
+        throw new IncompleteVaultWorldError();
+      }
+      if (committedStatus.status !== "valid" || committedStatus.epoch !== sharedEpoch) {
+        throw new IncompleteVaultWorldError();
+      }
+      return fn();
+    });
+    return { timedOut: false, result };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      // ロック取得待ちがtimeoutで中断された（fn自体は一度も呼ばれていない）。
+      return { timedOut: true };
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface VaultSwitchExclusiveResult<T> {
   timedOut: boolean;
   result?: T;
