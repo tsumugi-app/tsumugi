@@ -779,14 +779,21 @@ export async function readMemoriesForDay(root: FileSystemDirectoryHandle, day: s
   }
 }
 
-/** `HistoryDayIndex.reflectionIds`の1件を、idと日付からファイル名を再構築して読む。 */
+/**
+ * `HistoryDayIndex.reflectionIds`の1件を、idと日付からファイル名を再構築して読む。
+ * `memoriesDir`（省略可）：同じ日に複数のreflectionIdsを読む場合、呼び出し元
+ * （HistoryPanel.tsx）が`Memories`ディレクトリハンドルを1回だけ解決して使い回せる
+ * ようにするための任意引数。省略時は従来通りこの関数自身が`root`から解決する
+ * （後方互換。History以外の既存呼び出し元は無いが、念のため省略可能にしてある）。
+ */
 export async function readReflectionById(
   root: FileSystemDirectoryHandle,
   id: string,
-  day: string
+  day: string,
+  memoriesDir?: FileSystemDirectoryHandle
 ): Promise<MemoryObject | null> {
   try {
-    const dir = await root.getDirectoryHandle("Memories", { create: false });
+    const dir = memoriesDir ?? (await root.getDirectoryHandle("Memories", { create: false }));
     const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
     const file = await fileHandle.getFile();
     return parseMemoryObjectMarkdown(await file.text());
@@ -795,14 +802,19 @@ export async function readReflectionById(
   }
 }
 
-/** `HistoryDayIndex.conversationIds`の1件を、idと日付からファイル名を再構築して読む。 */
+/**
+ * `HistoryDayIndex.conversationIds`の1件を、idと日付からファイル名を再構築して読む。
+ * `conversationsDir`（省略可）：`readReflectionById`の`memoriesDir`と同じ理由・同じ
+ * 後方互換の任意引数。
+ */
 export async function readConversationById(
   root: FileSystemDirectoryHandle,
   id: string,
-  day: string
+  day: string,
+  conversationsDir?: FileSystemDirectoryHandle
 ): Promise<Conversation | null> {
   try {
-    const dir = await root.getDirectoryHandle("Conversations", { create: false });
+    const dir = conversationsDir ?? (await root.getDirectoryHandle("Conversations", { create: false }));
     const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
     const file = await fileHandle.getFile();
     return parseConversationMarkdown(await file.text());

@@ -133,62 +133,103 @@ export default function HistoryPanel({
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
   const [monthLoading, setMonthLoading] = useState(true);
-  const [dayRecords, setDayRecords] = useState<DayRecords | null>(null);
+  // 日付詳細は「通常Memory（day-file、month indexに依存しない）」と
+  // 「Reflection／Conversation（month indexのreflectionIds/conversationIdsに依存）」を
+  // 別々に読み、2つのstateを`dayRecords`（下のuseMemo）で安全にマージする
+  // （読込順序の見直し：通常MemoryはmonthLoadingを待たずに先行開始する）。
+  const [normalMemories, setNormalMemories] = useState<MemoryObject[]>([]);
+  const [extraDayRecords, setExtraDayRecords] = useState<{ conversations: Conversation[]; reflections: MemoryObject[] }>(
+    { conversations: [], reflections: [] }
+  );
   const [dayLoading, setDayLoading] = useState(false);
 
-  // race対策：月Index読み込み・日付詳細読み込みそれぞれについて、呼び出しごとに
-  // インクリメントするリクエストID。resolve/reject時に「今も自分が最新の要求か」を
-  // 確認してからsetStateすることで、月移動・Vault切替の後に旧readが遅れて完了しても
-  // 新しい画面へ混入しない（H4のepoch/generationのような大掛かりな仕組みは使わず、
-  // このコンポーネント内で完結する最小限のcancellationトークン）。
+  // race対策：月Index読み込み・日付詳細読み込み（通常Memory／Reflection・Conversationの
+  // 両方）それぞれについて、呼び出しごとにインクリメントするリクエストID。resolve/reject
+  // 時に「今も自分が最新の要求か」を確認してからsetStateすることで、月移動・日付切替・
+  // Vault切替の後に旧readが遅れて完了しても新しい画面へ混入しない（H4のepoch/generation
+  // のような大掛かりな仕組みは使わず、このコンポーネント内で完結する最小限の
+  // cancellationトークン）。
   const monthRequestRef = useRef(0);
   const dayRequestRef = useRef(0);
+  // 通常Memory・Reflection/Conversationという2つの独立した読み込みのうち、まだ完了して
+  // いない件数。0になった時点で初めてdayLoadingをfalseにする（どちらか一方だけ終わった
+  // 時点でロード完了扱いにしない）。
+  const dayPartsPendingRef = useRef(0);
+  // vaultHandleが実際に変わった（別Vaultへ切替）ことを検知するためだけの参照。
+  const previousVaultHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
+  // Vault切替を検知するたびに増やす、このコンポーネント内だけの世代カウンタ。
+  // 切替直後、リセットしたviewYear/viewMonthへReact stateが追いつくまでの間に
+  // 同じ月Indexを2回読んでしまわないようにするための重複排除キー
+  // （`${vaultGeneration}:${year}-${month}:${refreshToken}`）に使う。
+  const vaultGenerationRef = useRef(0);
+  const lastMonthFetchKeyRef = useRef<string>("");
   // initialMemoryIdは「一度だけ」該当日を見つけて開く用途のため、既に処理済みなら
   // 再度自動オープンしない（ユーザーが手動で別のMemoryを開いた後に、古いターゲットへ
   // 引き戻さないため）。vaultHandleが変わった場合はpropの値へ再度リセットする。
   const pendingInitialMemoryIdRef = useRef<string | undefined>(initialMemoryId);
 
   /**
-   * Vault境界の安全性：vaultHandleが変わった（別Vaultへ切替）瞬間、旧Vaultの表示が
-   * 一切残らないよう、月・日・詳細選択のいずれも即座にリセットしてから、今月・今日を
-   * 読み直す（読み直し自体は下のuseEffectが、リセットされたstateを見て行う）。
+   * Vault境界の安全性＋月Index二重読込の解消：vaultHandleが変わった（別Vaultへ切替）
+   * 瞬間、旧Vaultの表示が一切残らないよう月・詳細選択をリセットしてから、今月の
+   * month indexを読み直す。
+   *
+   * 以前はこの「リセット」と「month index読込」を2つの別々のuseEffectに分けていた
+   * ため、Vault切替時に「リセット前（切替前に見ていた月）のmonth indexを1回読む→
+   * リセット後のsetViewYear/setViewMonthが反映された次のレンダーで、今月のmonth
+   * indexをもう1回読む」という2回の実読込（1回目はrequestIdの不一致で結果こそ
+   * 捨てられるが、ファイル読込I/O自体は発生する）が起きていた。
+   *
+   * ここでは1つのeffectに統合し、Vault切替を検知した場合は「今月」をこのeffectの
+   * 実行内でローカル変数として直接計算し、setViewYear/setViewMonth（stateへの反映は
+   * 次のレンダーまで遅れる）を待たずに、その場でその月のmonth indexを読む。
+   * setViewYear/setViewMonthの反映により同じ内容でこのeffectが再度呼ばれても、
+   * `lastMonthFetchKeyRef`（vault世代＋年月＋refreshTokenの組）で重複読込を検知して
+   * 読み直さない。通常の前月/翌月移動・refreshTokenによる再読込はキーが変わるため
+   * 従来通り正しく再読込される。
+   *
    * H4のepoch/world isolationには一切触れない——このコンポーネントはVault切替の
    * 成否判定を行わず、ChatScreen.tsx側で既に確定した`vaultHandle`をそのまま信頼する。
    */
   useEffect(() => {
-    const now = new Date();
-    setViewYear(now.getFullYear());
-    setViewMonth(now.getMonth() + 1);
-    setSelectedDay(todayKey());
-    setSelectedMemory(null);
-    setSelectedConversation(null);
-    setMonthIndex(null);
-    setDayRecords(null);
-    pendingInitialMemoryIdRef.current = initialMemoryId;
-    // 進行中の旧vaultHandle向けreadを、以後のsetStateから確実に締め出す。
-    monthRequestRef.current += 1;
-    dayRequestRef.current += 1;
-    // initialMemoryIdは「vaultHandleが変わった時にリセットする」という目的だけで
-    // 参照しており、依存に含めるとinitialMemoryIdの変化のたびに月・日表示まで
-    // リセットしてしまうため、意図的に依存配列から外す。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vaultHandle]);
-
-  /**
-   * 月Index読み込み：表示中の年月が変わるたび、`.tsumugi/history/YYYY-MM.json`
-   * 1ファイルだけを読む。Vault全体をscanしない・IndexedDBへは一切アクセスしない。
-   */
-  useEffect(() => {
     if (!vaultHandle) {
+      previousVaultHandleRef.current = null;
+      lastMonthFetchKeyRef.current = "";
       monthRequestRef.current += 1;
       setMonthIndex(null);
       setMonthLoading(false);
       return;
     }
+
+    const vaultChanged = previousVaultHandleRef.current !== vaultHandle;
+    previousVaultHandleRef.current = vaultHandle;
+
+    let targetYear = viewYear;
+    let targetMonth = viewMonth;
+
+    if (vaultChanged) {
+      vaultGenerationRef.current += 1;
+      const now = new Date();
+      targetYear = now.getFullYear();
+      targetMonth = now.getMonth() + 1;
+      setSelectedDay(todayKey());
+      setSelectedMemory(null);
+      setSelectedConversation(null);
+      setMonthIndex(null);
+      pendingInitialMemoryIdRef.current = initialMemoryId;
+      if (targetYear !== viewYear || targetMonth !== viewMonth) {
+        setViewYear(targetYear);
+        setViewMonth(targetMonth);
+      }
+    }
+
+    const fetchKey = `${vaultGenerationRef.current}:${targetYear}-${targetMonth}:${refreshToken ?? 0}`;
+    if (fetchKey === lastMonthFetchKeyRef.current) return; // 直前と同じ内容の重複読込を防ぐ
+    lastMonthFetchKeyRef.current = fetchKey;
+
     const requestId = ++monthRequestRef.current;
     const handle = vaultHandle;
     setMonthLoading(true);
-    readHistoryMonthIndex(handle, monthKeyOf(viewYear, viewMonth))
+    readHistoryMonthIndex(handle, monthKeyOf(targetYear, targetMonth))
       .then((index) => {
         if (monthRequestRef.current !== requestId) return; // 月移動／Vault切替で既に無効化された要求
         setMonthIndex(index);
@@ -200,71 +241,138 @@ export default function HistoryPanel({
         setMonthIndex(null);
         setMonthLoading(false);
       });
+    // initialMemoryIdは「vaultHandleが変わった時にリセットする」という目的だけで
+    // 参照しており、依存に含めるとinitialMemoryIdの変化のたびに月・日表示まで
+    // リセットしてしまうため、意図的に依存配列から外す。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vaultHandle, viewYear, viewMonth, refreshToken]);
 
   /**
-   * 日付詳細読み込み：選択された日にちについてだけ、必要なMarkdownを読む。
-   * - 通常Memory：`Memories/YYYY-MM-DD.md`を1回（`readMemoriesForDay`）。
-   * - Reflection：月Indexの`reflectionIds`ぶんだけ個別に読む。
-   * - Conversation：月Indexの`conversationIds`ぶんだけ個別に読む。
-   * 月Indexの読み込み中（`monthLoading`）は待つ——reflectionIds/conversationIdsが
-   * まだ判明していない状態で通常Memoryだけ先に読んで、月Index到着後にもう一度
-   * 読み直す、という二度読みを避けるため。
+   * 日付詳細読み込み・その1（リセット）：選択日／Vaultが変わるたびに、通常Memory・
+   * Reflection/Conversationの両方の状態をクリアし、2件とも完了するまでdayLoadingを
+   * trueに保つ（`dayPartsPendingRef`で管理）。実際の読込は下の2つのeffectがそれぞれ
+   * 独立して行う。
    */
   useEffect(() => {
-    if (!vaultHandle || !selectedDay || monthLoading) {
-      if (!vaultHandle || !selectedDay) {
-        dayRequestRef.current += 1;
-        setDayRecords(null);
-        setDayLoading(false);
-      }
+    dayRequestRef.current += 1;
+    setNormalMemories([]);
+    setExtraDayRecords({ conversations: [], reflections: [] });
+    if (!vaultHandle || !selectedDay) {
+      dayPartsPendingRef.current = 0;
+      setDayLoading(false);
       return;
     }
-    const requestId = ++dayRequestRef.current;
+    dayPartsPendingRef.current = 2;
+    setDayLoading(true);
+  }, [vaultHandle, selectedDay]);
+
+  /**
+   * 日付詳細読み込み・その2（通常Memory）：`Memories/YYYY-MM-DD.md`はmonth index
+   * （reflectionIds/conversationIds）に一切依存しないため、選択日が確定した時点で
+   * month indexの読込完了（monthLoading）を待たずに開始する。
+   */
+  useEffect(() => {
+    if (!vaultHandle || !selectedDay) return;
+    const requestId = dayRequestRef.current;
     const handle = vaultHandle;
     const day = selectedDay;
-    const dayEntry = monthIndex?.days[day];
-    setDayLoading(true);
-    Promise.all([
-      readMemoriesForDay(handle, day),
-      Promise.all((dayEntry?.reflectionIds ?? []).map((id) => readReflectionById(handle, id, day))),
-      Promise.all((dayEntry?.conversationIds ?? []).map((id) => readConversationById(handle, id, day))),
-    ])
-      .then(([normalMemories, reflectionResults, conversationResults]) => {
+    readMemoriesForDay(handle, day)
+      .then((memories) => {
         if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
-        const reflections = reflectionResults.filter((memory): memory is MemoryObject => memory !== null);
-        const loadedConversations = conversationResults.filter(
-          (conversation): conversation is Conversation => conversation !== null
-        );
-        // 通常MemoryとReflectionは別ファイルだが、念のためidで重複排除してから統合する
-        // （同じrecordの二重表示を防ぐ）。
-        const seenMemoryIds = new Set<string>();
-        const memories: MemoryObject[] = [];
-        for (const memory of [...normalMemories, ...reflections]) {
-          if (seenMemoryIds.has(memory.id)) continue;
-          seenMemoryIds.add(memory.id);
-          memories.push(memory);
-        }
-        memories.sort((a, b) => a.date.localeCompare(b.date));
-
-        setDayRecords({ conversations: loadedConversations, memories });
-        setDayLoading(false);
-
-        if (pendingInitialMemoryIdRef.current) {
-          const target = memories.find((memory) => memory.id === pendingInitialMemoryIdRef.current);
-          if (target) {
-            setSelectedMemory(target);
-          }
-          pendingInitialMemoryIdRef.current = undefined;
-        }
+        setNormalMemories(memories);
+        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
+        if (dayPartsPendingRef.current === 0) setDayLoading(false);
       })
       .catch((error) => {
         if (dayRequestRef.current !== requestId) return;
-        console.error("Failed to load day records", error);
-        setDayRecords(null);
-        setDayLoading(false);
+        console.error("Failed to load memories for day", error);
+        setNormalMemories([]);
+        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
+        if (dayPartsPendingRef.current === 0) setDayLoading(false);
       });
+  }, [vaultHandle, selectedDay, refreshToken]);
+
+  /**
+   * 日付詳細読み込み・その3（Reflection／Conversation）：月Indexの`reflectionIds`/
+   * `conversationIds`が判明してから（monthLoading完了後）だけ読む。同じ日に複数件
+   * ある場合、`Memories`/`Conversations`ディレクトリハンドルをそれぞれ1回だけ
+   * （必要な場合のみ）解決し、各readへ使い回す（毎item`getDirectoryHandle`を
+   * 取り直さない）。
+   */
+  useEffect(() => {
+    if (!vaultHandle || !selectedDay || monthLoading) return;
+    const requestId = dayRequestRef.current;
+    const handle = vaultHandle;
+    const day = selectedDay;
+    const dayEntry = monthIndex?.days[day];
+    const reflectionIds = dayEntry?.reflectionIds ?? [];
+    const conversationIds = dayEntry?.conversationIds ?? [];
+
+    (async () => {
+      try {
+        const [memoriesDir, conversationsDir] = await Promise.all([
+          reflectionIds.length > 0
+            ? handle.getDirectoryHandle("Memories", { create: false }).catch(() => undefined)
+            : Promise.resolve(undefined),
+          conversationIds.length > 0
+            ? handle.getDirectoryHandle("Conversations", { create: false }).catch(() => undefined)
+            : Promise.resolve(undefined),
+        ]);
+        const [reflectionResults, conversationResults] = await Promise.all([
+          Promise.all(reflectionIds.map((id) => readReflectionById(handle, id, day, memoriesDir))),
+          Promise.all(conversationIds.map((id) => readConversationById(handle, id, day, conversationsDir))),
+        ]);
+        if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
+        const reflections = reflectionResults.filter((memory): memory is MemoryObject => memory !== null);
+        const conversations = conversationResults.filter(
+          (conversation): conversation is Conversation => conversation !== null
+        );
+        setExtraDayRecords({ conversations, reflections });
+        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
+        if (dayPartsPendingRef.current === 0) setDayLoading(false);
+      } catch (error) {
+        if (dayRequestRef.current !== requestId) return;
+        console.error("Failed to load day records", error);
+        setExtraDayRecords({ conversations: [], reflections: [] });
+        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
+        if (dayPartsPendingRef.current === 0) setDayLoading(false);
+      }
+    })();
   }, [vaultHandle, selectedDay, monthIndex, monthLoading, refreshToken]);
+
+  /**
+   * 通常MemoryとReflectionを安全にマージする（別々のeffectが別々のタイミングで完了
+   * しても、常に最新の両方から作り直すため、片方だけの中途半端な状態が画面に出る
+   * ことはない——実際に表示されるのは`dayLoading`がfalseになった後のみ）。idで
+   * 重複排除してから統合する（同じrecordの二重表示を防ぐ、以前と同じロジック）。
+   */
+  const dayRecords = useMemo<DayRecords>(() => {
+    const seenMemoryIds = new Set<string>();
+    const memories: MemoryObject[] = [];
+    for (const memory of [...normalMemories, ...extraDayRecords.reflections]) {
+      if (seenMemoryIds.has(memory.id)) continue;
+      seenMemoryIds.add(memory.id);
+      memories.push(memory);
+    }
+    memories.sort((a, b) => a.date.localeCompare(b.date));
+    return { conversations: extraDayRecords.conversations, memories };
+  }, [normalMemories, extraDayRecords]);
+
+  /**
+   * 「記憶しました」カードの「詳細を見る」から開かれた場合の自動オープン。以前は
+   * 単一の読込effect完了時にまとめて行っていたが、通常Memory／Reflection・
+   * Conversationが別々のeffectに分かれたため、両方が完了して`dayLoading`がfalseに
+   * なった時点でまとめて行う。
+   */
+  useEffect(() => {
+    if (dayLoading) return;
+    if (!pendingInitialMemoryIdRef.current) return;
+    const target = dayRecords.memories.find((memory) => memory.id === pendingInitialMemoryIdRef.current);
+    if (target) {
+      setSelectedMemory(target);
+    }
+    pendingInitialMemoryIdRef.current = undefined;
+  }, [dayLoading, dayRecords]);
 
   /**
    * 「今日」だけの安全な例外的マージ：Vault write未完了でも、既にIndexedDBへ保存済み
@@ -275,7 +383,7 @@ export default function HistoryPanel({
    * 二重表示にはならない。
    */
   const displayedMemories = useMemo(() => {
-    const base = dayRecords?.memories ?? [];
+    const base = dayRecords.memories;
     if (selectedDay !== todayKey() || sessionCapturedMemories.length === 0) {
       return base;
     }
@@ -302,7 +410,7 @@ export default function HistoryPanel({
   // その日のconversationsからだけ作る（追加のVault読み込みは行わない。由来会話が
   // 別の日にある場合は、この一覧に無いため表示を省略する——UIの完全再現ではなく
   // 「その日の記録を確認できる」ことを優先する今回の方針による割り切り）。
-  const conversationById = new Map((dayRecords?.conversations ?? []).map((c) => [c.id, c]));
+  const conversationById = new Map(dayRecords.conversations.map((c) => [c.id, c]));
 
   const monthGrid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
 
@@ -316,12 +424,12 @@ export default function HistoryPanel({
     setSelectedDay(day);
     setSelectedMemory(null);
     setSelectedConversation(null);
-    // 前の日付の表示が一瞬でも残らないよう、ここで即座にクリアし、その日付に対する
-    // in-flightな読み込みがあれば即座に無効化する（下のuseEffect自身のrequestId発行を
-    // 待たずに済む。日付切替raceを二重に閉じるための最小限の前倒し）。
-    setDayRecords(null);
+    // 前の日付の表示が一瞬でも残らないよう、ここで即座にクリアする（実際の
+    // requestId発行・dayPartsPendingRefのリセットは、直後に走るreset effect
+    // （selectedDayの変化を検知して発火する）が行う）。
+    setNormalMemories([]);
+    setExtraDayRecords({ conversations: [], reflections: [] });
     setDayLoading(true);
-    dayRequestRef.current += 1;
   }
 
   return (
@@ -402,13 +510,20 @@ export default function HistoryPanel({
               ))}
             </div>
 
-            {monthLoading && <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>}
-
-            {!monthLoading && selectedDay && (
+            {/*
+              UI安定化：以前は「monthLoading中はこの外枠ごと出さない」→「monthLoading
+              完了後にこの枠が現れ、その中でさらにdayLoadingを見る」という2段階の
+              出現だったため、カレンダー直下の高さが2回変化していた。selectedDayが
+              確定していれば（通常は常にtrue）この外枠（区切り線・日付ラベル）自体は
+              常に出したままにし、中身だけを「読み込んでいます…」⇄実際の内容で
+              切り替えることで、外枠の出現によるレイアウト変化を1回減らす（見た目・
+              配色・大規模な作り直しはしない）。
+            */}
+            {selectedDay && (
               <div className="flex flex-col gap-3 border-t border-black/5 pt-4 dark:border-white/10">
                 <p className="text-xs text-stone-400 dark:text-stone-500">{selectedDay}</p>
 
-                {dayLoading ? (
+                {monthLoading || dayLoading ? (
                   <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>
                 ) : selectedConversation ? (
                   <div className="flex flex-col gap-3">
