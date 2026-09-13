@@ -17,6 +17,9 @@
 "use client";
 
 import {
+  addConversationIfAbsentAndMarkSynced,
+  addMemoryObjectIfAbsentAndMarkSynced,
+  addSourceIfAbsentAndMarkSynced,
   getAllConversations,
   getAllMemoryObjects,
   getAllSources,
@@ -25,6 +28,9 @@ import {
   getSource,
   getVaultSyncState,
   loadVaultHandle,
+  putConversationAndMarkSynced,
+  putMemoryObjectAndMarkSynced,
+  saveSourceAndMarkSynced,
   setVaultSyncState,
 } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
@@ -2513,6 +2519,13 @@ export type VaultResyncOutcome = "unchanged" | "moved" | "edited" | "added" | "m
 export interface VaultResyncMemberResult {
   id: string;
   outcome: "unchanged" | "edited" | "added" | "conflict";
+  /** そのmemberの実際にparse済みの内容（Step 4bのapplyで使う。member removal
+   *  conflict時など、observedデータを意図的に使わない場合はnull）。 */
+  parsed: MemoryObject | null;
+  /** outcome==="added"の場合のみ意味を持つ（record単位の
+   *  `addedIndexedDbEquivalent`と同じ意味）。IndexedDBに既存のこのidがあり、
+   *  semantic equalityで一致が確認できたことを示す。 */
+  addedIndexedDbEquivalent: boolean | null;
 }
 
 export interface VaultResyncRecordResult {
@@ -2535,6 +2548,18 @@ export interface VaultResyncRecordResult {
   addedIndexedDbEquivalent: boolean | null;
   /** 診断用の短い説明（conflict理由・unreadable理由等）。無ければnull。 */
   note: string | null;
+  /** Conversation/Reflection/Sourceの実際にparse済みの内容（Step 4bのapplyで使う）。
+   *  normal Memory（memory-day）はこちらではなく`members[].parsed`を使う。
+   *  Phase 2のmissing検出等、実際にファイルを読めていない場合はnull。 */
+  parsed: Conversation | Source | MemoryObject | null;
+  /**
+   * Step 4b対応：`previousPath===null`（registryが一度も登録していなかった
+   * registryKey）で、かつ本scan中に2つ以上の異なるpathで同じregistryKeyが
+   * 見つかった（真のduplicate、`isDuplicatePath`）場合のみ非null。見つかった
+   * 全pathを保持する（順不同、scan順に依存させないための決定論的anchor選択は
+   * 4b側がlexicographical sortで行う）。それ以外の場合はnull。
+   */
+  allObservedPaths: string[] | null;
 }
 
 export interface VaultResyncScanResult {
@@ -2880,15 +2905,26 @@ async function classifyResyncMembers(
     const previousHash = previousMemberHashes[member.id];
     if (previousHash === undefined) {
       const { present, equivalent } = await checkIndexedDbForAdded("reflection", member.id, member);
-      results.push({ id: member.id, outcome: present && !equivalent ? "conflict" : "added" });
+      const outcome = present && !equivalent ? "conflict" : "added";
+      results.push({
+        id: member.id,
+        outcome,
+        parsed: member,
+        addedIndexedDbEquivalent: outcome === "added" ? present && equivalent : null,
+      });
       continue;
     }
     if (previousHash === memberHash) {
-      results.push({ id: member.id, outcome: "unchanged" });
+      results.push({ id: member.id, outcome: "unchanged", parsed: member, addedIndexedDbEquivalent: null });
       continue;
     }
     const localUnsynced = await checkLocalUnsynced("memory", member.id);
-    results.push({ id: member.id, outcome: localUnsynced ? "conflict" : "edited" });
+    results.push({
+      id: member.id,
+      outcome: localUnsynced ? "conflict" : "edited",
+      parsed: member,
+      addedIndexedDbEquivalent: null,
+    });
   }
   return results;
 }
@@ -2913,6 +2949,8 @@ async function handleResyncSingleRecordCandidate(
   const previousEntry = previousPath !== null ? state.previousEntries.get(previousPath) ?? null : null;
 
   if (isDuplicatePath) {
+    // previousPath===nullの場合（真に新規のidが本scan内で複数pathに見つかった）、
+    // 4bがdeterministicなanchorを選べるよう、見つかった全pathを保持する。
     state.recordsByKey.set(id, {
       registryKey: id,
       recordType: kind,
@@ -2925,6 +2963,8 @@ async function handleResyncSingleRecordCandidate(
       members: null,
       addedIndexedDbEquivalent: null,
       note: "同一idが複数pathに存在します（重複）",
+      parsed: record,
+      allObservedPaths: previousPath === null ? [...(state.seenPathsByKey.get(id) ?? [])] : null,
     });
     return;
   }
@@ -2944,6 +2984,8 @@ async function handleResyncSingleRecordCandidate(
       members: null,
       addedIndexedDbEquivalent: outcome === "added" ? present && equivalent : null,
       note: outcome === "conflict" ? "added: IndexedDBの既存内容と一致しません" : null,
+      parsed: record,
+      allObservedPaths: null,
     });
     return;
   }
@@ -2962,6 +3004,8 @@ async function handleResyncSingleRecordCandidate(
         members: null,
         addedIndexedDbEquivalent: null,
         note: null,
+        parsed: record,
+        allObservedPaths: null,
       });
       return;
     }
@@ -2978,6 +3022,8 @@ async function handleResyncSingleRecordCandidate(
       members: null,
       addedIndexedDbEquivalent: null,
       note: localUnsynced ? "edited: ローカル未flush変更と競合しています" : null,
+      parsed: record,
+      allObservedPaths: null,
     });
     return;
   }
@@ -2988,6 +3034,9 @@ async function handleResyncSingleRecordCandidate(
   // 勝手にnew pathへ変更しないようにする。
   const oldPathPresence = await targetedCheckSingleRecordStillAt(root, previousPath, kind, id);
   if (oldPathPresence === "present") {
+    // previousPathは既に非nullと判明済み（このブロックに来る時点でpreviousPath!==null）
+    // なので、既存のrecords[key]をそのまま維持しつつstatusだけconflictへ倒す
+    // （4bはanchor新規作成をしない、既存pathを維持）。
     markVaultResyncSeen(state, id, previousPath);
     state.recordsByKey.set(id, {
       registryKey: id,
@@ -3001,6 +3050,8 @@ async function handleResyncSingleRecordCandidate(
       members: null,
       addedIndexedDbEquivalent: null,
       note: "同一idが複数pathに存在します（重複）",
+      parsed: record,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3017,6 +3068,8 @@ async function handleResyncSingleRecordCandidate(
       members: null,
       addedIndexedDbEquivalent: null,
       note: "previous path could not be verified",
+      parsed: record,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3035,6 +3088,8 @@ async function handleResyncSingleRecordCandidate(
       members: null,
       addedIndexedDbEquivalent: null,
       note: null,
+      parsed: record,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3052,6 +3107,8 @@ async function handleResyncSingleRecordCandidate(
     members: null,
     addedIndexedDbEquivalent: null,
     note: localUnsynced ? "moved+edited: ローカル未flush変更と競合しています" : "moved+edited",
+    parsed: record,
+    allObservedPaths: null,
   });
 }
 
@@ -3095,6 +3152,8 @@ async function handleResyncMemoryDayCandidate(
       members: await classifyResyncMembers(members, previousMemberHashes),
       addedIndexedDbEquivalent: null,
       note: "同一day-fileが複数pathに存在します（重複）",
+      parsed: null,
+      allObservedPaths: previousPath === null ? [...(state.seenPathsByKey.get(registryKey) ?? [])] : null,
     });
     return;
   }
@@ -3114,6 +3173,8 @@ async function handleResyncMemoryDayCandidate(
       members: memberResults,
       addedIndexedDbEquivalent: null,
       note: hasConflictMember ? "新規day-fileだが一部メンバーがIndexedDBの既存内容と一致しません" : null,
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3133,9 +3194,13 @@ async function handleResyncMemoryDayCandidate(
       members: (previousEntry?.memberIds ?? []).map((id) => ({
         id,
         outcome: removedMemberIds.includes(id) ? ("conflict" as const) : ("unchanged" as const),
+        parsed: null,
+        addedIndexedDbEquivalent: null,
       })),
       addedIndexedDbEquivalent: null,
       note: `member removal detected: ${removedMemberIds.join(", ")}`,
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3154,6 +3219,8 @@ async function handleResyncMemoryDayCandidate(
         members: await classifyResyncMembers(members, previousMemberHashes),
         addedIndexedDbEquivalent: null,
         note: null,
+        parsed: null,
+        allObservedPaths: null,
       });
       return;
     }
@@ -3171,6 +3238,8 @@ async function handleResyncMemoryDayCandidate(
       members: memberResults,
       addedIndexedDbEquivalent: null,
       note: hasConflictMember ? "一部メンバーがローカル未flush変更と競合しています" : null,
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3192,6 +3261,8 @@ async function handleResyncMemoryDayCandidate(
       members: await classifyResyncMembers(members, previousMemberHashes),
       addedIndexedDbEquivalent: null,
       note: "同一day-fileが複数pathに存在します（重複）",
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3208,6 +3279,8 @@ async function handleResyncMemoryDayCandidate(
       members: await classifyResyncMembers(members, previousMemberHashes),
       addedIndexedDbEquivalent: null,
       note: "previous path could not be verified",
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3226,6 +3299,8 @@ async function handleResyncMemoryDayCandidate(
       members: await classifyResyncMembers(members, previousMemberHashes),
       addedIndexedDbEquivalent: null,
       note: null,
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -3244,6 +3319,8 @@ async function handleResyncMemoryDayCandidate(
     members: memberResults,
     addedIndexedDbEquivalent: null,
     note: hasConflictMember ? "moved+edited: 一部メンバーがローカル未flush変更と競合" : "moved+edited",
+    parsed: null,
+    allObservedPaths: null,
   });
 }
 
@@ -3412,6 +3489,8 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
         members: null,
         addedIndexedDbEquivalent: null,
         note: null,
+        parsed: null,
+        allObservedPaths: null,
       });
     }
   }
@@ -3424,14 +3503,783 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
   };
 }
 
+// ---------------------------------------------------------------------------
+// Vault Registry（Step 4b：resync applyの実装）
+//
+// Step 4aのclassification結果を使い、IndexedDB・Registry・History Index・
+// vaultSyncStateを安全に再整合させる。Markdown本文は一切書き換えない
+// （write経路はStep 2のまま、resyncからは呼ばない）。
+//
+// 最重要方針（合意済み）：
+// - 完全なatomic transactionは複数storageをまたぐため存在しない。ロールバック
+//   前提にはせず、「途中で失敗しても次回resyncが安全に再実行できる」
+//   idempotent/retry-safe設計を優先する。
+// - Registry status="ok"（＋新しいhash/path/metadata）は、IndexedDB・
+//   vaultSyncState・History Indexの全てが成功した後にのみ書く
+//   （commit markerとして最後に進める）。
+// - record本体とvaultSyncStateは同一IndexedDB transactionでまとめて書く
+//   （db.tsの`putConversationAndMarkSynced`等）。これにより「本体だけ更新できて
+//   vaultSyncStateだけ失敗した」という中間状態を構造的に作らない——この中間状態は
+//   次回resyncの「local unsynced」判定を誤らせ、正しく適用できた変更を誤って
+//   conflict候補にしてしまう。
+// - Conversation/ReflectionのeditedはL/Fのday（History上の日付）が一致する場合
+//   のみ適用する。`updateHistoryIndex`は「新しいdayへupsertするだけ」で旧dayの
+//   entryを削除しないため（実コード確認済み）、day変化を伴う編集を無条件適用すると
+//   同一recordがHistory上に重複表示されうる。day不一致はconflictへ切り替える。
+// - Conversationのturn数がL/Fで異なる場合も、安全側でconflictへ切り替える
+//   （turn単位の高度なdiff/mergeは今回実装しない）。
+// - normal Memory day-fileは、member単位で安全に適用できるものは適用しつつ、
+//   1件でも失敗・conflictがあればcontainer全体のRegistry"ok" commitを保留する
+//   （他memberの処理自体は止めない）。
+// ---------------------------------------------------------------------------
+
+export interface VaultResyncApplyErrorInfo {
+  registryKey: string;
+  recordType: VaultRegistryRecordType;
+  reason: string;
+}
+
+export interface VaultResyncApplyResult {
+  scanCompleted: boolean;
+  scannedFileCount: number;
+  counts: {
+    unchanged: number;
+    moved: number;
+    edited: number;
+    added: number;
+    missing: number;
+    conflict: number;
+    unreadable: number;
+  };
+  applyErrors: VaultResyncApplyErrorInfo[];
+  unreadableFiles: { path: string; reason: string }[];
+}
+
+/** 既存のfiles[path]エントリのstatusだけを変更する（他フィールドは一切触れない）。
+ *  records[key]自体が無い場合は何もしない（＝呼び出し元は代わりに
+ *  `createVaultRegistryConflictAnchor`を使うべき）。 */
+async function setVaultRegistryEntryStatus(
+  root: FileSystemDirectoryHandle,
+  registryKey: string,
+  status: VaultRegistryStatus
+): Promise<void> {
+  const bucket = vaultRegistryBucketOf(registryKey);
+  await withVaultRegistryLock(async () => {
+    const shard = await readVaultRegistryShard(root, bucket);
+    const path = shard.records[registryKey];
+    if (path === undefined) return;
+    const entry = shard.files[path];
+    if (entry === undefined || entry.status === status) return;
+    shard.files[path] = { ...entry, status };
+    await writeVaultRegistryShard(root, bucket, shard);
+  });
+}
+
+async function setVaultRegistryMissing(root: FileSystemDirectoryHandle, registryKey: string): Promise<void> {
+  await setVaultRegistryEntryStatus(root, registryKey, "missing");
+}
+
 /**
- * Step 4a公開エントリポイント。"tsumugi-vault-world"を排他保持した状態で
- * scan＋classificationを行う（`runVaultWorldExclusive`参照）。IndexedDB・
- * Registry・History Index・Markdownのいずれへも書き込みを行わない
- * （4bで初めてapplyを実装する）。UIからはまだ呼び出さない（Step 5）。
+ * Conversation/Reflection/Source（1id=1file）をstatus="ok"へ確定させる
+ * （moved・added・edited成功時の共通経路）。pathが変わっている場合、同一bucket
+ * 内の1回のread-modify-writeで旧pathのfiles entry削除＋新pathのfiles entry
+ * 追加＋records[key]更新を行う（Registryをcommit markerとして最後に進める）。
+ */
+async function commitVaultRegistrySingleRecordOk(
+  root: FileSystemDirectoryHandle,
+  registryKey: string,
+  recordType: VaultRegistryRecordType,
+  newPath: string,
+  oldPathToRemove: string | null,
+  mtime: number,
+  size: number,
+  contentHash: string
+): Promise<void> {
+  const bucket = vaultRegistryBucketOf(registryKey);
+  await withVaultRegistryLock(async () => {
+    const shard = await readVaultRegistryShard(root, bucket);
+    if (oldPathToRemove !== null && oldPathToRemove !== newPath) {
+      delete shard.files[oldPathToRemove];
+    }
+    shard.records[registryKey] = newPath;
+    shard.files[newPath] = {
+      recordType,
+      mtime,
+      size,
+      contentHash,
+      memberIds: [registryKey],
+      status: "ok",
+    };
+    await writeVaultRegistryShard(root, bucket, shard);
+  });
+}
+
+/** normal Memory day-file containerをstatus="ok"へ確定させる（member配列全体を持つ点のみ
+ *  `commitVaultRegistrySingleRecordOk`と異なる）。 */
+async function commitVaultRegistryMemoryDayOk(
+  root: FileSystemDirectoryHandle,
+  registryKey: string,
+  newPath: string,
+  oldPathToRemove: string | null,
+  mtime: number,
+  size: number,
+  contentHash: string,
+  memberIds: string[],
+  memberHashes: Record<string, string>
+): Promise<void> {
+  const bucket = vaultRegistryBucketOf(registryKey);
+  await withVaultRegistryLock(async () => {
+    const shard = await readVaultRegistryShard(root, bucket);
+    if (oldPathToRemove !== null && oldPathToRemove !== newPath) {
+      delete shard.files[oldPathToRemove];
+    }
+    shard.records[registryKey] = newPath;
+    shard.files[newPath] = {
+      recordType: "memory-day",
+      mtime,
+      size,
+      contentHash,
+      memberIds,
+      memberHashes,
+      status: "ok",
+    };
+    await writeVaultRegistryShard(root, bucket, shard);
+  });
+}
+
+/**
+ * 修正3（HIGH）対応：registryに一度も登録が無かった（`previousPath===null`）
+ * registryKeyがconflictへ確定した場合に、`records[key]`を必ず作る。作らないと
+ * Step 2/3の`lookupVaultRegistryRecord`が「registry entry無し」と判断し、
+ * 決定論的pathへのfallback（write再作成・read成功）が起きてしまう。
+ *
+ * duplicate（真に新規のidが本scan内で複数pathに見つかった）場合は、
+ * `allObservedPaths`の中からlexicographical sortの先頭を決定論的anchorとして
+ * 選ぶ（scan順に依存させない。毎回同じ結果になる）。単一pathしか無い場合
+ * （added+semantic mismatch）はそのpathをそのままanchorにする。他のduplicate
+ * pathは一切削除・変更しない——単にrecords[key]の対象にしないだけ。
+ *
+ * 既にrecords[key]が存在する場合は何もしない（他経路が既に作成済み、または
+ * 元々`previousPath!==null`だったケースはこの関数を呼ばない設計のため、
+ * 通常は到達しない防御的チェック）。
+ */
+/**
+ * Codexレビュー指摘・HIGH対応：anchorPathのfiles entryは、必ず
+ * 「anchorPathそのものの実ファイルを観測して得たmetadata」でなければならない
+ * （scanの分類対象になった別candidate pathのmetadataを誤って流用してはいけない）。
+ * この関数はanchorPathを実際に読み直し、`hashVaultText`でcontentHashを再計算し、
+ * `parseTsumugiResyncCandidate`（4aと同じ判定ロジック）でrecordType/member情報を
+ * 確認する。読み込み・parseのいずれかに失敗した場合、または実際のrecordTypeが
+ * 期待値と異なる場合は例外を投げる——呼び出し元（`createVaultRegistryConflictAnchor`）
+ * はこれを一切catchしないため、そのまま`applyVaultResyncScanResult`のapplyError
+ * として扱われ、conflict anchor自体はcommitされない（他pathのmetadataを代用しない）。
+ */
+async function readAnchorFileEntry(
+  root: FileSystemDirectoryHandle,
+  anchorPath: string,
+  expectedRecordType: VaultRegistryRecordType
+): Promise<Omit<VaultRegistryFileEntry, "status">> {
+  const resolved = await resolveVaultRelativePath(root, anchorPath);
+  const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+  const file = await fileHandle.getFile();
+  const text = await file.text();
+  const mtime = file.lastModified;
+  const size = file.size;
+  const contentHash = hashVaultText(text);
+
+  const candidate = parseTsumugiResyncCandidate(text);
+  if (!candidate) {
+    throw new Error(`anchor file at ${anchorPath} could not be parsed as a Tsumugi record`);
+  }
+
+  if (candidate.kind === "memory-day") {
+    if (expectedRecordType !== "memory-day") {
+      throw new Error(`anchor file at ${anchorPath} parsed as memory-day but expected ${expectedRecordType}`);
+    }
+    const memberIds = candidate.members.map((m) => m.id);
+    const memberHashes: Record<string, string> = {};
+    for (const m of candidate.members) {
+      memberHashes[m.id] = hashVaultText(memoryObjectToMarkdown(m));
+    }
+    return { recordType: "memory-day", mtime, size, contentHash, memberIds, memberHashes };
+  }
+
+  if (candidate.kind !== expectedRecordType) {
+    throw new Error(`anchor file at ${anchorPath} parsed as ${candidate.kind} but expected ${expectedRecordType}`);
+  }
+  return { recordType: candidate.kind, mtime, size, contentHash, memberIds: [candidate.id] };
+}
+
+async function createVaultRegistryConflictAnchor(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<void> {
+  let anchorPath: string;
+  if (record.allObservedPaths !== null && record.allObservedPaths.length > 0) {
+    anchorPath = [...record.allObservedPaths].sort()[0];
+  } else if (record.currentPath !== null) {
+    anchorPath = record.currentPath;
+  } else {
+    throw new Error(`conflict record ${record.registryKey} has no anchor path candidate`);
+  }
+
+  // Codexレビュー指摘・HIGH対応：anchorPathが本scanのcurrent candidate（例：B.md）と
+  // 異なる場合（例：lexicographical anchorがA.md）でも、必ずanchorPath自身
+  // （A.md）を読み直してmetadataを取得する。record.contentHash/mtime/size/members
+  // （current candidate由来）をそのまま流用しない。resync全体がexclusive world
+  // lockを保持している間はこの追加readの最中に通常Vault writeが割り込むことは無い。
+  const anchorEntry = await readAnchorFileEntry(root, anchorPath, record.recordType);
+
+  const bucket = vaultRegistryBucketOf(record.registryKey);
+  await withVaultRegistryLock(async () => {
+    const shard = await readVaultRegistryShard(root, bucket);
+    if (shard.records[record.registryKey] !== undefined) return;
+    shard.records[record.registryKey] = anchorPath;
+    shard.files[anchorPath] = { ...anchorEntry, status: "conflict" };
+    await writeVaultRegistryShard(root, bucket, shard);
+  });
+}
+
+/** conflict outcomeの共通apply：既存registry entryがあればstatusだけ変更、
+ *  無ければ`createVaultRegistryConflictAnchor`でanchorを新規作成する。 */
+async function applyConflictOutcome(root: FileSystemDirectoryHandle, record: VaultResyncRecordResult): Promise<void> {
+  if (record.previousPath !== null) {
+    await setVaultRegistryEntryStatus(root, record.registryKey, "conflict");
+    return;
+  }
+  await createVaultRegistryConflictAnchor(root, record);
+}
+
+async function getExistingSingleRecordUpdatedAt(
+  kind: VaultResyncSingleKind,
+  id: string
+): Promise<string | undefined> {
+  if (kind === "conversation") return (await getConversation(id))?.updatedAt;
+  if (kind === "source") return (await getSource(id))?.updatedAt;
+  return (await getMemoryObject(id))?.updatedAt;
+}
+
+/**
+ * Conversationのedited merge（D節）。Fをベースに、Markdown非往復fieldだけLから
+ * 上書きする。day（History上の日付）が変わっている、またはturn数が異なる場合は
+ * 安全に自動適用できないためnullを返す（呼び出し元がconflictへ切り替える）。
+ */
+function mergeConversationForApply(f: Conversation, l: Conversation): Conversation | null {
+  if (f.startedAt.slice(0, 10) !== l.startedAt.slice(0, 10)) return null;
+  if (f.turns.length !== l.turns.length) return null;
+  const turns = f.turns.map((fTurn, i) => {
+    const lTurn = l.turns[i];
+    return {
+      role: fTurn.role,
+      content: fTurn.content,
+      timestamp: lTurn.timestamp,
+      webSearchRequested: lTurn.webSearchRequested,
+      isRecordTurn: lTurn.isRecordTurn,
+    };
+  });
+  return {
+    ...f,
+    turns,
+    promptedMemoryId: l.promptedMemoryId,
+    metadata: {
+      ...l.metadata,
+      source: f.metadata.source,
+      sourceType: f.metadata.sourceType,
+      sourceDetail: f.metadata.sourceDetail,
+      schemaVersion: f.metadata.schemaVersion,
+      createdAt: f.createdAt,
+      updatedAt: f.updatedAt,
+    },
+  };
+}
+
+/**
+ * Reflection/normal Memory（MemoryObject）のedited merge（D節）。dateはday部分
+ * のみ比較し（frontmatterには日付のみ保存されるため）、一致する場合はLの実際の
+ * date（時刻含む）を維持する。dayが変わっている場合はnullを返す（呼び出し元が
+ * conflictへ切り替える。normal Memory day-fileでは、この関数に渡す前に
+ * container自体の識別で既にday不一致は別経路で処理されているため、通常この
+ * gateは発火しない防御的なものになる）。
+ */
+function mergeMemoryObjectForApply(f: MemoryObject, l: MemoryObject): MemoryObject | null {
+  if (f.date.slice(0, 10) !== l.date.slice(0, 10)) return null;
+  return {
+    ...f,
+    date: l.date,
+    themeIds: l.themeIds,
+    personIds: l.personIds,
+    emotionIds: l.emotionIds,
+    goalIds: l.goalIds,
+    ideaIds: l.ideaIds,
+    eventIds: l.eventIds,
+    sourceId: l.sourceId,
+    revisitPrompt: l.revisitPrompt,
+    metadata: {
+      ...l.metadata,
+      source: f.metadata.source,
+      sourceType: f.metadata.sourceType,
+      sourceDetail: f.metadata.sourceDetail,
+      aiProvider: f.metadata.aiProvider,
+      confidence: f.metadata.confidence,
+      schemaVersion: f.metadata.schemaVersion,
+      createdAt: f.createdAt,
+      updatedAt: f.updatedAt,
+      obsidian: l.metadata.obsidian,
+    },
+  };
+}
+
+/** History Index更新（Conversation/Reflectionのみ。Sourceは対象外——History
+ *  Indexが管理するのはConversation/Memory系であり、SourceのHistory day entryは
+ *  存在しないため）。 */
+async function updateHistoryIndexForSingleRecord(
+  root: FileSystemDirectoryHandle,
+  kind: VaultResyncSingleKind,
+  parsed: Conversation | Source | MemoryObject
+): Promise<void> {
+  if (kind === "conversation") {
+    const conversation = parsed as Conversation;
+    const mode: HistoryConversationMode = conversation.persona === "companion" ? "diary" : "conversation";
+    await updateHistoryIndex(root, {
+      kind: "conversation",
+      id: conversation.id,
+      day: conversation.startedAt.slice(0, 10),
+      mode,
+      turnCount: conversation.turns.length,
+    });
+    return;
+  }
+  if (kind === "reflection") {
+    const memoryObject = parsed as MemoryObject;
+    await updateHistoryIndex(root, {
+      kind: "reflection",
+      id: memoryObject.id,
+      day: memoryObject.date.slice(0, 10),
+      preview: truncateHistoryPreview(memoryObject.summary),
+      createdAt: memoryObject.createdAt,
+    });
+  }
+  // kind === "source"：History Index対象外（呼び出し元がガードすること）。
+}
+
+/** added outcome（Conversation/Reflection/Source）のapply。 */
+async function applySingleRecordAdded(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult,
+  kind: VaultResyncSingleKind
+): Promise<void> {
+  if (
+    record.currentPath === null ||
+    record.parsed === null ||
+    record.contentHash === null ||
+    record.mtime === null ||
+    record.size === null
+  ) {
+    throw new Error(`added outcome for ${record.registryKey} is missing required scan fields`);
+  }
+  const syncKey = vaultSyncKeyFor(vaultSyncKindOf(kind), record.registryKey);
+
+  if (record.addedIndexedDbEquivalent === true) {
+    // legacy-equivalent（F節）：IndexedDB本文は変更せず、vaultSyncStateの
+    // baselineだけ確立する。History Indexも更新しない（IndexedDBが変わって
+    // いない以上、既存のHistory Indexは既に正しいはずのため）。
+    const existingUpdatedAt = await getExistingSingleRecordUpdatedAt(kind, record.registryKey);
+    if (existingUpdatedAt === undefined) {
+      throw new Error(`legacy-equivalent record ${record.registryKey} disappeared from IndexedDB during apply`);
+    }
+    await setVaultSyncState(syncKey, existingUpdatedAt);
+  } else {
+    // 真の新規import（E節）：Markdown非往復fieldはparserの既定値のまま取り込む
+    // （Beta仕様として許容）。
+    if (kind === "conversation") {
+      await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
+    } else if (kind === "source") {
+      await addSourceIfAbsentAndMarkSynced(record.parsed as Source, syncKey);
+    } else {
+      await addMemoryObjectIfAbsentAndMarkSynced(record.parsed as MemoryObject, syncKey);
+    }
+    if (kind !== "source") {
+      await updateHistoryIndexForSingleRecord(root, kind, record.parsed);
+    }
+  }
+
+  await commitVaultRegistrySingleRecordOk(
+    root,
+    record.registryKey,
+    record.recordType,
+    record.currentPath,
+    record.previousPath,
+    record.mtime,
+    record.size,
+    record.contentHash
+  );
+}
+
+/**
+ * edited outcome（Conversation/Reflection/Source）のapply。日変化・turn数不一致
+ * によりmergeがnullを返した場合はconflictへ切り替える（例外は投げない——これは
+ * 「安全に自動適用できないと判断できた」という正常な処理結果であり、apply
+ * failureではないため）。戻り値が実際に適用されたoutcome。
+ */
+async function applySingleRecordEdited(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult,
+  kind: VaultResyncSingleKind
+): Promise<"edited" | "conflict"> {
+  if (
+    record.currentPath === null ||
+    record.parsed === null ||
+    record.contentHash === null ||
+    record.mtime === null ||
+    record.size === null
+  ) {
+    throw new Error(`edited outcome for ${record.registryKey} is missing required scan fields`);
+  }
+
+  if (kind === "source") {
+    // Sourceは全フィールドが素直に往復するためmerge不要（D節）。History Index対象外。
+    const f = record.parsed as Source;
+    const syncKey = vaultSyncKeyFor("source", record.registryKey);
+    await saveSourceAndMarkSynced(f, syncKey);
+    await commitVaultRegistrySingleRecordOk(
+      root,
+      record.registryKey,
+      record.recordType,
+      record.currentPath,
+      record.previousPath,
+      record.mtime,
+      record.size,
+      record.contentHash
+    );
+    return "edited";
+  }
+
+  if (kind === "conversation") {
+    const f = record.parsed as Conversation;
+    const existing = await getConversation(record.registryKey);
+    if (existing === undefined) {
+      throw new Error(`edited conversation ${record.registryKey} missing from IndexedDB`);
+    }
+    const merged = mergeConversationForApply(f, existing);
+    if (merged === null) {
+      await applyConflictOutcome(root, record);
+      return "conflict";
+    }
+    const syncKey = vaultSyncKeyFor("conversation", record.registryKey);
+    await putConversationAndMarkSynced(merged, syncKey);
+    await updateHistoryIndexForSingleRecord(root, kind, merged);
+    await commitVaultRegistrySingleRecordOk(
+      root,
+      record.registryKey,
+      record.recordType,
+      record.currentPath,
+      record.previousPath,
+      record.mtime,
+      record.size,
+      record.contentHash
+    );
+    return "edited";
+  }
+
+  // reflection
+  const f = record.parsed as MemoryObject;
+  const existing = await getMemoryObject(record.registryKey);
+  if (existing === undefined) {
+    throw new Error(`edited reflection ${record.registryKey} missing from IndexedDB`);
+  }
+  const merged = mergeMemoryObjectForApply(f, existing);
+  if (merged === null) {
+    await applyConflictOutcome(root, record);
+    return "conflict";
+  }
+  const syncKey = vaultSyncKeyFor("memory", record.registryKey);
+  await putMemoryObjectAndMarkSynced(merged, syncKey);
+  await updateHistoryIndexForSingleRecord(root, kind, merged);
+  await commitVaultRegistrySingleRecordOk(
+    root,
+    record.registryKey,
+    record.recordType,
+    record.currentPath,
+    record.previousPath,
+    record.mtime,
+    record.size,
+    record.contentHash
+  );
+  return "edited";
+}
+
+/** Conversation/Reflection/Source（1id=1file）のapply本体。実際に適用された
+ *  outcomeを返す（"edited"がday/turn数ゲートで"conflict"へ切り替わる場合がある）。 */
+async function applySingleRecordOutcome(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultResyncOutcome> {
+  const kind = record.recordType as VaultResyncSingleKind;
+  switch (record.outcome) {
+    case "unchanged":
+      return "unchanged";
+    case "moved": {
+      if (
+        record.currentPath === null ||
+        record.contentHash === null ||
+        record.mtime === null ||
+        record.size === null
+      ) {
+        throw new Error(`moved outcome for ${record.registryKey} is missing required scan fields`);
+      }
+      await commitVaultRegistrySingleRecordOk(
+        root,
+        record.registryKey,
+        record.recordType,
+        record.currentPath,
+        record.previousPath,
+        record.mtime,
+        record.size,
+        record.contentHash
+      );
+      return "moved";
+    }
+    case "added":
+      await applySingleRecordAdded(root, record, kind);
+      return "added";
+    case "edited":
+      return applySingleRecordEdited(root, record, kind);
+    case "missing":
+      await setVaultRegistryMissing(root, record.registryKey);
+      return "missing";
+    case "conflict":
+      await applyConflictOutcome(root, record);
+      return "conflict";
+    case "unreadable":
+      return "unreadable";
+  }
+}
+
+/**
+ * normal Memory day-fileのmember単位apply。修正2対応：1 memberが失敗/conflict
+ * でも他の安全なmemberの適用は継続する。その日のHistory Indexは、member適用の
+ * 成否に関わらず、処理完了後の現在のIndexedDB状態から絶対値で再構築する
+ * （既存write pipelineと同じ「絶対値で置き換える」設計）。1件でも失敗があれば
+ * 最後に例外を投げ、呼び出し元（`applyMemoryDayOutcome`）にcontainer
+ * Registryの"ok" commitを行わせない。
+ */
+async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: VaultResyncRecordResult): Promise<void> {
+  const members = record.members ?? [];
+  let allSucceeded = true;
+
+  for (const member of members) {
+    if (member.outcome === "unchanged") continue;
+    if (member.outcome === "conflict") {
+      // 修正3のmember removal等、既にconflict済みのmemberには一切触れない。
+      allSucceeded = false;
+      continue;
+    }
+    if (member.parsed === null) {
+      allSucceeded = false;
+      continue;
+    }
+    try {
+      const syncKey = vaultSyncKeyFor("memory", member.id);
+      if (member.outcome === "added") {
+        if (member.addedIndexedDbEquivalent === true) {
+          const existingUpdatedAt = (await getMemoryObject(member.id))?.updatedAt;
+          if (existingUpdatedAt === undefined) {
+            throw new Error(`legacy-equivalent member ${member.id} disappeared from IndexedDB during apply`);
+          }
+          await setVaultSyncState(syncKey, existingUpdatedAt);
+        } else {
+          await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey);
+        }
+      } else if (member.outcome === "edited") {
+        const existing = await getMemoryObject(member.id);
+        if (existing === undefined) {
+          throw new Error(`edited member ${member.id} missing from IndexedDB`);
+        }
+        const merged = mergeMemoryObjectForApply(member.parsed, existing);
+        if (merged === null) {
+          // container自体のdayとmemberのdayは4a側で既に整合済みのはずのため、
+          // ここに来るのは想定外——安全側でこのmemberだけ失敗扱いにする。
+          allSucceeded = false;
+          continue;
+        }
+        await putMemoryObjectAndMarkSynced(merged, syncKey);
+      }
+    } catch (error) {
+      allSucceeded = false;
+      console.error(`[Tsumugi] resync apply: memory-day member ${member.id} failed:`, error);
+    }
+  }
+
+  // dayFileRegistryKeyの形式は"day:YYYY-MM-DD"。History Index更新にはYYYY-MM-DD部分だけ必要。
+  const day = record.registryKey.startsWith("day:") ? record.registryKey.slice(4) : record.registryKey;
+  const historySummaries: HistoryMemorySummary[] = [];
+  for (const member of members) {
+    const current = await getMemoryObject(member.id);
+    if (!current) continue;
+    historySummaries.push({
+      id: current.id,
+      types: current.types,
+      preview: truncateHistoryPreview(current.summary),
+      createdAt: current.createdAt,
+    });
+  }
+  historySummaries.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  await updateHistoryIndex(root, { kind: "memory", day, normalMemories: historySummaries });
+
+  if (!allSucceeded) {
+    throw new Error(`one or more members of day-file ${record.registryKey} failed to apply`);
+  }
+}
+
+/** normal Memory day-file（container単位）のapply本体。 */
+async function applyMemoryDayOutcome(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultResyncOutcome> {
+  switch (record.outcome) {
+    case "unchanged":
+      return "unchanged";
+    case "moved": {
+      if (
+        record.currentPath === null ||
+        record.contentHash === null ||
+        record.mtime === null ||
+        record.size === null
+      ) {
+        throw new Error(`moved memory-day outcome for ${record.registryKey} is missing required scan fields`);
+      }
+      const memberIds = (record.members ?? []).map((m) => m.id);
+      const memberHashes: Record<string, string> = {};
+      for (const m of record.members ?? []) {
+        if (m.parsed) memberHashes[m.id] = hashVaultText(memoryObjectToMarkdown(m.parsed));
+      }
+      await commitVaultRegistryMemoryDayOk(
+        root,
+        record.registryKey,
+        record.currentPath,
+        record.previousPath,
+        record.mtime,
+        record.size,
+        record.contentHash,
+        memberIds,
+        memberHashes
+      );
+      return "moved";
+    }
+    case "missing":
+      await setVaultRegistryMissing(root, record.registryKey);
+      return "missing";
+    case "conflict":
+      // member removal conflict含む：previous memberIds/memberHashesは
+      // `createVaultRegistryConflictAnchor`/`setVaultRegistryEntryStatus`の
+      // いずれも「既存entryのstatusだけ変える」または「観測済みcontentHash等で
+      // 新規anchorを作る」だけであり、member removal時のrecordはStep 4a側で
+      // 既にpreviousの値を保持したまま渡ってくるため、ここで上書きすることはない。
+      await applyConflictOutcome(root, record);
+      return "conflict";
+    case "added":
+    case "edited": {
+      await applyMemoryDayMembers(root, record); // 失敗時はthrowする
+      if (
+        record.currentPath === null ||
+        record.contentHash === null ||
+        record.mtime === null ||
+        record.size === null
+      ) {
+        throw new Error(`${record.outcome} memory-day outcome for ${record.registryKey} is missing required scan fields`);
+      }
+      const memberIds = (record.members ?? []).map((m) => m.id);
+      const memberHashes: Record<string, string> = {};
+      for (const m of record.members ?? []) {
+        if (m.parsed) memberHashes[m.id] = hashVaultText(memoryObjectToMarkdown(m.parsed));
+      }
+      await commitVaultRegistryMemoryDayOk(
+        root,
+        record.registryKey,
+        record.currentPath,
+        record.previousPath,
+        record.mtime,
+        record.size,
+        record.contentHash,
+        memberIds,
+        memberHashes
+      );
+      return record.outcome;
+    }
+    case "unreadable":
+      return "unreadable";
+  }
+}
+
+/**
+ * Step 4aの分類結果をapplyする本体。record単位で独立して処理し、1件の失敗が
+ * 他のrecordの処理を止めない（合意済み：即時全体abortより、そのrecordだけ
+ * errorとして記録して次へ進む方がretry-safe）。day/turn数ゲートによる
+ * "edited"→"conflict"の切り替えは正常な処理結果であり、applyErrorsには含めない
+ * （countsには実際に適用されたoutcome側で計上する）。
+ */
+async function applyVaultResyncScanResult(
+  root: FileSystemDirectoryHandle,
+  scan: VaultResyncScanResult
+): Promise<VaultResyncApplyResult> {
+  const counts = { unchanged: 0, moved: 0, edited: 0, added: 0, missing: 0, conflict: 0, unreadable: 0 };
+  const applyErrors: VaultResyncApplyErrorInfo[] = [];
+
+  for (const record of scan.records) {
+    try {
+      const actualOutcome =
+        record.recordType === "memory-day"
+          ? await applyMemoryDayOutcome(root, record)
+          : await applySingleRecordOutcome(root, record);
+      counts[actualOutcome] += 1;
+    } catch (error) {
+      counts[record.outcome] += 1;
+      applyErrors.push({
+        registryKey: record.registryKey,
+        recordType: record.recordType,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  counts.unreadable = scan.unreadableFiles.length;
+
+  return {
+    scanCompleted: scan.scanCompleted,
+    scannedFileCount: scan.scannedFileCount,
+    counts,
+    applyErrors,
+    unreadableFiles: scan.unreadableFiles,
+  };
+}
+
+/**
+ * Step 4b公開エントリポイント。"tsumugi-vault-world"を排他保持した状態で
+ * scan→applyまで一括で行う（`runVaultWorldExclusive`参照、同じ排他区間の中で
+ * 完結させる——scanとapplyの間でロックを手放すと、その間に他の書込・別tabの
+ * 操作が割り込みうるため）。
+ *
+ * `lastFullResyncAt`は、`scanCompleted===true`かつ`applyErrors.length===0`の
+ * 場合にのみ更新する（合意済み：「最後にVault全体を走査し、実行可能な
+ * reconciliation処理まで正常に完了した時刻」という意味を持たせるため。
+ * conflict/missingへの正常な分類・適用はそれ自体エラーではないため
+ * lastFullResyncAtの更新を妨げない）。
  */
 export async function resyncVaultRegistry(
   root: FileSystemDirectoryHandle
-): Promise<{ timedOut: boolean; result?: VaultResyncScanResult }> {
-  return runVaultWorldExclusive(() => performVaultResyncScan(root));
+): Promise<{ timedOut: boolean; result?: VaultResyncApplyResult }> {
+  return runVaultWorldExclusive(async () => {
+    const scan = await performVaultResyncScan(root);
+    const applyResult = await applyVaultResyncScanResult(root, scan);
+
+    if (applyResult.scanCompleted && applyResult.applyErrors.length === 0) {
+      const meta = await readVaultRegistryMeta(root);
+      const now = new Date().toISOString();
+      meta.lastFullResyncAt = now;
+      meta.updatedAt = now;
+      await writeVaultRegistryMeta(root, meta);
+    }
+
+    return applyResult;
+  });
 }

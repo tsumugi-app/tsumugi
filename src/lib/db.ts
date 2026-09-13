@@ -390,6 +390,127 @@ export async function setVaultSyncState(key: string, updatedAt: string): Promise
 }
 
 /**
+ * Step 4b（Vault resync apply）専用：record本体とvaultSyncStateを同一の
+ * IndexedDB transactionでまとめて書く。この2つを別々のtransactionで行うと、
+ * 「record本体は新しい値に更新できたがvaultSyncStateだけ書き込みに失敗した」
+ * という中間状態が生じうる。この中間状態では、次回resyncの「local unsynced」
+ * 判定（IndexedDBの現在updatedAt と vaultSyncStateの記録値を比較するだけの
+ * 単純な仕組み）が、実際には正しく適用できた変更を誤ってunsynced＝conflict
+ * 候補と誤判定してしまう。record本体とvaultSyncStateを同一transaction内で
+ * 書くことで、この中間状態自体を構造的に発生させない。
+ *
+ * 既存の`putConversation`/`putMemoryObject`/`saveSource`（record本体のみ）・
+ * `setVaultSyncState`（ledgerのみ）は無変更のまま維持し、通常の書込経路
+ * （vault.tsのwrite関数群）には一切影響しない。
+ */
+export async function putConversationAndMarkSynced(conversation: Conversation, syncKey: string): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["conversations", "vaultSyncState"], "readwrite");
+  try {
+    await tx.objectStore("conversations").put(conversation);
+    await tx.objectStore("vaultSyncState").put(conversation.updatedAt, syncKey);
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+}
+
+export async function putMemoryObjectAndMarkSynced(memoryObject: MemoryObject, syncKey: string): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "vaultSyncState"], "readwrite");
+  try {
+    await tx.objectStore("memoryObjects").put(memoryObject);
+    await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+}
+
+export async function saveSourceAndMarkSynced(source: Source, syncKey: string): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["sources", "vaultSyncState"], "readwrite");
+  try {
+    await tx.objectStore("sources").put(source);
+    await tx.objectStore("vaultSyncState").put(source.updatedAt, syncKey);
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+}
+
+/**
+ * 「IndexedDBに存在しなければ挿入し、同時にvaultSyncStateも確立する」を
+ * 同一transactionで行う（Vault resyncの外部record import専用）。既に
+ * 存在する場合は何もせずfalseを返す——`importMissingRecordsIfAbsent`と同じ
+ * 「絶対に上書きしない」方針で、`add()`を使い構造的にも上書きを拒否させる。
+ * 「insertはできたがvaultSyncStateだけ失敗した」という中間状態を作らないため、
+ * 上のput系と同じく1つのtransactionにまとめている。
+ */
+export async function addConversationIfAbsentAndMarkSynced(
+  conversation: Conversation,
+  syncKey: string
+): Promise<boolean> {
+  const db = await getDB();
+  const tx = db.transaction(["conversations", "vaultSyncState"], "readwrite");
+  let inserted = false;
+  try {
+    const store = tx.objectStore("conversations");
+    const existing = await store.get(conversation.id);
+    if (existing === undefined) {
+      await store.add(conversation);
+      await tx.objectStore("vaultSyncState").put(conversation.updatedAt, syncKey);
+      inserted = true;
+    }
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return inserted;
+}
+
+export async function addMemoryObjectIfAbsentAndMarkSynced(
+  memoryObject: MemoryObject,
+  syncKey: string
+): Promise<boolean> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "vaultSyncState"], "readwrite");
+  let inserted = false;
+  try {
+    const store = tx.objectStore("memoryObjects");
+    const existing = await store.get(memoryObject.id);
+    if (existing === undefined) {
+      await store.add(memoryObject);
+      await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
+      inserted = true;
+    }
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return inserted;
+}
+
+export async function addSourceIfAbsentAndMarkSynced(source: Source, syncKey: string): Promise<boolean> {
+  const db = await getDB();
+  const tx = db.transaction(["sources", "vaultSyncState"], "readwrite");
+  let inserted = false;
+  try {
+    const store = tx.objectStore("sources");
+    const existing = await store.get(source.id);
+    if (existing === undefined) {
+      await store.add(source);
+      await tx.objectStore("vaultSyncState").put(source.updatedAt, syncKey);
+      inserted = true;
+    }
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return inserted;
+}
+
+/**
  * 新しいVaultフォルダを選択した直後にのみ呼ぶこと（同じVaultへの再認可では呼ばない）。
  * 台帳はどのフォルダに対する同期状況かを区別しないため、フォルダが変わった場合に
  * クリアしないと「新フォルダには実際は書き込まれていないのに同期済み」と誤判定し、
