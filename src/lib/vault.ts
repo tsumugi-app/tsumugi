@@ -1068,12 +1068,34 @@ function dayFileNameFor(isoDate: string) {
 
 async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, conversation: Conversation) {
   const dir = await timedIOStep("conversation dirHandle", () => root.getDirectoryHandle("Conversations", { create: true }));
-  const fileName = fileNameFor(conversation.id, conversation.startedAt);
+
+  // Vault Registry（Step 2）：真の新規recordは現行命名規則、既存recordは
+  // registry記載のactual pathへ。needs-resync/missing/conflictは書き込み保留。
+  const registryKey = conversation.id;
+  const lookup = await lookupVaultRegistryRecord(root, registryKey);
+  let targetDir = dir;
+  let fileName: string;
+  let relativePath: string;
+  if (lookup.entry === undefined) {
+    fileName = fileNameFor(conversation.id, conversation.startedAt);
+    relativePath = `Conversations/${fileName}`;
+  } else if (lookup.entry.status === "ok") {
+    relativePath = lookup.path as string;
+    const resolved = await resolveVaultRelativePath(root, relativePath);
+    targetDir = resolved.dir;
+    fileName = resolved.fileName;
+    // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する
+    // （旧pathへの自動再作成・外部編集の無条件上書きを防ぐ）。
+    await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
+  } else {
+    throw new VaultRecordNeedsResyncError("conversation", registryKey, lookup.entry.status);
+  }
+
   const renderStart = Date.now();
   const content = conversationToMarkdown(conversation);
   logSyncStep("conversation render", Date.now() - renderStart);
-  await writeFileInDir(dir, fileName, content, "conversation");
-  await updateIndex(root, conversation.id, `Conversations/${fileName}`);
+  await writeFileInDir(targetDir, fileName, content, "conversation");
+  await updateIndex(root, conversation.id, relativePath);
   // History Index（Step 1、v2でmode/turnCountを追加）：Markdown本体の書き込みが
   // 成功した直後に更新する。ここでcatchして握り潰さない——失敗すればこの関数全体が
   // 失敗として呼び出し元へ伝わり、vaultSyncStateが更新されないため、次回flush時に
@@ -1087,6 +1109,20 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
     day: conversation.startedAt.slice(0, 10),
     mode,
     turnCount: conversation.turns.length,
+  });
+
+  // Vault Registry（Step 2）：Markdown write成功後にのみ更新する（本体が保存されて
+  // いないのにregistryだけ先行して"ok"になる状態を作らない）。既存の
+  // 保存フロー（Markdown→旧index.json→History Index）は変更せず、その後に追加する。
+  const stat = await readVaultFileStat(targetDir, fileName);
+  await upsertVaultRegistryRecord(root, {
+    registryKey,
+    path: relativePath,
+    recordType: "conversation",
+    mtime: stat.mtime,
+    size: stat.size,
+    contentHash: hashVaultText(content),
+    memberIds: [conversation.id],
   });
 }
 
@@ -1110,12 +1146,45 @@ export async function writeConversationMarkdown(
  */
 async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: Source) {
   const dir = await timedIOStep("source dirHandle", () => root.getDirectoryHandle("Sources", { create: true }));
-  const fileName = fileNameFor(source.id, source.createdAt);
+
+  // Vault Registry（Step 2）：Conversationと同じ分岐（真の新規／既存recordの
+  // registry path／needs-resync等でwrite保留）。
+  const registryKey = source.id;
+  const lookup = await lookupVaultRegistryRecord(root, registryKey);
+  let targetDir = dir;
+  let fileName: string;
+  let relativePath: string;
+  if (lookup.entry === undefined) {
+    fileName = fileNameFor(source.id, source.createdAt);
+    relativePath = `Sources/${fileName}`;
+  } else if (lookup.entry.status === "ok") {
+    relativePath = lookup.path as string;
+    const resolved = await resolveVaultRelativePath(root, relativePath);
+    targetDir = resolved.dir;
+    fileName = resolved.fileName;
+    // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する。
+    await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
+  } else {
+    throw new VaultRecordNeedsResyncError("source", registryKey, lookup.entry.status);
+  }
+
   const renderStart = Date.now();
   const content = sourceToMarkdown(source);
   logSyncStep("source render", Date.now() - renderStart);
-  await writeFileInDir(dir, fileName, content, "source");
-  await updateIndex(root, source.id, `Sources/${fileName}`);
+  await writeFileInDir(targetDir, fileName, content, "source");
+  await updateIndex(root, source.id, relativePath);
+
+  // Vault Registry（Step 2）：Markdown write成功後にのみ更新する。
+  const stat = await readVaultFileStat(targetDir, fileName);
+  await upsertVaultRegistryRecord(root, {
+    registryKey,
+    path: relativePath,
+    recordType: "source",
+    mtime: stat.mtime,
+    size: stat.size,
+    contentHash: hashVaultText(content),
+    memberIds: [source.id],
+  });
 }
 
 export async function writeSourceMarkdown(
@@ -1158,12 +1227,32 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
   const dir = await timedIOStep("memory dirHandle", () => root.getDirectoryHandle("Memories", { create: true }));
 
   if (isReflectionSummary(memoryObject)) {
-    const fileName = fileNameFor(memoryObject.id, memoryObject.date);
+    // Vault Registry（Step 2）：Reflectionは1record1fileのため、Conversation/Sourceと
+    // 同じ分岐（真の新規／既存recordのregistry path／needs-resync等でwrite保留）。
+    const registryKey = memoryObject.id;
+    const lookup = await lookupVaultRegistryRecord(root, registryKey);
+    let targetDir = dir;
+    let fileName: string;
+    let relativePath: string;
+    if (lookup.entry === undefined) {
+      fileName = fileNameFor(memoryObject.id, memoryObject.date);
+      relativePath = `Memories/${fileName}`;
+    } else if (lookup.entry.status === "ok") {
+      relativePath = lookup.path as string;
+      const resolved = await resolveVaultRelativePath(root, relativePath);
+      targetDir = resolved.dir;
+      fileName = resolved.fileName;
+      // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する。
+      await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
+    } else {
+      throw new VaultRecordNeedsResyncError("reflection", registryKey, lookup.entry.status);
+    }
+
     const renderStart = Date.now();
     const content = memoryObjectToMarkdown(memoryObject);
     logSyncStep("memory render", Date.now() - renderStart);
-    await writeFileInDir(dir, fileName, content, "memory");
-    await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
+    await writeFileInDir(targetDir, fileName, content, "memory");
+    await updateIndex(root, memoryObject.id, relativePath);
     // History Index（Step 1、v2でpreviewを追加）：Reflection Summaryは1record1file
     // のため、月Indexへidベースでupsertする（`computeUpdatedDayEntryV2`参照。
     // 既存ロジックでidの有無から判定させる）。previewはReflection本文（summary＝
@@ -1176,23 +1265,71 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
       preview: truncateHistoryPreview(memoryObject.summary),
       createdAt: memoryObject.createdAt,
     });
+
+    // Vault Registry（Step 2）：Markdown write成功後にのみ更新する。
+    const stat = await readVaultFileStat(targetDir, fileName);
+    await upsertVaultRegistryRecord(root, {
+      registryKey,
+      path: relativePath,
+      recordType: "reflection",
+      mtime: stat.mtime,
+      size: stat.size,
+      contentHash: hashVaultText(content),
+      memberIds: [memoryObject.id],
+    });
+
     memoryObject.metadata.obsidian = {
       ...memoryObject.metadata.obsidian,
-      vaultPath: `Memories/${fileName}`,
+      vaultPath: relativePath,
     };
     return;
   }
 
-  const fileName = dayFileNameFor(memoryObject.date);
-  const existingEntries = await timedIOStep("memory existingRead", () => readDayFileEntries(dir, fileName));
+  // Vault Registry（Step 2）：normal Memoryはday-file container単位で判定する
+  // （メンバーidそれぞれではなく、day-file自体の所在＝`dayFileRegistryKey(day)`の
+  // 状態を見る）。containerがneeds-resync/missing/conflictの場合、対象memoryObjectが
+  // 真に新規のidであっても、その日のwrite全体を保留する（新しいday-fileを別途
+  // 作ってしまうと、外部で移動されただけの旧day-fileと重複する可能性があるため）。
+  const day = memoryObject.date.slice(0, 10);
+  const registryKey = dayFileRegistryKey(day);
+  const lookup = await lookupVaultRegistryRecord(root, registryKey);
+  let targetDir = dir;
+  let fileName: string;
+  let relativePath: string;
+  // Critical/High修正：write前検証で既にday-file本文を読んだ場合、そのテキストを
+  // ここへ受け取り、直後のmerge処理でそのまま再利用する（二重読み込みを避ける。
+  // 外部編集済みのday-fileをverify後に「もう一度」読み直して暗黙的に採用する、
+  // という経路を作らないため）。
+  let verifiedActualText: string | undefined;
+  if (lookup.entry === undefined) {
+    fileName = dayFileNameFor(memoryObject.date);
+    relativePath = `Memories/${fileName}`;
+  } else if (lookup.entry.status === "ok") {
+    relativePath = lookup.path as string;
+    const resolved = await resolveVaultRelativePath(root, relativePath);
+    targetDir = resolved.dir;
+    fileName = resolved.fileName;
+    // Critical/High修正：day-fileのmerge材料として読む前に、実ファイルの存在・
+    // 内容整合性を検証する。外部で移動/削除・外部編集されているday-fileを
+    // そのまま読み込んでmergeし、暗黙的に外部変更を採用してしまう経路を作らない。
+    const verifyResult = await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
+    verifiedActualText = verifyResult.actualText;
+  } else {
+    throw new VaultRecordNeedsResyncError("memory-day", registryKey, lookup.entry.status);
+  }
+
+  const existingEntries =
+    verifiedActualText !== undefined
+      ? parseMemoryDayFile(verifiedActualText)
+      : await timedIOStep("memory existingRead", () => readDayFileEntries(targetDir, fileName));
   const otherEntries = existingEntries.filter((memory) => memory.id !== memoryObject.id);
   const mergeStart = Date.now();
   const merged = [...otherEntries, memoryObject].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const serialized = serializeMemoryDayFile(merged);
   logSyncStep("memory render", Date.now() - mergeStart);
 
-  await writeFileInDir(dir, fileName, serialized, "memory");
-  await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
+  await writeFileInDir(targetDir, fileName, serialized, "memory");
+  await updateIndex(root, memoryObject.id, relativePath);
   // History Index（Step 1、Codexレビュー指摘対応。v2でnormalMemories配列を追加）：
   // day-fileへ実際に書き込んだ後のマージ済み配列（絶対値）を、そのまま軽量化して
   // 渡す。「新規か更新か」をここで判定して差分加算する設計は、retry時にday-fileへ
@@ -1203,7 +1340,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
   // catchせず、失敗をそのまま伝播させる（次回flushで本体・Index更新ともに再試行）。
   await updateHistoryIndex(root, {
     kind: "memory",
-    day: memoryObject.date.slice(0, 10),
+    day,
     normalMemories: merged.map((m) => ({
       id: m.id,
       types: m.types,
@@ -1211,9 +1348,32 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
       createdAt: m.createdAt,
     })),
   });
+
+  // Vault Registry（Step 2）：Markdown write成功後にのみ更新する。memberIds/
+  // memberHashesはday-file container単位（このpathに現在含まれる全メンバー）で
+  // 持つ——個々のMemory idを`records`へ個別登録することはしない。memberHashesは
+  // メンバーごとの個別ハッシュ（`memoryObjectToMarkdown`で1件分だけを再シリアライズ
+  // した文字列のハッシュ）で、将来の再同期がday-file内のどのidが変化したかを
+  // 特定するために使う。
+  const stat = await readVaultFileStat(targetDir, fileName);
+  const memberHashes: Record<string, string> = {};
+  for (const member of merged) {
+    memberHashes[member.id] = hashVaultText(memoryObjectToMarkdown(member));
+  }
+  await upsertVaultRegistryRecord(root, {
+    registryKey,
+    path: relativePath,
+    recordType: "memory-day",
+    mtime: stat.mtime,
+    size: stat.size,
+    contentHash: hashVaultText(serialized),
+    memberIds: merged.map((m) => m.id),
+    memberHashes,
+  });
+
   memoryObject.metadata.obsidian = {
     ...memoryObject.metadata.obsidian,
-    vaultPath: `Memories/${fileName}`,
+    vaultPath: relativePath,
   };
 }
 
@@ -1952,8 +2112,8 @@ export function hashVaultText(text: string): string {
  * registry shardの読み込み（低レベルprimitive）。History Indexの
  * `readHistoryMeta`/`readHistoryMonthIndex`と同じく、存在しない/壊れている
  * 場合は安全な既定値へfallbackする。ロックは取得しない（読み込みが書き込みと
- * 競合しても「わずかに古いregistryを読む」だけであり、Step 1時点では
- * どの経路からも呼ばれないため実害が無い）。
+ * 競合しても「わずかに古いregistryを読む」だけであり、実害が無いため。
+ * Step 2の`lookupVaultRegistryRecord`はこの関数を通じて読み取る）。
  */
 export async function readVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: number): Promise<VaultRegistryShard> {
   try {
@@ -1980,11 +2140,9 @@ export async function readVaultRegistryMeta(root: FileSystemDirectoryHandle): Pr
 }
 
 /**
- * registry shardの書き込み（低レベルprimitive、無条件書き込み）。Step 2以降の
- * 更新関数が、`withVaultRegistryLock`で全体を包んだ上で
- * 「読み込み→計算→変化があれば書き込み」の一部として呼ぶことを想定する
- * （History Indexの`updateHistoryIndex`と同じ構成）。Step 1時点ではまだ
- * どこからも呼ばれない。
+ * registry shardの書き込み（低レベルprimitive、無条件書き込み）。`upsertVaultRegistryRecord`が
+ * `withVaultRegistryLock`で全体を包んだ上で「読み込み→計算→書き込み」の一部として呼ぶ
+ * （History Indexの`updateHistoryIndex`と同じ構成）。
  */
 async function writeVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: number, shard: VaultRegistryShard): Promise<void> {
   const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
@@ -1995,4 +2153,254 @@ async function writeVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: 
 async function writeVaultRegistryMeta(root: FileSystemDirectoryHandle, meta: VaultRegistryMeta): Promise<void> {
   const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
   await writeFileInDir(tsumugiDir, "registry-meta.json", JSON.stringify(meta, null, 2), "registry meta write");
+}
+
+// ---------------------------------------------------------------------------
+// Vault Registry（Step 2：既存write経路への接続）
+//
+// writeConversationMarkdownImpl/writeSourceMarkdownImpl/writeMemoryObjectMarkdownImpl
+// が使う、registry参照・更新のための中位ヘルパー群。read経路（readConversationById/
+// readReflectionById/readMemoriesForDay）・再同期処理（Vault全体のdirectory
+// enumeration）は今回一切実装しない。
+//
+// write可否は合意済みの通り一律：
+//   status === "ok"                         → 書き込み可能
+//   "needs-resync" / "missing" / "conflict" → 書き込み保留（`VaultRecordNeedsResyncError`）
+// ---------------------------------------------------------------------------
+
+/**
+ * 既存recordへの書き込みが、registry上"needs-resync"/"missing"/"conflict"の
+ * いずれかで保留された場合にthrowする専用例外。呼び出し元（enqueueVaultWrite経由の
+ * write関数）はこれを他のI/Oエラーと同様に一切catchせず、そのまま呼び出し元
+ * （writeConversationMarkdown等）まで伝播させること——これにより`markVaultSynced`が
+ * 呼ばれず、`vaultSyncState`は「未同期」のまま残り、次回`flushPendingToVault`で
+ * 自然に再試行される（新しいretry機構は不要）。
+ */
+export class VaultRecordNeedsResyncError extends Error {
+  readonly recordType: VaultRegistryRecordType;
+  readonly registryKey: string;
+  readonly status: VaultRegistryStatus;
+
+  constructor(recordType: VaultRegistryRecordType, registryKey: string, status: VaultRegistryStatus) {
+    super(
+      `[Tsumugi] vault write held: ${recordType} "${registryKey}" is "${status}" in the vault registry; ` +
+        `refusing to write until a Vault resync resolves it (no automatic recreation at the old/deterministic path).`
+    );
+    this.name = "VaultRecordNeedsResyncError";
+    this.recordType = recordType;
+    this.registryKey = registryKey;
+    this.status = status;
+  }
+}
+
+/** `lookupVaultRegistryRecord`の結果。`entry`が`undefined`なら「registryに一度も
+ *  登録されたことが無い＝真の新規record」を意味する。 */
+interface VaultRegistryLookup {
+  bucket: number;
+  path: string | undefined;
+  entry: VaultRegistryFileEntry | undefined;
+}
+
+/**
+ * registryKey（Conversation/Reflection/Sourceのid、またはnormal Memoryの
+ * `dayFileRegistryKey(day)`）から、現在のregistry上の状態を引く。ロックは
+ * 取得しない（`readVaultRegistryShard`と同じ理由：読み取りが多少古くても、
+ * その後の書き込み判断自体は`upsertVaultRegistryRecord`側のlockで直列化される
+ * ため実害が無い。同一タブ内では`enqueueVaultWrite`が既にVault書き込みを
+ * 1件ずつ直列化している）。
+ */
+async function lookupVaultRegistryRecord(root: FileSystemDirectoryHandle, registryKey: string): Promise<VaultRegistryLookup> {
+  const bucket = vaultRegistryBucketOf(registryKey);
+  const shard = await readVaultRegistryShard(root, bucket);
+  const path = shard.records[registryKey];
+  const entry = path !== undefined ? shard.files[path] : undefined;
+  return { bucket, path, entry };
+}
+
+/**
+ * Vault rootからの相対pathとして安全かどうかの軽量チェック（絶対path・
+ * "."/".."セグメント・空セグメント・バックスラッシュを拒否）。Step 2時点では
+ * Tsumugi自身が`fileNameFor`/`dayFileNameFor`で生成したpathしか登場しないため、
+ * 通常は常にtrueになる想定——ユーザー入力由来のpathはまだ存在しない。将来
+ * （再同期でVault内の実ファイルを走査するようになった場合）に備えた防御的な
+ * チェックとして、ここで一律に検証しておく。
+ *
+ * バックスラッシュ（Codexレビュー指摘・Medium対応）：以前は先頭の"\"だけを
+ * 拒否しており、"Conversations\\x.md"のようにセグメント内部に紛れ込んだ"\"は
+ * 通過してしまっていた（File System Access API自体はバックスラッシュを
+ * パス区切りとして解釈しないためVault外への実際の脱出経路にはならないが、
+ * チェックとしての一貫性を欠いていた）。位置を問わず"\"を含むpath全体を
+ * 一律拒否することで、この非対称性を解消する。
+ */
+function isSafeVaultRelativePath(relativePath: string): boolean {
+  if (relativePath.length === 0) return false;
+  if (relativePath.includes("\\")) return false;
+  if (relativePath.startsWith("/")) return false;
+  // "C:/..." のようなWindows drive-letter絶対pathを拒否する。正規表現リテラル内に
+  // スラッシュを含めると可読性を落とすため、あえて文字単位の比較で書く。
+  if (relativePath.length >= 3 && /[a-zA-Z]/.test(relativePath[0]) && relativePath.slice(1, 3) === ":/") return false;
+  const segments = relativePath.split("/");
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+/**
+ * "Conversations/x/y.md"のようなVault root相対pathを、末尾のファイル名を除いた
+ * ディレクトリまで辿り、`{dir, fileName}`を返す（中間ディレクトリは
+ * `{ create: false }`——既存の構造だけを辿り、勝手に新規作成しない）。
+ * Step 2で実際に登場するpathは常に1階層（"Conversations/xxx.md"等）だが、
+ * 将来のネストしたpathでも正しく動くよう汎用的に実装する。
+ */
+async function resolveVaultRelativePath(
+  root: FileSystemDirectoryHandle,
+  relativePath: string
+): Promise<{ dir: FileSystemDirectoryHandle; fileName: string }> {
+  if (!isSafeVaultRelativePath(relativePath)) {
+    throw new Error(`[Tsumugi] refusing to resolve unsafe vault registry path: ${JSON.stringify(relativePath)}`);
+  }
+  const segments = relativePath.split("/");
+  let dir = root;
+  for (const segment of segments.slice(0, -1)) {
+    dir = await dir.getDirectoryHandle(segment, { create: false });
+  }
+  return { dir, fileName: segments[segments.length - 1] };
+}
+
+/** Markdown write成功直後にだけ呼ぶ。`File.lastModified`/`File.size`を取得する
+ *  （contentHashは呼び出し元が既に手元に持つ書き込み済み文字列から直接計算するため、
+ *  ここでは含めない——再読み込みによる無駄なI/Oを避ける）。 */
+async function readVaultFileStat(dir: FileSystemDirectoryHandle, fileName: string): Promise<{ mtime: number; size: number }> {
+  const fileHandle = await dir.getFileHandle(fileName, { create: false });
+  const file = await fileHandle.getFile();
+  return { mtime: file.lastModified, size: file.size };
+}
+
+interface VaultRegistryUpsertInput {
+  registryKey: string;
+  /** Vault rootからの相対path。絶対path・"."/".."・Vault外を指すpathは受け付けない
+   *  （`isSafeVaultRelativePath`で検証する）。 */
+  path: string;
+  recordType: VaultRegistryRecordType;
+  mtime: number;
+  size: number;
+  contentHash: string;
+  memberIds: string[];
+  memberHashes?: Record<string, string>;
+}
+
+/**
+ * registryの読み込み→更新→書き込みを、`withVaultRegistryLock`で1つの原子的操作
+ * として行う（History Indexの`updateHistoryIndex`と同じ構成）。同じbucketに
+ * 属する他のrecord（`shard.records`/`shard.files`の他のキー）には一切触れず、
+ * 対象のregistryKey/path分のエントリだけを追加・更新する。
+ *
+ * Markdown write成功後にのみ呼ぶこと（呼び出し元のwrite関数群を参照）。statusは
+ * 常に"ok"として書き込む——この関数はMarkdown本体の書き込みが実際に成功した後の
+ * 事後登録としてのみ使われる。"needs-resync"への遷移は別の専用関数
+ * `markVaultRegistryNeedsResync`が担い、"missing"/"conflict"への遷移
+ * （resync・多重path検出等）は引き続き本Stepでは実装しない。
+ */
+async function upsertVaultRegistryRecord(root: FileSystemDirectoryHandle, input: VaultRegistryUpsertInput): Promise<void> {
+  if (!isSafeVaultRelativePath(input.path)) {
+    throw new Error(`[Tsumugi] refusing to store unsafe vault registry path: ${JSON.stringify(input.path)}`);
+  }
+  const bucket = vaultRegistryBucketOf(input.registryKey);
+  await withVaultRegistryLock(async () => {
+    const shard = await readVaultRegistryShard(root, bucket);
+    shard.bucket = bucket;
+    shard.records[input.registryKey] = input.path;
+    shard.files[input.path] = {
+      recordType: input.recordType,
+      mtime: input.mtime,
+      size: input.size,
+      contentHash: input.contentHash,
+      memberIds: input.memberIds,
+      memberHashes: input.memberHashes,
+      status: "ok",
+    };
+    await writeVaultRegistryShard(root, bucket, shard);
+  });
+}
+
+/**
+ * registry上のregistryKeyが指すfile entryのstatusを"needs-resync"へ変更する
+ * （Codexレビュー指摘・Critical/High対応）。write前検証
+ * （`verifyVaultRegistryEntryBeforeWrite`）が「実ファイルが見つからない」
+ * 「本文が外部で変化している（hash不一致）」と判定した場合にのみ呼ぶ。
+ *
+ * `upsertVaultRegistryRecord`と同じ構成（`withVaultRegistryLock`でread→対象
+ * entryのみ変更→write）で、同じbucket内の他entryには一切触れない。対象の
+ * file entry自体が既に無い（read時点までの間に何らかの理由で消えている等）
+ * 場合は何もしない——無いものをneeds-resyncにはできないため静かに戻る。
+ * 既に"needs-resync"であれば変更不要として書き込み自体をskipする（同じ理由で
+ * 複数回呼ばれても安全・冪等）。
+ */
+async function markVaultRegistryNeedsResync(root: FileSystemDirectoryHandle, registryKey: string): Promise<void> {
+  const bucket = vaultRegistryBucketOf(registryKey);
+  await withVaultRegistryLock(async () => {
+    const shard = await readVaultRegistryShard(root, bucket);
+    const path = shard.records[registryKey];
+    if (path === undefined) return;
+    const entry = shard.files[path];
+    if (entry === undefined || entry.status === "needs-resync") return;
+    shard.files[path] = { ...entry, status: "needs-resync" };
+    await writeVaultRegistryShard(root, bucket, shard);
+  });
+}
+
+/**
+ * write前検証（Codexレビュー指摘・Critical/High対応）。registry status==="ok"の
+ * 既存recordへ書き込む直前に、実ファイルが本当にregistryの認識と一致しているかを
+ * 検証する。合意済みの安全設計：
+ *
+ * 1. 実ファイルの存在確認（`{ create: false }`）。見つからなければ、旧pathへの
+ *    自動再作成は絶対に行わず、registryを"needs-resync"へ更新した上で
+ *    `VaultRecordNeedsResyncError`をthrowする（write禁止のまま関数を抜ける）。
+ * 2. mtime/sizeがregistry記載値と一致すれば「registryが把握している内容と
+ *    変更なし」としてwrite続行可能（本文は読まない・返さない）。
+ * 3. mtimeまたはsizeが異なる場合のみ実ファイル本文を読み、`hashVaultText`で
+ *    registry記載のcontentHashと比較する。
+ *    - 一致：内容自体は変化していない（メタデータだけの差）としてwrite続行可能。
+ *      呼び出し元がこの後の処理（day-fileのmerge等）で再利用できるよう、
+ *      読み込んだ本文をそのまま返す（二重読み込みを避けるため）。
+ *    - 不一致：外部変更、またはMarkdown write成功後にRegistry更新だけ失敗した
+ *      未確定状態のいずれかであり、どちらであるかをここで推測しない。安全側に
+ *      倒し、registryを"needs-resync"へ更新した上で`VaultRecordNeedsResyncError`
+ *      をthrowする（write禁止）。回復は今回実装しない明示的Vault resync
+ *      （Step 4）に委ねる。
+ */
+interface VaultRegistryPreWriteCheck {
+  /** hash比較のために実際に読んだ本文。呼び出し元がその後の処理（day-fileの
+   *  parse等）で再利用できるよう返す。mtime/sizeが一致し本文を読まなかった
+   *  場合は`undefined`。 */
+  actualText: string | undefined;
+}
+
+async function verifyVaultRegistryEntryBeforeWrite(
+  root: FileSystemDirectoryHandle,
+  registryKey: string,
+  dir: FileSystemDirectoryHandle,
+  fileName: string,
+  entry: VaultRegistryFileEntry
+): Promise<VaultRegistryPreWriteCheck> {
+  let file: File;
+  try {
+    const fileHandle = await dir.getFileHandle(fileName, { create: false });
+    file = await fileHandle.getFile();
+  } catch {
+    await markVaultRegistryNeedsResync(root, registryKey);
+    throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync");
+  }
+
+  if (file.lastModified === entry.mtime && file.size === entry.size) {
+    return { actualText: undefined };
+  }
+
+  const actualText = await file.text();
+  const actualHash = hashVaultText(actualText);
+  if (actualHash === entry.contentHash) {
+    return { actualText };
+  }
+
+  await markVaultRegistryNeedsResync(root, registryKey);
+  throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync");
 }
