@@ -1,8 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { readHistoryMonthIndex, readMemoriesForDay, readReflectionById, readConversationById } from "@/lib/vault";
-import type { HistoryMonthIndex } from "@/lib/vault";
+import {
+  isHistoryDayIndexV2,
+  readConversationById,
+  readHistoryMonthIndex,
+  readMemoriesForDay,
+  readReflectionById,
+  truncateHistoryPreview,
+  upgradeHistoryDayToV2,
+} from "@/lib/vault";
+import type { HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
@@ -17,12 +25,17 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
   insight: "気づき",
 };
 
-/** ChatScreen.tsxのPERSONASと同じラベル（値の重複は許容し、循環import・新規ファイルを避ける）。 */
-const PERSONA_LABEL: Record<Persona, string> = {
-  companion: "日記",
-  coach: "探究",
-  analyst: "相談・創造",
-};
+/**
+ * History上のConversation表示名は「日記」「会話」の2つだけに正規化する
+ * （persona==="companion"のみ「日記」、coach/analystを含むそれ以外は一律「会話」）。
+ * 現在のチャットUI自体が「日記」「会話」の2択（ChatScreen.tsx参照）であり、旧
+ * 「探究」「相談・創造」という名称はHistory上には一切表示しない。Conversation本体の
+ * `persona`フィールド自体は変更しない（表示レイヤーでの正規化のみ）。
+ * `src/lib/vault.ts`のHistory Index v2書き込み時の正規化ルールと同一。
+ */
+function personaModeLabel(persona: Persona): string {
+  return persona === "companion" ? "日記" : "会話";
+}
 
 const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
 
@@ -71,40 +84,57 @@ function addMonths(year: number, month: number, delta: number): { year: number; 
   return { year: Math.floor(total / 12), month: (total % 12) + 1 };
 }
 
-interface DayRecords {
-  conversations: Conversation[];
-  /** 通常Memory（day-file統合分）とReflection Summary（1record1file）を統合済み。 */
-  memories: MemoryObject[];
+/**
+ * Conversation一覧行（History Index v2）。v2の日はHistory Indexの
+ * `HistoryConversationSummary`から直接作る（`full`は未設定＝本体未読）。v1
+ * fallbackの日はConversation本体を読み終えているため`full`を設定し、詳細表示時に
+ * 追加のreadを発生させない。
+ */
+interface ConversationRow {
+  id: string;
+  modeLabel: string;
+  turnCount: number;
+  full?: Conversation;
 }
 
-/** month indexのreflectionIds/conversationIdsに依存する読み込み結果（マージ前）。 */
-interface ExtraDayRecords {
-  conversations: Conversation[];
-  reflections: MemoryObject[];
+/**
+ * 通常Memory／Reflection共通の一覧行。`origin`で詳細表示時にどちらの本体read経路
+ * （`readMemoriesForDay`+find／`readReflectionById`）を使うかを判定する
+ * （`types`だけでは判別できない——通常Memoryも`types`に"insight"を持ちうるため）。
+ */
+interface MemoryRow {
+  id: string;
+  types: MemoryType[];
+  preview: string;
+  createdAt: string;
+  origin: "normal" | "reflection";
+  full?: MemoryObject;
 }
 
-/** 同一History表示セッション内だけの短期キャッシュ1件分（`DayCache`参照）。 */
+/** 同一History表示セッション内だけの短期キャッシュ1件分。 */
 interface DayCacheEntry {
-  normalMemories: MemoryObject[];
-  extraDayRecords: ExtraDayRecords;
+  conversationRows: ConversationRow[];
+  memoryRows: MemoryRow[];
 }
 
 /**
  * 「いつ何を話したかを見る場所」という時間軸中心のHistory UI（Vault読込方式の
- * 再設計、Step 3）。
+ * 再設計、History Index v2）。
  *
- * 以前はIndexedDBの`getAllMemoryObjects()`/`getAllConversations()`を毎回全件取得して
- * 縦長一覧を作っていたが、この方式はVault内のデータ量に読み込み量が比例してしまう
- * （本調査スレッドのAndroid実機性能問題の根本原因）。今回からは、Vault内
- * `.tsumugi/history/YYYY-MM.json`（月Index、`src/lib/vault.ts`のStep 1で追加）だけを
- * 読んでカレンダーの「印」を出し、日付をタップした瞬間だけ、その日に必要な
- * Markdown（`Memories/YYYY-MM-DD.md`・reflectionIds/conversationIdsのファイル）を
- * 読む。IndexedDB全件取得・Vault全体のfull scanはHistory表示のためには一切行わない
- * （full scan呼び出し自体の停止はStep 4で行う。このコンポーネント自身は今回の
- * 変更時点で既にIndexedDB全件取得を行わない設計になっている）。
+ * v2の日：`.tsumugi/history/YYYY-MM.json`（月Index）に、一覧表示に必要な軽量データ
+ * （Conversationのmode/turnCount、通常Memory/Reflectionのtypes/preview）を直接持つ
+ * ため、日付タップ時にVault本体（Conversation/Reflection/通常MemoryのMarkdown）を
+ * 一切読まずに一覧を描画できる。
  *
- * 旧「日記／Memory／会話」タブは、カレンダー中心の設計と競合するため今回は維持しない
- * （β段階のため、将来のシンプルな構造を優先する）。
+ * v1の日（History Index v2導入より前の既存Vaultで、まだ一度も開かれていない日）：
+ * 従来通りid経由でMarkdown本体を読むfallbackで一覧を組み立てる。Vault全体のscan・
+ * 月全体のbackfillは行わない——実際にユーザーがその日を開いた時だけ、fallbackで
+ * 取得済みのデータ（追加のMarkdown readなし）からv2 entryを組み立て、その日だけを
+ * 月Indexへ永続化する（lazy upgrade）。次回以降、アプリを再読み込みしてもその日は
+ * v2として即座に表示される。
+ *
+ * 詳細表示（Conversationの本文turns、通常Memory/Reflectionの本文content）は、
+ * 一覧行がタップされた時だけ、その1件分のMarkdownを読む。
  */
 export default function HistoryPanel({
   onClose,
@@ -145,42 +175,30 @@ export default function HistoryPanel({
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
   const [monthLoading, setMonthLoading] = useState(true);
-  // 日付詳細は「通常Memory（day-file、month indexに依存しない）」と
-  // 「Reflection／Conversation（month indexのreflectionIds/conversationIdsに依存）」を
-  // 別々に読み、2つのstateを`dayRecords`（下のuseMemo）で安全にマージする
-  // （読込順序の見直し：通常MemoryはmonthLoadingを待たずに先行開始する）。
-  const [normalMemories, setNormalMemories] = useState<MemoryObject[]>([]);
-  const [extraDayRecords, setExtraDayRecords] = useState<ExtraDayRecords>({ conversations: [], reflections: [] });
+  const [conversationRows, setConversationRows] = useState<ConversationRow[]>([]);
+  const [memoryRows, setMemoryRows] = useState<MemoryRow[]>([]);
   const [dayLoading, setDayLoading] = useState(false);
+  /** 一覧行タップ時のオンデマンド詳細読み込み中だけtrue（v2の日、または本体未読の行）。 */
+  const [detailLoading, setDetailLoading] = useState(false);
 
-  // race対策：月Index読み込み・日付詳細読み込み（通常Memory／Reflection・Conversationの
-  // 両方）それぞれについて、呼び出しごとにインクリメントするリクエストID。resolve/reject
-  // 時に「今も自分が最新の要求か」を確認してからsetStateすることで、月移動・日付切替・
+  // race対策：月Index読み込み・日付詳細読み込み・詳細（Conversation/Memory本体）読み込み
+  // それぞれについて、呼び出しごとにインクリメントするリクエストID。resolve/reject時に
+  // 「今も自分が最新の要求か」を確認してからsetStateすることで、月移動・日付切替・
   // Vault切替の後に旧readが遅れて完了しても新しい画面へ混入しない（H4のepoch/generation
   // のような大掛かりな仕組みは使わず、このコンポーネント内で完結する最小限の
   // cancellationトークン）。
   const monthRequestRef = useRef(0);
   const dayRequestRef = useRef(0);
-  // 通常Memory・Reflection/Conversationという2つの独立した読み込みのうち、まだ完了して
-  // いない件数。0になった時点で初めてdayLoadingをfalseにする（どちらか一方だけ終わった
-  // 時点でロード完了扱いにしない）。
-  const dayPartsPendingRef = useRef(0);
+  const detailRequestRef = useRef(0);
   // 同一History表示セッション（このコンポーネントがマウントされている間）だけの
   // 短期メモリキャッシュ。History Index・Vaultデータそのものを置き換えるものではなく、
   // 「A→B→A」のように同じ日を行き来した際にVault I/Oを省略するためだけの一時キャッシュ。
   // アンマウントで自然に消える（この変数自体がuseRefの初期値として再生成される）。
   const dayCacheRef = useRef<Map<string, DayCacheEntry>>(new Map());
-  // normalMemories/extraDayRecords stateの「今の値」を、非同期コールバック側からも
-  // 同期的に参照するためのミラー。2つの独立した読み込みのどちらが最後に完了しても、
-  // その時点の両方の最新値をまとめてdayCacheRefへ書き込めるようにするために使う
-  // （stateの読み取りだけでは、片方のeffectのコールバックからもう片方の最新値を
-  // 直接参照できないため）。
-  const normalMemoriesRef = useRef<MemoryObject[]>([]);
-  const extraDayRecordsRef = useRef<ExtraDayRecords>({ conversations: [], reflections: [] });
-  // 現在選択中の日について、通常Memory／Reflection・Conversationの実読み込みeffectを
-  // 走らせる必要が無い（＝dayCacheRefにヒットした、またはvaultHandle/selectedDayが
-  // 無い）ことを示すフラグ。日付リセットeffectが同期的に設定し、直後に同一コミット内で
-  // 走る2つの読み込みeffectがこれを見て自身のfetchを省略する。
+  // 現在選択中の日について、日付詳細の実読み込みeffectを走らせる必要が無い
+  // （＝dayCacheRefにヒットした、またはvaultHandle/selectedDayが無い）ことを示す
+  // フラグ。日付リセットeffectが同期的に設定し、直後に同一コミット内で走る
+  // 読み込みeffectがこれを見て自身のfetchを省略する。
   const skipDayFetchRef = useRef(false);
   // vaultHandleが実際に変わった（別Vaultへ切替）ことを検知するためだけの参照。
   const previousVaultHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
@@ -205,19 +223,12 @@ export default function HistoryPanel({
    * 瞬間、旧Vaultの表示が一切残らないよう月・詳細選択をリセットしてから、今月の
    * month indexを読み直す。
    *
-   * 以前はこの「リセット」と「month index読込」を2つの別々のuseEffectに分けていた
-   * ため、Vault切替時に「リセット前（切替前に見ていた月）のmonth indexを1回読む→
-   * リセット後のsetViewYear/setViewMonthが反映された次のレンダーで、今月のmonth
-   * indexをもう1回読む」という2回の実読込（1回目はrequestIdの不一致で結果こそ
-   * 捨てられるが、ファイル読込I/O自体は発生する）が起きていた。
-   *
-   * ここでは1つのeffectに統合し、Vault切替を検知した場合は「今月」をこのeffectの
-   * 実行内でローカル変数として直接計算し、setViewYear/setViewMonth（stateへの反映は
-   * 次のレンダーまで遅れる）を待たずに、その場でその月のmonth indexを読む。
-   * setViewYear/setViewMonthの反映により同じ内容でこのeffectが再度呼ばれても、
-   * `lastMonthFetchKeyRef`（vault世代＋年月＋refreshTokenの組）で重複読込を検知して
-   * 読み直さない。通常の前月/翌月移動・refreshTokenによる再読込はキーが変わるため
-   * 従来通り正しく再読込される。
+   * Vault切替を検知した場合は「今月」をこのeffectの実行内でローカル変数として直接
+   * 計算し、setViewYear/setViewMonth（stateへの反映は次のレンダーまで遅れる）を
+   * 待たずに、その場でその月のmonth indexを読む。setViewYear/setViewMonthの反映に
+   * より同じ内容でこのeffectが再度呼ばれても、`lastMonthFetchKeyRef`（vault世代＋
+   * 年月＋refreshTokenの組）で重複読込を検知して読み直さない。通常の前月/翌月移動・
+   * refreshTokenによる再読込はキーが変わるため従来通り正しく再読込される。
    *
    * H4のepoch/world isolationには一切触れない——このコンポーネントはVault切替の
    * 成否判定を行わず、ChatScreen.tsx側で既に確定した`vaultHandle`をそのまま信頼する。
@@ -290,8 +301,8 @@ export default function HistoryPanel({
    *
    * 選択日がキャッシュにヒットすれば、Vaultへは一切アクセスせずその場でstateを復元し、
    * `dayLoading`をtrueへ戻さない（要求通り、既読日の再表示は即時）。ヒットしなければ
-   * 従来通り状態をクリアしてdayLoadingをtrueにし、`skipDayFetchRef`をfalseにして
-   * 下の2つの読み込みeffectに実際のfetchを行わせる。
+   * 状態をクリアしてdayLoadingをtrueにし、`skipDayFetchRef`をfalseにして下の
+   * 読み込みeffectに実際の解決（v2直読み、またはv1 fallback）を行わせる。
    */
   useEffect(() => {
     const cacheInvalidated =
@@ -303,14 +314,12 @@ export default function HistoryPanel({
     }
 
     dayRequestRef.current += 1;
+    detailRequestRef.current += 1; // 進行中のオンデマンド詳細readも無効化する
 
     if (!vaultHandle || !selectedDay) {
       skipDayFetchRef.current = true;
-      normalMemoriesRef.current = [];
-      extraDayRecordsRef.current = { conversations: [], reflections: [] };
-      setNormalMemories([]);
-      setExtraDayRecords({ conversations: [], reflections: [] });
-      dayPartsPendingRef.current = 0;
+      setConversationRows([]);
+      setMemoryRows([]);
       setDayLoading(false);
       return;
     }
@@ -318,65 +327,32 @@ export default function HistoryPanel({
     const cached = dayCacheRef.current.get(selectedDay);
     if (cached) {
       skipDayFetchRef.current = true;
-      normalMemoriesRef.current = cached.normalMemories;
-      extraDayRecordsRef.current = cached.extraDayRecords;
-      setNormalMemories(cached.normalMemories);
-      setExtraDayRecords(cached.extraDayRecords);
-      dayPartsPendingRef.current = 0;
+      setConversationRows(cached.conversationRows);
+      setMemoryRows(cached.memoryRows);
       setDayLoading(false);
       return;
     }
 
     skipDayFetchRef.current = false;
-    normalMemoriesRef.current = [];
-    extraDayRecordsRef.current = { conversations: [], reflections: [] };
-    setNormalMemories([]);
-    setExtraDayRecords({ conversations: [], reflections: [] });
-    dayPartsPendingRef.current = 2;
+    setConversationRows([]);
+    setMemoryRows([]);
     setDayLoading(true);
   }, [vaultHandle, selectedDay, refreshToken]);
 
   /**
-   * 日付詳細読み込み・その2（通常Memory）：`Memories/YYYY-MM-DD.md`はmonth index
-   * （reflectionIds/conversationIds）に一切依存しないため、選択日が確定した時点で
-   * month indexの読込完了（monthLoading）を待たずに開始する。`skipDayFetchRef`が
-   * true（キャッシュヒット、またはvaultHandle/selectedDayが無い）の場合は何もしない。
-   */
-  useEffect(() => {
-    if (!vaultHandle || !selectedDay || skipDayFetchRef.current) return;
-    const requestId = dayRequestRef.current;
-    const handle = vaultHandle;
-    const day = selectedDay;
-    readMemoriesForDay(handle, day)
-      .then((memories) => {
-        if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
-        normalMemoriesRef.current = memories;
-        setNormalMemories(memories);
-        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
-        if (dayPartsPendingRef.current === 0) {
-          dayCacheRef.current.set(day, {
-            normalMemories: normalMemoriesRef.current,
-            extraDayRecords: extraDayRecordsRef.current,
-          });
-          setDayLoading(false);
-        }
-      })
-      .catch((error) => {
-        if (dayRequestRef.current !== requestId) return;
-        console.error("Failed to load memories for day", error);
-        normalMemoriesRef.current = [];
-        setNormalMemories([]);
-        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
-        if (dayPartsPendingRef.current === 0) setDayLoading(false);
-      });
-  }, [vaultHandle, selectedDay, refreshToken]);
-
-  /**
-   * 日付詳細読み込み・その3（Reflection／Conversation）：月Indexの`reflectionIds`/
-   * `conversationIds`が判明してから（monthLoading完了後）だけ読む。同じ日に複数件
-   * ある場合、`Memories`/`Conversations`ディレクトリハンドルをそれぞれ1回だけ
-   * （必要な場合のみ）解決し、各readへ使い回す（毎item`getDirectoryHandle`を
-   * 取り直さない）。`skipDayFetchRef`がtrueの場合は何もしない。
+   * 日付詳細読み込み・その2（解決）：`monthIndex.days[selectedDay]`がHistory Index v2
+   * 形状（`isHistoryDayIndexV2`）であれば、Vault本体を一切読まずに一覧を組み立てる
+   * （Conversation/Reflection/通常MemoryのMarkdownはいずれも読まない）。
+   *
+   * v1形状（既存Vaultで、まだ一度も開かれていない日）またはエントリ未登録の場合は、
+   * 従来通りid経由でMarkdown本体を読むfallbackを行う。fallback完了後、取得済みの
+   * データ（追加のMarkdown readを一切行わない）からv2 entryを組み立て、その日だけ
+   * `upgradeHistoryDayToV2`でfire-and-forgetに永続化する（lazy upgrade）。失敗しても
+   * console.errorに残すだけで、既に確定している表示（fallbackの結果）には影響させない。
+   *
+   * monthLoading完了を待つ（月Indexが無いとv1/v2の判定自体ができないため）。
+   * `skipDayFetchRef`がtrue（キャッシュヒット、またはvaultHandle/selectedDayが無い）
+   * の場合は何もしない。
    */
   useEffect(() => {
     if (!vaultHandle || !selectedDay || monthLoading || skipDayFetchRef.current) return;
@@ -384,6 +360,39 @@ export default function HistoryPanel({
     const handle = vaultHandle;
     const day = selectedDay;
     const dayEntry = monthIndex?.days[day];
+    const monthIndexAtStart = monthIndex;
+
+    if (dayEntry && isHistoryDayIndexV2(dayEntry)) {
+      // v2：Vault本体read 0回で一覧を構築する。
+      const conversations: ConversationRow[] = dayEntry.conversations.map((c) => ({
+        id: c.id,
+        modeLabel: c.mode === "diary" ? "日記" : "会話",
+        turnCount: c.turnCount,
+      }));
+      const memories: MemoryRow[] = [
+        ...dayEntry.normalMemories.map((m) => ({
+          id: m.id,
+          types: m.types,
+          preview: m.preview,
+          createdAt: m.createdAt,
+          origin: "normal" as const,
+        })),
+        ...dayEntry.reflections.map((m) => ({
+          id: m.id,
+          types: m.types,
+          preview: m.preview,
+          createdAt: m.createdAt,
+          origin: "reflection" as const,
+        })),
+      ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      setConversationRows(conversations);
+      setMemoryRows(memories);
+      dayCacheRef.current.set(day, { conversationRows: conversations, memoryRows: memories });
+      setDayLoading(false);
+      return;
+    }
+
+    // v1（またはエントリ未登録）：既存のfallback経路で本体を直接読む。
     const reflectionIds = dayEntry?.reflectionIds ?? [];
     const conversationIds = dayEntry?.conversationIds ?? [];
 
@@ -397,70 +406,163 @@ export default function HistoryPanel({
             ? handle.getDirectoryHandle("Conversations", { create: false }).catch(() => undefined)
             : Promise.resolve(undefined),
         ]);
-        const [reflectionResults, conversationResults] = await Promise.all([
+        const [normalMemoriesFull, reflectionResults, conversationResults] = await Promise.all([
+          readMemoriesForDay(handle, day),
           Promise.all(reflectionIds.map((id) => readReflectionById(handle, id, day, memoriesDir))),
           Promise.all(conversationIds.map((id) => readConversationById(handle, id, day, conversationsDir))),
         ]);
         if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
-        const reflections = reflectionResults.filter((memory): memory is MemoryObject => memory !== null);
-        const conversations = conversationResults.filter(
+
+        const reflectionsFull = reflectionResults.filter((memory): memory is MemoryObject => memory !== null);
+        const conversationsFull = conversationResults.filter(
           (conversation): conversation is Conversation => conversation !== null
         );
-        const records: ExtraDayRecords = { conversations, reflections };
-        extraDayRecordsRef.current = records;
-        setExtraDayRecords(records);
-        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
-        if (dayPartsPendingRef.current === 0) {
-          dayCacheRef.current.set(day, {
-            normalMemories: normalMemoriesRef.current,
-            extraDayRecords: extraDayRecordsRef.current,
-          });
-          setDayLoading(false);
+
+        const conversationRowsNext: ConversationRow[] = conversationsFull.map((c) => ({
+          id: c.id,
+          modeLabel: personaModeLabel(c.persona),
+          turnCount: c.turns.length,
+          full: c,
+        }));
+        const memoryRowsNext: MemoryRow[] = [
+          ...normalMemoriesFull.map((m) => ({
+            id: m.id,
+            types: m.types,
+            preview: m.summary,
+            createdAt: m.createdAt,
+            origin: "normal" as const,
+            full: m,
+          })),
+          ...reflectionsFull.map((m) => ({
+            id: m.id,
+            types: m.types,
+            preview: m.summary,
+            createdAt: m.createdAt,
+            origin: "reflection" as const,
+            full: m,
+          })),
+        ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+        setConversationRows(conversationRowsNext);
+        setMemoryRows(memoryRowsNext);
+        dayCacheRef.current.set(day, { conversationRows: conversationRowsNext, memoryRows: memoryRowsNext });
+        setDayLoading(false);
+
+        // lazy upgrade：fallbackで既に取得済みのデータだけから組み立てる（追加read無し）。
+        // v1エントリが元々存在した日、または（エントリ未登録でも）何かデータが
+        // 見つかった日だけを対象にする——完全に空の日を新規に書き込む必要は無いため。
+        const hadExistingEntry = !!dayEntry;
+        const hasAnyData = conversationsFull.length > 0 || normalMemoriesFull.length > 0 || reflectionsFull.length > 0;
+        if (hadExistingEntry || hasAnyData) {
+          const v2Entry: HistoryDayIndexV2 = {
+            conversations: conversationsFull.map((c) => ({
+              id: c.id,
+              mode: c.persona === "companion" ? "diary" : "conversation",
+              turnCount: c.turns.length,
+            })),
+            normalMemories: normalMemoriesFull.map((m) => ({
+              id: m.id,
+              types: m.types,
+              preview: truncateHistoryPreview(m.summary),
+              createdAt: m.createdAt,
+            })),
+            reflections: reflectionsFull.map((m) => ({
+              id: m.id,
+              types: m.types,
+              preview: truncateHistoryPreview(m.summary),
+              createdAt: m.createdAt,
+            })),
+          };
+          void upgradeHistoryDayToV2(handle, day, v2Entry)
+            .then(() => {
+              // monthIndex自体が（Vault切替・月移動・別のupgrade等で）既に別のものへ
+              // 変わっていれば何もしない（stale patchを防ぐ。参照の一致で判定する）。
+              setMonthIndex((current) => {
+                if (current !== monthIndexAtStart || !current) return current;
+                return { ...current, days: { ...current.days, [day]: v2Entry } };
+              });
+            })
+            .catch((error) => {
+              // 失敗してもHistory表示自体（既にfallbackで確定している表示）は
+              // 失敗させない。次にこの日を開いた時、再度fallback→upgradeを試みる。
+              console.error("[Tsumugi] failed to lazily upgrade history day index (display unaffected):", error);
+            });
         }
       } catch (error) {
         if (dayRequestRef.current !== requestId) return;
         console.error("Failed to load day records", error);
-        extraDayRecordsRef.current = { conversations: [], reflections: [] };
-        setExtraDayRecords({ conversations: [], reflections: [] });
-        dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
-        if (dayPartsPendingRef.current === 0) setDayLoading(false);
+        setConversationRows([]);
+        setMemoryRows([]);
+        setDayLoading(false);
       }
     })();
   }, [vaultHandle, selectedDay, monthIndex, monthLoading, refreshToken]);
 
   /**
-   * 通常MemoryとReflectionを安全にマージする（別々のeffectが別々のタイミングで完了
-   * しても、常に最新の両方から作り直すため、片方だけの中途半端な状態が画面に出る
-   * ことはない——実際に表示されるのは`dayLoading`がfalseになった後のみ）。idで
-   * 重複排除してから統合する（同じrecordの二重表示を防ぐ、以前と同じロジック）。
+   * 一覧行タップ時のオンデマンド詳細読み込み。`full`が既に設定済み（v1 fallbackで
+   * 本体を読み終えている）ならその場で使い、追加のreadは発生させない。未設定
+   * （v2の日、Vault本体read 0回で構築した行）の場合だけ、その1件分のMarkdownを読む。
    */
-  const dayRecords = useMemo<DayRecords>(() => {
-    const seenMemoryIds = new Set<string>();
-    const memories: MemoryObject[] = [];
-    for (const memory of [...normalMemories, ...extraDayRecords.reflections]) {
-      if (seenMemoryIds.has(memory.id)) continue;
-      seenMemoryIds.add(memory.id);
-      memories.push(memory);
+  async function openConversationRow(row: ConversationRow) {
+    if (row.full) {
+      setSelectedConversation(row.full);
+      return;
     }
-    memories.sort((a, b) => a.date.localeCompare(b.date));
-    return { conversations: extraDayRecords.conversations, memories };
-  }, [normalMemories, extraDayRecords]);
+    if (!vaultHandle || !selectedDay) return;
+    const requestId = ++detailRequestRef.current;
+    setDetailLoading(true);
+    try {
+      const conversation = await readConversationById(vaultHandle, row.id, selectedDay);
+      if (detailRequestRef.current !== requestId) return;
+      if (conversation) setSelectedConversation(conversation);
+    } finally {
+      if (detailRequestRef.current === requestId) setDetailLoading(false);
+    }
+  }
+
+  async function openMemoryRow(row: MemoryRow) {
+    if (row.full) {
+      setSelectedMemory(row.full);
+      return;
+    }
+    if (!vaultHandle || !selectedDay) return;
+    const requestId = ++detailRequestRef.current;
+    setDetailLoading(true);
+    try {
+      if (row.origin === "reflection") {
+        const memory = await readReflectionById(vaultHandle, row.id, selectedDay);
+        if (detailRequestRef.current !== requestId) return;
+        if (memory) setSelectedMemory(memory);
+      } else {
+        // 通常Memoryは1日1Markdown（複数件統合）のため、1件だけを取り出すファイル形式が
+        // 無い。その日のday-fileを1回読み、対象idをfindする（既存のreadMemoriesForDay
+        // を再利用するだけで、新しいvault.ts関数は追加しない）。
+        const dayMemories = await readMemoriesForDay(vaultHandle, selectedDay);
+        if (detailRequestRef.current !== requestId) return;
+        const memory = dayMemories.find((m) => m.id === row.id);
+        if (memory) setSelectedMemory(memory);
+      }
+    } finally {
+      if (detailRequestRef.current === requestId) setDetailLoading(false);
+    }
+  }
 
   /**
-   * 「記憶しました」カードの「詳細を見る」から開かれた場合の自動オープン。以前は
-   * 単一の読込effect完了時にまとめて行っていたが、通常Memory／Reflection・
-   * Conversationが別々のeffectに分かれたため、両方が完了して`dayLoading`がfalseに
-   * なった時点でまとめて行う。
+   * 「記憶しました」カードの「詳細を見る」から開かれた場合の自動オープン。
+   * `memoryRows`が確定して`dayLoading`がfalseになった時点で、対象idの行を探し
+   * オンデマンド詳細読み込み（`openMemoryRow`、v1 fallback済みなら追加read無し）を行う。
    */
   useEffect(() => {
     if (dayLoading) return;
     if (!pendingInitialMemoryIdRef.current) return;
-    const target = dayRecords.memories.find((memory) => memory.id === pendingInitialMemoryIdRef.current);
-    if (target) {
-      setSelectedMemory(target);
-    }
+    const targetId = pendingInitialMemoryIdRef.current;
     pendingInitialMemoryIdRef.current = undefined;
-  }, [dayLoading, dayRecords]);
+    const row = memoryRows.find((memoryRow) => memoryRow.id === targetId);
+    if (row) {
+      void openMemoryRow(row);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dayLoading, memoryRows]);
 
   /**
    * 「今日」だけの安全な例外的マージ：Vault write未完了でも、既にIndexedDBへ保存済み
@@ -470,18 +572,24 @@ export default function HistoryPanel({
    * そのまま受け取るだけ）。idで重複排除するため、Vault側読み込みが追いついた後に
    * 二重表示にはならない。
    */
-  const displayedMemories = useMemo(() => {
-    const base = dayRecords.memories;
+  const displayedMemoryRows = useMemo(() => {
     if (selectedDay !== todayKey() || sessionCapturedMemories.length === 0) {
-      return base;
+      return memoryRows;
     }
-    const seenIds = new Set(base.map((memory) => memory.id));
-    const todaysSessionMemories = sessionCapturedMemories.filter(
-      (memory) => memory.date.slice(0, 10) === selectedDay && !seenIds.has(memory.id)
-    );
-    if (todaysSessionMemories.length === 0) return base;
-    return [...base, ...todaysSessionMemories].sort((a, b) => a.date.localeCompare(b.date));
-  }, [dayRecords, selectedDay, sessionCapturedMemories]);
+    const seenIds = new Set(memoryRows.map((row) => row.id));
+    const todaysSessionRows: MemoryRow[] = sessionCapturedMemories
+      .filter((memory) => memory.date.slice(0, 10) === selectedDay && !seenIds.has(memory.id))
+      .map((memory) => ({
+        id: memory.id,
+        types: memory.types,
+        preview: memory.summary,
+        createdAt: memory.createdAt,
+        origin: "normal" as const,
+        full: memory,
+      }));
+    if (todaysSessionRows.length === 0) return memoryRows;
+    return [...memoryRows, ...todaysSessionRows].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }, [memoryRows, selectedDay, sessionCapturedMemories]);
 
   const hasSessionRecordToday = useMemo(
     () => sessionCapturedMemories.some((memory) => memory.date.slice(0, 10) === todayKey()),
@@ -490,15 +598,24 @@ export default function HistoryPanel({
 
   function dayHasRecord(day: string): boolean {
     const entry = monthIndex?.days[day];
-    if (entry && (entry.conversationIds.length > 0 || entry.memoryCount > 0)) return true;
+    if (entry) {
+      const hasEntryRecord = isHistoryDayIndexV2(entry)
+        ? entry.conversations.length > 0 || entry.normalMemories.length > 0 || entry.reflections.length > 0
+        : entry.conversationIds.length > 0 || entry.memoryCount > 0;
+      if (hasEntryRecord) return true;
+    }
     return day === todayKey() && hasSessionRecordToday;
   }
 
-  // Memoryの由来会話（日時・ペルソナ）を一言添えるための索引。既に読み込み済みの
-  // その日のconversationsからだけ作る（追加のVault読み込みは行わない。由来会話が
-  // 別の日にある場合は、この一覧に無いため表示を省略する——UIの完全再現ではなく
-  // 「その日の記録を確認できる」ことを優先する今回の方針による割り切り）。
-  const conversationById = new Map(dayRecords.conversations.map((c) => [c.id, c]));
+  // Memoryの由来会話（日時・モード）を一言添えるための索引。既に本体を読み終えている
+  // （`full`が設定済みの）Conversationからだけ作る（追加のVault読み込みは行わない。
+  // v2の日で由来会話がまだ詳細表示されていない場合は、この一覧に無いため表示を省略
+  // する——UIの完全再現ではなく「その日の記録を確認できる」ことを優先する方針）。
+  const conversationById = new Map(
+    conversationRows
+      .filter((row): row is ConversationRow & { full: Conversation } => !!row.full)
+      .map((row) => [row.id, row.full])
+  );
 
   const monthGrid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
 
@@ -513,23 +630,16 @@ export default function HistoryPanel({
     setSelectedMemory(null);
     setSelectedConversation(null);
     // 前の日付の表示が一瞬でも残らないよう、ここで即座に更新する（実際の
-    // requestId発行・skipDayFetchRef/dayPartsPendingRefの確定は、直後に走る
-    // reset effect（selectedDayの変化を検知して発火する）が同じ判定を行う。
-    // ここでも同一History表示セッション内キャッシュ（dayCacheRef）を確認し、
-    // ヒットしていれば「読み込んでいます…」を一瞬たりとも出さず即時表示する
-    // （キャッシュヒット時にdayLoadingをtrueへ戻さない、という要件のため）。
+    // requestId発行・skipDayFetchRefの確定は、直後に走るreset effect
+    // （selectedDayの変化を検知して発火する）が同じ判定を行う）。
     const cached = dayCacheRef.current.get(day);
     if (cached) {
-      normalMemoriesRef.current = cached.normalMemories;
-      extraDayRecordsRef.current = cached.extraDayRecords;
-      setNormalMemories(cached.normalMemories);
-      setExtraDayRecords(cached.extraDayRecords);
+      setConversationRows(cached.conversationRows);
+      setMemoryRows(cached.memoryRows);
       setDayLoading(false);
     } else {
-      normalMemoriesRef.current = [];
-      extraDayRecordsRef.current = { conversations: [], reflections: [] };
-      setNormalMemories([]);
-      setExtraDayRecords({ conversations: [], reflections: [] });
+      setConversationRows([]);
+      setMemoryRows([]);
       setDayLoading(true);
     }
   }
@@ -538,17 +648,12 @@ export default function HistoryPanel({
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
       <div className="flex h-[85dvh] w-full max-w-md flex-col overflow-hidden">
         {/*
-          レイアウト安定化（案B）：以前はこの外枠全体が「コンテンツ量に応じた可変高さの
-          1つのスクロール領域」（max-h＋overflow-y-auto）だったため、選択日の履歴の
-          長さが変わるたびに外枠全体の高さが変化し、外側の`items-center justify-center`
-          （画面中央配置）が再計算されて、カレンダーごとパネル全体が画面内で上下に
-          動いて見えていた。ここでは外枠の高さを固定（h-[85dvh]、既存のカレンダーとの
-          見た目のバランスを保つため従来のmax-h値をそのまま流用）＋overflow-hidden
-          にした上で、内部をflex columnで「上段＝見出し・月移動・曜日・カレンダー
-          グリッド（shrink-0、自然な高さのまま）」「下段＝選択日の履歴（flex-1＋
-          min-h-0＋overflow-y-auto、この部分だけが独立してスクロールする）」の2領域に
-          分割する。カレンダー本体は一切スクロールせず、外枠の高さも履歴の長さに関わらず
-          常に一定のため、カレンダー位置が画面内で動かない。デザイン・配色は変更しない。
+          レイアウト安定化（案B）：外枠の高さを固定（h-[85dvh]）＋overflow-hiddenにした
+          上で、内部をflex columnで「上段＝見出し・月移動・曜日・カレンダーグリッド
+          （shrink-0、自然な高さのまま）」「下段＝選択日の履歴（flex-1＋min-h-0＋
+          overflow-y-auto、この部分だけが独立してスクロールする）」の2領域に分割する。
+          カレンダー本体は一切スクロールせず、外枠の高さも履歴の長さに関わらず常に
+          一定のため、カレンダー位置が画面内で動かない。
         */}
         <div className="flex shrink-0 flex-col gap-5">
           <div className="flex items-center justify-between">
@@ -634,125 +739,125 @@ export default function HistoryPanel({
             <div className="flex flex-col gap-3 border-t border-black/5 pt-4 dark:border-white/10">
               <p className="text-xs text-stone-400 dark:text-stone-500">{selectedDay}</p>
 
-              {monthLoading || dayLoading ? (
-                  <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>
-                ) : selectedConversation ? (
+              {monthLoading || dayLoading || detailLoading ? (
+                <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>
+              ) : selectedConversation ? (
+                <div className="flex flex-col gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedConversation(null)}
+                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    戻る
+                  </button>
+                  <p className="text-xs text-stone-400 dark:text-stone-500">
+                    {selectedConversation.startedAt.slice(0, 10)}・{personaModeLabel(selectedConversation.persona)}
+                  </p>
                   <div className="flex flex-col gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedConversation(null)}
-                      className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-                    >
-                      戻る
-                    </button>
-                    <p className="text-xs text-stone-400 dark:text-stone-500">
-                      {selectedConversation.startedAt.slice(0, 10)}・{PERSONA_LABEL[selectedConversation.persona]}
-                    </p>
-                    <div className="flex flex-col gap-3">
-                      {selectedConversation.turns.map((turn, index) => (
-                        <HistoryTurnBubble key={index} turn={turn} />
-                      ))}
-                    </div>
+                    {selectedConversation.turns.map((turn, index) => (
+                      <HistoryTurnBubble key={index} turn={turn} />
+                    ))}
                   </div>
-                ) : selectedMemory ? (
-                  <div className="flex flex-col gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedMemory(null)}
-                      className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-                    >
-                      戻る
-                    </button>
-                    <div className="flex flex-wrap items-center gap-2 text-[11px] text-stone-400 dark:text-stone-500">
-                      <span>{selectedMemory.date.slice(0, 10)}</span>
-                      {selectedMemory.types.map((type) => (
+                </div>
+              ) : selectedMemory ? (
+                <div className="flex flex-col gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMemory(null)}
+                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    戻る
+                  </button>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-stone-400 dark:text-stone-500">
+                    <span>{selectedMemory.date.slice(0, 10)}</span>
+                    {selectedMemory.types.map((type) => (
+                      <span
+                        key={type}
+                        className="rounded-full border border-stone-300/60 px-2 py-0.5 dark:border-stone-600/60"
+                      >
+                        {MEMORY_TYPE_LABEL[type] ?? type}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-base text-stone-800 dark:text-stone-100">{selectedMemory.summary}</p>
+                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
+                    {selectedMemory.content}
+                  </p>
+                  {selectedMemory.keywords.length > 0 && (
+                    <div className="flex flex-wrap gap-2 pt-2">
+                      {selectedMemory.keywords.map((keyword) => (
                         <span
-                          key={type}
-                          className="rounded-full border border-stone-300/60 px-2 py-0.5 dark:border-stone-600/60"
+                          key={keyword}
+                          className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 dark:border-stone-600/60 dark:text-stone-400"
                         >
-                          {MEMORY_TYPE_LABEL[type] ?? type}
+                          {keyword}
                         </span>
                       ))}
                     </div>
-                    <p className="text-base text-stone-800 dark:text-stone-100">{selectedMemory.summary}</p>
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
-                      {selectedMemory.content}
-                    </p>
-                    {selectedMemory.keywords.length > 0 && (
-                      <div className="flex flex-wrap gap-2 pt-2">
-                        {selectedMemory.keywords.map((keyword) => (
-                          <span
-                            key={keyword}
-                            className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 dark:border-stone-600/60 dark:text-stone-400"
-                          >
-                            {keyword}
+                  )}
+                  {selectedMemory.conversationId &&
+                    (() => {
+                      const origin = conversationById.get(selectedMemory.conversationId);
+                      if (!origin) return null;
+                      return (
+                        <p className="border-t border-black/5 pt-3 text-xs text-stone-400 dark:border-white/10 dark:text-stone-500">
+                          由来：{origin.startedAt.slice(0, 10)}の{personaModeLabel(origin.persona)}の会話
+                        </p>
+                      );
+                    })()}
+                </div>
+              ) : conversationRows.length === 0 && displayedMemoryRows.length === 0 ? (
+                <p className="text-sm text-stone-400 dark:text-stone-500">この日の記録はありません。</p>
+              ) : (
+                <div className="flex flex-col gap-4">
+                  {conversationRows.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-xs text-stone-400 dark:text-stone-500">会話</p>
+                      {conversationRows.map((row) => (
+                        <button
+                          key={row.id}
+                          type="button"
+                          onClick={() => void openConversationRow(row)}
+                          className="flex items-center justify-between gap-4 rounded-2xl border border-stone-300/70 px-4 py-3 text-left text-sm text-stone-700 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-300 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+                        >
+                          <span>{row.modeLabel}</span>
+                          <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">
+                            {row.turnCount}件のメッセージ
                           </span>
-                        ))}
-                      </div>
-                    )}
-                    {selectedMemory.conversationId &&
-                      (() => {
-                        const origin = conversationById.get(selectedMemory.conversationId);
-                        if (!origin) return null;
-                        return (
-                          <p className="border-t border-black/5 pt-3 text-xs text-stone-400 dark:border-white/10 dark:text-stone-500">
-                            由来：{origin.startedAt.slice(0, 10)}の{PERSONA_LABEL[origin.persona]}の会話
-                          </p>
-                        );
-                      })()}
-                  </div>
-                ) : (dayRecords?.conversations.length ?? 0) === 0 && displayedMemories.length === 0 ? (
-                  <p className="text-sm text-stone-400 dark:text-stone-500">この日の記録はありません。</p>
-                ) : (
-                  <div className="flex flex-col gap-4">
-                    {(dayRecords?.conversations.length ?? 0) > 0 && (
-                      <div className="flex flex-col gap-2">
-                        <p className="text-xs text-stone-400 dark:text-stone-500">会話</p>
-                        {dayRecords?.conversations.map((conversation) => (
-                          <button
-                            key={conversation.id}
-                            type="button"
-                            onClick={() => setSelectedConversation(conversation)}
-                            className="flex items-center justify-between gap-4 rounded-2xl border border-stone-300/70 px-4 py-3 text-left text-sm text-stone-700 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-300 dark:hover:border-stone-400 dark:hover:bg-stone-900"
-                          >
-                            <span>{PERSONA_LABEL[conversation.persona]}</span>
-                            <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">
-                              {conversation.turns.length}件のメッセージ
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
 
-                    {displayedMemories.length > 0 && (
-                      <div className="flex flex-col gap-2">
-                        <p className="text-xs text-stone-400 dark:text-stone-500">記憶</p>
-                        {displayedMemories.map((memory) => (
-                          <button
-                            key={memory.id}
-                            type="button"
-                            onClick={() => setSelectedMemory(memory)}
-                            className="flex flex-col gap-1 rounded-2xl border border-stone-300/70 px-4 py-3 text-left transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:hover:border-stone-400 dark:hover:bg-stone-900"
-                          >
-                            <span className="text-sm text-stone-700 dark:text-stone-300">{memory.summary}</span>
-                            <span className="flex flex-wrap items-center gap-2 text-[11px] text-stone-400 dark:text-stone-500">
-                              {memory.types.map((type) => (
-                                <span
-                                  key={type}
-                                  className="rounded-full border border-stone-300/60 px-2 py-0.5 dark:border-stone-600/60"
-                                >
-                                  {MEMORY_TYPE_LABEL[type] ?? type}
-                                </span>
-                              ))}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
+                  {displayedMemoryRows.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-xs text-stone-400 dark:text-stone-500">記憶</p>
+                      {displayedMemoryRows.map((row) => (
+                        <button
+                          key={row.id}
+                          type="button"
+                          onClick={() => void openMemoryRow(row)}
+                          className="flex flex-col gap-1 rounded-2xl border border-stone-300/70 px-4 py-3 text-left transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+                        >
+                          <span className="text-sm text-stone-700 dark:text-stone-300">{row.preview}</span>
+                          <span className="flex flex-wrap items-center gap-2 text-[11px] text-stone-400 dark:text-stone-500">
+                            {row.types.map((type) => (
+                              <span
+                                key={type}
+                                className="rounded-full border border-stone-300/60 px-2 py-0.5 dark:border-stone-600/60"
+                              >
+                                {MEMORY_TYPE_LABEL[type] ?? type}
+                              </span>
+                            ))}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
+          </div>
         )}
       </div>
     </div>

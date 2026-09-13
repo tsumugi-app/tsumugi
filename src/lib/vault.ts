@@ -25,7 +25,7 @@ import {
   setVaultSyncState,
 } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
-import type { Conversation, MemoryObject, Source } from "./types";
+import type { Conversation, MemoryObject, MemoryType, Source } from "./types";
 import {
   conversationToMarkdown,
   memoryObjectToMarkdown,
@@ -511,21 +511,74 @@ async function updateIndex(root: FileSystemDirectoryHandle, id: string, relative
  * そのまま使うため、Index側とファイル名生成側が食い違うことはない）。
  */
 /**
- * `normalMemoryCount`：通常Memory（day-fileへ統合される形式）の、そのday-file自体の
- * 現在の実エントリ数（絶対値）。`reflectionIds`：Reflection Summary（1record1file）の
- * id一覧。`memoryCount`は常に`normalMemoryCount + reflectionIds.length`として
- * 再計算した絶対値であり、どちらか一方の更新時にも都度両方から算出し直す
- * （差分加算はしない。Codexレビュー指摘：差分加算はretryで永続的にずれうるため）。
+ * v1形状（既存、Step 1〜4）。`normalMemoryCount`：通常Memory（day-fileへ統合される
+ * 形式）の、そのday-file自体の現在の実エントリ数（絶対値）。`reflectionIds`：
+ * Reflection Summary（1record1file）のid一覧。`memoryCount`は常に
+ * `normalMemoryCount + reflectionIds.length`として再計算した絶対値。
+ * IDのみを保持するため、一覧表示にはid経由でMarkdown本体を読む必要がある
+ * （History Index v2で解消する対象そのもの）。
  */
-export interface HistoryDayIndex {
+export interface HistoryDayIndexV1 {
   conversationIds: string[];
   normalMemoryCount: number;
   reflectionIds: string[];
   memoryCount: number;
 }
 
+/**
+ * History Index v2。ユーザー向けの表示モード。coach/analyst問わず、
+ * persona!=="companion"は一律"conversation"（＝表示上「会話」）へ正規化する
+ * （旧「探究」「相談・創造」という名称をHistory Index・History UIには一切残さない）。
+ */
+export type HistoryConversationMode = "diary" | "conversation";
+
+/** Conversation一覧に必要な最小限のデータ（本文turnsは含まない）。 */
+export interface HistoryConversationSummary {
+  id: string;
+  mode: HistoryConversationMode;
+  turnCount: number;
+}
+
+/**
+ * 通常Memory／Reflection共通の一覧表示用データ（本文content/フルsummaryは含まない）。
+ * `preview`はHistory一覧専用の軽量表示データであり、Markdown本体の
+ * `summary`/`content`を置き換えるものではない（`truncateHistoryPreview`参照）。
+ * `createdAt`は同日内の通常Memory・Reflectionを時系列でマージ表示するためだけに使う。
+ */
+export interface HistoryMemorySummary {
+  id: string;
+  types: MemoryType[];
+  preview: string;
+  createdAt: string;
+}
+
+/**
+ * History Index v2（本ファイル本体）。一覧表示に必要なデータを直接持つため、
+ * 日付タップ時にConversation/Reflection/通常MemoryのMarkdownを一切読まなくても
+ * 一覧が描画できる（詳細表示時のみ、id経由でMarkdown本体を読む）。
+ */
+export interface HistoryDayIndexV2 {
+  conversations: HistoryConversationSummary[];
+  normalMemories: HistoryMemorySummary[];
+  reflections: HistoryMemorySummary[];
+}
+
+/**
+ * v1（既存Vaultの、まだ一度も開かれていない日）とv2（新規書き込み、または実際に
+ * 開かれてlazy upgradeされた日）が同じ月Index内に混在しうる。読み取り側は必ず
+ * `isHistoryDayIndexV2`で判定してから分岐すること。
+ */
+export type HistoryDayIndex = HistoryDayIndexV1 | HistoryDayIndexV2;
+
+/** `HistoryDayIndex`がv2形状かどうかを判定する。v1はこの3フィールドを持たない。 */
+export function isHistoryDayIndexV2(entry: HistoryDayIndex | undefined): entry is HistoryDayIndexV2 {
+  return !!entry && Array.isArray((entry as HistoryDayIndexV2).conversations);
+}
+
 export interface HistoryMonthIndex {
-  version: 1;
+  /** 1＝v1のみで書かれた月（このファイル自体はまだv2対応コードで触れられていない）。
+   *  2＝v2対応コードが一度でも書き込んだ月（日ごとにv1/v2が混在しうる）。 */
+  version: 1 | 2;
   month: string;
   days: Record<string, HistoryDayIndex>;
 }
@@ -555,12 +608,21 @@ function emptyHistoryMeta(): HistoryMeta {
   return { version: 1, updatedAt: "", months: {}, totalMemories: 0, totalConversations: 0 };
 }
 
+/**
+ * 新規書き込み時のfallback。v2対応コードが新しく作る月は最初からversion 2として
+ * 扱う（既存のv1のみの月をこの関数が作ることはない——既存月の読み込みは
+ * `readJSON`がファイルの実内容をそのまま返すため、この関数は「ファイルが無い」
+ * 場合にのみ使われる）。
+ */
 function emptyMonthIndex(month: string): HistoryMonthIndex {
-  return { version: 1, month, days: {} };
+  return { version: 2, month, days: {} };
 }
 
-function emptyDayIndex(): HistoryDayIndex {
-  return { conversationIds: [], normalMemoryCount: 0, reflectionIds: [], memoryCount: 0 };
+/** 新規（またはv2化された）日の初期値。v1の空エントリはもう新規に作らない
+ *  （v1形状は既存データを読んだ場合にのみ現れる。既存のcomputeUpdatedDayEntryV1は
+ *  必ず既存previousを受け取るため、この関数を必要としない）。 */
+function emptyDayIndexV2(): HistoryDayIndexV2 {
+  return { conversations: [], normalMemories: [], reflections: [] };
 }
 
 /**
@@ -595,35 +657,52 @@ async function withHistoryIndexLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export type HistoryIndexUpdate =
-  | { kind: "conversation"; id: string; day: string }
-  | { kind: "reflection"; id: string; day: string }
+  | { kind: "conversation"; id: string; day: string; mode: HistoryConversationMode; turnCount: number }
+  | { kind: "reflection"; id: string; day: string; preview: string; createdAt: string }
   /**
-   * 通常Memory（day-fileへ統合される形式）専用。`normalMemoryCount`は呼び出し元
+   * 通常Memory（day-fileへ統合される形式）専用。`normalMemories`は呼び出し元
    * （`writeMemoryObjectMarkdownImpl`）が、day-fileへ実際に書き込んだ後のマージ済み
-   * 配列の件数（絶対値）をそのまま渡す。「新規か更新か」の判定はここでは行わない
+   * 配列（絶対値）をそのまま軽量化して渡す。「新規か更新か」の判定はここでは行わない
    * （Codexレビュー指摘：retry時、day-fileには既にそのidが存在するため「更新」と
    * 誤判定され、差分加算方式ではIndex側の件数が永続的にずれる。絶対値を渡すことで
-   * 何度retryしても同じ正しい値へ収束する）。
+   * 何度retryしても同じ正しい値へ収束する。History Index v2でも同じ設計を維持する）。
    */
-  | { kind: "memory"; day: string; normalMemoryCount: number };
+  | { kind: "memory"; day: string; normalMemories: HistoryMemorySummary[] }
+  /**
+   * Step 3（HistoryPanel.tsxのlazy upgrade）専用。v1形状の日を実際に開いて
+   * fallback読み込みが完了した直後、その取得済みデータから組み立てたv2 entryを
+   * そのまま渡す（追加のMarkdown readはしない）。既に v2 になっている日には
+   * 一切上書きしない（`computeUpdatedDayEntry`参照、冪等性の担保）。
+   */
+  | { kind: "day-upgrade"; day: string; entry: HistoryDayIndexV2 };
+
+/** 既存配列からid一致する要素を探し、あれば同じ位置で置換、無ければ末尾へ追加する。
+ *  同一idの再write（retry・後続の更新）で重複せず、常に最新の内容へ置換される。 */
+function upsertById<T extends { id: string }>(list: T[], entry: T): T[] {
+  const index = list.findIndex((item) => item.id === entry.id);
+  if (index === -1) return [...list, entry];
+  const next = [...list];
+  next[index] = entry;
+  return next;
+}
 
 /**
- * 既存のday entry（無ければ空）へ、1件の更新を反映した新しいday entryを返す
- * （純粋関数、副作用なし）。conversationIds/reflectionIdsへの追加はidempotent
- * （既に含まれていれば追加しない）。memoryCountは常に
- * `normalMemoryCount + reflectionIds.length`として再計算する絶対値であり、
- * 差分加算はしない——normalMemoryCount側の更新かreflectionIds側の更新かに
- * 関わらず、他方の既存値はそのまま保持した上で毎回両方から算出し直す。
+ * v1形状の日を維持したまま更新する（既存ロジック、無変更）。v1→v2への自動変換は
+ * ここでは行わない——変換にはconversationIds/reflectionIds由来の他item（このupdateの
+ * 対象ではないitem）のturnCount/preview等を再構築する必要があり、追加のMarkdown read
+ * なしには行えないため。実際のv2化はHistoryPanel.tsx側のlazy upgrade
+ * （"day-upgrade"、その日を実際に開いてfallback読み込みが完了した時だけ）に委ねる。
  */
-function computeUpdatedDayEntry(previous: HistoryDayIndex | undefined, update: HistoryIndexUpdate): HistoryDayIndex {
-  const base: HistoryDayIndex = previous
-    ? {
-        conversationIds: [...previous.conversationIds],
-        normalMemoryCount: previous.normalMemoryCount,
-        reflectionIds: [...previous.reflectionIds],
-        memoryCount: previous.memoryCount,
-      }
-    : emptyDayIndex();
+function computeUpdatedDayEntryV1(
+  previous: HistoryDayIndexV1,
+  update: Exclude<HistoryIndexUpdate, { kind: "day-upgrade" }>
+): HistoryDayIndexV1 {
+  const base: HistoryDayIndexV1 = {
+    conversationIds: [...previous.conversationIds],
+    normalMemoryCount: previous.normalMemoryCount,
+    reflectionIds: [...previous.reflectionIds],
+    memoryCount: previous.memoryCount,
+  };
 
   if (update.kind === "conversation") {
     if (!base.conversationIds.includes(update.id)) {
@@ -634,31 +713,138 @@ function computeUpdatedDayEntry(previous: HistoryDayIndex | undefined, update: H
       base.reflectionIds = [...base.reflectionIds, update.id];
     }
   } else {
-    base.normalMemoryCount = update.normalMemoryCount;
+    base.normalMemoryCount = update.normalMemories.length;
   }
 
   base.memoryCount = base.normalMemoryCount + base.reflectionIds.length;
   return base;
 }
 
-function isDayIndexEqual(a: HistoryDayIndex, b: HistoryDayIndex): boolean {
+/**
+ * v2形状の日を更新する（新規の日、または既にv2化済みの日）。conversations/
+ * reflectionsは`upsertById`でid基準のupsert（同一idなら最新へ置換、初出なら追加）を
+ * 行うため、retryで重複しない。normalMemoriesは`writeMemoryObjectMarkdownImpl`が
+ * 渡すday-fileの現在の全件（絶対値）でそのまま置き換える——差分加算は一切しない。
+ */
+function computeUpdatedDayEntryV2(
+  previous: HistoryDayIndexV2 | undefined,
+  update: Exclude<HistoryIndexUpdate, { kind: "day-upgrade" }>
+): HistoryDayIndexV2 {
+  const base: HistoryDayIndexV2 = previous
+    ? {
+        conversations: [...previous.conversations],
+        normalMemories: [...previous.normalMemories],
+        reflections: [...previous.reflections],
+      }
+    : emptyDayIndexV2();
+
+  if (update.kind === "conversation") {
+    base.conversations = upsertById(base.conversations, {
+      id: update.id,
+      mode: update.mode,
+      turnCount: update.turnCount,
+    });
+  } else if (update.kind === "reflection") {
+    base.reflections = upsertById(base.reflections, {
+      id: update.id,
+      types: ["insight"],
+      preview: update.preview,
+      createdAt: update.createdAt,
+    });
+  } else {
+    base.normalMemories = update.normalMemories;
+  }
+
+  return base;
+}
+
+/**
+ * 既存のday entry（無ければ空）へ、1件の更新を反映した新しいday entryを返す
+ * （純粋関数、副作用なし）。
+ *
+ * 分岐方針（History Index v2、重要修正1対応）：
+ * - "day-upgrade"：既にv2ならそのまま返す（上書きしない＝複数回呼ばれても冪等）。
+ *   v1または未登録なら、呼び出し元が組み立て済みのv2 entryへ置き換える。
+ * - それ以外のkind（通常の書き込み）：既存entryがv1形状（かつ存在する）ならv1のまま
+ *   更新する（v1→v2の自動変換はしない）。既存entryが無い、またはv2形状なら
+ *   v2として更新する。これにより、新規の日・既にv2化された日は最初から
+ *   （またはこの1件の更新以降も）v2として保存され、まだ開かれていないv1の日は
+ *   Vault全体scanを伴わずに安全にv1のまま維持される。
+ */
+function computeUpdatedDayEntry(previous: HistoryDayIndex | undefined, update: HistoryIndexUpdate): HistoryDayIndex {
+  if (update.kind === "day-upgrade") {
+    if (previous && isHistoryDayIndexV2(previous)) return previous;
+    return update.entry;
+  }
+  if (previous && !isHistoryDayIndexV2(previous)) {
+    return computeUpdatedDayEntryV1(previous, update);
+  }
+  return computeUpdatedDayEntryV2(previous, update);
+}
+
+function isHistoryConversationSummaryEqual(a: HistoryConversationSummary, b: HistoryConversationSummary): boolean {
+  return a.id === b.id && a.mode === b.mode && a.turnCount === b.turnCount;
+}
+
+function isHistoryMemorySummaryEqual(a: HistoryMemorySummary, b: HistoryMemorySummary): boolean {
   return (
-    a.normalMemoryCount === b.normalMemoryCount &&
-    a.memoryCount === b.memoryCount &&
-    a.conversationIds.length === b.conversationIds.length &&
-    a.conversationIds.every((id, i) => id === b.conversationIds[i]) &&
-    a.reflectionIds.length === b.reflectionIds.length &&
-    a.reflectionIds.every((id, i) => id === b.reflectionIds[i])
+    a.id === b.id &&
+    a.preview === b.preview &&
+    a.createdAt === b.createdAt &&
+    a.types.length === b.types.length &&
+    a.types.every((type, i) => type === b.types[i])
   );
 }
 
-/** 月Indexの現在の（既に書き込み済みの）状態から、その月の絶対集計を計算する。 */
+function isDayIndexEqual(a: HistoryDayIndex, b: HistoryDayIndex): boolean {
+  const aIsV2 = isHistoryDayIndexV2(a);
+  const bIsV2 = isHistoryDayIndexV2(b);
+  if (aIsV2 !== bIsV2) return false; // v1↔v2の形状変化自体を変化として扱う（lazy upgrade時に必ず書き込ませる）
+
+  if (aIsV2 && bIsV2) {
+    return (
+      a.conversations.length === b.conversations.length &&
+      a.conversations.every((c, i) => isHistoryConversationSummaryEqual(c, b.conversations[i])) &&
+      a.normalMemories.length === b.normalMemories.length &&
+      a.normalMemories.every((m, i) => isHistoryMemorySummaryEqual(m, b.normalMemories[i])) &&
+      a.reflections.length === b.reflections.length &&
+      a.reflections.every((m, i) => isHistoryMemorySummaryEqual(m, b.reflections[i]))
+    );
+  }
+
+  const av1 = a as HistoryDayIndexV1;
+  const bv1 = b as HistoryDayIndexV1;
+  return (
+    av1.normalMemoryCount === bv1.normalMemoryCount &&
+    av1.memoryCount === bv1.memoryCount &&
+    av1.conversationIds.length === bv1.conversationIds.length &&
+    av1.conversationIds.every((id, i) => id === bv1.conversationIds[i]) &&
+    av1.reflectionIds.length === bv1.reflectionIds.length &&
+    av1.reflectionIds.every((id, i) => id === bv1.reflectionIds[i])
+  );
+}
+
+/** v1・v2いずれの形状でも、その日のMemory件数（通常Memory＋Reflection）を返す。 */
+function dayMemoryCount(day: HistoryDayIndex): number {
+  return isHistoryDayIndexV2(day) ? day.normalMemories.length + day.reflections.length : day.memoryCount;
+}
+
+/** v1・v2いずれの形状でも、その日のConversation件数を返す。 */
+function dayConversationCount(day: HistoryDayIndex): number {
+  return isHistoryDayIndexV2(day) ? day.conversations.length : day.conversationIds.length;
+}
+
+/**
+ * 月Indexの現在の（既に書き込み済みの）状態から、その月の絶対集計を計算する。
+ * v1の日・v2の日・両者が混在する月のいずれでも正しく集計する
+ * （`dayMemoryCount`/`dayConversationCount`が形状を吸収するため）。
+ */
 function computeMonthAggregate(monthIndex: HistoryMonthIndex): HistoryMonthAggregate {
   let memories = 0;
   let conversations = 0;
   for (const day of Object.values(monthIndex.days)) {
-    memories += day.memoryCount;
-    conversations += day.conversationIds.length;
+    memories += dayMemoryCount(day);
+    conversations += dayConversationCount(day);
   }
   return { memories, conversations };
 }
@@ -708,7 +894,10 @@ async function updateHistoryIndex(root: FileSystemDirectoryHandle, update: Histo
     const dayEntry = computeUpdatedDayEntry(previousDayEntry, update);
     const dayChanged = !previousDayEntry || !isDayIndexEqual(previousDayEntry, dayEntry);
 
-    monthIndex.version = 1;
+    // History Index v2：このファイルはv2対応コードで書かれたことを示すために2へ
+    // 更新する（日ごとのv1/v2判定は`isHistoryDayIndexV2`が形状で行うため、この
+    // ファイル単位のversionはあくまで参考情報であり、読み込み側の分岐には使わない）。
+    monthIndex.version = 2;
     monthIndex.month = month;
     monthIndex.days[update.day] = dayEntry;
 
@@ -742,8 +931,47 @@ async function updateHistoryIndex(root: FileSystemDirectoryHandle, update: Histo
 }
 
 /**
- * History Index読み取り側（Step 1時点では低レベルのプリミティブのみ。History UI自体は
- * 今回のスコープ外）。読み取りはロックを取得しない——書き込みと競合しても「わずかに
+ * History一覧専用の軽量プレビュー文字列を作る（重要修正2）。通常Memoryの`summary`は
+ * 元々20〜40文字程度の一行要約だが、Reflectionの`summary`は振り返り全文そのもの
+ * （`src/lib/reflection.ts`参照）であり、そのままIndexへ入れると1件で肥大化しうる。
+ * ここで一律に切り詰めることで「Markdown本体＝完全な内容」「History Index preview＝
+ * 一覧用の軽量表示」という役割を明確にする。日本語の文字境界（サロゲートペア等）を
+ * 厳密に考慮した高度な切り詰めは行わない、単純な`slice`で構わない（要求通り）。
+ */
+const HISTORY_PREVIEW_MAX_LENGTH = 80;
+
+export function truncateHistoryPreview(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length > HISTORY_PREVIEW_MAX_LENGTH ? trimmed.slice(0, HISTORY_PREVIEW_MAX_LENGTH) : trimmed;
+}
+
+/**
+ * lazy upgrade専用（Step 3、HistoryPanel.tsx）。v1形状の日を実際に開き、既存の
+ * fallback経路（`readMemoriesForDay`/`readReflectionById`/`readConversationById`）で
+ * 取得済みのデータから組み立てたv2 entryを、その日だけ月Indexへ永続化する。
+ * Vault全体のscan・月全体のbackfillは一切行わない（呼び出し元が既に読み終えた
+ * 1日分のデータを渡すだけで、この関数自体は追加のMarkdown readを一切行わない）。
+ *
+ * 冪等性：`computeUpdatedDayEntry`の"day-upgrade"分岐が、既にv2化済みの日には
+ * 一切上書きしないため、同じ日に対して複数回呼ばれても安全（2回目以降は
+ * 実質的なno-opになり、`isDayIndexEqual`によりファイル書き込み自体もskipされる）。
+ *
+ * 失敗時の扱い：既存の`updateHistoryIndex`と同じくエラーを一切catchしない。
+ * 呼び出し元（HistoryPanel.tsx）は、この呼び出しをfire-and-forgetで扱い、
+ * 失敗してもHistory表示自体（既にfallbackで取得済みのデータによる表示）を
+ * 失敗させないこと（catchしてconsole.errorに残すだけにとどめる）。
+ */
+export async function upgradeHistoryDayToV2(
+  root: FileSystemDirectoryHandle,
+  day: string,
+  entry: HistoryDayIndexV2
+): Promise<void> {
+  await updateHistoryIndex(root, { kind: "day-upgrade", day, entry });
+}
+
+/**
+ * History Index読み取り側（低レベルのプリミティブのみ）。読み取りはロックを
+ * 取得しない——書き込みと競合しても「わずかに
  * 古い目次を読む」だけであり、カレンダー表示用途では実害が無いため（既存の
  * `readJSON`と同じ、存在しない/壊れている場合は安全な既定値へfallbackする方針を踏襲）。
  */
@@ -846,11 +1074,20 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
   logSyncStep("conversation render", Date.now() - renderStart);
   await writeFileInDir(dir, fileName, content, "conversation");
   await updateIndex(root, conversation.id, `Conversations/${fileName}`);
-  // History Index（Step 1）：Markdown本体の書き込みが成功した直後に更新する。
-  // ここでcatchして握り潰さない——失敗すればこの関数全体が失敗として呼び出し元へ
-  // 伝わり、vaultSyncStateが更新されないため、次回flush時に本体・Index更新の両方が
-  // 自然に再試行される（詳細はupdateHistoryIndexのコメント参照）。
-  await updateHistoryIndex(root, { kind: "conversation", id: conversation.id, day: conversation.startedAt.slice(0, 10) });
+  // History Index（Step 1、v2でmode/turnCountを追加）：Markdown本体の書き込みが
+  // 成功した直後に更新する。ここでcatchして握り潰さない——失敗すればこの関数全体が
+  // 失敗として呼び出し元へ伝わり、vaultSyncStateが更新されないため、次回flush時に
+  // 本体・Index更新の両方が自然に再試行される（詳細はupdateHistoryIndexのコメント参照）。
+  // modeはpersona!=="companion"を一律"conversation"へ正規化する（coach/analyst問わず、
+  // History上は「日記」「会話」の2つにしか表示しない、という表示名正規化）。
+  const mode: HistoryConversationMode = conversation.persona === "companion" ? "diary" : "conversation";
+  await updateHistoryIndex(root, {
+    kind: "conversation",
+    id: conversation.id,
+    day: conversation.startedAt.slice(0, 10),
+    mode,
+    turnCount: conversation.turns.length,
+  });
 }
 
 export async function writeConversationMarkdown(
@@ -927,11 +1164,18 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
     logSyncStep("memory render", Date.now() - renderStart);
     await writeFileInDir(dir, fileName, content, "memory");
     await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
-    // History Index（Step 1）：Reflection Summaryは1record1fileのため、月Indexへ
-    // idを直接記録する（通常Memoryのようにday-fileの既存件数からは新規/更新を
-    // 判別できないため、`updateHistoryIndex`側でidの有無から判定させる）。
+    // History Index（Step 1、v2でpreviewを追加）：Reflection Summaryは1record1file
+    // のため、月Indexへidベースでupsertする（`computeUpdatedDayEntryV2`参照。
+    // 既存ロジックでidの有無から判定させる）。previewはReflection本文（summary＝
+    // 全文）をHistory一覧用に切り詰めたものであり、Markdown本体は変更しない。
     // ここでもcatchせず、失敗をそのまま伝播させる。
-    await updateHistoryIndex(root, { kind: "reflection", id: memoryObject.id, day: memoryObject.date.slice(0, 10) });
+    await updateHistoryIndex(root, {
+      kind: "reflection",
+      id: memoryObject.id,
+      day: memoryObject.date.slice(0, 10),
+      preview: truncateHistoryPreview(memoryObject.summary),
+      createdAt: memoryObject.createdAt,
+    });
     memoryObject.metadata.obsidian = {
       ...memoryObject.metadata.obsidian,
       vaultPath: `Memories/${fileName}`,
@@ -949,14 +1193,24 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
 
   await writeFileInDir(dir, fileName, serialized, "memory");
   await updateIndex(root, memoryObject.id, `Memories/${fileName}`);
-  // History Index（Step 1、Codexレビュー指摘対応）：day-fileへ実際に書き込んだ後の
-  // マージ済み配列の件数（絶対値）をそのまま渡す。「新規か更新か」をここで判定して
-  // 差分加算する設計は、retry時にday-fileへ既にそのidが存在するため常に「更新」と
-  // 誤判定され、Index側の件数が永続的にずれる不具合があったため廃止した
-  // （`updateHistoryIndex`側は絶対値からmemoryCountを再計算するため、何度retryしても
-  // 同じ正しい値へ収束する）。catchせず、失敗をそのまま伝播させる
-  // （次回flushで本体・Index更新ともに再試行）。
-  await updateHistoryIndex(root, { kind: "memory", day: memoryObject.date.slice(0, 10), normalMemoryCount: merged.length });
+  // History Index（Step 1、Codexレビュー指摘対応。v2でnormalMemories配列を追加）：
+  // day-fileへ実際に書き込んだ後のマージ済み配列（絶対値）を、そのまま軽量化して
+  // 渡す。「新規か更新か」をここで判定して差分加算する設計は、retry時にday-fileへ
+  // 既にそのidが存在するため常に「更新」と誤判定され、Index側の件数が永続的に
+  // ずれる不具合があったため廃止した（`updateHistoryIndex`側は絶対値から
+  // 再計算するため、何度retryしても同じ正しい値へ収束する）。previewは追加の
+  // Markdown readを伴わない（`merged`は既にこの関数内で読み込み・マージ済み）。
+  // catchせず、失敗をそのまま伝播させる（次回flushで本体・Index更新ともに再試行）。
+  await updateHistoryIndex(root, {
+    kind: "memory",
+    day: memoryObject.date.slice(0, 10),
+    normalMemories: merged.map((m) => ({
+      id: m.id,
+      types: m.types,
+      preview: truncateHistoryPreview(m.summary),
+      createdAt: m.createdAt,
+    })),
+  });
   memoryObject.metadata.obsidian = {
     ...memoryObject.metadata.obsidian,
     vaultPath: `Memories/${fileName}`,
