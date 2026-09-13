@@ -15,8 +15,10 @@ import {
   readHistoryMeta,
   requestVaultPermission,
   restoreVaultHandle,
+  resyncVaultRegistry,
   waitForVaultWrites,
   type VaultRestoreResult,
+  type VaultResyncResult,
   type VaultScanResult,
   type VaultWritePriority,
 } from "@/lib/vault";
@@ -138,6 +140,21 @@ export type RestoreStatus = "idle" | "restoring" | "done";
  * 既存のvaultConnectFeedback等と同じく数秒後に自動で消す。
  */
 export type DataActionFeedback = { kind: "busy" | "success" | "empty" | "error"; message: string };
+
+/**
+ * Step 5：「Vaultを再同期」の進行状況・結果表示用。`detail`は「詳細を見る」で
+ * 開くBeta向けの簡易debug情報（applyErrors/unreadableFilesの内容を短くまとめた
+ * もの）であり、一般ユーザー向けメッセージ（`message`）には含めない。busy中は
+ * ボタンをdisabledにする（他のVaultボタンも`vaultActionsDisabled`経由で連動して
+ * disableする）。success/partial/errors/errorは自動では消さない
+ * （競合・見つからない等の件数はユーザーが確認するまで残す）。
+ */
+export type VaultResyncFeedback = {
+  kind: "busy" | "success" | "partial" | "errors" | "error";
+  message: string;
+  detail?: string;
+};
+
 type SendStatus = "idle" | "error" | "authError";
 
 export interface RestoreCandidate {
@@ -393,6 +410,7 @@ export default function ChatScreen() {
   /** 「Markdownをエクスポート」「この端末のデータを削除」（SettingsPanelのデータ欄）の状態。 */
   const [exportDataFeedback, setExportDataFeedback] = useState<DataActionFeedback | null>(null);
   const [deleteDataFeedback, setDeleteDataFeedback] = useState<DataActionFeedback | null>(null);
+  const [vaultResyncFeedback, setVaultResyncFeedback] = useState<VaultResyncFeedback | null>(null);
   /**
    * トップ画面の「アクセスを再許可」カードの「あとで」で非表示にしたかどうか。
    * ページセッション中のみ有効（stateなのでリロードで自動的にfalseへ戻り、
@@ -2388,6 +2406,96 @@ export default function ChatScreen() {
   }
 
   /**
+   * Step 5：「Vaultを再同期」。ユーザーが外部（Obsidian等）でMarkdownを移動・編集・
+   * 追加した場合に、明示的な操作でのみVault Registry/IndexedDB/History Indexを
+   * 再整合させる（`resyncVaultRegistry`、起動時の自動実行は一切しない）。
+   *
+   * `vaultOperationLockRef`は既存のhandleConnectVault/handleReauthorizeVault/
+   * handleRestoreFromVaultと共有する軽いロックをそのまま再利用する（Vault管理系
+   * 操作同士の同時実行を防ぐ、既存の設計方針を踏襲。新しいロックは作らない）。
+   * conflict/missing/unreadableの解決（どちらを採用するか・削除するか等）は
+   * 今回のStepでは一切行わない——件数の表示だけに留める。
+   */
+  async function handleResyncVault() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    vaultOperationLockRef.current = true;
+    setVaultResyncFeedback({ kind: "busy", message: "再同期中…" });
+    try {
+      const result: VaultResyncResult = await resyncVaultRegistry(vaultHandle);
+      const { counts, applyErrors, unreadableFiles } = result;
+
+      const changedLines: string[] = [];
+      if (counts.added > 0) changedLines.push(`追加 ${counts.added}`);
+      if (counts.edited > 0) changedLines.push(`更新 ${counts.edited}`);
+      if (counts.moved > 0) changedLines.push(`移動 ${counts.moved}`);
+
+      const attentionLines: string[] = [];
+      if (counts.conflict > 0) attentionLines.push(`競合 ${counts.conflict}`);
+      if (counts.missing > 0) attentionLines.push(`見つからない ${counts.missing}`);
+      if (counts.unreadable > 0) attentionLines.push(`読み取れないファイル ${counts.unreadable}`);
+
+      // 完全成功の表示は scanCompleted/applyErrors/conflict/missing/unreadable の
+      // 全てが問題無い場合だけに限定する。scanCompleted=falseはVault全体の
+      // directory enumerationが最後まで完走しなかったことを意味し（Step 4c）、
+      // その時点までのpositive changeは既にapply済みの可能性があるため、
+      // 「エラーで全部失敗した」とは扱わずpartial表示に倒す（applyErrorsが
+      // 無ければ「反映できませんでした」ではなく「一部を確認できませんでした」
+      // という、scan未完了専用の文言にする）。
+      let headline: string;
+      let kind: VaultResyncFeedback["kind"];
+      if (applyErrors.length > 0) {
+        headline = "再同期は完了しましたが、一部を反映できませんでした。";
+        kind = "errors";
+      } else if (!result.scanCompleted) {
+        headline = "再同期は完了しましたが、Vaultの一部を確認できませんでした。";
+        kind = "partial";
+      } else if (attentionLines.length > 0) {
+        headline = "再同期しました。確認が必要な項目があります。";
+        kind = "partial";
+      } else {
+        headline = "再同期しました。";
+        kind = "success";
+      }
+
+      const detailLines = [...changedLines, ...attentionLines];
+      const message = detailLines.length > 0 ? `${headline}\n${detailLines.join("　")}` : headline;
+
+      // Beta向けの簡易debug情報（「詳細を見る」でのみ表示、生のstack traceは含めない）。
+      const debugLines = [
+        ...applyErrors.map((e) => `apply: ${e.registryKey}: ${e.reason}`),
+        ...unreadableFiles.map((f) => `read: ${f.path}: ${f.reason}`),
+      ];
+
+      setVaultResyncFeedback({
+        kind,
+        message,
+        detail: debugLines.length > 0 ? debugLines.join("\n") : undefined,
+      });
+
+      // History Indexはresync engine自身が更新済みのため、HistoryPanel側の
+      // 既存refresh経路（refreshToken）を再利用するだけでよい（新しいevent bus・
+      // 全体reloadは行わない）。Tree（つむぎの木）は起動時のLaunchTreeScreenのみが
+      // 実際に到達可能で、同一セッション内で再表示されることは無いため、
+      // 追加のrefresh処理は不要（次回起動時にhistory-meta.jsonを新たに読み直す）。
+      bumpHistoryRefreshToken();
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        // crossTabStale側の既存バナーへ処理を委ねるため、「再同期中…」のまま
+        // ボタンが固まって見えないよう、このpanel自身のfeedbackは消す。
+        setVaultResyncFeedback(null);
+        return;
+      }
+      console.error("Failed to resync vault", error);
+      setVaultResyncFeedback({
+        kind: "error",
+        message: "Vaultを再同期できませんでした。もう一度お試しください。",
+      });
+    } finally {
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
    * 「本日はここまで」。UI_UX.md「Users never press Save」の"Save"ではない
    * （保存は既にCaptureが自動で行っている）。あくまで任意の締めくくりの操作。
    * 既存のCaptureは呼ばない。既存のmemoryObjectを材料に、別のinsight MemoryObjectを1つ作る。
@@ -3553,11 +3661,13 @@ export default function ChatScreen() {
             onConnectVault={() => void handleConnectVault()}
             onReauthorizeVault={() => void handleReauthorizeVault()}
             onRestoreFromVault={() => void handleRestoreFromVault()}
-            vaultActionsDisabled={isVaultSwitching || crossTabStale}
+            vaultActionsDisabled={isVaultSwitching || crossTabStale || vaultResyncFeedback?.kind === "busy"}
             exportDataFeedback={exportDataFeedback}
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}
             onDeleteData={() => void handleDeleteData()}
+            vaultResyncFeedback={vaultResyncFeedback}
+            onResyncVault={() => void handleResyncVault()}
           />
         </div>
       )}

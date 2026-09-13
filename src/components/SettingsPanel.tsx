@@ -1,11 +1,13 @@
 "use client";
 
+import { useState } from "react";
 import type {
   DataActionFeedback,
   RestoreCandidate,
   RestoreStatus,
   SupportedChatProvider,
   VaultConnectFeedback,
+  VaultResyncFeedback,
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend } from "@/lib/vault";
@@ -36,6 +38,8 @@ export default function SettingsPanel({
   deleteDataFeedback,
   onExportData,
   onDeleteData,
+  vaultResyncFeedback,
+  onResyncVault,
 }: {
   chatProvider: SupportedChatProvider;
   keyStatusByProvider: Record<SupportedChatProvider, boolean>;
@@ -62,7 +66,11 @@ export default function SettingsPanel({
   deleteDataFeedback: DataActionFeedback | null;
   onExportData: () => void;
   onDeleteData: () => void;
+  /** Step 5：「Vaultを再同期」の進行状況・結果。 */
+  vaultResyncFeedback: VaultResyncFeedback | null;
+  onResyncVault: () => void;
 }) {
+  const [showResyncDetail, setShowResyncDetail] = useState(false);
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
       <div className="flex max-h-[85dvh] w-full max-w-md flex-col gap-6 overflow-y-auto">
@@ -188,6 +196,64 @@ export default function SettingsPanel({
                 >
                   変更する
                 </button>
+              )}
+            </div>
+          )}
+
+          {/*
+            Step 5：明示的なVault再同期。Obsidian等で外部からMarkdownを移動・編集・
+            追加した場合に、ユーザーが能動的に押した時だけTsumugiへ反映する
+            （自動実行はしない）。Registry/IndexedDB/History Index等の内部用語は
+            表示せず、Vault/Markdownという利用者が既に見慣れた言葉だけを使う。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <div className="flex flex-col gap-2 border-t border-black/5 pt-3 dark:border-white/10">
+              <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
+                <div className="flex flex-col gap-0.5">
+                  <span>Vaultを再同期</span>
+                  <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                    Obsidianなどで移動・編集したMarkdownをTsumugiに反映します。
+                  </span>
+                </div>
+                <button
+                  onClick={onResyncVault}
+                  disabled={vaultActionsDisabled || restoreStatus === "restoring"}
+                  className="shrink-0 rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                >
+                  {vaultResyncFeedback?.kind === "busy" ? "再同期中…" : "Vaultを再同期"}
+                </button>
+              </div>
+
+              {vaultResyncFeedback && vaultResyncFeedback.kind !== "busy" && (
+                <div className="flex flex-col gap-1">
+                  <p
+                    className={`whitespace-pre-line text-xs ${
+                      vaultResyncFeedback.kind === "errors" || vaultResyncFeedback.kind === "error"
+                        ? "text-red-600 dark:text-red-400"
+                        : vaultResyncFeedback.kind === "partial"
+                          ? "text-amber-600 dark:text-amber-400"
+                          : "text-stone-500 dark:text-stone-400"
+                    }`}
+                  >
+                    {vaultResyncFeedback.message}
+                  </p>
+                  {vaultResyncFeedback.detail && (
+                    <div>
+                      <button
+                        type="button"
+                        onClick={() => setShowResyncDetail((value) => !value)}
+                        className="text-[11px] text-stone-400 underline underline-offset-2 hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300"
+                      >
+                        {showResyncDetail ? "詳細を隠す" : "詳細を見る"}
+                      </button>
+                      {showResyncDetail && (
+                        <pre className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap rounded-lg bg-stone-100 p-2 text-[10px] text-stone-500 dark:bg-stone-900 dark:text-stone-400">
+                          {vaultResyncFeedback.detail}
+                        </pre>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}
