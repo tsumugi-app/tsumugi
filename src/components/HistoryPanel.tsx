@@ -77,6 +77,18 @@ interface DayRecords {
   memories: MemoryObject[];
 }
 
+/** month indexのreflectionIds/conversationIdsに依存する読み込み結果（マージ前）。 */
+interface ExtraDayRecords {
+  conversations: Conversation[];
+  reflections: MemoryObject[];
+}
+
+/** 同一History表示セッション内だけの短期キャッシュ1件分（`DayCache`参照）。 */
+interface DayCacheEntry {
+  normalMemories: MemoryObject[];
+  extraDayRecords: ExtraDayRecords;
+}
+
 /**
  * 「いつ何を話したかを見る場所」という時間軸中心のHistory UI（Vault読込方式の
  * 再設計、Step 3）。
@@ -138,9 +150,7 @@ export default function HistoryPanel({
   // 別々に読み、2つのstateを`dayRecords`（下のuseMemo）で安全にマージする
   // （読込順序の見直し：通常MemoryはmonthLoadingを待たずに先行開始する）。
   const [normalMemories, setNormalMemories] = useState<MemoryObject[]>([]);
-  const [extraDayRecords, setExtraDayRecords] = useState<{ conversations: Conversation[]; reflections: MemoryObject[] }>(
-    { conversations: [], reflections: [] }
-  );
+  const [extraDayRecords, setExtraDayRecords] = useState<ExtraDayRecords>({ conversations: [], reflections: [] });
   const [dayLoading, setDayLoading] = useState(false);
 
   // race対策：月Index読み込み・日付詳細読み込み（通常Memory／Reflection・Conversationの
@@ -155,6 +165,23 @@ export default function HistoryPanel({
   // いない件数。0になった時点で初めてdayLoadingをfalseにする（どちらか一方だけ終わった
   // 時点でロード完了扱いにしない）。
   const dayPartsPendingRef = useRef(0);
+  // 同一History表示セッション（このコンポーネントがマウントされている間）だけの
+  // 短期メモリキャッシュ。History Index・Vaultデータそのものを置き換えるものではなく、
+  // 「A→B→A」のように同じ日を行き来した際にVault I/Oを省略するためだけの一時キャッシュ。
+  // アンマウントで自然に消える（この変数自体がuseRefの初期値として再生成される）。
+  const dayCacheRef = useRef<Map<string, DayCacheEntry>>(new Map());
+  // normalMemories/extraDayRecords stateの「今の値」を、非同期コールバック側からも
+  // 同期的に参照するためのミラー。2つの独立した読み込みのどちらが最後に完了しても、
+  // その時点の両方の最新値をまとめてdayCacheRefへ書き込めるようにするために使う
+  // （stateの読み取りだけでは、片方のeffectのコールバックからもう片方の最新値を
+  // 直接参照できないため）。
+  const normalMemoriesRef = useRef<MemoryObject[]>([]);
+  const extraDayRecordsRef = useRef<ExtraDayRecords>({ conversations: [], reflections: [] });
+  // 現在選択中の日について、通常Memory／Reflection・Conversationの実読み込みeffectを
+  // 走らせる必要が無い（＝dayCacheRefにヒットした、またはvaultHandle/selectedDayが
+  // 無い）ことを示すフラグ。日付リセットeffectが同期的に設定し、直後に同一コミット内で
+  // 走る2つの読み込みeffectがこれを見て自身のfetchを省略する。
+  const skipDayFetchRef = useRef(false);
   // vaultHandleが実際に変わった（別Vaultへ切替）ことを検知するためだけの参照。
   const previousVaultHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   // Vault切替を検知するたびに増やす、このコンポーネント内だけの世代カウンタ。
@@ -167,6 +194,11 @@ export default function HistoryPanel({
   // 再度自動オープンしない（ユーザーが手動で別のMemoryを開いた後に、古いターゲットへ
   // 引き戻さないため）。vaultHandleが変わった場合はpropの値へ再度リセットする。
   const pendingInitialMemoryIdRef = useRef<string | undefined>(initialMemoryId);
+  // dayCacheRefを「vaultHandleまたはrefreshTokenが実際に変わった時」だけ丸ごと破棄する
+  // ための直前値の記録（selectedDayだけが変わった場合はキャッシュを破棄しない——
+  // それこそがこのキャッシュの存在意義であるA→B→Aの再訪高速化のため）。
+  const previousVaultHandleForCacheRef = useRef<FileSystemDirectoryHandle | null>(null);
+  const previousRefreshTokenForCacheRef = useRef<number | undefined>(refreshToken);
 
   /**
    * Vault境界の安全性＋月Index二重読込の解消：vaultHandleが変わった（別Vaultへ切替）
@@ -248,44 +280,91 @@ export default function HistoryPanel({
   }, [vaultHandle, viewYear, viewMonth, refreshToken]);
 
   /**
-   * 日付詳細読み込み・その1（リセット）：選択日／Vaultが変わるたびに、通常Memory・
-   * Reflection/Conversationの両方の状態をクリアし、2件とも完了するまでdayLoadingを
-   * trueに保つ（`dayPartsPendingRef`で管理）。実際の読込は下の2つのeffectがそれぞれ
-   * 独立して行う。
+   * 日付詳細読み込み・その1（リセット＋キャッシュ確認）：選択日／Vault／refreshTokenが
+   * 変わるたびに走る。
+   *
+   * キャッシュ（`dayCacheRef`、同一History表示セッション内だけの短期メモリキャッシュ。
+   * History Index・Vaultデータそのものを置き換えるものではない）は、vaultHandleまたは
+   * refreshTokenが実際に変わった場合だけ丸ごと破棄する（selectedDayだけの変化では
+   * 破棄しない——これがA→B→Aの再訪でVault I/Oを省略できる理由そのもの）。
+   *
+   * 選択日がキャッシュにヒットすれば、Vaultへは一切アクセスせずその場でstateを復元し、
+   * `dayLoading`をtrueへ戻さない（要求通り、既読日の再表示は即時）。ヒットしなければ
+   * 従来通り状態をクリアしてdayLoadingをtrueにし、`skipDayFetchRef`をfalseにして
+   * 下の2つの読み込みeffectに実際のfetchを行わせる。
    */
   useEffect(() => {
+    const cacheInvalidated =
+      previousVaultHandleForCacheRef.current !== vaultHandle || previousRefreshTokenForCacheRef.current !== refreshToken;
+    previousVaultHandleForCacheRef.current = vaultHandle;
+    previousRefreshTokenForCacheRef.current = refreshToken;
+    if (cacheInvalidated) {
+      dayCacheRef.current.clear();
+    }
+
     dayRequestRef.current += 1;
-    setNormalMemories([]);
-    setExtraDayRecords({ conversations: [], reflections: [] });
+
     if (!vaultHandle || !selectedDay) {
+      skipDayFetchRef.current = true;
+      normalMemoriesRef.current = [];
+      extraDayRecordsRef.current = { conversations: [], reflections: [] };
+      setNormalMemories([]);
+      setExtraDayRecords({ conversations: [], reflections: [] });
       dayPartsPendingRef.current = 0;
       setDayLoading(false);
       return;
     }
+
+    const cached = dayCacheRef.current.get(selectedDay);
+    if (cached) {
+      skipDayFetchRef.current = true;
+      normalMemoriesRef.current = cached.normalMemories;
+      extraDayRecordsRef.current = cached.extraDayRecords;
+      setNormalMemories(cached.normalMemories);
+      setExtraDayRecords(cached.extraDayRecords);
+      dayPartsPendingRef.current = 0;
+      setDayLoading(false);
+      return;
+    }
+
+    skipDayFetchRef.current = false;
+    normalMemoriesRef.current = [];
+    extraDayRecordsRef.current = { conversations: [], reflections: [] };
+    setNormalMemories([]);
+    setExtraDayRecords({ conversations: [], reflections: [] });
     dayPartsPendingRef.current = 2;
     setDayLoading(true);
-  }, [vaultHandle, selectedDay]);
+  }, [vaultHandle, selectedDay, refreshToken]);
 
   /**
    * 日付詳細読み込み・その2（通常Memory）：`Memories/YYYY-MM-DD.md`はmonth index
    * （reflectionIds/conversationIds）に一切依存しないため、選択日が確定した時点で
-   * month indexの読込完了（monthLoading）を待たずに開始する。
+   * month indexの読込完了（monthLoading）を待たずに開始する。`skipDayFetchRef`が
+   * true（キャッシュヒット、またはvaultHandle/selectedDayが無い）の場合は何もしない。
    */
   useEffect(() => {
-    if (!vaultHandle || !selectedDay) return;
+    if (!vaultHandle || !selectedDay || skipDayFetchRef.current) return;
     const requestId = dayRequestRef.current;
     const handle = vaultHandle;
     const day = selectedDay;
     readMemoriesForDay(handle, day)
       .then((memories) => {
         if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
+        normalMemoriesRef.current = memories;
         setNormalMemories(memories);
         dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
-        if (dayPartsPendingRef.current === 0) setDayLoading(false);
+        if (dayPartsPendingRef.current === 0) {
+          dayCacheRef.current.set(day, {
+            normalMemories: normalMemoriesRef.current,
+            extraDayRecords: extraDayRecordsRef.current,
+          });
+          setDayLoading(false);
+        }
       })
       .catch((error) => {
         if (dayRequestRef.current !== requestId) return;
         console.error("Failed to load memories for day", error);
+        normalMemoriesRef.current = [];
         setNormalMemories([]);
         dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
         if (dayPartsPendingRef.current === 0) setDayLoading(false);
@@ -297,10 +376,10 @@ export default function HistoryPanel({
    * `conversationIds`が判明してから（monthLoading完了後）だけ読む。同じ日に複数件
    * ある場合、`Memories`/`Conversations`ディレクトリハンドルをそれぞれ1回だけ
    * （必要な場合のみ）解決し、各readへ使い回す（毎item`getDirectoryHandle`を
-   * 取り直さない）。
+   * 取り直さない）。`skipDayFetchRef`がtrueの場合は何もしない。
    */
   useEffect(() => {
-    if (!vaultHandle || !selectedDay || monthLoading) return;
+    if (!vaultHandle || !selectedDay || monthLoading || skipDayFetchRef.current) return;
     const requestId = dayRequestRef.current;
     const handle = vaultHandle;
     const day = selectedDay;
@@ -327,12 +406,21 @@ export default function HistoryPanel({
         const conversations = conversationResults.filter(
           (conversation): conversation is Conversation => conversation !== null
         );
-        setExtraDayRecords({ conversations, reflections });
+        const records: ExtraDayRecords = { conversations, reflections };
+        extraDayRecordsRef.current = records;
+        setExtraDayRecords(records);
         dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
-        if (dayPartsPendingRef.current === 0) setDayLoading(false);
+        if (dayPartsPendingRef.current === 0) {
+          dayCacheRef.current.set(day, {
+            normalMemories: normalMemoriesRef.current,
+            extraDayRecords: extraDayRecordsRef.current,
+          });
+          setDayLoading(false);
+        }
       } catch (error) {
         if (dayRequestRef.current !== requestId) return;
         console.error("Failed to load day records", error);
+        extraDayRecordsRef.current = { conversations: [], reflections: [] };
         setExtraDayRecords({ conversations: [], reflections: [] });
         dayPartsPendingRef.current = Math.max(0, dayPartsPendingRef.current - 1);
         if (dayPartsPendingRef.current === 0) setDayLoading(false);
@@ -424,106 +512,129 @@ export default function HistoryPanel({
     setSelectedDay(day);
     setSelectedMemory(null);
     setSelectedConversation(null);
-    // 前の日付の表示が一瞬でも残らないよう、ここで即座にクリアする（実際の
-    // requestId発行・dayPartsPendingRefのリセットは、直後に走るreset effect
-    // （selectedDayの変化を検知して発火する）が行う）。
-    setNormalMemories([]);
-    setExtraDayRecords({ conversations: [], reflections: [] });
-    setDayLoading(true);
+    // 前の日付の表示が一瞬でも残らないよう、ここで即座に更新する（実際の
+    // requestId発行・skipDayFetchRef/dayPartsPendingRefの確定は、直後に走る
+    // reset effect（selectedDayの変化を検知して発火する）が同じ判定を行う。
+    // ここでも同一History表示セッション内キャッシュ（dayCacheRef）を確認し、
+    // ヒットしていれば「読み込んでいます…」を一瞬たりとも出さず即時表示する
+    // （キャッシュヒット時にdayLoadingをtrueへ戻さない、という要件のため）。
+    const cached = dayCacheRef.current.get(day);
+    if (cached) {
+      normalMemoriesRef.current = cached.normalMemories;
+      extraDayRecordsRef.current = cached.extraDayRecords;
+      setNormalMemories(cached.normalMemories);
+      setExtraDayRecords(cached.extraDayRecords);
+      setDayLoading(false);
+    } else {
+      normalMemoriesRef.current = [];
+      extraDayRecordsRef.current = { conversations: [], reflections: [] };
+      setNormalMemories([]);
+      setExtraDayRecords({ conversations: [], reflections: [] });
+      setDayLoading(true);
+    }
   }
 
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
-      <div className="flex max-h-[85dvh] w-full max-w-md flex-col gap-5 overflow-y-auto">
-        <div className="flex items-center justify-between">
-          <p className="text-lg text-stone-800 dark:text-stone-100">これまでの記憶</p>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-full border border-stone-300/70 px-4 py-1.5 text-xs text-stone-600 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-300 dark:hover:bg-white/5"
-          >
-            閉じる
-          </button>
+      <div className="flex h-[85dvh] w-full max-w-md flex-col overflow-hidden">
+        {/*
+          レイアウト安定化（案B）：以前はこの外枠全体が「コンテンツ量に応じた可変高さの
+          1つのスクロール領域」（max-h＋overflow-y-auto）だったため、選択日の履歴の
+          長さが変わるたびに外枠全体の高さが変化し、外側の`items-center justify-center`
+          （画面中央配置）が再計算されて、カレンダーごとパネル全体が画面内で上下に
+          動いて見えていた。ここでは外枠の高さを固定（h-[85dvh]、既存のカレンダーとの
+          見た目のバランスを保つため従来のmax-h値をそのまま流用）＋overflow-hidden
+          にした上で、内部をflex columnで「上段＝見出し・月移動・曜日・カレンダー
+          グリッド（shrink-0、自然な高さのまま）」「下段＝選択日の履歴（flex-1＋
+          min-h-0＋overflow-y-auto、この部分だけが独立してスクロールする）」の2領域に
+          分割する。カレンダー本体は一切スクロールせず、外枠の高さも履歴の長さに関わらず
+          常に一定のため、カレンダー位置が画面内で動かない。デザイン・配色は変更しない。
+        */}
+        <div className="flex shrink-0 flex-col gap-5">
+          <div className="flex items-center justify-between">
+            <p className="text-lg text-stone-800 dark:text-stone-100">これまでの記憶</p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full border border-stone-300/70 px-4 py-1.5 text-xs text-stone-600 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-300 dark:hover:bg-white/5"
+            >
+              閉じる
+            </button>
+          </div>
+
+          {!vaultHandle ? (
+            <p className="text-sm text-stone-400 dark:text-stone-500">保存先が接続されていません。</p>
+          ) : (
+            <>
+              <div className="flex items-center justify-between">
+                <button
+                  type="button"
+                  onClick={() => goToMonth(-1)}
+                  className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                >
+                  前月
+                </button>
+                <p className="text-sm text-stone-700 dark:text-stone-300">
+                  {viewYear}年{viewMonth}月
+                </p>
+                <button
+                  type="button"
+                  onClick={() => goToMonth(1)}
+                  className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                >
+                  翌月
+                </button>
+              </div>
+
+              <div className="grid grid-cols-7 gap-1 text-center text-[11px] text-stone-400 dark:text-stone-500">
+                {WEEKDAY_LABELS.map((label) => (
+                  <span key={label}>{label}</span>
+                ))}
+              </div>
+
+              <div className="flex flex-col gap-1">
+                {monthGrid.map((week, weekIndex) => (
+                  <div key={weekIndex} className="grid grid-cols-7 gap-1">
+                    {week.map((day, dayIndex) => {
+                      if (!day) {
+                        return <div key={dayIndex} />;
+                      }
+                      const dayNumber = Number(day.slice(8, 10));
+                      const isSelected = day === selectedDay;
+                      const hasRecord = dayHasRecord(day);
+                      return (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => selectDay(day)}
+                          className={`flex flex-col items-center gap-0.5 rounded-xl border px-1 py-1.5 text-xs transition ${
+                            isSelected
+                              ? "border-stone-800 bg-stone-800 text-stone-50 dark:border-stone-200 dark:bg-stone-200 dark:text-stone-900"
+                              : "border-transparent text-stone-600 hover:bg-stone-900/5 dark:text-stone-300 dark:hover:bg-white/5"
+                          }`}
+                        >
+                          <span>{dayNumber}</span>
+                          <span
+                            className={`h-1 w-1 rounded-full ${
+                              hasRecord ? (isSelected ? "bg-stone-50 dark:bg-stone-900" : "bg-stone-500 dark:bg-stone-400") : ""
+                            }`}
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
-        {!vaultHandle ? (
-          <p className="text-sm text-stone-400 dark:text-stone-500">保存先が接続されていません。</p>
-        ) : (
-          <>
-            <div className="flex items-center justify-between">
-              <button
-                type="button"
-                onClick={() => goToMonth(-1)}
-                className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-              >
-                前月
-              </button>
-              <p className="text-sm text-stone-700 dark:text-stone-300">
-                {viewYear}年{viewMonth}月
-              </p>
-              <button
-                type="button"
-                onClick={() => goToMonth(1)}
-                className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-              >
-                翌月
-              </button>
-            </div>
+        {vaultHandle && selectedDay && (
+          <div className="mt-5 min-h-0 flex-1 overflow-y-auto">
+            <div className="flex flex-col gap-3 border-t border-black/5 pt-4 dark:border-white/10">
+              <p className="text-xs text-stone-400 dark:text-stone-500">{selectedDay}</p>
 
-            <div className="grid grid-cols-7 gap-1 text-center text-[11px] text-stone-400 dark:text-stone-500">
-              {WEEKDAY_LABELS.map((label) => (
-                <span key={label}>{label}</span>
-              ))}
-            </div>
-
-            <div className="flex flex-col gap-1">
-              {monthGrid.map((week, weekIndex) => (
-                <div key={weekIndex} className="grid grid-cols-7 gap-1">
-                  {week.map((day, dayIndex) => {
-                    if (!day) {
-                      return <div key={dayIndex} />;
-                    }
-                    const dayNumber = Number(day.slice(8, 10));
-                    const isSelected = day === selectedDay;
-                    const hasRecord = dayHasRecord(day);
-                    return (
-                      <button
-                        key={day}
-                        type="button"
-                        onClick={() => selectDay(day)}
-                        className={`flex flex-col items-center gap-0.5 rounded-xl border px-1 py-1.5 text-xs transition ${
-                          isSelected
-                            ? "border-stone-800 bg-stone-800 text-stone-50 dark:border-stone-200 dark:bg-stone-200 dark:text-stone-900"
-                            : "border-transparent text-stone-600 hover:bg-stone-900/5 dark:text-stone-300 dark:hover:bg-white/5"
-                        }`}
-                      >
-                        <span>{dayNumber}</span>
-                        <span
-                          className={`h-1 w-1 rounded-full ${
-                            hasRecord ? (isSelected ? "bg-stone-50 dark:bg-stone-900" : "bg-stone-500 dark:bg-stone-400") : ""
-                          }`}
-                        />
-                      </button>
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
-
-            {/*
-              UI安定化：以前は「monthLoading中はこの外枠ごと出さない」→「monthLoading
-              完了後にこの枠が現れ、その中でさらにdayLoadingを見る」という2段階の
-              出現だったため、カレンダー直下の高さが2回変化していた。selectedDayが
-              確定していれば（通常は常にtrue）この外枠（区切り線・日付ラベル）自体は
-              常に出したままにし、中身だけを「読み込んでいます…」⇄実際の内容で
-              切り替えることで、外枠の出現によるレイアウト変化を1回減らす（見た目・
-              配色・大規模な作り直しはしない）。
-            */}
-            {selectedDay && (
-              <div className="flex flex-col gap-3 border-t border-black/5 pt-4 dark:border-white/10">
-                <p className="text-xs text-stone-400 dark:text-stone-500">{selectedDay}</p>
-
-                {monthLoading || dayLoading ? (
+              {monthLoading || dayLoading ? (
                   <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>
                 ) : selectedConversation ? (
                   <div className="flex flex-col gap-3">
@@ -641,8 +752,7 @@ export default function HistoryPanel({
                   </div>
                 )}
               </div>
-            )}
-          </>
+            </div>
         )}
       </div>
     </div>
