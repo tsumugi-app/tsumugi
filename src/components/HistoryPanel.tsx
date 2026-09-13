@@ -619,10 +619,40 @@ export default function HistoryPanel({
 
   const monthGrid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
 
+  /**
+   * 月を移動する際、選択中の日付を必ず解除する（重要：データ整合性バグ対応）。
+   *
+   * 以前はselectedDayを保持したまま月だけ移動できたため、「新しいmonthIndex」と
+   * 「古い月のselectedDay」という組み合わせが一時的に成立し得た。この状態で
+   * 「日付詳細・その2（解決）」effectが発火すると、新しい月のmonthIndexの中に
+   * 古い日付のdayEntryを探すことになり、ほぼ確実にundefinedとなってv1 fallback
+   * 経路（readMemoriesForDay等）へ進んでしまう。fallback自体はmonthをまたいで
+   * 直接day-fileを読むため一部のデータ（通常Memory）だけが見つかることがあり、
+   * その不完全な結果（Conversation/Reflectionは常に空）でlazy upgradeが実行される
+   * と、その日が本来v1で持っていたconversationIds/reflectionIdsを失った、
+   * 空のconversations/reflectionsを持つv2 entryとしてHistory Indexへ書き込まれて
+   * しまう。`isHistoryDayIndexV2`は一度v2になったentryを二度とv1 fallbackへ
+   * 戻さないため、この誤ったv2化は通常の操作では二度と修復されない
+   * （データ整合性バグ）。
+   *
+   * ここでselectedDayをnullにすることで、「日付詳細・その2」effectの冒頭ガード
+   * （`if (!vaultHandle || !selectedDay || ...) return;`）が即座に働き、上記の
+   * 誤ったfallback読み込み・誤ったlazy upgradeは一切発生しなくなる。
+   * conversationRows/memoryRows/dayLoadingは、selectedDayを依存に持つ既存の
+   * 「日付詳細・その1（リセット＋キャッシュ確認）」effectがselectedDay===nullの
+   * 分岐で自動的にクリアするため、ここで重複して手動クリアはしない。
+   * selectedMemory/selectedConversationは、selectedDayの変化だけでは自動的に
+   * クリアされる既存effectが無い（表示は`{selectedDay && (...)}`のゲートで
+   * 隠れるだけでstate自体は残る）ため、`selectDay()`と同様にここで明示的に
+   * クリアする。
+   */
   function goToMonth(delta: number) {
     const next = addMonths(viewYear, viewMonth, delta);
     setViewYear(next.year);
     setViewMonth(next.month);
+    setSelectedDay(null);
+    setSelectedMemory(null);
+    setSelectedConversation(null);
   }
 
   function selectDay(day: string) {
