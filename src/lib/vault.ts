@@ -1149,12 +1149,24 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
 
   // Vault Registry（Step 2）：真の新規recordは現行命名規則、既存recordは
   // registry記載のactual pathへ。needs-resync/missing/conflictは書き込み保留。
+  //
+  // Registry absent baseline gate：Registry entryが無いというだけでは
+  // 「真に新規」を意味しない（Registry導入前のlegacy recordもRegistry absent
+  // になり得るため）。baselineEstablishedAt（初回full resync成功時刻、以後
+  // 不変）より後にこのConversationがcreateされた場合にのみ「真に新規」と
+  // 判定する。baseline未確立、またはcreatedAtがbaseline以前/不正な場合は
+  // 一律write保留とし、旧pathへの自動再作成を絶対に行わない。
   const registryKey = conversation.id;
   const lookup = await lookupVaultRegistryRecord(root, registryKey);
   let targetDir = dir;
   let fileName: string;
   let relativePath: string;
   if (lookup.entry === undefined) {
+    const meta = await readVaultRegistryMeta(root);
+    const baselineEstablishedAt = meta.baselineEstablishedAt;
+    if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(conversation.createdAt, baselineEstablishedAt)) {
+      throw new VaultRecordNeedsResyncError("conversation", registryKey, "needs-resync");
+    }
     fileName = fileNameFor(conversation.id, conversation.startedAt);
     relativePath = `Conversations/${fileName}`;
   } else if (lookup.entry.status === "ok") {
@@ -1227,12 +1239,20 @@ async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: 
 
   // Vault Registry（Step 2）：Conversationと同じ分岐（真の新規／既存recordの
   // registry path／needs-resync等でwrite保留）。
+  //
+  // Registry absent baseline gate：Conversationと同じ判定
+  // （`isRecordNewerThanBaseline`のコメント参照）。
   const registryKey = source.id;
   const lookup = await lookupVaultRegistryRecord(root, registryKey);
   let targetDir = dir;
   let fileName: string;
   let relativePath: string;
   if (lookup.entry === undefined) {
+    const meta = await readVaultRegistryMeta(root);
+    const baselineEstablishedAt = meta.baselineEstablishedAt;
+    if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(source.createdAt, baselineEstablishedAt)) {
+      throw new VaultRecordNeedsResyncError("source", registryKey, "needs-resync");
+    }
     fileName = fileNameFor(source.id, source.createdAt);
     relativePath = `Sources/${fileName}`;
   } else if (lookup.entry.status === "ok") {
@@ -1282,6 +1302,30 @@ function isReflectionSummary(memoryObject: MemoryObject): boolean {
   return memoryObject.metadata.source === "system-generated";
 }
 
+/**
+ * normal Memory day-file（Registry absent時）のbaseline gateに使う。指定した
+ * dayについて、IndexedDB上に存在する全normal Memory（Reflectionは対象外——
+ * Reflectionは1record1fileであり、day-file containerのmemberではないため）の
+ * createdAtが、1件残らずbaselineEstablishedAtより後かどうかを判定する。
+ *
+ * 今回書こうとしている1件のmemoryObjectだけでなく、同じdayの既存member全員を
+ * 見ることで、「legacy memberが1件でも存在する日には、新規memberが来ても
+ * day-fileを新規createしない」という安全側の判定にする。
+ *
+ * dayMembersが0件の場合は`every`の仕様上trueになってしまうが、これを
+ * 「true newと証明できた」とは扱わない——このhelperはnormal Memory write中に
+ * 呼ばれるため、本来は書こうとしている当該memoryObject自身が`putMemoryObject`
+ * 済みでIndexedDB上に存在しているはずであり（`writeMemoryObjectMarkdown`は
+ * 呼び出し元が`putMemoryObject`後に呼ぶ）、0件はそれが何らかの理由で見えて
+ * いない異常系を意味する。真に0件かどうかをここで推測せず、安全側にHOLDする。
+ */
+async function isMemoryDayContainerAllNew(day: string, baselineEstablishedAt: string): Promise<boolean> {
+  const all = await getAllMemoryObjects();
+  const dayMembers = all.filter((m) => !isReflectionSummary(m) && m.date.slice(0, 10) === day);
+  if (dayMembers.length === 0) return false;
+  return dayMembers.every((m) => isRecordNewerThanBaseline(m.createdAt, baselineEstablishedAt));
+}
+
 async function readDayFileEntries(
   dir: FileSystemDirectoryHandle,
   fileName: string
@@ -1307,12 +1351,20 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
   if (isReflectionSummary(memoryObject)) {
     // Vault Registry（Step 2）：Reflectionは1record1fileのため、Conversation/Sourceと
     // 同じ分岐（真の新規／既存recordのregistry path／needs-resync等でwrite保留）。
+    //
+    // Registry absent baseline gate：Conversationと同じ判定
+    // （`isRecordNewerThanBaseline`のコメント参照）。
     const registryKey = memoryObject.id;
     const lookup = await lookupVaultRegistryRecord(root, registryKey);
     let targetDir = dir;
     let fileName: string;
     let relativePath: string;
     if (lookup.entry === undefined) {
+      const meta = await readVaultRegistryMeta(root);
+      const baselineEstablishedAt = meta.baselineEstablishedAt;
+      if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(memoryObject.createdAt, baselineEstablishedAt)) {
+        throw new VaultRecordNeedsResyncError("reflection", registryKey, "needs-resync");
+      }
       fileName = fileNameFor(memoryObject.id, memoryObject.date);
       relativePath = `Memories/${fileName}`;
     } else if (lookup.entry.status === "ok") {
@@ -1380,6 +1432,17 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
   // という経路を作らないため）。
   let verifiedActualText: string | undefined;
   if (lookup.entry === undefined) {
+    // Registry absent baseline gate（day-file container版）：今回writeしようと
+    // している1件のmemoryObject.createdAtだけを見て判定してはいけない。同じdayに
+    // baseline以前から存在するlegacy normal Memoryが1件でもあれば、そのcontainer
+    // （day-file）は「真に新規」ではない可能性があるため、day全体を保留する
+    // （CASE BD：legacy Aが存在する日にbaseline後の新規Bを追加しても、Bだけで
+    // 新しいday-fileを作ってはいけない）。
+    const meta = await readVaultRegistryMeta(root);
+    const baselineEstablishedAt = meta.baselineEstablishedAt;
+    if (baselineEstablishedAt === null || !(await isMemoryDayContainerAllNew(day, baselineEstablishedAt))) {
+      throw new VaultRecordNeedsResyncError("memory-day", registryKey, "needs-resync");
+    }
     fileName = dayFileNameFor(memoryObject.date);
     relativePath = `Memories/${fileName}`;
   } else if (lookup.entry.status === "ok") {
@@ -2094,6 +2157,15 @@ export interface VaultRegistryMeta {
   updatedAt: string;
   /** 最後にVault全体のdirectory enumerationが正常完了した時刻。未実施ならnull。 */
   lastFullResyncAt: string | null;
+  /**
+   * 最初にRegistry baselineが確立された（＝初回full resyncが成功した）時刻。
+   * `lastFullResyncAt`と異なり、一度設定した後は以後のresyncで一切更新しない
+   * （`resyncVaultRegistry`参照）。Registry absentなrecordの新規/legacy判定
+   * （`createdAt`との比較）に使う固定境界時刻。未確立ならnull。
+   * 旧`registry-meta.json`にはこのfieldが存在しないため、読み込み側
+   * （`readVaultRegistryMeta`）で必ず`undefined`を`null`へ正規化する。
+   */
+  baselineEstablishedAt: string | null;
 }
 
 /** 呼び出しごとに新しいオブジェクトを返す（`emptyHistoryMeta`/`emptyMonthIndex`と
@@ -2105,7 +2177,7 @@ function emptyVaultRegistryShard(bucket: number): VaultRegistryShard {
 }
 
 function emptyVaultRegistryMeta(): VaultRegistryMeta {
-  return { schemaVersion: 1, updatedAt: "", lastFullResyncAt: null };
+  return { schemaVersion: 1, updatedAt: "", lastFullResyncAt: null, baselineEstablishedAt: null };
 }
 
 /**
@@ -2211,10 +2283,36 @@ export async function readVaultRegistryShard(root: FileSystemDirectoryHandle, bu
 export async function readVaultRegistryMeta(root: FileSystemDirectoryHandle): Promise<VaultRegistryMeta> {
   try {
     const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
-    return await readJSON<VaultRegistryMeta>(tsumugiDir, "registry-meta.json", emptyVaultRegistryMeta(), "registry meta read");
+    const parsed = await readJSON<VaultRegistryMeta>(
+      tsumugiDir,
+      "registry-meta.json",
+      emptyVaultRegistryMeta(),
+      "registry meta read"
+    );
+    // 旧registry-meta.json（baselineEstablishedAt導入前）にはこのfieldが存在せず
+    // `undefined`のままparseされる。呼び出し元が`undefined`/`null`の両方を
+    // 意識せず済むよう、この関数から返る値は必ずstring | nullの正規形にする。
+    return { ...parsed, baselineEstablishedAt: parsed.baselineEstablishedAt ?? null };
   } catch {
     return emptyVaultRegistryMeta();
   }
+}
+
+/**
+ * Registry absentなrecordの新規/legacy判定用。`recordCreatedAt`（Conversation/
+ * Source/ReflectionのcreatedAt、またはnormal Memory day-fileの各member
+ * のcreatedAt）が、Registry baseline確立時刻より後かどうかを判定する。
+ *
+ * ISO 8601文字列同士の比較は`Date.parse`で数値化してから行う（文字列の
+ * 辞書式比較には依存しない）。どちらか一方でも空・不正でparse不能な場合は
+ * 「新規」と判定してはいけない（合意済み：parse失敗を新規扱いにしない）ため、
+ * 安全側に倒して`false`（＝新規ではない＝write保留）を返す。
+ */
+function isRecordNewerThanBaseline(recordCreatedAt: string, baselineEstablishedAt: string): boolean {
+  const recordMs = Date.parse(recordCreatedAt);
+  const baselineMs = Date.parse(baselineEstablishedAt);
+  if (Number.isNaN(recordMs) || Number.isNaN(baselineMs)) return false;
+  return recordMs > baselineMs;
 }
 
 /**
@@ -4338,6 +4436,13 @@ export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Prom
         const meta = await readVaultRegistryMeta(root);
         const now = new Date().toISOString();
         meta.lastFullResyncAt = now;
+        // baselineEstablishedAtは初回成功時にのみ、このresyncの`startedAt`
+        // （排他ロック取得より前に確定させた時刻）で1回だけ設定する。以後の
+        // resyncでは絶対に上書きしない（Registry absent recordの新規/legacy
+        // 判定はこの固定境界時刻に依存するため、動かしてはいけない）。
+        if (meta.baselineEstablishedAt === null) {
+          meta.baselineEstablishedAt = startedAt;
+        }
         meta.updatedAt = now;
         await writeVaultRegistryMeta(root, meta);
         lastFullResyncUpdated = true;
