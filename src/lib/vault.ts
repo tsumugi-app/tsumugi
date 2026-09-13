@@ -2512,11 +2512,25 @@ async function verifyVaultRegistryEntryBeforeWrite(
 // Vaultを切り替えることは構造的に不可能なため）。
 // ---------------------------------------------------------------------------
 
-/** 1回のresync scanで得られる、1つのrecord/containerについての分類結果。 */
-export type VaultResyncOutcome = "unchanged" | "moved" | "edited" | "added" | "missing" | "conflict" | "unreadable";
+/**
+ * Step 4c対応：probeでTsumugiファイルらしいと判定されたがparseできなかった、
+ * または`getFile`/`text`自体が失敗したファイルの記録。UI/debugで追跡できるよう
+ * `path`と`reason`だけを保持する（生のError objectはVault/IndexedDBへ保存しない）。
+ * `resyncVaultRegistry`が返す公開結果`VaultResyncResult.unreadableFiles`にも
+ * そのまま使う。
+ */
+export interface VaultResyncUnreadableFile {
+  path: string;
+  reason: string;
+}
 
-/** normal Memory day-file内の、1メンバー単位の分類（container自体の状態とは別に持つ）。 */
-export interface VaultResyncMemberResult {
+/** 1回のresync scanで得られる、1つのrecord/containerについての分類結果
+ *  （resync engine内部専用、外部へはexportしない）。 */
+type VaultResyncOutcome = "unchanged" | "moved" | "edited" | "added" | "missing" | "conflict" | "unreadable";
+
+/** normal Memory day-file内の、1メンバー単位の分類（container自体の状態とは別に持つ、
+ *  resync engine内部専用）。 */
+interface VaultResyncMemberResult {
   id: string;
   outcome: "unchanged" | "edited" | "added" | "conflict";
   /** そのmemberの実際にparse済みの内容（Step 4bのapplyで使う。member removal
@@ -2528,7 +2542,9 @@ export interface VaultResyncMemberResult {
   addedIndexedDbEquivalent: boolean | null;
 }
 
-export interface VaultResyncRecordResult {
+/** resync engine内部専用（外部へはexportしない。Step 5 UIは`VaultResyncResult`の
+ *  countsだけを使う想定で、個別recordの生データは不要）。 */
+interface VaultResyncRecordResult {
   /** Conversation/Reflection/Sourceはid自身、normal Memoryは`dayFileRegistryKey(day)`。 */
   registryKey: string;
   recordType: VaultRegistryRecordType;
@@ -2562,7 +2578,8 @@ export interface VaultResyncRecordResult {
   allObservedPaths: string[] | null;
 }
 
-export interface VaultResyncScanResult {
+/** resync engine内部専用（外部へはexportしない）。 */
+interface VaultResyncScanResult {
   /** Vault全体のdirectory enumerationが最後まで正常完了したかどうか。falseの場合、
    *  records内に"missing"は一切含まれない（未確定のまま、次回resyncへ持ち越す）。 */
   scanCompleted: boolean;
@@ -2570,7 +2587,7 @@ export interface VaultResyncScanResult {
   records: VaultResyncRecordResult[];
   /** probeでTsumugiファイルらしいと判定されたがparseできなかった、または
    *  getFile/text自体が失敗したファイル。分類（unchanged等）の対象にはしない。 */
-  unreadableFiles: { path: string; reason: string }[];
+  unreadableFiles: VaultResyncUnreadableFile[];
 }
 
 type VaultResyncSingleKind = "conversation" | "source" | "reflection";
@@ -2789,7 +2806,7 @@ interface VaultResyncScanState {
    */
   seenKnownKeys: Set<string>;
   recordsByKey: Map<string, VaultResyncRecordResult>;
-  unreadableFiles: { path: string; reason: string }[];
+  unreadableFiles: VaultResyncUnreadableFile[];
   scannedFileCount: number;
 }
 
@@ -3533,13 +3550,21 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
 //   （他memberの処理自体は止めない）。
 // ---------------------------------------------------------------------------
 
-export interface VaultResyncApplyErrorInfo {
+/**
+ * Step 4c対応：`resyncVaultRegistry`の公開結果`VaultResyncResult.applyErrors`に
+ * 使う型（旧`VaultResyncApplyErrorInfo`から改名）。`recordType`は通常のrecord単位
+ * エラーでは必ず設定されるが、registry-meta更新失敗のような特定recordに紐付かない
+ * system-levelのエラー（`registryKey: "__registry_meta__"`）では省略できるよう
+ * optionalにしている。
+ */
+export interface VaultResyncApplyError {
   registryKey: string;
-  recordType: VaultRegistryRecordType;
+  recordType?: VaultRegistryRecordType;
   reason: string;
 }
 
-export interface VaultResyncApplyResult {
+/** resync engine内部専用（外部へはexportしない。公開結果は`VaultResyncResult`）。 */
+interface VaultResyncApplyResult {
   scanCompleted: boolean;
   scannedFileCount: number;
   counts: {
@@ -3551,8 +3576,8 @@ export interface VaultResyncApplyResult {
     conflict: number;
     unreadable: number;
   };
-  applyErrors: VaultResyncApplyErrorInfo[];
-  unreadableFiles: { path: string; reason: string }[];
+  applyErrors: VaultResyncApplyError[];
+  unreadableFiles: VaultResyncUnreadableFile[];
 }
 
 /** 既存のfiles[path]エントリのstatusだけを変更する（他フィールドは一切触れない）。
@@ -4223,7 +4248,7 @@ async function applyVaultResyncScanResult(
   scan: VaultResyncScanResult
 ): Promise<VaultResyncApplyResult> {
   const counts = { unchanged: 0, moved: 0, edited: 0, added: 0, missing: 0, conflict: 0, unreadable: 0 };
-  const applyErrors: VaultResyncApplyErrorInfo[] = [];
+  const applyErrors: VaultResyncApplyError[] = [];
 
   for (const record of scan.records) {
     try {
@@ -4242,6 +4267,9 @@ async function applyVaultResyncScanResult(
     }
   }
 
+  // Codexレビュー指摘・Step 4c対応：unreadableはrecords配列のoutcomeとしては
+  // 現れない（4aの設計上、probe/parse失敗はunreadableFilesにのみ記録される）ため、
+  // countsの唯一のunreadable計上経路はここ1箇所だけにする（二重countを避ける）。
   counts.unreadable = scan.unreadableFiles.length;
 
   return {
@@ -4254,32 +4282,95 @@ async function applyVaultResyncScanResult(
 }
 
 /**
- * Step 4b公開エントリポイント。"tsumugi-vault-world"を排他保持した状態で
- * scan→applyまで一括で行う（`runVaultWorldExclusive`参照、同じ排他区間の中で
- * 完結させる——scanとapplyの間でロックを手放すと、その間に他の書込・別tabの
- * 操作が割り込みうるため）。
+ * Step 4c公開エントリポイント：Step 4a（scan/classification）とStep 4b（apply）を
+ * 1つのVault resync engineとして統合した、外部から呼ぶべき唯一の公開API。
  *
- * `lastFullResyncAt`は、`scanCompleted===true`かつ`applyErrors.length===0`の
- * 場合にのみ更新する（合意済み：「最後にVault全体を走査し、実行可能な
- * reconciliation処理まで正常に完了した時刻」という意味を持たせるため。
- * conflict/missingへの正常な分類・適用はそれ自体エラーではないため
- * lastFullResyncAtの更新を妨げない）。
+ * `startedAt`/`completedAt`はこの関数の実行区間全体（排他ロック取得前〜結果確定後）
+ * を表す。`counts`は「最終的にapplyで確定したoutcome」を表す（4aの分類がday変化
+ * ゲート等でapply時にconflictへ切り替わった場合、countsはconflict側に計上され、
+ * 元のedited側には計上されない——`applyVaultResyncScanResult`が返す実際の
+ * outcomeをそのまま使うため）。`applyErrors`はrecord単位で適用に失敗したものの
+ * 記録（この場合countsは元のclassification outcome側に計上される）。
+ *
+ * `lastFullResyncUpdated`は、`scanCompleted===true`かつ`applyErrors.length===0`の
+ * 場合にのみtrueになる（「最後にVault全体を走査し、実行可能なreconciliation処理
+ * まで正常に完了した時刻」という意味をlastFullResyncAtに持たせるため。conflict/
+ * missingへの正常な分類・適用はそれ自体エラーではないため更新を妨げない）。
+ * registry-meta自体の書き込みが失敗した場合は、resync全体をthrowさせず、
+ * "__registry_meta__"というsystem-level `VaultResyncApplyError`として
+ * `applyErrors`へ追加し、`lastFullResyncUpdated=false`のまま結果を返す
+ * （resync自体は正常に完了しているため、個別の失敗として扱う）。
  */
-export async function resyncVaultRegistry(
-  root: FileSystemDirectoryHandle
-): Promise<{ timedOut: boolean; result?: VaultResyncApplyResult }> {
-  return runVaultWorldExclusive(async () => {
+export interface VaultResyncResult {
+  scanCompleted: boolean;
+  scannedFileCount: number;
+  counts: {
+    unchanged: number;
+    moved: number;
+    edited: number;
+    added: number;
+    missing: number;
+    conflict: number;
+    unreadable: number;
+  };
+  applyErrors: VaultResyncApplyError[];
+  unreadableFiles: VaultResyncUnreadableFile[];
+  startedAt: string;
+  completedAt: string;
+  lastFullResyncUpdated: boolean;
+}
+
+export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Promise<VaultResyncResult> {
+  const startedAt = new Date().toISOString();
+
+  // "tsumugi-vault-world"の排他ロックを1回だけ取得し、snapshot→scan→
+  // classification→apply→registry meta更新までを同一区間内で完結させる
+  // （scanとapplyの間でロックを手放さない）。この関数の内部からは
+  // withVaultWorldRead/runVaultSwitchExclusive/runVaultWorldExclusiveの
+  // いずれも再帰的に呼ばない（呼び出し元のscan/apply実装がそれを保証する）。
+  const lockResult = await runVaultWorldExclusive(async () => {
     const scan = await performVaultResyncScan(root);
     const applyResult = await applyVaultResyncScanResult(root, scan);
 
+    let lastFullResyncUpdated = false;
     if (applyResult.scanCompleted && applyResult.applyErrors.length === 0) {
-      const meta = await readVaultRegistryMeta(root);
-      const now = new Date().toISOString();
-      meta.lastFullResyncAt = now;
-      meta.updatedAt = now;
-      await writeVaultRegistryMeta(root, meta);
+      try {
+        const meta = await readVaultRegistryMeta(root);
+        const now = new Date().toISOString();
+        meta.lastFullResyncAt = now;
+        meta.updatedAt = now;
+        await writeVaultRegistryMeta(root, meta);
+        lastFullResyncUpdated = true;
+      } catch (error) {
+        applyResult.applyErrors.push({
+          registryKey: "__registry_meta__",
+          reason: `failed to update registry meta: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
     }
 
-    return applyResult;
+    return { applyResult, lastFullResyncUpdated };
   });
+
+  if (lockResult.timedOut) {
+    throw new Error(
+      "[Tsumugi] resyncVaultRegistry: could not acquire the exclusive vault-world lock in time (another vault operation may be in progress)."
+    );
+  }
+
+  // timedOut===falseの場合、runVaultWorldExclusiveは必ずresultを設定して返す
+  // （契約上、fnが例外なく完了した場合のみここへ到達するため）。
+  const { applyResult, lastFullResyncUpdated } = lockResult.result!;
+  const completedAt = new Date().toISOString();
+
+  return {
+    scanCompleted: applyResult.scanCompleted,
+    scannedFileCount: applyResult.scannedFileCount,
+    counts: applyResult.counts,
+    applyErrors: applyResult.applyErrors,
+    unreadableFiles: applyResult.unreadableFiles,
+    startedAt,
+    completedAt,
+    lastFullResyncUpdated,
+  };
 }
