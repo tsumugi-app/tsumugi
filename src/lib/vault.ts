@@ -1750,3 +1750,249 @@ export async function scanVaultForRestore(
     skippedCount,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Vault Registry（所在registry、Step 1：型・読み書きprimitive・専用Lockのみ）
+//
+// 「ユーザーが外部からMarkdownを手動で移動・編集・追加・削除した場合にTsumugiが
+// 再認識できるようにする」設計（別途合意済みの設計投稿を参照）のうち、Step 1の
+// スコープにあたる。既存の`.tsumugi/index.json`（`updateIndex`、id→pathの
+// 平坦map、書き込み専用で読み込みには使われていない）とは別の、新しいファイル群
+// として追加する。既存のindex.json・History Index・read/write実装（
+// readConversationById/readReflectionById/readMemoriesForDay/
+// writeConversationMarkdownImpl/writeMemoryObjectMarkdownImpl等）は本Stepでは
+// 一切変更しない（このセクションの型・関数は、まだどこからも呼ばれない）。
+//
+// shard分割方式（重要・月単位ではなくhash bucket単位）：registryの役割は
+// 「日付とactual pathを切り離すこと」そのものであるため、registry自身の
+// shard分割を日付（月）に依存させない。History Index（history/YYYY-MM.json）は
+// 表示が日付単位である以上、月shardのままでよいが、registryは将来のtimezone
+// 変更・日付の編集があってもshard構成そのものは一切変わらない必要がある。
+// そのため、registryKey（idまたは`dayFileRegistryKey`が返す合成キー）自体の
+// ハッシュ値から`bucket = hash(registryKey) % VAULT_REGISTRY_BUCKET_COUNT`を
+// 計算し、bucket番号のファイルへ振り分ける。Conversation/Reflection/Sourceの
+// path解決は「id→bucket→shard→path」だけで完結し、day/date/monthを一切
+// 経由しない。64bucketを事前に全部作る必要はなく、実際に使うbucketのファイルだけ
+// 都度作成する（`{ create: true }`のwriteFileInDir/getDirectoryHandleが
+// 既存パターン通り遅延作成する）。
+//
+// 配置：
+//   .tsumugi/registry-meta.json  … 極小のメタ情報（schemaVersion・最終再同期時刻）
+//   .tsumugi/registry/NN.json    … bucket番号（0〜63、2桁16進、"00"〜"3f"）ごとの
+//                                  record/file所在情報
+//
+// record/file分離構造：Conversation/Reflection/Sourceは1record=1fileだが、
+// normal Memory（day-file）は1fileに複数idが載る。この非対称性を表現するため、
+// `records`（registryKey→実path）と`files`（path→mtime/size/hash/status等の
+// fileレベルmetadata）を分離する。normal Memoryについては、メンバーid1件ずつを
+// `records`へ個別登録する必要は無いと判断した——day-fileは
+// `records["day:YYYY-MM-DD"]`という合成キー（`dayFileRegistryKey`）1つだけで
+// pathを指し、そのpathの`files`entryが`memberIds`（現在そのday-fileに実在する
+// 全id）と`memberHashes`（idごとの個別ハッシュ、どのメンバーが変化したかの特定用）
+// を持つことでcontainer単位の所在管理が完結する。
+//
+// status（`VaultRegistryStatus`）とwrite可否の対応（合意済み、Beta方針）：
+//   "ok"          → write可能（registry記載pathへ書く）
+//   "needs-resync"→ write保留（識別可能な例外をthrow、旧/決定論的pathへの
+//                    自動再作成はしない）
+//   "missing"     → 同上（write保留）。Vault全体のdirectory enumerationが
+//                    最後まで正常完了したresyncのみがこの状態を確定できる
+//                    （write/read時のローカルな不在確認だけでは設定しない）
+//   "conflict"    → 同上（write保留）。同一idの複数path衝突・外部編集と
+//                    未flush変更の衝突中にTsumugi側が勝手にMarkdownを書き換え
+//                    ないための安全策。将来、conflictの種類を分けてwrite可能
+//                    条件を追加する余地は残すが、Betaでは一律write不可とする。
+// この対応表自体の適用（read/write経路への接続、`VaultRecordNeedsResyncError`の
+// 導入等）はStep 2以降のスコープであり、本Stepでは型として定義するのみ。
+// ---------------------------------------------------------------------------
+
+/** Conversation/Reflection/Sourceは1record=1file。"memory-day"はnormal Memoryの
+ *  day-file（1file=複数id）を指す（Reflectionは同じMemoriesディレクトリに
+ *  保存されるが1record1fileのため、通常Memoryとは別のrecordTypeとして区別する）。 */
+export type VaultRegistryRecordType = "conversation" | "reflection" | "source" | "memory-day";
+
+/**
+ * "ok"のみwrite可能（Betaの安全側方針）。"needs-resync"/"missing"/"conflict"は
+ * いずれも合意済みの通りwrite保留対象。将来的にconflictの内訳（例：
+ * 同一id複数path衝突 と 外部編集×未flush衝突 を別種別に分け、前者だけ限定的に
+ * write可能にする等）を追加する余地を残すため、"conflict"を単独の値として
+ * 残してある（"needs-resync"等と統合しない）。
+ */
+export type VaultRegistryStatus = "ok" | "needs-resync" | "missing" | "conflict";
+
+/** 1つの実ファイル（path）についてのregistry上のmetadata。 */
+export interface VaultRegistryFileEntry {
+  recordType: VaultRegistryRecordType;
+  /** `File.lastModified`。次回再同期での一次判定（変化なしのfast path）に使う。 */
+  mtime: number;
+  /** `File.size`。mtimeだけでは拾えない誤検知を補助的に弾くために使う。 */
+  size: number;
+  /** ファイル全文の非暗号ハッシュ（`hashVaultText`）。 */
+  contentHash: string;
+  /** このpathに現在含まれる全record id。conversation/reflection/sourceは常に1件、
+   *  memory-dayはそのday-fileの現在の全メンバー。 */
+  memberIds: string[];
+  /** memory-dayのみ使用。メンバーidごとの個別ハッシュ（day-file内の1件だけが
+   *  変化した場合に、どのidが変わったかを特定するために使う）。 */
+  memberHashes?: Record<string, string>;
+  status: VaultRegistryStatus;
+}
+
+/** hash bucket 1つ分のregistry shard。`records`はregistryKey（idまたは
+ *  day-file用の合成キー）→path、`files`はpath→そのfileのmetadata
+ *  （record/file分離構造）。`bucket`は日付・月とは無関係な
+ *  `hash(registryKey) % VAULT_REGISTRY_BUCKET_COUNT`の値。 */
+export interface VaultRegistryShard {
+  schemaVersion: 1;
+  bucket: number;
+  records: Record<string, string>;
+  files: Record<string, VaultRegistryFileEntry>;
+}
+
+/** `.tsumugi/registry-meta.json`の内容。History Indexの`HistoryMeta`と同様、
+ *  月ごとの内訳はshard側が持つため、ここは極小のメタ情報のみ。 */
+export interface VaultRegistryMeta {
+  schemaVersion: 1;
+  updatedAt: string;
+  /** 最後にVault全体のdirectory enumerationが正常完了した時刻。未実施ならnull。 */
+  lastFullResyncAt: string | null;
+}
+
+/** 呼び出しごとに新しいオブジェクトを返す（`emptyHistoryMeta`/`emptyMonthIndex`と
+ *  同じ理由：`readJSON`のfallbackを呼び出し元が直接書き換えるため、共有の
+ *  定数オブジェクトを使うと2回目以降の「まだファイルが無い」呼び出しが
+ *  前回の書き換え結果を誤って引き継いでしまう）。 */
+function emptyVaultRegistryShard(bucket: number): VaultRegistryShard {
+  return { schemaVersion: 1, bucket, records: {}, files: {} };
+}
+
+function emptyVaultRegistryMeta(): VaultRegistryMeta {
+  return { schemaVersion: 1, updatedAt: "", lastFullResyncAt: null };
+}
+
+/**
+ * normal Memory（day-file）用の合成キー。ULIDが絶対に含まない":"を挟むことで、
+ * 実record idの名前空間と衝突しないようにする。日付を含むが、これはあくまで
+ * 「day-fileという1つの実体を指し示すための識別子の中身」であって、shard分割
+ * そのものには使わない（shard分割は下記`vaultRegistryBucketOf`が行う、この
+ * キー自体のhash値によるものであり、日付の値そのものには依存しない）。
+ */
+export function dayFileRegistryKey(day: string): string {
+  return `day:${day.slice(0, 10)}`;
+}
+
+/** registryのshard数（bucket数）。事前に64ファイル全部を作る必要は無く、
+ *  実際に使われたbucketのファイルだけが遅延作成される。 */
+export const VAULT_REGISTRY_BUCKET_COUNT = 64;
+
+/**
+ * FNV-1a（32bit）のコア計算。`hashVaultText`（ファイル内容の変更検知用）と
+ * `vaultRegistryBucketOf`（registryKeyのshard振り分け用）の両方から使う、
+ * 同じアルゴリズムの共有実装（用途が違うだけで、ハッシュの計算方法自体を
+ * 分ける理由が無いため）。
+ */
+function fnv1a32(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * registryKey（Conversation/Reflection/Sourceのid、またはnormal Memory
+ * day-fileの合成キー）から、そのrecordが所属するbucket番号（0〜
+ * `VAULT_REGISTRY_BUCKET_COUNT - 1`）を計算する。日付・月を一切参照しない
+ * ——path解決が「id→bucket→shard→path」だけで完結し、将来timezoneの基準が
+ * 変わったり、record自身のdate/startedAtが編集されたりしても、このbucket
+ * 番号（＝どのshardファイルに載っているか）が変化しないようにするため。
+ */
+export function vaultRegistryBucketOf(registryKey: string): number {
+  return fnv1a32(registryKey) % VAULT_REGISTRY_BUCKET_COUNT;
+}
+
+/** registry shardのファイル名（2桁16進、"00"〜"3f"）。 */
+function vaultRegistryBucketFileName(bucket: number): string {
+  return `${bucket.toString(16).padStart(2, "0")}.json`;
+}
+
+/**
+ * History Index専用ロック（`HISTORY_INDEX_LOCK_NAME`）・H4のVault世界ロック
+ * （`vaultWorldLock.ts`の`"tsumugi-vault-world"`）のいずれとも独立した、
+ * registry専用のWeb Lock。既存の「関心事ごとに別ロックを持つ」方針を踏襲する
+ * （registryの読み書きがHistory Index・H4のロック待ちで足止めされない、
+ * その逆も無い）。
+ */
+const VAULT_REGISTRY_LOCK_NAME = "tsumugi-vault-registry-write";
+
+function isVaultRegistryLockSupported(): boolean {
+  return typeof navigator !== "undefined" && typeof navigator.locks !== "undefined";
+}
+
+/** Step 2以降（read-modify-writeを行う更新関数）が使うためのlockラッパー。
+ *  Step 1時点ではまだどこからも呼ばれない。 */
+async function withVaultRegistryLock<T>(fn: () => Promise<T>): Promise<T> {
+  if (!isVaultRegistryLockSupported()) return fn();
+  return navigator.locks.request(VAULT_REGISTRY_LOCK_NAME, fn);
+}
+
+/**
+ * 非暗号の軽量ハッシュ（FNV-1a、32bit）。Vault内Markdownの変更検知にのみ使う
+ * fingerprintであり、暗号学的な衝突耐性は不要（Beta規模の1Vault内で偶然衝突する
+ * 確率は無視できる水準で十分）。外部ライブラリは使わない。bucket振り分け
+ * （`vaultRegistryBucketOf`）とは別の目的（ファイル内容の変更検知）で使うが、
+ * 計算方法自体は`fnv1a32`を共有する。
+ */
+export function hashVaultText(text: string): string {
+  return fnv1a32(text).toString(16).padStart(8, "0");
+}
+
+/**
+ * registry shardの読み込み（低レベルprimitive）。History Indexの
+ * `readHistoryMeta`/`readHistoryMonthIndex`と同じく、存在しない/壊れている
+ * 場合は安全な既定値へfallbackする。ロックは取得しない（読み込みが書き込みと
+ * 競合しても「わずかに古いregistryを読む」だけであり、Step 1時点では
+ * どの経路からも呼ばれないため実害が無い）。
+ */
+export async function readVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: number): Promise<VaultRegistryShard> {
+  try {
+    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+    const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: false });
+    return await readJSON<VaultRegistryShard>(
+      registryDir,
+      vaultRegistryBucketFileName(bucket),
+      emptyVaultRegistryShard(bucket),
+      "registry shard read"
+    );
+  } catch {
+    return emptyVaultRegistryShard(bucket);
+  }
+}
+
+export async function readVaultRegistryMeta(root: FileSystemDirectoryHandle): Promise<VaultRegistryMeta> {
+  try {
+    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+    return await readJSON<VaultRegistryMeta>(tsumugiDir, "registry-meta.json", emptyVaultRegistryMeta(), "registry meta read");
+  } catch {
+    return emptyVaultRegistryMeta();
+  }
+}
+
+/**
+ * registry shardの書き込み（低レベルprimitive、無条件書き込み）。Step 2以降の
+ * 更新関数が、`withVaultRegistryLock`で全体を包んだ上で
+ * 「読み込み→計算→変化があれば書き込み」の一部として呼ぶことを想定する
+ * （History Indexの`updateHistoryIndex`と同じ構成）。Step 1時点ではまだ
+ * どこからも呼ばれない。
+ */
+async function writeVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: number, shard: VaultRegistryShard): Promise<void> {
+  const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
+  const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: true });
+  await writeFileInDir(registryDir, vaultRegistryBucketFileName(bucket), JSON.stringify(shard, null, 2), "registry shard write");
+}
+
+async function writeVaultRegistryMeta(root: FileSystemDirectoryHandle, meta: VaultRegistryMeta): Promise<void> {
+  const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
+  await writeFileInDir(tsumugiDir, "registry-meta.json", JSON.stringify(meta, null, 2), "registry meta write");
+}
