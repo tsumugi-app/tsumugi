@@ -995,24 +995,56 @@ export async function readHistoryMonthIndex(root: FileSystemDirectoryHandle, mon
 }
 
 /**
+ * Vault Registry（Step 3：read経路への接続）。
+ *
+ * registry entryの有無・statusに応じてread先を決める方針（write側Step 2と対称）：
+ *   entryなし              → 既存Vault互換のため、従来の決定論的pathへfallback
+ *   entryあり + status ok  → registry actual pathのみを読む（読めなければ
+ *                             「見つからない」、決定論的pathへは絶対にfallbackしない）
+ *   entryあり + non-ok     → 「見つからない」として扱う（試みすらしない）。
+ *                             registryが「旧pathは信用できない」と判断している
+ *                             状態で決定論的pathへ戻ると、移動前・削除前の
+ *                             ファイルを誤って読んでしまう可能性があるため。
+ * read経路はstatus変更・registry/History Index/index.json更新・ファイル/
+ * ディレクトリ作成のいずれも行わない（副作用なし。lookup→path resolve→readのみ）。
+ */
+
+/**
  * 指定日のMemory（day-file統合分）だけを読む。Reflection Summary（1record1file）は
- * 含まれない——`readReflectionById`で別途idごとに読むこと。
+ * 含まれない——`readReflectionById`で別途idごとに読むこと。registryKeyは
+ * `dayFileRegistryKey(day)`（day-file container単位。個々のMemory idではない）。
  */
 export async function readMemoriesForDay(root: FileSystemDirectoryHandle, day: string): Promise<MemoryObject[]> {
+  const registryKey = dayFileRegistryKey(day);
+  const lookup = await lookupVaultRegistryRecord(root, registryKey);
+
+  if (lookup.entry === undefined) {
+    try {
+      const dir = await root.getDirectoryHandle("Memories", { create: false });
+      return await readDayFileEntries(dir, dayFileNameFor(day));
+    } catch {
+      return [];
+    }
+  }
+
+  if (lookup.entry.status !== "ok") {
+    return [];
+  }
+
   try {
-    const dir = await root.getDirectoryHandle("Memories", { create: false });
-    return await readDayFileEntries(dir, dayFileNameFor(day));
+    const resolved = await resolveVaultRelativePath(root, lookup.path as string);
+    return await readDayFileEntries(resolved.dir, resolved.fileName);
   } catch {
     return [];
   }
 }
 
 /**
- * `HistoryDayIndex.reflectionIds`の1件を、idと日付からファイル名を再構築して読む。
- * `memoriesDir`（省略可）：同じ日に複数のreflectionIdsを読む場合、呼び出し元
- * （HistoryPanel.tsx）が`Memories`ディレクトリハンドルを1回だけ解決して使い回せる
- * ようにするための任意引数。省略時は従来通りこの関数自身が`root`から解決する
- * （後方互換。History以外の既存呼び出し元は無いが、念のため省略可能にしてある）。
+ * `HistoryDayIndex.reflectionIds`の1件を読む。registryKeyはreflectionのid自身
+ * （write側`writeMemoryObjectMarkdownImpl`のreflection分岐と同じ）。
+ * `memoriesDir`（省略可）：entryなしのfallback時にのみ使う——registry actual
+ * pathを読む場合は`resolveVaultRelativePath`が`root`から都度解決するため、
+ * このヒントは使われない（後方互換のため引数自体は維持する）。
  */
 export async function readReflectionById(
   root: FileSystemDirectoryHandle,
@@ -1020,9 +1052,26 @@ export async function readReflectionById(
   day: string,
   memoriesDir?: FileSystemDirectoryHandle
 ): Promise<MemoryObject | null> {
+  const lookup = await lookupVaultRegistryRecord(root, id);
+
+  if (lookup.entry === undefined) {
+    try {
+      const dir = memoriesDir ?? (await root.getDirectoryHandle("Memories", { create: false }));
+      const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
+      const file = await fileHandle.getFile();
+      return parseMemoryObjectMarkdown(await file.text());
+    } catch {
+      return null;
+    }
+  }
+
+  if (lookup.entry.status !== "ok") {
+    return null;
+  }
+
   try {
-    const dir = memoriesDir ?? (await root.getDirectoryHandle("Memories", { create: false }));
-    const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
+    const resolved = await resolveVaultRelativePath(root, lookup.path as string);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
     const file = await fileHandle.getFile();
     return parseMemoryObjectMarkdown(await file.text());
   } catch {
@@ -1031,9 +1080,9 @@ export async function readReflectionById(
 }
 
 /**
- * `HistoryDayIndex.conversationIds`の1件を、idと日付からファイル名を再構築して読む。
- * `conversationsDir`（省略可）：`readReflectionById`の`memoriesDir`と同じ理由・同じ
- * 後方互換の任意引数。
+ * `HistoryDayIndex.conversationIds`の1件を読む。registryKeyはconversationのid自身
+ * （write側`writeConversationMarkdownImpl`と同じ）。`conversationsDir`（省略可）：
+ * `readReflectionById`の`memoriesDir`と同じ理由・同じ後方互換の任意引数。
  */
 export async function readConversationById(
   root: FileSystemDirectoryHandle,
@@ -1041,9 +1090,26 @@ export async function readConversationById(
   day: string,
   conversationsDir?: FileSystemDirectoryHandle
 ): Promise<Conversation | null> {
+  const lookup = await lookupVaultRegistryRecord(root, id);
+
+  if (lookup.entry === undefined) {
+    try {
+      const dir = conversationsDir ?? (await root.getDirectoryHandle("Conversations", { create: false }));
+      const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
+      const file = await fileHandle.getFile();
+      return parseConversationMarkdown(await file.text());
+    } catch {
+      return null;
+    }
+  }
+
+  if (lookup.entry.status !== "ok") {
+    return null;
+  }
+
   try {
-    const dir = conversationsDir ?? (await root.getDirectoryHandle("Conversations", { create: false }));
-    const fileHandle = await dir.getFileHandle(fileNameFor(id, day), { create: false });
+    const resolved = await resolveVaultRelativePath(root, lookup.path as string);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
     const file = await fileHandle.getFile();
     return parseConversationMarkdown(await file.text());
   } catch {
