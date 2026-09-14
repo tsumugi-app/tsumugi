@@ -1144,8 +1144,12 @@ function dayFileNameFor(isoDate: string) {
   return `${isoDate.slice(0, 10)}.md`;
 }
 
-async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, conversation: Conversation) {
-  const dir = await timedIOStep("conversation dirHandle", () => root.getDirectoryHandle("Conversations", { create: true }));
+async function writeConversationMarkdownImpl(
+  root: FileSystemDirectoryHandle,
+  conversation: Conversation,
+  dirHandleCache?: VaultDirHandleCache
+) {
+  const dir = await getCachedVaultTopLevelDir(root, "Conversations", "conversation dirHandle", dirHandleCache);
 
   // Vault Registry（Step 2）：真の新規recordは現行命名規則、既存recordは
   // registry記載のactual pathへ。needs-resync/missing/conflictは書き込み保留。
@@ -1171,11 +1175,12 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
     relativePath = `Conversations/${fileName}`;
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
-    const resolved = await resolveVaultRelativePath(root, relativePath);
+    const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
     targetDir = resolved.dir;
     fileName = resolved.fileName;
     // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する
-    // （旧pathへの自動再作成・外部編集の無条件上書きを防ぐ）。
+    // （旧pathへの自動再作成・外部編集の無条件上書きを防ぐ）。安全確認自体
+    // （実ファイル存在確認・Registry path確認）は変更していない。
     await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
   } else {
     throw new VaultRecordNeedsResyncError("conversation", registryKey, lookup.entry.status, holdReasonFromEntryStatus(lookup.entry.status));
@@ -1219,10 +1224,11 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
 export async function writeConversationMarkdown(
   root: FileSystemDirectoryHandle,
   conversation: Conversation,
-  priority: VaultWritePriority = "interactive"
+  priority: VaultWritePriority = "interactive",
+  dirHandleCache?: VaultDirHandleCache
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeConversationMarkdownImpl(root, conversation),
+    () => writeConversationMarkdownImpl(root, conversation, dirHandleCache),
     priority,
     vaultSyncKeyFor("conversation", conversation.id)
   );
@@ -1234,8 +1240,12 @@ export async function writeConversationMarkdown(
  * Memoryの日別統合は適用しない。STORAGE.md §3）。`Sources/`が無ければ既存パターン通り
  * `{ create: true }`で作成する。SourceにはMemoryObjectのような`date`が無いため、`createdAt`を使う。
  */
-async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: Source) {
-  const dir = await timedIOStep("source dirHandle", () => root.getDirectoryHandle("Sources", { create: true }));
+async function writeSourceMarkdownImpl(
+  root: FileSystemDirectoryHandle,
+  source: Source,
+  dirHandleCache?: VaultDirHandleCache
+) {
+  const dir = await getCachedVaultTopLevelDir(root, "Sources", "source dirHandle", dirHandleCache);
 
   // Vault Registry（Step 2）：Conversationと同じ分岐（真の新規／既存recordの
   // registry path／needs-resync等でwrite保留）。
@@ -1257,7 +1267,7 @@ async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: 
     relativePath = `Sources/${fileName}`;
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
-    const resolved = await resolveVaultRelativePath(root, relativePath);
+    const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
     targetDir = resolved.dir;
     fileName = resolved.fileName;
     // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する。
@@ -1288,9 +1298,14 @@ async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: 
 export async function writeSourceMarkdown(
   root: FileSystemDirectoryHandle,
   source: Source,
-  priority: VaultWritePriority = "interactive"
+  priority: VaultWritePriority = "interactive",
+  dirHandleCache?: VaultDirHandleCache
 ): Promise<void> {
-  await enqueueVaultWrite(() => writeSourceMarkdownImpl(root, source), priority, vaultSyncKeyFor("source", source.id));
+  await enqueueVaultWrite(
+    () => writeSourceMarkdownImpl(root, source, dirHandleCache),
+    priority,
+    vaultSyncKeyFor("source", source.id)
+  );
   await markVaultSynced("source", source.id, source.updatedAt);
 }
 
@@ -1345,8 +1360,12 @@ async function readDayFileEntries(
  * 同じidのエントリが既にあれば置き換え、無ければ追加する（重複を作らない）。
  * MemoryObject自体のデータ構造・idは変えない。保存単位（ファイル）だけを日単位にする。
  */
-async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, memoryObject: MemoryObject) {
-  const dir = await timedIOStep("memory dirHandle", () => root.getDirectoryHandle("Memories", { create: true }));
+async function writeMemoryObjectMarkdownImpl(
+  root: FileSystemDirectoryHandle,
+  memoryObject: MemoryObject,
+  dirHandleCache?: VaultDirHandleCache
+) {
+  const dir = await getCachedVaultTopLevelDir(root, "Memories", "memory dirHandle", dirHandleCache);
 
   if (isReflectionSummary(memoryObject)) {
     // Vault Registry（Step 2）：Reflectionは1record1fileのため、Conversation/Sourceと
@@ -1369,7 +1388,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
       relativePath = `Memories/${fileName}`;
     } else if (lookup.entry.status === "ok") {
       relativePath = lookup.path as string;
-      const resolved = await resolveVaultRelativePath(root, relativePath);
+      const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
       targetDir = resolved.dir;
       fileName = resolved.fileName;
       // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する。
@@ -1447,7 +1466,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
     relativePath = `Memories/${fileName}`;
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
-    const resolved = await resolveVaultRelativePath(root, relativePath);
+    const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
     targetDir = resolved.dir;
     fileName = resolved.fileName;
     // Critical/High修正：day-fileのmerge材料として読む前に、実ファイルの存在・
@@ -1521,10 +1540,11 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
 export async function writeMemoryObjectMarkdown(
   root: FileSystemDirectoryHandle,
   memoryObject: MemoryObject,
-  priority: VaultWritePriority = "interactive"
+  priority: VaultWritePriority = "interactive",
+  dirHandleCache?: VaultDirHandleCache
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeMemoryObjectMarkdownImpl(root, memoryObject),
+    () => writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache),
     priority,
     vaultSyncKeyFor("memory", memoryObject.id)
   );
@@ -1623,15 +1643,24 @@ export async function flushPendingToVault(
   let writtenCount = 0;
   let failedCount = 0;
   let heldCount = 0;
+  // 実機不具合対応（aggregate diagnostic）：実際にwrite試行された（＝
+  // isAlreadySyncedToVaultでスキップされなかった）record数。writtenCount＋
+  // failedCount＋heldCountと必ず一致する。
+  let pendingCount = 0;
   const heldByReason = emptyHeldByReason();
+  // 実機不具合対応（Android性能改善）：この1回のflush実行の間だけ、
+  // Conversations/Memories/Sourcesディレクトリハンドルを使い回す。ローカル
+  // 変数のため、この関数を抜ければ破棄され、次回のflushへは持ち越さない。
+  const dirHandleCache: VaultDirHandleCache = new Map();
   for (const conversation of conversations) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
       return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
     if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
+    pendingCount += 1;
     try {
-      await writeConversationMarkdown(root, conversation, priority);
+      await writeConversationMarkdown(root, conversation, priority, dirHandleCache);
       writtenCount += 1;
     } catch (error) {
       if (error instanceof VaultRecordNeedsResyncError) {
@@ -1653,8 +1682,9 @@ export async function flushPendingToVault(
       return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
     if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
+    pendingCount += 1;
     try {
-      await writeMemoryObjectMarkdown(root, memoryObject, priority);
+      await writeMemoryObjectMarkdown(root, memoryObject, priority, dirHandleCache);
       writtenCount += 1;
     } catch (error) {
       if (error instanceof VaultRecordNeedsResyncError) {
@@ -1674,8 +1704,9 @@ export async function flushPendingToVault(
       return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
     if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
+    pendingCount += 1;
     try {
-      await writeSourceMarkdown(root, source, priority);
+      await writeSourceMarkdown(root, source, priority, dirHandleCache);
       writtenCount += 1;
     } catch (error) {
       if (error instanceof VaultRecordNeedsResyncError) {
@@ -1694,7 +1725,9 @@ export async function flushPendingToVault(
   console.log(
     `[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} failedCount=${failedCount} heldCount=${heldCount} durationMs=${flushDurationMs}`
   );
-  logTimingEvent("Vault flush:end", { count: totalCount, writtenCount, durationMs: flushDurationMs });
+  // 実機不具合対応（aggregate diagnostic）：既存の"Vault flush:end"イベントへ
+  // pendingCount/heldCountを追加するだけで、新規イベントは増やさない。
+  logTimingEvent("Vault flush:end", { count: totalCount, writtenCount, pendingCount, heldCount, durationMs: flushDurationMs });
   return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
 }
 
@@ -2313,16 +2346,28 @@ export function hashVaultText(text: string): string {
  * 競合しても「わずかに古いregistryを読む」だけであり、実害が無いため。
  * Step 2の`lookupVaultRegistryRecord`はこの関数を通じて読み取る）。
  */
+/**
+ * 実機不具合対応（Android性能改善）：既に解決済みの`registryDir`ハンドルを
+ * 呼び出し元から受け取って読むだけの内部helper。`.tsumugi`/`.tsumugi/registry`の
+ * 再解決を行わないため、同一operation内で複数shardを読む場合（
+ * `buildVaultRegistrySnapshot`等）はこちらを使うことで重複I/Oを避けられる。
+ * 既存の`readVaultRegistryShard`（下記）はこのhelperを内部的に使うだけで、
+ * 挙動・戻り値は一切変えていない。
+ */
+async function readVaultRegistryShardFromDir(registryDir: FileSystemDirectoryHandle, bucket: number): Promise<VaultRegistryShard> {
+  return await readJSON<VaultRegistryShard>(
+    registryDir,
+    vaultRegistryBucketFileName(bucket),
+    emptyVaultRegistryShard(bucket),
+    "registry shard read"
+  );
+}
+
 export async function readVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: number): Promise<VaultRegistryShard> {
   try {
     const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
     const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: false });
-    return await readJSON<VaultRegistryShard>(
-      registryDir,
-      vaultRegistryBucketFileName(bucket),
-      emptyVaultRegistryShard(bucket),
-      "registry shard read"
-    );
+    return await readVaultRegistryShardFromDir(registryDir, bucket);
   } catch {
     return emptyVaultRegistryShard(bucket);
   }
@@ -2489,26 +2534,78 @@ function isSafeVaultRelativePath(relativePath: string): boolean {
 }
 
 /**
+ * 実機不具合対応（Android性能改善）：Android SAFの`getDirectoryHandle`1回が
+ * 数百ms級のため、「同一操作内で同じディレクトリを何度も解決し直す」ことが
+ * 積み重なると、record数・shard数に比例して数十秒級の遅延になることが実機ログで
+ * 確認された（詳細はresolveVaultRelativePath/buildVaultRegistrySnapshot/
+ * flushPendingToVaultの各コメント参照）。
+ *
+ * このMapは「呼び出し元が明示的に生成し、1回のoperation（1回のLevel 1 discovery、
+ * 1回のflush実行等）の間だけ手元に持ち、そのoperationの終了とともに破棄する」
+ * ものであり、モジュールレベル/グローバルな状態には一切しない（stale handleを
+ * 次回操作へ持ち越さない）。キーは"Conversations"のようなVault root相対の
+ * ディレクトリpath文字列。
+ */
+type VaultDirHandleCache = Map<string, FileSystemDirectoryHandle>;
+
+/**
+ * "Conversations"のようなVault root直下のトップレベルディレクトリを、
+ * （渡されていれば）`dirHandleCache`経由で使い回しながら解決する。
+ * `writeConversationMarkdownImpl`等が、同一flush実行内でrecordごとに
+ * 同じディレクトリを何度も`root`から解決し直さないようにするためのhelper。
+ * `dirHandleCache`省略時は毎回`root.getDirectoryHandle`を呼ぶ（従来通り）。
+ * キーは`resolveVaultRelativePath`の1階層目と同じ文字列空間を使うため、
+ * 同一キャッシュを共有すれば互いの解決結果を再利用できる。
+ */
+async function getCachedVaultTopLevelDir(
+  root: FileSystemDirectoryHandle,
+  name: string,
+  label: string,
+  dirHandleCache?: VaultDirHandleCache
+): Promise<FileSystemDirectoryHandle> {
+  const cached = dirHandleCache?.get(name);
+  if (cached !== undefined) return cached;
+  const dir = await timedIOStep(label, () => root.getDirectoryHandle(name, { create: true }));
+  dirHandleCache?.set(name, dir);
+  return dir;
+}
+
+/**
  * "Conversations/x/y.md"のようなVault root相対pathを、末尾のファイル名を除いた
  * ディレクトリまで辿り、`{dir, fileName}`を返す（中間ディレクトリは
  * `{ create: false }`——既存の構造だけを辿り、勝手に新規作成しない）。
  * Step 2で実際に登場するpathは常に1階層（"Conversations/xxx.md"等）だが、
  * 将来のネストしたpathでも正しく動くよう汎用的に実装する。
+ *
+ * `dirHandleCache`（省略可）：呼び出し元が同一operation内で使い回すキャッシュを
+ * 渡した場合、既に解決済みのディレクトリはSAF I/Oを行わずそのまま返す。
+ * 省略時（従来通り`undefined`）は毎回フルに`getDirectoryHandle`を呼ぶ——
+ * 既存呼び出し元の挙動は一切変えない。
  */
 async function resolveVaultRelativePath(
   root: FileSystemDirectoryHandle,
-  relativePath: string
+  relativePath: string,
+  dirHandleCache?: VaultDirHandleCache
 ): Promise<{ dir: FileSystemDirectoryHandle; fileName: string }> {
   if (!isSafeVaultRelativePath(relativePath)) {
     throw new Error(`[Tsumugi] refusing to resolve unsafe vault registry path: ${JSON.stringify(relativePath)}`);
   }
   const segments = relativePath.split("/");
   let dir = root;
+  let cacheKey = "";
   for (const segment of segments.slice(0, -1)) {
+    cacheKey = cacheKey ? `${cacheKey}/${segment}` : segment;
+    const cached = dirHandleCache?.get(cacheKey);
+    if (cached !== undefined) {
+      dir = cached;
+      continue;
+    }
     // 実機不具合対応（Android診断）：Android SAFでここが遅延/停止していないかを
     // 計測するためだけの追加。既存のtimedIOStepパターンを再利用し、path名は
-    // labelに含めない（固定文字列のみ）。
+    // labelに含めない（固定文字列のみ）。キャッシュhit時はI/Oが発生しないため
+    // このログ自体も出ない（＝ログの出現回数減少がキャッシュ効果の目安になる）。
     dir = await timedIOStep("registry resolve:getDirectoryHandle", () => dir.getDirectoryHandle(segment, { create: false }));
+    dirHandleCache?.set(cacheKey, dir);
   }
   return { dir, fileName: segments[segments.length - 1] };
 }
@@ -3708,28 +3805,70 @@ interface VaultRegistrySnapshot {
 }
 
 async function buildVaultRegistrySnapshot(root: FileSystemDirectoryHandle): Promise<VaultRegistrySnapshot> {
+  const snapshotStart = Date.now();
   const previousByKey = new Map<string, string>();
   const previousEntries = new Map<string, VaultRegistryFileEntry>();
   const previousRegistryKeyByPath = new Map<string, string>();
+  // Codexレビュー指摘（Low）対応：shardCountは「実際にsnapshotへ反映できた
+  // shard数」を表す。ループ内で1件処理するたびに加算するため、途中でI/Oエラーに
+  // なっても0固定にはならず、そこまでに処理できた件数が正しく残る。
+  let shardCount = 0;
+  // .tsumugi/registry/ が無い（Registry未確立の正常な状態）場合は、既存挙動
+  // （previousByKey等は空のまま）を維持しつつ、diagnostic上もcompleted=true
+  // （＝空のsnapshotとして正常に完了した）として扱う。
+  let completed = true;
   try {
-    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
-    const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: false });
-    for await (const [name, handle] of registryDir.entries()) {
-      if (handle.kind !== "file" || !name.endsWith(".json")) continue;
-      const bucket = Number.parseInt(name.replace(/\.json$/, ""), 16);
-      if (!Number.isFinite(bucket)) continue;
-      const shard = await readVaultRegistryShard(root, bucket);
-      for (const [key, path] of Object.entries(shard.records)) {
-        previousByKey.set(key, path);
-        previousRegistryKeyByPath.set(path, key);
+    // 実機不具合対応（Android性能改善）：`.tsumugi`/`.tsumugi/registry`は
+    // このsnapshot構築の間ずっと同じディレクトリを指すため、1回だけ解決して
+    // 以降の全shard readで使い回す（`readVaultRegistryShardFromDir`）。以前は
+    // shardを読むたびに`readVaultRegistryShard`経由で毎回この2階層を再解決して
+    // いた（実機ログで確認された重複I/Oの一因）。この解決自体はCodexレビュー
+    // 指摘（M1）の対象外で、そのまま維持する。
+    const tsumugiDir = await timedIOStep("registry snapshot:tsumugiDir", () => root.getDirectoryHandle(".tsumugi", { create: false }));
+    const registryDir = await timedIOStep("registry snapshot:registryDir", () =>
+      tsumugiDir.getDirectoryHandle("registry", { create: false })
+    );
+
+    // Codexレビュー指摘（M1）対応：「entries()を先に配列化してから読む」二段
+    // 構成をやめ、変更前と同じ「列挙しながらその場でshardを読み、snapshotへ
+    // 反映する」単一ループへ戻した。これにより、entries()の途中でI/Oエラーが
+    // 起きても、それまでに読めたshardの情報は（変更前と同じく）previousByKey/
+    // previousEntries/previousRegistryKeyByPathに残る。読む順序もentries()の
+    // 列挙順のまま。registryDirハンドルの使い回しだけは維持する。
+    try {
+      for await (const [name, handle] of registryDir.entries()) {
+        if (handle.kind !== "file" || !name.endsWith(".json")) continue;
+        const bucket = Number.parseInt(name.replace(/\.json$/, ""), 16);
+        if (!Number.isFinite(bucket)) continue;
+        const shard = await readVaultRegistryShardFromDir(registryDir, bucket);
+        for (const [key, path] of Object.entries(shard.records)) {
+          previousByKey.set(key, path);
+          previousRegistryKeyByPath.set(path, key);
+        }
+        for (const [path, entry] of Object.entries(shard.files)) {
+          previousEntries.set(path, entry);
+        }
+        shardCount += 1;
       }
-      for (const [path, entry] of Object.entries(shard.files)) {
-        previousEntries.set(path, entry);
-      }
+    } catch {
+      // 実機不具合対応（Codexレビュー指摘対応）：entries()の列挙自体が途中で
+      // 失敗した場合。それまでにshardCountへ加算済み・snapshotへ反映済みの
+      // 内容はそのまま残す（変更前と同じ「読めた分だけ読む」挙動）。diagnostic
+      // 上は「完了しなかった」ことだけを記録する。
+      completed = false;
     }
   } catch {
     // .tsumugi/registry/ が無い：previousByKey/previousEntries/previousRegistryKeyByPathは空のまま。
   }
+  // 実機不具合対応（Android性能改善・aggregate diagnostic、Codexレビュー指摘
+  // M1/Low対応）：個々のpath/idは含めず、実際にsnapshotへ反映できたshard数・
+  // 全体所要時間・列挙が最後まで完了したかどうかだけを記録する。途中失敗時に
+  // 「complete」と誤解されるイベントは出さない（completed=0として区別する）。
+  logTimingEvent("Vault registry snapshot:end", {
+    shardCount,
+    durationMs: Date.now() - snapshotStart,
+    completed: completed ? 1 : 0,
+  });
   return { previousByKey, previousEntries, previousRegistryKeyByPath };
 }
 
@@ -3872,8 +4011,14 @@ async function discoverLevel1MetadataCandidates(
   root: FileSystemDirectoryHandle,
   snapshot: VaultRegistrySnapshot
 ): Promise<VaultLightCheckLevel1Result> {
+  const level1Start = Date.now();
   const candidates: VaultLightCheckKnownPathCandidate[] = [];
   const confirmedPresentKeys = new Set<string>();
+  // 実機不具合対応（Android性能改善）：既知recordの多くが同じConversations/
+  // Memories/Sourcesディレクトリを共有するため、このLevel 1実行1回の間だけ
+  // ディレクトリハンドルを使い回す。この関数のローカル変数のため、関数を抜ければ
+  // 破棄され、次回のLevel 1実行へは一切持ち越さない（stale handleを作らない）。
+  const dirHandleCache: VaultDirHandleCache = new Map();
 
   for (const [registryKey, path] of snapshot.previousByKey.entries()) {
     const entry = snapshot.previousEntries.get(path);
@@ -3881,7 +4026,7 @@ async function discoverLevel1MetadataCandidates(
 
     let file: File;
     try {
-      const resolved = await resolveVaultRelativePath(root, path);
+      const resolved = await resolveVaultRelativePath(root, path, dirHandleCache);
       const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
       file = await fileHandle.getFile();
     } catch (error) {
@@ -3901,6 +4046,14 @@ async function discoverLevel1MetadataCandidates(
 
     confirmedPresentKeys.add(registryKey);
   }
+
+  // 実機不具合対応（aggregate diagnostic）：個々のregistryKey/pathは含めず、
+  // 件数と所要時間だけを記録する。
+  logTimingEvent("Vault light:L1 complete", {
+    knownCount: snapshot.previousByKey.size,
+    candidateCount: candidates.length,
+    durationMs: Date.now() - level1Start,
+  });
 
   return { candidates, confirmedPresentKeys };
 }
