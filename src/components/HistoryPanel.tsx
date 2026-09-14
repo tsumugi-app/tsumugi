@@ -138,19 +138,12 @@ interface DayCacheEntry {
  */
 export default function HistoryPanel({
   onClose,
-  onOpenSettings,
   vaultHandle,
   initialMemoryId,
   refreshToken,
   sessionCapturedMemories = [],
 }: {
   onClose: () => void;
-  /**
-   * 実機不具合対応（原則B）：外部変更によりdetailが開けない（`detailUnavailable`）
-   * 状態のとき、案内メッセージから直接設定画面（「Vaultを再同期」がある場所）へ
-   * 遷移するための導線。渡されなければボタン自体を出さない（後方互換のoptional）。
-   */
-  onOpenSettings?: () => void;
   /**
    * ChatScreen.tsx側の既存Vault state（変更なし）をそのまま渡してもらうだけ。
    * このコンポーネント自身はVault切替ロジックを一切持たない——propが変わった
@@ -190,8 +183,14 @@ export default function HistoryPanel({
   /**
    * 実機不具合対応（原則B）：一覧行をタップしたが本体を読めなかった場合にtrue。
    * History上には行として残っている（存在した記録）にもかかわらず読めない場合、
-   * 無言で何も起きなかったように見せず、「外部で変更された可能性があるため
-   * Vaultを再同期してください」という案内を表示する（技術用語は出さない）。
+   * 無言で何も起きなかったように見せず「この記録は現在開けません。」とだけ表示する。
+   *
+   * Codex監査対応（M1）：read failureは、Registry statusがok以外・ファイル不存在・
+   * 権限/I-O失敗・parse失敗・day-file内に対象recordが存在しない、等の複数の原因が
+   * null/空の戻り値へ集約されており、History側では実際の原因を判別できない。
+   * そのため原因を断定する文言や、解決手段の無い「設定を開く」導線は出さない
+   * （以前は「Vaultを再同期してください」と案内していたが、Settingsには対応する
+   * 復旧操作が無く誤誘導だったため削除した）。
    */
   const [detailUnavailable, setDetailUnavailable] = useState(false);
 
@@ -202,11 +201,10 @@ export default function HistoryPanel({
    * 既存effect（下記、月/日一覧の再取得用）は`conversationRows`/`memoryRows`等
    * 一覧側のstateしか更新せず、`selectedConversation`/`selectedMemory`/
    * `detailUnavailable`（1行タップ時にだけ設定される、detail画面固有のstate）は
-   * 一切触れない。そのため、再同期前に「この記録を開くために、保存先の確認が
-   * 必要です」を表示したままSettingsで再同期を実行してHistoryへ戻ると、Registry
-   * 側は既に解決しているにもかかわらず、この画面には古いエラー表示が残り続けて
-   * いた。自動的な再オープンは行わない（「戻る」を押して行を選び直せば最新状態で
-   * 読み直される）——ここでは古い状態を残さないことだけを保証する。
+   * 一切触れない。そのため、「この記録は現在開けません。」を表示したまま裏で
+   * Vault側の状態が解決してHistoryへ戻ると、この画面には古いエラー表示が残り
+   * 続けていた。自動的な再オープンは行わない（「戻る」を押して行を選び直せば
+   * 最新状態で読み直される）——ここでは古い状態を残さないことだけを保証する。
    */
   useEffect(() => {
     setDetailUnavailable(false);
@@ -826,17 +824,7 @@ export default function HistoryPanel({
                     戻る
                   </button>
                   <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
-                    <p>この記録を開くために、保存先の確認が必要です。</p>
-                    <p className="text-xs text-stone-500 dark:text-stone-400">設定から「Vaultを再同期」してください。</p>
-                    {onOpenSettings && (
-                      <button
-                        type="button"
-                        onClick={onOpenSettings}
-                        className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
-                      >
-                        設定を開く
-                      </button>
-                    )}
+                    <p>この記録は現在開けません。</p>
                   </div>
                 </div>
               ) : selectedConversation ? (

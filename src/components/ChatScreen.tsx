@@ -19,13 +19,11 @@ import {
   readHistoryMeta,
   requestVaultPermission,
   restoreVaultHandle,
-  resyncVaultRegistry,
   waitForVaultWrites,
   type VaultHoldReason,
   type VaultLightCheckClassifyResult,
   type VaultLightCheckDiscoveryResult,
   type VaultRestoreResult,
-  type VaultResyncResult,
   type VaultScanResult,
   type VaultWritePriority,
 } from "@/lib/vault";
@@ -149,23 +147,10 @@ export type RestoreStatus = "idle" | "restoring" | "done";
 export type DataActionFeedback = { kind: "busy" | "success" | "empty" | "error"; message: string };
 
 /**
- * Step 5：「Vaultを再同期」の進行状況・結果表示用。`detail`は「詳細を見る」で
- * 開くBeta向けの簡易debug情報（applyErrors/unreadableFilesの内容を短くまとめた
- * もの）であり、一般ユーザー向けメッセージ（`message`）には含めない。busy中は
- * ボタンをdisabledにする（他のVaultボタンも`vaultActionsDisabled`経由で連動して
- * disableする）。success/partial/errors/errorは自動では消さない
- * （競合・見つからない等の件数はユーザーが確認するまで残す）。
- */
-export type VaultResyncFeedback = {
-  kind: "busy" | "success" | "partial" | "errors" | "error";
-  message: string;
-  detail?: string;
-};
-
-/**
  * 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。起動時のbackground
  * チェック（Level 1/2）で候補が1件以上見つかった場合のみ"candidates-found"に
- * なり、Settingsに「外部の変更があります」を表示する。
+ * なり、Settingsに「外部の変更がある可能性があります」を表示する（Codex監査
+ * 対応：Level 1/2のcandidateにはTsumugi管理外Markdownが含まれうるため断定しない）。
  * 「確認する」でLevel 3（candidateのみの本文read＋分類）を実行し"classified"へ、
  * 「変更を反映」でLevel 4（apply直前の再検証＋candidateのみapply）を実行し
  * "applied"へ進む。既存の`resyncVaultRegistry`（full resync）は一切呼ばない
@@ -234,17 +219,6 @@ const STARTUP_CAPTURE_LIMIT = 3;
  * ことは絶対にしない。
  */
 const VAULT_SWITCH_SETTLE_TIMEOUT_MS = 20000;
-
-/**
- * Android実機不具合対応：「Vaultを再同期」が`"再同期中…"`のまま、この時間を
- * 超えて続いた場合に、UIへ「時間がかかっています」という案内を追加表示する
- * ためだけの閾値。resyncVaultRegistry自体のsoft deadline
- * （`VAULT_RESYNC_SOFT_DEADLINE_MS`、vault.ts）とは独立しており、
- * こちらは純粋にユーザーへの早めの状況共有が目的（20秒——通常のAndroid実機でも
- * 数件〜十数件程度の処理なら収まりうる時間だが、これを超えたら「動いてはいるが
- * 時間がかかる処理だ」と認識してもらうのに十分な長さ）。
- */
-const RESYNC_TAKING_LONG_MS = 20000;
 
 /** Beta C4：/api/chatの失敗時、ステータスだけを見てAPIキー由来かどうかをUI側で分岐するための最小限のエラー型。 */
 class ChatRequestError extends Error {
@@ -463,7 +437,6 @@ export default function ChatScreen() {
   /** 「Markdownをエクスポート」「この端末のデータを削除」（SettingsPanelのデータ欄）の状態。 */
   const [exportDataFeedback, setExportDataFeedback] = useState<DataActionFeedback | null>(null);
   const [deleteDataFeedback, setDeleteDataFeedback] = useState<DataActionFeedback | null>(null);
-  const [vaultResyncFeedback, setVaultResyncFeedback] = useState<VaultResyncFeedback | null>(null);
   /** 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。詳細は`VaultLightCheckStatus`参照。 */
   const [vaultLightCheckStatus, setVaultLightCheckStatus] = useState<VaultLightCheckStatus>({ kind: "idle" });
   /**
@@ -486,16 +459,6 @@ export default function ChatScreen() {
    * 自然に再試行される）。
    */
   const [vaultHoldReasons, setVaultHoldReasons] = useState<Record<VaultHoldReason, number> | null>(null);
-  /**
-   * Android実機不具合対応：「Vaultを再同期」が`vaultResyncFeedback.kind==="busy"`
-   * のまま一定時間（`RESYNC_TAKING_LONG_MS`）続いた場合にtrueにする。File System
-   * Access APIには`entries()`/`getFile()`等をキャンセルする手段が無いため
-   * （MDN仕様確認済み）、単発I/Oが実機で極端に遅い・応答しないケースをアプリ側で
-   * 強制的に打ち切ることはできない。せめてユーザーに「時間がかかっている」ことを
-   * 伝え、ページ再読み込みによる中断という選択肢を示すためだけのUI状態であり、
-   * 実際のresync処理そのものには一切影響しない。
-   */
-  const [vaultResyncTakingLong, setVaultResyncTakingLong] = useState(false);
   /**
    * トップ画面の「アクセスを再許可」カードの「あとで」で非表示にしたかどうか。
    * ページセッション中のみ有効（stateなのでリロードで自動的にfalseへ戻り、
@@ -1094,6 +1057,14 @@ export default function ChatScreen() {
     // ここでは残存しているUI状態・discovery参照だけを破棄すればよい。
     vaultLightCheckDiscoveryRef.current = null;
     setVaultLightCheckStatus({ kind: "idle" });
+    // Codex監査対応（M4）：`vaultHoldReasons`は「最後に観測したflush結果」を表す
+    // UI専用stateであり、書き込み可否等の安全判定には一切使われない（安全判定は
+    // 既存のRegistry write gate側が毎回独立に行う）。しかしVault/Memory World切替
+    // 時に明示的にリセットしないと、旧Vaultで観測したHOLDがSettings上に新Vaultの
+    // ものとして残り続けてしまう。ここでnullへ戻す——「HOLDが存在しないことを
+    // 確認済み」という意味ではなく、「新しいworldではまだ観測していない」という
+    // 初期状態を表す（次回のflushで実測され次第、正しい値へ更新される）。
+    setVaultHoldReasons(null);
   }
 
   /**
@@ -2123,7 +2094,7 @@ export default function ChatScreen() {
           | { status: "success" }
           | { status: "stale" }
           | { status: "flush-failed" }
-          | { status: "held" }
+          | { status: "held"; heldByReason: Record<VaultHoldReason, number> }
           | { status: "clear-failed" }
           | { status: "save-handle-failed" };
 
@@ -2160,13 +2131,20 @@ export default function ChatScreen() {
           //
           // 優先順位：真の書き込み失敗（failedCount）がある場合は、従来通り
           // 「保存に失敗した」という文言（"flush-failed"）を優先する。failedCountが
-          // 0でheldCountだけがある場合は、ユーザーが取るべき行動（Vaultを再同期）を
-          // 案内できる専用の"held"を返す。
+          // 0でheldCountだけがある場合は、専用の"held"を返す。
+          //
+          // Codex監査対応（M2）：以前はheldByReasonをここで捨てていたため、
+          // 「保存先切替のfinal flushで初めてHOLDを検出した」経路では
+          // `vaultHoldReasons`（Settings常設表示のtruth source）が更新されず、
+          // 一時feedback（「保存先の切り替えを中止しました。」）だけが出て、
+          // Settingsを開いても常設のHOLD説明が出ない不整合があった。実測した
+          // heldByReasonをそのまま呼び出し元へ返し、`vaultHoldReasons`へ反映する
+          // （HOLD時の切替拒否条件・flushロジック自体は一切変更しない）。
           if (flushResult.failedCount > 0) {
             return { status: "flush-failed" };
           }
           if (flushResult.heldCount > 0) {
-            return { status: "held" };
+            return { status: "held", heldByReason: flushResult.heldByReason };
           }
 
           // 6. flushPendingToVault自身が積んだ書き込みが完了するまで待つ。
@@ -2265,14 +2243,20 @@ export default function ChatScreen() {
           return;
         }
         if (outcome.status === "held") {
-          // 安全確認（実機不具合の再調査）対応：真の書き込み失敗ではなく、想定された
+          // 実機不具合対応（HOLD表示整理）：真の書き込み失敗ではなく、想定された
           // 安全HOLD（VaultRecordNeedsResyncError）が原因で切替を中止した場合。技術用語
-          // は出さない。「Vaultを再同期」ボタンは通常UIから外したため、その名称を
-          // 案内することはできない——設定内のHOLD fallback導線（vaultHoldReasons）を
-          // 指す中立的な文言にする（UX調査対応）。
+          // は出さない。この`vaultConnectFeedback`はあくまで「今回の切替操作の結果」を
+          // 伝える一時的なfeedback（数秒で自動的に消える）であり、HOLDの原因説明は
+          // Settings側の常設ブロック（`vaultHoldReasons`）が既に担うため、ここでは
+          // 重複させない——「操作がどうなったか」だけを短く伝える。
+          // Codex監査対応（M2）：このfinal flushが今回のセッションで初めてHOLDを
+          // 検出したケースでは、`vaultHoldReasons`がまだnullのまま（起動時flush等が
+          // まだ一度も検出していない）ことがある。実測した`heldByReason`をここでも
+          // 反映し、Settings常設表示が正しく出るようにする。
+          setVaultHoldReasons(outcome.heldByReason);
           setVaultConnectFeedback({
             kind: "error",
-            message: "保存先への反映を保留している記録があります。設定から保存先を確認してから、もう一度お試しください。",
+            message: "保存先の切り替えを中止しました。",
           });
           window.setTimeout(() => setVaultConnectFeedback(null), 6000);
           return;
@@ -2624,140 +2608,19 @@ export default function ChatScreen() {
   }
 
   /**
-   * Android実機不具合対応：`vaultResyncFeedback`が`"busy"`になっている間だけ
-   * タイマーを張り、`RESYNC_TAKING_LONG_MS`を超えたら`vaultResyncTakingLong`を
-   * trueにする。busy以外（成功/partial/errors/null）に変わった時点でクリアする。
-   * resyncVaultRegistry自体を一切操作しない、UI表示専用の軽量な監視。
-   */
-  useEffect(() => {
-    if (vaultResyncFeedback?.kind !== "busy") {
-      setVaultResyncTakingLong(false);
-      return;
-    }
-    const timer = window.setTimeout(() => setVaultResyncTakingLong(true), RESYNC_TAKING_LONG_MS);
-    return () => window.clearTimeout(timer);
-  }, [vaultResyncFeedback]);
-
-  /**
-   * Step 5：「Vaultを再同期」。ユーザーが外部（Obsidian等）でMarkdownを移動・編集・
-   * 追加した場合に、明示的な操作でのみVault Registry/IndexedDB/History Indexを
-   * 再整合させる（`resyncVaultRegistry`、起動時の自動実行は一切しない）。
+   * 実機不具合対応（孤立UIコードの整理）：以前ここには「Vaultを再同期」ボタンの
+   * 進行状況監視effect（vaultResyncTakingLong）と、そのボタンから呼ばれていた
+   * handleResyncVault（resyncVaultRegistryのUIラッパー）があった。Android実機
+   * 確認の結果、full resyncを通常ユーザー向け復旧操作として使わない方針に変更し、
+   * SettingsPanel.tsxからそのボタン（およびpropsのvaultResyncFeedback／
+   * vaultResyncTakingLong／onResolveVaultHold）を削除した時点で、これらは
+   * どこからも呼ばれないReact側コードになったため削除した。
    *
-   * `vaultOperationLockRef`は既存のhandleConnectVault/handleReauthorizeVault/
-   * handleRestoreFromVaultと共有する軽いロックをそのまま再利用する（Vault管理系
-   * 操作同士の同時実行を防ぐ、既存の設計方針を踏襲。新しいロックは作らない）。
-   * conflict/missing/unreadableの解決（どちらを採用するか・削除するか等）は
-   * 今回のStepでは一切行わない——件数の表示だけに留める。
+   * resyncVaultRegistry本体（vault.ts）およびfull resyncエンジン自体は
+   * 削除・変更していない——将来advanced/debug用途で再度UIハンドラを作る際は、
+   * resyncVaultRegistry(vaultHandle)を直接呼び出すところから再構築できる。
    */
-  async function handleResyncVault() {
-    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
-    vaultOperationLockRef.current = true;
-    setVaultResyncFeedback({ kind: "busy", message: "再同期中…" });
-    try {
-      const result: VaultResyncResult = await resyncVaultRegistry(vaultHandle);
-      const { counts, applyErrors, unreadableFiles, conflictDetails, missingDetails } = result;
 
-      const changedLines: string[] = [];
-      if (counts.added > 0) changedLines.push(`追加 ${counts.added}`);
-      if (counts.edited > 0) changedLines.push(`更新 ${counts.edited}`);
-      if (counts.moved > 0) changedLines.push(`移動 ${counts.moved}`);
-
-      const attentionLines: string[] = [];
-      if (counts.conflict > 0) attentionLines.push(`競合 ${counts.conflict}`);
-      if (counts.missing > 0) attentionLines.push(`見つからない ${counts.missing}`);
-      if (counts.unreadable > 0) attentionLines.push(`読み取れないファイル ${counts.unreadable}`);
-
-      // 完全成功の表示は scanCompleted/applyErrors/conflict/missing/unreadable の
-      // 全てが問題無い場合だけに限定する。scanCompleted=falseはVault全体の
-      // directory enumerationが最後まで完走しなかったことを意味し（Step 4c）、
-      // その時点までのpositive changeは既にapply済みの可能性があるため、
-      // 「エラーで全部失敗した」とは扱わずpartial表示に倒す（applyErrorsが
-      // 無ければ「反映できませんでした」ではなく「一部を確認できませんでした」
-      // という、scan未完了専用の文言にする）。
-      let headline: string;
-      let kind: VaultResyncFeedback["kind"];
-      if (applyErrors.length > 0) {
-        headline = "再同期は完了しましたが、一部を反映できませんでした。";
-        kind = "errors";
-      } else if (!result.scanCompleted) {
-        headline = "再同期は完了しましたが、Vaultの一部を確認できませんでした。";
-        kind = "partial";
-      } else if (attentionLines.length > 0) {
-        headline = "再同期しました。確認が必要な項目があります。";
-        kind = "partial";
-      } else {
-        headline = "再同期しました。";
-        kind = "success";
-      }
-
-      const detailLines = [...changedLines, ...attentionLines];
-      const message = detailLines.length > 0 ? `${headline}\n${detailLines.join("　")}` : headline;
-
-      // Beta向けの簡易debug情報（「詳細を見る」でのみ表示、生のstack traceは含めない）。
-      // 実機不具合対応（診断情報）：conflict/missingそれぞれについて、どのrecordが
-      // 対象かをここでのみ（通常表示には出さず）確認できるようにする。分類理由
-      // （reason）は既存のnote文言をそのまま転記したもので、新しい分類基準の追加ではない。
-      const debugLines = [
-        ...applyErrors.map((e) => `apply: ${e.registryKey}: ${e.reason}`),
-        ...unreadableFiles.map((f) => `read: ${f.path}: ${f.reason}`),
-        ...conflictDetails.map(
-          (c) =>
-            `conflict: ${c.registryKey} (${c.recordType}): ${c.previousPath ?? "(no previous path)"} → ${c.candidatePath ?? "(no candidate path)"} — ${c.reason}`
-        ),
-        ...missingDetails.map((m) => `missing: ${m.registryKey} (${m.recordType}): ${m.previousPath ?? "(no previous path)"}`),
-      ];
-
-      // History Indexはresync engine自身が更新済みのため、HistoryPanel側の
-      // 既存refresh経路（refreshToken）を再利用するだけでよい（新しいevent bus・
-      // 全体reloadは行わない）。Tree（つむぎの木）は起動時のLaunchTreeScreenのみが
-      // 実際に到達可能で、同一セッション内で再表示されることは無いため、
-      // 追加のrefresh処理は不要（次回起動時にhistory-meta.jsonを新たに読み直す）。
-      bumpHistoryRefreshToken();
-
-      // UX調査対応（HOLD成功判定の実状態化）：resyncが正常終了したこと自体を
-      // HOLD解消の証拠にしない。missing/conflict/baseline-not-establishedは
-      // resyncが問題無く完了してもHOLD原因が残る場合があることを確認済みのため、
-      // ここでもう一度flushして実際のheldCount/heldByReasonを取得し、それを
-      // truth sourceとして`vaultHoldReasons`へ反映する。`vaultResyncFeedback`は
-      // この再flushが終わるまで"busy"のままにしておく（他のVault操作を
-      // 誤って有効化しないため）。
-      let heldAfterResync: { heldCount: number; heldByReason: Record<VaultHoldReason, number> } | null = null;
-      try {
-        heldAfterResync = await withVaultWorldRead(() => flushPendingToVault(vaultHandle, "interactive"));
-      } catch (reflushError) {
-        if (handleStaleVaultTabError(reflushError)) {
-          setVaultResyncFeedback(null);
-          return;
-        }
-        console.error("Failed to re-check held records after vault resync", reflushError);
-        // 再flush自体が失敗：実測できていないため、vaultHoldReasonsは動かさない
-        // （安全側：誤って「解消した」とみなさない。既存の表示のまま次回flushへ委ねる）。
-      }
-
-      setVaultResyncFeedback({
-        kind,
-        message,
-        detail: debugLines.length > 0 ? debugLines.join("\n") : undefined,
-      });
-      if (heldAfterResync) {
-        setVaultHoldReasons(heldAfterResync.heldCount > 0 ? heldAfterResync.heldByReason : null);
-      }
-    } catch (error) {
-      if (handleStaleVaultTabError(error)) {
-        // crossTabStale側の既存バナーへ処理を委ねるため、「再同期中…」のまま
-        // ボタンが固まって見えないよう、このpanel自身のfeedbackは消す。
-        setVaultResyncFeedback(null);
-        return;
-      }
-      console.error("Failed to resync vault", error);
-      setVaultResyncFeedback({
-        kind: "error",
-        message: "Vaultを再同期できませんでした。もう一度お試しください。",
-      });
-    } finally {
-      vaultOperationLockRef.current = false;
-    }
-  }
 
   /**
    * 軽量「外部の変更」検知フロー：「確認する」＝Level 3。起動時（Level 1/2）で
@@ -3480,28 +3343,19 @@ export default function ChatScreen() {
         </div>
       )}
       {/*
-        UX調査対応（HOLD原因の区別）：background/startup flushが
+        実機不具合対応（HOLD表示整理）：background/startup flushが
         `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
-        いる状態）を検出した場合のバナー。「Registry」「needs-resync」「baseline」
-        等の内部用語は出さない。
-        重要：これは軽量「外部の変更」検知フロー（`vaultLightCheckStatus`）とは
-        別の仕組みであり、混同を避けるため誘導文言・ボタンは出さない——
-        以前は「『Vaultを再同期』すると最新の状態を確認できます」→「設定を開く」
-        という、light-check導線とほぼ同じ見た目の誘導になっており、実際には
-        Settings側に対応する「確認する」が無い（light-checkとは無関係）ため、
-        「設定を開いても何も表示されていない」という実機報告の原因になっていた。
-        原因（baseline未確立／needs-resync／missing／conflict）ごとに安全な
-        解消方法が未確定なため、押すと何かが起きるボタンは今回追加しない——
-        静的な状態説明のみ表示する（他の読み取り専用バナー、例：
-        "unsupported-journal-version"と同じパターン）。
-        IndexedDB側の記録はHOLD中も変更されない（`markVaultSynced`が呼ばれず
-        「未同期」のまま残るだけ）ため、会話の継続・記憶へのアクセスは妨げない。
+        いる状態）を検出した場合、以前はここ（ホーム最上部）にも常時バナーを
+        出していたが、実機確認の結果：
+        - ユーザーがその場で直接解消できる操作が無い（full resyncは重く、通常
+          ユーザー向け復旧として使わない方針に変更済み）
+        - Settings側（SettingsPanel.tsx、`vaultHoldReasons`）に同じ内容の説明が
+          既にあり、二重表示になっていた
+        - 常時表示だと会話の妨げになる
+        という3点から、ホーム最上部には表示しないことにした。`vaultHoldReasons`
+        自体（state）は変更せず、Settingsを開いた時だけ説明を表示する
+        （SettingsPanel.tsx参照）。
       */}
-      {vaultHoldReasons && vaultStatus === "connected" && (
-        <div className="flex shrink-0 items-center bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
-          <span>保存先への反映を保留している記録があります。</span>
-        </div>
-      )}
       {/*
         Phase A（Android実機キーボード入力の完全復旧）：rootのoverflowは
         f818292時点の状態（overflow制限なし）へ戻した。
@@ -4092,13 +3946,6 @@ export default function ChatScreen() {
             restoreStatus={restoreStatus}
             onClose={() => {
               setSettingsOpen(false);
-              // 実機不具合対応：前回の再同期結果（「再同期しました。」「競合：xx」等）を
-              // Settingsを閉じるたびにクリアし、次に開いた時に古い結果が残らない
-              // ようにする。ただし再同期が今まさに実行中（"busy"）の場合はクリアしない
-              // ——ここでクリアすると`vaultActionsDisabled`がfalseに戻り、裏でまだ
-              // 実行中のresyncと並行して他のVault操作（保存先変更等）が開始できて
-              // しまうため（busy状態は実際の処理完了までUIとして正確に保たれる必要がある）。
-              setVaultResyncFeedback((current) => (current?.kind === "busy" ? current : null));
             }}
             onDeleteApiKey={(deleteTarget) => void handleDeleteApiKey(deleteTarget)}
             onOpenApiKeySetup={(provider) => setApiKeySetupProvider(provider)}
@@ -4109,7 +3956,6 @@ export default function ChatScreen() {
             vaultActionsDisabled={
               isVaultSwitching ||
               crossTabStale ||
-              vaultResyncFeedback?.kind === "busy" ||
               vaultLightCheckStatus.kind === "classifying" ||
               vaultLightCheckStatus.kind === "applying"
             }
@@ -4122,9 +3968,6 @@ export default function ChatScreen() {
             onApplyVaultLightCheck={() => void handleApplyVaultLightCheck()}
             onRetryVaultLightCheck={() => handleRetryVaultLightCheck()}
             vaultHoldReasons={vaultHoldReasons}
-            vaultResyncFeedback={vaultResyncFeedback}
-            vaultResyncTakingLong={vaultResyncTakingLong}
-            onResolveVaultHold={() => void handleResyncVault()}
           />
         </div>
       )}
@@ -4147,11 +3990,6 @@ export default function ChatScreen() {
             initialMemoryId={historyInitialMemoryId}
             refreshToken={historyRefreshToken}
             sessionCapturedMemories={sessionCapturedMemories}
-            onOpenSettings={() => {
-              setHistoryOpen(false);
-              setHistoryInitialMemoryId(undefined);
-              setSettingsOpen(true);
-            }}
             onClose={() => {
               setHistoryOpen(false);
               setHistoryInitialMemoryId(undefined);

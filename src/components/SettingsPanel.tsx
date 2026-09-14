@@ -7,7 +7,6 @@ import type {
   SupportedChatProvider,
   VaultConnectFeedback,
   VaultLightCheckStatus,
-  VaultResyncFeedback,
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
@@ -43,9 +42,6 @@ export default function SettingsPanel({
   onApplyVaultLightCheck,
   onRetryVaultLightCheck,
   vaultHoldReasons,
-  vaultResyncFeedback,
-  vaultResyncTakingLong = false,
-  onResolveVaultHold,
 }: {
   chatProvider: SupportedChatProvider;
   keyStatusByProvider: Record<SupportedChatProvider, boolean>;
@@ -87,25 +83,15 @@ export default function SettingsPanel({
   /** 「もう一度確認する」：staleまたはerror/partial発生後、古い結果を使わずLevel 1/2からやり直す。 */
   onRetryVaultLightCheck: () => void;
   /**
-   * UX調査対応（HOLD原因の区別）：Tsumugi自身のVault書き込みが保留されている
+   * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
    * 別の仕組みであり、混ぜない——HOLDはVaultへの保存待ちの記録があることを
    * 示すだけで、外部で変更が見つかったわけではない。
+   * Android実機確認の結果、full resyncを通常ユーザー向け復旧操作として使う案は
+   * 採用しないことにした（重い処理が実機で終わらず固まって見える）ため、
+   * ここは情報表示のみで、操作ボタンは一切出さない。
    */
   vaultHoldReasons: Record<VaultHoldReason, number> | null;
-  /**
-   * HOLD fallback（既存full resyncの結果）。「Vaultを再同期」ボタン自体は通常
-   * UIに出さないが、light-checkでは解消できないHOLDが検出された場合だけ、
-   * 一般ユーザー向け名称の「保存先を確認する」ボタンからこの仕組みを呼ぶ
-   * （内部的には`handleResyncVault`＝既存`resyncVaultRegistry`をそのまま使う）。
-   * 表示文言はこのコンポーネント側で`kind`から生成し直し、`message`の内容
-   * （「Vaultを再同期しました」等）はそのまま出さない。
-   */
-  vaultResyncFeedback: VaultResyncFeedback | null;
-  /** Android実機不具合対応：確認が一定時間を超えて終わらない場合にtrue。 */
-  vaultResyncTakingLong?: boolean;
-  /** 「保存先を確認する」／エラー後の再試行。内部でfull resyncを呼ぶ。 */
-  onResolveVaultHold: () => void;
 }) {
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
@@ -332,87 +318,28 @@ export default function SettingsPanel({
           )}
 
           {/*
-            UX調査対応：Tsumugi自身のVault書き込みHOLD（`vaultHoldReasons`）専用の
-            fallback UI。下の軽量「外部の変更」検知フロー（`vaultLightCheckStatus`）
-            とは完全に別物であり、混ぜない——こちらは「Tsumugi側の保存が保留中」、
-            light-checkは「外部で変更が見つかった」。「Vault」「再同期」「Registry」
-            という言葉は出さない。通常は`vaultHoldReasons`がnullのため、この節は
-            一切表示されない。調査の結果、baseline-not-established／needs-resync／
-            missing／conflictのいずれも、light-check（Level 1〜4）では解消できず、
-            既存full resyncだけが解消手段として利用可能なことを確認したため、
-            HOLDが1件でも検出された場合だけ、一般ユーザー向け名称の
-            「保存先を確認する」ボタンを出す（内部的には既存`handleResyncVault`＝
-            `resyncVaultRegistry`をそのまま使う、fallback。full resync本体は変更
-            していない）。
+            実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みHOLD
+            （`vaultHoldReasons`）専用の表示。下の軽量「外部の変更」検知フロー
+            （`vaultLightCheckStatus`）とは完全に別物であり、混ぜない——こちらは
+            「Tsumugi側の保存が保留中」、light-checkは「外部で変更が見つかった」。
+            「Vault」「再同期」「Registry」という言葉は出さない。通常は
+            `vaultHoldReasons`がnullのため、この節は一切表示されない。
 
-            成功判定の実状態化：`handleResyncVault`はresync完了直後にもう一度
-            flushして実測した`vaultHoldReasons`をtruth sourceにするよう変更済み
-            （resyncが正常終了したこと自体では成功と判定しない）。missing/
-            conflict/baseline-not-establishedはresyncが問題無く終わってもHOLDが
-            残りうるため、`vaultHoldReasons`がまだnullでない場合は「確認しました」
-            とは表示しない。また、一度確認を試みて解消しなかった場合、単純な
-            「もう一度確認する」（同じfull resyncを無意味に繰り返すだけ）は
-            出さない——reasonに応じて静的な状態説明に留める（詳細な競合解決UIは
-            今回作らない）。
+            Android実機確認の結果、この節から既存full resync（`handleResyncVault`）
+            を呼ぶ「保存先を確認する」ボタンは撤去した——実機で長時間終わらず、
+            アプリが止まったように見えるため、通常ユーザー向け復旧操作として
+            成立しないと判断した（full resync機能自体はadvanced/debug fallbackと
+            してChatScreen.tsx／vault.tsにそのまま残す）。解決できない操作ボタンは
+            出さず、情報表示のみに留める。IndexedDB側の記録はHOLD中も変更されず
+            （`markVaultSynced`が呼ばれず「未同期」のまま残るだけ）、端末内に
+            安全に保持されたまま会話を継続できるため、その旨も併記する。
+            Codex監査対応：「保留」は内部処理感が強いため避け、ユーザー向け3状態
+            （外部変更候補／保存先への未反映／記録を開けない）の表現に統一する。
           */}
-          {(vaultHoldReasons || vaultResyncFeedback) && (
-            <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
-              {vaultResyncFeedback?.kind === "busy" ? (
-                <div className="flex flex-col gap-2">
-                  <span>保存先を確認しています…</span>
-                  {vaultResyncTakingLong && (
-                    <div className="flex items-center justify-between gap-3 rounded-lg bg-amber-50/60 px-2.5 py-1.5 text-[11px] text-amber-700 dark:bg-amber-950/20 dark:text-amber-400">
-                      <span>確認に時間がかかっています。</span>
-                      <button
-                        type="button"
-                        onClick={() => window.location.reload()}
-                        className="shrink-0 rounded-full border border-amber-400/60 px-2.5 py-0.5 text-[11px] transition hover:bg-amber-200/40 dark:border-amber-600/60 dark:hover:bg-amber-900/40"
-                      >
-                        再読み込みして中止
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ) : vaultResyncFeedback ? (
-                vaultResyncFeedback.kind === "error" && vaultHoldReasons !== null ? (
-                  // resync自体が完了しなかった（実測できていない）場合：
-                  // 「解消できなかった」と断定せず、再試行可能なエラーとして扱う
-                  // （一時的な通信/権限エラー等の可能性があるため）。
-                  <div className="flex items-center justify-between gap-4">
-                    <span>保存先を確認できませんでした。もう一度お試しください。</span>
-                    <button
-                      onClick={onResolveVaultHold}
-                      disabled={vaultActionsDisabled}
-                      className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
-                    >
-                      もう一度確認する
-                    </button>
-                  </div>
-                ) : vaultHoldReasons === null ? (
-                  <span>保存先を確認しました。</span>
-                ) : vaultHoldReasons["baseline-not-established"] === 0 && vaultHoldReasons["needs-resync"] === 0 ? (
-                  // missing/conflictだけが残っている：Vault側の実ファイル状態に
-                  // 起因するため、自動処理（もう一度同じ確認を繰り返す）では
-                  // 解消できない状態として扱う。
-                  <span>保存先のファイル状態を確認する必要があります。</span>
-                ) : (
-                  // resyncは正常終了したが、再flushで実測した結果まだHOLDが
-                  // 残っている（baseline-not-established／needs-resync）。同じ
-                  // full resyncを無意味に繰り返させるボタンは出さない。
-                  <span>保存先への反映を完了できない記録があります。</span>
-                )
-              ) : (
-                <div className="flex items-center justify-between gap-4">
-                  <span>保存先への反映を保留している記録があります。</span>
-                  <button
-                    onClick={onResolveVaultHold}
-                    disabled={vaultActionsDisabled}
-                    className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
-                  >
-                    保存先を確認する
-                  </button>
-                </div>
-              )}
+          {vaultHoldReasons && (
+            <div className="flex flex-col gap-1 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <span>保存先に反映されていない記録があります。</span>
+              <span className="text-xs text-stone-500 dark:text-stone-400">記録は端末内に保持されています。</span>
             </div>
           )}
 
@@ -420,14 +347,20 @@ export default function SettingsPanel({
             軽量「外部の変更」検知フロー（Level 1〜4）。「Vault」「Registry」
             「resync」「同期」等の内部用語は出さない。保存先の外部変更に関する
             通常ユーザー向け導線はこのUIに一本化する（完成イメージ：
-            「外部の変更があります［確認する］」→「編集/移動/追加/削除 N件」
-            ［変更を反映］→「外部の変更を反映しました。」）。
+            「外部の変更がある可能性があります［確認する］」→
+            「編集/移動/追加/見つからない N件」［変更を反映］→
+            「外部の変更を反映しました。」）。
             調査対応：`countVaultLightCheckCandidates()`（Level 1/2のraw candidate数）
             はユーザー向けの正確な変更件数ではない——move 1件がmissing+unknownの
             2 candidateに分かれたり、Tsumugi管理外のMarkdownもunknown candidateに
             含まれたりするため。したがって"candidates-found"の段階では数値を
-            一切表示しない。確定した内訳（編集/移動/追加/削除/確認が必要）は
-            「確認する」実行後（"classified"、Level 3の分類結果）にのみ表示する。
+            一切表示しない。
+            Codex監査対応（M5）：Level 1/2のcandidateにはTsumugi管理外Markdownが
+            含まれうるため、"candidates-found"の文言は「外部の変更があります」と
+            断定せず「外部の変更がある可能性があります」とする（Level 3後、
+            actionableCount===0なら従来通り"idle"へ戻り表示は消える）。確定した
+            内訳（編集/移動/追加/見つからない/確認が必要）は「確認する」実行後
+            （"classified"、Level 3の分類結果）にのみ表示する。
           */}
           {vaultLightCheckStatus.kind === "checking" && (
             <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
@@ -437,7 +370,7 @@ export default function SettingsPanel({
 
           {vaultLightCheckStatus.kind === "candidates-found" && (
             <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
-              <span>外部の変更があります</span>
+              <span>外部の変更がある可能性があります</span>
               <button
                 onClick={onConfirmVaultLightCheck}
                 disabled={vaultActionsDisabled}
@@ -458,12 +391,15 @@ export default function SettingsPanel({
             <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               <span className="text-xs text-stone-500 dark:text-stone-400">
                 {/* 内部用語（added/edited/moved/missing）は出さず、日本語の
-                    行だけを、存在するものだけ表示する。 */}
+                    行だけを、存在するものだけ表示する。
+                    Codex監査対応（M5）：missingは「既知pathでファイルが見つから
+                    ない」という事実であり、削除されたと確定できるわけではない
+                    ため、「削除」ではなく事実に即した「見つからない」と表示する。 */}
                 {[
                   vaultLightCheckStatus.result.counts.edited > 0 ? `編集 ${vaultLightCheckStatus.result.counts.edited}件` : null,
                   vaultLightCheckStatus.result.counts.moved > 0 ? `移動 ${vaultLightCheckStatus.result.counts.moved}件` : null,
                   vaultLightCheckStatus.result.counts.added > 0 ? `追加 ${vaultLightCheckStatus.result.counts.added}件` : null,
-                  vaultLightCheckStatus.result.counts.missing > 0 ? `削除 ${vaultLightCheckStatus.result.counts.missing}件` : null,
+                  vaultLightCheckStatus.result.counts.missing > 0 ? `見つからない ${vaultLightCheckStatus.result.counts.missing}件` : null,
                   vaultLightCheckStatus.result.counts.conflict + vaultLightCheckStatus.result.counts.unreadable > 0
                     ? `確認が必要 ${vaultLightCheckStatus.result.counts.conflict + vaultLightCheckStatus.result.counts.unreadable}件`
                     : null,
