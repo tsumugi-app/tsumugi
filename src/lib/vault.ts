@@ -2937,6 +2937,22 @@ interface VaultResyncScanState {
   recordsByKey: Map<string, VaultResyncRecordResult>;
   unreadableFiles: VaultResyncUnreadableFile[];
   scannedFileCount: number;
+  /**
+   * Android実機不具合対応（soft deadline）：resync全体の開始時刻から
+   * `VAULT_RESYNC_SOFT_DEADLINE_MS`だけ後の絶対時刻。File System Access API
+   * （`entries()`/`getFile()`/`getFileHandle()`/`Blob.text()`等）はいずれも
+   * AbortSignal・cancelを一切サポートしないため、単発I/O呼び出し自体を
+   * 強制的に打ち切ることはできない（MDN仕様確認済み）。そのため「次に新しい
+   * ファイルの処理を開始する前」というファイル境界でのみdeadlineを確認し、
+   * 超過していれば以降のファイル処理を一切開始せずscanを安全に終了する
+   * （既に処理を開始済みの1ファイルの完了は待つ——その最中のI/Oを裏で
+   * 放置したまま先へ進む、という設計は意図的に避けている）。
+   */
+  deadline: number;
+  /** deadline超過によりwalkを打ち切った場合にtrue。既存の
+   *  `scanCompleted=false`と同じ安全側の扱い（missing確定・baseline確立を
+   *  行わない）に合流させるためのフラグ。 */
+  deadlineExceeded: boolean;
 }
 
 function markVaultResyncSeen(state: VaultResyncScanState, key: string, path: string): void {
@@ -3517,6 +3533,18 @@ async function processVaultResyncCandidate(
  * 個別ファイルの`getFile()`失敗は1件のunreadableとして記録しscanを継続する。
  * ディレクトリ列挙（`entries()`）自体が失敗した場合は例外をそのまま呼び出し元へ
  * 伝播させる（scanCompleted=falseにするための唯一のトリガー）。
+ *
+ * Android実機不具合対応（soft deadline）：各エントリの処理を開始する直前に
+ * `state.deadline`を確認する。超過していれば`state.deadlineExceeded = true`を
+ * 立てて即座にreturnし、このディレクトリ以降の新規エントリ・再帰先の
+ * サブディレクトリの処理を一切開始しない（既に開始済みの1エントリの処理は
+ * 呼び出し元でも中断しない——File System Access APIの`entries()`/`getFile()`/
+ * `getFileHandle()`/`Blob.text()`はいずれもAbortSignalを持たず、実行中のI/Oを
+ * 安全に取り消す手段が無いため、「新しいI/Oを開始しない」という境界でしか
+ * soft deadlineを効かせられない）。この関数は再帰的に自分自身を呼ぶため、
+ * 一度deadlineを検出してreturnすると、呼び出し元の`for await`ループも次の
+ * iterationで同じ判定に当たり、ツリー全体が速やかに（新規I/Oを増やさずに）
+ * 巻き戻る。
  */
 async function walkVaultForResync(
   root: FileSystemDirectoryHandle,
@@ -3525,6 +3553,10 @@ async function walkVaultForResync(
   prefix: string
 ): Promise<void> {
   for await (const [name, handle] of dir.entries()) {
+    if (Date.now() > state.deadline) {
+      state.deadlineExceeded = true;
+      return;
+    }
     if (name.startsWith(HIDDEN_PREFIX)) continue;
     const path = prefix ? `${prefix}/${name}` : name;
     if (handle.kind === "directory") {
@@ -3561,6 +3593,42 @@ async function walkVaultForResync(
 }
 
 /**
+ * Android実機不具合対応（soft deadline）：明示的Vault resync1回あたりの
+ * scan phaseに与える時間予算（ミリ秒）。File System Access APIの1回のI/O
+ * （`getFile()`/`file.text()`等）は、実機観測でPC・Chromeでは数十ms程度だが、
+ * Android（Storage Access Framework/document provider経由）では1回あたり
+ * 1.3〜2.8秒、時に8〜11秒かかることが既存コメントで確認されている
+ * （`flushPendingToVaultInBackground`関連コメント参照）。15秒のような短い
+ * 予算では、Android実機でファイル数件を処理しただけで毎回打ち切られてしまい
+ * 実用的な進捗が得られない。2分（120秒）であれば、典型的なAndroid実機の
+ * 1件あたりコストでも数十〜100件程度は1回のresyncで処理できる。
+ *
+ * このsoft deadlineの目的：File System Access APIのI/O自体は正常に返ってくる
+ * が、Vault全体の処理に（Android実機のI/Oコストの積み重ねで）時間がかかる
+ * ケースにおいて、安全なファイル境界（次のファイルの処理を開始する直前）で
+ * partial scanとして終了させるためのもの。超過した場合はscanCompleted=false
+ * として返るため、既存の安全設計（missing確定・baselineEstablishedAt/
+ * lastFullResyncAtの更新はscanCompleted=trueの場合のみ）により、missing確定・
+ * baseline更新のいずれも行われない。deadlineまでに処理できた範囲（moved/
+ * edited/added等）は安全にRegistry/IndexedDBへ反映される。
+ *
+ * 重要な制約：`performVaultResyncScan`は呼ばれるたびに新しいscan stateで
+ * Vault rootから走査をやり直す設計であり、前回どこまで処理したかを記録・
+ * 再開するcursor/resume機構は持たない。"unchanged"と判明する記録であっても
+ * 判定前に本文I/O（probe読み込み＋`file.text()`）を要するため、次回resyncは
+ * 前回の続きからではなく常にrootから再走査する。そのため、1回のsoft
+ * deadline（本予算）に収まらないほど大きいVaultでは、複数回resyncを実行しても
+ * 毎回同じ範囲の処理で打ち切られ、全体には到達できない可能性がある。
+ *
+ * また、このsoft deadlineはファイル境界（＝次のI/Oを開始する前）でのみ判定
+ * されるため、単発のFile System Access API呼び出し自体がhangした場合
+ * （`await`が返らない場合）は、このdeadlineでは中断できない
+ * （AbortSignal等によるI/O自体のcancelはFile System Access APIの仕様上
+ * 提供されていないため）。
+ */
+const VAULT_RESYNC_SOFT_DEADLINE_MS = 120_000;
+
+/**
  * Step 4a本体：registry snapshot→Vault全体のenumeration＋classificationを
  * メモリ上で完成させる（applyは一切行わない）。呼び出し元（`resyncVaultRegistry`）
  * が既に"tsumugi-vault-world"を排他保持していることを前提とする——この関数の
@@ -3576,6 +3644,8 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
     recordsByKey: new Map(),
     unreadableFiles: [],
     scannedFileCount: 0,
+    deadline: Date.now() + VAULT_RESYNC_SOFT_DEADLINE_MS,
+    deadlineExceeded: false,
   };
 
   // Phase 0：registry snapshot（実在するshardファイルだけを読む。64個を仮定して
@@ -3605,7 +3675,15 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
   let scanCompleted = false;
   try {
     await walkVaultForResync(root, state, root, "");
-    scanCompleted = true;
+    // Android実機不具合対応（soft deadline）：deadline超過により打ち切った場合は
+    // "全体を見終えていない"という点でディレクトリ列挙失敗と同じ意味を持つため、
+    // 既存のscanCompleted=false（missing確定・baseline確立を行わない）へ合流させる。
+    if (state.deadlineExceeded) {
+      console.warn(
+        `[Tsumugi] resync: soft deadline (${VAULT_RESYNC_SOFT_DEADLINE_MS}ms) exceeded, stopping scan at a safe file boundary (no new I/O started).`
+      );
+    }
+    scanCompleted = !state.deadlineExceeded;
   } catch (error) {
     console.error("[Tsumugi] resync: directory enumeration failed, skipping missing-detection this run:", error);
     scanCompleted = false;
@@ -3692,6 +3770,31 @@ export interface VaultResyncApplyError {
   reason: string;
 }
 
+/**
+ * 実機不具合対応（診断情報）：「詳細を見る」でconflict/missingそれぞれの
+ * 実体（どのrecordか）を確認できるようにするための最小限の情報。分類ロジック
+ * 自体（`checkLocalUnsynced`等）は一切変更せず、既存の`VaultResyncRecordResult`
+ * が既に保持している情報（`registryKey`/`recordType`/`previousPath`/
+ * `currentPath`/`note`）をそのまま転記するだけ。`note`は既存のconflict経路
+ * ごとに異なる文言が既に設定されている（例："同一idが複数pathに存在します（重複）"
+ * "previous path could not be verified" "edited: ローカル未flush変更と競合して
+ * います"等）ため、これをそのまま`reason`として使うことで、経路を識別可能にする
+ * （新しい分類ロジックの追加ではない）。
+ */
+export interface VaultResyncConflictDetail {
+  registryKey: string;
+  recordType: VaultRegistryRecordType;
+  previousPath: string | null;
+  candidatePath: string | null;
+  reason: string;
+}
+
+export interface VaultResyncMissingDetail {
+  registryKey: string;
+  recordType: VaultRegistryRecordType;
+  previousPath: string | null;
+}
+
 /** resync engine内部専用（外部へはexportしない。公開結果は`VaultResyncResult`）。 */
 interface VaultResyncApplyResult {
   scanCompleted: boolean;
@@ -3707,6 +3810,8 @@ interface VaultResyncApplyResult {
   };
   applyErrors: VaultResyncApplyError[];
   unreadableFiles: VaultResyncUnreadableFile[];
+  conflictDetails: VaultResyncConflictDetail[];
+  missingDetails: VaultResyncMissingDetail[];
 }
 
 /** 既存のfiles[path]エントリのstatusだけを変更する（他フィールドは一切触れない）。
@@ -4378,20 +4483,42 @@ async function applyVaultResyncScanResult(
 ): Promise<VaultResyncApplyResult> {
   const counts = { unchanged: 0, moved: 0, edited: 0, added: 0, missing: 0, conflict: 0, unreadable: 0 };
   const applyErrors: VaultResyncApplyError[] = [];
+  const conflictDetails: VaultResyncConflictDetail[] = [];
+  const missingDetails: VaultResyncMissingDetail[] = [];
 
   for (const record of scan.records) {
+    let finalOutcome: VaultResyncOutcome;
     try {
-      const actualOutcome =
+      finalOutcome =
         record.recordType === "memory-day"
           ? await applyMemoryDayOutcome(root, record)
           : await applySingleRecordOutcome(root, record);
-      counts[actualOutcome] += 1;
+      counts[finalOutcome] += 1;
     } catch (error) {
-      counts[record.outcome] += 1;
+      finalOutcome = record.outcome;
+      counts[finalOutcome] += 1;
       applyErrors.push({
         registryKey: record.registryKey,
         recordType: record.recordType,
         reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // 実機不具合対応（診断情報）：分類ロジックは変更せず、最終的に確定した
+    // outcomeがconflict/missingの場合だけ、既存のnote等をそのまま転記する。
+    if (finalOutcome === "conflict") {
+      conflictDetails.push({
+        registryKey: record.registryKey,
+        recordType: record.recordType,
+        previousPath: record.previousPath,
+        candidatePath: record.currentPath,
+        reason: record.note ?? "reason not recorded",
+      });
+    } else if (finalOutcome === "missing") {
+      missingDetails.push({
+        registryKey: record.registryKey,
+        recordType: record.recordType,
+        previousPath: record.previousPath,
       });
     }
   }
@@ -4407,6 +4534,8 @@ async function applyVaultResyncScanResult(
     counts,
     applyErrors,
     unreadableFiles: scan.unreadableFiles,
+    conflictDetails,
+    missingDetails,
   };
 }
 
@@ -4444,6 +4573,8 @@ export interface VaultResyncResult {
   };
   applyErrors: VaultResyncApplyError[];
   unreadableFiles: VaultResyncUnreadableFile[];
+  conflictDetails: VaultResyncConflictDetail[];
+  missingDetails: VaultResyncMissingDetail[];
   startedAt: string;
   completedAt: string;
   lastFullResyncUpdated: boolean;
@@ -4505,6 +4636,8 @@ export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Prom
     counts: applyResult.counts,
     applyErrors: applyResult.applyErrors,
     unreadableFiles: applyResult.unreadableFiles,
+    conflictDetails: applyResult.conflictDetails,
+    missingDetails: applyResult.missingDetails,
     startedAt,
     completedAt,
     lastFullResyncUpdated,

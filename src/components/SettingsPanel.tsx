@@ -39,6 +39,7 @@ export default function SettingsPanel({
   onExportData,
   onDeleteData,
   vaultResyncFeedback,
+  vaultResyncTakingLong = false,
   onResyncVault,
 }: {
   chatProvider: SupportedChatProvider;
@@ -68,6 +69,13 @@ export default function SettingsPanel({
   onDeleteData: () => void;
   /** Step 5：「Vaultを再同期」の進行状況・結果。 */
   vaultResyncFeedback: VaultResyncFeedback | null;
+  /**
+   * Android実機不具合対応：再同期が"busy"のまま一定時間を超えた場合にtrue。
+   * File System Access APIの個々のI/Oはキャンセルできないため、処理そのものを
+   * 止めることはできない——ユーザーへの状況共有と、ページ再読み込みによる
+   * 中断という選択肢を示すためだけに使う。既定false。
+   */
+  vaultResyncTakingLong?: boolean;
   onResyncVault: () => void;
 }) {
   const [showResyncDetail, setShowResyncDetail] = useState(false);
@@ -223,6 +231,25 @@ export default function SettingsPanel({
                   {vaultResyncFeedback?.kind === "busy" ? "再同期中…" : "Vaultを再同期"}
                 </button>
               </div>
+
+              {/*
+                Android実機不具合対応：File System Access APIの個々のI/Oは
+                キャンセルできないため（MDN仕様確認済み）、処理自体を止める手段は
+                無い。せめて「時間がかかっている」ことと、ページ再読み込みで
+                中断できることを案内する（無言で待たせ続けない）。
+              */}
+              {vaultResyncFeedback?.kind === "busy" && vaultResyncTakingLong && (
+                <div className="flex items-center justify-between gap-3 rounded-lg bg-amber-50/60 px-2.5 py-1.5 text-[11px] text-amber-700 dark:bg-amber-950/20 dark:text-amber-400">
+                  <span>再同期に時間がかかっています。</span>
+                  <button
+                    type="button"
+                    onClick={() => window.location.reload()}
+                    className="shrink-0 rounded-full border border-amber-400/60 px-2.5 py-0.5 text-[11px] transition hover:bg-amber-200/40 dark:border-amber-600/60 dark:hover:bg-amber-900/40"
+                  >
+                    再読み込みして中止
+                  </button>
+                </div>
+              )}
 
               {vaultResyncFeedback && vaultResyncFeedback.kind !== "busy" && (
                 <div className="flex flex-col gap-1">

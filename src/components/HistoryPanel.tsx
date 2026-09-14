@@ -195,6 +195,25 @@ export default function HistoryPanel({
    */
   const [detailUnavailable, setDetailUnavailable] = useState(false);
 
+  /**
+   * 実機不具合対応（stale detail修正）：`refreshToken`（Vault再同期完了時等に
+   * ChatScreen側でインクリメントされる）が変わった時点で、直前に開いていた
+   * detail画面のstateをリセットする。理由：`refreshToken`変化を検知する
+   * 既存effect（下記、月/日一覧の再取得用）は`conversationRows`/`memoryRows`等
+   * 一覧側のstateしか更新せず、`selectedConversation`/`selectedMemory`/
+   * `detailUnavailable`（1行タップ時にだけ設定される、detail画面固有のstate）は
+   * 一切触れない。そのため、再同期前に「この記録を開くために、保存先の確認が
+   * 必要です」を表示したままSettingsで再同期を実行してHistoryへ戻ると、Registry
+   * 側は既に解決しているにもかかわらず、この画面には古いエラー表示が残り続けて
+   * いた。自動的な再オープンは行わない（「戻る」を押して行を選び直せば最新状態で
+   * 読み直される）——ここでは古い状態を残さないことだけを保証する。
+   */
+  useEffect(() => {
+    setDetailUnavailable(false);
+    setSelectedConversation(null);
+    setSelectedMemory(null);
+  }, [refreshToken]);
+
   // race対策：月Index読み込み・日付詳細読み込み・詳細（Conversation/Memory本体）読み込み
   // それぞれについて、呼び出しごとにインクリメントするリクエストID。resolve/reject時に
   // 「今も自分が最新の要求か」を確認してからsetStateすることで、月移動・日付切替・

@@ -193,6 +193,17 @@ const STARTUP_CAPTURE_LIMIT = 3;
  */
 const VAULT_SWITCH_SETTLE_TIMEOUT_MS = 20000;
 
+/**
+ * Android実機不具合対応：「Vaultを再同期」が`"再同期中…"`のまま、この時間を
+ * 超えて続いた場合に、UIへ「時間がかかっています」という案内を追加表示する
+ * ためだけの閾値。resyncVaultRegistry自体のsoft deadline
+ * （`VAULT_RESYNC_SOFT_DEADLINE_MS`、vault.ts）とは独立しており、
+ * こちらは純粋にユーザーへの早めの状況共有が目的（20秒——通常のAndroid実機でも
+ * 数件〜十数件程度の処理なら収まりうる時間だが、これを超えたら「動いてはいるが
+ * 時間がかかる処理だ」と認識してもらうのに十分な長さ）。
+ */
+const RESYNC_TAKING_LONG_MS = 20000;
+
 /** Beta C4：/api/chatの失敗時、ステータスだけを見てAPIキー由来かどうかをUI側で分岐するための最小限のエラー型。 */
 class ChatRequestError extends Error {
   constructor(readonly status: number) {
@@ -425,6 +436,16 @@ export default function ChatScreen() {
    * flushで自然に再度trueになる）。
    */
   const [vaultHoldDetected, setVaultHoldDetected] = useState(false);
+  /**
+   * Android実機不具合対応：「Vaultを再同期」が`vaultResyncFeedback.kind==="busy"`
+   * のまま一定時間（`RESYNC_TAKING_LONG_MS`）続いた場合にtrueにする。File System
+   * Access APIには`entries()`/`getFile()`等をキャンセルする手段が無いため
+   * （MDN仕様確認済み）、単発I/Oが実機で極端に遅い・応答しないケースをアプリ側で
+   * 強制的に打ち切ることはできない。せめてユーザーに「時間がかかっている」ことを
+   * 伝え、ページ再読み込みによる中断という選択肢を示すためだけのUI状態であり、
+   * 実際のresync処理そのものには一切影響しない。
+   */
+  const [vaultResyncTakingLong, setVaultResyncTakingLong] = useState(false);
   /**
    * トップ画面の「アクセスを再許可」カードの「あとで」で非表示にしたかどうか。
    * ページセッション中のみ有効（stateなのでリロードで自動的にfalseへ戻り、
@@ -2451,6 +2472,21 @@ export default function ChatScreen() {
   }
 
   /**
+   * Android実機不具合対応：`vaultResyncFeedback`が`"busy"`になっている間だけ
+   * タイマーを張り、`RESYNC_TAKING_LONG_MS`を超えたら`vaultResyncTakingLong`を
+   * trueにする。busy以外（成功/partial/errors/null）に変わった時点でクリアする。
+   * resyncVaultRegistry自体を一切操作しない、UI表示専用の軽量な監視。
+   */
+  useEffect(() => {
+    if (vaultResyncFeedback?.kind !== "busy") {
+      setVaultResyncTakingLong(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setVaultResyncTakingLong(true), RESYNC_TAKING_LONG_MS);
+    return () => window.clearTimeout(timer);
+  }, [vaultResyncFeedback]);
+
+  /**
    * Step 5：「Vaultを再同期」。ユーザーが外部（Obsidian等）でMarkdownを移動・編集・
    * 追加した場合に、明示的な操作でのみVault Registry/IndexedDB/History Indexを
    * 再整合させる（`resyncVaultRegistry`、起動時の自動実行は一切しない）。
@@ -2467,7 +2503,7 @@ export default function ChatScreen() {
     setVaultResyncFeedback({ kind: "busy", message: "再同期中…" });
     try {
       const result: VaultResyncResult = await resyncVaultRegistry(vaultHandle);
-      const { counts, applyErrors, unreadableFiles } = result;
+      const { counts, applyErrors, unreadableFiles, conflictDetails, missingDetails } = result;
 
       const changedLines: string[] = [];
       if (counts.added > 0) changedLines.push(`追加 ${counts.added}`);
@@ -2506,9 +2542,17 @@ export default function ChatScreen() {
       const message = detailLines.length > 0 ? `${headline}\n${detailLines.join("　")}` : headline;
 
       // Beta向けの簡易debug情報（「詳細を見る」でのみ表示、生のstack traceは含めない）。
+      // 実機不具合対応（診断情報）：conflict/missingそれぞれについて、どのrecordが
+      // 対象かをここでのみ（通常表示には出さず）確認できるようにする。分類理由
+      // （reason）は既存のnote文言をそのまま転記したもので、新しい分類基準の追加ではない。
       const debugLines = [
         ...applyErrors.map((e) => `apply: ${e.registryKey}: ${e.reason}`),
         ...unreadableFiles.map((f) => `read: ${f.path}: ${f.reason}`),
+        ...conflictDetails.map(
+          (c) =>
+            `conflict: ${c.registryKey} (${c.recordType}): ${c.previousPath ?? "(no previous path)"} → ${c.candidatePath ?? "(no candidate path)"} — ${c.reason}`
+        ),
+        ...missingDetails.map((m) => `missing: ${m.registryKey} (${m.recordType}): ${m.previousPath ?? "(no previous path)"}`),
       ];
 
       setVaultResyncFeedback({
@@ -3729,7 +3773,16 @@ export default function ChatScreen() {
             vaultConnectFeedback={vaultConnectFeedback}
             restoreCandidate={restoreCandidate}
             restoreStatus={restoreStatus}
-            onClose={() => setSettingsOpen(false)}
+            onClose={() => {
+              setSettingsOpen(false);
+              // 実機不具合対応：前回の再同期結果（「再同期しました。」「競合：xx」等）を
+              // Settingsを閉じるたびにクリアし、次に開いた時に古い結果が残らない
+              // ようにする。ただし再同期が今まさに実行中（"busy"）の場合はクリアしない
+              // ——ここでクリアすると`vaultActionsDisabled`がfalseに戻り、裏でまだ
+              // 実行中のresyncと並行して他のVault操作（保存先変更等）が開始できて
+              // しまうため（busy状態は実際の処理完了までUIとして正確に保たれる必要がある）。
+              setVaultResyncFeedback((current) => (current?.kind === "busy" ? current : null));
+            }}
             onDeleteApiKey={(deleteTarget) => void handleDeleteApiKey(deleteTarget)}
             onOpenApiKeySetup={(provider) => setApiKeySetupProvider(provider)}
             onSelectChatProvider={handleSelectChatProvider}
@@ -3742,6 +3795,7 @@ export default function ChatScreen() {
             onExportData={() => void handleExportData()}
             onDeleteData={() => void handleDeleteData()}
             vaultResyncFeedback={vaultResyncFeedback}
+            vaultResyncTakingLong={vaultResyncTakingLong}
             onResyncVault={() => void handleResyncVault()}
           />
         </div>
