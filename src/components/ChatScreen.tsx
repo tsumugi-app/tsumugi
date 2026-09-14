@@ -4,19 +4,25 @@ import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
+  applyVaultLightCheckCandidates,
   checkVaultIdentity,
+  classifyVaultLightCheckCandidates,
   clearOpfsVault,
   collectAllMarkdownFiles,
+  countVaultLightCheckCandidates,
   ensureVaultSkeleton,
   flushPendingToVault,
   getVaultBackend,
   isVaultSupported,
+  performVaultLightCheckDiscovery,
   pickVaultDirectory,
   readHistoryMeta,
   requestVaultPermission,
   restoreVaultHandle,
   resyncVaultRegistry,
   waitForVaultWrites,
+  type VaultLightCheckClassifyResult,
+  type VaultLightCheckDiscoveryResult,
   type VaultRestoreResult,
   type VaultResyncResult,
   type VaultScanResult,
@@ -154,6 +160,38 @@ export type VaultResyncFeedback = {
   message: string;
   detail?: string;
 };
+
+/**
+ * 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。起動時のbackground
+ * チェック（Level 1/2）で候補が1件以上見つかった場合のみ"candidates-found"に
+ * なり、Settingsに「外部で変更されたファイルがあります」を表示する。
+ * 「確認する」でLevel 3（candidateのみの本文read＋分類）を実行し"classified"へ、
+ * 「変更を反映」でLevel 4（apply直前の再検証＋candidateのみapply）を実行し
+ * "applied"へ進む。既存の`resyncVaultRegistry`（full resync）は一切呼ばない
+ * ため、baselineEstablishedAt/lastFullResyncAtはこのフローからは更新されない。
+ * candidate件数（"candidates-found"のcount）は実際の変更件数ではなく、
+ * Level 1/2段階で読める範囲の粗い候補数であることに注意（move等は複数
+ * candidateに分かれうる）——そのためこの件数自体はユーザーへ表示しない設計とし、
+ * 行の表示可否（0件かどうか）の判定にのみ使う。
+ *
+ * 安全性レビュー対応（M1/M3）："checking"はLevel 1/2（起動時の自動実行、または
+ * 「もう一度確認する」による手動再実行）が進行中の状態。"partial"はapplyが
+ * 一部だけ成功した（stale skip・apply失敗が1件でもあった）状態、"error"は
+ * 確認/反映自体が失敗した状態——いずれも「もう一度確認する」導線を持ち、
+ * 古いclassificationは再利用せずLevel 1/2 discoveryからやり直す
+ * （`handleRetryVaultLightCheck`）。"applied"は完全成功のみ（stale skip・
+ * applyErrorsが1件もない場合）。
+ */
+export type VaultLightCheckStatus =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "candidates-found"; count: number }
+  | { kind: "classifying" }
+  | { kind: "classified"; result: VaultLightCheckClassifyResult; generation: number }
+  | { kind: "applying" }
+  | { kind: "applied" }
+  | { kind: "partial"; message: string }
+  | { kind: "error"; message: string };
 
 type SendStatus = "idle" | "error" | "authError";
 
@@ -422,6 +460,8 @@ export default function ChatScreen() {
   const [exportDataFeedback, setExportDataFeedback] = useState<DataActionFeedback | null>(null);
   const [deleteDataFeedback, setDeleteDataFeedback] = useState<DataActionFeedback | null>(null);
   const [vaultResyncFeedback, setVaultResyncFeedback] = useState<VaultResyncFeedback | null>(null);
+  /** 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。詳細は`VaultLightCheckStatus`参照。 */
+  const [vaultLightCheckStatus, setVaultLightCheckStatus] = useState<VaultLightCheckStatus>({ kind: "idle" });
   /**
    * 実機不具合対応：background/startup flushが`VaultRecordNeedsResyncError`
    * （Registry baseline未確立のRegistry absent record、または外部でMarkdownが
@@ -555,6 +595,32 @@ export default function ChatScreen() {
    * 排他ロック（runVaultSwitchExclusive）を取りに行ってしまう」事故を防ぐ。
    */
   const backgroundFlushInFlightPromiseRef = useRef<Promise<void> | null>(null);
+  /**
+   * 軽量「外部の変更」検知フロー：起動時のLevel 1/2（`performVaultLightCheckDiscovery`）
+   * の結果を保持する。UIには件数（`vaultLightCheckStatus`の"candidates-found".count）
+   * しか出さないが、「確認する」（Level 3）を実行する際に、どのcandidate
+   * （既知path・未知path）を読むべきかをこのrefから取り出す。Reactの再描画対象
+   * ではない内部bookkeepingのためstateではなくrefにする。
+   *
+   * 安全性レビュー対応（H2）：`generation`はdiscovery開始時点の
+   * `vaultGenerationRef.current`（Vault切替のたびに進む、同一タブ内のMemory
+   * World世代）を保持する。「確認する」実行時、現在のgenerationと一致しない
+   * 場合は古いVaultの候補を破棄する——排他ロックのepoch確認だけでは、同一タブ
+   * 内でVault A→Bへ切り替えた後にtabVaultEpoch自体もBの値へ更新されてしまう
+   * ため、「Aの時に見つけた候補をBへ適用してしまう」ことを検出できない
+   * （epoch検査はcross-tab staleness用であり、この目的には使えない）。
+   */
+  const vaultLightCheckDiscoveryRef = useRef<{ discovery: VaultLightCheckDiscoveryResult; generation: number } | null>(
+    null
+  );
+  /**
+   * レビュー修正：`runVaultLightCheckInBackground`の多重起動防止。
+   * `applyRestoredHandle`は通常パスとlegacy migrationパスの2箇所から呼ばれる
+   * 分岐上、実行時には常にどちらか一方のみが呼ばれる設計だが、それに依存せず
+   * この関数自体でも二重起動を防ぐ（React StrictModeでのeffect二重実行等の
+   * 不測の再入も含め、安全側で保証する）。
+   */
+  const vaultLightCheckInFlightRef = useRef(false);
   /**
    * Android Vault問題（in-flight scanの協調的キャンセル）：現在実行中のrestore
    * candidate scanに紐づく`AbortController`。`startVaultRestoreScan`が新しいscanを
@@ -901,6 +967,58 @@ export default function ChatScreen() {
   }
 
   /**
+   * 軽量「外部の変更」検知フロー：Level 1（既知path metadata確認）＋Level 2
+   * （path-onlyのdirectory walk）を起動時にfire-and-forgetで実行する。
+   * `resyncVaultRegistry`（full resync）は絶対に呼ばない。既存の
+   * `flushPendingToVaultInBackground`と同じ安全パターン——`beginMemoryTask`で
+   * Vault切替の収束待ち（`drainPendingMemoryTasks`）に登録しつつ、
+   * `withVaultWorldRead`の共有ロックで包む——を踏襲する。Level 1/2はbody I/Oを
+   * 行わない軽量な処理のため、flushのようなAbortController経由の協調的
+   * キャンセル（早期preemption）は設けていない——Vault切替時は
+   * `drainPendingMemoryTasks`がこの処理の完了を待つだけで足りると判断した
+   * （切替を著しく遅らせるほど重い処理ではないため）。
+   *
+   * 候補が1件も無ければReact stateには一切触れない（`vaultLightCheckStatus`は
+   * "idle"のまま、Settingsには何も表示されない）。
+   */
+  /**
+   * `announce`（安全性レビュー対応・M3）：起動時の自動実行（`false`、既定）は、
+   * 候補が見つかるまでUIに一切触れない（従来通り）。「もう一度確認する」
+   * からの手動再実行（`true`）は、開始直後に`"checking"`を表示し、ユーザーへ
+   * 「今まさにやり直している」ことを伝える。
+   */
+  function runVaultLightCheckInBackground(handle: FileSystemDirectoryHandle, announce = false): void {
+    if (vaultLightCheckInFlightRef.current) return; // 多重起動防止（レビュー修正）
+    vaultLightCheckInFlightRef.current = true;
+    if (announce) setVaultLightCheckStatus({ kind: "checking" });
+    const endTask = beginMemoryTask();
+    // 安全性レビュー対応（H2）：discovery開始時点のVault世代を記録する。
+    const generation = vaultGenerationRef.current;
+    void (async () => {
+      try {
+        const discovery = await withVaultWorldRead(() => performVaultLightCheckDiscovery(handle));
+        if (generation !== vaultGenerationRef.current) return; // Vault切替済み：この結果は使わない
+        const count = countVaultLightCheckCandidates(discovery);
+        if (count > 0) {
+          vaultLightCheckDiscoveryRef.current = { discovery, generation };
+          setVaultLightCheckStatus({ kind: "candidates-found", count });
+        } else if (announce) {
+          setVaultLightCheckStatus({ kind: "idle" });
+        }
+      } catch (error) {
+        if (handleStaleVaultTabError(error)) return;
+        console.error("[Tsumugi] background vault light check failed (will retry on next launch):", error);
+        if (announce) {
+          setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
+        }
+      } finally {
+        endTask();
+        vaultLightCheckInFlightRef.current = false;
+      }
+    })();
+  }
+
+  /**
    * Vault切替（`runVaultSwitchExclusive`＝排他ロック取得）の直前に必ず呼ぶこと。
    * 現在in-flightのbackground flushがあれば中断シグナルを送り、そのflushが
    * （現在処理中の1itemを最後まで終えてから）実際にPromiseをsettleさせるまで
@@ -948,6 +1066,12 @@ export default function ChatScreen() {
     setLaunchTreeSignals(null);
     setEntryConfirmed(false);
     setInputResetKey((key) => key + 1);
+    // 安全性レビュー対応（H2）：Vault世代が変わる際、旧Vaultに対する軽量「外部の変更」
+    // 検知の状態（discovery/classification結果を含む）を必ず初期化する。
+    // vaultGenerationRef自体はこの関数の呼び出し元（切替コミット直前）で更新されるため、
+    // ここでは残存しているUI状態・discovery参照だけを破棄すればよい。
+    vaultLightCheckDiscoveryRef.current = null;
+    setVaultLightCheckStatus({ kind: "idle" });
   }
 
   /**
@@ -1396,6 +1520,10 @@ export default function ChatScreen() {
         } catch (error) {
           console.error("Failed to flush pending vault writes on startup", error);
         }
+        // 軽量「外部の変更」検知フロー（Level 1/2）：flushとは独立にfire-and-forgetで
+        // 開始する（awaitしない——起動UI・Tree表示・会話開始を一切ブロックしない）。
+        // full resync（`resyncVaultRegistry`）は呼ばない。
+        runVaultLightCheckInBackground(result.handle);
       } else if (result.status === "needs-permission") {
         // Android等：以前選択したフォルダのFileSystemDirectoryHandle自体はIndexedDBに
         // 有効なまま残っているが、ブラウザ管理の書き込み許可がリロードで失効している状態。
@@ -2584,6 +2712,151 @@ export default function ChatScreen() {
         kind: "error",
         message: "Vaultを再同期できませんでした。もう一度お試しください。",
       });
+    } finally {
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 軽量「外部の変更」検知フロー：「確認する」＝Level 3。起動時（Level 1/2）で
+   * 見つかったcandidate（`vaultLightCheckDiscoveryRef`）だけを対象に、既存の
+   * classification engineをそのまま使って本文read・分類を行う
+   * （`classifyVaultLightCheckCandidates`、vault.ts参照）。Vault全体は読まない。
+   * 「Registry」「resync」等の内部用語はここでもUIへ出さない。
+   */
+  async function handleConfirmVaultLightCheck() {
+    const stored = vaultLightCheckDiscoveryRef.current;
+    // 安全性レビュー対応（H2）：discovery開始時点のVault世代と現在の世代が
+    // 一致しない場合、別Vaultで見つかった候補を今のVaultへ適用してしまう
+    // ことになるため、古い候補を破棄してidleへ戻す。
+    if (stored && stored.generation !== vaultGenerationRef.current) {
+      vaultLightCheckDiscoveryRef.current = null;
+      setVaultLightCheckStatus({ kind: "idle" });
+      return;
+    }
+    if (!stored || !vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = stored.generation;
+    vaultOperationLockRef.current = true;
+    setVaultLightCheckStatus({ kind: "classifying" });
+    try {
+      const result = await withVaultWorldRead(() => classifyVaultLightCheckCandidates(vaultHandle, stored.discovery));
+      if (generation !== vaultGenerationRef.current) {
+        // classify実行中にVaultが切り替わった：この結果は今のVaultのものではない。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        return;
+      }
+      // レビュー修正（Case 6対応）：Level 2はTsumugi管理外の`.md`もcandidate化
+      // しうる（本文を読まないため区別できない）。Level 3で実際に読んだ結果、
+      // 反映すべき変更が1件も無かった場合（例：候補が全てTsumugi管理外の
+      // Markdownだった、または全てunchangedだった場合）は、"classified"
+      // （「変更を反映」ボタン付き）を表示せず、"idle"へ自然に戻す——反映対象が
+      // 無いのに操作可能なボタンを出さないため。
+      const actionableCount =
+        result.counts.added +
+        result.counts.edited +
+        result.counts.moved +
+        result.counts.conflict +
+        result.counts.missing +
+        result.counts.unreadable;
+      if (actionableCount === 0) {
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+      } else {
+        setVaultLightCheckStatus({ kind: "classified", result, generation });
+      }
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setVaultLightCheckStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] light check classify failed", error);
+      setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
+    } finally {
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 安全性レビュー対応（M1/M3）：「もう一度確認する」。stale発生時／確認や
+   * 反映に失敗した時のいずれからも、古いclassification/discoveryを一切
+   * 再利用せず、Level 1/2 discoveryからやり直す。
+   */
+  function handleRetryVaultLightCheck() {
+    vaultLightCheckDiscoveryRef.current = null;
+    if (!vaultHandle) {
+      setVaultLightCheckStatus({ kind: "idle" });
+      return;
+    }
+    runVaultLightCheckInBackground(vaultHandle, true);
+  }
+
+  /**
+   * 軽量「外部の変更」検知フロー：「変更を反映」＝Level 4。Level 3の分類結果
+   * （React stateに保持済み）だけを対象に、apply直前の再検証（追加条件2）を
+   * 挟んだ上で、既存の`applyVaultResyncScanResult`（無変更）へ渡す
+   * （`applyVaultLightCheckCandidates`、vault.ts参照）。Vault全体の再scanは
+   * 行わない。`resyncVaultRegistry`を呼ばないため、baselineEstablishedAt／
+   * lastFullResyncAtはこのフローからは更新されない。
+   */
+  async function handleApplyVaultLightCheck() {
+    const status = vaultLightCheckStatus;
+    if (status.kind !== "classified") return;
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    // 安全性レビュー対応（H2）：classification開始時点のVault世代と現在の世代を比較。
+    if (status.generation !== vaultGenerationRef.current) {
+      vaultLightCheckDiscoveryRef.current = null;
+      setVaultLightCheckStatus({ kind: "idle" });
+      return;
+    }
+    const records = status.result.records;
+    const localSnapshots = status.result.localSnapshots;
+    vaultOperationLockRef.current = true;
+    setVaultLightCheckStatus({ kind: "applying" });
+    try {
+      // 安全性レビュー対応（Lock設計）：applyVaultLightCheckCandidatesは内部で
+      // 既存の`runVaultWorldExclusive`（full resyncと同じ排他ロックhelper）を
+      // 使うため、ここではwithVaultWorldRead（共有ロック）で包まない——同名
+      // ロックの共有→排他という二重要求による自己デッドロックを避けるため。
+      const outcome = await applyVaultLightCheckCandidates(vaultHandle, records, localSnapshots);
+
+      if (outcome.timedOut) {
+        setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
+        return;
+      }
+      if (status.generation !== vaultGenerationRef.current) {
+        // apply実行中にVaultが切り替わった：反映結果は元のVaultに対するもの。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        return;
+      }
+
+      bumpHistoryRefreshToken();
+
+      // 安全性レビュー対応（M1/M3）：stale skip・apply失敗・Level 3時点で読めな
+      // かったcandidate（`status.result.counts.unreadable`——これらは
+      // `applyVaultLightCheckCandidates`へ渡すrecordsに含まれないため、
+      // applyErrors/staleSkippedのどちらにも現れず反映もされない）のいずれかが
+      // 1件でもあれば単純な成功状態にしない。古いclassification/discoveryは
+      // 再利用せず、「もう一度確認する」でLevel 1/2からやり直す。
+      const hasIssue =
+        outcome.staleSkipped.length > 0 || outcome.applyErrors.length > 0 || status.result.counts.unreadable > 0;
+      vaultLightCheckDiscoveryRef.current = null;
+      if (hasIssue) {
+        setVaultLightCheckStatus({ kind: "partial", message: "一部の変更を確認できませんでした。" });
+      } else {
+        setVaultLightCheckStatus({ kind: "applied" });
+      }
+      // 反映によりHOLD状態の一部が解消された可能性があるため楽観的にクリアする
+      // （新たなHOLDがあれば次回のflushで自然に再度立つ、既存vaultHoldDetectedと同じ方針）。
+      setVaultHoldDetected(false);
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setVaultLightCheckStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] light check apply failed", error);
+      setVaultLightCheckStatus({ kind: "error", message: "外部の変更を反映できませんでした。" });
     } finally {
       vaultOperationLockRef.current = false;
     }
@@ -3789,7 +4062,13 @@ export default function ChatScreen() {
             onConnectVault={() => void handleConnectVault()}
             onReauthorizeVault={() => void handleReauthorizeVault()}
             onRestoreFromVault={() => void handleRestoreFromVault()}
-            vaultActionsDisabled={isVaultSwitching || crossTabStale || vaultResyncFeedback?.kind === "busy"}
+            vaultActionsDisabled={
+              isVaultSwitching ||
+              crossTabStale ||
+              vaultResyncFeedback?.kind === "busy" ||
+              vaultLightCheckStatus.kind === "classifying" ||
+              vaultLightCheckStatus.kind === "applying"
+            }
             exportDataFeedback={exportDataFeedback}
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}
@@ -3797,6 +4076,10 @@ export default function ChatScreen() {
             vaultResyncFeedback={vaultResyncFeedback}
             vaultResyncTakingLong={vaultResyncTakingLong}
             onResyncVault={() => void handleResyncVault()}
+            vaultLightCheckStatus={vaultLightCheckStatus}
+            onConfirmVaultLightCheck={() => void handleConfirmVaultLightCheck()}
+            onApplyVaultLightCheck={() => void handleApplyVaultLightCheck()}
+            onRetryVaultLightCheck={() => handleRetryVaultLightCheck()}
           />
         </div>
       )}

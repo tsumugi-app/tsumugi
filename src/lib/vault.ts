@@ -2671,7 +2671,7 @@ interface VaultResyncMemberResult {
 
 /** resync engine内部専用（外部へはexportしない。Step 5 UIは`VaultResyncResult`の
  *  countsだけを使う想定で、個別recordの生データは不要）。 */
-interface VaultResyncRecordResult {
+export interface VaultResyncRecordResult {
   /** Conversation/Reflection/Sourceはid自身、normal Memoryは`dayFileRegistryKey(day)`。 */
   registryKey: string;
   recordType: VaultRegistryRecordType;
@@ -3634,23 +3634,25 @@ const VAULT_RESYNC_SOFT_DEADLINE_MS = 120_000;
  * が既に"tsumugi-vault-world"を排他保持していることを前提とする——この関数の
  * 内部からは`withVaultWorldRead`等のH4ロック関数を一切呼び出さない。
  */
-async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<VaultResyncScanResult> {
-  const state: VaultResyncScanState = {
-    previousByKey: new Map(),
-    previousEntries: new Map(),
-    previousRegistryKeyByPath: new Map(),
-    seenPathsByKey: new Map(),
-    seenKnownKeys: new Set(),
-    recordsByKey: new Map(),
-    unreadableFiles: [],
-    scannedFileCount: 0,
-    deadline: Date.now() + VAULT_RESYNC_SOFT_DEADLINE_MS,
-    deadlineExceeded: false,
-  };
+/**
+ * registry snapshot（実在するshardファイルだけを読む。64個を仮定して全部
+ * 読みにいかない）。.tsumugi/registry/ 自体が無い場合（既存Vault・初回）は
+ * 空のsnapshotを返す——呼び出し元はこれを「全recordがRegistry absent」として
+ * 扱う（既存の`performVaultResyncScan`のPhase 0と、軽量チェック（Level 1/2）
+ * の両方から共有する純粋な読み取りprimitive。ロックは取得しない（既存の
+ * `readVaultRegistryShard`と同じ理由：読み込みが書き込みと競合しても
+ * 「わずかに古いregistryを読む」だけであり実害が無いため）。
+ */
+interface VaultRegistrySnapshot {
+  previousByKey: Map<string, string>;
+  previousEntries: Map<string, VaultRegistryFileEntry>;
+  previousRegistryKeyByPath: Map<string, string>;
+}
 
-  // Phase 0：registry snapshot（実在するshardファイルだけを読む。64個を仮定して
-  // 全部読みにいかない）。.tsumugi/registry/ 自体が無い場合（既存Vault・初回）は
-  // 空のsnapshotのまま進む——このあと全てが"added"候補として扱われる（L節）。
+async function buildVaultRegistrySnapshot(root: FileSystemDirectoryHandle): Promise<VaultRegistrySnapshot> {
+  const previousByKey = new Map<string, string>();
+  const previousEntries = new Map<string, VaultRegistryFileEntry>();
+  const previousRegistryKeyByPath = new Map<string, string>();
   try {
     const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
     const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: false });
@@ -3660,16 +3662,33 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
       if (!Number.isFinite(bucket)) continue;
       const shard = await readVaultRegistryShard(root, bucket);
       for (const [key, path] of Object.entries(shard.records)) {
-        state.previousByKey.set(key, path);
-        state.previousRegistryKeyByPath.set(path, key);
+        previousByKey.set(key, path);
+        previousRegistryKeyByPath.set(path, key);
       }
       for (const [path, entry] of Object.entries(shard.files)) {
-        state.previousEntries.set(path, entry);
+        previousEntries.set(path, entry);
       }
     }
   } catch {
     // .tsumugi/registry/ が無い：previousByKey/previousEntries/previousRegistryKeyByPathは空のまま。
   }
+  return { previousByKey, previousEntries, previousRegistryKeyByPath };
+}
+
+async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<VaultResyncScanResult> {
+  const snapshot = await buildVaultRegistrySnapshot(root);
+  const state: VaultResyncScanState = {
+    previousByKey: snapshot.previousByKey,
+    previousEntries: snapshot.previousEntries,
+    previousRegistryKeyByPath: snapshot.previousRegistryKeyByPath,
+    seenPathsByKey: new Map(),
+    seenKnownKeys: new Set(),
+    recordsByKey: new Map(),
+    unreadableFiles: [],
+    scannedFileCount: 0,
+    deadline: Date.now() + VAULT_RESYNC_SOFT_DEADLINE_MS,
+    deadlineExceeded: false,
+  };
 
   // Phase 1：directory enumeration + classification。
   let scanCompleted = false;
@@ -3725,6 +3744,260 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
     records: [...state.recordsByKey.values()],
     unreadableFiles: state.unreadableFiles,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 軽量「外部の変更」検知フロー（Level 1〜4）
+//
+// 目的：ユーザーに毎回「Vaultを再同期」を手動で押させる既存フロー（full resync、
+// 上記`performVaultResyncScan`/`resyncVaultRegistry`）とは別に、起動時に軽量に
+// 「変更の可能性があるファイル」だけを検出し、ユーザーが確認・反映を選んだ場合
+// だけ本文を読んで実際に分類・適用する、4段階のフローを提供する。
+//
+// 最重要方針（合意済み）：
+// - classification engine（`processVaultResyncCandidate`／
+//   `handleResyncSingleRecordCandidate`／`handleResyncMemoryDayCandidate`／
+//   `applySingleRecordOutcome`／`applyMemoryDayOutcome`／
+//   `applyVaultResyncScanResult`）は一切変更しない。Level 3/4はこれらへ
+//   candidate集合だけを渡す形で再利用する。
+// - 既存のfull resync（`performVaultResyncScan`/`resyncVaultRegistry`）も
+//   一切変更しない。maintenance fallbackとして残す。
+// - この軽量フローは`resyncVaultRegistry`を一切呼ばないため、
+//   `baselineEstablishedAt`／`lastFullResyncAt`は絶対に更新されない
+//   （これらを更新できるのは既存のfull resyncだけ、という制約を構造的に
+//   満たす——「呼ばない」ことで保証しており、フラグ等での抑制ではない）。
+// ---------------------------------------------------------------------------
+
+/**
+ * Level 1：既知path（Registryに登録済みの全path）それぞれについて、
+ * `getFileHandle`＋`getFile()`だけでmtime/sizeを確認する（本文は一切読まない）。
+ * 既存の`verifyVaultRegistryEntryBeforeWrite`（write側の軽量fast path）と
+ * 同じ考え方——mtime/sizeが一致すれば本文read無しで「変更なし」と判断してよい、
+ * という既に本番で使われている前提をbulk化しただけであり、新しい安全性の
+ * 前提を持ち込んでいない。
+ *
+ * statusが"ok"以外（既にneeds-resync/missing/conflict）の既知recordも対象に
+ * 含める——既存full resyncボタンを使わないユーザーでも、この軽量フロー経由で
+ * 再確認・解消できるようにするため。
+ */
+export interface VaultLightCheckKnownPathCandidate {
+  registryKey: string;
+  recordType: VaultRegistryRecordType;
+  previousPath: string;
+  /**
+   * 安全性レビュー対応（M2）：「読めなかった」と「存在しない」を区別する。
+   * - "path-missing"：`NotFoundError`（既存`targetedCheckSingleRecordStillAt`と
+   *   同じ判定基準）——ファイルが物理的に無いと確認できた場合のみ。
+   * - "read-failed"：権限エラー・I/Oエラー・その他の失敗。ファイルが本当に
+   *   無いのか一時的に読めないだけなのか区別できないため、missing扱いには
+   *   絶対にしない（Level 3で再試行し、それでも読めなければ「確認不能」として
+   *   confirmedPresentにもmissingにもしない——次回チェックへ持ち越す）。
+   */
+  reason: "metadata-changed" | "path-missing" | "read-failed";
+}
+
+/** `targetedCheckSingleRecordStillAt`等の既存判定基準と同じ：NotFoundErrorだけを
+ *  「確認できた不在」として扱う。 */
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "NotFoundError";
+}
+
+interface VaultLightCheckLevel1Result {
+  candidates: VaultLightCheckKnownPathCandidate[];
+  /** candidateにならなかった（＝mtime/sizeが一致し、物理的に存在も確認できた）
+   *  registryKeyの集合。Level 3のmissing確定で「Level 1が既に存在確認済み」
+   *  として除外するために使う。 */
+  confirmedPresentKeys: Set<string>;
+}
+
+async function discoverLevel1MetadataCandidates(
+  root: FileSystemDirectoryHandle,
+  snapshot: VaultRegistrySnapshot
+): Promise<VaultLightCheckLevel1Result> {
+  const candidates: VaultLightCheckKnownPathCandidate[] = [];
+  const confirmedPresentKeys = new Set<string>();
+
+  for (const [registryKey, path] of snapshot.previousByKey.entries()) {
+    const entry = snapshot.previousEntries.get(path);
+    if (!entry) continue; // snapshot不整合（理論上起こらない想定）。安全側でcandidate化しない。
+
+    let file: File;
+    try {
+      const resolved = await resolveVaultRelativePath(root, path);
+      const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+      file = await fileHandle.getFile();
+    } catch (error) {
+      candidates.push({
+        registryKey,
+        recordType: entry.recordType,
+        previousPath: path,
+        reason: isNotFoundError(error) ? "path-missing" : "read-failed",
+      });
+      continue;
+    }
+
+    if (file.lastModified !== entry.mtime || file.size !== entry.size) {
+      candidates.push({ registryKey, recordType: entry.recordType, previousPath: path, reason: "metadata-changed" });
+      continue;
+    }
+
+    confirmedPresentKeys.add(registryKey);
+  }
+
+  return { candidates, confirmedPresentKeys };
+}
+
+/**
+ * Android実機不具合対応（soft deadline）：Level 2はbody I/Oを一切行わない
+ * path-only walkのため、既存full resyncのLevel（`VAULT_RESYNC_SOFT_DEADLINE_MS`、
+ * 1ファイルあたり複数回のbody read込み）よりも大幅に軽量だが、極端に大きい
+ * ディレクトリツリーでは`entries()`の呼び出し回数自体がAndroidで無視できない
+ * コストになりうるため、同じ「ファイル境界（＝次のディレクトリ/エントリの
+ * 処理を開始する前）でのみ確認する」soft deadlineを用意する。
+ */
+const VAULT_LIGHT_CHECK_LEVEL2_DEADLINE_MS = 60_000;
+
+interface VaultLightCheckLevel2State {
+  /** 既知registered pathには一致しない、新規または移動先候補の`.md` path。 */
+  unknownPaths: string[];
+  /** 既知registryKeyのうち、本walkでそのregistered pathの名前を実際に
+   *  見つけた（＝物理的に存在した）ものの集合。既存`walkVaultForResync`の
+   *  `seenKnownKeys`と同じ役割・同じ判定方法（path文字列の一致のみ、
+   *  bodyは一切読まない）。 */
+  seenKnownKeys: Set<string>;
+  deadline: number;
+  deadlineExceeded: boolean;
+}
+
+/**
+ * Level 2：Vault全体を再帰的に列挙するが、`.md`拡張子のpath文字列を集める
+ * だけで、`getFile()`／`file.text()`／parse／`processVaultResyncCandidate`の
+ * いずれも呼ばない（禁止事項として明示された通り）。既知registered pathとの
+ * 一致判定も、Registry snapshotの`previousRegistryKeyByPath`（path文字列→
+ * registryKey）を使った文字列比較のみで行う。
+ */
+async function walkVaultForLightCheckPaths(
+  dir: FileSystemDirectoryHandle,
+  prefix: string,
+  snapshot: VaultRegistrySnapshot,
+  state: VaultLightCheckLevel2State
+): Promise<void> {
+  for await (const [name, handle] of dir.entries()) {
+    if (Date.now() > state.deadline) {
+      state.deadlineExceeded = true;
+      return;
+    }
+    if (name.startsWith(HIDDEN_PREFIX)) continue;
+    const path = prefix ? `${prefix}/${name}` : name;
+    if (handle.kind === "directory") {
+      await walkVaultForLightCheckPaths(handle, path, snapshot, state);
+      continue;
+    }
+    if (!name.endsWith(".md")) continue;
+
+    const knownKey = snapshot.previousRegistryKeyByPath.get(path);
+    if (knownKey !== undefined) {
+      state.seenKnownKeys.add(knownKey);
+    } else {
+      state.unknownPaths.push(path);
+    }
+  }
+}
+
+export interface VaultLightCheckLevel2Result {
+  unknownPaths: string[];
+  seenKnownKeys: Set<string>;
+  /**
+   * Vault全体のpath enumerationを最後まで完走できた場合のみtrue。deadline
+   * 超過・例外・directory read失敗等、理由を問わずfalseにする。missing確定は
+   * この値がtrueの場合にのみ許可する（既存full resyncの`scanCompleted`と
+   * 同じ安全思想）。
+   */
+  completed: boolean;
+}
+
+async function performLevel2PathWalk(
+  root: FileSystemDirectoryHandle,
+  snapshot: VaultRegistrySnapshot
+): Promise<VaultLightCheckLevel2Result> {
+  const state: VaultLightCheckLevel2State = {
+    unknownPaths: [],
+    seenKnownKeys: new Set(),
+    deadline: Date.now() + VAULT_LIGHT_CHECK_LEVEL2_DEADLINE_MS,
+    deadlineExceeded: false,
+  };
+  let completed = false;
+  try {
+    await walkVaultForLightCheckPaths(root, "", snapshot, state);
+    if (state.deadlineExceeded) {
+      console.warn(
+        `[Tsumugi] light check: Level 2 soft deadline (${VAULT_LIGHT_CHECK_LEVEL2_DEADLINE_MS}ms) exceeded, stopping path enumeration.`
+      );
+    }
+    completed = !state.deadlineExceeded;
+  } catch (error) {
+    console.error("[Tsumugi] light check: Level 2 path enumeration failed:", error);
+    completed = false;
+  }
+  return { unknownPaths: state.unknownPaths, seenKnownKeys: state.seenKnownKeys, completed };
+}
+
+/**
+ * Level 1＋2の統合エントリポイント。起動時のbackground軽量チェックから
+ * 呼ばれる想定（呼び出し元でロック・`beginMemoryTask`を扱う。この関数自体は
+ * H4ロック関数を呼ばない——既存registry読み込みprimitiveと同じ、lock-free・
+ * 読み取り専用のため）。
+ */
+export interface VaultLightCheckDiscoveryResult {
+  metadataChangedCandidates: VaultLightCheckKnownPathCandidate[];
+  missingPathCandidates: VaultLightCheckKnownPathCandidate[];
+  /** 安全性レビュー対応（M2）：権限エラー・I/Oエラー等で確認できなかった既知
+   *  path。missingPathCandidatesとは明確に区別する（「存在しない」と確定した
+   *  わけではないため）。 */
+  readFailedCandidates: VaultLightCheckKnownPathCandidate[];
+  unknownPathCandidates: string[];
+  /** 安全性レビュー対応（M2）：Level 2のpath-only walkが実際に存在を確認できた
+   *  既知registryKeyの集合（path文字列の一致のみで判定、本文は読まない）。
+   *  Level 1が`read-failed`とした既知pathでも、Level 2が同じpathを列挙で
+   *  見つけていれば、少なくとも物理的に何か存在することの独立した証拠になる
+   *  （Level 3のmissing確定判定で、Level 1の読み取り失敗だけを理由に誤って
+   *  missing扱いしないためのセーフティネット）。 */
+  level2SeenKnownKeys: Set<string>;
+  level2Completed: boolean;
+  checkedAt: string;
+}
+
+export async function performVaultLightCheckDiscovery(
+  root: FileSystemDirectoryHandle
+): Promise<VaultLightCheckDiscoveryResult> {
+  const snapshot = await buildVaultRegistrySnapshot(root);
+  const level1 = await discoverLevel1MetadataCandidates(root, snapshot);
+  const level2 = await performLevel2PathWalk(root, snapshot);
+
+  const metadataChangedCandidates = level1.candidates.filter((c) => c.reason === "metadata-changed");
+  const missingPathCandidates = level1.candidates.filter((c) => c.reason === "path-missing");
+  const readFailedCandidates = level1.candidates.filter((c) => c.reason === "read-failed");
+
+  return {
+    metadataChangedCandidates,
+    missingPathCandidates,
+    readFailedCandidates,
+    unknownPathCandidates: level2.unknownPaths,
+    level2SeenKnownKeys: level2.seenKnownKeys,
+    level2Completed: level2.completed,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/** UI表示用（件数のみ、内訳の意味は断定しない——moveがmissing+unknownの2件に
+ *  分かれる等の理由で、この合計は実際の変更件数と一致しない）。readFailedは
+ *  「確認できなかっただけ」であり変更の証拠ではないため件数に含めない。 */
+export function countVaultLightCheckCandidates(discovery: VaultLightCheckDiscoveryResult): number {
+  return (
+    discovery.metadataChangedCandidates.length +
+    discovery.missingPathCandidates.length +
+    discovery.unknownPathCandidates.length
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4642,4 +4915,483 @@ export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Prom
     completedAt,
     lastFullResyncUpdated,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 軽量「外部の変更」検知フロー：Level 3（candidateのみclassification）／
+// Level 4（candidateのみapply）
+//
+// 重要：この2つの関数はいずれも`resyncVaultRegistry`を呼ばない。したがって
+// `baselineEstablishedAt`／`lastFullResyncAt`はこのフロー経由では一切更新
+// されない（この2つのフィールドを書き込むコードは`resyncVaultRegistry`内の
+// 1箇所だけであり、ここから到達しない）。
+// ---------------------------------------------------------------------------
+
+/**
+ * Level 3：Level 1/2で得たcandidateだけを対象に、既存の`processVaultResyncCandidate`
+ * （＝`handleResyncSingleRecordCandidate`／`handleResyncMemoryDayCandidate`を
+ * 含む、既存classification engine）をそのまま呼ぶ。分類ロジック自体は一切
+ * 変更しない。
+ *
+ * missing確定：`discovery.level2Completed`がtrueの場合のみ許可する（既存
+ * full resyncの`scanCompleted`と同じ安全思想）。falseの場合、Level 1が
+ * "path-missing"とした候補はこの回では確定させず、次回の軽量チェックへ
+ * 持ち越す（既存Phase 2の「recordsByKeyにもseenKnownKeysにも無い場合だけ
+ * missingにする」という判定を、Level 1/2の情報から再構成する）。
+ */
+/**
+ * 安全性レビュー対応（H1）：Level 3 classification時点の「ローカル状態」の
+ * snapshot。apply（Level 4）直前に、classification時点からIndexedDB record・
+ * vaultSyncState（ledger）・Registry entryのいずれかが変化していないかを
+ * 比較するために使う。`addedIndexedDbEquivalent`のように、既存apply関数が
+ * 「apply時点で読み直したIndexedDBの内容をそのまま同期済みとして記録する」
+ * 経路（`applySingleRecordAdded`/`applyMemoryDayMembers`、いずれも無変更）を
+ * 持つため、classification時点と完全一致することを確認できたrecordだけを
+ * applyへ進ませる必要がある。
+ */
+export interface VaultLightCheckMemberSnapshot {
+  id: string;
+  ledgerValue: string | undefined;
+  indexedDbRecord: MemoryObject | null;
+}
+
+export interface VaultLightCheckLocalSnapshot {
+  registryKey: string;
+  recordType: VaultRegistryRecordType;
+  /** classification時点でこのregistryKeyがRegistry上で指していたpath（無ければnull）。 */
+  registryPath: string | null;
+  registryContentHash: string | null;
+  /** Conversation/Reflection/Sourceのみ使用。memory-dayは`memberSnapshots`を使う。 */
+  ledgerValue: string | undefined;
+  indexedDbRecord: Conversation | Source | MemoryObject | null;
+  /** memory-dayのみ非null：その日の全member（Reflection除く）のsnapshot。 */
+  memberSnapshots: VaultLightCheckMemberSnapshot[] | null;
+}
+
+async function buildVaultLightCheckLocalSnapshot(
+  record: VaultResyncRecordResult,
+  registrySnapshot: VaultRegistrySnapshot
+): Promise<VaultLightCheckLocalSnapshot> {
+  const registryPath = registrySnapshot.previousByKey.get(record.registryKey) ?? null;
+  const registryEntry = registryPath !== null ? (registrySnapshot.previousEntries.get(registryPath) ?? null) : null;
+
+  if (record.recordType === "memory-day") {
+    const memberSnapshots: VaultLightCheckMemberSnapshot[] = [];
+    for (const member of record.members ?? []) {
+      const ledgerValue = await getVaultSyncState(vaultSyncKeyFor("memory", member.id));
+      const indexedDbRecord = (await getMemoryObject(member.id)) ?? null;
+      memberSnapshots.push({ id: member.id, ledgerValue, indexedDbRecord });
+    }
+    return {
+      registryKey: record.registryKey,
+      recordType: record.recordType,
+      registryPath,
+      registryContentHash: registryEntry?.contentHash ?? null,
+      ledgerValue: undefined,
+      indexedDbRecord: null,
+      memberSnapshots,
+    };
+  }
+
+  const kind = record.recordType as VaultResyncSingleKind;
+  const ledgerValue = await getVaultSyncState(vaultSyncKeyFor(vaultSyncKindOf(kind), record.registryKey));
+  let indexedDbRecord: Conversation | Source | MemoryObject | null;
+  if (kind === "conversation") indexedDbRecord = (await getConversation(record.registryKey)) ?? null;
+  else if (kind === "source") indexedDbRecord = (await getSource(record.registryKey)) ?? null;
+  else indexedDbRecord = (await getMemoryObject(record.registryKey)) ?? null;
+
+  return {
+    registryKey: record.registryKey,
+    recordType: record.recordType,
+    registryPath,
+    registryContentHash: registryEntry?.contentHash ?? null,
+    ledgerValue,
+    indexedDbRecord,
+    memberSnapshots: null,
+  };
+}
+
+export interface VaultLightCheckClassifyResult {
+  records: VaultResyncRecordResult[];
+  /** H1対応：commitを伴うoutcome（moved/edited/added）のrecordだけ、
+   *  registryKeyをキーにしたローカルsnapshotを保持する。Level 4のapply直前
+   *  再検証で使う。 */
+  localSnapshots: Map<string, VaultLightCheckLocalSnapshot>;
+  level2Completed: boolean;
+  counts: {
+    unchanged: number;
+    moved: number;
+    edited: number;
+    added: number;
+    missing: number;
+    conflict: number;
+    unreadable: number;
+  };
+}
+
+export async function classifyVaultLightCheckCandidates(
+  root: FileSystemDirectoryHandle,
+  discovery: VaultLightCheckDiscoveryResult
+): Promise<VaultLightCheckClassifyResult> {
+  const snapshot = await buildVaultRegistrySnapshot(root);
+  const state: VaultResyncScanState = {
+    previousByKey: snapshot.previousByKey,
+    previousEntries: snapshot.previousEntries,
+    previousRegistryKeyByPath: snapshot.previousRegistryKeyByPath,
+    seenPathsByKey: new Map(),
+    seenKnownKeys: new Set(),
+    recordsByKey: new Map(),
+    unreadableFiles: [],
+    scannedFileCount: 0,
+    // Level 3はcandidateだけを対象とする小さな処理のため、soft deadlineは
+    // 設けない（既存`VaultResyncScanState`型の必須フィールドを満たすための
+    // 形式的な値）。
+    deadline: Number.POSITIVE_INFINITY,
+    deadlineExceeded: false,
+  };
+
+  // Level 1が"metadata-changed"とした既知pathを読み直す。
+  for (const candidate of discovery.metadataChangedCandidates) {
+    try {
+      const resolved = await resolveVaultRelativePath(root, candidate.previousPath);
+      const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+      const file = await fileHandle.getFile();
+      await processVaultResyncCandidate(root, state, candidate.previousPath, file);
+    } catch (error) {
+      state.unreadableFiles.push({ path: candidate.previousPath, reason: `light check re-read failed: ${String(error)}` });
+    }
+  }
+
+  // Level 1が"path-missing"／"read-failed"とした既知pathも、Level 3の時点で
+  // 改めて1回だけ狙い撃ちで読み直す（Level 1判定からLevel 3実行までの間に
+  // 復元された場合、またはLevel 1判定自体が一時的な読み取り失敗だった場合を
+  // 取りこぼさないため）。読めなければ何もしない——後段のmissing確定処理へ委ねる
+  // （"read-failed"は後段でseenKnownKeysへ安全側フォールバックする、下記参照）。
+  for (const candidate of [...discovery.missingPathCandidates, ...discovery.readFailedCandidates]) {
+    try {
+      const resolved = await resolveVaultRelativePath(root, candidate.previousPath);
+      const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+      const file = await fileHandle.getFile();
+      await processVaultResyncCandidate(root, state, candidate.previousPath, file);
+    } catch {
+      // 読めない：missing確定処理（後段）へ委ねる。
+    }
+  }
+
+  // Level 2が見つけた未知pathを読む（新規追加、または移動先候補）。
+  for (const path of discovery.unknownPathCandidates) {
+    try {
+      const resolved = await resolveVaultRelativePath(root, path);
+      const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+      const file = await fileHandle.getFile();
+      await processVaultResyncCandidate(root, state, path, file);
+    } catch (error) {
+      state.unreadableFiles.push({ path, reason: `light check candidate read failed: ${String(error)}` });
+    }
+  }
+
+  // seenKnownKeysの再構成：Level 1がcandidate化しなかった（＝getFileHandle/
+  // getFile()に成功しmtime/sizeも一致していた）registryKeyは、既存
+  // walkVaultForResyncの「pathの文字列一致だけで確認済みとする」判定と同じ
+  // 強さ（実際にファイルを開けたことまで確認済みであり、より強い）で
+  // 「存在確認済み」として扱う。
+  //
+  // 安全性レビュー対応（M2）：`readFailedCandidates`（権限/I-Oエラー等で
+  // 読めなかっただけの既知path）はここでは「存在確認済み」に含めない
+  // （"path-missing"と同じ扱いにはしない）。代わりに、Level 2が独立して
+  // 同じpathを列挙で見つけていれば（`discovery.level2SeenKnownKeys`）、
+  // その証拠だけを安全側フォールバックとして採用する——本文は読めなくても
+  // 「物理的に何かが存在した」という事実は取り消さない、という既存
+  // walkVaultForResyncの原則と同じ考え方。
+  const level1CandidateKeys = new Set<string>([
+    ...discovery.metadataChangedCandidates.map((c) => c.registryKey),
+    ...discovery.missingPathCandidates.map((c) => c.registryKey),
+    ...discovery.readFailedCandidates.map((c) => c.registryKey),
+  ]);
+  for (const key of snapshot.previousByKey.keys()) {
+    if (!level1CandidateKeys.has(key)) {
+      state.seenKnownKeys.add(key);
+    }
+  }
+  for (const key of discovery.level2SeenKnownKeys) {
+    state.seenKnownKeys.add(key);
+  }
+
+  // missing確定：既存Phase 2と同じ判定（recordsByKeyにもseenKnownKeysにも
+  // 無い場合だけ）。ただしlevel2Completed===trueの場合のみ許可する。
+  if (discovery.level2Completed) {
+    for (const [key, prevPath] of state.previousByKey.entries()) {
+      if (state.recordsByKey.has(key)) continue;
+      if (state.seenKnownKeys.has(key)) continue;
+      const entry = state.previousEntries.get(prevPath);
+      if (!entry) continue;
+      state.recordsByKey.set(key, {
+        registryKey: key,
+        recordType: entry.recordType,
+        outcome: "missing",
+        previousPath: prevPath,
+        currentPath: null,
+        contentHash: null,
+        mtime: null,
+        size: null,
+        members: null,
+        addedIndexedDbEquivalent: null,
+        note: null,
+        parsed: null,
+        allObservedPaths: null,
+      });
+    }
+  }
+
+  const records = [...state.recordsByKey.values()];
+  const counts = { unchanged: 0, moved: 0, edited: 0, added: 0, missing: 0, conflict: 0, unreadable: 0 };
+  for (const record of records) {
+    counts[record.outcome] += 1;
+  }
+  counts.unreadable += state.unreadableFiles.length;
+
+  // H1対応：commitを伴うoutcome（moved/edited/added）のrecordだけ、apply直前
+  // 再検証に使うローカルsnapshotを構築する（conflict/missing/unchanged/
+  // unreadableはIndexedDB/ledgerへ一切書き込まないため不要）。
+  const localSnapshots = new Map<string, VaultLightCheckLocalSnapshot>();
+  for (const record of records) {
+    if (record.outcome === "moved" || record.outcome === "edited" || record.outcome === "added") {
+      localSnapshots.set(record.registryKey, await buildVaultLightCheckLocalSnapshot(record, snapshot));
+    }
+  }
+
+  return { records, localSnapshots, level2Completed: discovery.level2Completed, counts };
+}
+
+/**
+ * Level 4 apply直前の再検証（追加条件2、および安全性レビューH1/M2対応）。
+ * File System Access APIのI/Oはabort不可能なため、Level 3確認からユーザーが
+ * ［変更を反映］を押すまでの間隔で状態がさらに変化した場合に備え、apply直前に
+ * 対象candidateだけの狙い撃ち再確認を行う。Vault全体の再scanは行わない。
+ *
+ * commitを伴うoutcome（moved/edited/added）：
+ * 1. new/current pathのmtime+sizeがLevel 3確認時点と一致するか。
+ * 2. moved、またはpathが変化したedited（moved+edited）の場合はさらに、
+ *    旧pathに対象recordが依然として存在しないかも確認する。
+ * 3〜5（H1）：classification時点のローカルsnapshot（Registry entry・
+ *    vaultSyncState・IndexedDB内容）と、apply直前の現在値を比較する。
+ *    IndexedDB側の比較は、既存の`conversationsSemanticEqual`／
+ *    `memoryObjectsSemanticEqual`／`sourcesSemanticEqual`（いずれも無変更）を
+ *    そのまま再利用する——単純に`updatedAt`だけで判定しない。これにより、
+ *    `applySingleRecordAdded`/`applyMemoryDayMembers`（いずれも無変更）が
+ *    apply時点で読み直したIndexedDBの内容をそのまま「同期済み」として
+ *    記録してしまう経路（`addedIndexedDbEquivalent`）に、classification後に
+ *    変化したローカルrecordが紛れ込むことを防ぐ。
+ *
+ * missing outcome（M2）：apply（`setVaultRegistryMissing`）前に、旧registered
+ * pathをもう一度狙い撃ちで確認する。`NotFoundError`で確認できた場合のみ
+ * apply可。ファイルが復活していればstale、権限/I-Oエラー等で確認不能な
+ * 場合も安全側でapply禁止にする（「読めなかった」を「存在しない」として
+ * 扱わない）。
+ */
+export interface VaultLightCheckStaleCandidate {
+  registryKey: string;
+  reason:
+    | "new-path-changed"
+    | "old-path-restored"
+    | "registry-changed"
+    | "ledger-changed"
+    | "indexeddb-changed"
+    | "missing-file-restored"
+    | "missing-unconfirmed";
+}
+
+/** H1：classification時点のIndexedDB snapshotと現在値を、recordTypeに応じた
+ *  既存semantic equality関数で比較する。両方nullなら不変（未存在のまま）。 */
+function isLocalIndexedDbRecordUnchanged(
+  recordType: VaultRegistryRecordType,
+  snapshotRecord: Conversation | Source | MemoryObject | null,
+  currentRecord: Conversation | Source | MemoryObject | null
+): boolean {
+  if (snapshotRecord === null && currentRecord === null) return true;
+  if (snapshotRecord === null || currentRecord === null) return false;
+  if (recordType === "conversation") return conversationsSemanticEqual(snapshotRecord as Conversation, currentRecord as Conversation);
+  if (recordType === "source") return sourcesSemanticEqual(snapshotRecord as Source, currentRecord as Source);
+  return memoryObjectsSemanticEqual(snapshotRecord as MemoryObject, currentRecord as MemoryObject);
+}
+
+async function reverifyMissingCandidateBeforeApply(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultLightCheckStaleCandidate | null> {
+  if (record.previousPath === null) return null; // 理論上missingは必ずpreviousPathを持つ
+  try {
+    const resolved = await resolveVaultRelativePath(root, record.previousPath);
+    await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    // ここに到達した＝ファイルが復活していた。
+    return { registryKey: record.registryKey, reason: "missing-file-restored" };
+  } catch (error) {
+    if (isNotFoundError(error)) return null; // 本当に存在しない：apply可。
+    // 権限/I-Oエラー等で確認不能：「存在しない」と断定せず安全側でapply禁止。
+    return { registryKey: record.registryKey, reason: "missing-unconfirmed" };
+  }
+}
+
+async function reverifyVaultLightCheckCandidateBeforeApply(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult,
+  localSnapshot: VaultLightCheckLocalSnapshot | undefined
+): Promise<VaultLightCheckStaleCandidate | null> {
+  if (record.outcome === "missing") {
+    return reverifyMissingCandidateBeforeApply(root, record);
+  }
+  if (record.outcome !== "moved" && record.outcome !== "edited" && record.outcome !== "added") {
+    // conflict/unchanged/unreadableはMarkdown本体・IndexedDB・registry"ok"の
+    // commitを一切伴わないため、apply前再検証は不要。
+    return null;
+  }
+
+  // 1. new/current pathのmtime+size再検証（既存）。
+  const currentPath = record.currentPath;
+  const expectedMtime = record.mtime;
+  const expectedSize = record.size;
+  if (currentPath === null || expectedMtime === null || expectedSize === null) {
+    return { registryKey: record.registryKey, reason: "new-path-changed" };
+  }
+  let file: File;
+  try {
+    const resolved = await resolveVaultRelativePath(root, currentPath);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    file = await fileHandle.getFile();
+  } catch {
+    return { registryKey: record.registryKey, reason: "new-path-changed" };
+  }
+  if (file.lastModified !== expectedMtime || file.size !== expectedSize) {
+    return { registryKey: record.registryKey, reason: "new-path-changed" };
+  }
+
+  // 2. old path再検証（move系、既存）。
+  const previousPath = record.previousPath;
+  if (previousPath !== null && previousPath !== currentPath && (record.outcome === "moved" || record.outcome === "edited")) {
+    let presence: VaultResyncTargetedPresence;
+    if (record.recordType === "memory-day") {
+      const day = record.registryKey.startsWith("day:") ? record.registryKey.slice(4) : record.registryKey;
+      presence = await targetedCheckMemoryDayStillAt(root, previousPath, day);
+    } else {
+      presence = await targetedCheckSingleRecordStillAt(
+        root,
+        previousPath,
+        record.recordType as VaultResyncSingleKind,
+        record.registryKey
+      );
+    }
+    if (presence !== "absent") {
+      return { registryKey: record.registryKey, reason: "old-path-restored" };
+    }
+  }
+
+  // 3〜5. ローカル状態再検証（H1）：snapshotが無ければ（理論上起こらない想定だが）
+  // 安全側でstale扱いにする。
+  if (!localSnapshot) {
+    return { registryKey: record.registryKey, reason: "indexeddb-changed" };
+  }
+
+  // 5. Registry側再検証：classification時点にこのregistryKeyが指していた
+  // path/contentHashと、現在のRegistryを比較する。
+  const currentLookup = await lookupVaultRegistryRecord(root, record.registryKey);
+  const currentRegistryPath = currentLookup.entry !== undefined ? (currentLookup.path ?? null) : null;
+  const currentRegistryHash = currentLookup.entry?.contentHash ?? null;
+  if (currentRegistryPath !== localSnapshot.registryPath || currentRegistryHash !== localSnapshot.registryContentHash) {
+    return { registryKey: record.registryKey, reason: "registry-changed" };
+  }
+
+  if (record.recordType === "memory-day") {
+    for (const memberSnapshot of localSnapshot.memberSnapshots ?? []) {
+      const currentLedger = await getVaultSyncState(vaultSyncKeyFor("memory", memberSnapshot.id));
+      if (currentLedger !== memberSnapshot.ledgerValue) {
+        return { registryKey: record.registryKey, reason: "ledger-changed" };
+      }
+      const currentRecord = (await getMemoryObject(memberSnapshot.id)) ?? null;
+      if (!isLocalIndexedDbRecordUnchanged("memory-day", memberSnapshot.indexedDbRecord, currentRecord)) {
+        return { registryKey: record.registryKey, reason: "indexeddb-changed" };
+      }
+    }
+  } else {
+    const kind = record.recordType as VaultResyncSingleKind;
+    const currentLedger = await getVaultSyncState(vaultSyncKeyFor(vaultSyncKindOf(kind), record.registryKey));
+    if (currentLedger !== localSnapshot.ledgerValue) {
+      return { registryKey: record.registryKey, reason: "ledger-changed" };
+    }
+    let currentRecord: Conversation | Source | MemoryObject | null;
+    if (kind === "conversation") currentRecord = (await getConversation(record.registryKey)) ?? null;
+    else if (kind === "source") currentRecord = (await getSource(record.registryKey)) ?? null;
+    else currentRecord = (await getMemoryObject(record.registryKey)) ?? null;
+    if (!isLocalIndexedDbRecordUnchanged(record.recordType, localSnapshot.indexedDbRecord, currentRecord)) {
+      return { registryKey: record.registryKey, reason: "indexeddb-changed" };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Level 4：Level 3の分類結果（React stateに保持されている前提）だけを対象に
+ * apply直前の再検証を行い、staleでないrecordsだけを既存
+ * `applyVaultResyncScanResult`（無変更）へ渡す。Vault全体の再scanはしない。
+ * `resyncVaultRegistry`は呼ばないため、baselineEstablishedAt/lastFullResyncAt
+ * は更新されない。
+ *
+ * Lock設計（安全性レビュー対応）：再検証からapplyまでを、既存full resyncと
+ * 同じ`runVaultWorldExclusive`（排他ロック）の1区間で完結させる。新しい独自
+ * lock体系は作らない。排他ロックだけでは「ボタンを押す前に発生したローカル
+ * 変更」は検出できないため（ロック取得時点の状態しか保護しない）、上記の
+ * classification時点snapshotとの比較（H1）を排他ロック区間の中で行うことで、
+ * 「再検証からcommitまでの間に何も割り込めない」ことと「classification時点
+ * からの変化を検出できる」ことの両方を満たす。
+ */
+export interface VaultLightCheckApplyOutcome {
+  timedOut: boolean;
+  counts: {
+    unchanged: number;
+    moved: number;
+    edited: number;
+    added: number;
+    missing: number;
+    conflict: number;
+    unreadable: number;
+  };
+  applyErrors: VaultResyncApplyError[];
+  staleSkipped: VaultLightCheckStaleCandidate[];
+}
+
+const EMPTY_VAULT_LIGHT_CHECK_COUNTS = { unchanged: 0, moved: 0, edited: 0, added: 0, missing: 0, conflict: 0, unreadable: 0 };
+
+export async function applyVaultLightCheckCandidates(
+  root: FileSystemDirectoryHandle,
+  records: VaultResyncRecordResult[],
+  localSnapshots: Map<string, VaultLightCheckLocalSnapshot>
+): Promise<VaultLightCheckApplyOutcome> {
+  const lockResult = await runVaultWorldExclusive(async () => {
+    const applicable: VaultResyncRecordResult[] = [];
+    const staleSkipped: VaultLightCheckStaleCandidate[] = [];
+
+    for (const record of records) {
+      const stale = await reverifyVaultLightCheckCandidateBeforeApply(root, record, localSnapshots.get(record.registryKey));
+      if (stale) {
+        staleSkipped.push(stale);
+        continue;
+      }
+      applicable.push(record);
+    }
+
+    const applyResult = await applyVaultResyncScanResult(root, {
+      scanCompleted: true,
+      scannedFileCount: applicable.length,
+      records: applicable,
+      unreadableFiles: [],
+    });
+
+    return { counts: applyResult.counts, applyErrors: applyResult.applyErrors, staleSkipped };
+  });
+
+  if (lockResult.timedOut) {
+    return { timedOut: true, counts: { ...EMPTY_VAULT_LIGHT_CHECK_COUNTS }, applyErrors: [], staleSkipped: [] };
+  }
+  const { counts, applyErrors, staleSkipped } = lockResult.result!;
+  return { timedOut: false, counts, applyErrors, staleSkipped };
 }

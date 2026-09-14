@@ -7,6 +7,7 @@ import type {
   RestoreStatus,
   SupportedChatProvider,
   VaultConnectFeedback,
+  VaultLightCheckStatus,
   VaultResyncFeedback,
   VaultStatus,
 } from "./ChatScreen";
@@ -41,6 +42,10 @@ export default function SettingsPanel({
   vaultResyncFeedback,
   vaultResyncTakingLong = false,
   onResyncVault,
+  vaultLightCheckStatus,
+  onConfirmVaultLightCheck,
+  onApplyVaultLightCheck,
+  onRetryVaultLightCheck,
 }: {
   chatProvider: SupportedChatProvider;
   keyStatusByProvider: Record<SupportedChatProvider, boolean>;
@@ -77,6 +82,17 @@ export default function SettingsPanel({
    */
   vaultResyncTakingLong?: boolean;
   onResyncVault: () => void;
+  /**
+   * 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。"idle"の間は何も
+   * 表示しない（起動時のLevel 1/2で候補が1件も無い場合も含む）。
+   */
+  vaultLightCheckStatus: VaultLightCheckStatus;
+  /** 「確認する」＝Level 3（candidateのみ本文read・分類）を開始する。 */
+  onConfirmVaultLightCheck: () => void;
+  /** 「変更を反映」＝Level 4（apply直前の再検証＋candidateのみapply）を開始する。 */
+  onApplyVaultLightCheck: () => void;
+  /** 「もう一度確認する」：staleまたはerror/partial発生後、古い結果を使わずLevel 1/2からやり直す。 */
+  onRetryVaultLightCheck: () => void;
 }) {
   const [showResyncDetail, setShowResyncDetail] = useState(false);
   return (
@@ -370,6 +386,108 @@ export default function SettingsPanel({
 
           {restoreStatus === "done" && (
             <div className="text-xs text-stone-500 dark:text-stone-400">記憶を復元しました。</div>
+          )}
+
+          {/*
+            軽量「外部の変更」検知フロー（Level 1〜4）。「Registry」「resync」
+            「同期」等の内部用語は出さない。件数（"candidates-found".count）は
+            実際の変更件数ではない粗い候補数のため、ここでは表示せず行の
+            表示可否だけに使う——確定した内訳（編集/移動/確認が必要）は
+            「確認する」実行後（"classified"）にのみ表示する。
+          */}
+          {vaultLightCheckStatus.kind === "checking" && (
+            <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              確認しています…
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "candidates-found" && (
+            <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <span>外部で変更されたファイルがあります</span>
+              <button
+                onClick={onConfirmVaultLightCheck}
+                disabled={vaultActionsDisabled}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+              >
+                確認する
+              </button>
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "classifying" && (
+            <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              確認しています…
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "classified" && (
+            <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <span>外部の変更が見つかりました</span>
+              <span className="text-xs text-stone-500 dark:text-stone-400">
+                {[
+                  vaultLightCheckStatus.result.counts.added > 0 ? `追加 ${vaultLightCheckStatus.result.counts.added}件` : null,
+                  vaultLightCheckStatus.result.counts.edited > 0 ? `編集 ${vaultLightCheckStatus.result.counts.edited}件` : null,
+                  vaultLightCheckStatus.result.counts.moved > 0 ? `移動 ${vaultLightCheckStatus.result.counts.moved}件` : null,
+                  vaultLightCheckStatus.result.counts.conflict +
+                    vaultLightCheckStatus.result.counts.missing +
+                    vaultLightCheckStatus.result.counts.unreadable >
+                  0
+                    ? `確認が必要 ${
+                        vaultLightCheckStatus.result.counts.conflict +
+                        vaultLightCheckStatus.result.counts.missing +
+                        vaultLightCheckStatus.result.counts.unreadable
+                      }件`
+                    : null,
+                ]
+                  .filter((line): line is string => line !== null)
+                  .join("　") || "変更はありませんでした"}
+              </span>
+              <button
+                onClick={onApplyVaultLightCheck}
+                disabled={vaultActionsDisabled}
+                className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+              >
+                変更を反映
+              </button>
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "applying" && (
+            <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              反映しています…
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "applied" && (
+            <div className="rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+              外部の変更を反映しました。
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "partial" && (
+            <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <span>{vaultLightCheckStatus.message}</span>
+              <button
+                onClick={onRetryVaultLightCheck}
+                disabled={vaultActionsDisabled}
+                className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+              >
+                もう一度確認する
+              </button>
+            </div>
+          )}
+
+          {vaultLightCheckStatus.kind === "error" && (
+            <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+              <span>{vaultLightCheckStatus.message}</span>
+              <button
+                onClick={onRetryVaultLightCheck}
+                disabled={vaultActionsDisabled}
+                className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+              >
+                もう一度確認する
+              </button>
+            </div>
           )}
         </section>
 
