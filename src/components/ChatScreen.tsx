@@ -1013,12 +1013,40 @@ export default function ChatScreen() {
    * `runVaultSwitchExclusive`（排他ロック）取得が、残りの未flush件数ぶんではなく
    * 「現在処理中だった最大1item分」の待ちだけで済むようになる（H4のロック名・
    * epochロジック・sync ledger・History Index更新ロジックはいずれも無変更）。
+   *
+   * 実機不具合対応（Android light-check確認停止）：`timeoutMs`は省略可能。
+   * 省略時（Vault切替系の既存呼び出し元）は**無期限**に待つ——これは
+   * 意図的な安全側の挙動である。File System Access APIの単発I/O
+   * （`getFileHandle`/`getFile`/`writeFileInDir`等）はcancelできないため
+   * （MDN仕様確認済み、本ファイル内の既存コメント多数を参照）、abort()した
+   * ところで現在処理中のI/Oそのものは止まらない。Vault切替系がここで
+   * 待ち切らずに先へ進むと、まだ完了していないflush writeと並行して
+   * IndexedDBの早期clear等が走り、データが失われる実害のある経路になる
+   * （実機で確認済みの重大な問題、既存コメント参照）ため、Vault切替系の
+   * 呼び出し元は無期限待機のままにする（今回変更しない）。
+   *
+   * 一方、light-check確認（`handleConfirmVaultLightCheck`、L3直前の安定境界）
+   * だけは`timeoutMs`を渡せるようにした。classifyは読み取り専用で何も
+   * 書き換えないため、「待っても安全側にclassifyへ進まず中止する」ことが
+   * 許容できる——Vault切替のような取り消せない副作用が無いため。timeoutしても
+   * 裏のflush自体（`backgroundFlushInFlightPromiseRef`が指す既存Promise）は
+   * 中断されず、そのまま自然に完了する（このI/O自体をcancelする手段が無いのは
+   * 変わらないため）。呼び出し元が単にこの待機を諦めて`classify`を呼ばずに
+   * 中止するだけであり、「危険なwriteを裏で継続させたままclassifyだけ進める」
+   * という禁止されたPromise.race方式ではない。
    */
-  function abortBackgroundFlushAndWait(): Promise<void> {
+  function abortBackgroundFlushAndWait(timeoutMs?: number): Promise<{ timedOut: boolean }> {
     const inFlight = backgroundFlushInFlightPromiseRef.current;
     backgroundFlushAbortControllerRef.current?.abort();
-    if (!inFlight) return Promise.resolve();
-    return inFlight.catch(() => {});
+    if (!inFlight) return Promise.resolve({ timedOut: false });
+    const settled: Promise<{ timedOut: boolean }> = inFlight.catch(() => {}).then(() => ({ timedOut: false }));
+    if (timeoutMs === undefined) return settled;
+    return Promise.race([
+      settled,
+      new Promise<{ timedOut: boolean }>((resolve) => {
+        window.setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+      }),
+    ]);
   }
 
   /**
@@ -2674,6 +2702,18 @@ export default function ChatScreen() {
    * 待機のため、その後の`withVaultWorldRead`呼び出しとの間でロックの再要求
    * （自己デッドロックの原因）は発生しない。
    *
+   * 実機不具合対応（Android確認停止）：手順1の`abortBackgroundFlushAndWait()`は
+   * 元々timeoutが無く、tracked background flushが単発のFile System Access API
+   * 呼び出し（cancel不可）の途中で止まっていると、この待機自体が無期限に
+   * 止まり、手順2の`waitForVaultWrites`側のtimeoutへ到達できなかった
+   * （実機で確認された「確認しています…」が終わらない不具合の原因）。
+   * これを踏まえ、手順1にも`VAULT_SWITCH_SETTLE_TIMEOUT_MS`を予算として渡す
+   * ようにした。timeoutしても、tracked flush自体（`backgroundFlushInFlightPromiseRef`
+   * が指す既存Promise）はcancelされず裏で自然完了に任せる——classifyは
+   * 読み取り専用なので、ここで進むのを諦めて安全側にエラー表示して終える
+   * （「危険な書き込みを裏で続けさせたままUIだけ先へ進む」Promise.race方式は
+   * 使わない）。
+   *
    * 完全性の限界（正直な開示）：この2手順は「新しいbackground flush」と
    * 「待機開始時点までにenqueue済みのwrite」を確実に安定させるが、待機完了の
    * 直後・classify呼び出し直前の一瞬に、ユーザーの別操作（会話送信等）に由来する
@@ -2700,8 +2740,25 @@ export default function ChatScreen() {
     try {
       // L3安定境界（Codex指摘対応）：classifyへ進む前に、内部writeを安全に
       // settleさせる。ロックは一切取得しない（ロック外の待機）。
-      await abortBackgroundFlushAndWait();
-      const settle = await waitForVaultWrites(VAULT_SWITCH_SETTLE_TIMEOUT_MS);
+      // 実機不具合対応：手順1にもtimeoutを持たせ（上記コメント参照）、
+      // 2手順合計でVAULT_SWITCH_SETTLE_TIMEOUT_MSの予算を共有する
+      // （Vault切替フローの`settleDeadline`パターンと同じ考え方）。
+      const settleDeadline = Date.now() + VAULT_SWITCH_SETTLE_TIMEOUT_MS;
+      const abortWaitResult = await abortBackgroundFlushAndWait(VAULT_SWITCH_SETTLE_TIMEOUT_MS);
+      if (abortWaitResult.timedOut) {
+        // 進行中のbackground flushが規定時間内に収まらなかった：flush自体は
+        // 裏で継続させたまま、classifyへは進まず安全側にエラー表示して終える
+        // （「もう一度確認する」でLevel 1/2からやり直せる）。
+        setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
+        return;
+      }
+      if (generation !== vaultGenerationRef.current) {
+        // 待機中にVaultが切り替わっていた：この候補は今のVaultのものではない。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        return;
+      }
+      const settle = await waitForVaultWrites(Math.max(0, settleDeadline - Date.now()));
       if (settle.timedOut) {
         // 書き込みが収まらない：不安定な状態でclassifyへ進まず、エラー表示
         // して終える（「もう一度確認する」でLevel 1/2からやり直せる）。

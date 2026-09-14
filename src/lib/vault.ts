@@ -1638,6 +1638,9 @@ export async function flushPendingToVault(
         heldCount += 1;
         heldByReason[error.holdReason] += 1;
         console.log("[Vault] flush: conversation write held pending vault resync (expected):", error.message);
+        // 実機不具合対応（Android診断）：holdReason/recordTypeだけを診断ログへ記録する
+        // （registryKey/ID/path/本文は含めない。debugTimingLog.tsのprivacy方針を維持）。
+        logTimingEvent("Vault flush:held", { holdReason: error.holdReason, recordType: error.recordType });
       } else {
         failedCount += 1;
         console.error("[Tsumugi] flush: conversation write failed (will retry on next flush):", error);
@@ -1658,6 +1661,7 @@ export async function flushPendingToVault(
         heldCount += 1;
         heldByReason[error.holdReason] += 1;
         console.log("[Vault] flush: memory write held pending vault resync (expected):", error.message);
+        logTimingEvent("Vault flush:held", { holdReason: error.holdReason, recordType: error.recordType });
       } else {
         failedCount += 1;
         console.error("[Tsumugi] flush: memory write failed (will retry on next flush):", error);
@@ -1678,6 +1682,7 @@ export async function flushPendingToVault(
         heldCount += 1;
         heldByReason[error.holdReason] += 1;
         console.log("[Vault] flush: source write held pending vault resync (expected):", error.message);
+        logTimingEvent("Vault flush:held", { holdReason: error.holdReason, recordType: error.recordType });
       } else {
         failedCount += 1;
         console.error("[Tsumugi] flush: source write failed (will retry on next flush):", error);
@@ -2500,7 +2505,10 @@ async function resolveVaultRelativePath(
   const segments = relativePath.split("/");
   let dir = root;
   for (const segment of segments.slice(0, -1)) {
-    dir = await dir.getDirectoryHandle(segment, { create: false });
+    // 実機不具合対応（Android診断）：Android SAFでここが遅延/停止していないかを
+    // 計測するためだけの追加。既存のtimedIOStepパターンを再利用し、path名は
+    // labelに含めない（固定文字列のみ）。
+    dir = await timedIOStep("registry resolve:getDirectoryHandle", () => dir.getDirectoryHandle(segment, { create: false }));
   }
   return { dir, fileName: segments[segments.length - 1] };
 }
@@ -2624,8 +2632,12 @@ async function verifyVaultRegistryEntryBeforeWrite(
 ): Promise<VaultRegistryPreWriteCheck> {
   let file: File;
   try {
-    const fileHandle = await dir.getFileHandle(fileName, { create: false });
-    file = await fileHandle.getFile();
+    // 実機不具合対応（Android診断）：Registryに記録された旧pathの実ファイル確認が
+    // Android SAFでどれだけ時間を要しているかを計測するためだけの追加。
+    // 既存のtimedIOStepパターンを再利用し、path/fileName等はlabelに含めない
+    // （固定文字列のみ）。判定ロジック・エラー処理は一切変更しない。
+    const fileHandle = await timedIOStep("registry verify:getFileHandle", () => dir.getFileHandle(fileName, { create: false }));
+    file = await timedIOStep("registry verify:getFile", () => fileHandle.getFile());
   } catch {
     await markVaultRegistryNeedsResync(root, registryKey);
     throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync", "needs-resync");
