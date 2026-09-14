@@ -138,12 +138,19 @@ interface DayCacheEntry {
  */
 export default function HistoryPanel({
   onClose,
+  onOpenSettings,
   vaultHandle,
   initialMemoryId,
   refreshToken,
   sessionCapturedMemories = [],
 }: {
   onClose: () => void;
+  /**
+   * 実機不具合対応（原則B）：外部変更によりdetailが開けない（`detailUnavailable`）
+   * 状態のとき、案内メッセージから直接設定画面（「Vaultを再同期」がある場所）へ
+   * 遷移するための導線。渡されなければボタン自体を出さない（後方互換のoptional）。
+   */
+  onOpenSettings?: () => void;
   /**
    * ChatScreen.tsx側の既存Vault state（変更なし）をそのまま渡してもらうだけ。
    * このコンポーネント自身はVault切替ロジックを一切持たない——propが変わった
@@ -180,6 +187,13 @@ export default function HistoryPanel({
   const [dayLoading, setDayLoading] = useState(false);
   /** 一覧行タップ時のオンデマンド詳細読み込み中だけtrue（v2の日、または本体未読の行）。 */
   const [detailLoading, setDetailLoading] = useState(false);
+  /**
+   * 実機不具合対応（原則B）：一覧行をタップしたが本体を読めなかった場合にtrue。
+   * History上には行として残っている（存在した記録）にもかかわらず読めない場合、
+   * 無言で何も起きなかったように見せず、「外部で変更された可能性があるため
+   * Vaultを再同期してください」という案内を表示する（技術用語は出さない）。
+   */
+  const [detailUnavailable, setDetailUnavailable] = useState(false);
 
   // race対策：月Index読み込み・日付詳細読み込み・詳細（Conversation/Memory本体）読み込み
   // それぞれについて、呼び出しごとにインクリメントするリクエストID。resolve/reject時に
@@ -257,6 +271,7 @@ export default function HistoryPanel({
       setSelectedDay(todayKey());
       setSelectedMemory(null);
       setSelectedConversation(null);
+      setDetailUnavailable(false);
       setMonthIndex(null);
       pendingInitialMemoryIdRef.current = initialMemoryId;
       if (targetYear !== viewYear || targetMonth !== viewMonth) {
@@ -511,10 +526,16 @@ export default function HistoryPanel({
     if (!vaultHandle || !selectedDay) return;
     const requestId = ++detailRequestRef.current;
     setDetailLoading(true);
+    setDetailUnavailable(false);
     try {
       const conversation = await readConversationById(vaultHandle, row.id, selectedDay);
       if (detailRequestRef.current !== requestId) return;
+      // 実機不具合対応（原則B）：一覧に行として存在する（＝過去に記録された）
+      // Conversationであるにもかかわらず本体が読めない場合、無言で何も起きな
+      // かったように見せない。外部でMarkdownが移動・編集・削除された等の理由で
+      // Vault Registryが安全のため読み取りを保留している可能性が高いため。
       if (conversation) setSelectedConversation(conversation);
+      else setDetailUnavailable(true);
     } finally {
       if (detailRequestRef.current === requestId) setDetailLoading(false);
     }
@@ -528,11 +549,13 @@ export default function HistoryPanel({
     if (!vaultHandle || !selectedDay) return;
     const requestId = ++detailRequestRef.current;
     setDetailLoading(true);
+    setDetailUnavailable(false);
     try {
       if (row.origin === "reflection") {
         const memory = await readReflectionById(vaultHandle, row.id, selectedDay);
         if (detailRequestRef.current !== requestId) return;
         if (memory) setSelectedMemory(memory);
+        else setDetailUnavailable(true);
       } else {
         // 通常Memoryは1日1Markdown（複数件統合）のため、1件だけを取り出すファイル形式が
         // 無い。その日のday-fileを1回読み、対象idをfindする（既存のreadMemoriesForDay
@@ -541,6 +564,7 @@ export default function HistoryPanel({
         if (detailRequestRef.current !== requestId) return;
         const memory = dayMemories.find((m) => m.id === row.id);
         if (memory) setSelectedMemory(memory);
+        else setDetailUnavailable(true);
       }
     } finally {
       if (detailRequestRef.current === requestId) setDetailLoading(false);
@@ -653,12 +677,14 @@ export default function HistoryPanel({
     setSelectedDay(null);
     setSelectedMemory(null);
     setSelectedConversation(null);
+    setDetailUnavailable(false);
   }
 
   function selectDay(day: string) {
     setSelectedDay(day);
     setSelectedMemory(null);
     setSelectedConversation(null);
+    setDetailUnavailable(false);
     // 前の日付の表示が一瞬でも残らないよう、ここで即座に更新する（実際の
     // requestId発行・skipDayFetchRefの確定は、直後に走るreset effect
     // （selectedDayの変化を検知して発火する）が同じ判定を行う）。
@@ -771,6 +797,29 @@ export default function HistoryPanel({
 
               {monthLoading || dayLoading || detailLoading ? (
                 <p className="text-sm text-stone-400 dark:text-stone-500">読み込んでいます…</p>
+              ) : detailUnavailable ? (
+                <div className="flex flex-col gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setDetailUnavailable(false)}
+                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    戻る
+                  </button>
+                  <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                    <p>この記録を開くために、保存先の確認が必要です。</p>
+                    <p className="text-xs text-stone-500 dark:text-stone-400">設定から「Vaultを再同期」してください。</p>
+                    {onOpenSettings && (
+                      <button
+                        type="button"
+                        onClick={onOpenSettings}
+                        className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                      >
+                        設定を開く
+                      </button>
+                    )}
+                  </div>
+                </div>
               ) : selectedConversation ? (
                 <div className="flex flex-col gap-3">
                   <button

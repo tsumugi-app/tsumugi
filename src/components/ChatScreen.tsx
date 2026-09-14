@@ -412,6 +412,20 @@ export default function ChatScreen() {
   const [deleteDataFeedback, setDeleteDataFeedback] = useState<DataActionFeedback | null>(null);
   const [vaultResyncFeedback, setVaultResyncFeedback] = useState<VaultResyncFeedback | null>(null);
   /**
+   * 実機不具合対応：background/startup flushが`VaultRecordNeedsResyncError`
+   * （Registry baseline未確立のRegistry absent record、または外部でMarkdownが
+   * 移動・編集・削除された等の理由でRegistryが安全のため書き込みを保留した、
+   * いずれも想定されたHOLD）を1件でも検出した場合にtrueにする。安全確認（実機
+   * 不具合の再調査）対応：どちらの理由でHOLDされたかはこのstate単体からは
+   * 区別できないため、「外部変更を検出した」と断定する文言には使わない（表示
+   * 文言は「保存先の確認が必要」という中立的な表現に留める）。無言で「何も
+   * 起きていないように見える」ことを避けるため、画面上部の控えめなバナーで
+   * 「設定から『Vaultを再同期』してください」と案内する（大きなモーダルは出さない）。
+   * 再同期が完了した時点で楽観的にfalseへ戻す（新たなHOLDを検出すれば、次回の
+   * flushで自然に再度trueになる）。
+   */
+  const [vaultHoldDetected, setVaultHoldDetected] = useState(false);
+  /**
    * トップ画面の「アクセスを再許可」カードの「あとで」で非表示にしたかどうか。
    * ページセッション中のみ有効（stateなのでリロードで自動的にfalseへ戻り、
    * needs-permissionが続いていれば再度カードが表示される）。
@@ -842,7 +856,8 @@ export default function ChatScreen() {
         await previousInFlight.catch(() => {});
       }
       try {
-        await withVaultWorldRead(() => flushPendingToVault(handle, "background", controller.signal));
+        const flushResult = await withVaultWorldRead(() => flushPendingToVault(handle, "background", controller.signal));
+        if (flushResult.heldCount > 0) setVaultHoldDetected(true);
       } catch (error) {
         if (!handleStaleVaultTabError(error)) {
           console.error("[Tsumugi] background vault flush failed (will retry on next flush):", error);
@@ -1355,7 +1370,8 @@ export default function ChatScreen() {
         // まだVaultへ書き戻されていない変更がある場合に、古いMarkdownの内容で
         // IndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
         try {
-          await flushPendingToVault(result.handle);
+          const flushResult = await flushPendingToVault(result.handle);
+          if (flushResult.heldCount > 0) setVaultHoldDetected(true);
         } catch (error) {
           console.error("Failed to flush pending vault writes on startup", error);
         }
@@ -1936,6 +1952,7 @@ export default function ChatScreen() {
           | { status: "success" }
           | { status: "stale" }
           | { status: "flush-failed" }
+          | { status: "held" }
           | { status: "clear-failed" }
           | { status: "save-handle-failed" };
 
@@ -1960,8 +1977,25 @@ export default function ChatScreen() {
           // 「timeoutを報告した直後にロックだけ解放し、flush I/Oが無保護のまま裏で
           // 継続する」事故を起こさない（vaultWorldLock.ts参照）。
           const flushResult = await flushPendingToVault(savedVaultHandleForFlush, "interactive");
+          // 安全確認（実機不具合の再調査）対応：heldCount（VaultRecordNeedsResyncError
+          // による想定されたHOLD）は「失敗ではない」からと切替を許可してよい理由には
+          // ならない。HOLD中のrecordは「今は安全に保存完了と確認できない」状態であり、
+          // 特にRegistry baseline未確立＋Registry absentの新規recordは、この時点で
+          // Vault（旧）側のどこにもMarkdownとして存在しない可能性がある。この直後の
+          // clearMemoryData()はIndexedDBを無条件に全クリアするため、HOLD中のまま
+          // 切替を進めると、そのrecordが永久に失われる（実機で確認済みの重大なデータ
+          // 喪失経路）。failedCount・heldCountのいずれか一方でも0より大きい限り、
+          // 切替（＝この先のclearMemoryData()）へは絶対に進まない。
+          //
+          // 優先順位：真の書き込み失敗（failedCount）がある場合は、従来通り
+          // 「保存に失敗した」という文言（"flush-failed"）を優先する。failedCountが
+          // 0でheldCountだけがある場合は、ユーザーが取るべき行動（Vaultを再同期）を
+          // 案内できる専用の"held"を返す。
           if (flushResult.failedCount > 0) {
             return { status: "flush-failed" };
+          }
+          if (flushResult.heldCount > 0) {
+            return { status: "held" };
           }
 
           // 6. flushPendingToVault自身が積んだ書き込みが完了するまで待つ。
@@ -2057,6 +2091,17 @@ export default function ChatScreen() {
             message: "今のデータの保存に失敗したため、切り替えを中止しました。もう一度お試しください。",
           });
           window.setTimeout(() => setVaultConnectFeedback(null), 4000);
+          return;
+        }
+        if (outcome.status === "held") {
+          // 安全確認（実機不具合の再調査）対応：真の書き込み失敗ではなく、想定された
+          // 安全HOLD（VaultRecordNeedsResyncError）が原因で切替を中止した場合。技術用語
+          // は出さず、ユーザーが取るべき具体的な行動（Vaultを再同期）を案内する。
+          setVaultConnectFeedback({
+            kind: "error",
+            message: "保存先の確認が必要な記録があります。「Vaultを再同期」してから、もう一度お試しください。",
+          });
+          window.setTimeout(() => setVaultConnectFeedback(null), 6000);
           return;
         }
         if (outcome.status === "clear-failed" || outcome.status === "save-handle-failed") {
@@ -2478,6 +2523,11 @@ export default function ChatScreen() {
       // 実際に到達可能で、同一セッション内で再表示されることは無いため、
       // 追加のrefresh処理は不要（次回起動時にhistory-meta.jsonを新たに読み直す）。
       bumpHistoryRefreshToken();
+      // resyncが完了すれば（scan未完了・一部apply失敗があっても）、HOLD中だった
+      // registry-absent/needs-resync recordは基本的にactual pathの確認・更新まで
+      // 済んでいるはずのため、外部変更通知バナーは一旦消す（新たな外部変更を
+      // 検出すれば次回のflushで自然に再度立つ）。
+      setVaultHoldDetected(false);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         // crossTabStale側の既存バナーへ処理を委ねるため、「再同期中…」のまま
@@ -3063,6 +3113,31 @@ export default function ChatScreen() {
             className="shrink-0 rounded-full border border-amber-400/60 px-3 py-1 text-xs transition hover:bg-amber-200/60 dark:border-amber-600/60 dark:hover:bg-amber-900/60"
           >
             再読み込み
+          </button>
+        </div>
+      )}
+      {/*
+        実機不具合対応（原則B）：background/startup flushがVaultRecordNeedsResyncError
+        （Registry baseline未確立のRegistry absent record／外部でMarkdownが移動・編集・
+        削除等された場合、いずれも想定された安全HOLD）を検出した場合のバナー。
+        「Registry」「needs-resync」等の内部用語は出さず、設定への導線だけを示す。
+        無言で「何も起きていないように見える」状態を避けるための最小限の通知（大きな
+        モーダルは出さない）。vaultStatus!=="connected"の間は保存先自体が使えない別の
+        バナーが優先されるため、ここでは出さない。
+        安全確認（実機不具合の再調査）対応：heldCountはbaseline未確立の真に新規な
+        recordでも1件でも外部変更があった場合でも同じ値になり、この2つを区別できない
+        ため、文言は「外部変更を検出した」と断定しない（CASE BQ：baseline未確立の
+        新規Conversationでも外部変更ゼロのままこのバナーが立ちうる）。
+      */}
+      {vaultHoldDetected && vaultStatus === "connected" && (
+        <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
+          <span>保存先の確認が必要です。「Vaultを再同期」すると最新の状態を確認できます。</span>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            className="shrink-0 rounded-full border border-amber-400/60 px-3 py-1 text-xs transition hover:bg-amber-200/60 dark:border-amber-600/60 dark:hover:bg-amber-900/60"
+          >
+            設定を開く
           </button>
         </div>
       )}
@@ -3690,6 +3765,11 @@ export default function ChatScreen() {
             initialMemoryId={historyInitialMemoryId}
             refreshToken={historyRefreshToken}
             sessionCapturedMemories={sessionCapturedMemories}
+            onOpenSettings={() => {
+              setHistoryOpen(false);
+              setHistoryInitialMemoryId(undefined);
+              setSettingsOpen(true);
+            }}
             onClose={() => {
               setHistoryOpen(false);
               setHistoryInitialMemoryId(undefined);

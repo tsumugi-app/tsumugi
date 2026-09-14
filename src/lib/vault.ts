@@ -1564,11 +1564,24 @@ export async function writeMemoryObjectMarkdown(
  * 「IndexedDBをclearしない・別Vaultへ切り替えない」という安全側の判断に使う。
  * `priority`はデフォルト"background"のまま（既存の挙動を変えない）。Vault切替の
  * ユーザー確認直後のような、応答性が求められる文脈からは"interactive"を渡せるようにした。
+ *
+ * `heldCount`（実機不具合対応）：`VaultRecordNeedsResyncError`は、Registry baseline
+ * gate（baselineEstablishedAt）や既存のneeds-resync検出が「外部変更を検出したので
+ * 安全のためこのrecordの書き込みを保留した」ことを示す、想定された安全HOLDであり、
+ * ディスクI/O失敗等の真の異常系（`failedCount`）とは意味が異なる。以前は両者を区別
+ * せず一律`failedCount`へ計上していたため、legacy record（Registry baseline未確立、
+ * または外部で移動されたrecord）が1件でも保留されるだけで、呼び出し元
+ * （Vault切替フロー）が「flush-failed」として保存先変更そのものを丸ごとブロック
+ * してしまう実機不具合があった。HOLDは「そのrecordがIndexedDBに未同期のまま安全に
+ * 残る」だけで実際のデータ喪失は起きないため、`failedCount`から除外し、この専用の
+ * `heldCount`へ計上する（Vaultを再同期すれば解消する、という性質を呼び出し元が
+ * 判別できるようにする）。
  */
 export interface FlushResult {
   totalCount: number;
   writtenCount: number;
   failedCount: number;
+  heldCount: number;
 }
 
 /**
@@ -1599,55 +1612,71 @@ export async function flushPendingToVault(
 
   let writtenCount = 0;
   let failedCount = 0;
+  let heldCount = 0;
   for (const conversation of conversations) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
-      return { totalCount, writtenCount, failedCount };
+      return { totalCount, writtenCount, failedCount, heldCount };
     }
     if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
     try {
       await writeConversationMarkdown(root, conversation, priority);
       writtenCount += 1;
     } catch (error) {
-      failedCount += 1;
-      console.error("[Tsumugi] flush: conversation write failed (will retry on next flush):", error);
+      if (error instanceof VaultRecordNeedsResyncError) {
+        heldCount += 1;
+        console.log("[Vault] flush: conversation write held pending vault resync (expected):", error.message);
+      } else {
+        failedCount += 1;
+        console.error("[Tsumugi] flush: conversation write failed (will retry on next flush):", error);
+      }
     }
   }
   for (const memoryObject of memoryObjects) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
-      return { totalCount, writtenCount, failedCount };
+      return { totalCount, writtenCount, failedCount, heldCount };
     }
     if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
     try {
       await writeMemoryObjectMarkdown(root, memoryObject, priority);
       writtenCount += 1;
     } catch (error) {
-      failedCount += 1;
-      console.error("[Tsumugi] flush: memory write failed (will retry on next flush):", error);
+      if (error instanceof VaultRecordNeedsResyncError) {
+        heldCount += 1;
+        console.log("[Vault] flush: memory write held pending vault resync (expected):", error.message);
+      } else {
+        failedCount += 1;
+        console.error("[Tsumugi] flush: memory write failed (will retry on next flush):", error);
+      }
     }
   }
   for (const source of sources) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
-      return { totalCount, writtenCount, failedCount };
+      return { totalCount, writtenCount, failedCount, heldCount };
     }
     if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
     try {
       await writeSourceMarkdown(root, source, priority);
       writtenCount += 1;
     } catch (error) {
-      failedCount += 1;
-      console.error("[Tsumugi] flush: source write failed (will retry on next flush):", error);
+      if (error instanceof VaultRecordNeedsResyncError) {
+        heldCount += 1;
+        console.log("[Vault] flush: source write held pending vault resync (expected):", error.message);
+      } else {
+        failedCount += 1;
+        console.error("[Tsumugi] flush: source write failed (will retry on next flush):", error);
+      }
     }
   }
 
   const flushDurationMs = Date.now() - flushStart;
   console.log(
-    `[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} failedCount=${failedCount} durationMs=${flushDurationMs}`
+    `[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} failedCount=${failedCount} heldCount=${heldCount} durationMs=${flushDurationMs}`
   );
   logTimingEvent("Vault flush:end", { count: totalCount, writtenCount, durationMs: flushDurationMs });
-  return { totalCount, writtenCount, failedCount };
+  return { totalCount, writtenCount, failedCount, heldCount };
 }
 
 export function isVaultSupported() {
