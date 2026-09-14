@@ -2834,7 +2834,9 @@ function memoryObjectsSemanticEqual(a: MemoryObject, b: MemoryObject): boolean {
   if (a.summary !== b.summary) return false;
   if (a.keywords.length !== b.keywords.length || !a.keywords.every((k, i) => k === b.keywords[i])) return false;
   if ((a.conversationId ?? null) !== (b.conversationId ?? null)) return false;
-  if ((a.topicId ?? null) !== (b.topicId ?? null)) return false;
+  // topicId（Topic Continuity機能）は意図的に比較対象へ含めない：Vault機能は
+  // Topic Continuityに依存してはいけないため（Topic Continuity側が別途commitされた
+  // 際に、必要であればそちら側の変更として比較を追加すべきもの）。
   if (JSON.stringify(a.links) !== JSON.stringify(b.links)) return false;
   if (a.createdAt !== b.createdAt) return false;
   if (a.updatedAt !== b.updatedAt) return false;
