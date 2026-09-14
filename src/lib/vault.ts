@@ -1165,7 +1165,7 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
     const meta = await readVaultRegistryMeta(root);
     const baselineEstablishedAt = meta.baselineEstablishedAt;
     if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(conversation.createdAt, baselineEstablishedAt)) {
-      throw new VaultRecordNeedsResyncError("conversation", registryKey, "needs-resync");
+      throw new VaultRecordNeedsResyncError("conversation", registryKey, "needs-resync", "baseline-not-established");
     }
     fileName = fileNameFor(conversation.id, conversation.startedAt);
     relativePath = `Conversations/${fileName}`;
@@ -1178,7 +1178,7 @@ async function writeConversationMarkdownImpl(root: FileSystemDirectoryHandle, co
     // （旧pathへの自動再作成・外部編集の無条件上書きを防ぐ）。
     await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
   } else {
-    throw new VaultRecordNeedsResyncError("conversation", registryKey, lookup.entry.status);
+    throw new VaultRecordNeedsResyncError("conversation", registryKey, lookup.entry.status, holdReasonFromEntryStatus(lookup.entry.status));
   }
 
   const renderStart = Date.now();
@@ -1251,7 +1251,7 @@ async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: 
     const meta = await readVaultRegistryMeta(root);
     const baselineEstablishedAt = meta.baselineEstablishedAt;
     if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(source.createdAt, baselineEstablishedAt)) {
-      throw new VaultRecordNeedsResyncError("source", registryKey, "needs-resync");
+      throw new VaultRecordNeedsResyncError("source", registryKey, "needs-resync", "baseline-not-established");
     }
     fileName = fileNameFor(source.id, source.createdAt);
     relativePath = `Sources/${fileName}`;
@@ -1263,7 +1263,7 @@ async function writeSourceMarkdownImpl(root: FileSystemDirectoryHandle, source: 
     // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する。
     await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
   } else {
-    throw new VaultRecordNeedsResyncError("source", registryKey, lookup.entry.status);
+    throw new VaultRecordNeedsResyncError("source", registryKey, lookup.entry.status, holdReasonFromEntryStatus(lookup.entry.status));
   }
 
   const renderStart = Date.now();
@@ -1363,7 +1363,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
       const meta = await readVaultRegistryMeta(root);
       const baselineEstablishedAt = meta.baselineEstablishedAt;
       if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(memoryObject.createdAt, baselineEstablishedAt)) {
-        throw new VaultRecordNeedsResyncError("reflection", registryKey, "needs-resync");
+        throw new VaultRecordNeedsResyncError("reflection", registryKey, "needs-resync", "baseline-not-established");
       }
       fileName = fileNameFor(memoryObject.id, memoryObject.date);
       relativePath = `Memories/${fileName}`;
@@ -1375,7 +1375,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
       // Critical/High修正：write前に実ファイルの存在・内容整合性を検証する。
       await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
     } else {
-      throw new VaultRecordNeedsResyncError("reflection", registryKey, lookup.entry.status);
+      throw new VaultRecordNeedsResyncError("reflection", registryKey, lookup.entry.status, holdReasonFromEntryStatus(lookup.entry.status));
     }
 
     const renderStart = Date.now();
@@ -1441,7 +1441,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
     const meta = await readVaultRegistryMeta(root);
     const baselineEstablishedAt = meta.baselineEstablishedAt;
     if (baselineEstablishedAt === null || !(await isMemoryDayContainerAllNew(day, baselineEstablishedAt))) {
-      throw new VaultRecordNeedsResyncError("memory-day", registryKey, "needs-resync");
+      throw new VaultRecordNeedsResyncError("memory-day", registryKey, "needs-resync", "baseline-not-established");
     }
     fileName = dayFileNameFor(memoryObject.date);
     relativePath = `Memories/${fileName}`;
@@ -1456,7 +1456,7 @@ async function writeMemoryObjectMarkdownImpl(root: FileSystemDirectoryHandle, me
     const verifyResult = await verifyVaultRegistryEntryBeforeWrite(root, registryKey, targetDir, fileName, lookup.entry);
     verifiedActualText = verifyResult.actualText;
   } else {
-    throw new VaultRecordNeedsResyncError("memory-day", registryKey, lookup.entry.status);
+    throw new VaultRecordNeedsResyncError("memory-day", registryKey, lookup.entry.status, holdReasonFromEntryStatus(lookup.entry.status));
   }
 
   const existingEntries =
@@ -1582,6 +1582,16 @@ export interface FlushResult {
   writtenCount: number;
   failedCount: number;
   heldCount: number;
+  /**
+   * UX調査対応（HOLD原因の区別）：`heldCount`の内訳。UI側
+   * （`vaultHoldReasons`相当）が「HOLD＝light-checkで見つかる外部変更」と
+   * 誤解しないよう、原因ごとに分けて返す。合計は`heldCount`と一致する。
+   */
+  heldByReason: Record<VaultHoldReason, number>;
+}
+
+function emptyHeldByReason(): Record<VaultHoldReason, number> {
+  return { "baseline-not-established": 0, "needs-resync": 0, missing: 0, conflict: 0 };
 }
 
 /**
@@ -1613,10 +1623,11 @@ export async function flushPendingToVault(
   let writtenCount = 0;
   let failedCount = 0;
   let heldCount = 0;
+  const heldByReason = emptyHeldByReason();
   for (const conversation of conversations) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
-      return { totalCount, writtenCount, failedCount, heldCount };
+      return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
     if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
     try {
@@ -1625,6 +1636,7 @@ export async function flushPendingToVault(
     } catch (error) {
       if (error instanceof VaultRecordNeedsResyncError) {
         heldCount += 1;
+        heldByReason[error.holdReason] += 1;
         console.log("[Vault] flush: conversation write held pending vault resync (expected):", error.message);
       } else {
         failedCount += 1;
@@ -1635,7 +1647,7 @@ export async function flushPendingToVault(
   for (const memoryObject of memoryObjects) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
-      return { totalCount, writtenCount, failedCount, heldCount };
+      return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
     if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
     try {
@@ -1644,6 +1656,7 @@ export async function flushPendingToVault(
     } catch (error) {
       if (error instanceof VaultRecordNeedsResyncError) {
         heldCount += 1;
+        heldByReason[error.holdReason] += 1;
         console.log("[Vault] flush: memory write held pending vault resync (expected):", error.message);
       } else {
         failedCount += 1;
@@ -1654,7 +1667,7 @@ export async function flushPendingToVault(
   for (const source of sources) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
-      return { totalCount, writtenCount, failedCount, heldCount };
+      return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
     if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
     try {
@@ -1663,6 +1676,7 @@ export async function flushPendingToVault(
     } catch (error) {
       if (error instanceof VaultRecordNeedsResyncError) {
         heldCount += 1;
+        heldByReason[error.holdReason] += 1;
         console.log("[Vault] flush: source write held pending vault resync (expected):", error.message);
       } else {
         failedCount += 1;
@@ -1676,7 +1690,7 @@ export async function flushPendingToVault(
     `[Vault] flush:end count=${totalCount} writtenCount=${writtenCount} failedCount=${failedCount} heldCount=${heldCount} durationMs=${flushDurationMs}`
   );
   logTimingEvent("Vault flush:end", { count: totalCount, writtenCount, durationMs: flushDurationMs });
-  return { totalCount, writtenCount, failedCount, heldCount };
+  return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
 }
 
 export function isVaultSupported() {
@@ -2374,6 +2388,25 @@ async function writeVaultRegistryMeta(root: FileSystemDirectoryHandle, meta: Vau
 // ---------------------------------------------------------------------------
 
 /**
+ * UX調査対応（HOLD原因の区別）：`VaultRecordNeedsResyncError.status`だけでは、
+ * 「Registry entryが元から存在しない（baseline未確立、またはbaseline以前の
+ * legacy record）」場合と「Registry entryは存在するがstatus="needs-resync"」の
+ * 場合を区別できない（どちらも`status`は同じ"needs-resync"文字列になる——
+ * 前者はentryが無いため実際には格納されたstatus値ではなく、呼び出し元が
+ * 便宜上"needs-resync"を渡しているだけ）。UI（`vaultHoldReasons`相当）が
+ * 「HOLD＝light-checkで見つかる外部変更」と誤解しないよう、この4値で
+ * 原因を明示的に区別する。既存のwrite可否判定・書き込み保留の条件（いつthrowするか）
+ * は一切変更しない——この型・fieldは診断用の追加情報のみ。
+ */
+export type VaultHoldReason = "baseline-not-established" | "needs-resync" | "missing" | "conflict";
+
+/** Registry entryが実在する場合（status!=="ok"でthrowする分岐）専用。"ok"はこの
+ *  分岐に到達しない想定だが、型上の安全側fallbackとして"needs-resync"を返す。 */
+function holdReasonFromEntryStatus(status: VaultRegistryStatus): VaultHoldReason {
+  return status === "ok" ? "needs-resync" : status;
+}
+
+/**
  * 既存recordへの書き込みが、registry上"needs-resync"/"missing"/"conflict"の
  * いずれかで保留された場合にthrowする専用例外。呼び出し元（enqueueVaultWrite経由の
  * write関数）はこれを他のI/Oエラーと同様に一切catchせず、そのまま呼び出し元
@@ -2385,8 +2418,9 @@ export class VaultRecordNeedsResyncError extends Error {
   readonly recordType: VaultRegistryRecordType;
   readonly registryKey: string;
   readonly status: VaultRegistryStatus;
+  readonly holdReason: VaultHoldReason;
 
-  constructor(recordType: VaultRegistryRecordType, registryKey: string, status: VaultRegistryStatus) {
+  constructor(recordType: VaultRegistryRecordType, registryKey: string, status: VaultRegistryStatus, holdReason: VaultHoldReason) {
     super(
       `[Tsumugi] vault write held: ${recordType} "${registryKey}" is "${status}" in the vault registry; ` +
         `refusing to write until a Vault resync resolves it (no automatic recreation at the old/deterministic path).`
@@ -2395,6 +2429,7 @@ export class VaultRecordNeedsResyncError extends Error {
     this.recordType = recordType;
     this.registryKey = registryKey;
     this.status = status;
+    this.holdReason = holdReason;
   }
 }
 
@@ -2593,7 +2628,7 @@ async function verifyVaultRegistryEntryBeforeWrite(
     file = await fileHandle.getFile();
   } catch {
     await markVaultRegistryNeedsResync(root, registryKey);
-    throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync");
+    throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync", "needs-resync");
   }
 
   if (file.lastModified === entry.mtime && file.size === entry.size) {
@@ -2607,7 +2642,7 @@ async function verifyVaultRegistryEntryBeforeWrite(
   }
 
   await markVaultRegistryNeedsResync(root, registryKey);
-  throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync");
+  throw new VaultRecordNeedsResyncError(entry.recordType, registryKey, "needs-resync", "needs-resync");
 }
 
 // ---------------------------------------------------------------------------

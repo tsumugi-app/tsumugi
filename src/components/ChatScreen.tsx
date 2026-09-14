@@ -21,6 +21,7 @@ import {
   restoreVaultHandle,
   resyncVaultRegistry,
   waitForVaultWrites,
+  type VaultHoldReason,
   type VaultLightCheckClassifyResult,
   type VaultLightCheckDiscoveryResult,
   type VaultRestoreResult,
@@ -164,15 +165,18 @@ export type VaultResyncFeedback = {
 /**
  * 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。起動時のbackground
  * チェック（Level 1/2）で候補が1件以上見つかった場合のみ"candidates-found"に
- * なり、Settingsに「外部で変更されたファイルがあります」を表示する。
+ * なり、Settingsに「外部の変更があります」を表示する。
  * 「確認する」でLevel 3（candidateのみの本文read＋分類）を実行し"classified"へ、
  * 「変更を反映」でLevel 4（apply直前の再検証＋candidateのみapply）を実行し
  * "applied"へ進む。既存の`resyncVaultRegistry`（full resync）は一切呼ばない
  * ため、baselineEstablishedAt/lastFullResyncAtはこのフローからは更新されない。
- * candidate件数（"candidates-found"のcount）は実際の変更件数ではなく、
- * Level 1/2段階で読める範囲の粗い候補数であることに注意（move等は複数
- * candidateに分かれうる）——そのためこの件数自体はユーザーへ表示しない設計とし、
- * 行の表示可否（0件かどうか）の判定にのみ使う。
+ * 調査対応：candidate件数（"candidates-found"のcount）は実際の変更件数ではなく、
+ * Level 1/2段階で読める範囲の粗いraw candidate数であることを確認済み
+ * （move 1件がmissing+unknownの2 candidateに分かれる、Tsumugi管理外の
+ * Markdownもunknown candidateに含まれる等）——そのためこの件数はユーザーへ
+ * 一切表示しない（SettingsPanel.tsx側も数値を出さない）。行の表示可否
+ * （0件かどうか）の判定にのみ使う。正確な内訳は"classified"（Level 3の
+ * 分類結果）でのみ表示する。
  *
  * 安全性レビュー対応（M1/M3）："checking"はLevel 1/2（起動時の自動実行、または
  * 「もう一度確認する」による手動再実行）が進行中の状態。"partial"はapplyが
@@ -463,19 +467,25 @@ export default function ChatScreen() {
   /** 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。詳細は`VaultLightCheckStatus`参照。 */
   const [vaultLightCheckStatus, setVaultLightCheckStatus] = useState<VaultLightCheckStatus>({ kind: "idle" });
   /**
-   * 実機不具合対応：background/startup flushが`VaultRecordNeedsResyncError`
-   * （Registry baseline未確立のRegistry absent record、または外部でMarkdownが
-   * 移動・編集・削除された等の理由でRegistryが安全のため書き込みを保留した、
-   * いずれも想定されたHOLD）を1件でも検出した場合にtrueにする。安全確認（実機
-   * 不具合の再調査）対応：どちらの理由でHOLDされたかはこのstate単体からは
-   * 区別できないため、「外部変更を検出した」と断定する文言には使わない（表示
-   * 文言は「保存先の確認が必要」という中立的な表現に留める）。無言で「何も
-   * 起きていないように見える」ことを避けるため、画面上部の控えめなバナーで
-   * 「設定から『Vaultを再同期』してください」と案内する（大きなモーダルは出さない）。
-   * 再同期が完了した時点で楽観的にfalseへ戻す（新たなHOLDを検出すれば、次回の
-   * flushで自然に再度trueになる）。
+   * UX調査対応（HOLD原因の区別）：background/startup flushが
+   * `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
+   * いる状態——外部で見つかった変更ではない）を1件でも検出した場合、原因別の
+   * 件数をここへ保持する（`vault.ts`の`VaultHoldReason`＝
+   * "baseline-not-established"｜"needs-resync"｜"missing"｜"conflict"）。
+   * 検出が無ければnull。
+   *
+   * 重要：これは軽量「外部の変更」検知フロー（`vaultLightCheckStatus`）とは
+   * 完全に別の仕組みであり、混ぜない——HOLDは「Tsumugi側の保存が保留中」、
+   * light-checkは「Vault側で外部変更が見つかった」であり、原因も解消方法も
+   * 異なる。特に"baseline-not-established"は、light-check（Level 1〜4）では
+   * 解消できない（baselineEstablishedAtを設定できるのはfull resyncだけ）。
+   * この画面には現時点でHOLDを解消する操作ボタンを置かない（原因と安全な
+   * 解消方法が確定するまで、誤った導線を作らないため）。IndexedDB側の記録は
+   * HOLD中も変更されず、会話の継続・記憶へのアクセスには影響しない
+   * （`markVaultSynced`が呼ばれず「未同期」のまま残るだけで、次回flushで
+   * 自然に再試行される）。
    */
-  const [vaultHoldDetected, setVaultHoldDetected] = useState(false);
+  const [vaultHoldReasons, setVaultHoldReasons] = useState<Record<VaultHoldReason, number> | null>(null);
   /**
    * Android実機不具合対応：「Vaultを再同期」が`vaultResyncFeedback.kind==="busy"`
    * のまま一定時間（`RESYNC_TAKING_LONG_MS`）続いた場合にtrueにする。File System
@@ -944,7 +954,7 @@ export default function ChatScreen() {
       }
       try {
         const flushResult = await withVaultWorldRead(() => flushPendingToVault(handle, "background", controller.signal));
-        if (flushResult.heldCount > 0) setVaultHoldDetected(true);
+        setVaultHoldReasons(flushResult.heldCount > 0 ? flushResult.heldByReason : null);
       } catch (error) {
         if (!handleStaleVaultTabError(error)) {
           console.error("[Tsumugi] background vault flush failed (will retry on next flush):", error);
@@ -982,15 +992,25 @@ export default function ChatScreen() {
    * "idle"のまま、Settingsには何も表示されない）。
    */
   /**
-   * `announce`（安全性レビュー対応・M3）：起動時の自動実行（`false`、既定）は、
-   * 候補が見つかるまでUIに一切触れない（従来通り）。「もう一度確認する」
-   * からの手動再実行（`true`）は、開始直後に`"checking"`を表示し、ユーザーへ
-   * 「今まさにやり直している」ことを伝える。
+   * 実機不具合対応（外部変更UX修正）：起動直後のHOLD通知（`vaultHoldReasons`）等、
+   * Settings外の通知がlight-checkの完了より先に表示されるケースがあっても、
+   * Settingsを開けば必ず「今まさに確認している」ことが分かるよう、
+   * `announce`の値に関わらず開始直後に`"checking"`を表示する（以前は
+   * announce===trueの手動再実行時にしか表示していなかった。これが
+   * 「設定画面を開いても外部の変更○件が出ていなかった」実機報告の一因）。
+   * 候補が0件だった場合も、以前は起動時（announce===false）は状態を一切
+   * 変えず暗黙に"idle"のままにしていたが、"checking"を必ず表示するように
+   * なった以上、完了時も必ず"idle"へ戻す（"checking"のまま残さない）。
+   *
+   * `announce`は、通信/読み取り失敗時にエラーバナーを出すかどうかにのみ残す
+   * ——起動時の一時的な失敗（次回起動時に再試行される）まで毎回エラー表示
+   * すると煩わしいため、起動時はconsole.errorのみに留め、手動再実行時
+   * （「もう一度確認する」）だけエラーを表示する。
    */
   function runVaultLightCheckInBackground(handle: FileSystemDirectoryHandle, announce = false): void {
     if (vaultLightCheckInFlightRef.current) return; // 多重起動防止（レビュー修正）
     vaultLightCheckInFlightRef.current = true;
-    if (announce) setVaultLightCheckStatus({ kind: "checking" });
+    setVaultLightCheckStatus({ kind: "checking" });
     const endTask = beginMemoryTask();
     // 安全性レビュー対応（H2）：discovery開始時点のVault世代を記録する。
     const generation = vaultGenerationRef.current;
@@ -1002,7 +1022,7 @@ export default function ChatScreen() {
         if (count > 0) {
           vaultLightCheckDiscoveryRef.current = { discovery, generation };
           setVaultLightCheckStatus({ kind: "candidates-found", count });
-        } else if (announce) {
+        } else {
           setVaultLightCheckStatus({ kind: "idle" });
         }
       } catch (error) {
@@ -1010,6 +1030,8 @@ export default function ChatScreen() {
         console.error("[Tsumugi] background vault light check failed (will retry on next launch):", error);
         if (announce) {
           setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
+        } else {
+          setVaultLightCheckStatus({ kind: "idle" });
         }
       } finally {
         endTask();
@@ -1516,7 +1538,7 @@ export default function ChatScreen() {
         // IndexedDBを上書きしてしまう恐れがあるため必ず先に実行する。
         try {
           const flushResult = await flushPendingToVault(result.handle);
-          if (flushResult.heldCount > 0) setVaultHoldDetected(true);
+          setVaultHoldReasons(flushResult.heldCount > 0 ? flushResult.heldByReason : null);
         } catch (error) {
           console.error("Failed to flush pending vault writes on startup", error);
         }
@@ -2245,10 +2267,12 @@ export default function ChatScreen() {
         if (outcome.status === "held") {
           // 安全確認（実機不具合の再調査）対応：真の書き込み失敗ではなく、想定された
           // 安全HOLD（VaultRecordNeedsResyncError）が原因で切替を中止した場合。技術用語
-          // は出さず、ユーザーが取るべき具体的な行動（Vaultを再同期）を案内する。
+          // は出さない。「Vaultを再同期」ボタンは通常UIから外したため、その名称を
+          // 案内することはできない——設定内のHOLD fallback導線（vaultHoldReasons）を
+          // 指す中立的な文言にする（UX調査対応）。
           setVaultConnectFeedback({
             kind: "error",
-            message: "保存先の確認が必要な記録があります。「Vaultを再同期」してから、もう一度お試しください。",
+            message: "保存先への反映を保留している記録があります。設定から保存先を確認してから、もう一度お試しください。",
           });
           window.setTimeout(() => setVaultConnectFeedback(null), 6000);
           return;
@@ -2683,23 +2707,41 @@ export default function ChatScreen() {
         ...missingDetails.map((m) => `missing: ${m.registryKey} (${m.recordType}): ${m.previousPath ?? "(no previous path)"}`),
       ];
 
-      setVaultResyncFeedback({
-        kind,
-        message,
-        detail: debugLines.length > 0 ? debugLines.join("\n") : undefined,
-      });
-
       // History Indexはresync engine自身が更新済みのため、HistoryPanel側の
       // 既存refresh経路（refreshToken）を再利用するだけでよい（新しいevent bus・
       // 全体reloadは行わない）。Tree（つむぎの木）は起動時のLaunchTreeScreenのみが
       // 実際に到達可能で、同一セッション内で再表示されることは無いため、
       // 追加のrefresh処理は不要（次回起動時にhistory-meta.jsonを新たに読み直す）。
       bumpHistoryRefreshToken();
-      // resyncが完了すれば（scan未完了・一部apply失敗があっても）、HOLD中だった
-      // registry-absent/needs-resync recordは基本的にactual pathの確認・更新まで
-      // 済んでいるはずのため、外部変更通知バナーは一旦消す（新たな外部変更を
-      // 検出すれば次回のflushで自然に再度立つ）。
-      setVaultHoldDetected(false);
+
+      // UX調査対応（HOLD成功判定の実状態化）：resyncが正常終了したこと自体を
+      // HOLD解消の証拠にしない。missing/conflict/baseline-not-establishedは
+      // resyncが問題無く完了してもHOLD原因が残る場合があることを確認済みのため、
+      // ここでもう一度flushして実際のheldCount/heldByReasonを取得し、それを
+      // truth sourceとして`vaultHoldReasons`へ反映する。`vaultResyncFeedback`は
+      // この再flushが終わるまで"busy"のままにしておく（他のVault操作を
+      // 誤って有効化しないため）。
+      let heldAfterResync: { heldCount: number; heldByReason: Record<VaultHoldReason, number> } | null = null;
+      try {
+        heldAfterResync = await withVaultWorldRead(() => flushPendingToVault(vaultHandle, "interactive"));
+      } catch (reflushError) {
+        if (handleStaleVaultTabError(reflushError)) {
+          setVaultResyncFeedback(null);
+          return;
+        }
+        console.error("Failed to re-check held records after vault resync", reflushError);
+        // 再flush自体が失敗：実測できていないため、vaultHoldReasonsは動かさない
+        // （安全側：誤って「解消した」とみなさない。既存の表示のまま次回flushへ委ねる）。
+      }
+
+      setVaultResyncFeedback({
+        kind,
+        message,
+        detail: debugLines.length > 0 ? debugLines.join("\n") : undefined,
+      });
+      if (heldAfterResync) {
+        setVaultHoldReasons(heldAfterResync.heldCount > 0 ? heldAfterResync.heldByReason : null);
+      }
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         // crossTabStale側の既存バナーへ処理を委ねるため、「再同期中…」のまま
@@ -2847,9 +2889,13 @@ export default function ChatScreen() {
       } else {
         setVaultLightCheckStatus({ kind: "applied" });
       }
-      // 反映によりHOLD状態の一部が解消された可能性があるため楽観的にクリアする
-      // （新たなHOLDがあれば次回のflushで自然に再度立つ、既存vaultHoldDetectedと同じ方針）。
-      setVaultHoldDetected(false);
+      // UX調査対応（HOLD原因の区別）：light-checkとvaultHoldReasons（Tsumugi自身の
+      // 保存保留）は別の仕組みのため、ここでは`vaultHoldReasons`を操作しない
+      // （以前は「反映によりHOLD状態の一部が解消された可能性がある」として楽観的に
+      // falseへ戻していたが、light-check applyがRegistryを更新するのはこのapplyが
+      // 対象にしたcandidateだけであり、HOLDの原因（baseline未確立等）を一般に
+      // 解消するとは限らないため、誤って安心させない）。HOLDの実際の解消有無は
+      // 次回のflushでheldByReasonが正しく再計測される。
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setVaultLightCheckStatus({ kind: "idle" });
@@ -3434,28 +3480,26 @@ export default function ChatScreen() {
         </div>
       )}
       {/*
-        実機不具合対応（原則B）：background/startup flushがVaultRecordNeedsResyncError
-        （Registry baseline未確立のRegistry absent record／外部でMarkdownが移動・編集・
-        削除等された場合、いずれも想定された安全HOLD）を検出した場合のバナー。
-        「Registry」「needs-resync」等の内部用語は出さず、設定への導線だけを示す。
-        無言で「何も起きていないように見える」状態を避けるための最小限の通知（大きな
-        モーダルは出さない）。vaultStatus!=="connected"の間は保存先自体が使えない別の
-        バナーが優先されるため、ここでは出さない。
-        安全確認（実機不具合の再調査）対応：heldCountはbaseline未確立の真に新規な
-        recordでも1件でも外部変更があった場合でも同じ値になり、この2つを区別できない
-        ため、文言は「外部変更を検出した」と断定しない（CASE BQ：baseline未確立の
-        新規Conversationでも外部変更ゼロのままこのバナーが立ちうる）。
+        UX調査対応（HOLD原因の区別）：background/startup flushが
+        `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
+        いる状態）を検出した場合のバナー。「Registry」「needs-resync」「baseline」
+        等の内部用語は出さない。
+        重要：これは軽量「外部の変更」検知フロー（`vaultLightCheckStatus`）とは
+        別の仕組みであり、混同を避けるため誘導文言・ボタンは出さない——
+        以前は「『Vaultを再同期』すると最新の状態を確認できます」→「設定を開く」
+        という、light-check導線とほぼ同じ見た目の誘導になっており、実際には
+        Settings側に対応する「確認する」が無い（light-checkとは無関係）ため、
+        「設定を開いても何も表示されていない」という実機報告の原因になっていた。
+        原因（baseline未確立／needs-resync／missing／conflict）ごとに安全な
+        解消方法が未確定なため、押すと何かが起きるボタンは今回追加しない——
+        静的な状態説明のみ表示する（他の読み取り専用バナー、例：
+        "unsupported-journal-version"と同じパターン）。
+        IndexedDB側の記録はHOLD中も変更されない（`markVaultSynced`が呼ばれず
+        「未同期」のまま残るだけ）ため、会話の継続・記憶へのアクセスは妨げない。
       */}
-      {vaultHoldDetected && vaultStatus === "connected" && (
-        <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
-          <span>保存先の確認が必要です。「Vaultを再同期」すると最新の状態を確認できます。</span>
-          <button
-            type="button"
-            onClick={() => setSettingsOpen(true)}
-            className="shrink-0 rounded-full border border-amber-400/60 px-3 py-1 text-xs transition hover:bg-amber-200/60 dark:border-amber-600/60 dark:hover:bg-amber-900/60"
-          >
-            設定を開く
-          </button>
+      {vaultHoldReasons && vaultStatus === "connected" && (
+        <div className="flex shrink-0 items-center bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
+          <span>保存先への反映を保留している記録があります。</span>
         </div>
       )}
       {/*
@@ -4073,13 +4117,14 @@ export default function ChatScreen() {
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}
             onDeleteData={() => void handleDeleteData()}
-            vaultResyncFeedback={vaultResyncFeedback}
-            vaultResyncTakingLong={vaultResyncTakingLong}
-            onResyncVault={() => void handleResyncVault()}
             vaultLightCheckStatus={vaultLightCheckStatus}
             onConfirmVaultLightCheck={() => void handleConfirmVaultLightCheck()}
             onApplyVaultLightCheck={() => void handleApplyVaultLightCheck()}
             onRetryVaultLightCheck={() => handleRetryVaultLightCheck()}
+            vaultHoldReasons={vaultHoldReasons}
+            vaultResyncFeedback={vaultResyncFeedback}
+            vaultResyncTakingLong={vaultResyncTakingLong}
+            onResolveVaultHold={() => void handleResyncVault()}
           />
         </div>
       )}
