@@ -3146,8 +3146,13 @@ async function handleResyncSingleRecordCandidate(
   const previousEntry = previousPath !== null ? state.previousEntries.get(previousPath) ?? null : null;
 
   if (isDuplicatePath) {
-    // previousPath===nullの場合（真に新規のidが本scan内で複数pathに見つかった）、
-    // 4bがdeterministicなanchorを選べるよう、見つかった全pathを保持する。
+    // Codex監査対応（stale conflict apply防止・known-record duplicate）：
+    // 見つかった全path（previousPathの有無を問わない）を保持する。以前は
+    // previousPath===nullの場合にのみ保持しており、「registry登録済みpath＋
+    // 複数の新規重複path」という3件以上のduplicateでは、observed pathの一部
+    // （state.seenPathsByKeyには実在する）が記録から失われていた。この情報は
+    // apply直前revalidationでのconflict identity確認にのみ使い、conflict
+    // semantics（何がduplicateとして検出されるか）自体は変更していない。
     state.recordsByKey.set(id, {
       registryKey: id,
       recordType: kind,
@@ -3161,7 +3166,7 @@ async function handleResyncSingleRecordCandidate(
       addedIndexedDbEquivalent: null,
       note: "同一idが複数pathに存在します（重複）",
       parsed: record,
-      allObservedPaths: previousPath === null ? [...(state.seenPathsByKey.get(id) ?? [])] : null,
+      allObservedPaths: [...(state.seenPathsByKey.get(id) ?? [])],
     });
     return;
   }
@@ -3235,6 +3240,8 @@ async function handleResyncSingleRecordCandidate(
     // なので、既存のrecords[key]をそのまま維持しつつstatusだけconflictへ倒す
     // （4bはanchor新規作成をしない、既存pathを維持）。
     markVaultResyncSeen(state, id, previousPath);
+    // Codex監査対応（known-record duplicate）：observed pathの一部が失われない
+    // よう、previousPath===nullの場合と同様にここでもallObservedPathsを保持する。
     state.recordsByKey.set(id, {
       registryKey: id,
       recordType: kind,
@@ -3248,7 +3255,7 @@ async function handleResyncSingleRecordCandidate(
       addedIndexedDbEquivalent: null,
       note: "同一idが複数pathに存在します（重複）",
       parsed: record,
-      allObservedPaths: null,
+      allObservedPaths: [...(state.seenPathsByKey.get(id) ?? [])],
     });
     return;
   }
@@ -3337,6 +3344,9 @@ async function handleResyncMemoryDayCandidate(
   const removedMemberIds = [...previousMemberIds].filter((id) => !currentMemberIds.has(id));
 
   if (isDuplicatePath) {
+    // Codex監査対応（known-record duplicate）：previousPathの有無を問わず
+    // observed path集合を保持する（apply直前revalidationのconflict identity
+    // 確認専用。conflict semantics自体は変更しない）。
     state.recordsByKey.set(registryKey, {
       registryKey,
       recordType: "memory-day",
@@ -3350,7 +3360,7 @@ async function handleResyncMemoryDayCandidate(
       addedIndexedDbEquivalent: null,
       note: "同一day-fileが複数pathに存在します（重複）",
       parsed: null,
-      allObservedPaths: previousPath === null ? [...(state.seenPathsByKey.get(registryKey) ?? [])] : null,
+      allObservedPaths: [...(state.seenPathsByKey.get(registryKey) ?? [])],
     });
     return;
   }
@@ -3446,6 +3456,7 @@ async function handleResyncMemoryDayCandidate(
   const oldPathPresence = await targetedCheckMemoryDayStillAt(root, previousPath, day);
   if (oldPathPresence === "present") {
     markVaultResyncSeen(state, registryKey, previousPath);
+    // Codex監査対応（known-record duplicate）：observed path集合を保持する。
     state.recordsByKey.set(registryKey, {
       registryKey,
       recordType: "memory-day",
@@ -3459,7 +3470,7 @@ async function handleResyncMemoryDayCandidate(
       addedIndexedDbEquivalent: null,
       note: "同一day-fileが複数pathに存在します（重複）",
       parsed: null,
-      allObservedPaths: null,
+      allObservedPaths: [...(state.seenPathsByKey.get(registryKey) ?? [])],
     });
     return;
   }
@@ -5223,6 +5234,13 @@ export async function classifyVaultLightCheckCandidates(
  * apply可。ファイルが復活していればstale、権限/I-Oエラー等で確認不能な
  * 場合も安全側でapply禁止にする（「読めなかった」を「存在しない」として
  * 扱わない）。
+ *
+ * conflict outcome（Codex監査対応・stale conflict apply防止）：`applyConflictOutcome`は
+ * 実際にRegistry status="conflict"の設定・conflict anchor作成を行うため、
+ * moved/edited/added/missingと同様にapply直前の再検証が必要。既存の
+ * classification本体（`processVaultResyncCandidate`）を対象pathへ再度通し、
+ * 「現在も同じ対象・同じpath関係・同じ理由でconflictが成立しているか」を
+ * 判定する（詳細は`reverifyConflictCandidateBeforeApply`参照）。
  */
 export interface VaultLightCheckStaleCandidate {
   registryKey: string;
@@ -5233,7 +5251,10 @@ export interface VaultLightCheckStaleCandidate {
     | "ledger-changed"
     | "indexeddb-changed"
     | "missing-file-restored"
-    | "missing-unconfirmed";
+    | "missing-unconfirmed"
+    | "conflict-resolved"
+    | "conflict-changed"
+    | "conflict-unconfirmed";
 }
 
 /** H1：classification時点のIndexedDB snapshotと現在値を、recordTypeに応じた
@@ -5267,6 +5288,285 @@ async function reverifyMissingCandidateBeforeApply(
   }
 }
 
+/** 1pathの現在の識別結果（純粋関数、共有stateに依存しない）。conflict
+ *  revalidationでのidentity確認専用に使う。 */
+type VaultLightCheckPathIdentity =
+  | { status: "absent" }
+  | { status: "not-tsumugi" }
+  | { status: "unconfirmed" }
+  | { status: "identified"; registryKey: string };
+
+/**
+ * Codex監査対応（stale conflict apply防止・anchor安全性）：1pathを、既存の
+ * probe（`isLikelyTsumugiFile`）＋parse（`parseTsumugiResyncCandidate`、いずれも
+ * 無変更）だけを使って「現在どのregistryKeyを指しているか」を判定する。
+ * `processVaultResyncCandidate`のような共有state（duplicate検出等）を経由しない
+ * 純粋な1path単位の判定のため、「pathの識別が今も同じregistryKeyのままか」を
+ * 他のpathの状態に影響されずに確認できる。
+ *
+ * `NotFoundError`だけを「確認できた不在」（absent）として扱う。権限/provider/
+ * 一時I-Oエラー、probe失敗、parse失敗（`tsumugi:true`はあるが分類・parse不能）は
+ * すべて`unconfirmed`とする——「読めなかった」を「存在しない」や「変わった」と
+ * 断定しない（M2と同じ原則）。
+ */
+async function identifyVaultPathForConflictRecheck(
+  root: FileSystemDirectoryHandle,
+  path: string
+): Promise<VaultLightCheckPathIdentity> {
+  let file: File;
+  try {
+    const resolved = await resolveVaultRelativePath(root, path);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    file = await fileHandle.getFile();
+  } catch (error) {
+    if (isNotFoundError(error)) return { status: "absent" };
+    return { status: "unconfirmed" };
+  }
+  let likely: boolean;
+  try {
+    likely = await isLikelyTsumugiFile(file);
+  } catch {
+    return { status: "unconfirmed" };
+  }
+  if (!likely) return { status: "not-tsumugi" };
+  let text: string;
+  try {
+    text = await file.text();
+  } catch {
+    return { status: "unconfirmed" };
+  }
+  const candidate = parseTsumugiResyncCandidate(text);
+  if (!candidate) return { status: "unconfirmed" };
+  const registryKey = candidate.kind === "memory-day" ? dayFileRegistryKey(candidate.day) : candidate.id;
+  return { status: "identified", registryKey };
+}
+
+/** conflict中のmember（`outcome==="conflict"`）のid＋内容ハッシュの集合を、
+ *  順序に依存しない署名文字列にする（`classifyResyncMembers`自身が使うのと
+ *  同じ`hashVaultText(memoryObjectToMarkdown(...))`計算を再利用）。member
+ *  除去（`parsed===null`）は固定マーカーで扱う。 */
+function memberConflictSignature(members: VaultResyncMemberResult[] | null): string {
+  return JSON.stringify(
+    (members ?? [])
+      .filter((m) => m.outcome === "conflict")
+      .map((m) => `${m.id}:${m.parsed !== null ? hashVaultText(memoryObjectToMarkdown(m.parsed)) : "(removed)"}`)
+      .sort()
+  );
+}
+
+/** 指定pathのday-fileを独立して読み直し、`classifyResyncMembers`（無変更、
+ *  stateを持たない純粋関数）でmember単位のconflict署名を計算する。読めない・
+ *  Tsumugi形式でない・parse不能・memory-dayでない場合はnullを返す（呼び出し元が
+ *  確認不能として扱う）。 */
+async function memoryDayConflictSignatureAtPath(
+  root: FileSystemDirectoryHandle,
+  path: string,
+  previousMemberHashes: Record<string, string>
+): Promise<string | null> {
+  try {
+    const resolved = await resolveVaultRelativePath(root, path);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    const file = await fileHandle.getFile();
+    if (!(await isLikelyTsumugiFile(file))) return null;
+    const text = await file.text();
+    const candidate = parseTsumugiResyncCandidate(text);
+    if (!candidate || candidate.kind !== "memory-day") return null;
+    const memberResults = await classifyResyncMembers(candidate.members, previousMemberHashes);
+    return memberConflictSignature(memberResults);
+  } catch {
+    return null;
+  }
+}
+
+/** 指定pathのConversation/Reflection/Sourceを独立して読み直し、`hashVaultText`
+ *  （`handleResyncSingleRecordCandidate`が`contentHash`に使うのと同じ計算）を
+ *  返す。読めない場合はnull。 */
+async function singleRecordContentHashAtPath(root: FileSystemDirectoryHandle, path: string): Promise<string | null> {
+  try {
+    const resolved = await resolveVaultRelativePath(root, path);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    const file = await fileHandle.getFile();
+    const text = await file.text();
+    return hashVaultText(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Codex監査対応（stale conflict apply防止）：duplicate系conflict
+ * （`record.allObservedPaths !== null`）専用のapply直前再検証。
+ *
+ * Codex監査対応（順序依存の解消）：以前はduplicateも含め、再検証対象の全path
+ * を1つの共有scan stateへ通して`processVaultResyncCandidate`を繰り返し
+ * 呼んでいたが、「registry既知path＋新規重複path」のような組み合わせでは、
+ * `handleResyncSingleRecordCandidate`内部の`seenPathsByKey`累積・old path
+ * 存在確認の副作用（存在確認できたold pathを暗黙的に「見た」ことにする）が、
+ * 処理順序によって最終的な`recordsByKey`の内容を変えてしまっていた
+ * （duplicateが検出されない、または`currentPath`が処理順序で変わる等）。
+ * 外部変更が一切なくてもこれだけでconflict-changedになりうるため、
+ * duplicate系conflictでは共有stateの再実行を一切使わない。
+ *
+ * Step A（path集合のidentity確認、anchor安全性）：classification時点に
+ * 観測していた全path（`allObservedPaths`）について、
+ * `identifyVaultPathForConflictRecheck`（stateを持たない純粋関数）で現在の
+ * identityを個別に確認する。1件でも`unconfirmed`（確認不能）ならその時点で
+ * 即座に`conflict-unconfirmed`とし、以降の処理・書き込みは一切行わない。
+ * 「現在もrecord.registryKeyを指しているpathの集合」がclassification時点の
+ * 観測path集合と完全一致しない場合（pathが減った・pathのidentityが別のkeyへ
+ * 変わった等）は`conflict-changed`とする——`allObservedPaths`をそのまま
+ * `applyConflictOutcome`のanchor選択（lexicographical最小）へ渡してよいのは、
+ * この完全一致が確認できた場合だけ。
+ *
+ * Step B：Step Aでpath集合のidentityが完全一致していれば、`currentPath`の
+ * 並び順（＝どのpathを最後に処理したか）だけでstaleにしない。代わりに、
+ * Registryの現在の`registryKey→path`ポインタがclassification時点の
+ * `previousPath`と一致すること（純粋な読み取りのみ）、および
+ * `record.currentPath`（L3が実際に記録した固定値、再実行のたびに変わる値では
+ * ない）自身の内容（member署名／contentHash）だけを独立して読み直し、
+ * classification時点の内容と一致するかを確認する。
+ */
+async function reverifyDuplicateConflictBeforeApply(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultLightCheckStaleCandidate | null> {
+  const uniqueOriginalPaths = [...new Set(record.allObservedPaths ?? [])];
+  if (uniqueOriginalPaths.length === 0 || record.currentPath === null) {
+    return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+  }
+
+  // Step A：path集合のidentityを個別に確認する（純粋・順序非依存）。
+  const stillMatchingPaths = new Set<string>();
+  for (const path of uniqueOriginalPaths) {
+    const identity = await identifyVaultPathForConflictRecheck(root, path);
+    if (identity.status === "unconfirmed") {
+      return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+    }
+    if (identity.status === "identified" && identity.registryKey === record.registryKey) {
+      stillMatchingPaths.add(path);
+    }
+    // "absent"（NotFoundErrorで確認できた不在）・"not-tsumugi"・別のregistryKeyへの
+    // 変化はいずれも「安全に確認できた変化」であり、このpathを対象集合から除外する。
+  }
+  const originalPathSet = new Set(uniqueOriginalPaths);
+  if (stillMatchingPaths.size !== originalPathSet.size || [...originalPathSet].some((p) => !stillMatchingPaths.has(p))) {
+    // classification時点のpath集合と、現在も同じidentityを持つpath集合が
+    // 完全一致しない（pathが減った、またはidentityが変わった）。
+    return { registryKey: record.registryKey, reason: "conflict-changed" };
+  }
+
+  // Step B：Registryの現在のポインタと内容（member署名／contentHash）を、
+  // record.currentPath自身について独立して確認する（再実行の副作用に依存しない）。
+  const snapshot = await buildVaultRegistrySnapshot(root);
+  const currentRegistryPath = snapshot.previousByKey.get(record.registryKey) ?? null;
+  if (currentRegistryPath !== record.previousPath) {
+    return { registryKey: record.registryKey, reason: "conflict-changed" };
+  }
+  if (record.recordType === "memory-day") {
+    const previousEntry = record.previousPath !== null ? (snapshot.previousEntries.get(record.previousPath) ?? null) : null;
+    const previousMemberHashes = previousEntry?.memberHashes ?? {};
+    const freshSignature = await memoryDayConflictSignatureAtPath(root, record.currentPath, previousMemberHashes);
+    if (freshSignature === null) {
+      return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+    }
+    if (freshSignature !== memberConflictSignature(record.members)) {
+      return { registryKey: record.registryKey, reason: "conflict-changed" };
+    }
+  } else {
+    const freshHash = await singleRecordContentHashAtPath(root, record.currentPath);
+    if (freshHash === null) {
+      return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+    }
+    if (freshHash !== record.contentHash) {
+      return { registryKey: record.registryKey, reason: "conflict-changed" };
+    }
+  }
+  return null; // 同じpath集合・同じRegistryポインタ・同じ内容：apply可。
+}
+
+/**
+ * Codex監査対応（stale conflict apply防止）：duplicate以外のconflict
+ * （IndexedDB既存内容との不一致／ローカル未flush変更との競合／旧path確認不能等）
+ * 専用のapply直前再検証。`applyConflictOutcome`は実際にRegistry
+ * status="conflict"の設定・conflict anchorの新規作成を行うため（commitを
+ * 伴わない、という以前のコメントは誤りだった）、moved/edited/addedと同様に
+ * apply直前の再検証が必要。
+ *
+ * 対象pathは常に`record.currentPath`の1つだけ（conflict outcomeでは必ず
+ * 非null）。これを空のscan stateへ`processVaultResyncCandidate`（既存
+ * classification本体、無変更）で通し、「今も同じ理由でconflictか」を確認する
+ * （既存のprevious/current比較を維持）。1pathだけを空のstateへ通すため、
+ * duplicate検出の副作用による順序依存は生じない。
+ */
+async function reverifyNonDuplicateConflictBeforeApply(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultLightCheckStaleCandidate | null> {
+  if (record.currentPath === null) {
+    return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+  }
+  const snapshot = await buildVaultRegistrySnapshot(root);
+  const state: VaultResyncScanState = {
+    previousByKey: snapshot.previousByKey,
+    previousEntries: snapshot.previousEntries,
+    previousRegistryKeyByPath: snapshot.previousRegistryKeyByPath,
+    seenPathsByKey: new Map(),
+    seenKnownKeys: new Set(),
+    recordsByKey: new Map(),
+    unreadableFiles: [],
+    scannedFileCount: 0,
+    deadline: Number.POSITIVE_INFINITY,
+    deadlineExceeded: false,
+  };
+  try {
+    const resolved = await resolveVaultRelativePath(root, record.currentPath);
+    const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
+    const file = await fileHandle.getFile();
+    const unreadableCountBefore = state.unreadableFiles.length;
+    await processVaultResyncCandidate(root, state, record.currentPath, file);
+    if (state.unreadableFiles.length > unreadableCountBefore) {
+      return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+    }
+  } catch (error) {
+    // NotFoundErrorであっても、単一pathの再分類自体が成立しなくなっている
+    // （＝対象recordの現在状態を再現できない）ため、安全側で確認不能扱いにする。
+    void error;
+    return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
+  }
+
+  const fresh = state.recordsByKey.get(record.registryKey);
+  if (!fresh || fresh.outcome !== "conflict") {
+    // 現在はconflictが成立していない（解消済み、または別の分類に変わった）。
+    return { registryKey: record.registryKey, reason: "conflict-resolved" };
+  }
+  if (fresh.previousPath !== record.previousPath || fresh.currentPath !== record.currentPath) {
+    return { registryKey: record.registryKey, reason: "conflict-changed" };
+  }
+  if (fresh.contentHash !== record.contentHash) {
+    return { registryKey: record.registryKey, reason: "conflict-changed" };
+  }
+  // noteは補助的な追加確認として使う（一致しないことの検出専用。noteの一致
+  // だけをidentity判定の根拠にはしない——上記の構造的な比較が本体）。
+  if (fresh.note !== record.note) {
+    return { registryKey: record.registryKey, reason: "conflict-changed" };
+  }
+  return null; // 現在も同じ対象・同じpath関係・同じ理由でconflictが成立している：apply可。
+}
+
+/** conflict outcomeのapply直前再検証の入口。duplicate系conflict
+ *  （`allObservedPaths !== null`）とそれ以外を明確に分けて判定する
+ *  （詳細は`reverifyDuplicateConflictBeforeApply`／
+ *  `reverifyNonDuplicateConflictBeforeApply`参照）。 */
+async function reverifyConflictCandidateBeforeApply(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultLightCheckStaleCandidate | null> {
+  if (record.allObservedPaths !== null) {
+    return reverifyDuplicateConflictBeforeApply(root, record);
+  }
+  return reverifyNonDuplicateConflictBeforeApply(root, record);
+}
+
 async function reverifyVaultLightCheckCandidateBeforeApply(
   root: FileSystemDirectoryHandle,
   record: VaultResyncRecordResult,
@@ -5275,8 +5575,11 @@ async function reverifyVaultLightCheckCandidateBeforeApply(
   if (record.outcome === "missing") {
     return reverifyMissingCandidateBeforeApply(root, record);
   }
+  if (record.outcome === "conflict") {
+    return reverifyConflictCandidateBeforeApply(root, record);
+  }
   if (record.outcome !== "moved" && record.outcome !== "edited" && record.outcome !== "added") {
-    // conflict/unchanged/unreadableはMarkdown本体・IndexedDB・registry"ok"の
+    // unchanged/unreadableはMarkdown本体・IndexedDB・registry"ok"の
     // commitを一切伴わないため、apply前再検証は不要。
     return null;
   }

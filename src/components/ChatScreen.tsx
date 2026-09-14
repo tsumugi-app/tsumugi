@@ -1986,6 +1986,11 @@ export default function ChatScreen() {
         // Android Vault問題（「保存先を変更」ボタン無反応）対応：flush完了を
         // ここでawaitしない（flushPendingToVaultInBackgroundのコメント参照）。
         flushPendingToVaultInBackground(newHandle);
+        // 実機不具合対応（light-check開始漏れ）：この分岐は同じVaultの再選択
+        // （Memory World切替ではない＝vaultGenerationRefは進めていない）だが、
+        // connectedへ確定した以上、startup connected経路と同じくlight-checkを
+        // 開始する（安全条件は`runVaultLightCheckInBackground`内部のものと同一）。
+        runVaultLightCheckInBackground(newHandle);
         return;
       }
 
@@ -2275,6 +2280,15 @@ export default function ChatScreen() {
         resetMemoryWorldState();
         setVaultHandle(newHandle);
         setVaultStatus("connected");
+        // 実機不具合対応（light-check開始漏れ）：world reset・新handle commit・
+        // generation確定（`vaultGenerationRef.current += 1`は上の排他ロック内、
+        // clearMemoryData()の直前で既に行われている）が完了した、この時点で
+        // だけ新Vaultに対するlight-checkを開始する。旧Vaultのlight-check結果が
+        // 新Vaultへ混入しないことは、`runVaultLightCheckInBackground`内部の
+        // generation capture（呼び出し時点の`vaultGenerationRef.current`を記録し、
+        // discovery完了後に不一致なら結果を破棄する）で保証される——ここでは
+        // 単に「新Vaultが確定した後に呼ぶ」ことだけを守ればよい。
+        runVaultLightCheckInBackground(newHandle);
       } finally {
         // 11. 切替ロック解除（成功・中止・例外いずれの経路でも必ず解除する）。
         setIsVaultSwitching(false);
@@ -2422,6 +2436,11 @@ export default function ChatScreen() {
       resetMemoryWorldState();
       setVaultHandle(outcome.handle);
       setVaultStatus("connected");
+      // 実機不具合対応（light-check開始漏れ）：incomplete-switch復旧の成功も
+      // 「別Vaultへの正常切替」と同じ形（world reset・新handle commit・generation
+      // 確定＝この直前の排他ロック内で`vaultGenerationRef.current += 1`済み）
+      // のため、通常のVault切替成功時と同じ箇所でlight-checkを開始する。
+      runVaultLightCheckInBackground(outcome.handle);
       return;
     }
 
@@ -2465,6 +2484,15 @@ export default function ChatScreen() {
       // Android Vault問題（「保存先を変更」ボタン無反応）対応：flush完了を
       // ここでawaitしない（flushPendingToVaultInBackgroundのコメント参照）。
       flushPendingToVaultInBackground(vaultHandle);
+      // 実機不具合対応（light-check開始漏れ）：起動時（applyRestoredHandle）は
+      // flush直後にrunVaultLightCheckInBackground()を呼んでいたが、
+      // needs-permissionからの再許可成功時には呼ばれていなかった。Androidで
+      // 「再許可→flushが旧pathでHOLD→light-check未開始→移動先を探索しない」
+      // という経路が成立していたため、connected確定後にここでも開始する。
+      // 安全条件は起動時の呼び出しと同一（`runVaultLightCheckInBackground`内部の
+      // 多重起動防止・generation capture・世代不一致チェック・共有ロックをそのまま
+      // 再利用、新しい安全機構は追加しない）。
+      runVaultLightCheckInBackground(vaultHandle);
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to reauthorize vault", error);
@@ -2621,13 +2649,39 @@ export default function ChatScreen() {
    * resyncVaultRegistry(vaultHandle)を直接呼び出すところから再構築できる。
    */
 
-
   /**
    * 軽量「外部の変更」検知フロー：「確認する」＝Level 3。起動時（Level 1/2）で
    * 見つかったcandidate（`vaultLightCheckDiscoveryRef`）だけを対象に、既存の
    * classification engineをそのまま使って本文read・分類を行う
    * （`classifyVaultLightCheckCandidates`、vault.ts参照）。Vault全体は読まない。
    * 「Registry」「resync」等の内部用語はここでもUIへ出さない。
+   *
+   * Codex指摘対応（L3安定境界）：`writeConversationMarkdownImpl`等の内部write
+   * （Markdown本体→Registry upsertの順に、`enqueueVaultWrite`の1itemとして
+   * 直列実行される）が進行中にL3がRegistry snapshotを読むと、「新Markdown＋
+   * 旧Registry」という中間状態を「外部編集」と誤認しうる。これを避けるため、
+   * classify本体を呼ぶ直前に、既存primitiveだけで安定境界を作る：
+   *   1. `abortBackgroundFlushAndWait()`（既存、Vault切替直前にも使っている）で
+   *      background flushのループ自体を止め、現在処理中の最大1item分だけ待つ。
+   *   2. `waitForVaultWrites()`（既存、vault.tsのwrite queueを外側から
+   *      ポーリングするだけの軽量関数、Vault切替のfinal flush待機で使用中）で、
+   *      その時点までにenqueueされた全item（実行中の1件を含む）が完了する
+   *      （＝Markdown本体とRegistry upsertの両方が完了する。両者は同一queue
+   *      itemの中で直列に行われるため、queueがdrainした時点で必ず両方済み）
+   *      まで待つ。
+   * この2つはいずれも`withVaultWorldRead`/`runVaultWorldExclusive`等のVault
+   * world lock（"tsumugi-vault-world"）を一切取得・保持しない、ロックの外側での
+   * 待機のため、その後の`withVaultWorldRead`呼び出しとの間でロックの再要求
+   * （自己デッドロックの原因）は発生しない。
+   *
+   * 完全性の限界（正直な開示）：この2手順は「新しいbackground flush」と
+   * 「待機開始時点までにenqueue済みのwrite」を確実に安定させるが、待機完了の
+   * 直後・classify呼び出し直前の一瞬に、ユーザーの別操作（会話送信等）に由来する
+   * 新しいinteractive writeが割り込む可能性そのものはゼロにはできない
+   * （`isVaultSwitchingRef`のような全操作停止フラグは、今回のスコープでは
+   * 「軽い確認操作」に対して過大な副作用となるため使わない）。この残余リスクは
+   * 既存のH1 apply直前再検証（`reverifyVaultLightCheckCandidateBeforeApply`）が
+   * 安全側（stale判定→apply拒否）で吸収する設計のため、致命的ではないと判断した。
    */
   async function handleConfirmVaultLightCheck() {
     const stored = vaultLightCheckDiscoveryRef.current;
@@ -2644,6 +2698,22 @@ export default function ChatScreen() {
     vaultOperationLockRef.current = true;
     setVaultLightCheckStatus({ kind: "classifying" });
     try {
+      // L3安定境界（Codex指摘対応）：classifyへ進む前に、内部writeを安全に
+      // settleさせる。ロックは一切取得しない（ロック外の待機）。
+      await abortBackgroundFlushAndWait();
+      const settle = await waitForVaultWrites(VAULT_SWITCH_SETTLE_TIMEOUT_MS);
+      if (settle.timedOut) {
+        // 書き込みが収まらない：不安定な状態でclassifyへ進まず、エラー表示
+        // して終える（「もう一度確認する」でLevel 1/2からやり直せる）。
+        setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
+        return;
+      }
+      if (generation !== vaultGenerationRef.current) {
+        // 待機中にVaultが切り替わっていた：この候補は今のVaultのものではない。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        return;
+      }
       const result = await withVaultWorldRead(() => classifyVaultLightCheckCandidates(vaultHandle, stored.discovery));
       if (generation !== vaultGenerationRef.current) {
         // classify実行中にVaultが切り替わった：この結果は今のVaultのものではない。
