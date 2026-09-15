@@ -2498,6 +2498,12 @@ interface VaultRegistryLookup {
  * その後の書き込み判断自体は`upsertVaultRegistryRecord`側のlockで直列化される
  * ため実害が無い。同一タブ内では`enqueueVaultWrite`が既にVault書き込みを
  * 1件ずつ直列化している）。
+ *
+ * A1（conflict revalidation）・write経路がそのまま使う、operation間キャッシュを
+ * 持たないシンプルな単一shard lookup。L3 classify専用の判定（found/not-found/
+ * unconfirmedの区別・shard cache）は別途`lookupCurrentRegistryEntryForL3`に
+ * 分離しており、この関数自体には手を加えない（A1/L4のlookup semanticsを
+ * 変更しないため）。
  */
 async function lookupVaultRegistryRecord(root: FileSystemDirectoryHandle, registryKey: string): Promise<VaultRegistryLookup> {
   const bucket = vaultRegistryBucketOf(registryKey);
@@ -4005,6 +4011,20 @@ interface VaultLightCheckLevel1Result {
    *  registryKeyの集合。Level 3のmissing確定で「Level 1が既に存在確認済み」
    *  として除外するために使う。 */
   confirmedPresentKeys: Set<string>;
+  /**
+   * Codexレビュー指摘（A2 M2関連）対応：`confirmedPresentKeys ∪ candidates`は
+   * 「Level 1がsnapshot上で観測した全known key」の完全な分割ではない——
+   * `previousByKey`にkeyがあるのに対応する`previousEntries`が無い（snapshot不整合、
+   * 理論上起こらない想定だが`if (!entry) continue`で実際にスキップされ得る）場合、
+   * そのkeyは`confirmedPresentKeys`にも`candidates`にも入らない。このMapは
+   * そうした「orphan」keyも含め、Level 1がこのsnapshotで見た**全known key→
+   * その時点のpath**をそのまま保持する（`snapshot.previousByKey`を丸ごとコピー
+   * するだけで、追加のI/Oは発生しない）。Level 3のmissing確定は、このMapに
+   * 含まれる全keyを対象にし、かつRegistryの「現在」状態を都度確認することで、
+   * このMapのpath自体が古くても安全側に倒れる（`lookupCurrentRegistryEntryForL3`
+   * 参照）。
+   */
+  allKnownKeys: Map<string, string>;
 }
 
 async function discoverLevel1MetadataCandidates(
@@ -4014,6 +4034,11 @@ async function discoverLevel1MetadataCandidates(
   const level1Start = Date.now();
   const candidates: VaultLightCheckKnownPathCandidate[] = [];
   const confirmedPresentKeys = new Set<string>();
+  // Codexレビュー指摘（A2 M2関連）対応：orphan key（下記`if (!entry) continue`で
+  // スキップされるkey）も含め、Level 1がこのsnapshotで見た全known keyのpathを
+  // そのまま保持する。`snapshot.previousByKey`は既にメモリ上にあるMapなので、
+  // コピーのみで追加I/Oは発生しない。
+  const allKnownKeys = new Map<string, string>(snapshot.previousByKey);
   // 実機不具合対応（Android性能改善）：既知recordの多くが同じConversations/
   // Memories/Sourcesディレクトリを共有するため、このLevel 1実行1回の間だけ
   // ディレクトリハンドルを使い回す。この関数のローカル変数のため、関数を抜ければ
@@ -4055,7 +4080,7 @@ async function discoverLevel1MetadataCandidates(
     durationMs: Date.now() - level1Start,
   });
 
-  return { candidates, confirmedPresentKeys };
+  return { candidates, confirmedPresentKeys, allKnownKeys };
 }
 
 /**
@@ -4176,6 +4201,24 @@ export interface VaultLightCheckDiscoveryResult {
   level2SeenKnownKeys: Set<string>;
   level2Completed: boolean;
   checkedAt: string;
+  /**
+   * 実機不具合対応（Android性能改善・A2）：Level 1が既に存在確認まで完了した
+   * （＝getFileHandle/getFileに成功し、mtime/sizeもRegistry記載値と一致した）
+   * registryKeyの集合。`discoverLevel1MetadataCandidates`が内部で計算している
+   * `confirmedPresentKeys`をそのままここへ伝播するだけで、新たな計算・新たな
+   * I/Oは発生しない。L3（`classifyVaultLightCheckCandidates`）が、Level 1/2
+   * 終了後に改めてRegistry全体を読み直さずにmissing確定判定を行うために使う。
+   *
+   * Codexレビュー指摘対応：`confirmedPresentKeys ∪ metadataChangedCandidates ∪
+   * missingPathCandidates ∪ readFailedCandidates`は「全known key」の完全な
+   * 分割ではない（`allKnownKeys`のコメント参照、snapshot不整合でどちらにも
+   * 入らないkeyがあり得る）。「全known key集合」が必要な場面では
+   * `allKnownKeys`を使うこと。
+   */
+  confirmedPresentKeys: Set<string>;
+  /** `discoverLevel1MetadataCandidates`の`allKnownKeys`をそのまま伝播する
+   *  （詳細はそちらのコメント参照）。追加I/Oは発生しない。 */
+  allKnownKeys: Map<string, string>;
 }
 
 export async function performVaultLightCheckDiscovery(
@@ -4197,6 +4240,8 @@ export async function performVaultLightCheckDiscovery(
     level2SeenKnownKeys: level2.seenKnownKeys,
     level2Completed: level2.completed,
     checkedAt: new Date().toISOString(),
+    confirmedPresentKeys: level1.confirmedPresentKeys,
+    allKnownKeys: level1.allKnownKeys,
   };
 }
 
@@ -5240,15 +5285,273 @@ export interface VaultLightCheckClassifyResult {
   };
 }
 
+/**
+ * Codexレビュー指摘（M2・再レビューMedium）対応：L3専用のRegistry shard
+ * **生の**読み込み結果。「物理的に何が起きたか」（正常read／shard file自体が
+ * NotFound／その他I-O・JSON失敗）だけを表し、「あるregistryKeyについて
+ * not-found/unconfirmedのどちらと解釈すべきか」という意味づけは含まない
+ * ——同じbucketに対する生の読み取り結果は1回のL3実行内で使い回してよいが、
+ * 「shard file自体がNotFound」を"not-found"と断定してキャッシュへ焼き込んで
+ * しまうと、後から「実はL1でこのbucketにrecordが実在した」ことが分かった
+ * 別のregistryKeyの解釈まで誤って引きずってしまう（同じbucketでも、
+ * registryKeyごとにL1時点で既知だったかどうかは異なり得るため）。そのため
+ * cacheには常にこの生の結果だけを保持し、意味づけは
+ * `lookupCurrentRegistryEntryForL3`側でregistryKeyごとに行う。
+ *
+ * 既存`readVaultRegistryShard`（write経路・A1が使う）は「shardが無い／
+ * registryKeyが無い／I-O失敗／JSON破損」の**いずれも**区別せず空shardへ
+ * fallbackする。A1（conflict revalidation）にとっては、この空shard fallbackが
+ * `currentRegistryPath !== record.previousPath`等の不一致判定を経由して
+ * 「conflict-changed」等の非apply側outcomeへ倒れるため安全に機能する
+ * （Codexレビュー指摘・Low対応：以前のコメントは「結果は必ず非apply側へ倒れる」
+ * と断定していたが、これはA1の2関数の呼び出され方に限った話であり、write経路
+ * （`writeConversationMarkdownImpl`等）が同じ空shard fallbackを受け取った場合は
+ * 「Registry absent」＝真の新規record候補として扱われ、baseline gateを経て
+ * 実際に書き込みへ進み得るため、一般に「必ず非apply側」とは言えない。ここでの
+ * 主張はA1文脈に限定する）。missing確定のように「本当に居ないと確認できたか」
+ * を要する場面では、I-O失敗を「registryKeyが存在しない」と誤認するリスクになる。
+ * 既存の`readVaultRegistryShard`/`lookupVaultRegistryRecord`自体は一切変更
+ * していない（A1/L4/write経路は従来通りそちらを使う）。
+ */
+type VaultRegistryShardRawResultL3 =
+  | { status: "found"; shard: VaultRegistryShard }
+  | { status: "shard-file-not-found" }
+  | { status: "unconfirmed" };
+
+async function readVaultRegistryShardForL3(root: FileSystemDirectoryHandle, bucket: number): Promise<VaultRegistryShardRawResultL3> {
+  let registryDir: FileSystemDirectoryHandle;
+  try {
+    const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+    registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: false });
+  } catch (error) {
+    // `.tsumugi`/`.tsumugi/registry`自体が無い場合も含め、ここでの失敗は
+    // 「本当にRegistryが未確立」なのか「一時的なI-O問題」なのか区別できない
+    // ため、安全側で"unconfirmed"とする（意味づけ側がfail-closedに倒す）。
+    void error;
+    return { status: "unconfirmed" };
+  }
+  const fileName = vaultRegistryBucketFileName(bucket);
+  // Codexレビュー指摘（再レビューMedium 1）対応：`getFileHandle`と`getFile`を
+  // 別々のtry/catchに分離する。「shard fileという名前のエントリ自体が無い」と
+  // 確認できるのは`getFileHandle`のNotFoundErrorだけであり、これが
+  // 「そのbucketに一度もrecordが無かった」ことを意味するか「L1→L3間でshard
+  // 自体が消えた」ことを意味するかは、ここでは判断しない（`wasKnownAtL1`を
+  // 使う`lookupCurrentRegistryEntryForL3`側の責務）。一方、`getFileHandle`が
+  // 成功した後の`getFile`失敗（ファイルは存在するが読み取り自体に失敗した等）
+  // は、shard fileの不存在を意味しないため、NotFoundErrorであっても
+  // 無条件に"unconfirmed"とする——「エントリが見つからない」ことと「見つかった
+  // エントリを読めない」ことを混同しない。
+  let fileHandle: FileSystemFileHandle;
+  try {
+    fileHandle = await registryDir.getFileHandle(fileName, { create: false });
+  } catch (error) {
+    return isNotFoundError(error) ? { status: "shard-file-not-found" } : { status: "unconfirmed" };
+  }
+  let file: File;
+  try {
+    file = await fileHandle.getFile();
+  } catch (error) {
+    void error;
+    return { status: "unconfirmed" };
+  }
+  try {
+    const text = await file.text();
+    return { status: "found", shard: JSON.parse(text) as VaultRegistryShard };
+  } catch (error) {
+    // 読めたがJSON parseに失敗＝壊れている可能性。「空（＝居ない）」と
+    // 断定せず"unconfirmed"にする。
+    void error;
+    return { status: "unconfirmed" };
+  }
+}
+
+async function getVaultRegistryShardRawForL3Cached(
+  root: FileSystemDirectoryHandle,
+  bucket: number,
+  shardCache: Map<number, VaultRegistryShardRawResultL3>
+): Promise<VaultRegistryShardRawResultL3> {
+  const cached = shardCache.get(bucket);
+  if (cached !== undefined) return cached;
+  const raw = await readVaultRegistryShardForL3(root, bucket);
+  shardCache.set(bucket, raw);
+  return raw;
+}
+
+/**
+ * Codexレビュー指摘（再レビューMedium 2）対応：`lookupCurrentRegistryEntryForL3`の
+ * `found`/`not-found`/`unconfirmed`のうち、呼び出し元が安全に判断を下せるよう
+ * `prefetchRegistryEntryIntoState`が返す結果の型。「見つからなかった」だけを
+ * 表す旧来の戻り値（`void`）では、呼び出し元が"not-found"（＝通常のnew record
+ * classificationへ進んでよい）と"unconfirmed"（＝Registry状態を確認できず
+ * 進めてはいけない）を区別できなかった。
+ */
+type VaultRegistryLookupOutcomeL3 = "found" | "not-found" | "unconfirmed";
+
+/**
+ * 実機不具合対応（Android性能改善・A2）：L3 candidateのregistryKey 1件分を、
+ * `lookupCurrentRegistryEntryForL3`（bucket計算→単一shard読み、`shardCache`
+ * 経由で同一bucketの重複readを避ける）で解決し、`state.previousByKey`/
+ * `state.previousEntries`へ反映する。`processVaultResyncCandidate`（無変更）が
+ * 内部で行う`state.previousByKey.get(id)`/`state.previousEntries.get(path)`が、
+ * 全shardを読んだ場合と同じ値を返せるようにするための事前読み込みであり、
+ * 分類ロジック自体には一切関与しない。
+ *
+ * `wasKnownAtL1`：このregistryKeyがLevel 1時点の`discovery.allKnownKeys`に
+ * 存在していたか（呼び出し元が`discovery.allKnownKeys.has(registryKey)`から
+ * 判断して渡す）。shard file NotFoundの意味づけに使う（詳細は
+ * `lookupCurrentRegistryEntryForL3`参照）。
+ *
+ * Codexレビュー指摘（再レビューMedium 2）対応：戻り値を`void`から
+ * `VaultRegistryLookupOutcomeL3`へ変更した。以前は"not-found"（＝正常な
+ * 「Registryに存在しない」）と"unconfirmed"（＝Registry状態を確認できない）を
+ * 呼び出し元が区別できず、いずれの場合も`state`へ何も反映しないまま
+ * `processVaultResyncCandidate`へ進んでいた。これは"unconfirmed"のケースで
+ * 「確認できないだけ」のrecordを無条件に`previousPath === null`扱い（＝新規/
+ * 通常classification対象）へ進めてしまう安全上の問題があった。呼び出し元
+ * （`classifyVaultLightCheckCandidates`内の4 candidate loop）は、この戻り値が
+ * "unconfirmed"の場合、`processVaultResyncCandidate`を呼ばず安全側に倒す。
+ */
+async function prefetchRegistryEntryIntoState(
+  root: FileSystemDirectoryHandle,
+  state: VaultResyncScanState,
+  registryKey: string,
+  wasKnownAtL1: boolean,
+  shardCache: Map<number, VaultRegistryShardRawResultL3>
+): Promise<VaultRegistryLookupOutcomeL3> {
+  if (state.previousByKey.has(registryKey)) return "found"; // 既にprefetch済み。
+  const current = await lookupCurrentRegistryEntryForL3(root, registryKey, wasKnownAtL1, shardCache);
+  if (current.status !== "found") return current.status;
+  state.previousByKey.set(registryKey, current.path);
+  state.previousEntries.set(current.path, current.entry);
+  return "found";
+}
+
+/**
+ * Codexレビュー指摘（再レビューMedium 2）対応：あるcandidateについて、実際に
+ * classificationの対象となる本文identityのRegistry状態が"unconfirmed"だった
+ * 場合に呼ぶ。既存の`unreadableFiles`（確認不能ファイルの表現として既にある
+ * 語彙）へ計上し、新しいclassification typeは追加しない。
+ *
+ * `keys`に渡した各registryKeyは`state.seenKnownKeys`へ追加する——このpathに
+ * 何らかのTsumugi形式のfileが物理的に存在したこと自体は確認できているため
+ * （negative evidence、既存`walkVaultForResync`と同じ原則）、後段のmissing
+ * eliminationがこれらのkeyを「消えた」と誤って再生成しないようにするため。
+ * `state.recordsByKey`へは何も設定しない（＝unchanged/moved/edited/added/
+ * conflictのいずれにも分類しない。次回のlight checkサイクルで再確認される）。
+ */
+function recordUnconfirmedIdentitySkip(state: VaultResyncScanState, path: string, keys: readonly string[]): void {
+  for (const key of keys) {
+    state.seenKnownKeys.add(key);
+  }
+  state.unreadableFiles.push({
+    path,
+    reason: "light check: registry state for this record's actual content identity could not be confirmed",
+  });
+}
+
+/**
+ * 実機不具合対応（Android性能改善・A2）：Level 2が見つけた未知pathは、
+ * ファイル内容を読むまでどのregistryKeyに対応するか分からない。この関数は
+ * 「どのshardをprefetchすべきか」を知るためだけの軽量peekであり、
+ * `isLikelyTsumugiFile`/`parseTsumugiResyncCandidate`（いずれも無変更、
+ * `processVaultResyncCandidate`が内部で使うのと同じ関数）をそのまま呼ぶだけで、
+ * 分類結果には一切影響しない。ここでの読み取りは同一`File`（既にgetFile()
+ * 済みのin-memory Blob）に対する`slice().text()`/`text()`呼び出しのみのため、
+ * 追加のディスク/SAF I-Oは発生しない（直後に`processVaultResyncCandidate`が
+ * 同じfileへ対し独立に読み直すのは、既存の分類ロジックを一切変更しないための
+ * 意図的な重複であり、性能上のコストはCPU側の文字列decodeのみ）。
+ *
+ * Codexレビュー指摘（M1）対応：既知path candidate（metadataChanged/
+ * missingPath/readFailed）についても、`candidate.registryKey`だけを信用せず、
+ * 実際に再readした本文が名乗っているidentityをこの関数で確認し、異なる場合は
+ * そちらもprefetchする（呼び出し元側で実施、下記参照）。「Registry X→x.md、
+ * Y→y.mdのうちx.mdの本文がYへ変更された」ケースでも、Yのregistry情報が
+ * stateへ入った状態で既存`processVaultResyncCandidate`を実行できるようにする。
+ *
+ * 判定できない場合はnullを返し、呼び出し元はprefetchを単に省略する——「新規
+ * record」side（added）へ安易に倒すのではなく、`processVaultResyncCandidate`
+ * 自身が持つ既存のunreadable/unconfirmed判定（`isLikelyTsumugiFile`失敗・
+ * parse失敗時はunreadableFilesへ計上、分類対象にしない）にそのまま委ねる。
+ */
+async function peekTsumugiResyncCandidateRegistryKey(file: File): Promise<string | null> {
+  try {
+    if (!(await isLikelyTsumugiFile(file))) return null;
+    const text = await file.text();
+    const parsed = parseTsumugiResyncCandidate(text);
+    if (!parsed) return null;
+    return parsed.kind === "memory-day" ? dayFileRegistryKey(parsed.day) : parsed.id;
+  } catch {
+    return null;
+  }
+}
+
+/** `lookupCurrentRegistryEntryForL3`の結果。missing確定用のfail-closedな3値。 */
+type VaultCurrentRegistryLookupL3 =
+  | { status: "found"; path: string; entry: VaultRegistryFileEntry }
+  | { status: "not-found" }
+  | { status: "unconfirmed" };
+
+/**
+ * Codexレビュー指摘（M2・再レビューMedium対応）：あるregistryKeyの「現在の」
+ * Registry状態をL3時点でfreshに確認する。生の読み取り結果
+ * （`VaultRegistryShardRawResultL3`）に対して、`wasKnownAtL1`（このkeyが
+ * Level 1時点の`discovery.allKnownKeys`に存在していたか）を踏まえた意味づけを
+ * ここで行う：
+ *
+ * - 生の読み取り自体が"unconfirmed"（`.tsumugi`/registry解決失敗・I-O・
+ *   JSON破損）→ 常に"unconfirmed"（known/newを問わない）。
+ * - shard file自体が無い（"shard-file-not-found"）：
+ *   - `wasKnownAtL1===false`（L1時点でこのkeyの存在証拠が無い。例：unknown
+ *     pathから読めた完全新規のregistryKey）→ そのbucketに一度もrecordが
+ *     無かった通常の"not-found"。
+ *   - `wasKnownAtL1===true`（L1時点でこのbucketにこのkeyの記録が実在した）
+ *     → shard file自体が消えている＝「元々空だった」のではなくL1→L3間で
+ *     Registryが変化した可能性がある異常系のため、"unconfirmed"（fail-closed）。
+ * - shardは読めたが`records[registryKey]`が無い：`wasKnownAtL1===true`なら、
+ *   L1で見えていたrecordがL3時点で消えている変化を否定できないため
+ *   "unconfirmed"とする（`wasKnownAtL1===false`なら通常通り"not-found"）。
+ * - `records[registryKey]`はあるが`files[path]`が無い（registry内部の
+ *   records/files不整合）：known/new問わず常に"unconfirmed"。
+ *
+ * `shardCache`には常に「生の読み取り結果」だけを保持し（`wasKnownAtL1`に
+ * 依存する意味づけ結果はcacheしない）、同一bucketに属する別のregistryKeyが
+ * 異なる`wasKnownAtL1`を持っていても、それぞれ正しく意味づけできるようにする。
+ */
+async function lookupCurrentRegistryEntryForL3(
+  root: FileSystemDirectoryHandle,
+  registryKey: string,
+  wasKnownAtL1: boolean,
+  shardCache: Map<number, VaultRegistryShardRawResultL3>
+): Promise<VaultCurrentRegistryLookupL3> {
+  const raw = await getVaultRegistryShardRawForL3Cached(root, vaultRegistryBucketOf(registryKey), shardCache);
+  if (raw.status === "unconfirmed") return { status: "unconfirmed" };
+  if (raw.status === "shard-file-not-found") {
+    return wasKnownAtL1 ? { status: "unconfirmed" } : { status: "not-found" };
+  }
+  // raw.status === "found"
+  const path = raw.shard.records[registryKey];
+  if (path === undefined) {
+    return wasKnownAtL1 ? { status: "unconfirmed" } : { status: "not-found" };
+  }
+  const entry = raw.shard.files[path];
+  if (entry === undefined) return { status: "unconfirmed" }; // records/files不整合：安全側で確認不能扱い。
+  return { status: "found", path, entry };
+}
+
 export async function classifyVaultLightCheckCandidates(
   root: FileSystemDirectoryHandle,
   discovery: VaultLightCheckDiscoveryResult
 ): Promise<VaultLightCheckClassifyResult> {
-  const snapshot = await buildVaultRegistrySnapshot(root);
+  const l3Start = Date.now();
   const state: VaultResyncScanState = {
-    previousByKey: snapshot.previousByKey,
-    previousEntries: snapshot.previousEntries,
-    previousRegistryKeyByPath: snapshot.previousRegistryKeyByPath,
+    // Codexレビュー指摘（A2）対応：L1/L2終了後にRegistry全体を読み直さない。
+    // `previousByKey`/`previousEntries`は最初は空で、各candidateを処理する
+    // 直前に`prefetchRegistryEntryIntoState`で必要なkeyだけを都度埋める。
+    previousByKey: new Map<string, string>(),
+    previousEntries: new Map<string, VaultRegistryFileEntry>(),
+    // L3では（旧実装でも）`walkVaultForResync`のような全体探索は行わないため、
+    // このfieldは参照されない（duplicate判定は`seenPathsByKey`が担う）。
+    previousRegistryKeyByPath: new Map<string, string>(),
     seenPathsByKey: new Map(),
     seenKnownKeys: new Set(),
     recordsByKey: new Map(),
@@ -5260,14 +5563,54 @@ export async function classifyVaultLightCheckCandidates(
     deadline: Number.POSITIVE_INFINITY,
     deadlineExceeded: false,
   };
+  // 実機不具合対応（Android性能改善・A2）：この1回のclassify実行の間だけ
+  // 有効な、生のshard read結果のcache。ローカル変数のため、この関数を抜ければ
+  // 破棄され、次回のConfirm・別Vaultへは一切持ち越さない。candidate prefetch・
+  // missing確定の両方でこの同じcacheを共有する（同一bucketの重複readを避ける）。
+  // Codexレビュー指摘（再レビューMedium対応）：cacheには常に生の読み取り結果
+  // （`VaultRegistryShardRawResultL3`）だけを保持し、`wasKnownAtL1`に依存する
+  // not-found/unconfirmedの意味づけはcacheしない——同じbucketに属する別の
+  // registryKeyがそれぞれ異なる`wasKnownAtL1`を持ち得るため。
+  const shardCache = new Map<number, VaultRegistryShardRawResultL3>();
 
-  // Level 1が"metadata-changed"とした既知pathを読み直す。
+  // Level 1が"metadata-changed"とした既知pathを読み直す。registryKeyは
+  // candidate自身が既に持っているため、読む前にprefetchできる（L1の
+  // `discovery.allKnownKeys`由来のkeyなので`wasKnownAtL1=true`）。
+  //
+  // Codexレビュー指摘（M1）対応：`candidate.registryKey`だけを信用せず、実際に
+  // 再readした本文が名乗っているidentityも確認する。両者が異なる場合
+  // （例：Registry X→x.md、Y→y.mdのうちx.md本文がYへ変更された）、Yの
+  // Registry情報もprefetchしてから既存`processVaultResyncCandidate`（無変更）
+  // へ渡す——`processVaultResyncCandidate`内部が実際に使うidは本文由来のY
+  // であり、Xのprefetchだけでは不十分なため。Yの`wasKnownAtL1`は
+  // `discovery.allKnownKeys.has(actualKey)`から判断する（unknown pathから
+  // 見つかった完全新規idならfalseになり得る）。
   for (const candidate of discovery.metadataChangedCandidates) {
+    const xResult = await prefetchRegistryEntryIntoState(root, state, candidate.registryKey, true, shardCache);
     try {
       const resolved = await resolveVaultRelativePath(root, candidate.previousPath);
       const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
       const file = await fileHandle.getFile();
-      await processVaultResyncCandidate(root, state, candidate.previousPath, file);
+      const actualKey = await peekTsumugiResyncCandidateRegistryKey(file);
+      let actualKeyResult: VaultRegistryLookupOutcomeL3 = xResult;
+      if (actualKey !== null && actualKey !== candidate.registryKey) {
+        actualKeyResult = await prefetchRegistryEntryIntoState(root, state, actualKey, discovery.allKnownKeys.has(actualKey), shardCache);
+      }
+      // Codexレビュー指摘（再レビューMedium 2）対応：candidate自身のkey・実際に
+      // classificationへ使われるidentityのkeyのいずれかがRegistry状態を
+      // 確認できない（"unconfirmed"）場合、通常classification
+      // （`processVaultResyncCandidate`）へは進めない。物理ファイル自体は
+      // 確認できているため、negative evidenceとしてseenKnownKeysへ加え、
+      // 既存の`unreadableFiles`表現で「確認不能」を記録する。
+      if (xResult === "unconfirmed" || actualKeyResult === "unconfirmed") {
+        recordUnconfirmedIdentitySkip(
+          state,
+          candidate.previousPath,
+          actualKey !== null && actualKey !== candidate.registryKey ? [candidate.registryKey, actualKey] : [candidate.registryKey]
+        );
+      } else {
+        await processVaultResyncCandidate(root, state, candidate.previousPath, file);
+      }
     } catch (error) {
       state.unreadableFiles.push({ path: candidate.previousPath, reason: `light check re-read failed: ${String(error)}` });
     }
@@ -5278,24 +5621,59 @@ export async function classifyVaultLightCheckCandidates(
   // 復元された場合、またはLevel 1判定自体が一時的な読み取り失敗だった場合を
   // 取りこぼさないため）。読めなければ何もしない——後段のmissing確定処理へ委ねる
   // （"read-failed"は後段でseenKnownKeysへ安全側フォールバックする、下記参照）。
+  // Codexレビュー指摘（M1）対応：上記と同じ理由で、本文が実際に名乗っている
+  // identityもprefetchする（`wasKnownAtL1`の考え方も上記と同じ）。
   for (const candidate of [...discovery.missingPathCandidates, ...discovery.readFailedCandidates]) {
+    const xResult = await prefetchRegistryEntryIntoState(root, state, candidate.registryKey, true, shardCache);
     try {
       const resolved = await resolveVaultRelativePath(root, candidate.previousPath);
       const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
       const file = await fileHandle.getFile();
-      await processVaultResyncCandidate(root, state, candidate.previousPath, file);
+      const actualKey = await peekTsumugiResyncCandidateRegistryKey(file);
+      let actualKeyResult: VaultRegistryLookupOutcomeL3 = xResult;
+      if (actualKey !== null && actualKey !== candidate.registryKey) {
+        actualKeyResult = await prefetchRegistryEntryIntoState(root, state, actualKey, discovery.allKnownKeys.has(actualKey), shardCache);
+      }
+      // Codexレビュー指摘（再レビューMedium 2）対応：上記metadataChangedループと
+      // 同じ理由で、いずれかのkeyが"unconfirmed"なら通常classificationへ進めない。
+      if (xResult === "unconfirmed" || actualKeyResult === "unconfirmed") {
+        recordUnconfirmedIdentitySkip(
+          state,
+          candidate.previousPath,
+          actualKey !== null && actualKey !== candidate.registryKey ? [candidate.registryKey, actualKey] : [candidate.registryKey]
+        );
+      } else {
+        await processVaultResyncCandidate(root, state, candidate.previousPath, file);
+      }
     } catch {
       // 読めない：missing確定処理（後段）へ委ねる。
     }
   }
 
-  // Level 2が見つけた未知pathを読む（新規追加、または移動先候補）。
+  // Level 2が見つけた未知pathを読む（新規追加、または移動先候補）。どのkeyを
+  // prefetchすべきかはファイル内容を読むまで分からないため、読んだ直後に
+  // `peekTsumugiResyncCandidateRegistryKey`で軽くpeekしてから、既存の
+  // `processVaultResyncCandidate`（無変更）へ渡す。peekしたkeyが
+  // `discovery.allKnownKeys`に無ければ（＝完全な新規record）`wasKnownAtL1=false`
+  // になり、shard file NotFoundは通常のnot-foundとして扱われる。
   for (const path of discovery.unknownPathCandidates) {
     try {
       const resolved = await resolveVaultRelativePath(root, path);
       const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
       const file = await fileHandle.getFile();
-      await processVaultResyncCandidate(root, state, path, file);
+      const peekedKey = await peekTsumugiResyncCandidateRegistryKey(file);
+      let peekedKeyResult: VaultRegistryLookupOutcomeL3 = "not-found";
+      if (peekedKey !== null) {
+        peekedKeyResult = await prefetchRegistryEntryIntoState(root, state, peekedKey, discovery.allKnownKeys.has(peekedKey), shardCache);
+      }
+      // Codexレビュー指摘（再レビューMedium 2）対応：peekできたidentityの
+      // Registry状態が"unconfirmed"なら、通常classificationへは進めない
+      // （新規record・moveのいずれの可能性についても確認不能なまま進めない）。
+      if (peekedKey !== null && peekedKeyResult === "unconfirmed") {
+        recordUnconfirmedIdentitySkip(state, path, [peekedKey]);
+      } else {
+        await processVaultResyncCandidate(root, state, path, file);
+      }
     } catch (error) {
       state.unreadableFiles.push({ path, reason: `light check candidate read failed: ${String(error)}` });
     }
@@ -5305,24 +5683,18 @@ export async function classifyVaultLightCheckCandidates(
   // getFile()に成功しmtime/sizeも一致していた）registryKeyは、既存
   // walkVaultForResyncの「pathの文字列一致だけで確認済みとする」判定と同じ
   // 強さ（実際にファイルを開けたことまで確認済みであり、より強い）で
-  // 「存在確認済み」として扱う。
+  // 「存在確認済み」として扱う。`confirmedPresentKeys`をそのまま
+  // `seenKnownKeys`へ加えるだけで、Registry全体の再読み込みは不要。
   //
-  // 安全性レビュー対応（M2）：`readFailedCandidates`（権限/I-Oエラー等で
+  // 安全性レビュー対応（M2、既存）：`readFailedCandidates`（権限/I-Oエラー等で
   // 読めなかっただけの既知path）はここでは「存在確認済み」に含めない
   // （"path-missing"と同じ扱いにはしない）。代わりに、Level 2が独立して
   // 同じpathを列挙で見つけていれば（`discovery.level2SeenKnownKeys`）、
   // その証拠だけを安全側フォールバックとして採用する——本文は読めなくても
   // 「物理的に何かが存在した」という事実は取り消さない、という既存
   // walkVaultForResyncの原則と同じ考え方。
-  const level1CandidateKeys = new Set<string>([
-    ...discovery.metadataChangedCandidates.map((c) => c.registryKey),
-    ...discovery.missingPathCandidates.map((c) => c.registryKey),
-    ...discovery.readFailedCandidates.map((c) => c.registryKey),
-  ]);
-  for (const key of snapshot.previousByKey.keys()) {
-    if (!level1CandidateKeys.has(key)) {
-      state.seenKnownKeys.add(key);
-    }
+  for (const key of discovery.confirmedPresentKeys) {
+    state.seenKnownKeys.add(key);
   }
   for (const key of discovery.level2SeenKnownKeys) {
     state.seenKnownKeys.add(key);
@@ -5330,17 +5702,35 @@ export async function classifyVaultLightCheckCandidates(
 
   // missing確定：既存Phase 2と同じ判定（recordsByKeyにもseenKnownKeysにも
   // 無い場合だけ）。ただしlevel2Completed===trueの場合のみ許可する。
+  //
+  // Codexレビュー指摘（M2）対応：対象を`discovery.allKnownKeys`（Level 1が
+  // このsnapshotで見た全known key、orphan key含む）に拡張し、Registry全体の
+  // 再読み込みは行わずに、missingを確定する**直前**にそのregistryKey 1件だけの
+  // 現在のRegistry状態を`lookupCurrentRegistryEntryForL3`でfreshに確認する。
+  // - "unconfirmed"（shard read失敗等）：現在の状態を確認できない→missingへ
+  //   進めない（fail-closed、古いcandidate.previousPathへのfallbackもしない）。
+  // - "not-found"（現在Registryに登録が無い）：missingとして扱う対象が無いため
+  //   スキップ。
+  // - "found"だがcurrent.path !== l1Path（Level 1時点のpath）：L1時点から既に
+  //   pathが変わっている＝この判定はstaleなので進めない（次回のlight check
+  //   サイクルへ委ねる）。
+  // - "found"かつcurrent.path === l1Path：現在も同じpathを指しているため、
+  //   missing recordの内容は**現在確認した**current.path/current.entry.recordType
+  //   を根拠に構築する（L1 candidateの古い値は使わない）。
   if (discovery.level2Completed) {
-    for (const [key, prevPath] of state.previousByKey.entries()) {
+    for (const [key, l1Path] of discovery.allKnownKeys) {
       if (state.recordsByKey.has(key)) continue;
       if (state.seenKnownKeys.has(key)) continue;
-      const entry = state.previousEntries.get(prevPath);
-      if (!entry) continue;
+      // このループはdiscovery.allKnownKeys由来なので、常にwasKnownAtL1=true。
+      const current = await lookupCurrentRegistryEntryForL3(root, key, true, shardCache);
+      if (current.status === "unconfirmed") continue;
+      if (current.status === "not-found") continue;
+      if (current.path !== l1Path) continue;
       state.recordsByKey.set(key, {
         registryKey: key,
-        recordType: entry.recordType,
+        recordType: current.entry.recordType,
         outcome: "missing",
-        previousPath: prevPath,
+        previousPath: current.path,
         currentPath: null,
         contentHash: null,
         mtime: null,
@@ -5364,12 +5754,35 @@ export async function classifyVaultLightCheckCandidates(
   // H1対応：commitを伴うoutcome（moved/edited/added）のrecordだけ、apply直前
   // 再検証に使うローカルsnapshotを構築する（conflict/missing/unchanged/
   // unreadableはIndexedDB/ledgerへ一切書き込まないため不要）。
+  // Codexレビュー指摘（A2）対応：`buildVaultLightCheckLocalSnapshot`が必要とする
+  // `previousByKey.get(record.registryKey)`/`previousEntries`は、上記の
+  // candidate処理で既にprefetch済みのため、`state`（`VaultRegistrySnapshot`と
+  // 同じ3 fieldを持つ）をそのまま渡せる。
   const localSnapshots = new Map<string, VaultLightCheckLocalSnapshot>();
   for (const record of records) {
     if (record.outcome === "moved" || record.outcome === "edited" || record.outcome === "added") {
-      localSnapshots.set(record.registryKey, await buildVaultLightCheckLocalSnapshot(record, snapshot));
+      localSnapshots.set(record.registryKey, await buildVaultLightCheckLocalSnapshot(record, state));
     }
   }
+
+  // 実機不具合対応（aggregate diagnostic）：個々のpath/idは含めず、候補件数・
+  // 所要時間だけを記録する。
+  // Codexレビュー指摘（Low）対応：`shardReadCount`という名前だが、実際には
+  // 「成功して読めたshardの数」ではなく`shardCache.size`——このclassify実行中に
+  // アクセスを試みた（＝cacheへ結果を記録した）distinctなbucket数であり、
+  // "shard-file-not-found"/"unconfirmed"だったbucketも1件としてカウントされる。
+  // ログの互換性を保つためfield名・出力値自体は変更しないが、この意味の違いを
+  // ここに明記する。
+  const candidateCount =
+    discovery.metadataChangedCandidates.length +
+    discovery.missingPathCandidates.length +
+    discovery.readFailedCandidates.length +
+    discovery.unknownPathCandidates.length;
+  logTimingEvent("Vault light:L3 complete", {
+    candidateCount,
+    shardReadCount: shardCache.size,
+    durationMs: Date.now() - l3Start,
+  });
 
   return { records, localSnapshots, level2Completed: discovery.level2Completed, counts };
 }
