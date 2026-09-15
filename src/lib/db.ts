@@ -749,6 +749,90 @@ export async function markVaultEpochCommitted(epoch: number): Promise<void> {
 }
 
 /**
+ * C1（軽量Registry index・多tab安全性設計のbootstrap/rebuild foundation）対応：
+ * `activeVaultEpoch`（Vault切替の世代管理）とは完全に別物の、Registry
+ * ownership用の単調増加カウンタ。既存の`settings`ストアへ1キー追加するだけで、
+ * DB schemaの変更は行わない。`activeVaultEpoch`の意味・読み書き経路（H4の
+ * Vault切替判定）には一切触れない。
+ *
+ * bumpするのは、`registry-meta.json`の`registryGeneration`が進む操作
+ * （full resync/rebuildの成功commit、将来のG成功）だけ。C1では
+ * `resyncVaultRegistry`からのbumpのみを実装し、read/checkする消費側
+ * （将来のOWNED_DIRTY mutationのfast path）はまだ実装しない。
+ *
+ * 未設定（一度もbumpされていない）は0として扱う。validation・CAS方式の
+ * bump（`expectedEpoch`一致時のみ進める、overflow検出）は`activeVaultEpoch`と
+ * 完全に同じ契約にする（`parseStoredEpoch`/`isValidStoredEpochValue`を
+ * そのまま再利用）。
+ */
+const REGISTRY_GENERATION_EPOCH_KEY = "registryGenerationEpoch";
+
+export async function getRegistryGenerationEpoch(): Promise<number> {
+  const db = await getDB();
+  const raw = await db.get("settings", REGISTRY_GENERATION_EPOCH_KEY);
+  const status = parseStoredEpoch(raw);
+  if (status.status === "missing") return 0;
+  if (status.status === "invalid") {
+    throw new Error(`[Tsumugi] invalid registryGenerationEpoch value in storage: ${JSON.stringify(raw)}`);
+  }
+  return status.epoch;
+}
+
+/**
+ * C1では`resyncVaultRegistry`の成功commitの最終ステップ（`runVaultWorldExclusive`
+ * 排他ロック保持中、registry-index.json/registry-meta.json書き込み成功後）から
+ * のみ呼ぶ。`activeVaultEpoch`の`bumpActiveVaultEpoch`と同じCAS契約：
+ * `expectedEpoch`と現在値が一致した場合のみ`+1`する。一致しない場合・
+ * overflowの場合は例外を投げ、fallbackしない（fail-fast、単調増加を崩さない）。
+ *
+ * Medium修正（Codexレビュー指摘）：read→比較→incrementの一連を単一の
+ * readwrite transaction内で完結させる（`getRegistryGenerationEpoch()`＋
+ * `db.put()`という2つの独立したtransactionに分けない）。これにより、
+ * 同じ`expectedEpoch`を持つ2つの呼び出しが本当に同時に実行された場合でも、
+ * IndexedDBのtransaction直列化によって必ず一方だけが成功し、もう一方は
+ * transaction commit後に読み直した値が既に進んでいるため
+ * `expected mismatch`として確実に失敗する（2つの独立readのtransactionでは、
+ * 両方が同じ「古い」値を読んでしまい両方成功するTOCTOUが起こり得た）。
+ *
+ * Medium再修正（Codexレビュー再指摘）：`store.get`/`store.put`のreject・
+ * invalid・expected mismatch・overflowのいずれの失敗パスでも、
+ * transactionを未回収のまま放置しない。既存の`abortAndSettleTransaction`
+ * （`importMissingRecordsIfAbsent`等で既に確立済みのpattern）へ処理を
+ * 集約し、`tx.abort()`→`tx.done`のreject回収→元errorの再throw、という
+ * 既存の後始末を全失敗パスで行う。成功パスのみ`tx.done`をawaitして
+ * commitまで待つ（committed後に`next`を返す）。
+ */
+export async function bumpRegistryGenerationEpoch(expectedEpoch: number): Promise<number> {
+  const db = await getDB();
+  const tx = db.transaction("settings", "readwrite");
+  const store = tx.objectStore("settings");
+
+  let next: number;
+  try {
+    const raw = await store.get(REGISTRY_GENERATION_EPOCH_KEY);
+    const status = parseStoredEpoch(raw);
+    if (status.status === "invalid") {
+      throw new Error(`[Tsumugi] invalid registryGenerationEpoch value in storage: ${JSON.stringify(raw)}`);
+    }
+    const current = status.status === "missing" ? 0 : status.epoch;
+    if (current !== expectedEpoch) {
+      throw new Error(
+        `[Tsumugi] bumpRegistryGenerationEpoch: expected registryGenerationEpoch=${expectedEpoch} but found ${current}; refusing (stale).`
+      );
+    }
+    next = current + 1;
+    if (!Number.isSafeInteger(next)) {
+      throw new Error(`[Tsumugi] bumpRegistryGenerationEpoch: epoch overflow (current=${current})`);
+    }
+    await store.put(String(next), REGISTRY_GENERATION_EPOCH_KEY);
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return next;
+}
+
+/**
  * Codexレビュー指摘（既存Beta migration）対応：「committedVaultEpochキー自体が
  * まだ存在しない」を、常に安全な"legacy"とみなしてよいのは、この端末で
  * journal方式（committedVaultEpoch）がまだ一度も有効化されていない場合だけ。

@@ -20,11 +20,13 @@ import {
   addConversationIfAbsentAndMarkSynced,
   addMemoryObjectIfAbsentAndMarkSynced,
   addSourceIfAbsentAndMarkSynced,
+  bumpRegistryGenerationEpoch,
   getAllConversations,
   getAllMemoryObjects,
   getAllSources,
   getConversation,
   getMemoryObject,
+  getRegistryGenerationEpoch,
   getSource,
   getVaultSyncState,
   loadVaultHandle,
@@ -74,6 +76,26 @@ export const vaultRegistryInstanceId: string =
  * instanceIdと偶然一致することは無い。
  */
 export const VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE = "MULTIPLE" as const;
+
+/**
+ * C1（軽量Registry index・多tab安全性設計のbootstrap/rebuild foundation）対応：
+ * 新しい`registryGeneration`を確立するたびに呼ぶtoken生成。`vaultRegistryInstanceId`
+ * と同じ`crypto.randomUUID()`優先＋fallbackのpatternをそのまま踏襲する
+ * （instanceIdとgeneration tokenは意味が異なる別概念のため、値そのものは
+ * 共有しない——生成方法だけを揃える）。
+ *
+ * Low修正（Codexレビュー指摘）：`crypto.randomUUID()`が使える環境では
+ * それだけを使う（`Date.now()`は関与しない）。`crypto.randomUUID()`が
+ * 使えない環境でのみ、`Math.random()`と`Date.now()`を組み合わせた
+ * best-effortなfallbackを使う——これは衝突を構造的に防ぐ保証では
+ * ないが、同一ミリ秒内に複数回このfallbackが呼ばれる頻度（resync
+ * 成功のたびに1回だけ）を踏まえると実用上十分な衝突耐性として許容する。
+ */
+function generateVaultRegistryGeneration(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `fallback-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+}
 
 const VAULT_DIRS = ["Conversations", "Memories", "People", "Themes", "Emotions", "Goals", "Ideas", "Events", "Attachments"] as const;
 
@@ -2485,6 +2507,35 @@ async function writeVaultRegistryMeta(root: FileSystemDirectoryHandle, meta: Vau
   await writeFileInDir(tsumugiDir, "registry-meta.json", JSON.stringify(meta, null, 2), "registry meta write");
 }
 
+/**
+ * C1（軽量Registry index・多tab安全性設計のbootstrap/rebuild foundation）：
+ * `.tsumugi/registry-index.json`の内容。L1/L2が実際に使うのは
+ * `registryKey/path/mtime/size/recordType`の5fieldのみ（既存の軽量チェック
+ * 設計と同じ範囲）であり、contentHash/memberIds/memberHashes/statusは
+ * 持たない——このfileはあくまで64 shardのlightweightな代替キャッシュであり、
+ * 64 shard自体（authoritative構造）を置き換えるものではない。
+ *
+ * 今回（C1）はこのfileを書くだけで、まだどこからも読まれない（配線は
+ * 将来のC2/C4以降）。
+ */
+export interface VaultRegistryIndexEntry {
+  path: string;
+  mtime: number;
+  size: number;
+  recordType: VaultRegistryRecordType;
+}
+
+export interface VaultRegistryIndex {
+  schemaVersion: 1;
+  builtAtGeneration: string;
+  records: Record<string, VaultRegistryIndexEntry>;
+}
+
+async function writeVaultRegistryIndex(root: FileSystemDirectoryHandle, index: VaultRegistryIndex): Promise<void> {
+  const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
+  await writeFileInDir(tsumugiDir, "registry-index.json", JSON.stringify(index, null, 2), "registry index write");
+}
+
 // ---------------------------------------------------------------------------
 // B2（軽量Registry index・多tab安全性設計）：ownership state machineのpure logic
 //
@@ -3162,6 +3213,31 @@ interface VaultResyncScanResult {
   /** probeでTsumugiファイルらしいと判定されたがparseできなかった、または
    *  getFile/text自体が失敗したファイル。分類（unchanged等）の対象にはしない。 */
   unreadableFiles: VaultResyncUnreadableFile[];
+  /**
+   * C1（軽量Registry index・多tab安全性設計のbootstrap/rebuild foundation）対応：
+   * Phase 0で`buildVaultRegistrySnapshot`が読み込んだ、apply前のauthoritative
+   * Registryスナップショットをそのまま公開する（追加のshard読み込みは発生しない、
+   * 既にこの関数が内部で保持している値をそのまま返すだけ）。`resyncVaultRegistry`が
+   * apply後の最終registry-index.jsonを、新たなshard読み込み無しで構築するために使う
+   * （`records`のapply結果と合わせて、「apply前の全体像」+「今回変化した差分」から
+   * 最終状態を再構成する）。resync自体の分類・apply挙動には一切影響しない。
+   */
+  previousByKey: Map<string, string>;
+  previousEntries: Map<string, VaultRegistryFileEntry>;
+  /**
+   * C1（Codexレビュー指摘・High 2対応）：apply前のRegistry snapshot読み込み
+   * （`buildVaultRegistrySnapshotForResync`のPhase 0：directory enumeration・
+   * 個々のshard読み込みの両方）が、一切の失敗無く完了したかどうか。`false`の
+   * 場合、`previousByKey`/`previousEntries`はfallback値（一部shardが空扱い）を
+   * 含んでいる可能性があり、C1のregistry-index/registryGeneration/
+   * dirtyOwnerInstanceId/registryGenerationEpochの新規確立には使ってはならない
+   * （`resyncVaultRegistry`参照）。既存resyncの`scanCompleted`（Vault全体の
+   * directory enumeration＝Phase 1）とは別軸の完全性であり、こちらはPhase 0
+   * （Registry自体の読み込み）を指す。既存のclassification/apply挙動
+   * （`scanCompleted`ベースのlastFullResyncAt/baselineEstablishedAt更新等）には
+   * 一切影響しない。
+   */
+  previousSnapshotCompleted: boolean;
 }
 
 type VaultResyncSingleKind = "conversation" | "source" | "reflection";
@@ -4175,8 +4251,157 @@ async function buildVaultRegistrySnapshot(root: FileSystemDirectoryHandle): Prom
   return { previousByKey, previousEntries, previousRegistryKeyByPath };
 }
 
+/**
+ * C1（Codexレビュー指摘・High 2対応）：resync専用のshard読み込み。
+ * `buildVaultRegistrySnapshot`が内部で使う`readVaultRegistryShardFromDir`
+ * （→`readJSON`）は、getFileHandle/getFile/readText/JSON.parseのいずれが
+ * 失敗しても静かに既定値へfallbackする既存の共有契約であり、呼び出し元は
+ * 個々のshard読み込み単体の失敗を一切区別できない。この関数はその既存契約
+ * （`readJSON`/`readVaultRegistryShardFromDir`自体）を一切変更せず、
+ * resync専用の別経路として同じ読み込みシーケンスを独自に行い、失敗を
+ * `readFailed`として呼び出し元へ伝える。データ（成功時の値、失敗時の
+ * fallback値）は既存と完全に同一——追加されるのは失敗シグナルのみ。
+ */
+/**
+ * Codexレビュー再指摘・High 2対応：`.tsumugi`/`.tsumugi/registry`の
+ * `getDirectoryHandle`失敗のうち、真正NotFound（＝Registry未確立の正常な
+ * 状態）だけを「正常な空」として扱うための判定。permission error/I-O
+ * error/SecurityError等、存在自体を確認できない失敗はこれに含めない
+ * （catch-allで同じ扱いにしない）。
+ */
+function isVaultRegistryDirectoryNotFoundError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "NotFoundError";
+}
+
+function isValidVaultRegistryRecordType(value: unknown): value is VaultRegistryRecordType {
+  return value === "conversation" || value === "reflection" || value === "source" || value === "memory-day";
+}
+
+/**
+ * Codexレビュー再指摘・High 2対応：`JSON.parse`が成功しただけではshard構造が
+ * completeとはみなさない。C1のlightweight projection（registryKey/path/
+ * mtime/size/recordType）を安全に構築するために必要な構造——`records`/`files`
+ * がobjectであること、`records`が参照する全pathについて`files`に対応する
+ * entryが存在すること（orphan禁止）、そのentryの`mtime`/`size`が数値、
+ * `recordType`が既知のenum値であること——を検証する。1件でも不整合・
+ * malformedな値があれば`null`を返し、呼び出し元はshard読み込み失敗と同じ
+ * fallback（空shard＋`readFailed=true`）へ倒す。既存の`readJSON`/
+ * `readVaultRegistryShardFromDir`（L1/L2・A1/A2共有）には一切触れない。
+ */
+function validateVaultRegistryShardStructure(parsed: unknown): VaultRegistryShard | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed as Record<string, unknown>;
+  const records = obj.records;
+  const files = obj.files;
+  if (typeof records !== "object" || records === null || Array.isArray(records)) return null;
+  if (typeof files !== "object" || files === null || Array.isArray(files)) return null;
+  const recordsObj = records as Record<string, unknown>;
+  const filesObj = files as Record<string, unknown>;
+  for (const path of Object.values(recordsObj)) {
+    if (typeof path !== "string") return null;
+    const entry = filesObj[path];
+    if (typeof entry !== "object" || entry === null) return null; // orphan：records→filesの整合性が崩れている
+    const e = entry as Record<string, unknown>;
+    if (typeof e.mtime !== "number" || typeof e.size !== "number") return null;
+    if (!isValidVaultRegistryRecordType(e.recordType)) return null;
+  }
+  return parsed as VaultRegistryShard;
+}
+
+async function readVaultRegistryShardFromDirForResyncSnapshot(
+  registryDir: FileSystemDirectoryHandle,
+  bucket: number
+): Promise<{ shard: VaultRegistryShard; readFailed: boolean }> {
+  try {
+    const fileHandle = await timedIOStep("registry snapshot:shard fileHandle", () =>
+      registryDir.getFileHandle(vaultRegistryBucketFileName(bucket), { create: false })
+    );
+    const file = await timedIOStep("registry snapshot:shard getFile", () => fileHandle.getFile());
+    const text = await timedIOStep("registry snapshot:shard readText", () => file.text());
+    const parsed: unknown = JSON.parse(text);
+    const validated = validateVaultRegistryShardStructure(parsed);
+    if (validated === null) {
+      return { shard: emptyVaultRegistryShard(bucket), readFailed: true };
+    }
+    return { shard: validated, readFailed: false };
+  } catch {
+    return { shard: emptyVaultRegistryShard(bucket), readFailed: true };
+  }
+}
+
+/**
+ * C1（Codexレビュー指摘・High 2対応）：`performVaultResyncScan`専用の
+ * registry snapshot読み込み。`buildVaultRegistrySnapshot`（L1/L2の軽量
+ * チェックとも共有される既存の読み取りprimitive）とは意図的に別関数として
+ * 複製する——L1/L2の挙動には一切触れないため（L1/L2は引き続き
+ * `buildVaultRegistrySnapshot`をそのまま使う、無変更）。
+ *
+ * データの集め方（previousByKey/previousEntries/previousRegistryKeyByPath/
+ * shardCount）は`buildVaultRegistrySnapshot`と完全に同一であり、既存resync
+ * classificationへ渡るデータは1バイトも変わらない。追加している点は1つ：
+ * `.tsumugi/registry/`のdirectory enumeration失敗（既存も検出済み）に加えて、
+ * 個々のshard読み込み単体の失敗（`readVaultRegistryShardFromDirForResyncSnapshot`
+ * 参照、既存の`readJSON`経由では検出不可能だった＝Codexレビュー指摘・High 2）も
+ * `completed`へ反映する。`.tsumugi/registry/`自体が存在しない場合（正常な
+ * 空Registry）は、既存と同じく`completed=true`のまま。
+ */
+async function buildVaultRegistrySnapshotForResync(
+  root: FileSystemDirectoryHandle
+): Promise<VaultRegistrySnapshot & { completed: boolean }> {
+  const snapshotStart = Date.now();
+  const previousByKey = new Map<string, string>();
+  const previousEntries = new Map<string, VaultRegistryFileEntry>();
+  const previousRegistryKeyByPath = new Map<string, string>();
+  let shardCount = 0;
+  let completed = true;
+
+  let registryDir: FileSystemDirectoryHandle | null = null;
+  try {
+    const tsumugiDir = await timedIOStep("registry snapshot:tsumugiDir", () => root.getDirectoryHandle(".tsumugi", { create: false }));
+    registryDir = await timedIOStep("registry snapshot:registryDir", () => tsumugiDir.getDirectoryHandle("registry", { create: false }));
+  } catch (error) {
+    // Codexレビュー再指摘・High 2対応：真正NotFound（.tsumugi/.tsumugi/registry
+    // が単に存在しない＝Registry未確立の正常な状態）のみ「正常な空Registry」
+    // としてcompleted=trueを維持する。permission error/I-O error/
+    // SecurityError等、存在自体を確認できない失敗はcatch-allで同じ扱いに
+    // せず、completed=falseとする。
+    if (!isVaultRegistryDirectoryNotFoundError(error)) {
+      completed = false;
+    }
+  }
+
+  if (registryDir) {
+    try {
+      for await (const [name, handle] of registryDir.entries()) {
+        if (handle.kind !== "file" || !name.endsWith(".json")) continue;
+        const bucket = Number.parseInt(name.replace(/\.json$/, ""), 16);
+        if (!Number.isFinite(bucket)) continue;
+        const { shard, readFailed } = await readVaultRegistryShardFromDirForResyncSnapshot(registryDir, bucket);
+        if (readFailed) completed = false;
+        for (const [key, path] of Object.entries(shard.records)) {
+          previousByKey.set(key, path);
+          previousRegistryKeyByPath.set(path, key);
+        }
+        for (const [path, entry] of Object.entries(shard.files)) {
+          previousEntries.set(path, entry);
+        }
+        shardCount += 1;
+      }
+    } catch {
+      completed = false;
+    }
+  }
+
+  logTimingEvent("Vault registry snapshot:end", {
+    shardCount,
+    durationMs: Date.now() - snapshotStart,
+    completed: completed ? 1 : 0,
+  });
+  return { previousByKey, previousEntries, previousRegistryKeyByPath, completed };
+}
+
 async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<VaultResyncScanResult> {
-  const snapshot = await buildVaultRegistrySnapshot(root);
+  const snapshot = await buildVaultRegistrySnapshotForResync(root);
   const state: VaultResyncScanState = {
     previousByKey: snapshot.previousByKey,
     previousEntries: snapshot.previousEntries,
@@ -4243,6 +4468,9 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
     scannedFileCount: state.scannedFileCount,
     records: [...state.recordsByKey.values()],
     unreadableFiles: state.unreadableFiles,
+    previousByKey: state.previousByKey,
+    previousEntries: state.previousEntries,
+    previousSnapshotCompleted: snapshot.completed,
   };
 }
 
@@ -4621,6 +4849,28 @@ export interface VaultResyncMissingDetail {
   previousPath: string | null;
 }
 
+/**
+ * C1対応：1record分のapply結果（実際にshardへ反映されたかどうか）。
+ * `applyVaultResyncScanResult`が既に計算しているfinalOutcome/成否を、
+ * 追加I/O無しでそのまま公開するためだけの型（apply判定ロジック自体は
+ * 一切変更しない）。`failed=true`の場合、そのrecordのshardは今回一切
+ * 変更されていない（apply前のauthoritative状態のまま）ことを意味する。
+ *
+ * `finalRegistryEntry`（Codexレビュー指摘・High 1対応）：apply後に
+ * authoritative Registry shardへ実際に存在する、このregistryKeyのentry
+ * （path/mtime/size/recordType）を、推測ではなく確定値として持つ。
+ * `status`(ok/missing/conflict/needs-resync)を問わず、shardに
+ * recordが存在する限り必ず設定される（C1のindex契約：status限定
+ * projectionではなく、known recordの全件projection）。shard上に
+ * そもそもこのkeyのrecordが存在しない（previousPathが無く、かつ
+ * 新規anchor作成もされなかった等）場合のみ`null`。 */
+interface VaultResyncApplyRecordOutcome {
+  registryKey: string;
+  finalOutcome: VaultResyncOutcome;
+  failed: boolean;
+  finalRegistryEntry: VaultRegistryIndexEntry | null;
+}
+
 /** resync engine内部専用（外部へはexportしない。公開結果は`VaultResyncResult`）。 */
 interface VaultResyncApplyResult {
   scanCompleted: boolean;
@@ -4638,6 +4888,10 @@ interface VaultResyncApplyResult {
   unreadableFiles: VaultResyncUnreadableFile[];
   conflictDetails: VaultResyncConflictDetail[];
   missingDetails: VaultResyncMissingDetail[];
+  /** C1対応：records配列と同じ順序・同じregistryKey集合を持つ、record単位の
+   *  最終apply結果。`resyncVaultRegistry`がregistry-index.jsonを構築する際、
+   *  追加のshard読み込み無しでこれを使う。 */
+  recordOutcomes: VaultResyncApplyRecordOutcome[];
 }
 
 /** 既存のfiles[path]エントリのstatusだけを変更する（他フィールドは一切触れない）。
@@ -4795,10 +5049,21 @@ async function readAnchorFileEntry(
   return { recordType: candidate.kind, mtime, size, contentHash, memberIds: [candidate.id] };
 }
 
+/**
+ * C1（Codexレビュー指摘・High 1対応）：`createVaultRegistryConflictAnchor`が
+ * 実際にshardへ書き込んだ（またはrace時に何も書かなかった）anchor entryを、
+ * 呼び出し元（`applyVaultResyncScanResult`）が推測無しでregistry-index.jsonへ
+ * 反映できるようにするための戻り値。`path`はこの関数が最終的に選んだ
+ * anchor path（`record.currentPath`と異なりうる——lexicographical sortで
+ * 選ばれた別pathの場合がある）、`entry`はそのpathを実際に読み直して得た
+ * 値（`readAnchorFileEntry`の戻り値そのもの）。
+ */
+type VaultRegistryConflictAnchorCommit = { path: string; entry: Omit<VaultRegistryFileEntry, "status"> };
+
 async function createVaultRegistryConflictAnchor(
   root: FileSystemDirectoryHandle,
   record: VaultResyncRecordResult
-): Promise<void> {
+): Promise<VaultRegistryConflictAnchorCommit> {
   let anchorPath: string;
   if (record.allObservedPaths !== null && record.allObservedPaths.length > 0) {
     anchorPath = [...record.allObservedPaths].sort()[0];
@@ -4816,23 +5081,63 @@ async function createVaultRegistryConflictAnchor(
   const anchorEntry = await readAnchorFileEntry(root, anchorPath, record.recordType);
 
   const bucket = vaultRegistryBucketOf(record.registryKey);
-  await withVaultRegistryLock(async () => {
+  return await withVaultRegistryLock(async (): Promise<VaultRegistryConflictAnchorCommit> => {
     const shard = await readVaultRegistryShard(root, bucket);
-    if (shard.records[record.registryKey] !== undefined) return;
+    const existingPath = shard.records[record.registryKey];
+    if (existingPath !== undefined) {
+      // Codexレビュー再指摘・High 1対応：既にこのkeyがregistryへ登録済み
+      // （race等でこのresync自身の判定より先に他所から登録された）場合、
+      // nullを返してindexから除外するのは誤り——authoritative shardには
+      // 既にこのkeyのrecordが実在するため、その実entryを推測無しで返す。
+      const existingEntry = shard.files[existingPath];
+      if (existingEntry === undefined) {
+        // records→filesの整合性が崩れている（本来あり得ない防御的分岐）。
+        // 「不存在」と推測せず、5-field projectionを安全に構築できないことを
+        // 明示的なfailureとしてthrowする——呼び出し元のper-record try/catchで
+        // applyErrorsへ計上され、C1 establishment全体がfail-closedになる。
+        throw new Error(
+          `registry inconsistency: records[${record.registryKey}]=${existingPath} but files[${existingPath}] is missing`
+        );
+      }
+      return {
+        path: existingPath,
+        entry: {
+          recordType: existingEntry.recordType,
+          mtime: existingEntry.mtime,
+          size: existingEntry.size,
+          contentHash: existingEntry.contentHash,
+          memberIds: existingEntry.memberIds,
+          memberHashes: existingEntry.memberHashes,
+        },
+      };
+    }
     shard.records[record.registryKey] = anchorPath;
     shard.files[anchorPath] = { ...anchorEntry, status: "conflict" };
     await writeVaultRegistryShard(root, bucket, shard);
+    return { path: anchorPath, entry: anchorEntry };
   });
 }
 
-/** conflict outcomeの共通apply：既存registry entryがあればstatusだけ変更、
- *  無ければ`createVaultRegistryConflictAnchor`でanchorを新規作成する。 */
-async function applyConflictOutcome(root: FileSystemDirectoryHandle, record: VaultResyncRecordResult): Promise<void> {
+/**
+ * conflict outcomeの共通apply：既存registry entryがあればstatusだけ変更、
+ * 無ければ`createVaultRegistryConflictAnchor`でanchorを新規作成する（race等で
+ * 既に他所から登録済みだった場合はその既存entryを返す。records→filesの
+ * 整合性が崩れている場合はthrowする——詳細は同関数のコメント参照）。
+ * 分類・適用ロジック自体は無変更。C1（Codexレビュー指摘・High 1対応）：
+ * `record.previousPath!==null`（既存entryのstatusだけ変えた）場合はnullを
+ * 返す——呼び出し元は既存の`previousEntries`からそのentryを復元できるため。
+ * `previousPath===null`（新規anchor作成、またはそのrace）の場合は必ず
+ * `createVaultRegistryConflictAnchor`の戻り値（非null）をそのまま返す。
+ */
+async function applyConflictOutcome(
+  root: FileSystemDirectoryHandle,
+  record: VaultResyncRecordResult
+): Promise<VaultRegistryConflictAnchorCommit | null> {
   if (record.previousPath !== null) {
     await setVaultRegistryEntryStatus(root, record.registryKey, "conflict");
-    return;
+    return null;
   }
-  await createVaultRegistryConflictAnchor(root, record);
+  return await createVaultRegistryConflictAnchor(root, record);
 }
 
 async function getExistingSingleRecordUpdatedAt(
@@ -5004,13 +5309,20 @@ async function applySingleRecordAdded(
  * edited outcome（Conversation/Reflection/Source）のapply。日変化・turn数不一致
  * によりmergeがnullを返した場合はconflictへ切り替える（例外は投げない——これは
  * 「安全に自動適用できないと判断できた」という正常な処理結果であり、apply
- * failureではないため）。戻り値が実際に適用されたoutcome。
+ * failureではないため）。`outcome`が実際に適用されたoutcome。`anchorCommit`は
+ * C1（Codexレビュー指摘・High 1対応）：conflictへ切り替わった場合に実際に
+ * commitされたanchor情報（あれば）を呼び出し元へ伝える。edited成功時は常に`null`。
  */
+interface VaultResyncSingleApplyResult {
+  outcome: "edited" | "conflict";
+  anchorCommit: VaultRegistryConflictAnchorCommit | null;
+}
+
 async function applySingleRecordEdited(
   root: FileSystemDirectoryHandle,
   record: VaultResyncRecordResult,
   kind: VaultResyncSingleKind
-): Promise<"edited" | "conflict"> {
+): Promise<VaultResyncSingleApplyResult> {
   if (
     record.currentPath === null ||
     record.parsed === null ||
@@ -5036,7 +5348,7 @@ async function applySingleRecordEdited(
       record.size,
       record.contentHash
     );
-    return "edited";
+    return { outcome: "edited", anchorCommit: null };
   }
 
   if (kind === "conversation") {
@@ -5047,8 +5359,8 @@ async function applySingleRecordEdited(
     }
     const merged = mergeConversationForApply(f, existing);
     if (merged === null) {
-      await applyConflictOutcome(root, record);
-      return "conflict";
+      const anchorCommit = await applyConflictOutcome(root, record);
+      return { outcome: "conflict", anchorCommit };
     }
     const syncKey = vaultSyncKeyFor("conversation", record.registryKey);
     await putConversationAndMarkSynced(merged, syncKey);
@@ -5063,7 +5375,7 @@ async function applySingleRecordEdited(
       record.size,
       record.contentHash
     );
-    return "edited";
+    return { outcome: "edited", anchorCommit: null };
   }
 
   // reflection
@@ -5074,8 +5386,8 @@ async function applySingleRecordEdited(
   }
   const merged = mergeMemoryObjectForApply(f, existing);
   if (merged === null) {
-    await applyConflictOutcome(root, record);
-    return "conflict";
+    const anchorCommit = await applyConflictOutcome(root, record);
+    return { outcome: "conflict", anchorCommit };
   }
   const syncKey = vaultSyncKeyFor("memory", record.registryKey);
   await putMemoryObjectAndMarkSynced(merged, syncKey);
@@ -5090,19 +5402,31 @@ async function applySingleRecordEdited(
     record.size,
     record.contentHash
   );
-  return "edited";
+  return { outcome: "edited", anchorCommit: null };
 }
 
 /** Conversation/Reflection/Source（1id=1file）のapply本体。実際に適用された
- *  outcomeを返す（"edited"がday/turn数ゲートで"conflict"へ切り替わる場合がある）。 */
+ *  outcomeを返す（"edited"がday/turn数ゲートで"conflict"へ切り替わる場合がある）。
+ *  C1（Codexレビュー指摘・High 1対応）：`anchorCommit`は、conflictで新規anchorが
+ *  実際にcommitされた場合のみ非null（呼び出し元が推測無しでregistry-index.jsonへ
+ *  反映するために使う）。 */
+/** C1（Codexレビュー指摘・High 1対応）：`applySingleRecordOutcome`/
+ *  `applyMemoryDayOutcome`共通の戻り値。`anchorCommit`は新規conflict anchorが
+ *  実際にcommitされた場合のみ非null。呼び出し元（`applyVaultResyncScanResult`）は
+ *  これとscan snapshotから、推測無しでregistry-index.jsonのentryを組み立てる。 */
+interface VaultResyncApplyOutcomeResult {
+  finalOutcome: VaultResyncOutcome;
+  anchorCommit: VaultRegistryConflictAnchorCommit | null;
+}
+
 async function applySingleRecordOutcome(
   root: FileSystemDirectoryHandle,
   record: VaultResyncRecordResult
-): Promise<VaultResyncOutcome> {
+): Promise<VaultResyncApplyOutcomeResult> {
   const kind = record.recordType as VaultResyncSingleKind;
   switch (record.outcome) {
     case "unchanged":
-      return "unchanged";
+      return { finalOutcome: "unchanged", anchorCommit: null };
     case "moved": {
       if (
         record.currentPath === null ||
@@ -5122,21 +5446,24 @@ async function applySingleRecordOutcome(
         record.size,
         record.contentHash
       );
-      return "moved";
+      return { finalOutcome: "moved", anchorCommit: null };
     }
     case "added":
       await applySingleRecordAdded(root, record, kind);
-      return "added";
-    case "edited":
-      return applySingleRecordEdited(root, record, kind);
+      return { finalOutcome: "added", anchorCommit: null };
+    case "edited": {
+      const result = await applySingleRecordEdited(root, record, kind);
+      return { finalOutcome: result.outcome, anchorCommit: result.anchorCommit };
+    }
     case "missing":
       await setVaultRegistryMissing(root, record.registryKey);
-      return "missing";
-    case "conflict":
-      await applyConflictOutcome(root, record);
-      return "conflict";
+      return { finalOutcome: "missing", anchorCommit: null };
+    case "conflict": {
+      const anchorCommit = await applyConflictOutcome(root, record);
+      return { finalOutcome: "conflict", anchorCommit };
+    }
     case "unreadable":
-      return "unreadable";
+      return { finalOutcome: "unreadable", anchorCommit: null };
   }
 }
 
@@ -5216,14 +5543,16 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
   }
 }
 
-/** normal Memory day-file（container単位）のapply本体。 */
+/** normal Memory day-file（container単位）のapply本体。C1（Codexレビュー指摘・
+ *  High 1対応）：`applySingleRecordOutcome`と同じ`VaultResyncApplyOutcomeResult`を
+ *  返す。 */
 async function applyMemoryDayOutcome(
   root: FileSystemDirectoryHandle,
   record: VaultResyncRecordResult
-): Promise<VaultResyncOutcome> {
+): Promise<VaultResyncApplyOutcomeResult> {
   switch (record.outcome) {
     case "unchanged":
-      return "unchanged";
+      return { finalOutcome: "unchanged", anchorCommit: null };
     case "moved": {
       if (
         record.currentPath === null ||
@@ -5249,19 +5578,20 @@ async function applyMemoryDayOutcome(
         memberIds,
         memberHashes
       );
-      return "moved";
+      return { finalOutcome: "moved", anchorCommit: null };
     }
     case "missing":
       await setVaultRegistryMissing(root, record.registryKey);
-      return "missing";
-    case "conflict":
+      return { finalOutcome: "missing", anchorCommit: null };
+    case "conflict": {
       // member removal conflict含む：previous memberIds/memberHashesは
       // `createVaultRegistryConflictAnchor`/`setVaultRegistryEntryStatus`の
       // いずれも「既存entryのstatusだけ変える」または「観測済みcontentHash等で
       // 新規anchorを作る」だけであり、member removal時のrecordはStep 4a側で
       // 既にpreviousの値を保持したまま渡ってくるため、ここで上書きすることはない。
-      await applyConflictOutcome(root, record);
-      return "conflict";
+      const anchorCommit = await applyConflictOutcome(root, record);
+      return { finalOutcome: "conflict", anchorCommit };
+    }
     case "added":
     case "edited": {
       await applyMemoryDayMembers(root, record); // 失敗時はthrowする
@@ -5289,10 +5619,73 @@ async function applyMemoryDayOutcome(
         memberIds,
         memberHashes
       );
-      return record.outcome;
+      return { finalOutcome: record.outcome, anchorCommit: null };
     }
     case "unreadable":
-      return "unreadable";
+      return { finalOutcome: "unreadable", anchorCommit: null };
+  }
+}
+
+/**
+ * C1（Codexレビュー指摘・High 1対応）：apply後にauthoritative Registry
+ * shardへ実際に存在するentry（path/mtime/size/recordType）を、推測ではなく
+ * 確定的に求める。追加I/Oは一切行わない（`previousEntries`はPhase 0で
+ * 既に読み込み済み、`anchorCommit`はapply helper自身が実際にcommitした
+ * 値をそのまま伝播したもの）。
+ *
+ * - unchanged/missing/conflict（`previousPath!==null`、＝既存entryのstatusだけ
+ *   変更）：shardは書き換えられていない。apply前の既存entry（`previousEntries`、
+ *   previousPathキー）がそのまま現在のauthoritative値——scanが観測した
+ *   `record.mtime`/`record.size`（ファイルの最新metadata）ではない
+ *   （unchangedでもmtimeだけ動いている可能性があり、それはshardに未反映のため）。
+ * - moved/edited/added（成功）：`commitVaultRegistrySingleRecordOk`/
+ *   `commitVaultRegistryMemoryDayOk`が実際に書き込んだ値そのもの
+ *   （＝`record.currentPath`/`record.mtime`/`record.size`/`record.recordType`。
+ *   これらはcommit呼び出しへ渡した引数と完全に同一）。
+ * - conflict（`previousPath===null`、＝新規anchor作成）：`anchorCommit`
+ *   （`createVaultRegistryConflictAnchor`が実際にcommitしたanchor path/entry）
+ *   をそのまま使う。race等でanchor作成がno-opだった場合は`null`
+ *   （shard上にこのkeyのrecordがまだ存在しないため、含めない）。
+ * - unreadable：`null`（scan.recordsには現れない防御的分岐）。
+ */
+function computeFinalRegistryEntry(
+  record: VaultResyncRecordResult,
+  finalOutcome: VaultResyncOutcome,
+  previousEntries: ReadonlyMap<string, VaultRegistryFileEntry>,
+  anchorCommit: VaultRegistryConflictAnchorCommit | null
+): VaultRegistryIndexEntry | null {
+  switch (finalOutcome) {
+    case "unchanged":
+    case "missing": {
+      if (record.previousPath === null) return null;
+      const prev = previousEntries.get(record.previousPath);
+      if (!prev) return null;
+      return { path: record.previousPath, mtime: prev.mtime, size: prev.size, recordType: prev.recordType };
+    }
+    case "moved":
+    case "edited":
+    case "added": {
+      if (record.currentPath === null || record.mtime === null || record.size === null) return null;
+      return { path: record.currentPath, mtime: record.mtime, size: record.size, recordType: record.recordType };
+    }
+    case "conflict": {
+      if (record.previousPath !== null) {
+        // 既存entryのstatusだけがconflictへ変わった（pathはそのまま）。
+        const prev = previousEntries.get(record.previousPath);
+        if (!prev) return null;
+        return { path: record.previousPath, mtime: prev.mtime, size: prev.size, recordType: prev.recordType };
+      }
+      // previousPath===null：新規anchor作成（またはrace時のno-op）。
+      if (!anchorCommit) return null;
+      return {
+        path: anchorCommit.path,
+        mtime: anchorCommit.entry.mtime,
+        size: anchorCommit.entry.size,
+        recordType: anchorCommit.entry.recordType,
+      };
+    }
+    case "unreadable":
+      return null;
   }
 }
 
@@ -5311,17 +5704,23 @@ async function applyVaultResyncScanResult(
   const applyErrors: VaultResyncApplyError[] = [];
   const conflictDetails: VaultResyncConflictDetail[] = [];
   const missingDetails: VaultResyncMissingDetail[] = [];
+  const recordOutcomes: VaultResyncApplyRecordOutcome[] = [];
 
   for (const record of scan.records) {
     let finalOutcome: VaultResyncOutcome;
+    let anchorCommit: VaultRegistryConflictAnchorCommit | null = null;
+    let failed = false;
     try {
-      finalOutcome =
+      const result =
         record.recordType === "memory-day"
           ? await applyMemoryDayOutcome(root, record)
           : await applySingleRecordOutcome(root, record);
+      finalOutcome = result.finalOutcome;
+      anchorCommit = result.anchorCommit;
       counts[finalOutcome] += 1;
     } catch (error) {
       finalOutcome = record.outcome;
+      failed = true;
       counts[finalOutcome] += 1;
       applyErrors.push({
         registryKey: record.registryKey,
@@ -5329,6 +5728,13 @@ async function applyVaultResyncScanResult(
         reason: error instanceof Error ? error.message : String(error),
       });
     }
+    // C1（Codexレビュー指摘・High 1対応）：apply失敗時はshardが未変更のため、
+    // unchanged/missingと同じ「apply前の既存entryをそのまま使う」ロジックで
+    // finalRegistryEntryを求める（previousPathが無ければnull）。
+    const finalRegistryEntry = failed
+      ? computeFinalRegistryEntry(record, "unchanged", scan.previousEntries, null)
+      : computeFinalRegistryEntry(record, finalOutcome, scan.previousEntries, anchorCommit);
+    recordOutcomes.push({ registryKey: record.registryKey, finalOutcome, failed, finalRegistryEntry });
 
     // 実機不具合対応（診断情報）：分類ロジックは変更せず、最終的に確定した
     // outcomeがconflict/missingの場合だけ、既存のnote等をそのまま転記する。
@@ -5362,7 +5768,62 @@ async function applyVaultResyncScanResult(
     unreadableFiles: scan.unreadableFiles,
     conflictDetails,
     missingDetails,
+    recordOutcomes,
   };
+}
+
+/**
+ * C1（軽量Registry index・多tab安全性設計のbootstrap/rebuild foundation）：
+ * apply完了後のauthoritative Registry状態から、追加のshard読み込み無しで
+ * registry-index.jsonの`records`を構築する純粋関数（Vault I/Oを一切行わない）。
+ *
+ * 【index契約（Codexレビュー指摘・High 1対応で明確化）】registry-index.jsonは
+ * 「authoritative Registry shardに存在する全known recordについて、
+ * registryKey/path/mtime/size/recordTypeを保持するlightweight projection」
+ * である。status="ok"限定ではない——missing/conflict/needs-resync等であっても、
+ * shardにrecordが存在する限りindexにもkeyを存在させる。schemaにstatus
+ * 自体は含めない（C1時点のL1/L2用途では不要なため。5-field schemaのまま）。
+ *
+ * 使うデータ構造は次の2つだけ（いずれも本resync実行中に既にメモリ上へ
+ * 読み込み/計算済み、追加のshard読み込みは一切発生しない）：
+ *   1. `scan.previousByKey`/`scan.previousEntries`：Phase 0で読み込んだ、
+ *      apply前のauthoritative Registryスナップショット全体（baseline——
+ *      本resyncで一切触れられなかったkeyをそのまま保持するために使う）。
+ *   2. `recordOutcomes`：`applyVaultResyncScanResult`が実際にapplyした結果。
+ *      各entryの`finalRegistryEntry`は、apply helper自身が実際にshardへ
+ *      write/保持したentryそのもの（scan metadataからの推測ではない——
+ *      `computeFinalRegistryEntry`参照）。
+ *
+ * 手順：まずbaseline（apply前の全体像）でrecordsを初期化する。次に、
+ * 今回のresyncで実際に処理された各recordについて、`finalRegistryEntry`が
+ * 非nullならその値で上書き、nullなら（shard上に対応するrecordが存在しない
+ * ことが確定しているため）indexから削除する。
+ */
+function buildVaultRegistryIndexRecordsFromResync(
+  scan: VaultResyncScanResult,
+  recordOutcomes: readonly VaultResyncApplyRecordOutcome[]
+): Record<string, VaultRegistryIndexEntry> {
+  const records: Record<string, VaultRegistryIndexEntry> = {};
+
+  // baseline：apply前のauthoritative Registry状態（追加I/Oなし、既読のsnapshot）。
+  for (const [registryKey, path] of scan.previousByKey.entries()) {
+    const entry = scan.previousEntries.get(path);
+    if (!entry) continue;
+    records[registryKey] = { path, mtime: entry.mtime, size: entry.size, recordType: entry.recordType };
+  }
+
+  // apply helperが実際にcommitした確定値で上書きする（推測なし）。
+  for (const outcome of recordOutcomes) {
+    if (outcome.finalRegistryEntry !== null) {
+      records[outcome.registryKey] = outcome.finalRegistryEntry;
+    } else {
+      // shard上にこのkeyのrecordが存在しないことが確定している
+      // （例：previousPathも無く、新規conflict anchor作成もno-opだった）。
+      delete records[outcome.registryKey];
+    }
+  }
+
+  return records;
 }
 
 /**
@@ -5377,13 +5838,20 @@ async function applyVaultResyncScanResult(
  * 記録（この場合countsは元のclassification outcome側に計上される）。
  *
  * `lastFullResyncUpdated`は、`scanCompleted===true`かつ`applyErrors.length===0`の
- * 場合にのみtrueになる（「最後にVault全体を走査し、実行可能なreconciliation処理
- * まで正常に完了した時刻」という意味をlastFullResyncAtに持たせるため。conflict/
- * missingへの正常な分類・適用はそれ自体エラーではないため更新を妨げない）。
- * registry-meta自体の書き込みが失敗した場合は、resync全体をthrowさせず、
- * "__registry_meta__"というsystem-level `VaultResyncApplyError`として
- * `applyErrors`へ追加し、`lastFullResyncUpdated=false`のまま結果を返す
- * （resync自体は正常に完了しているため、個別の失敗として扱う）。
+ * 場合にのみtrueになりうる（conflict/missingへの正常な分類・適用はそれ自体
+ * エラーではないため更新を妨げない）。Low修正（Codexレビュー指摘）：この
+ * flagは「meta.lastFullResyncAtが更新されたか」だけを表すものではなく、
+ * このresyncが意図した確立処理全体——lastFullResyncAt/baselineEstablishedAt
+ * の更新、および`previousSnapshotCompleted`がtrueの場合はC1の
+ * registry-index/registryGeneration/dirtyOwnerInstanceId/
+ * registryGenerationEpochの新規確立——が最後まで完了を確認できたかを表す。
+ * したがって`false`は「meta.jsonの内容が一切変化していない」ことを意味
+ * しない（例：index/meta writeまでは成功し、epoch bumpだけが例外を投げた
+ * 場合でも`false`になる。呼び出し元はこのflagを物理的なmeta不変の証明として
+ * 扱ってはならない）。registry-meta/index/epoch自体の書き込みが失敗した場合は、
+ * resync全体をthrowさせず、"__registry_meta__"というsystem-level
+ * `VaultResyncApplyError`として`applyErrors`へ追加し、`lastFullResyncUpdated=false`
+ * のまま結果を返す（resync自体は正常に完了しているため、個別の失敗として扱う）。
  */
 export interface VaultResyncResult {
   scanCompleted: boolean;
@@ -5406,6 +5874,107 @@ export interface VaultResyncResult {
   lastFullResyncUpdated: boolean;
 }
 
+/**
+ * C1 Step 0専用のfail-closed meta reader（Codexレビュー再指摘対応）。
+ *
+ * 既存の`readVaultRegistryMeta`（`readJSON`経由、getFileHandle/getFile/
+ * readText/JSON.parseのいずれが失敗しても静かにempty metaへfallbackする
+ * 既存の共有契約）は一切変更しない。Step 0は「安全性を確認できなければ
+ * Registry mutationへ進まない」というfail-closed contractを守る必要が
+ * あるため、この関数はresync専用の別経路として、真正NotFound（＝Registry
+ * 未確立の正常な状態）と、それ以外の読み込み失敗（permission/SecurityError/
+ * I-O error/JSON.parse失敗/構造不正）を明確に区別する：
+ *   - "not-found"：`.tsumugi`または`registry-meta.json`が真正に存在しない。
+ *     既存の「generation未確立」と同等に扱ってよい。
+ *   - "found"：読み込み・parse・最低限の構造検証に全て成功した。
+ *   - "error"：上記いずれにも該当しない失敗。安全性を確認できないため、
+ *     Step 0はこの場合scan/applyへ進んではならない。
+ *
+ * L1/L2/L4・A1/A2・既存の他のread箇所（`readVaultRegistryMeta`自体を
+ * 含む）には一切触れない——この関数はStep 0からのみ呼ばれる。
+ */
+type VaultRegistryMetaReadForStep0 =
+  | { status: "not-found" }
+  | { status: "found"; meta: VaultRegistryMeta }
+  | { status: "error"; error: unknown };
+
+/** `readVaultRegistryMetaForStep0`専用の最低限の構造検証。既存
+ *  `readVaultRegistryMeta`のような型assertionだけの信頼はしない。 */
+function isValidVaultRegistryMetaShape(parsed: unknown): parsed is VaultRegistryMeta {
+  if (typeof parsed !== "object" || parsed === null) return false;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.schemaVersion !== 1) return false;
+  if (typeof obj.updatedAt !== "string") return false;
+  if (obj.lastFullResyncAt !== null && typeof obj.lastFullResyncAt !== "string") return false;
+  if (
+    obj.baselineEstablishedAt !== undefined &&
+    obj.baselineEstablishedAt !== null &&
+    typeof obj.baselineEstablishedAt !== "string"
+  ) {
+    return false;
+  }
+  if (obj.registryGeneration !== undefined && typeof obj.registryGeneration !== "string") return false;
+  if (
+    obj.dirtyOwnerInstanceId !== undefined &&
+    obj.dirtyOwnerInstanceId !== null &&
+    typeof obj.dirtyOwnerInstanceId !== "string"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function readVaultRegistryMetaForStep0(root: FileSystemDirectoryHandle): Promise<VaultRegistryMetaReadForStep0> {
+  let tsumugiDir: FileSystemDirectoryHandle;
+  try {
+    tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+  } catch (error) {
+    if (isVaultRegistryDirectoryNotFoundError(error)) return { status: "not-found" };
+    return { status: "error", error };
+  }
+
+  let fileHandle: FileSystemFileHandle;
+  try {
+    fileHandle = await tsumugiDir.getFileHandle("registry-meta.json", { create: false });
+  } catch (error) {
+    if (isVaultRegistryDirectoryNotFoundError(error)) return { status: "not-found" };
+    return { status: "error", error };
+  }
+
+  try {
+    const file = await fileHandle.getFile();
+    const text = await file.text();
+    const parsed: unknown = JSON.parse(text);
+    if (!isValidVaultRegistryMetaShape(parsed)) {
+      return { status: "error", error: new Error("registry-meta.json failed structural validation") };
+    }
+    // 既存readVaultRegistryMetaと同じ正規化（undefined→null）。
+    const meta: VaultRegistryMeta = {
+      ...parsed,
+      baselineEstablishedAt: parsed.baselineEstablishedAt ?? null,
+      dirtyOwnerInstanceId: parsed.dirtyOwnerInstanceId ?? null,
+    };
+    return { status: "found", meta };
+  } catch (error) {
+    return { status: "error", error };
+  }
+}
+
+/** Step 0がRegistryへ一切触れずresyncを中止する際に返す合成結果を組み立てる。
+ *  meta read失敗・invalidate失敗のいずれの経路からも同じ形を使う。 */
+function buildAbortedVaultResyncApplyResult(reason: string): VaultResyncApplyResult {
+  return {
+    scanCompleted: false,
+    scannedFileCount: 0,
+    counts: { unchanged: 0, moved: 0, edited: 0, added: 0, missing: 0, conflict: 0, unreadable: 0 },
+    applyErrors: [{ registryKey: "__registry_meta__", reason }],
+    unreadableFiles: [],
+    conflictDetails: [],
+    missingDetails: [],
+    recordOutcomes: [],
+  };
+}
+
 export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Promise<VaultResyncResult> {
   const startedAt = new Date().toISOString();
 
@@ -5415,12 +5984,92 @@ export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Prom
   // withVaultWorldRead/runVaultSwitchExclusive/runVaultWorldExclusiveの
   // いずれも再帰的に呼ばない（呼び出し元のscan/apply実装がそれを保証する）。
   const lockResult = await runVaultWorldExclusive(async () => {
+    // Step 0（fail-closed invalidation contract、Codexレビュー再指摘対応）：
+    // Registryへ一切触れる前に、現在の状態が「CLEAN」（owner===null かつ
+    // registryGeneration確立済み）に見える場合、必ずここで無条件にinvalidateする。
+    // meta write・epoch bumpの両方が成功して初めて、この後のapply（Registry
+    // mutation）へ進んでよい——どちらか一方でも失敗したら、Registryへは一切
+    // 触れず、このresync実行全体を中止する。
+    //
+    // 理由：「新しいfreshなindexを確立できない可能性がある状態でapplyが
+    // Registryを変更してしまうと、古いindex/generationが実体と食い違ったまま
+    // 『まだ有効』に見えてしまう」というfalse-freshを、事後の後始末ではなく
+    // 事前の無効化で構造的に防ぐ（前回設計で見つかった「invalidate-last」の
+    // 穴——安全化step自身が失敗した場合の逃げ場が無い——を、「安全化に
+    // 失敗したら安全化すべき対象＝Registry mutation自体を発生させない」
+    // という一段強い保証に置き換える）。
+    //
+    // epoch bumpも同時に必須とする理由：将来C2のOWNED_DIRTY steady-state
+    // mutationは、registry lock取得後にepochだけを確認し、一致すれば
+    // meta/indexを読まずにshard mutationへ進む設計になる予定。resyncが
+    // このexclusive world lockを保持している間、shared world lockを要する
+    // 通常mutationは構造的に開始できないため、既存zombie tabがepochを
+    // 観測できる最初のタイミングは、必ずこの排他区間が完全に終わった後になる。
+    // したがってStep 0でepochを少なくとも1回前進させておけば、resyncが
+    // 実際にRegistryを変更し始める前に、既存zombieの古いepoch信念は
+    // 必ず無効化される。
+    // Codexレビュー再指摘対応：Step 0が現在の状態を正しく確認できなければ、
+    // このresyncはRegistryへ一切触れてはならない。既存の`readVaultRegistryMeta`
+    // （読み込み失敗を静かにempty metaへfallbackする）をStep 0で使うと、
+    // 実際にはdisk上にCLEAN state（meta G_old/owner=null、index G_old）が
+    // 存在するのに、一時的なI/O失敗等でempty meta（registryGeneration
+    // undefined）に見えてしまい、invalidateをskipしたままscan/applyへ
+    // 進んでしまう危険があった。`readVaultRegistryMetaForStep0`は
+    // 真正NotFound（Registry未確立の正常な状態）とそれ以外の失敗
+    // （permission/I-O/parse/構造不正）を明確に区別する。
+    const preMetaRead = await readVaultRegistryMetaForStep0(root);
+    if (preMetaRead.status === "error") {
+      const reason = preMetaRead.error instanceof Error ? preMetaRead.error.message : String(preMetaRead.error);
+      return {
+        applyResult: buildAbortedVaultResyncApplyResult(
+          `failed to read the current registry meta before resync (cannot confirm safety of invalidation); aborting without touching the registry: ${reason}`
+        ),
+        lastFullResyncUpdated: false,
+      };
+    }
+    if (preMetaRead.status === "found" && preMetaRead.meta.dirtyOwnerInstanceId === null && preMetaRead.meta.registryGeneration !== undefined) {
+      const preMeta = preMetaRead.meta;
+      try {
+        const invalidatedGeneration = generateVaultRegistryGeneration();
+        await writeVaultRegistryMeta(root, {
+          ...preMeta,
+          registryGeneration: invalidatedGeneration,
+          dirtyOwnerInstanceId: null,
+        });
+        const currentEpoch = await getRegistryGenerationEpoch();
+        await bumpRegistryGenerationEpoch(currentEpoch);
+      } catch (error) {
+        return {
+          applyResult: buildAbortedVaultResyncApplyResult(
+            `failed to invalidate the existing CLEAN registry state before resync; aborting without touching the registry: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          ),
+          lastFullResyncUpdated: false,
+        };
+      }
+    }
+    // preMetaRead.status === "not-found"：既存の「generation未確立」と同等
+    // （invalidateすべき既存CLEAN state自体が存在しない）。そのままscan/applyへ
+    // 進んでよい。preMetaRead.status === "found"でnon-clean（既にowner有り、
+    // またはMULTIPLE）だった場合も、invalidateすべきfresh state自体が
+    // 存在しないため同様にそのまま進む（確定済みstate machineの通り）。
+
+    // 既存resync behavior（変更しない）：Vault全体のdirectory enumeration
+    // （Phase 1）＋apply（Step 4b）。Step 0を通過した（＝無効化が必要無かった、
+    // または無効化に成功した）場合にのみここへ到達する。
     const scan = await performVaultResyncScan(root);
     const applyResult = await applyVaultResyncScanResult(root, scan);
 
     let lastFullResyncUpdated = false;
     if (applyResult.scanCompleted && applyResult.applyErrors.length === 0) {
       try {
+        // Step 0でinvalidateされた（または元々non-cleanだった）最新のmetaを
+        // 読み直す。lastFullResyncAt/baselineEstablishedAtはこのresyncの
+        // scan+applyが正常に完了した以上、C1のindex/generation確立が
+        // 行われるかどうかとは独立して更新してよい——ただし、下記の
+        // 「Step 3のepoch bump失敗時」だけは例外的にこのwriteごと行わない
+        // （Codexレビュー再指摘：新しいfailure windowを増やさないため）。
         const meta = await readVaultRegistryMeta(root);
         const now = new Date().toISOString();
         meta.lastFullResyncAt = now;
@@ -5432,12 +6081,69 @@ export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Prom
           meta.baselineEstablishedAt = startedAt;
         }
         meta.updatedAt = now;
-        await writeVaultRegistryMeta(root, meta);
+
+        // C1（Codexレビュー指摘・High 2対応）：apply前のRegistry snapshot読み込み
+        // （Phase 0：directory enumeration＋個々のshard読み込み）が一切の失敗
+        // 無く完了した場合（`scan.previousSnapshotCompleted`）にのみ、新しい
+        // fresh CLEANの確立を試みる。不完全なsnapshotから構築したindexを
+        // 「fresh」と宣言してはならない（High 2の核心）。
+        if (scan.previousSnapshotCompleted) {
+          // Step 3 ordering（Codexレビュー再指摘対応）：index write → epoch bump
+          // → meta CLEAN write の順で固定する。meta CLEAN write（owner=null＋
+          // 新generationの確定）だけが「CLEAN publication」の唯一のcommit
+          // pointであり、その直前でepoch bumpの成功を必須の前提条件とする。
+          const newGeneration = generateVaultRegistryGeneration();
+          const index: VaultRegistryIndex = {
+            schemaVersion: 1,
+            builtAtGeneration: newGeneration,
+            records: buildVaultRegistryIndexRecordsFromResync(scan, applyResult.recordOutcomes),
+          };
+          await writeVaultRegistryIndex(root, index); // (a)
+
+          const currentEpoch = await getRegistryGenerationEpoch();
+          await bumpRegistryGenerationEpoch(currentEpoch); // (b)
+          // ここへ到達できるのは(b)が成功した場合のみ。(b)が例外を投げた
+          // 場合、以降のmeta更新・meta write（(c)）は一切実行されず、
+          // catchへ落ちる——meta.jsonはStep 0でinvalidateされた値
+          // （または元々non-cleanだった値）のまま残る（意図的：後述）。
+
+          // C1：このresyncが確立した最新authoritative状態を表す、新しい
+          // generation。dirtyOwnerInstanceIdは無条件でnull（clean）へ戻す
+          // ——生きているOWNED_DIRTY ownerが存在していても、fullな
+          // authoritative rebuildである以上、そのownerのmirror内容に
+          // 依存せず安全に上書きできる（owner本人が居なくても正しい
+          // indexを再構築できるのがexpensive rebuildの定義）。
+          meta.registryGeneration = newGeneration;
+          meta.dirtyOwnerInstanceId = null;
+          await writeVaultRegistryMeta(root, meta); // (c) CLEAN publicationの唯一のcommit point
+        } else {
+          console.warn(
+            "[Tsumugi] resyncVaultRegistry: registry snapshot read was incomplete; skipping registry-index/generation/epoch establishment this run (existing values preserved)."
+          );
+          // snapshot不完全時はregistryGeneration/dirtyOwnerInstanceIdへ一切
+          // 触れない（Step 0の結果、またはnon-clean値をそのまま維持）。
+          // このwriteはlastFullResyncAt等の更新のみが目的で、CLEAN
+          // publicationとは無関係のため無条件に行ってよい。
+          await writeVaultRegistryMeta(root, meta);
+        }
+
         lastFullResyncUpdated = true;
       } catch (error) {
+        // Codexレビュー再指摘対応：Step 3のepoch bump（(b)）が失敗した場合、
+        // 上記の通りmeta write（(c)）自体に到達しないため、ここで改めて
+        // meta.jsonへ何かを書き戻そうとはしない——Step 0で確立済みの
+        // invalidated meta（またはnon-clean meta）をそのまま残す方が、
+        // 新たなfailure window（この後始末write自体が失敗する可能性）を
+        // 増やすより安全（fail-closed）である。
+        //
+        // Low修正（Codexレビュー指摘）：`lastFullResyncUpdated=false`は
+        // 「meta.jsonが一切更新されなかった」ことを意味しない——このresyncが
+        // 意図した確立処理のうち、少なくとも1ステップが完了を確認できな
+        // かったことを意味するだけであり、呼び出し元はこのflagを
+        // 「meta.jsonの内容が完全に不変」と解釈してはならない。
         applyResult.applyErrors.push({
           registryKey: "__registry_meta__",
-          reason: `failed to update registry meta: ${error instanceof Error ? error.message : String(error)}`,
+          reason: `failed to establish registry meta/index/generation: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
     }
@@ -6631,6 +7337,14 @@ export async function applyVaultLightCheckCandidates(
       scannedFileCount: applicable.length,
       records: applicable,
       unreadableFiles: [],
+      // C1でVaultResyncScanResultへ追加したfield。L4（light check apply）は
+      // 個別candidateの適用のみを行い、full resyncのようなbaseline snapshotを
+      // 持たない（そもそも持つ必要が無い——applyVaultResyncScanResultはこの
+      // 3 fieldを一切参照しない。resyncVaultRegistry側のindex構築でのみ使う）。
+      // 空Map・trueを渡すのみで、L4の分類・適用ロジックには一切影響しない。
+      previousByKey: new Map(),
+      previousEntries: new Map(),
+      previousSnapshotCompleted: true,
     });
 
     return { counts: applyResult.counts, applyErrors: applyResult.applyErrors, staleSkipped };
