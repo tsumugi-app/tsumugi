@@ -49,6 +49,32 @@ import {
 } from "./markdown";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 
+/**
+ * B1（軽量Registry index・多tab安全性設計）：このpage load（session）固有の
+ * ランダムID。Registry ownershipの安全性根拠として使う——`meta.dirtyOwnerInstanceId`
+ * と比較し、「自分が現在のdirty spellの唯一の所有者か」を判定するために使う。
+ *
+ * `debugTimingLog.ts`の`instanceId`（診断ログの相関用、8文字に切り詰め、privacy
+ * 目的で軽量）とは責務を分離し、**流用しない**。こちらは安全性判定の根拠に使うため、
+ * `crypto.randomUUID()`をそのまま（切り詰めずに）使い、衝突耐性を優先する。
+ *
+ * 今回（B1/B2）はこの定数を定義するだけで、実際のRegistry mutation経路・
+ * light check・UIのいずれからも参照されない（配線はB3以降）。
+ */
+export const vaultRegistryInstanceId: string =
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `fallback-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+
+/**
+ * B1：`meta.dirtyOwnerInstanceId`が「複数instanceが関与し、誰の所有権主張も
+ * 無効化された」ことを示すための固定sentinel値。マジック文字列を各所へ直接
+ * 書かないよう、この定数を経由して比較・代入する。`crypto.randomUUID()`が
+ * 生成する値（ダッシュ区切りの36文字UUID形式）とは形式が異なるため、実際の
+ * instanceIdと偶然一致することは無い。
+ */
+export const VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE = "MULTIPLE" as const;
+
 const VAULT_DIRS = ["Conversations", "Memories", "People", "Themes", "Emotions", "Goals", "Ideas", "Events", "Attachments"] as const;
 
 export type VaultPermissionState = "granted" | "prompt" | "denied" | "unsupported" | "unset";
@@ -2247,6 +2273,32 @@ export interface VaultRegistryMeta {
    * （`readVaultRegistryMeta`）で必ず`undefined`を`null`へ正規化する。
    */
   baselineEstablishedAt: string | null;
+  /**
+   * B1（軽量Registry index・多tab安全性設計）：現在の「dirty spell」を識別する
+   * generation token。`registryGeneration`未確立（このfieldが存在しない、＝
+   * 旧Vaultまたは初回）の場合、将来のB2以降の判定では「cheap ownershipを
+   * 許可しない」側へ倒す（`readVaultRegistryMeta`は値を強制せず、`undefined`
+   * のまま返す——「未確立」という事実自体が意味を持つため、他のfieldのように
+   * nullへ正規化しない）。
+   *
+   * 今回（B1/B2）はこのfieldを実際に書き込む経路がまだ存在しない
+   * （配線はB3以降）。既存のfull resync等の書き込み経路は、読み込んだ
+   * `VaultRegistryMeta`オブジェクトをread-modify-writeするだけであり、この
+   * fieldに触れなければ`JSON.stringify`が自動的に省略するため、既存Vaultの
+   * registry-meta.jsonに意図せずこのfieldが出現することは無い。
+   */
+  registryGeneration?: string;
+  /**
+   * B1：現在のdirty spellの所有者。`null`＝clean（誰もdirty spellを構成して
+   * いない）。実在のinstanceId＝その1つのinstanceが唯一の所有者。
+   * `VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE`＝複数instanceが関与し、誰の所有権
+   * 主張も無効（cheap indexのpersistは誰にも許可しない）。
+   *
+   * 旧Vaultにはこのfieldが存在しないため、`readVaultRegistryMeta`は
+   * `undefined`を`null`（clean）へ正規化する——`baselineEstablishedAt`と同じ
+   * パターン。今回（B1/B2）はこのfieldを実際に書き込む経路がまだ存在しない。
+   */
+  dirtyOwnerInstanceId?: string | null;
 }
 
 /** 呼び出しごとに新しいオブジェクトを返す（`emptyHistoryMeta`/`emptyMonthIndex`と
@@ -2258,7 +2310,9 @@ function emptyVaultRegistryShard(bucket: number): VaultRegistryShard {
 }
 
 function emptyVaultRegistryMeta(): VaultRegistryMeta {
-  return { schemaVersion: 1, updatedAt: "", lastFullResyncAt: null, baselineEstablishedAt: null };
+  // B1: registryGenerationはあえて含めない（＝undefined）。「未確立」という
+  // 状態そのものが意味を持つため、他のfieldのように既定値を与えない。
+  return { schemaVersion: 1, updatedAt: "", lastFullResyncAt: null, baselineEstablishedAt: null, dirtyOwnerInstanceId: null };
 }
 
 /**
@@ -2385,7 +2439,14 @@ export async function readVaultRegistryMeta(root: FileSystemDirectoryHandle): Pr
     // 旧registry-meta.json（baselineEstablishedAt導入前）にはこのfieldが存在せず
     // `undefined`のままparseされる。呼び出し元が`undefined`/`null`の両方を
     // 意識せず済むよう、この関数から返る値は必ずstring | nullの正規形にする。
-    return { ...parsed, baselineEstablishedAt: parsed.baselineEstablishedAt ?? null };
+    // B1：`dirtyOwnerInstanceId`も同じ理由で`undefined`→`null`（clean）へ正規化する。
+    // `registryGeneration`はあえて正規化しない——`undefined`（未確立）という
+    // 状態自体がB2以降の判定にとって意味を持つ値のため。
+    return {
+      ...parsed,
+      baselineEstablishedAt: parsed.baselineEstablishedAt ?? null,
+      dirtyOwnerInstanceId: parsed.dirtyOwnerInstanceId ?? null,
+    };
   } catch {
     return emptyVaultRegistryMeta();
   }
@@ -2422,6 +2483,242 @@ async function writeVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: 
 async function writeVaultRegistryMeta(root: FileSystemDirectoryHandle, meta: VaultRegistryMeta): Promise<void> {
   const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
   await writeFileInDir(tsumugiDir, "registry-meta.json", JSON.stringify(meta, null, 2), "registry meta write");
+}
+
+// ---------------------------------------------------------------------------
+// B2（軽量Registry index・多tab安全性設計）：ownership state machineのpure logic
+//
+// 重要：このセクションの関数群は、まだどこからも呼ばれていない（配線はB3以降）。
+// 現在のRegistry mutation経路（writeVaultRegistryShard/upsertVaultRegistryRecord/
+// markVaultRegistryNeedsResync/commitVaultRegistrySingleRecordOk/
+// applyConflictOutcome/full resync）・L1/L2/L3/L4・light check startup・UIの
+// いずれもこの関数群を参照しない。したがってこのセクションの追加だけでは、
+// Vaultのruntime動作は一切変化しない。
+//
+// ここに定義する関数はいずれも副作用を持たない（Vault I/O・lock取得を一切
+// 行わない）純粋関数。「今、何をすべきか」を判定するだけで、実際のmeta/index
+// read・write・lock取得は全て将来のB3以降で、呼び出し元が担う。
+//
+// レビュー指摘（Medium 1）を受けて、CLEANからのownership開始判定と、
+// OWNED_DIRTY/CONTESTEDのsteady-state継続判定を明確に分離した。このセクションが
+// 提供する`decideVaultRegistryOwnershipStart`は「CLEANからownershipを開始
+// できるか」だけを判定し、steady-state継続はこの関数の責務外（B3では、既に
+// OWNED_DIRTY/CONTESTEDのinstanceはこの関数を呼ばず、session-local stateを
+// そのまま使うfast pathとして扱う想定。そのfast path自体の新規pure function
+// 化は今回のB2の対象外）。
+//
+// 【最重要の呼び出し規約（Invariant 6）】
+// この2関数へ渡す`meta`（registryGeneration/dirtyOwnerInstanceId）は、
+// 必ず`withVaultRegistryLock`を取得した**後**に改めて読み直した最新の値で
+// なければならない。lock取得前に保持していたstale な値を渡すと、
+// 別tabが同じlockの中で行った変更を見落とし、false-freshの原因になる
+// （詳細はowner重複反例の調査を参照）。この規約を呼び出し側の実装ミスで
+// 破りにくくするため、あえて「lock内で読んだfreshなmeta」という前提を
+// 関数名・JSDoc・パラメータ名（`freshMeta`）で明示する。
+// ---------------------------------------------------------------------------
+
+/** このinstance（page load）が、Registry mutationの文脈で現在どのsession
+ *  stateにいるかを表す。boolean `sessionDirty`ではなく、3値のstate machine
+ *  として扱う（詳細は各値のコメント参照）。`decideVaultRegistryOwnershipStart`
+ *  自体はこの型を入力に取らない（CLEAN専用のため）が、`checkVaultRegistry
+ *  IndexPersistPreconditions`の入力として、また呼び出し元（B3）が
+ *  session-local stateを持ち回すための共通の型として、ここで定義する。 */
+export type VaultRegistrySessionState = "CLEAN" | "OWNED_DIRTY" | "CONTESTED";
+
+/** `VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE`sentinelであることを型名で示すための
+ *  別名。runtimeでは通常のinstanceIdと同じ`string`型であり、brand type等に
+ *  よる強制的な型レベル区別は導入していない（過度な複雑化を避けるため——
+ *  検討した結果、branded typeにするとinstanceId生成・比較の全箇所へcastが
+ *  必要になり複雑化が実装量に見合わないと判断した）。実際の安全性は、この
+ *  型ではなく`checkVaultRegistryIndexPersistPreconditions`内のruntime明示
+ *  チェック（Medium 2対応）が担保する。 */
+export type VaultRegistryDirtyOwnerMultipleSentinel = typeof VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE;
+
+/**
+ * `decideVaultRegistryOwnershipStart`の判定結果。呼び出し元（将来のB3）が
+ * 実際に行うべきI/Oの種類を識別できるようにする。この関数はCLEANからの
+ * ownership開始判定専用であり、steady-state（既にOWNED_DIRTY/CONTESTEDの
+ * instanceがそのまま継続してよいか）はこの型・関数の対象外。
+ *
+ * - `CLAIM_OWNED_DIRTY`: 現在clean（`meta.dirtyOwnerInstanceId===null`）かつ
+ *   自分のmirrorが現在のgenerationと一致している。呼び出し元は新しい
+ *   generation tokenを生成し、`meta.dirtyOwnerInstanceId`を自分のinstanceIdへ
+ *   書いた上でOWNED_DIRTYへ進んでよい。
+ * - `INDEX_CATCH_UP_REQUIRED`: 現在cleanだが自分のmirrorが古い。呼び出し元は
+ *   disk上のregistry-index.jsonを読み直し、`index.builtAtGeneration`が
+ *   `meta.registryGeneration`と一致することを確認できた場合に限りmirrorを
+ *   補完し、この関数を再度呼んで判定をやり直すべき（catch-up後は通常
+ *   `CLAIM_OWNED_DIRTY`になる）。
+ * - `BECOME_CONTESTED`: 他instance（または既存の"MULTIPLE"状態）が既に
+ *   dirty spellを構成している、または安全にcatch-upできない。
+ *   `requiresMultipleMarkerWrite`が`true`の場合、呼び出し元は
+ *   `meta.dirtyOwnerInstanceId`へ`VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE`を
+ *   書き込む必要がある（既にその値なら書き込み不要、`false`になる）。
+ * - `GENERATION_NOT_ESTABLISHED`: `meta.registryGeneration`自体が存在しない
+ *   （旧Vaultまたは初回）。owner側の値（null/自分と衝突しうる他instance/
+ *   MULTIPLEのいずれであっても）に一切関係なく、必ずこの値へfail-closed
+ *   する——cheap ownershipの比較対象となるbaseline自体が存在しないため。
+ *   `BECOME_CONTESTED`と実務上の扱い（cheap ownershipを許可せず、いずれ
+ *   64 shardからのfull rebuild/migrationへ倒す）は同じだが、「複数instance
+ *   の競合」ではなく「そもそも基盤が無い」ことを診断上区別できるよう別の
+ *   値として返す。`meta.dirtyOwnerInstanceId`への書き込みは行わない
+ *   （`requiresMultipleMarkerWrite`は常に`false`）。
+ */
+export type VaultRegistryOwnershipStartAction =
+  | "CLAIM_OWNED_DIRTY"
+  | "INDEX_CATCH_UP_REQUIRED"
+  | "BECOME_CONTESTED"
+  | "GENERATION_NOT_ESTABLISHED";
+
+export interface VaultRegistryOwnershipStartDecision {
+  action: VaultRegistryOwnershipStartAction;
+  /** `true`の場合、呼び出し元は`meta.dirtyOwnerInstanceId`へ
+   *  `VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE`を書き込む必要がある。それ以外の
+   *  actionでは常に`false`。 */
+  requiresMultipleMarkerWrite: boolean;
+}
+
+export interface VaultRegistryOwnershipStartInput {
+  /** このinstanceのin-memory mirrorが、どのregistry generationの状態を正しく
+   *  反映しているか。一度もcatch-up/確立していなければ`undefined`。 */
+  myMirrorBaselineGeneration: string | undefined;
+  /**
+   * Invariant 6：`withVaultRegistryLock`取得後に読み直した、最新の
+   * registry-meta.json由来の値のみを渡すこと。lock取得前の古い値を渡しては
+   * ならない。
+   */
+  freshMeta: {
+    registryGeneration: string | undefined;
+    dirtyOwnerInstanceId: string | VaultRegistryDirtyOwnerMultipleSentinel | null;
+  };
+  /** disk上のregistry-index.jsonが利用可能か、利用可能ならそのbuiltAtGeneration。
+   *  `INDEX_CATCH_UP_REQUIRED`後の再評価でのみ意味を持つ（catch-up前の初回
+   *  評価では`{available:false}`を渡してよい——generation不一致の場合は
+   *  どのみち一度`INDEX_CATCH_UP_REQUIRED`を返し、呼び出し元がindexを読んでから
+   *  この関数を再度呼ぶ設計のため）。 */
+  diskIndex: { available: false } | { available: true; builtAtGeneration: string };
+}
+
+/**
+ * CLEANからownershipを開始できるかどうかだけを判定する純粋関数（レビュー
+ * 指摘Medium 1を受けて、旧`decideVaultRegistryOwnershipTransition`から
+ * steady-state判定を切り離し、このCLEAN専用のAPIへ改名・縮小した）。
+ * Vault I/O・lock取得を一切行わない。入力に`localState`を含まない——この
+ * 関数を呼ぶこと自体が「呼び出し元は現在CLEANである」という前提であり、
+ * OWNED_DIRTY/CONTESTEDのsteady-state継続は、呼び出し元がこの関数を呼ばずに
+ * 自分のsession-local stateだけを見て判定する（B3のfast path）。
+ *
+ * 判定順序は固定：まず`registryGeneration`が未確立かどうかを、owner側の値に
+ * 一切関係なく最初に判定し、未確立なら無条件で`GENERATION_NOT_ESTABLISHED`へ
+ * fail-closedする。確立済みの場合のみ、owner（MULTIPLE／他instance／null）と
+ * baseline一致・disk index一致を見て判定する。
+ */
+export function decideVaultRegistryOwnershipStart(
+  input: VaultRegistryOwnershipStartInput
+): VaultRegistryOwnershipStartDecision {
+  const { freshMeta, myMirrorBaselineGeneration, diskIndex } = input;
+
+  // 最優先：registry generation自体が未確立（旧Vault/初回）。owner側の値
+  // （null/他instance/MULTIPLEのいずれであっても）を見るまでもなく、cheap
+  // ownershipの比較対象となるbaselineが存在しないため、常にfail-closedする。
+  if (freshMeta.registryGeneration === undefined) {
+    return { action: "GENERATION_NOT_ESTABLISHED", requiresMultipleMarkerWrite: false };
+  }
+
+  if (freshMeta.dirtyOwnerInstanceId === VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE) {
+    // 既に複数instanceの競合としてmarkされている。再度の書き込みは不要。
+    return { action: "BECOME_CONTESTED", requiresMultipleMarkerWrite: false };
+  }
+
+  if (freshMeta.dirtyOwnerInstanceId !== null) {
+    // 他instanceが既にdirty spellを構成している（この関数はCLEANからの
+    // 開始判定専用であり、呼び出し元は自分がCLEANだと認識している以上、
+    // ここに自分自身のinstanceIdが入っていることは正しい運用では起こらない
+    // ——起きていればsession-local stateとmeta状態の食い違いを示す異常系
+    // であり、いずれにせよ安全側で「他instance」として扱い競合へ倒す）。
+    return { action: "BECOME_CONTESTED", requiresMultipleMarkerWrite: true };
+  }
+
+  // freshMeta.dirtyOwnerInstanceId === null：現在clean。
+  if (myMirrorBaselineGeneration === freshMeta.registryGeneration) {
+    // 自分のmirrorは現在のclean generationと一致している。安全にownershipを
+    // 主張できる。
+    return { action: "CLAIM_OWNED_DIRTY", requiresMultipleMarkerWrite: false };
+  }
+
+  // 自分のmirrorは現在のgenerationより古い。disk indexから安全にcatch-up
+  // できるか確認する。
+  if (diskIndex.available && diskIndex.builtAtGeneration === freshMeta.registryGeneration) {
+    return { action: "INDEX_CATCH_UP_REQUIRED", requiresMultipleMarkerWrite: false };
+  }
+
+  // disk indexが利用不可、またはそれ自体が現在のgenerationと一致しない：
+  // cheapに整合を取る方法が無いため、安全側でCONTESTEDへ倒す。
+  return { action: "BECOME_CONTESTED", requiresMultipleMarkerWrite: true };
+}
+
+/** `checkVaultRegistryIndexPersistPreconditions`の入力。 */
+export interface VaultRegistryGPreconditionInput {
+  localState: VaultRegistrySessionState;
+  myInstanceId: string;
+  /** このinstance自身が`CLAIM_OWNED_DIRTY`時に生成・記録した、自分が所有して
+   *  いると信じているgeneration token。一度も主張していなければ`undefined`。 */
+  myOwnedGeneration: string | undefined;
+  /** Invariant 6：`withVaultRegistryLock`取得後に読み直した最新の値のみを渡すこと。 */
+  freshMeta: {
+    registryGeneration: string | undefined;
+    dirtyOwnerInstanceId: string | VaultRegistryDirtyOwnerMultipleSentinel | null;
+  };
+}
+
+export type VaultRegistryGPreconditionResult =
+  | { canPersist: true }
+  | { canPersist: false; reason: string };
+
+/**
+ * index persist（G）を実行してよいかどうかを判定する純粋関数。Vault I/O・lock
+ * 取得を一切行わない。呼び出し元は、この関数が`{canPersist:true}`を返した
+ * 場合に限り、実際のindex.json/meta.jsonへの書き込みへ進んでよい（それも
+ * 同じlock保持区間内で、他の変更が割り込む前に行うこと）。
+ *
+ * 6条件のAND判定（1つでも不成立ならfail-closedでabort、reasonに理由を残す
+ * だけで、Vault I/Oは一切発生しない）:
+ *   1. localState === "OWNED_DIRTY"
+ *   2. myOwnedGenerationが記録されている（undefinedでない）
+ *   3. myInstanceIdが`VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE`sentinelそのもの
+ *      ではない（レビュー指摘Medium 2：万一呼び出し元がinstanceIdの代わりに
+ *      誤ってsentinel値を渡した場合、条件5の等値比較がたまたま一致して
+ *      persistを誤って許可してしまう反例が存在したため、独立した明示チェック
+ *      として拒否する）
+ *   4. freshMeta.dirtyOwnerInstanceIdが`VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE`
+ *      sentinelではない（レビュー指摘Medium 2：条件5の不一致判定に暗黙的に
+ *      依存せず、MULTIPLE状態でのpersist拒否を独立した明示チェックとして
+ *      固定する）
+ *   5. freshMeta.dirtyOwnerInstanceId === myInstanceId
+ *   6. freshMeta.registryGeneration === myOwnedGeneration
+ */
+export function checkVaultRegistryIndexPersistPreconditions(
+  input: VaultRegistryGPreconditionInput
+): VaultRegistryGPreconditionResult {
+  if (input.localState !== "OWNED_DIRTY") {
+    return { canPersist: false, reason: "local session state is not OWNED_DIRTY" };
+  }
+  if (input.myOwnedGeneration === undefined) {
+    return { canPersist: false, reason: "no owned generation recorded for this instance" };
+  }
+  if (input.myInstanceId === VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE) {
+    return { canPersist: false, reason: "myInstanceId must not be the MULTIPLE sentinel" };
+  }
+  if (input.freshMeta.dirtyOwnerInstanceId === VAULT_REGISTRY_DIRTY_OWNER_MULTIPLE) {
+    return { canPersist: false, reason: "meta.dirtyOwnerInstanceId is MULTIPLE; ownership is contested" };
+  }
+  if (input.freshMeta.dirtyOwnerInstanceId !== input.myInstanceId) {
+    return { canPersist: false, reason: "meta.dirtyOwnerInstanceId does not match this instance" };
+  }
+  if (input.freshMeta.registryGeneration !== input.myOwnedGeneration) {
+    return { canPersist: false, reason: "meta.registryGeneration does not match the generation this instance owns" };
+  }
+  return { canPersist: true };
 }
 
 // ---------------------------------------------------------------------------
