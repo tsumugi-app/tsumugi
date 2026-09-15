@@ -801,13 +801,27 @@ export async function getRegistryGenerationEpoch(): Promise<number> {
  * 集約し、`tx.abort()`→`tx.done`のreject回収→元errorの再throw、という
  * 既存の後始末を全失敗パスで行う。成功パスのみ`tx.done`をawaitして
  * commitまで待つ（committed後に`next`を返す）。
+ *
+ * TypeScript修正（Vercel build指摘・Codexレビュー対応）：`next`を`try`の
+ * 外側で`let`宣言し、失敗パス側の`abortAndSettleTransaction`（戻り値
+ * `Promise<never>`、必ずthrowする）に実質的な後始末を任せる構成では、
+ * TypeScriptのdefinite assignment解析が「`next`はcatch節を経由しても
+ * 必ず代入済みである」ことを認識できず、`return next;`が
+ * "used before being assigned"として型エラーになった（実機のVercel build
+ * で確認）。CAS契約（単一readwrite transaction内でget→validate→expected
+ * compare→next算出→put→tx.done、失敗時は`abortAndSettleTransaction`で
+ * 後始末しrethrow）自体は一切変更せず、`next`の算出・`tx.done`のawait・
+ * `return`を全て同じ`try`ブロック内で完結させることで、「成功経路でのみ
+ * `next`を使い、そのまま返す」という構造をTypeScriptが素直に検証できる
+ * 形にした。catch節は`abortAndSettleTransaction`の呼び出しのみで終わり
+ * （戻り値`Promise<never>`により、この関数はここで正常終了しない）、
+ * 明示的な`return`は置かない。
  */
 export async function bumpRegistryGenerationEpoch(expectedEpoch: number): Promise<number> {
   const db = await getDB();
   const tx = db.transaction("settings", "readwrite");
   const store = tx.objectStore("settings");
 
-  let next: number;
   try {
     const raw = await store.get(REGISTRY_GENERATION_EPOCH_KEY);
     const status = parseStoredEpoch(raw);
@@ -820,16 +834,16 @@ export async function bumpRegistryGenerationEpoch(expectedEpoch: number): Promis
         `[Tsumugi] bumpRegistryGenerationEpoch: expected registryGenerationEpoch=${expectedEpoch} but found ${current}; refusing (stale).`
       );
     }
-    next = current + 1;
+    const next = current + 1;
     if (!Number.isSafeInteger(next)) {
       throw new Error(`[Tsumugi] bumpRegistryGenerationEpoch: epoch overflow (current=${current})`);
     }
     await store.put(String(next), REGISTRY_GENERATION_EPOCH_KEY);
+    await tx.done;
+    return next;
   } catch (error) {
     await abortAndSettleTransaction(tx, error);
   }
-  await tx.done;
-  return next;
 }
 
 /**
