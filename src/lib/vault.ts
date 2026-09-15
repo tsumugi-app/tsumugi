@@ -5622,13 +5622,26 @@ async function reverifyDuplicateConflictBeforeApply(
 
   // Step B：Registryの現在のポインタと内容（member署名／contentHash）を、
   // record.currentPath自身について独立して確認する（再実行の副作用に依存しない）。
-  const snapshot = await buildVaultRegistrySnapshot(root);
-  const currentRegistryPath = snapshot.previousByKey.get(record.registryKey) ?? null;
+  // 実機不具合対応（Android性能改善・A1）：この時点で必要なRegistry情報は
+  // record.registryKey 1件分だけであり、`buildVaultRegistrySnapshot`（全shard読み）
+  // ではなく`lookupVaultRegistryRecord`（bucket計算→単一shard読みのみ、
+  // operation間キャッシュ無し・毎回フレッシュ）で十分に同じ情報が得られる。
+  // `path`と`entry`は必ず同一のshard読み込みから得られる（`records`/`files`が
+  // 同じshardファイル内にあるため）。shardが無い／registryKeyが無い／I/Oエラー
+  // いずれの場合も`lookup.path`は`undefined`（＝下記`?? null`経由で`null`）に
+  // なる点は`buildVaultRegistrySnapshot`使用時と同じであり、Registry lookup
+  // 失敗・欠損時も既存のrevalidation semantics（`currentRegistryPath`と
+  // `record.previousPath`の比較結果に応じた判定）をそのまま維持する（弱くしない）。
+  const lookup = await lookupVaultRegistryRecord(root, record.registryKey);
+  const currentRegistryPath = lookup.path ?? null;
   if (currentRegistryPath !== record.previousPath) {
     return { registryKey: record.registryKey, reason: "conflict-changed" };
   }
   if (record.recordType === "memory-day") {
-    const previousEntry = record.previousPath !== null ? (snapshot.previousEntries.get(record.previousPath) ?? null) : null;
+    // currentRegistryPath === record.previousPath が確認済みのため、
+    // `lookup.entry`は`previousEntries.get(record.previousPath)`と同じ値
+    // （同一shardから取得済み）。
+    const previousEntry = record.previousPath !== null ? (lookup.entry ?? null) : null;
     const previousMemberHashes = previousEntry?.memberHashes ?? {};
     const freshSignature = await memoryDayConflictSignatureAtPath(root, record.currentPath, previousMemberHashes);
     if (freshSignature === null) {
@@ -5670,11 +5683,32 @@ async function reverifyNonDuplicateConflictBeforeApply(
   if (record.currentPath === null) {
     return { registryKey: record.registryKey, reason: "conflict-unconfirmed" };
   }
-  const snapshot = await buildVaultRegistrySnapshot(root);
+  // 実機不具合対応（Android性能改善・A1）：`processVaultResyncCandidate`
+  // （後続の`handleResyncSingleRecordCandidate`/`handleResyncMemoryDayCandidate`）が
+  // このstateから実際に読むのは`previousByKey.get(record.registryKey相当のid)`と
+  // それに対応する`previousEntries`の1件だけ（`previousRegistryKeyByPath`は
+  // 「1pathだけを空のseenPathsByKeyへ通す」設計上、重複判定に使われないため
+  // 参照されない）。よって`buildVaultRegistrySnapshot`（全shard読み）ではなく、
+  // `lookupVaultRegistryRecord`（bucket計算→単一shard読みのみ、operation間
+  // キャッシュ無し・毎回フレッシュ）で得たrecord.registryKey 1件分だけを
+  // 含む最小Mapで完全に同じ挙動になる。`path`と`entry`は同一shard読み込みから
+  // 得られる。ファイル内容が別のidを名乗っていた場合（候補すり替わり）は、
+  // 元の実装でもそのidの分類結果は`record.registryKey`とは別keyへ格納される
+  // ため、後段の`state.recordsByKey.get(record.registryKey)`は元の実装でも
+  // 今回の実装でも同じく見つからず"conflict-resolved"へ倒れる（挙動同値）。
+  const lookup = await lookupVaultRegistryRecord(root, record.registryKey);
+  const previousByKey = new Map<string, string>();
+  const previousEntries = new Map<string, VaultRegistryFileEntry>();
+  if (lookup.path !== undefined) {
+    previousByKey.set(record.registryKey, lookup.path);
+    if (lookup.entry !== undefined) {
+      previousEntries.set(lookup.path, lookup.entry);
+    }
+  }
   const state: VaultResyncScanState = {
-    previousByKey: snapshot.previousByKey,
-    previousEntries: snapshot.previousEntries,
-    previousRegistryKeyByPath: snapshot.previousRegistryKeyByPath,
+    previousByKey,
+    previousEntries,
+    previousRegistryKeyByPath: new Map<string, string>(),
     seenPathsByKey: new Map(),
     seenKnownKeys: new Set(),
     recordsByKey: new Map(),
