@@ -813,9 +813,21 @@ export async function getRegistryGenerationEpoch(): Promise<number> {
  * 後始末しrethrow）自体は一切変更せず、`next`の算出・`tx.done`のawait・
  * `return`を全て同じ`try`ブロック内で完結させることで、「成功経路でのみ
  * `next`を使い、そのまま返す」という構造をTypeScriptが素直に検証できる
- * 形にした。catch節は`abortAndSettleTransaction`の呼び出しのみで終わり
- * （戻り値`Promise<never>`により、この関数はここで正常終了しない）、
- * 明示的な`return`は置かない。
+ * 形にした。
+ *
+ * TypeScript再修正（Vercel build再指摘対応）：上記の対応後も、catch節が
+ * `await abortAndSettleTransaction(tx, error);`のみで終わる構成では、
+ * TypeScriptの「関数が値を返さずに終わりうるかどうか」のcontrol flow解析が
+ * `Promise<never>`をawaitした式の直後を十分にnarrowできず、"Function lacks
+ * ending return statement and return type does not include 'undefined'"
+ * という型エラーになった（実機のVercel buildで確認）。`abortAndSettleTransaction`
+ * 自体の実装・semantics（`tx.abort()`→`tx.done`のreject回収→`throw error;`で
+ * 必ず終わる）は一切変更していない——catch節の末尾に、TypeScriptが構文上
+ * 確実に「ここで関数が終わらない」と認識できる明示的な`throw error;`を
+ * 追加しただけである。`abortAndSettleTransaction`は内部で必ず`throw error;`
+ * するため、この`throw error;`はruntime上到達しない（既存のCAS/後始末の
+ * 挙動には一切影響しない）が、TypeScriptの静的解析上は「この関数はここで
+ * 必ず終了する」ことを曖昧さ無く保証する。
  */
 export async function bumpRegistryGenerationEpoch(expectedEpoch: number): Promise<number> {
   const db = await getDB();
@@ -843,6 +855,10 @@ export async function bumpRegistryGenerationEpoch(expectedEpoch: number): Promis
     return next;
   } catch (error) {
     await abortAndSettleTransaction(tx, error);
+    // 到達しない（abortAndSettleTransactionは内部で必ずthrowする）。TypeScriptの
+    // control flow解析へ「この関数はここで正常終了しない」ことを明示するためだけの
+    // 冗長なthrow。
+    throw error;
   }
 }
 
