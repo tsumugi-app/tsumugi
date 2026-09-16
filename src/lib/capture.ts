@@ -13,7 +13,8 @@ import { writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePr
 import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "./retrieval";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
-import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "./types";
+import type { Conversation, ConversationTurn, EventTimePrecision, MemoryObject, MemoryType, Persona } from "./types";
+import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 
 const AI_PROVIDER = "gemini";
@@ -64,6 +65,9 @@ interface ExtractedMemory {
   keywords: string[];
   types: MemoryType[];
   confidence: number;
+  /** Time Axis Phase 2（Event Time, v1）。/api/capture参照。 */
+  eventTime?: string;
+  eventTimePrecision?: EventTimePrecision;
 }
 
 /**
@@ -240,6 +244,30 @@ async function captureConversationImpl(
     return existing?.topicId;
   }
 
+  // Time Axis Phase 2（Event Time, v1）：existingMemoryId・topicDecisionとは独立に
+  // eventTime/eventTimePrecisionを解決する。「過剰なUPDATE判定Engineは作らない、
+  // v1ではfail-safeを優先する」という方針から、既存Memory（更新対象）が既にeventTimeを
+  // 持っている場合、今回の抽出結果が別の出来事（次回の予定等）を指している可能性がある
+  // ため、常に既存の値を維持し一切上書きしない（「同じ出来事をより正確に表しているか」を
+  // ここで判定するロジックは追加しない）。既存に無く今回分かった場合にのみ新しく設定する。
+  // どちらの値も、precisionと矛盾しない形式かを検証してから採用する（無条件castしない）。
+  function resolveEventTime(
+    item: ExtractedMemory,
+    existing: MemoryObject | undefined
+  ): { eventTime?: string; eventTimePrecision?: EventTimePrecision } {
+    if (existing?.eventTime && existing?.eventTimePrecision) {
+      return { eventTime: existing.eventTime, eventTimePrecision: existing.eventTimePrecision };
+    }
+    if (
+      item.eventTime &&
+      isValidEventTimePrecision(item.eventTimePrecision) &&
+      isValidEventTimeValue(item.eventTime, item.eventTimePrecision)
+    ) {
+      return { eventTime: item.eventTime, eventTimePrecision: item.eventTimePrecision };
+    }
+    return {};
+  }
+
   // TEMP-TEST：Topic Continuity Phase 1の判定結果を観測するためだけのログ。
   // 本文・summary・keywords・topicId自体は出さない（列挙値と件数のみ）。
   const candidateCount = existingMemoryObjects.length + relatedMemoryObjects.length;
@@ -247,6 +275,7 @@ async function captureConversationImpl(
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
     const existing = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
     const resolvedTopicId = resolveTopicId(item, existing);
+    const resolvedEventTime = resolveEventTime(item, existing);
     logTimingEvent("Capture topicDecision", {
       topicDecision: item.topicDecision,
       candidateCount,
@@ -261,6 +290,8 @@ async function captureConversationImpl(
         keywords: item.keywords,
         types: item.types,
         topicId: resolvedTopicId,
+        eventTime: resolvedEventTime.eventTime,
+        eventTimePrecision: resolvedEventTime.eventTimePrecision,
         updatedAt: timestamp,
         metadata: {
           ...existing.metadata,
@@ -288,6 +319,8 @@ async function captureConversationImpl(
       eventIds: [],
       links: [],
       topicId: resolvedTopicId,
+      eventTime: resolvedEventTime.eventTime,
+      eventTimePrecision: resolvedEventTime.eventTimePrecision,
       createdAt: timestamp,
       updatedAt: timestamp,
       metadata: {

@@ -12,6 +12,7 @@ import { SCHEMA_VERSION } from "./types";
 import type {
   Conversation,
   ConversationTurn,
+  EventTimePrecision,
   Link,
   MemoryObject,
   MemorySource,
@@ -20,6 +21,7 @@ import type {
   Source,
   SourceType,
 } from "./types";
+import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
 
 function yamlScalar(value: string): string {
   const looksSpecial =
@@ -63,6 +65,8 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     keywords: memoryObject.keywords.length > 0 ? memoryObject.keywords : undefined,
     conversationId: memoryObject.conversationId,
     topicId: memoryObject.topicId,
+    eventTime: memoryObject.eventTime,
+    eventTimePrecision: memoryObject.eventTimePrecision,
     summary: memoryObject.summary,
     links: memoryObject.links.length > 0 ? JSON.stringify(memoryObject.links) : undefined,
     source: memoryObject.metadata.source,
@@ -332,12 +336,28 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
   const source = (asString(frontmatter.source) ?? "import") as MemorySource;
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
 
+  // Time Axis Phase 2（Event Time, v1）：precisionが"day"|"month"|"year"のいずれかで、
+  // かつeventTimeの形式がそのprecisionと矛盾しない場合のみ採用する（無条件castしない）。
+  // 古いMemory Markdownにはこのキー自体が無いため、その場合は両方ともundefinedになる
+  // （topicIdと同じ後方互換の扱い）。
+  const rawEventTimePrecision = asString(frontmatter.eventTimePrecision);
+  const rawEventTime = asString(frontmatter.eventTime);
+  const eventTimePrecision: EventTimePrecision | undefined =
+    isValidEventTimePrecision(rawEventTimePrecision) &&
+    rawEventTime !== undefined &&
+    isValidEventTimeValue(rawEventTime, rawEventTimePrecision)
+      ? rawEventTimePrecision
+      : undefined;
+  const eventTime = eventTimePrecision ? rawEventTime : undefined;
+
   return {
     id,
     date,
     types,
     conversationId: asString(frontmatter.conversationId),
     topicId: asString(frontmatter.topicId),
+    eventTime,
+    eventTimePrecision,
     content,
     summary,
     keywords: asStringArray(frontmatter.keywords),

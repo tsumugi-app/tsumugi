@@ -1,6 +1,7 @@
 import type { ConversationTurn, MemoryType, Persona } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getJstTodayDateString, isValidEventTimeSource, resolveEventTimeSourceDate } from "@/lib/eventTimeResolver";
 
 export const runtime = "nodejs";
 
@@ -95,6 +96,45 @@ Topic判定（重要。existingMemoryIdによるUPDATE/CREATE判定とは完全�
 - Topic判定はexistingMemoryIdの有無に関わらず必ず行う（新規Memoryとして出力する場合も
   topicDecisionを必ず設定する）。
 
+Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは別の軸、最重要原則あり）:
+- 「いつ話したか」（Conversation自体の時間）とは別に、「その記憶が表す出来事が実際に
+  いつ起きた（起きる）か」を、分かる範囲でだけ判定する。
+- 【最重要】時間の計算はあなたの役割ではない。「今日」「昨日」「一昨日」「明日」
+  「明後日」という5つの固定表現のいずれかが、その記憶の出来事を実際に指していると
+  判断できる場合は、実際の日付を自分で計算せず、該当する表現をeventTimeSource
+  （today/yesterday/day-before-yesterday/tomorrow/day-after-tomorrow）としてだけ
+  返す。実際の日付はTsumugi側があなたのリクエストを処理した基準日から確定するため、
+  eventTimeSourceを設定する場合、eventTime/eventTimePrecisionは出力しなくてよい
+  （出力してもTsumugi側で確定した値が優先されるため使われない）。
+- eventTimeSourceの選択は「その単語が文中のどこかに存在するか」ではなく「その記憶の
+  出来事そのものを表しているか」で判断する。例：「昨日から考えているけど、来年会社を
+  辞めることにした」という記憶では、「昨日」は考え始めた時点を指しているだけで、
+  記憶の中心的な出来事（退職）の時間ではない。この場合、eventTimeSourceは設定しない
+  （「昨日」が文中に存在するというだけの理由で機械的にeventTimeSource: yesterdayを
+  選んではいけない）。
+- 存在しない時間精度を絶対に作らない。「2024年」から分かるのは年までであり、月・日は
+  絶対に作らない。「去年の夏」のように月未満の粒度（季節）しか分からない場合、無理に
+  特定の月へ丸めず年精度（precision: "year"）にとどめる。
+- 「◯年前」「◯週間前」「先週の日曜日」のような、上記5つの固定表現に含まれない相対的な
+  時間表現については、あなた自身で現在の日付から計算してeventTimeを作ってはいけない。
+  この場合はeventTime・eventTimePrecisionとも設定しない。
+- 「9月10日」のように年が明示されていない絶対日付は、会話の文脈から年が明確に特定できる
+  場合（例：本文中に年が別途明示されている等）にのみeventTime/eventTimePrecisionとして
+  採用する。文脈から年を安易に補完（たとえば「今年だろう」という推測だけ）して確定値に
+  しない。年が確定できなければeventTimeを設定しない。
+- 「2024年に〜」「2026年8月に〜」のように、年（および場合により月）が会話の中に明示的に
+  書かれている場合は、その値をeventTime/eventTimePrecisionとしてそのまま採用してよい
+  （これは計算ではなく単なる抽出であり、eventTimeSourceの対象ではない）。
+- 「最近」「この前」「昔」「高校の頃」のような曖昧な時間表現、または時間表現が一切
+  無い内容については、eventTimeSource・eventTime・eventTimePrecisionのいずれも設定
+  しない（未設定のままにする。無理に値を作らない方が正しい）。
+- 1つのMemory候補の中に複数の異なる出来事の時間が含まれ、どれが主要な出来事の時間かを
+  明確に決められない場合も、いずれも設定しない。
+- 既存Memoryを更新する場合（existingMemoryIdを設定する場合）でも、eventTimeSource/
+  eventTime/eventTimePrecisionは今回のあなたの判定結果として設定してよい（既存の値を
+  保持するか上書きするかはCapture処理側が別途判断するため、あなたは今回分かる範囲の
+  判定を素直に出力すればよい）。
+
 別Conversationからの関連Memory候補との対応付け（重要）:
 - 「既存Memory」とは別に、過去の別Conversationから機械的な検索で見つかった、話題が
   近い可能性のある「関連Memory候補」が提示される場合がある。
@@ -186,6 +226,42 @@ function buildRelatedMemoriesSection(relatedMemories: ExistingMemoryRef[]): stri
 }
 
 /**
+ * Time Axis Phase 2（Event Time, v1）。本日の日付（JST）だけを参考情報として渡す。
+ * 「今日/昨日/一昨日/明日/明後日」の実際の日付計算はLLMの役割ではないため
+ * （SYSTEM_PROMPT側のEvent Time判定ルール参照）、ここでは相対表現の対応表は渡さない。
+ * 本日の日付自体は、「9月10日」のような年省略の絶対日付について、会話の文脈から年が
+ * 明確かどうかをLLMが判断する際の参考として使われる。
+ */
+function buildEventTimeReferenceSection(todayDateString: string): string {
+  return `\n\n=== 本日の日付（参考情報。日本時間） ===\n本日の日付は${todayDateString}です。\n=== END 本日の日付 ===`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Time Axis Phase 2（Event Time, v1）。「deterministic resolverを最終決定者にする」設計：
+ * LLMが選んだeventTimeSourceを、このCaptureリクエストで確定した同一のJST基準日
+ * （todayDateString）からresolveEventTimeSourceDate()で機械的に解決し直し、LLM自身が
+ * 返したeventTime/eventTimePrecisionがあっても無条件で上書きする（値そのものの最終決定権を
+ * Tsumugi側に置く）。eventTimeSourceが無い・不正な場合は、LLMが返したeventTime/
+ * eventTimePrecisionをそのまま素通しする（precision・実在暦日の検証はcapture.ts側の
+ * 既存ロジックが引き続き担当する）。
+ *
+ * eventTimeSource自体は一時的なLLM判定情報でありMemoryObject/Markdownへ永続化しないため、
+ * どちらの経路でもレスポンスからは必ず取り除く（クライアント側へ一切渡さない）。
+ */
+function finalizeEventTimeForMemory(memory: Record<string, unknown>, todayDateString: string): Record<string, unknown> {
+  const { eventTimeSource, ...rest } = memory;
+  if (isValidEventTimeSource(eventTimeSource)) {
+    const resolvedDate = resolveEventTimeSourceDate(todayDateString, eventTimeSource);
+    return { ...rest, eventTime: resolvedDate, eventTimePrecision: "day" };
+  }
+  return rest;
+}
+
+/**
  * chat/route.ts と同じ理由（Gemini 3.6系の既定thinkingが重い）でthinking予算を明示する。
  * Captureは会話全体を読む処理なので、会話が長いほど予算を増やす。
  */
@@ -260,6 +336,27 @@ const MEMORIES_SCHEMA: AISchema = {
             type: "number",
             description: "この抽出結果に対する確信度（0〜1）",
           },
+          eventTimeSource: {
+            type: "string",
+            enum: ["today", "yesterday", "day-before-yesterday", "tomorrow", "day-after-tomorrow"],
+            description:
+              "この記憶の出来事が「今日・昨日・一昨日・明日・明後日」のいずれかを実際に" +
+              "指している場合のみ設定する。日付そのものの計算はTsumugi側が行うため、" +
+              "ここでは表現の選択だけを行う（設定する場合、eventTime/eventTimePrecisionは" +
+              "省略してよい）。該当しない場合は省略する",
+          },
+          eventTime: {
+            type: "string",
+            description:
+              "eventTimeSourceが対象としない、それ以外の出来事の時間（分かる範囲でのみ）。" +
+              'precisionに応じて"YYYY-MM-DD"（day）・"YYYY-MM"（month）・"YYYY"（year）の' +
+              "いずれかの形式。出来事の時間が不明・曖昧な場合は省略する（架空の精度を作らない）",
+          },
+          eventTimePrecision: {
+            type: "string",
+            enum: ["day", "month", "year"],
+            description: "eventTimeを設定した場合のみ、その値が示す精度",
+          },
         },
         required: ["summary", "content", "keywords", "types", "confidence", "topicDecision"],
       },
@@ -296,7 +393,8 @@ export async function POST(request: Request) {
     return Response.json({ error: "turns is required" }, { status: 400 });
   }
 
-  const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}`;
+  const todayDateString = getJstTodayDateString();
+  const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}${buildEventTimeReferenceSection(todayDateString)}`;
 
   const provider = getProvider(providerName);
   let response: { text: string };
@@ -328,10 +426,15 @@ export async function POST(request: Request) {
   }
 
   try {
-    const parsed = JSON.parse(text);
-    return Response.json(parsed, {
-      headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) },
-    });
+    const parsed = JSON.parse(text) as { memories?: unknown };
+    const memories = Array.isArray(parsed.memories) ? parsed.memories : [];
+    const finalizedMemories = memories.map((memory) =>
+      isRecord(memory) ? finalizeEventTimeForMemory(memory, todayDateString) : memory
+    );
+    return Response.json(
+      { ...parsed, memories: finalizedMemories },
+      { headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) } }
+    );
   } catch {
     return Response.json(
       { error: "Failed to parse AI response as JSON." },

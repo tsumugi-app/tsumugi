@@ -138,6 +138,13 @@ export type MemoryType =
   | "event"
   | "insight";
 
+/**
+ * Time Axis Phase 2（Event Time, v1）。day/month/yearの3段階のみを許可する
+ * （「unknown」等のsentinel値は作らない。不明な場合はMemoryObject側の2フィールドとも
+ * 未設定にすることで表現する）。
+ */
+export type EventTimePrecision = "day" | "month" | "year";
+
 /** MEMORY_ENGINE.md 4章 / DATA_MODEL.md §7。Phase 1（Capture）では生成されず、常に空配列。 */
 export type LinkAxis = "person" | "time" | "theme" | "emotion" | "place";
 
@@ -202,6 +209,17 @@ export interface MemoryObject extends Identifiable, Timestamped {
    * Vault migration不要）。
    */
   topicId?: ID;
+  /**
+   * Time Axis Phase 2（Event Time, v1）。「いつ話したか」（Message Time／Conversation
+   * Time Awareness、Phase 1）とは別に、「話している出来事が実際に起きた（起きる）時間」を
+   * 持つ。精度に応じた可変長のcalendar date文字列（day: "YYYY-MM-DD"、month: "YYYY-MM"、
+   * year: "YYYY"）で、時刻は一切含まない。存在しない時間精度を作らないという原則のため、
+   * 出来事の時間が不明・曖昧な場合はeventTime/eventTimePrecisionとも未設定のままにする
+   * （`topicId`と同じ、追加のみのoptionalフィールド。IndexedDBバージョンアップ・
+   * Vault migration不要）。
+   */
+  eventTime?: string;
+  eventTimePrecision?: EventTimePrecision;
   metadata: Metadata;
 }
 
