@@ -252,18 +252,32 @@ export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
  * 場合、`lastFullResyncUpdated === true`）にのみ、db.tsの永続markerを立てる。
  * 失敗時はmarkerを立てず、次回起動時に再試行する（途中失敗を「移行済み」と
  * 誤認しない）。Android以外・OPFS以外では何もしない。
+ *
+ * 呼び出し元（ChatScreen.tsx）は、必ず起動時の共有"tsumugi-vault-world"ロックが
+ * 完全に解放された後で呼ぶこと（内部で`resyncVaultRegistry`がexclusiveロックを
+ * 要求するため、共有ロックの内側から呼ぶと自己デッドロックする）。
+ *
+ * 戻り値：このリクエストで実際にbaselineを新しく確立できた場合のみ
+ * `{ established: true, baselineEstablishedAt }`を返す（それ以外＝Android以外・
+ * 既に確立済み・失敗、いずれも`{ established: false }`）。呼び出し元はこれを使い、
+ * 「baseline確立時点でまだ一度も使われていない初期Conversation」のcreatedAtが
+ * baselineより古い場合の対応要否を判断できる。
  */
-export async function ensureAndroidOpfsVaultBaseline(root: FileSystemDirectoryHandle): Promise<void> {
-  if (!isAndroid() || getVaultBackend() !== "opfs") return;
-  if (await isAndroidOpfsVaultInitialized()) return;
+export async function ensureAndroidOpfsVaultBaseline(
+  root: FileSystemDirectoryHandle
+): Promise<{ established: boolean; baselineEstablishedAt?: string }> {
+  if (!isAndroid() || getVaultBackend() !== "opfs") return { established: false };
+  if (await isAndroidOpfsVaultInitialized()) return { established: false };
   try {
     const result = await resyncVaultRegistry(root);
     if (result.lastFullResyncUpdated) {
       await markAndroidOpfsVaultInitialized();
+      return { established: true, baselineEstablishedAt: result.startedAt };
     }
   } catch (error) {
     console.error("[Tsumugi] failed to establish Android OPFS vault baseline (will retry on next launch):", error);
   }
+  return { established: false };
 }
 
 /**

@@ -1494,6 +1494,13 @@ export default function ChatScreen() {
 
   useEffect(() => {
     let cancelled = false;
+    // Android保存方式の見直し：ensureAndroidOpfsVaultBaseline（resyncVaultRegistryを
+    // 呼ぶ）は、下のwithStartupSharedLock()が保持する共有"tsumugi-vault-world"ロックの
+    // 内側から呼んではいけない（resyncVaultRegistry自身が同名ロックをexclusiveで
+    // 要求するため、shared→exclusiveの自己デッドロックになる。実機で確認済み）。
+    // applyRestoredHandle内ではこの変数へhandleを記録するだけにとどめ、実際の呼び出しは
+    // 共有ロックが完全に解放された後（下の.then(...)）まで遅延させる。
+    let androidOpfsBaselineHandle: FileSystemDirectoryHandle | null = null;
     // TEMP-TEST：起動処理全体（Vault復元+flush／起動時Connect／起動時Capture、
     // 3フェーズ）の開始点。page:hidden/page:loadとの因果関係切り分け用の計測のみで、
     // 以下の処理内容・順序には一切影響しない。
@@ -1530,18 +1537,13 @@ export default function ChatScreen() {
         setVaultHandle(result.handle);
         setVaultStatus("connected");
 
-        // Android保存方式の見直し：Android以外・既にbaseline確立済みでは何もしない
-        // （ensureAndroidOpfsVaultBaseline内部でガード済み）。Androidの新しい空の
-        // OPFS Vaultについて初回だけRegistry baselineを確立する。下のflush（既存の
-        // pending変更をVaultへ書き戻す処理）より必ず前に行う——baseline未確立の
-        // ままflushすると、新規recordも含めて全件が一時的にHOLD対象になってしまう
-        // ため。過去のIndexedDBデータ（conversations/memoryObjects/sources）は
-        // 一切読み書きしない。既存のPC/iOSの経路・タイミングは変更しない。
-        try {
-          await ensureAndroidOpfsVaultBaseline(result.handle);
-        } catch (error) {
-          console.error("Failed to ensure Android OPFS vault baseline", error);
-        }
+        // Android保存方式の見直し：ここはまだ共有ロック保持区間の中のため、
+        // ensureAndroidOpfsVaultBaselineをここで直接呼ばない（ファイル冒頭の
+        // androidOpfsBaselineHandle宣言のコメント参照）。ここでは「共有ロック解放後に
+        // baseline初期化が必要かもしれないhandle」を記録するだけにとどめる。
+        // ensureAndroidOpfsVaultBaseline自身がAndroid+OPFS以外では即座に何もしない
+        // ため、PC/iOSも含め常に記録するだけで安全（余計な分岐を増やさない）。
+        androidOpfsBaselineHandle = result.handle;
 
         // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
         // 接続許可（restoreVaultHandle）が確認できている場合、handleConnectVault()と
@@ -1678,6 +1680,43 @@ export default function ChatScreen() {
         throw error;
       } finally {
         logTimingEvent("Startup vault-restore:end");
+      }
+    }).then(async () => {
+      // Android保存方式の見直し：ここは共有"tsumugi-vault-world"ロックが完全に
+      // 解放された後（withStartupSharedLockが返すPromiseが解決した後）にのみ
+      // 実行される。ここでresyncVaultRegistry（exclusiveロックを要求する）を
+      // 呼んでも、上の共有ロックとは競合しない。fn（上のasyncコールバック）が
+      // 例外を投げていた場合はこのthenごとskipされ、既存の（catchしていない）
+      // rejectionの伝播はそのまま維持される。baseline確立が完了するまでの間に
+      // 他のVault write（flush等）が新規recordを対象にしても、C1の既存
+      // fail-closedガードにより無害にHOLDされ、次回flush時に自然に再試行される
+      // だけである（IndexedDBは一切変更されない）。
+      if (cancelled || !androidOpfsBaselineHandle) return;
+      const baseline = await ensureAndroidOpfsVaultBaseline(androidOpfsBaselineHandle);
+      if (cancelled || !baseline.established || !baseline.baselineEstablishedAt) return;
+
+      // createdAtレース対応：mount時に同期的に作られた初期Conversation
+      // （createConversation()、useState初期化子。アプリ起動とほぼ同時刻の
+      // createdAtを持つ）は、今まさに確立したbaselineより必ず古い。C1の既存
+      // ガード（baseline確立後のcreatedAtでなければ書き込めない）は変更しないため、
+      // このConversationのまま使い続けると、以後createdAtが不変である以上、
+      // 永久にHOLDされ続ける。
+      //
+      // 対象を厳密に絞る：turnsが1件も無い（まだ一度も使われていない）・
+      // promptedMemoryIdが無い（「過去からの問いかけ」起点ではない）・endedAtが
+      // 無い（終了済みではない）の3条件をすべて満たし、かつcreatedAtが実際に
+      // baseline以前の場合だけを対象にする。turnsが存在する・復元された・
+      // ユーザーが既に使い始めたConversationは絶対に作り直さない。
+      const current = latestConversationRef.current;
+      const isUnusedPreBaselineConversation =
+        current.turns.length === 0 &&
+        !current.promptedMemoryId &&
+        !current.endedAt &&
+        Date.parse(current.createdAt) <= Date.parse(baseline.baselineEstablishedAt);
+      if (isUnusedPreBaselineConversation) {
+        const refreshed = createConversation(current.persona);
+        setConversation(refreshed);
+        latestConversationRef.current = refreshed;
       }
     }).finally(() => {
       endStartupTask();
