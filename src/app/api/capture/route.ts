@@ -96,40 +96,46 @@ Topic判定（重要。existingMemoryIdによるUPDATE/CREATE判定とは完全�
 - Topic判定はexistingMemoryIdの有無に関わらず必ず行う（新規Memoryとして出力する場合も
   topicDecisionを必ず設定する）。
 
-Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは別の軸、最重要原則あり）:
+Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは別の軸、必須の軸）:
 - 「いつ話したか」（Conversation自体の時間）とは別に、「その記憶が表す出来事が実際に
-  いつ起きた（起きる）か」を、分かる範囲でだけ判定する。
-- 【最重要】時間の計算はあなたの役割ではない。「今日」「昨日」「一昨日」「明日」
-  「明後日」という5つの固定表現のいずれかが、その記憶の出来事を実際に指していると
-  判断できる場合は、実際の日付を自分で計算せず、該当する表現をeventTimeSource
-  （today/yesterday/day-before-yesterday/tomorrow/day-after-tomorrow）としてだけ
-  返す。実際の日付はTsumugi側があなたのリクエストを処理した基準日から確定するため、
-  eventTimeSourceを設定する場合、eventTime/eventTimePrecisionは出力しなくてよい
-  （出力してもTsumugi側で確定した値が優先されるため使われない）。
-- eventTimeSourceの選択は「その単語が文中のどこかに存在するか」ではなく「その記憶の
-  出来事そのものを表しているか」で判断する。例：「昨日から考えているけど、来年会社を
-  辞めることにした」という記憶では、「昨日」は考え始めた時点を指しているだけで、
-  記憶の中心的な出来事（退職）の時間ではない。この場合、eventTimeSourceは設定しない
-  （「昨日」が文中に存在するというだけの理由で機械的にeventTimeSource: yesterdayを
-  選んではいけない）。
+  いつ起きた（起きる）か」を、Memory候補ごとに必ず1回判断する（省略しない）。
+- 【必須】まず、その記憶の中心的な出来事が「今日」「昨日」「一昨日」「明日」「明後日」の
+  いずれかに対応するかを判断し、eventTimeSourceへ必ず設定する。
+  - 対応する場合：実際の日付は自分で計算せず、該当する表現（today/yesterday/
+    day-before-yesterday/tomorrow/day-after-tomorrow）だけを設定する。実際の日付は
+    Tsumugi側があなたのリクエストを処理した基準日から確定するため、eventTime/
+    eventTimePrecisionは省略してよい。
+  - 対応しない、または確信が持てない場合："none"を設定する（安全な既定値。少しでも
+    根拠が薄ければ必ず"none"を選ぶ）。
+- eventTimeSourceの判断は「その単語が文中のどこかに存在するか」ではなく「その記憶の
+  中心的な出来事そのものを表しているか」で行う。
+  - 肯定例：「昨日、公園を散歩した」という記憶 → eventTimeSource: "yesterday"
+    （「昨日」が記憶の中心的な出来事そのものの時間）
+  - 否定例：「昨日から考えているけど、2026年12月に会社を辞める」という記憶 →
+    eventTimeSource: "none"（「昨日」は考え始めた時点であり、記憶の中心的な出来事
+    ＝退職の時間ではない。「昨日」が文中に存在するというだけの理由で機械的に
+    eventTimeSource: "yesterday"を選んではいけない。退職の時間そのものは下記の通り
+    eventTime: "2026-12", eventTimePrecision: "month"として別途扱う）
+- eventTimeSourceが"none"の場合でも、以下に該当すれば追加でeventTime/
+  eventTimePrecisionを設定してよい（これは計算ではなく、会話に明示された内容の抽出）：
+  - 「2024年に〜」「2026年8月に〜」のように年（および場合により月）が会話の中に明示的に
+    書かれている場合は、その値をそのまま採用する。
+  - 「9月10日」のように年が明示されていない絶対日付は、会話の文脈から年が明確に特定
+    できる場合にのみ採用する。文脈からの安易な補完（「今年だろう」という推測だけ）は
+    しない。年が確定できなければeventTimeを設定しない。
 - 存在しない時間精度を絶対に作らない。「2024年」から分かるのは年までであり、月・日は
   絶対に作らない。「去年の夏」のように月未満の粒度（季節）しか分からない場合、無理に
   特定の月へ丸めず年精度（precision: "year"）にとどめる。
-- 「◯年前」「◯週間前」「先週の日曜日」のような、上記5つの固定表現に含まれない相対的な
-  時間表現については、あなた自身で現在の日付から計算してeventTimeを作ってはいけない。
-  この場合はeventTime・eventTimePrecisionとも設定しない。
-- 「9月10日」のように年が明示されていない絶対日付は、会話の文脈から年が明確に特定できる
-  場合（例：本文中に年が別途明示されている等）にのみeventTime/eventTimePrecisionとして
-  採用する。文脈から年を安易に補完（たとえば「今年だろう」という推測だけ）して確定値に
-  しない。年が確定できなければeventTimeを設定しない。
-- 「2024年に〜」「2026年8月に〜」のように、年（および場合により月）が会話の中に明示的に
-  書かれている場合は、その値をeventTime/eventTimePrecisionとしてそのまま採用してよい
-  （これは計算ではなく単なる抽出であり、eventTimeSourceの対象ではない）。
+- 「◯年前」「◯週間前」「先週の日曜日」のような、固定表現5つに含まれない相対的な時間
+  表現については、あなた自身で現在の日付から計算してeventTimeを作ってはいけない。
+  この場合eventTimeSourceは"none"、eventTime・eventTimePrecisionとも設定しない。
 - 「最近」「この前」「昔」「高校の頃」のような曖昧な時間表現、または時間表現が一切
-  無い内容については、eventTimeSource・eventTime・eventTimePrecisionのいずれも設定
-  しない（未設定のままにする。無理に値を作らない方が正しい）。
+  無い内容については、eventTimeSourceは"none"、eventTime・eventTimePrecisionとも
+  設定しない（無理に値を作らない方が正しい）。
 - 1つのMemory候補の中に複数の異なる出来事の時間が含まれ、どれが主要な出来事の時間かを
-  明確に決められない場合も、いずれも設定しない。
+  明確に決められない場合も、eventTimeSourceは"none"、eventTime・eventTimePrecisionとも
+  設定しない（例：「昨日さきさんと話して、明日また会う」を1つのMemoryとして扱う場合、
+  過去と未来のどちらが中心か安全に決められないため"none"とする）。
 - 既存Memoryを更新する場合（existingMemoryIdを設定する場合）でも、eventTimeSource/
   eventTime/eventTimePrecisionは今回のあなたの判定結果として設定してよい（既存の値を
   保持するか上書きするかはCapture処理側が別途判断するため、あなたは今回分かる範囲の
@@ -242,19 +248,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * Time Axis Phase 2（Event Time, v1）。「deterministic resolverを最終決定者にする」設計：
- * LLMが選んだeventTimeSourceを、このCaptureリクエストで確定した同一のJST基準日
- * （todayDateString）からresolveEventTimeSourceDate()で機械的に解決し直し、LLM自身が
- * 返したeventTime/eventTimePrecisionがあっても無条件で上書きする（値そのものの最終決定権を
- * Tsumugi側に置く）。eventTimeSourceが無い・不正な場合は、LLMが返したeventTime/
- * eventTimePrecisionをそのまま素通しする（precision・実在暦日の検証はcapture.ts側の
- * 既存ロジックが引き続き担当する）。
+ * LLMが選んだeventTimeSourceが固定語彙5値（today/yesterday/day-before-yesterday/
+ * tomorrow/day-after-tomorrow）のいずれかであれば、このCaptureリクエストで確定した
+ * 同一のJST基準日（todayDateString）からresolveEventTimeSourceDate()で機械的に解決し
+ * 直し、LLM自身が返したeventTime/eventTimePrecisionがあっても無条件で上書きする
+ * （値そのものの最終決定権をTsumugi側に置く）。
+ *
+ * eventTimeSourceが"none"（固定語彙のどれにも対応しないというLLMの判断結果）・無い・
+ * 不正な場合は、eventTimeSourceだけを取り除き、LLMが返したeventTime/eventTimePrecision
+ * （「2024年に〜」のような明示的な絶対時間の抽出結果）があればそのまま素通しする
+ * （precision・実在暦日の検証はcapture.ts側の既存ロジックが引き続き担当する）。
  *
  * eventTimeSource自体は一時的なLLM判定情報でありMemoryObject/Markdownへ永続化しないため、
  * どちらの経路でもレスポンスからは必ず取り除く（クライアント側へ一切渡さない）。
  */
 function finalizeEventTimeForMemory(memory: Record<string, unknown>, todayDateString: string): Record<string, unknown> {
   const { eventTimeSource, ...rest } = memory;
-  if (isValidEventTimeSource(eventTimeSource)) {
+  if (isValidEventTimeSource(eventTimeSource) && eventTimeSource !== "none") {
     const resolvedDate = resolveEventTimeSourceDate(todayDateString, eventTimeSource);
     return { ...rest, eventTime: resolvedDate, eventTimePrecision: "day" };
   }
@@ -338,17 +348,18 @@ const MEMORIES_SCHEMA: AISchema = {
           },
           eventTimeSource: {
             type: "string",
-            enum: ["today", "yesterday", "day-before-yesterday", "tomorrow", "day-after-tomorrow"],
+            enum: ["today", "yesterday", "day-before-yesterday", "tomorrow", "day-after-tomorrow", "none"],
             description:
-              "この記憶の出来事が「今日・昨日・一昨日・明日・明後日」のいずれかを実際に" +
-              "指している場合のみ設定する。日付そのものの計算はTsumugi側が行うため、" +
-              "ここでは表現の選択だけを行う（設定する場合、eventTime/eventTimePrecisionは" +
-              "省略してよい）。該当しない場合は省略する",
+              "この記憶の中心的な出来事が「今日・昨日・一昨日・明日・明後日」のいずれかに" +
+              "対応するかを必ず判断して設定する（必須）。対応する場合はその表現を設定する" +
+              "（日付そのものの計算はTsumugi側が行うため、ここでは表現の選択だけを行う。" +
+              "eventTime/eventTimePrecisionは省略してよい）。対応しない・確信が持てない" +
+              '場合は"none"を設定する（安全な既定値。少しでも根拠が薄ければ"none"を選ぶこと）',
           },
           eventTime: {
             type: "string",
             description:
-              "eventTimeSourceが対象としない、それ以外の出来事の時間（分かる範囲でのみ）。" +
+              'eventTimeSourceが"none"の場合にのみ使う、それ以外の出来事の時間（分かる範囲でのみ）。' +
               'precisionに応じて"YYYY-MM-DD"（day）・"YYYY-MM"（month）・"YYYY"（year）の' +
               "いずれかの形式。出来事の時間が不明・曖昧な場合は省略する（架空の精度を作らない）",
           },
@@ -358,7 +369,7 @@ const MEMORIES_SCHEMA: AISchema = {
             description: "eventTimeを設定した場合のみ、その値が示す精度",
           },
         },
-        required: ["summary", "content", "keywords", "types", "confidence", "topicDecision"],
+        required: ["summary", "content", "keywords", "types", "confidence", "topicDecision", "eventTimeSource"],
       },
     },
   },

@@ -51,11 +51,22 @@ function addDaysToDateString(dateString: string, days: number): string {
 
 /**
  * v1で対応する固定語彙。LLMのstructured outputはこのキーだけを選択し、日付そのものは
- * 計算しない（/api/capture/route.tsのMEMORIES_SCHEMA参照）。
+ * 計算しない（/api/capture/route.tsのMEMORIES_SCHEMA参照）。"none"は「この5表現の
+ * どれにも対応しない」という判断結果そのものを表す値であり、Production実機テストで
+ * eventTimeSourceがoptionalだったためにLLMが判断自体を省略してしまう事象が確認された
+ * ことを受け、eventTimeSourceをrequiredにしたうえで追加した（値の断定を必須にする
+ * わけではなく、判断を必須にするための選択肢）。
  */
-export type EventTimeSource = "today" | "yesterday" | "day-before-yesterday" | "tomorrow" | "day-after-tomorrow";
+export type EventTimeSource =
+  | "today"
+  | "yesterday"
+  | "day-before-yesterday"
+  | "tomorrow"
+  | "day-after-tomorrow"
+  | "none";
 
-const EVENT_TIME_SOURCE_OFFSETS: Record<EventTimeSource, number> = {
+/** "none"以外の5値（実際に日付計算が必要なもの）だけのoffsetテーブル。 */
+const EVENT_TIME_SOURCE_OFFSETS: Record<Exclude<EventTimeSource, "none">, number> = {
   today: 0,
   yesterday: -1,
   "day-before-yesterday": -2,
@@ -63,19 +74,20 @@ const EVENT_TIME_SOURCE_OFFSETS: Record<EventTimeSource, number> = {
   "day-after-tomorrow": 2,
 };
 
-const EVENT_TIME_SOURCES = Object.keys(EVENT_TIME_SOURCE_OFFSETS) as EventTimeSource[];
+const EVENT_TIME_SOURCES: readonly EventTimeSource[] = [...Object.keys(EVENT_TIME_SOURCE_OFFSETS), "none"] as EventTimeSource[];
 
-/** LLMが返したeventTimeSourceが、v1で対応する固定語彙のいずれかであることを検証する。 */
+/** LLMが返したeventTimeSourceが、v1で対応する6値（固定語彙5つ＋"none"）のいずれかであることを検証する。 */
 export function isValidEventTimeSource(value: unknown): value is EventTimeSource {
   return typeof value === "string" && (EVENT_TIME_SOURCES as readonly string[]).includes(value);
 }
 
 /**
  * eventTimeSourceが指す確定日付を、todayDateString（そのCaptureリクエストで確定した
- * 同一のJST基準日）から計算する。sourceは事前にisValidEventTimeSource()で検証されている
- * 前提（呼び出し元の責務）。
+ * 同一のJST基準日）から計算する。"none"はここでは扱わない（呼び出し元が"none"かどうかを
+ * 先に判定し、"none"の場合はこの関数を呼ばない責務を持つ）。sourceは事前に
+ * isValidEventTimeSource()で検証されている前提。
  */
-export function resolveEventTimeSourceDate(todayDateString: string, source: EventTimeSource): string {
+export function resolveEventTimeSourceDate(todayDateString: string, source: Exclude<EventTimeSource, "none">): string {
   return addDaysToDateString(todayDateString, EVENT_TIME_SOURCE_OFFSETS[source]);
 }
 
