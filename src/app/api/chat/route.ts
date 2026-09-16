@@ -54,6 +54,37 @@ Web検索を行う場合や、「今」「現在」「最新」「今日」「�
 }
 
 /**
+ * Time Axis Phase 1（Conversation Time Awareness）。ConversationTurn.timestampを
+ * 「[YYYY-MM-DD HH:mm JST]」形式のラベルに変換する。既存のbuildCurrentDateTimeContext()
+ * （NOW、漢字混じりの表示形式）とは別の、turnごとに繰り返し付けても冗長になりにくい
+ * 簡潔な絶対日時形式にする。
+ *
+ * timestampが無い・パース不能な場合はnullを返す。呼び出し元はnullのとき、そのturnへ
+ * ラベルを一切付けない（現在時刻や他のturnの時刻から推測・捏造しない）。既存Conversation
+ * やMarkdown restore由来のturnでtimestampが欠けている・不正確である可能性への対処
+ * （Markdown restoreはturn単位のtimestampを保存しておらず、復元時はconversation.startedAt
+ * を暫定的に全turnへ割り当てている。markdown.ts参照。今回この復元方式自体は変更しない）。
+ */
+function formatTurnTimestampLabel(timestamp: string | undefined): string | null {
+  if (!timestamp) return null;
+  const ms = Date.parse(timestamp);
+  if (!Number.isFinite(ms)) return null;
+
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(ms));
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
+
+  return `[${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")} JST]`;
+}
+
+/**
  * AI_DESIGN.md Philosophy / Core Role「1. Listen」に対応するシステムプロンプト。
  * この段階のAIは記憶を作ろうとしない。ただ自然に会話を受け取る（MEMORY_ENGINE.md 2.1）。
  *
@@ -788,6 +819,14 @@ AI自身の考えを話したあと、心理的意味づけ（「あなたが惹
   ついて断定・保証してはいけない。このAIには、今回実際に渡されている範囲以外の過去の会話は
   見えていない。今の範囲では確認できないときは、「存在しない」ではなく「今参照できている
   文脈では、その内容を確認できていない」のように、自分に見えている範囲の限界として述べる
+- 現在のConversation turns・「直前の会話」の一部には「[YYYY-MM-DD HH:mm JST]」のような
+  発言日時ラベルが付いている場合がある。これはシステムが確定できる事実（そのturnが実際に
+  発言された時刻）であり、AIの推測ではない。ラベルが無いturnについては、日時を推測・
+  捏造しない。ラベルがある場合は、冒頭の現在日時（NOW）と比較し、時間的にどれくらい
+  離れているかを会話理解の材料にする。数日前・数週間前のturnを「さっき」「今話していた」
+  「今の会話で」のように、現在進行中のこととして語らない。ただし直近数分〜十数分程度の
+  turnについて「さっき」のような自然な表現を使うこと自体は禁止しない。毎回の応答で経過
+  時間を数値で言う必要はなく、あくまで時間的な位置関係を正しく理解するための材料として使う
 - register に合った長さで。雑談（A）は1〜3文で軽く、相談（B）は必要なだけ深く、調査（C）は
   必要な情報量を確保する。雑談で「考えた跡を見せる」ために無理に長くしない。ただし「軽い」と
   「中身がない（相槌だけ）」は違う。可能なら対象について一つ何か返す
@@ -1060,7 +1099,11 @@ function buildRecentConversationSection(recent: RecentConversationInput | undefi
   const elapsedLabel = elapsedMinutes === null ? "" : `（約${elapsedMinutes}分前まで）`;
 
   const transcript = recent.turns
-    .map((turn) => `${turn.role === "user" ? "ユーザー" : "Tsumugi"}：${turn.content}`)
+    .map((turn) => {
+      const timestampLabel = formatTurnTimestampLabel(turn.timestamp);
+      const prefix = timestampLabel ? `${timestampLabel} ` : "";
+      return `${prefix}${turn.role === "user" ? "ユーザー" : "Tsumugi"}：${turn.content}`;
+    })
     .join("\n");
 
   return `
@@ -1308,7 +1351,15 @@ export async function POST(request: Request) {
     // 副作用を持っていた（Test47で確認：ユーザーが実際に話した内容や、AI自身が直前の
     // ターンで答えた内容について「話していない」と否定するなど、会話履歴の認識が
     // 破綻する原因になっていた）。record保護turnを除き、user/ai turnは常にそのまま渡す。
-    providerTurns.push({ role: turn.role === "user" ? "user" : "ai", content: turn.content });
+    //
+    // Time Axis Phase 1（Conversation Time Awareness）：以前はturn.timestampをここで
+    // 捨てていたため、同一Conversation内に何日も前のturnが残っていても（例：閉じずに
+    // 使い続けたタブ）、LLMにはそれを見分ける手段が無かった。Provider APIのmessage
+    // schema自体（role/content構造）は変えず、contentの先頭にラベルとして付与する
+    // （必要なければ何も付けない＝既存の見た目を壊さない）。
+    const timestampLabel = formatTurnTimestampLabel(turn.timestamp);
+    const contentWithTimestamp = timestampLabel ? `${timestampLabel}\n${turn.content}` : turn.content;
+    providerTurns.push({ role: turn.role === "user" ? "user" : "ai", content: contentWithTimestamp });
   }
 
   const provider = getProvider(providerName);
