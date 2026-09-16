@@ -916,6 +916,34 @@ export async function markVaultWorldJournalMigrated(): Promise<void> {
   await db.put("settings", String(CURRENT_VAULT_WORLD_JOURNAL_VERSION), VAULT_WORLD_JOURNAL_VERSION_KEY);
 }
 
+/**
+ * Android保存方式の見直し：Androidの既定Vault backendをFile System Access
+ * （SAF/document provider経由）からOPFS（この端末専有の内部領域）へ切り替えるにあたり、
+ * 新しい空のOPFS VaultについてRegistry baseline（`resyncVaultRegistry`の初回実行）を
+ * 確立済みかどうかを、端末ごとに一度だけ記録する。`VAULT_WORLD_JOURNAL_VERSION_KEY`と
+ * 同じパターンで、値の中身自体は問わず、キーの存在だけを見る。
+ * 既存IndexedDBデータ（conversations/memoryObjects/sources）・旧外部Vaultへは
+ * このmarker自体は一切触れない。
+ */
+const ANDROID_OPFS_VAULT_INITIALIZED_KEY = "androidOpfsVaultInitialized";
+
+export async function isAndroidOpfsVaultInitialized(): Promise<boolean> {
+  const db = await getDB();
+  const raw = await db.get("settings", ANDROID_OPFS_VAULT_INITIALIZED_KEY);
+  return raw !== undefined;
+}
+
+/**
+ * Registry baseline確立（`resyncVaultRegistry`の初回実行）が正常に完了したと
+ * 呼び出し元（vault.ts）が確認した後にのみ呼ぶこと。途中失敗した場合はこの関数を
+ * 呼ばないことで、次回起動時に再試行できるようにする（`markVaultWorldJournalMigrated`
+ * と同じ「成功確認後にのみmarkerを立てる」原則）。
+ */
+export async function markAndroidOpfsVaultInitialized(): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", "true", ANDROID_OPFS_VAULT_INITIALIZED_KEY);
+}
+
 /** 「過去からの問いかけ」機能が直近に表示したMemory IDの一覧（新しいものが末尾）。同じMemoryの連続表示を避けるためだけに使う。 */
 const LAST_PROMPTED_MEMORY_IDS_KEY = "lastPromptedMemoryIds";
 const MAX_LAST_PROMPTED_MEMORY_IDS = 5;

@@ -10,6 +10,7 @@ import {
   clearOpfsVault,
   collectAllMarkdownFiles,
   countVaultLightCheckCandidates,
+  ensureAndroidOpfsVaultBaseline,
   ensureVaultSkeleton,
   flushPendingToVault,
   getVaultBackend,
@@ -1528,6 +1529,19 @@ export default function ChatScreen() {
       if (result.status === "connected") {
         setVaultHandle(result.handle);
         setVaultStatus("connected");
+
+        // Android保存方式の見直し：Android以外・既にbaseline確立済みでは何もしない
+        // （ensureAndroidOpfsVaultBaseline内部でガード済み）。Androidの新しい空の
+        // OPFS Vaultについて初回だけRegistry baselineを確立する。下のflush（既存の
+        // pending変更をVaultへ書き戻す処理）より必ず前に行う——baseline未確立の
+        // ままflushすると、新規recordも含めて全件が一時的にHOLD対象になってしまう
+        // ため。過去のIndexedDBデータ（conversations/memoryObjects/sources）は
+        // 一切読み書きしない。既存のPC/iOSの経路・タイミングは変更しない。
+        try {
+          await ensureAndroidOpfsVaultBaseline(result.handle);
+        } catch (error) {
+          console.error("Failed to ensure Android OPFS vault baseline", error);
+        }
 
         // Test 34：STORAGE.md §2.4 Rebuildability Guarantee。起動時にすでにVaultへの
         // 接続許可（restoreVaultHandle）が確認できている場合、handleConnectVault()と

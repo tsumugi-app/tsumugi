@@ -29,7 +29,9 @@ import {
   getRegistryGenerationEpoch,
   getSource,
   getVaultSyncState,
+  isAndroidOpfsVaultInitialized,
   loadVaultHandle,
+  markAndroidOpfsVaultInitialized,
   putConversationAndMarkSynced,
   putMemoryObjectAndMarkSynced,
   saveSourceAndMarkSynced,
@@ -117,11 +119,27 @@ function isOpfsSupported() {
 }
 
 /**
- * このブラウザで実際に使えるVaultバックエンドを返す。File System Access APIが使えれば
+ * Android保存方式の見直し：Android Chrome（SAF/document provider経由）は
+ * `showDirectoryPicker`が使える場合があるが、実機でVault接続/権限確認の不安定さ・
+ * I/Oの遅さ・カレンダー反映の遅延が繰り返し確認されたため、外部Vaultを日常動作の
+ * primary storageとして使う方針を終了する。Androidだけを他のFSA対応環境より先に
+ * 判定し、常にOPFS（この端末専有の内部領域）を優先させる。iOS/iPadOS Safariは
+ * 元々`showDirectoryPicker`非対応のため、この判定の影響を受けない
+ * （isFsAccessSupported()が既にfalseを返すので、この分岐に到達する前に
+ * 下のOPFSフォールバックへ進む）。この用途だけの最小限のUser-Agent判定にとどめる。
+ */
+function isAndroid() {
+  return typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+}
+
+/**
+ * このブラウザで実際に使えるVaultバックエンドを返す。Androidでは常にOPFSを優先する
+ * （上記コメント参照）。それ以外の環境ではFile System Access APIが使えれば
  * 必ずそちらを優先する（PCで既にVaultを接続しているユーザーを、意図せずOPFSへ切り替えない
  * ため）。使えない場合のみOPFSへフォールバックする。どちらも使えなければnull。
  */
 export function getVaultBackend(): VaultBackend | null {
+  if (isAndroid()) return isOpfsSupported() ? "opfs" : null;
   if (isFsAccessSupported()) return "file-system-access";
   if (isOpfsSupported()) return "opfs";
   return null;
@@ -210,6 +228,41 @@ export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
   } catch (error) {
     logTimingEvent("Vault restoreVaultHandle:error");
     throw error;
+  }
+}
+
+/**
+ * Android保存方式の見直し：Androidの既定backendがOPFSへ切り替わった端末で、新しい
+ * （空の）OPFS VaultについてRegistry baseline（`baselineEstablishedAt`）を一度だけ
+ * 確立する。C1のfail-closed設計（Registry absentなrecordはbaseline確立後の
+ * createdAtでなければ書き込めない）は一切変更しない——単に、空のVaultに対して
+ * 既存の`resyncVaultRegistry()`（full resync）を、C1が想定する「初回のVault確立」
+ * という正規の用途でそのまま1回呼ぶだけである。
+ *
+ * 過去のIndexedDBデータ（conversations/memoryObjects/sources）は一切対象にしない
+ * （このリクエスト自体はどのrecordも読み書きしない）。`vaultSyncState`もクリア
+ * しない——これにより、以前File System Access（旧backend）で同期済みだった
+ * recordは「同期済み」のまま残り、この後に自動実行される`flushPendingToVault`
+ * から静かにスキップされる。新しいOPFS Vaultへ過去recordが誤ってback-fillされる
+ * ことを、追加のロジック無しに防ぐ（同期されていなかった一部recordがあれば、
+ * C1の既存fail-closed判定により無害にHOLDされるだけで、IndexedDB本体には
+ * 一切影響しない）。
+ *
+ * 成功時（`resyncVaultRegistry`がRegistry CLEAN state・baselineの確立まで完了した
+ * 場合、`lastFullResyncUpdated === true`）にのみ、db.tsの永続markerを立てる。
+ * 失敗時はmarkerを立てず、次回起動時に再試行する（途中失敗を「移行済み」と
+ * 誤認しない）。Android以外・OPFS以外では何もしない。
+ */
+export async function ensureAndroidOpfsVaultBaseline(root: FileSystemDirectoryHandle): Promise<void> {
+  if (!isAndroid() || getVaultBackend() !== "opfs") return;
+  if (await isAndroidOpfsVaultInitialized()) return;
+  try {
+    const result = await resyncVaultRegistry(root);
+    if (result.lastFullResyncUpdated) {
+      await markAndroidOpfsVaultInitialized();
+    }
+  } catch (error) {
+    console.error("[Tsumugi] failed to establish Android OPFS vault baseline (will retry on next launch):", error);
   }
 }
 
