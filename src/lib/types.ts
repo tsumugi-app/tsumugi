@@ -192,6 +192,16 @@ export interface MemoryObject extends Identifiable, Timestamped {
    * 既存Memoryには存在しない可能性があり、その場合はトップ画面の問いかけ候補にしない。
    */
   revisitPrompt?: string;
+  /**
+   * Topic Continuity Phase 1（基礎のみ、Retrievalへの本格接続はまだ行わない）。
+   * 「今後も同じ話の続きとして扱うべきテーマ」をCapture時に軽く判定し、sameTopicと
+   * 判定された場合にのみ既存のtopicIdを継承する（無ければ新規発行）。単なる共通語の
+   * 一致では設定しない。既存Memoryには存在しない可能性があり（Phase 1では過去Memoryへの
+   * 一括backfillを行わないため）、undefinedの場合は「まだTopic未分類」として扱う。
+   * `revisitPrompt`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・
+   * Vault migration不要）。
+   */
+  topicId?: ID;
   metadata: Metadata;
 }
 

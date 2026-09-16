@@ -805,17 +805,20 @@ AI自身の考えを話したあと、心理的意味づけ（「あなたが惹
  * として追加し、その場合だけ最低512を保証する（`Math.max(baseBudget, 512)`）。
  * Recent Conversation Continuity v1：直前Conversationの逐語がcontextに含まれるターンも
  * 同様に「継続の理解」へ思考予算が要るため、hasRecentConversationでも同じfloorを適用する。
- * どちらも無い（hasRetrievedMemories=false かつ hasRecentConversation=false）ターンは、
- * 既存の文字数ベース計算を一切変更しない。既存の上限（長文で768）もMath.maxにより
- * 自然に維持される（768 > 512なので長文でもfloorで下がることはない）。
+ * Topic Continuity Context v1：話題候補（topicContext）がcontextに含まれるターンも、
+ * 「どの候補が今回の発言と本当に繋がるか」を判断する分だけ同様の思考が要るため、
+ * hasTopicContextでも同じfloorを適用する。いずれも無い（hasRetrievedMemories=false
+ * かつhasRecentConversation=falseかつhasTopicContext=false）ターンは、既存の文字数
+ * ベース計算を一切変更しない。既存の上限（長文で768）もMath.maxにより自然に維持される
+ * （768 > 512なので長文でもfloorで下がることはない）。
  */
 function computeThinkingBudget(
   latestUserMessage: string,
-  options?: { hasRetrievedMemories?: boolean; hasRecentConversation?: boolean }
+  options?: { hasRetrievedMemories?: boolean; hasRecentConversation?: boolean; hasTopicContext?: boolean }
 ): number {
   const length = latestUserMessage.length;
   const baseBudget = length < 120 ? 128 : length < 400 ? 384 : 768;
-  if (options?.hasRetrievedMemories || options?.hasRecentConversation) {
+  if (options?.hasRetrievedMemories || options?.hasRecentConversation || options?.hasTopicContext) {
     return Math.max(baseBudget, 512);
   }
   return baseBudget;
@@ -1076,6 +1079,65 @@ ${transcript}
   にも根拠が無い過去について「さっき話した」と話を作らない。`;
 }
 
+/**
+ * Topic Continuity Context v1（Current Conversation → Recent Conversation → Topic
+ * Continuity Context → Memory Retrieval の並びのうち、Recent ConversationとMemory
+ * Retrievalの間の層）。クライアント（topicContinuity.ts / ChatScreen.handleSend）が、
+ * 現在発言にcontinuity signal（「昨日」「前に」等）がある場合のみ、MemoryObject.topicId
+ * （Topic Continuity Phase 1）でグルーピングした話題候補（最大3件、各最大3 Memoryの
+ * summary/date/keywordsのみ）を組み立てて渡すoptional field。これも永続スキーマではなく
+ * 1リクエストごとに破棄される。
+ *
+ * 重要な設計方針（ここが今回の核心）：
+ * - クライアント側は「続きである可能性のある候補を絞る」ところまでしか行わない。
+ *   どの候補が実際に今回の発言の続きなのか、あるいはどれも続きではないのかは、
+ *   ここ（LLMへの指示）で判断させる——ローカル側で1件に決め打ちしない設計と対になる。
+ * - topicIdはクライアント側の内部識別用であり、ここではLLMへの参考情報の整理にしか
+ *   使わない。ユーザーへ内部識別子やMemory構造そのものを見せる応答をさせない。
+ * - Retrieved Memories・直前の会話と同じ判断基準：関連が無ければ無理に使わない。
+ *   「記録によると」のような不自然な引用口調にせず、過去を知識として自然に理解した
+ *   上で返答させる。
+ */
+interface TopicContinuityInput {
+  topicId: string;
+  memories: Array<{ date: string; summary: string; keywords: string[] }>;
+}
+
+function buildTopicContinuitySection(topics: TopicContinuityInput[] | undefined): string {
+  if (!topics || topics.length === 0) return "";
+  const validTopics = topics.filter((topic) => topic.memories.length > 0);
+  if (validTopics.length === 0) return "";
+
+  const topicBlocks = validTopics
+    .map((topic, index) => {
+      const memoryLines = topic.memories
+        .map((memory) => `  - ${memory.date}：${memory.summary}`)
+        .join("\n");
+      return `候補${index + 1}：\n${memoryLines}`;
+    })
+    .join("\n\n");
+
+  return `
+
+## 継続中かもしれない話題の候補
+
+現在の発言に「昨日」「前に」「続き」のような、過去の話を指しているとみられる言い回しが
+含まれていたため、これまでの記憶の中から、続きである可能性のある話題をいくつか集めました。
+**これは確定した答えではなく、あくまで候補です。**
+
+${topicBlocks}
+
+- 現在の発言の意味を最優先で読み、上の候補のどれかと本当に自然に繋がる場合にのみ使う。
+  候補が提示されていること自体を「続きが確定している」根拠にしない。
+- 候補が複数ある場合、最も自然に繋がる1つだけを使う。無理に複数を混ぜたり、全てに
+  触れようとしない。
+- どの候補とも意味的に繋がらない場合は、これらを一切使わず、現在の発言だけに応答する。
+- ここに書かれた内容やこの仕組みの存在（候補・分類・内部識別等）をユーザーへ説明したり
+  見せたりしない。「以前の記録によると」のような不自然な引用口調も使わない。過去のことを
+  すでに知っている人として、自然に理解した上で返答する。
+- ここに書かれていないことを、推測で「続きだ」と決めつけて話を作らない。`;
+}
+
 export async function POST(request: Request) {
   // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。クライアントが明示指定
   // していればそれを最終的なproviderとして使い、無ければ従来通りfeatureベースの
@@ -1090,11 +1152,12 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
     recentConversation?: RecentConversationInput;
+    topicContext?: TopicContinuityInput[];
   };
 
   if (!turns || turns.length === 0) {
@@ -1196,18 +1259,24 @@ export async function POST(request: Request) {
   // 現在のturns（providerTurns）へは混ぜない。memoriesSectionForPersonaの直後、
   // webSearchInstructionの前に置く（「直前の会話」→「関連する過去の記憶」の順で提示済み）。
   const recentConversationSection = buildRecentConversationSection(recentConversation);
+  // Topic Continuity Context v1：continuity signal（「昨日」「前に」等）がある場合のみ
+  // クライアントが渡す話題候補。「直前の会話」（逐語・時間的に直前）と「関連する過去の記憶」
+  // （通常のkeyword一致）の間に置く（recentConversationSectionの直後）。
+  const topicContinuitySection = buildTopicContinuitySection(topicContext);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${recentConversationSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${recentConversationSection}${topicContinuitySection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
-  // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection`。
-  // フィルタ等で最終的に空文字列になった場合は対象外）の有無を基準にする。
-  // 全persona共通のsectionのため、companion/coach/analystいずれのターンでも同じ基準で
-  // 最低budgetを保証する（persona別の特別扱いは今回追加しない）。Recent Conversationが
-  // あるターンも、Memoryがあるターンと同様に「継続の理解」に思考予算が要るため floor 512 とする。
+  // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
+  // `topicContinuitySection`。フィルタ等で最終的に空文字列になった場合は対象外）の有無を
+  // 基準にする。全persona共通のsectionのため、companion/coach/analystいずれのターンでも
+  // 同じ基準で最低budgetを保証する（persona別の特別扱いは今回追加しない）。Recent
+  // Conversation・Topic Continuity Contextがあるターンも、Memoryがあるターンと同様に
+  // 「継続の理解」に思考予算が要るため floor 512 とする。
   const thinkingBudget = computeThinkingBudget(latestUserMessage, {
     hasRetrievedMemories: retrievedMemoriesSection.length > 0,
     hasRecentConversation: recentConversationSection.length > 0,
+    hasTopicContext: topicContinuitySection.length > 0,
   });
 
   // Test 13：記録形式のAIターンがあった場合、そのターンの実本文（Markdown記録）を

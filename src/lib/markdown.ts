@@ -62,6 +62,7 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     types: memoryObject.types,
     keywords: memoryObject.keywords.length > 0 ? memoryObject.keywords : undefined,
     conversationId: memoryObject.conversationId,
+    topicId: memoryObject.topicId,
     summary: memoryObject.summary,
     links: memoryObject.links.length > 0 ? JSON.stringify(memoryObject.links) : undefined,
     source: memoryObject.metadata.source,
@@ -234,6 +235,8 @@ function extractAfterHeading(body: string, heading: string): string {
  *   （Entity自体を実装しないため）
  * - `links`はPhase 2で追加したフィールド。古い（Phase 1で書かれた）ファイルには無いため、
  *   その場合は空配列にフォールバックする
+ * - `topicId`はTopic Continuity Phase 1で追加したoptionalフィールド。古いファイルには
+ *   無いため、その場合は`undefined`（Topic未分類）にフォールバックする
  * - `metadata.id`（Metadataレコード自身のID）はMarkdownに保存されていないため新規に振り直す
  */
 function parseLinks(raw: unknown): Link[] {
@@ -334,6 +337,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     date,
     types,
     conversationId: asString(frontmatter.conversationId),
+    topicId: asString(frontmatter.topicId),
     content,
     summary,
     keywords: asStringArray(frontmatter.keywords),

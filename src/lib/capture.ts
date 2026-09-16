@@ -52,8 +52,13 @@ export function appendTurn(conversation: Conversation, turn: ConversationTurn): 
   };
 }
 
+/** Topic Continuity Phase 1。existingMemoryId（同一Memoryの更新かどうか）とは別の軸。 */
+type TopicDecision = "sameTopic" | "newTopic" | "uncertain";
+
 interface ExtractedMemory {
   existingMemoryId?: string;
+  topicDecision: TopicDecision;
+  sameTopicMemoryId?: string;
   summary: string;
   content: string;
   keywords: string[];
@@ -212,8 +217,41 @@ async function captureConversationImpl(
   // 単一の血統情報と、意味を一致させる）。
   const newlyCreatedIds: string[] = [];
 
+  // Topic Continuity Phase 1：existingMemoryId（同一Memoryの更新かどうか）とは独立に
+  // topicIdを解決する。「弱い関連を無理にsameTopicにしない」「空白を勝手に埋めない」
+  // という方針から：
+  // - sameTopic：対象候補が既にtopicIdを持っていればそれを継承する。対象候補が
+  //   まだtopicIdを持たない場合、既存Memory（対象候補）側へは一切書き戻さず
+  //   （Phase 1では過去Memoryへのbackfillをしない。10/11の制約通り）、新しいtopicIdを
+  //   この新規/更新Memory側にだけ発行する。
+  // - newTopic：新しいtopicIdを発行する（今後sameTopicの対象として機能しうる）。
+  // - uncertain：新規にtopicIdを発行しない（安全側。理由は実装報告参照）。ただし
+  //   更新対象（existing）が既にtopicIdを持っていた場合、今回の判定がuncertainだった
+  //   というだけの理由でそれを消さない（維持する）。
+  function resolveTopicId(item: ExtractedMemory, existing: MemoryObject | undefined): string | undefined {
+    if (item.topicDecision === "sameTopic") {
+      const target = item.sameTopicMemoryId ? existingById.get(item.sameTopicMemoryId) : undefined;
+      if (target?.topicId) return target.topicId;
+      return ulid();
+    }
+    if (item.topicDecision === "newTopic") {
+      return ulid();
+    }
+    return existing?.topicId;
+  }
+
+  // TEMP-TEST：Topic Continuity Phase 1の判定結果を観測するためだけのログ。
+  // 本文・summary・keywords・topicId自体は出さない（列挙値と件数のみ）。
+  const candidateCount = existingMemoryObjects.length + relatedMemoryObjects.length;
+
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
     const existing = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
+    const resolvedTopicId = resolveTopicId(item, existing);
+    logTimingEvent("Capture topicDecision", {
+      topicDecision: item.topicDecision,
+      candidateCount,
+      topicIdPresent: resolvedTopicId ? 1 : 0,
+    });
 
     if (existing) {
       return {
@@ -222,6 +260,7 @@ async function captureConversationImpl(
         summary: item.summary,
         keywords: item.keywords,
         types: item.types,
+        topicId: resolvedTopicId,
         updatedAt: timestamp,
         metadata: {
           ...existing.metadata,
@@ -248,6 +287,7 @@ async function captureConversationImpl(
       ideaIds: [],
       eventIds: [],
       links: [],
+      topicId: resolvedTopicId,
       createdAt: timestamp,
       updatedAt: timestamp,
       metadata: {

@@ -71,6 +71,30 @@ Memory候補の粒度（重要）:
 - 既存Memoryのうち、今回の会話で全く触れられていないものは、出力に含めない
   （それらは変更されない。無理に毎回すべて出力し直す必要はない）。
 
+Topic判定（重要。existingMemoryIdによるUPDATE/CREATE判定とは完全に別の軸）:
+- 「同じMemoryの更新か・新規Memoryか」（existingMemoryId）とは別に、「今後も同じ話の
+  続きとして扱うべき、続いているテーマ（Topic）かどうか」を判定する。同じMemoryの
+  更新でなくても（＝新規Memoryとして出力する場合でも）、既存Memory・関連Memory候補の
+  どれかと同じ大きなテーマの続きであることは十分にありうる。
+- 判断基準は「単なる共通の単語が含まれているか」ではなく「今後も同じ話の続きとして
+  扱うべきテーマか」。以下の結果のいずれか1つを「topicDecision」に設定する：
+  - sameTopic: 既存Memory・関連Memory候補のうちどれか1つと、明確に同じ継続的テーマ
+    である場合。この場合、その候補のidを「sameTopicMemoryId」に設定する。
+    例：過去に「08小隊」「サイサリス」「ZZ」というガンダム関連のMemoryがあり、今回
+    「ガンダムの話をしよう」という会話があった場合、これはsameTopicとして妥当
+    （具体的な単語が完全一致していなくても、同じ継続的テーマだと明確に言える）。
+  - newTopic: 既存Memory・関連Memory候補のどれとも明確に異なる、新しい継続的テーマ
+    だと言える場合。
+    例：過去に「レンタカー事業」の話をしていて、今回「ガンダムの話をしよう」という
+    会話があった場合、これは必ず別Topic（newTopまたはuncertain、sameTopicにはしない）。
+  - uncertain: sameTopicともnewTopicとも明確には言えない場合。弱い関連・単なる連想
+    だけでsameTopicと判定しない（迷う場合は必ずuncertainを選ぶ）。
+    例：過去に「ガンダム」というテーマのMemoryがあり、今回「最近アニメあまり見てない」
+    という一般的な発言があった場合、ガンダムというテーマへ無理に接続せず、uncertain
+    （またはnewTopic）とする。
+- Topic判定はexistingMemoryIdの有無に関わらず必ず行う（新規Memoryとして出力する場合も
+  topicDecisionを必ず設定する）。
+
 別Conversationからの関連Memory候補との対応付け（重要）:
 - 「既存Memory」とは別に、過去の別Conversationから機械的な検索で見つかった、話題が
   近い可能性のある「関連Memory候補」が提示される場合がある。
@@ -202,6 +226,18 @@ const MEMORIES_SCHEMA: AISchema = {
             type: "string",
             description: "既存Memoryのいずれかの続き・更新である場合のみ、そのid。新規Memoryの場合は省略する",
           },
+          topicDecision: {
+            type: "string",
+            enum: ["sameTopic", "newTopic", "uncertain"],
+            description:
+              "existingMemoryIdとは別の軸。既存Memory・関連Memory候補のいずれかと同じ継続的テーマなら" +
+              "sameTopic、明確に異なる新しいテーマならnewTopic、どちらとも言えなければuncertain（迷う場合は必ずuncertain）",
+          },
+          sameTopicMemoryId: {
+            type: "string",
+            description:
+              "topicDecisionがsameTopicの場合のみ、同じテーマだと判断した既存Memory・関連Memory候補のid",
+          },
           summary: {
             type: "string",
             description: "この記憶をひと目で思い出せる一行の要約（20〜40文字程度）",
@@ -225,7 +261,7 @@ const MEMORIES_SCHEMA: AISchema = {
             description: "この抽出結果に対する確信度（0〜1）",
           },
         },
-        required: ["summary", "content", "keywords", "types", "confidence"],
+        required: ["summary", "content", "keywords", "types", "confidence", "topicDecision"],
       },
     },
   },

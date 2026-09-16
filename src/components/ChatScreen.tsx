@@ -52,6 +52,7 @@ import {
 } from "@/lib/retrieval";
 import { createInsightMemoryObject, generateSessionReflection } from "@/lib/reflection";
 import { buildRecentConversationPayload, type RecentConversationPayload } from "@/lib/recentConversation";
+import { buildTopicContinuityPayload, type TopicContinuityCandidate } from "@/lib/topicContinuity";
 import { connectMemory } from "@/lib/connect";
 import { filterUnconnected } from "@/lib/connectState";
 import {
@@ -3229,6 +3230,23 @@ export default function ChatScreen() {
         console.error("Failed to load recent conversation context", recentError);
       }
 
+      // Topic Continuity Context v1（Recent ConversationとMemory Retrievalの間の層。
+      // topicContinuity.ts参照）。「昨日の話なんだけど」のようなcontinuity signalが
+      // 現在発言にある場合のみ、MemoryObject.topicId（Capture時に判定・付与済み、
+      // Topic Continuity Phase 1）でグルーピングした話題候補（最大3件、各最大3 Memory、
+      // summary/date/keywordsのみ）を/api/chatへ別枠で渡す。どのtopicの続きか・
+      // どれも使うべきでないかの最終判断はローカルでは行わず、/api/chatの既存LLM呼び出しへ
+      // 委ねる（新しいAPI/LLM callは追加しない）。取得失敗は既存recentConversationと同じ
+      // 方針：StaleVaultTabErrorのみ上位へ再送出、それ以外は会話送信をブロックせずnullで続行。
+      let topicContext: TopicContinuityCandidate[] | null = null;
+      try {
+        const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
+        topicContext = buildTopicContinuityPayload(allMemoriesForTopicContinuity, text);
+      } catch (topicError) {
+        if (topicError instanceof StaleVaultTabError) throw topicError;
+        console.error("Failed to load topic continuity context", topicError);
+      }
+
       // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用。`?debugLog=1`が
       // 無い場合は即returnするため（conversationDebugLog.ts参照）、通常のユーザーには
       // 一切影響しない。会話送信そのものを待たせない・失敗させないためvoidで発火するだけにする。
@@ -3266,6 +3284,7 @@ export default function ChatScreen() {
           turns: updated.turns,
           retrievedMemories,
           ...(recentConversation ? { recentConversation } : {}),
+          ...(topicContext ? { topicContext } : {}),
         }),
       });
 
