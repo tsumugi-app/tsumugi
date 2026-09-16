@@ -272,46 +272,6 @@ function finalizeEventTimeForMemory(memory: Record<string, unknown>, todayDateSt
 }
 
 /**
- * Time Axis Phase 2（Event Time, v1）。一時的な診断用instrumentation（原因調査専用）。
- * Production実機でGeminiが実際にeventTimeSourceへ何を返しているか（"yesterday"等の
- * 有効値／"none"／キー欠落／null／enum外の不正値）を、finalizeEventTimeForMemory()による
- * 加工前後で突き合わせて観測できるようにするためだけの情報を組み立てる。
- *
- * 重要な境界：
- * - ここで作る情報は/api/captureレスポンスの`debugEventTime`という別フィールドにのみ
- *   含める。`memories`配列（capture.ts側が実際にMemoryObjectの生成に使う値）には
- *   一切混ぜない・spreadしない。
- * - capture.ts・types.ts・markdown.ts・eventTimeResolver.tsは変更していない。
- *   capture.tsのextractMemories()は`data.memories`だけを読みその他のトップレベル
- *   フィールドは無視するため、`debugEventTime`はMemoryObject/IndexedDB/Markdown/Vault
- *   のいずれにも一切到達しない（読み捨てられるだけ）。
- * - Memory本文（summary/content/keywords等）は一切含めない。含めるのはEvent Time
- *   関連フィールドとmemoryIndexだけ。
- * - 「キー自体が無い」と「値がnull（またはstring以外の型）」を区別できるよう、
- *   *Presentという真偽値を別途持たせる（JSON上undefinedはそもそも表現できないため、
- *   hasOwnPropertyで欠落を判定する）。
- */
-function toDebugStringOrNull(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function buildEventTimeDebugEntry(
-  memoryIndex: number,
-  rawMemory: Record<string, unknown>,
-  finalizedMemory: Record<string, unknown>
-) {
-  return {
-    memoryIndex,
-    rawEventTimeSourcePresent: Object.prototype.hasOwnProperty.call(rawMemory, "eventTimeSource"),
-    rawEventTimeSource: toDebugStringOrNull(rawMemory.eventTimeSource),
-    rawEventTime: toDebugStringOrNull(rawMemory.eventTime),
-    rawEventTimePrecision: toDebugStringOrNull(rawMemory.eventTimePrecision),
-    finalizedEventTime: toDebugStringOrNull(finalizedMemory.eventTime),
-    finalizedEventTimePrecision: toDebugStringOrNull(finalizedMemory.eventTimePrecision),
-  };
-}
-
-/**
  * chat/route.ts と同じ理由（Gemini 3.6系の既定thinkingが重い）でthinking予算を明示する。
  * Captureは会話全体を読む処理なので、会話が長いほど予算を増やす。
  */
@@ -482,16 +442,8 @@ export async function POST(request: Request) {
     const finalizedMemories = memories.map((memory) =>
       isRecord(memory) ? finalizeEventTimeForMemory(memory, todayDateString) : memory
     );
-    // Time Axis Phase 2（Event Time, v1）一時的診断用：debugEventTimeはmemoriesとは
-    // 独立した別フィールドであり、capture.ts側では読まれず素通しされる（原因調査専用、
-    // 本番挙動には影響しない）。
-    const debugEventTime = memories.map((memory, index) => {
-      const raw = isRecord(memory) ? memory : {};
-      const finalized = isRecord(finalizedMemories[index]) ? (finalizedMemories[index] as Record<string, unknown>) : {};
-      return buildEventTimeDebugEntry(index, raw, finalized);
-    });
     return Response.json(
-      { ...parsed, memories: finalizedMemories, debugEventTime },
+      { ...parsed, memories: finalizedMemories },
       { headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) } }
     );
   } catch {
