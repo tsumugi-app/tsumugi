@@ -3647,9 +3647,10 @@ export default function ChatScreen() {
               persona自体の型・/api/chat・/api/reflectのペルソナ別プロンプト分岐・
               Retrievalの分岐・coach自体のロジックは一切削除・変更していない
               （表示上の入口を2つにまとめただけ。内部ロジックは現状維持）。
-              「過去からの問いかけ」経由（handleTopPromptSend）や、その会話が終わった
-              後の継続選択（下記、promptedMemoryId起点の3ボタン）は、この変更の対象外
-              として従来どおり残している（会話境界を大きく作り直さないため）。
+              「過去からの問いかけ」経由（handleTopPromptSend）自体は、この変更の対象外
+              として従来どおり残している（会話境界を大きく作り直さないため）。その会話中の
+              継続選択（下記、promptedMemoryId起点の入口）も、この2本立てと同じ
+              persona mapping（日記／会話）へ後日揃えた。
             */}
             <div className="flex flex-wrap justify-center gap-3">
               <button
@@ -3851,25 +3852,35 @@ export default function ChatScreen() {
         )}
 
         {/*
-          この3ボタンは「Personaを切り替えるナビゲーション」ではなく、過去からの問いかけ
+          この2ボタンは「Personaを切り替えるナビゲーション」ではなく、過去からの問いかけ
           （revisitPrompt）をきっかけに始まったConversationからだけ出す入口。判定は
           turnsの文字列内容からの推測ではなく、Conversation生成時に明示的に立てる
           promptedMemoryId（handleTopPromptSendが設定、通常のPersona選択や
           handleSwitchPersonaが作るConversationには付かない）で行う。
+          通常トップ画面の「日記」＋「会話」の2本立て（f818292）と意味・persona
+          mappingを揃える：「日記」はpersona="companion"、「会話」はpersona="analyst"
+          （既存の「相談・創造」の体験、探究/coachは別モードとして表示しない）。
+          ここは会話進行中（turns.length > 0）からの遷移のため、通常トップの
+          setPersona/setEntryConfirmedではなく、既存のhandleSwitchPersona
+          （現在のConversationをboundary Captureしたうえで新しいConversationを
+          開始する）をそのまま使う（この関数自体は変更しない）。
         */}
         {!showEntryScreen && !busy && conversation.turns.length > 0 && !!conversation.promptedMemoryId && (
           <div className="flex flex-col items-center gap-3 pt-6 text-center">
             <p className="text-sm text-stone-500 dark:text-stone-400">今日は、どう話そう？</p>
             <div className="flex flex-wrap justify-center gap-3">
-              {PERSONAS.map((p) => (
-                <button
-                  key={p.value}
-                  onClick={() => handleSwitchPersona(p.value)}
-                  className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
-                >
-                  {p.label}
-                </button>
-              ))}
+              <button
+                onClick={() => handleSwitchPersona("companion")}
+                className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+              >
+                日記
+              </button>
+              <button
+                onClick={() => handleSwitchPersona("analyst")}
+                className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+              >
+                会話
+              </button>
             </div>
           </div>
         )}
