@@ -335,6 +335,22 @@ async function captureConversationImpl(
     };
   });
 
+  // TEMP-DEBUG（Time Axis Phase 2, Event Time v1 原因調査専用）：capture.tsが最終的に
+  // 返すmemoryObjects（new/UPDATE分岐どちらも組み立て完了後）の時点でeventTime/
+  // eventTimePrecisionが存在するかどうかだけを観測する。id/eventTime/eventTimePrecision/
+  // isNewの4値のみ（summary/content/keywords/topicId等は一切含めない）。MemoryObject
+  // 自体・IndexedDB・Markdown・Vaultには一切影響しない、ブラウザConsoleへの出力のみ。
+  // 原因調査が終わり次第削除すること。
+  console.debug(
+    "[EventTime debug] capture memoryObjects",
+    memoryObjects.map((memory) => ({
+      id: memory.id,
+      eventTime: memory.eventTime ?? null,
+      eventTimePrecision: memory.eventTimePrecision ?? null,
+      isNew: newlyCreatedIds.includes(memory.id),
+    }))
+  );
+
   const updatedConversation: Conversation = {
     ...conversation,
     status: "captured",
