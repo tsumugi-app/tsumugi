@@ -23,6 +23,7 @@ import {
   saveLastPromptedMemoryIds,
 } from "./db";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { getJstTodayDateString } from "./jstDate";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import type { MemoryObject, Persona } from "./types";
 
@@ -40,7 +41,7 @@ interface CandidateSelection {
 }
 
 function isToday(dateISO: string): boolean {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getJstTodayDateString();
   return dateISO.slice(0, 10) === today;
 }
 

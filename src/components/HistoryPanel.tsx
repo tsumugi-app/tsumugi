@@ -12,6 +12,7 @@ import {
 } from "@/lib/vault";
 import type { HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
+import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -44,13 +45,15 @@ function pad2(n: number): string {
 }
 
 /**
- * Vault内のMarkdown命名規則（`fileNameFor`/`dayFileNameFor`、`src/lib/vault.ts`）は
- * すべて`ISODateString.slice(0, 10)`（UTC基準の日付文字列）を単位にしている。
- * カレンダー上の「今日」・「今日だけIndexedDBとマージする」判定も、この同じ基準に
- * 揃える（ローカル時刻の「今日」とVault側の日付バケットがずれないようにするため）。
+ * 画面上の「今日」はAsia/Tokyo（JST）基準で判定する（`@/lib/jstDate`、日本時間0:00〜8:59に
+ * UTC日付が前日にずれる不具合の修正）。なお、Vault内のMarkdown命名規則
+ * （`fileNameFor`/`dayFileNameFor`、`src/lib/vault.ts`）は引き続きUTC基準の日付文字列を
+ * ファイルバケット単位にしており、ここは変更していない。そのため、JST 0:00〜8:59台に
+ * 作られた記録は、画面が「今日」と表示する日と、実際に書き込まれるVaultファイルの
+ * 日付バケットとがずれる場合がある（既知の、今回のスコープ外の特性）。
  */
 function todayKey(): string {
-  return new Date().toISOString().slice(0, 10);
+  return getJstTodayDateString();
 }
 
 function monthKeyOf(year: number, month: number): string {
@@ -167,9 +170,15 @@ export default function HistoryPanel({
    */
   sessionCapturedMemories?: MemoryObject[];
 }) {
-  const [viewYear, setViewYear] = useState(() => new Date().getFullYear());
-  const [viewMonth, setViewMonth] = useState(() => new Date().getMonth() + 1);
+  const [viewYear, setViewYear] = useState(() => getJstYearMonth().year);
+  const [viewMonth, setViewMonth] = useState(() => getJstYearMonth().month);
   const [selectedDay, setSelectedDay] = useState<string | null>(todayKey());
+  /**
+   * visibilitychange時に「JSTの今日が変わったか」を判定するための、直近に把握していた
+   * JST今日の日付。ユーザーが過去の月・日を意図的に閲覧している場合は、日付が変わっても
+   * 表示を今日へ強制的に戻さないための基準値として使う（後述のuseEffect参照）。
+   */
+  const lastKnownTodayRef = useRef(todayKey());
   const [selectedMemory, setSelectedMemory] = useState<MemoryObject | null>(null);
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
 
@@ -321,6 +330,42 @@ export default function HistoryPanel({
     // リセットしてしまうため、意図的に依存配列から外す。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vaultHandle, viewYear, viewMonth, refreshToken]);
+
+  /**
+   * PWAがバックグラウンドから復帰した際（`visibilitychange`でhidden→visibleになった時）に、
+   * JST基準の「今日」が変わっていないかを確認する（`useState`の初期値はmount時に固定され、
+   * 自動では再計算されないため）。`setInterval`によるポーリングは行わない。
+   *
+   * 日付が変わっていた場合でも、無条件に「今日」へ表示を戻すことはしない。ユーザーが
+   * 過去の月・日を意図的に閲覧中の場合（例：9/10を見ている最中に日付が9/17へ進んだ場合）は
+   * 表示を変更しない。「今日」を見ていた（＝表示中のviewYear/viewMonth/selectedDayが、
+   * 直前まで把握していた今日の日付と一致していた）場合にのみ、新しい今日へ表示を進める
+   * （例：9/16を「今日」として見ていた状態で日付が9/17に変わった場合は9/17へ進める）。
+   */
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+
+      const previousToday = lastKnownTodayRef.current;
+      const newToday = todayKey();
+      if (newToday === previousToday) return;
+
+      const [previousYear, previousMonth] = previousToday.split("-").map(Number);
+      const wasFollowingToday = viewYear === previousYear && viewMonth === previousMonth && selectedDay === previousToday;
+
+      lastKnownTodayRef.current = newToday;
+
+      if (wasFollowingToday) {
+        const { year: newYear, month: newMonth } = getJstYearMonth();
+        setViewYear(newYear);
+        setViewMonth(newMonth);
+        setSelectedDay(newToday);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [viewYear, viewMonth, selectedDay]);
 
   /**
    * 日付詳細読み込み・その1（リセット＋キャッシュ確認）：選択日／Vault／refreshTokenが

@@ -18,20 +18,15 @@
  * 計算するが、UTCのtoISOString().slice(0,10)は使わない（JST 00:00〜08:59台でUTC日付が
  * 前日にずれる既知の問題を、ここで新たに踏まないため）。chat/route.tsとの共通化は、
  * 変更範囲が不必要に広がるため行わず、この最小限の計算をCapture側専用に持つ。
+ *
+ * クライアント側「今日」統一（HistoryPanel.tsx/topPrompt.tsの日付跨ぎ不具合対応）に
+ * あたり、実装自体は共通の`./jstDate`へ切り出した。ここでは既存の呼び出し元
+ * （/api/capture/route.ts等）に対する公開API・挙動を完全に維持するため、そのまま
+ * re-exportする（Event Time semanticsは一切変更しない）。
  */
 import type { EventTimePrecision } from "./types";
 
-/** JST基準の「今日」をYYYY-MM-DD形式で返す。 */
-export function getJstTodayDateString(now: Date = new Date()): string {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(now);
-  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
-  return `${get("year")}-${get("month")}-${get("day")}`;
-}
+export { getJstTodayDateString } from "./jstDate";
 
 /**
  * "YYYY-MM-DD"の日付演算はUTCのcalendar componentだけで行う（サーバーの実行時刻の
