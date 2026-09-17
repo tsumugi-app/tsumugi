@@ -3130,6 +3130,13 @@ export default function ChatScreen() {
       setConversation(latestConversationRef.current);
 
       setEndedConversationMemories(latestMemoryObjects);
+      // HistoryPanel「今日」即時マージ対応（handleEndSessionと同じ思想）：Vault/History
+      // Indexへの反映（上のrunConversationBoundaryはawaitVaultSync=falseで、Vault反映は
+      // 待っていない）を待たずに、既にIndexedDBへは保存済みのこのセッションのMemoryを
+      // HistoryPanelがすぐ表示できるようにする。以前はここで反映されず、handleEndSession
+      // （日記）専用の経路になっていたため、「この会話を終える」直後にHistoryPanelを開くと
+      // 通常会話由来のMemoryだけがまだ見えない、という非対称があった。
+      setSessionCapturedMemories(latestMemoryObjects);
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to end conversation", error);
