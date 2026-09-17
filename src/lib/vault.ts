@@ -38,10 +38,11 @@ import {
   setVaultSyncState,
 } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
-import type { Conversation, MemoryObject, MemoryType, Source } from "./types";
+import type { Conversation, MemoryObject, MemorySource, MemoryType, Source } from "./types";
 import {
   asString,
   conversationToMarkdown,
+  inferSourceType,
   memoryObjectToMarkdown,
   parseConversationMarkdown,
   parseFrontmatter,
@@ -3221,10 +3222,17 @@ export interface VaultResyncUnreadableFile {
 type VaultResyncOutcome = "unchanged" | "moved" | "edited" | "added" | "missing" | "conflict" | "unreadable";
 
 /** normal Memory day-file内の、1メンバー単位の分類（container自体の状態とは別に持つ、
- *  resync engine内部専用）。 */
+ *  resync engine内部専用）。
+ *
+ * "ledger-repair"：Vault側のhashがRegistryの前回記録と異なり、かつIndexedDB側も
+ * vaultSyncState台帳上は「未同期」に見えるが、実際にはnormalized semantic equality
+ * （`memoryObjectsSemanticEqual`）でVault側・IndexedDB側の内容が完全に一致していると
+ * 確認できた場合の分類。真のconflict（内容が実際に食い違っている）とは明確に区別し、
+ * IndexedDB record本体は書き換えず、vaultSyncState台帳の再確立だけを行う
+ * （"edited"のように`mergeMemoryObjectForApply`でrecord本体を上書きしない）。 */
 interface VaultResyncMemberResult {
   id: string;
-  outcome: "unchanged" | "edited" | "added" | "conflict";
+  outcome: "unchanged" | "edited" | "added" | "conflict" | "ledger-repair";
   /** そのmemberの実際にparse済みの内容（Step 4bのapplyで使う。member removal
    *  conflict時など、observedデータを意図的に使わない場合はnull）。 */
   parsed: MemoryObject | null;
@@ -3390,6 +3398,18 @@ function parseTsumugiResyncCandidate(text: string): VaultResyncParsedCandidate |
  * するため比較対象にしない。turn単位のtimestamp・webSearchRequested・
  * isRecordTurnはMarkdownへ保存されず往復しないため比較しない。
  */
+/**
+ * `metadata.sourceType`はMarkdown round-trip時、未設定なら`inferSourceType(source)`
+ * で必ず補完される（markdown.ts参照）。そのため、片方が`undefined`のまま・もう片方が
+ * その推測値を持つだけの差は「意味的には同じ」であり、単純な`??`比較では実在しない
+ * 不一致（false conflict）を生む。両側にこの同じ推測を適用してから比較することで、
+ * 「本当にsourceTypeが異なる」場合だけを不一致として検出する
+ * （sourceType自体を比較対象から外すのではなく、判定基準をparserの実際の挙動に揃える）。
+ */
+function normalizedSourceType(source: MemorySource, sourceType: string | undefined): string {
+  return sourceType ?? inferSourceType(source);
+}
+
 function conversationsSemanticEqual(a: Conversation, b: Conversation): boolean {
   if (a.id !== b.id) return false;
   if (a.persona !== b.persona) return false;
@@ -3403,7 +3423,7 @@ function conversationsSemanticEqual(a: Conversation, b: Conversation): boolean {
   if (a.turns.length !== b.turns.length) return false;
   if (!a.turns.every((turn, i) => turn.role === b.turns[i].role && turn.content === b.turns[i].content)) return false;
   if (a.metadata.source !== b.metadata.source) return false;
-  if ((a.metadata.sourceType ?? null) !== (b.metadata.sourceType ?? null)) return false;
+  if (normalizedSourceType(a.metadata.source, a.metadata.sourceType) !== normalizedSourceType(b.metadata.source, b.metadata.sourceType)) return false;
   if (JSON.stringify(a.metadata.sourceDetail ?? null) !== JSON.stringify(b.metadata.sourceDetail ?? null)) return false;
   if (a.metadata.schemaVersion !== b.metadata.schemaVersion) return false;
   return true;
@@ -3428,10 +3448,16 @@ function memoryObjectsSemanticEqual(a: MemoryObject, b: MemoryObject): boolean {
   // Topic Continuityに依存してはいけないため（Topic Continuity側が別途commitされた
   // 際に、必要であればそちら側の変更として比較を追加すべきもの）。
   if (JSON.stringify(a.links) !== JSON.stringify(b.links)) return false;
+  // Time Axis Phase 2（Event Time）：eventTime/eventTimePrecisionはmemoryObjectToMarkdown/
+  // parseMemoryObjectMarkdownの両方で正しくround-tripし、sourceTypeのような推測による
+  // 補完も無いため、単純比較でよい（以前はここに含まれておらず、実際の食い違いを
+  // 見逃していた）。
+  if ((a.eventTime ?? null) !== (b.eventTime ?? null)) return false;
+  if ((a.eventTimePrecision ?? null) !== (b.eventTimePrecision ?? null)) return false;
   if (a.createdAt !== b.createdAt) return false;
   if (a.updatedAt !== b.updatedAt) return false;
   if (a.metadata.source !== b.metadata.source) return false;
-  if ((a.metadata.sourceType ?? null) !== (b.metadata.sourceType ?? null)) return false;
+  if (normalizedSourceType(a.metadata.source, a.metadata.sourceType) !== normalizedSourceType(b.metadata.source, b.metadata.sourceType)) return false;
   if (JSON.stringify(a.metadata.sourceDetail ?? null) !== JSON.stringify(b.metadata.sourceDetail ?? null)) return false;
   if ((a.metadata.aiProvider ?? null) !== (b.metadata.aiProvider ?? null)) return false;
   if ((a.metadata.confidence ?? null) !== (b.metadata.confidence ?? null)) return false;
@@ -3671,9 +3697,28 @@ async function classifyResyncMembers(
       continue;
     }
     const localUnsynced = await checkLocalUnsynced("memory", member.id);
+    if (localUnsynced) {
+      // 実機不具合対応（ledger欠落の自己修復）：vaultSyncState台帳上は「未同期」に
+      // 見えても、それだけで即conflictとは決めない。IndexedDB側の現在の内容を
+      // 実際に読み、Vault側のparse済み内容とnormalized semantic equalityで
+      // 一致するかを確認する。一致すれば「内容は既に同一、台帳の反映漏れだけ」
+      // という安全なケースであり、"ledger-repair"として扱う（IndexedDB record
+      // 本体は書き換えず、台帳の再確立のみをapply側で行う）。一致しなければ、
+      // 従来通りfail-closedで"conflict"のままにする（内容が本当に食い違う場合は
+      // 絶対に自動解決しない）。
+      const currentIndexedDb = await getMemoryObject(member.id);
+      const ledgerRepairable = currentIndexedDb !== undefined && memoryObjectsSemanticEqual(currentIndexedDb, member);
+      results.push({
+        id: member.id,
+        outcome: ledgerRepairable ? "ledger-repair" : "conflict",
+        parsed: member,
+        addedIndexedDbEquivalent: null,
+      });
+      continue;
+    }
     results.push({
       id: member.id,
-      outcome: localUnsynced ? "conflict" : "edited",
+      outcome: "edited",
       parsed: member,
       addedIndexedDbEquivalent: null,
     });
@@ -5582,6 +5627,17 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
           continue;
         }
         await putMemoryObjectAndMarkSynced(merged, syncKey);
+      } else if (member.outcome === "ledger-repair") {
+        // classifyResyncMembers側で既にnormalized semantic equalityを確認済み
+        // （Vault側・IndexedDB側の内容が完全に一致している）。そのため"edited"とは
+        // 異なり、IndexedDB record本体（mergeMemoryObjectForApply・putMemoryObject）
+        // には一切触れず、vaultSyncState台帳の再確立だけを行う（不要なrecord
+        // mutationを増やさないため）。
+        const existingUpdatedAt = (await getMemoryObject(member.id))?.updatedAt;
+        if (existingUpdatedAt === undefined) {
+          throw new Error(`ledger-repair member ${member.id} disappeared from IndexedDB during apply`);
+        }
+        await setVaultSyncState(syncKey, existingUpdatedAt);
       }
     } catch (error) {
       allSucceeded = false;

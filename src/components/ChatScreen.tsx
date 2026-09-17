@@ -1758,7 +1758,22 @@ export default function ChatScreen() {
             if (cancelled || isVaultSwitchingRef.current || crossTabStale) return;
             // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
             // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
-            await connectMemory(vaultHandle, memory, "background");
+            try {
+              await connectMemory(vaultHandle, memory, "background");
+            } catch (error) {
+              // 実機不具合対応（1件のHOLD/conflictがcatch-up全体を止める問題）：
+              // connectMemoryImpl自身は失敗時にclaimを解放したうえで必ず再throwする
+              // 設計（次回retryのため、connect.ts参照）。以前はここでcatchしておらず、
+              // 1件のVaultRecordNeedsResyncError等がループ全体を停止させ、それより
+              // 後（＝より新しい）他のMemoryのConnectまで巻き込んで保留にしていた。
+              // Vault切替関連のstale判定（handleStaleVaultTabError）だけは、
+              // flushPendingToVaultの他ループと同様、従来通りここで検出して
+              // キャッチアップ全体を止める。それ以外の失敗はこのitemだけ諦めて
+              // 次のitemへ進む（markMemoryConnectedが呼ばれていないため、次回の
+              // filterUnconnectedで自然に再度対象になる。新しいretry機構は追加しない）。
+              if (handleStaleVaultTabError(error)) return;
+              console.error("[Tsumugi] startup connect catch-up: failed to connect one memory (will retry later)", error);
+            }
           }
         } catch (error) {
           if (handleStaleVaultTabError(error)) return;
@@ -2925,11 +2940,22 @@ export default function ChatScreen() {
       // applyErrors/staleSkippedのどちらにも現れず反映もされない）のいずれかが
       // 1件でもあれば単純な成功状態にしない。古いclassification/discoveryは
       // 再利用せず、「もう一度確認する」でLevel 1/2からやり直す。
+      // 実機不具合対応（誤った成功表示）：`applySingleRecordOutcome`/
+      // `applyMemoryDayOutcome`の"conflict"は例外を投げない「正常な処理結果」
+      // （vault.ts参照）のため、以前はここに含まれておらず、conflictが残った
+      // ままでも「外部の変更を反映しました。」という成功表示になっていた。
+      // `outcome.counts.conflict`（apply後の実際のfinalOutcomeを集計した値）を
+      // 確認対象に加える。
+      const hasUnresolvedConflict = outcome.counts.conflict > 0;
       const hasIssue =
-        outcome.staleSkipped.length > 0 || outcome.applyErrors.length > 0 || status.result.counts.unreadable > 0;
+        outcome.staleSkipped.length > 0 ||
+        outcome.applyErrors.length > 0 ||
+        status.result.counts.unreadable > 0 ||
+        hasUnresolvedConflict;
       vaultLightCheckDiscoveryRef.current = null;
       if (hasIssue) {
-        setVaultLightCheckStatus({ kind: "partial", message: "一部の変更を確認できませんでした。" });
+        const message = hasUnresolvedConflict ? "確認が必要な記録があります。" : "一部の変更を確認できませんでした。";
+        setVaultLightCheckStatus({ kind: "partial", message });
       } else {
         setVaultLightCheckStatus({ kind: "applied" });
       }

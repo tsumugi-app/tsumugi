@@ -271,8 +271,13 @@ function parseSourceDetail(raw: unknown): Record<string, string> | undefined {
  * 読み込んだ際、`source`の値から妥当な初期値を推測する。書き込み側は一切変更しないため、
  * 既存パイプライン（Capture/Reflection）が生成するファイルには実際には書き込まれず、
  * 読み込み時にその場で補完されるだけである。
+ *
+ * vault.ts（semantic equality判定）からも再利用する：Markdown round-trip後は
+ * 必ずこの推測値が補完されるため、IndexedDB側の`sourceType`が`undefined`のまま
+ * （この推測ロジック導入前に作られたrecord等）でも、同じ推測を両側に適用してから
+ * 比較しないと、内容が同一のrecordを誤って不一致と判定してしまうため。
  */
-function inferSourceType(source: MemorySource): SourceType {
+export function inferSourceType(source: MemorySource): SourceType {
   switch (source) {
     case "ai-capture":
       return "chat";
