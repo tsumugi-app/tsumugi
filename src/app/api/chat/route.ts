@@ -1,3 +1,5 @@
+import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
+import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
 import type { ConversationTurn, Persona, RetrievedMemory } from "@/lib/types";
 import type { AIFeature, StreamChunk } from "@/lib/ai/types";
 import { needsWebSearch } from "@/lib/needsWebSearch";
@@ -901,6 +903,32 @@ function looksLikeRecordRequest(text: string): boolean {
  * Retrieval Engine（src/lib/retrieval.ts）が見つけた記憶をプロンプトに注入する。
  * 0件のときはセクション自体を作らない（「見つかりませんでした」とAIに伝える必要は無い）。
  */
+/** 全Memory経路で、記録日と出来事日時を同じ規則で区別する。 */
+function buildMemoryTimeLabel(memory: Pick<RetrievedMemory, "date" | "eventTime" | "eventTimePrecision">): string {
+  const recordedDate = memory.date.slice(0, 10);
+  const { eventTime, eventTimePrecision } = memory;
+  if (!isValidEventTimePrecision(eventTimePrecision) || !isValidEventTimeValue(eventTime, eventTimePrecision)) {
+    return `[記録日: ${recordedDate}]`;
+  }
+  let eventLabel = eventTime;
+  if (eventTimePrecision === "month") {
+    const [year, month] = eventTime.split("-");
+    eventLabel = `${year}年${Number(month)}月（月まで判明）`;
+  } else if (eventTimePrecision === "year") {
+    eventLabel = `${eventTime}年（年まで判明）`;
+  }
+  return `[記録日: ${recordedDate} / 出来事: ${eventLabel}]`;
+}
+
+const MEMORY_TIME_INSTRUCTIONS = `
+## 過去Memoryの時間の扱い（通常の記憶・話題候補・つながり・起点Memoryに共通）
+- 記録日はConversation／記録の日時であり、出来事の日付ではない。
+- 出来事日時が明示されている場合は、それを正として扱う。
+- summary内の「昨日」「先週」「この前」などは過去の発言時点の表現であり、現在日時基準で再解釈しない。出来事日時がある場合は、その日時を優先する。
+- 出来事日時がない場合、記録日から出来事日時を推測しない。必要なら「以前」など時点を断定しない表現を使う。
+- 月まで判明している場合は日を、年まで判明している場合は月・日を補完しない。
+`;
+
 /**
  * Link.reason（Connect, Phase 2）をAIへ渡すためのブロック。
  * 事実（過去の記憶リスト）とは明確に分離し、「Tsumugiが過去に生成した仮説であり、
@@ -919,8 +947,7 @@ function buildLinkReasonSection(memories: RetrievedMemory[]): string {
 
   const items = linked
     .map((memory) => {
-      const datePart = memory.date.slice(0, 10);
-      return `[${datePart}] ${memory.summary} について、Tsumugiは以前こう感じていた：\n「${memory.linkReason}」`;
+      return `${buildMemoryTimeLabel(memory)} ${memory.summary} について、Tsumugiは以前こう感じていた：\n「${memory.linkReason}」`;
     })
     .join("\n\n");
 
@@ -950,13 +977,11 @@ function buildOriginMemorySection(memories: RetrievedMemory[]): string {
   const origin = memories.find((memory) => memory.isOriginMemory);
   if (!origin) return "";
 
-  const datePart = origin.date.slice(0, 10);
-
   return `
 
 ## この会話のきっかけとなった記憶
 
-[${datePart}] ${origin.summary}
+${buildMemoryTimeLabel(origin)} ${origin.summary}
 
 このMemoryは、今回の会話を始めるきっかけとなった過去の記憶です。ユーザーが「何の話だっけ？」
 「いつ話した？」など、きっかけとなった過去の話を思い出せていない場合は、このMemoryを手がかりに
@@ -1004,11 +1029,10 @@ function buildRetrievedMemoriesSection(memories: RetrievedMemory[]): string {
 
   const lines = memories
     .map((memory) => {
-      const datePart = memory.date.slice(0, 10);
       const keywords = memory.keywords.length > 0 ? `keywords: ${memory.keywords.join(", ")}` : "";
       const source = memory.source ? `source: ${memory.source}` : "";
       const meta = [keywords, source].filter(Boolean).join(" / ");
-      return `- [${datePart}] ${memory.summary}${meta ? `（${meta}）` : ""}`;
+      return `- ${buildMemoryTimeLabel(memory)}\n${memory.summary}${meta ? `（${meta}）` : ""}`;
     })
     .join("\n");
 
@@ -1148,7 +1172,7 @@ ${transcript}
  */
 interface TopicContinuityInput {
   topicId: string;
-  memories: Array<{ date: string; summary: string; keywords: string[] }>;
+  memories: TopicContinuityMemoryRef[];
 }
 
 function buildTopicContinuitySection(topics: TopicContinuityInput[] | undefined): string {
@@ -1159,7 +1183,7 @@ function buildTopicContinuitySection(topics: TopicContinuityInput[] | undefined)
   const topicBlocks = validTopics
     .map((topic, index) => {
       const memoryLines = topic.memories
-        .map((memory) => `  - ${memory.date}：${memory.summary}`)
+        .map((memory) => `  - ${buildMemoryTimeLabel(memory)}\n    ${memory.summary}`)
         .join("\n");
       return `候補${index + 1}：\n${memoryLines}`;
     })
@@ -1312,7 +1336,7 @@ export async function POST(request: Request) {
   // （通常のkeyword一致）の間に置く（recentConversationSectionの直後）。
   const topicContinuitySection = buildTopicContinuitySection(topicContext);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${recentConversationSection}${topicContinuitySection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${recentConversationSection}${topicContinuitySection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /

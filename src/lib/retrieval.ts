@@ -515,6 +515,8 @@ function toRetrievedMemory(memory: MemoryObject, linkReason?: string, matchType?
   return {
     id: memory.id,
     date: memory.date,
+    eventTime: memory.eventTime,
+    eventTimePrecision: memory.eventTimePrecision,
     summary: memory.summary,
     keywords: memory.keywords,
     linkReason,

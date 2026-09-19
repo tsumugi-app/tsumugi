@@ -34,7 +34,7 @@
  *   optional field。
  */
 
-import type { MemoryObject } from "./types";
+import type { EventTimePrecision, MemoryObject } from "./types";
 import { scoreMemory } from "./retrieval";
 
 /** topic候補として提示する最大topic数（v1）。 */
@@ -76,6 +76,8 @@ export function hasTopicContinuitySignal(text: string): boolean {
  *  既存RetrievedMemoryと同じく、contentは含めない（summaryで十分という既存方針）。 */
 export interface TopicContinuityMemoryRef {
   date: string;
+  eventTime?: string;
+  eventTimePrecision?: EventTimePrecision;
   summary: string;
   keywords: string[];
 }
@@ -124,7 +126,13 @@ function bestKeywordScore(group: TopicGroup, trimmed: string): number {
 }
 
 function toMemoryRef(memory: MemoryObject): TopicContinuityMemoryRef {
-  return { date: memory.date, summary: memory.summary, keywords: memory.keywords };
+  return {
+    date: memory.date,
+    eventTime: memory.eventTime,
+    eventTimePrecision: memory.eventTimePrecision,
+    summary: memory.summary,
+    keywords: memory.keywords,
+  };
 }
 
 /**

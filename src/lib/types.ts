@@ -267,7 +267,10 @@ export type Importer<Input> = (input: Input) => Promise<SourceDraft>;
  */
 export interface RetrievedMemory {
   id: ID;
+  /** Conversation／記録日時。出来事日時とは区別する。 */
   date: ISODateString;
+  eventTime?: string;
+  eventTimePrecision?: EventTimePrecision;
   summary: string;
   keywords: string[];
   /**
