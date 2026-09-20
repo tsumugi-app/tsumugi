@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import type {
   DataActionFeedback,
   RestoreCandidate,
@@ -10,10 +11,12 @@ import type {
   LegacyCleanupUiStatus,
   LocalOnlyUiStatus,
   OrphanUiStatus,
+  VaultStatusCheckUi,
   VaultRestoreUiStatus,
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
+import type { VaultStatusView } from "@/lib/vaultStatus";
 
 /**
  * ChatScreen.tsx下部にあった設定領域（APIキー・保存先）を、⚙から開くオーバーレイへ移した表示専用コンポーネント。
@@ -55,6 +58,11 @@ export default function SettingsPanel({
   onRunLocalOnlyDryRun,
   onToggleLocalOnlyExcluded,
   onExecuteAppendLocal,
+  vaultStatusView,
+  vaultStatusCheck,
+  onCheckVaultStatus,
+  onUpdateVaultStatus,
+  onCleanupVaultStatus,
   orphanStatus,
   onRunOrphanDryRun,
   onExecuteOrphanCleanup,
@@ -113,6 +121,12 @@ export default function SettingsPanel({
   onRunLocalOnlyDryRun: () => void;
   onToggleLocalOnlyExcluded: (key: string) => void;
   onExecuteAppendLocal: () => void;
+  /** 保存先の統合表示（「最新の状態です」等）。測定結果から導出した値（`deriveVaultStatusView`）。 */
+  vaultStatusView: VaultStatusView;
+  vaultStatusCheck: VaultStatusCheckUi;
+  onCheckVaultStatus: () => void;
+  onUpdateVaultStatus: () => void;
+  onCleanupVaultStatus: () => void;
   orphanStatus: OrphanUiStatus;
   onRunOrphanDryRun: () => void;
   onExecuteOrphanCleanup: () => void;
@@ -127,6 +141,15 @@ export default function SettingsPanel({
    */
   vaultHoldReasons: Record<VaultHoldReason, number> | null;
 }) {
+  // 保存先の技術的な確認機能（既存の4つの入口・外部変更の詳細表示）は、通常のUIには出さず、
+  // `?debugLog=1`のときだけ「詳細（開発者向け）」に表示する（機能・handler・stateは削除していない）。
+  const [showAdvancedVaultTools] = useState(() => {
+    try {
+      return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debugLog") === "1";
+    } catch {
+      return false;
+    }
+  });
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-[var(--background)] px-5 py-8 text-[var(--foreground)]">
       <div className="flex max-h-[85dvh] w-full max-w-md flex-col gap-6 overflow-y-auto">
@@ -334,6 +357,132 @@ export default function SettingsPanel({
             </div>
           )}
 
+          {/*
+            保存先の統合表示（通常のUI）。基本は「✓ 最新の状態です」か「外部の変更がある可能性があります
+            ［確認する］」。「確認する」を押した後だけ、実際に必要な対応を意味で説明する。内部用語
+            （Registry・baseline・missing・conflict・IDB・Vault・legacy・orphan・resync）は出さない。
+            「最新の状態です」は、測定が全て済んで未解決が0であることから導出した値（`vaultStatusView`）。
+          */}
+          {vaultStatusView.kind !== "hidden" && (
+            <div className="flex flex-col gap-2 text-sm text-stone-700 dark:text-stone-300">
+              {vaultStatusView.kind === "checking" && (
+                <span className="text-xs text-stone-500 dark:text-stone-400">
+                  {vaultStatusCheck.kind === "working" ? vaultStatusCheck.label : "確認しています…"}
+                </span>
+              )}
+
+              {vaultStatusView.kind === "latest" && <span>✓ 最新の状態です</span>}
+
+              {vaultStatusView.kind === "maybe" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 dark:bg-amber-950/20">
+                  <span>
+                    {vaultStatusView.reason === "local"
+                      ? "この端末に、保存先へ反映されていない記録がある可能性があります"
+                      : "外部の変更がある可能性があります"}
+                  </span>
+                  <button
+                    onClick={onCheckVaultStatus}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                  >
+                    確認する
+                  </button>
+                </div>
+              )}
+
+              {vaultStatusView.kind === "review" && vaultStatusCheck.kind === "ready" && (
+                <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs dark:bg-amber-950/20">
+                  {(vaultStatusView.hasUpdate || vaultStatusView.hasCleanup) && (
+                    <span className="text-sm">保存先に変更が見つかりました。</span>
+                  )}
+                  {vaultStatusCheck.findings.summary.map((line) => (
+                    <span key={line}>・{line}</span>
+                  ))}
+                  {vaultStatusCheck.findings.details.filter((group) => !group.heading.startsWith("確認が必要")).length > 0 && (
+                    <details className="text-stone-600 dark:text-stone-300">
+                      <summary className="cursor-pointer">内容を確認</summary>
+                      <div className="mt-2 flex flex-col gap-3">
+                        {vaultStatusCheck.findings.details
+                          .filter((group) => !group.heading.startsWith("確認が必要"))
+                          .map((group) => (
+                            <div key={group.heading} className="flex flex-col gap-0.5">
+                              <span className="text-stone-700 dark:text-stone-200">{group.heading}</span>
+                              {group.lines.map((line, i) => (
+                                <span key={i} className="break-all text-stone-500 dark:text-stone-400">
+                                  ・{line}
+                                </span>
+                              ))}
+                            </div>
+                          ))}
+                      </div>
+                    </details>
+                  )}
+                  {vaultStatusView.hasAttention && (
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-stone-700 dark:text-stone-200">
+                        確認が必要な記録があります（今回は変更しません）
+                      </span>
+                      {vaultStatusCheck.findings.attention.slice(0, 8).map((line) => (
+                        <span key={line} className="break-all text-stone-500 dark:text-stone-400">
+                          ・{line}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    {vaultStatusView.hasUpdate && (
+                      <button
+                        onClick={onUpdateVaultStatus}
+                        disabled={vaultActionsDisabled}
+                        className="rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                      >
+                        更新する
+                      </button>
+                    )}
+                    {vaultStatusView.hasCleanup && (
+                      <button
+                        onClick={onCleanupVaultStatus}
+                        disabled={vaultActionsDisabled}
+                        className="rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                      >
+                        整理する
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {vaultStatusCheck.kind === "ready" && vaultStatusCheck.note && vaultStatusCheck.note.length > 0 && (
+                <div className="flex flex-col gap-0.5 text-xs text-red-600 dark:text-red-400">
+                  <span>一部を完了できませんでした。</span>
+                  {vaultStatusCheck.note.map((step) => (
+                    <span key={step.name} className="break-all">
+                      {step.name}
+                      {step.detail ? `（${step.detail}）` : ""}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {vaultStatusCheck.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{vaultStatusCheck.message}</span>
+                  <button
+                    onClick={onCheckVaultStatus}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {showAdvancedVaultTools && (
+            <details className="rounded-xl border border-black/5 px-3 py-2 dark:border-white/10">
+              <summary className="cursor-pointer text-xs text-stone-400 dark:text-stone-500">詳細（開発者向け）</summary>
+              <div className="mt-3 flex flex-col gap-4">
           {restoreCandidate && (
             <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               <span>このVaultには以前の記憶が見つかりました（{restoreCandidate.newCount}件）。復元しますか？</span>
@@ -1084,6 +1233,9 @@ export default function SettingsPanel({
                 </div>
               )}
             </div>
+          )}
+              </div>
+            </details>
           )}
         </section>
 

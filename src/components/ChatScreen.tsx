@@ -80,6 +80,21 @@ import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
 import { planVaultRestore, restoreMissingRecordsFromVault, type VaultRestoreCounts } from "@/lib/vaultRestore";
 import { executeOrphanCleanup, planOrphanCleanup, type OrphanCleanupResult, type OrphanPlan } from "@/lib/vaultOrphanCleanup";
 import {
+  VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
+  applyVaultStatusCleanup,
+  applyVaultStatusUpdate,
+  collectVaultStatusFindings,
+  computeRegistryIdbDiff,
+  deriveVaultStatusView,
+  lightCheckMeasureFrom,
+  unresolvedLightCheckCount,
+  type LightCheckMeasure,
+  type RegistryIdbDiff,
+  type VaultStatusFindings,
+  type VaultStatusStep,
+  type VaultStatusView,
+} from "@/lib/vaultStatus";
+import {
   appendLocalRecordsToVault,
   planAppendLocalRecords,
   type AppendLocalResult,
@@ -269,6 +284,18 @@ export type OrphanUiStatus =
   | { kind: "plan"; plan: OrphanPlan; generation: number }
   | { kind: "executing" }
   | { kind: "done"; result: OrphanCleanupResult }
+  | { kind: "error"; message: string };
+
+/**
+ * Settings「保存先」の統合表示のうち、「確認する」「更新する」「整理する」の操作の状態
+ * （`vaultStatus.ts`）。「最新の状態です」等の表示そのものは、この状態と測定結果から導出する
+ * （`deriveVaultStatusView`）。`ready`は、「確認する」の結果（何が必要か）を持つ状態。
+ */
+export type VaultStatusCheckUi =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "ready"; findings: VaultStatusFindings; generation: number; note: VaultStatusStep[] | null }
+  | { kind: "working"; label: string }
   | { kind: "error"; message: string };
 
 export interface RestoreCandidate {
@@ -534,6 +561,15 @@ export default function ChatScreen() {
   const [localOnlyStatus, setLocalOnlyStatus] = useState<LocalOnlyUiStatus>({ kind: "idle" });
   /** 「保存先に本体が見つからない記録の整理」のUI状態。詳細は`OrphanUiStatus`参照。 */
   const [orphanStatus, setOrphanStatus] = useState<OrphanUiStatus>({ kind: "idle" });
+  /**
+   * 統合表示の測定結果。`null`は「未測定」（測定済みで0件、とは別）。light-check・RegistryとIDBの差は
+   * 起動時・保存先の接続／変更時・保存先関連の操作の実行後に測る。flushの測定は`vaultHoldMeasure`。
+   */
+  const [vaultMeasure, setVaultMeasure] = useState<{ generation: number; lightCheck: LightCheckMeasure | null; diff: RegistryIdbDiff | null } | null>(null);
+  const [vaultHoldMeasure, setVaultHoldMeasure] = useState<{ measured: boolean; count: number }>({ measured: false, count: 0 });
+  /** background flushが進行中か（測定中の表示に使う）。 */
+  const [vaultFlushing, setVaultFlushing] = useState(false);
+  const [vaultStatusCheck, setVaultStatusCheck] = useState<VaultStatusCheckUi>({ kind: "idle" });
   /**
    * UX調査対応（HOLD原因の区別）：background/startup flushが
    * `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
@@ -1001,6 +1037,7 @@ export default function ChatScreen() {
     const controller = new AbortController();
     backgroundFlushAbortControllerRef.current = controller;
     const endTask = beginMemoryTask();
+    setVaultFlushing(true);
     const runPromise = (async () => {
       // 直前のbackground flushがまだ残っていれば、まずそれを中断し、現在処理中の
       // 1itemが終わってPromiseがsettleするまで待ってから、このflushの本体を
@@ -1013,6 +1050,8 @@ export default function ChatScreen() {
       try {
         const flushResult = await withVaultWorldRead(() => flushPendingToVault(handle, "background", controller.signal));
         setVaultHoldReasons(flushResult.heldCount > 0 ? flushResult.heldByReason : null);
+        // 中断されたflushの集計は途中経過のため「測定済み」にしない（未測定と、保留0件の測定は別）。
+        setVaultHoldMeasure(controller.signal.aborted ? { measured: false, count: 0 } : { measured: true, count: flushResult.heldCount });
       } catch (error) {
         if (!handleStaleVaultTabError(error)) {
           console.error("[Tsumugi] background vault flush failed (will retry on next flush):", error);
@@ -1028,6 +1067,7 @@ export default function ChatScreen() {
         if (backgroundFlushAbortControllerRef.current === controller) {
           backgroundFlushAbortControllerRef.current = null;
           backgroundFlushInFlightPromiseRef.current = null;
+          setVaultFlushing(false);
         }
       }
     })();
@@ -1065,10 +1105,30 @@ export default function ChatScreen() {
    * すると煩わしいため、起動時はconsole.errorのみに留め、手動再実行時
    * （「もう一度確認する」）だけエラーを表示する。
    */
+  /**
+   * 進行中のbackground flushの完了を、中断せずに待つ（Level 3の自動分類の前に、内部の書き込みを落ち着かせる）。
+   * 待ち切れなかった場合はfalse（分類へ進まず、未測定のままにする）。
+   */
+  async function waitForBackgroundFlushToSettle(timeoutMs: number): Promise<boolean> {
+    const inFlight = backgroundFlushInFlightPromiseRef.current;
+    if (inFlight) {
+      const settled = await Promise.race([
+        inFlight.catch(() => {}).then(() => true),
+        new Promise<boolean>((resolve) => {
+          window.setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+      if (!settled) return false;
+    }
+    return !(await waitForVaultWrites(timeoutMs)).timedOut;
+  }
+
   function runVaultLightCheckInBackground(handle: FileSystemDirectoryHandle, announce = false): void {
     if (vaultLightCheckInFlightRef.current) return; // 多重起動防止（レビュー修正）
     vaultLightCheckInFlightRef.current = true;
     setVaultLightCheckStatus({ kind: "checking" });
+    setVaultMeasure(null); // 測定し直している間は未測定
+    setVaultStatusCheck((current) => (current.kind === "ready" ? { kind: "idle" } : current));
     const endTask = beginMemoryTask();
     // 安全性レビュー対応（H2）：discovery開始時点のVault世代を記録する。
     const generation = vaultGenerationRef.current;
@@ -1077,12 +1137,45 @@ export default function ChatScreen() {
         const discovery = await withVaultWorldRead(() => performVaultLightCheckDiscovery(handle));
         if (generation !== vaultGenerationRef.current) return; // Vault切替済み：この結果は使わない
         const count = countVaultLightCheckCandidates(discovery);
-        if (count > 0) {
-          vaultLightCheckDiscoveryRef.current = { discovery, generation };
-          setVaultLightCheckStatus({ kind: "candidates-found", count });
-        } else {
-          setVaultLightCheckStatus({ kind: "idle" });
+        let measure: LightCheckMeasure = lightCheckMeasureFrom(discovery, null);
+        let autoClassified = false;
+        // 候補が少数なら、Level 3まで読み取り専用で自動分類する（Tsumugi管理外のMarkdownだけで
+        // 「外部の変更がある可能性があります」が出続けないように）。候補が多い場合は自動分類せず、
+        // 「確認する」にする。
+        if ((count > 0 || discovery.readFailedCandidates.length > 0) && count <= VAULT_STATUS_AUTO_CLASSIFY_LIMIT) {
+          if (await waitForBackgroundFlushToSettle(VAULT_SWITCH_SETTLE_TIMEOUT_MS)) {
+            if (generation !== vaultGenerationRef.current) return;
+            const result = await withVaultWorldRead(() => classifyVaultLightCheckCandidates(handle, discovery));
+            if (generation !== vaultGenerationRef.current) return;
+            measure = lightCheckMeasureFrom(discovery, result.counts);
+            autoClassified = true;
+            if (unresolvedLightCheckCount(result.counts) > 0) {
+              vaultLightCheckDiscoveryRef.current = { discovery, generation };
+              setVaultLightCheckStatus({ kind: "classified", result, generation });
+            } else {
+              vaultLightCheckDiscoveryRef.current = null;
+              setVaultLightCheckStatus({ kind: "idle" });
+            }
+          }
         }
+        if (!autoClassified) {
+          if (count > 0) {
+            vaultLightCheckDiscoveryRef.current = { discovery, generation };
+            setVaultLightCheckStatus({ kind: "candidates-found", count });
+          } else {
+            setVaultLightCheckStatus({ kind: "idle" });
+          }
+        }
+        // RegistryとIndexedDBの必要な差（既に読める情報の突き合わせ。保存先の全走査はしない）。
+        let diff: RegistryIdbDiff | null = null;
+        try {
+          diff = await withVaultWorldRead(() => computeRegistryIdbDiff(handle));
+        } catch (diffError) {
+          if (handleStaleVaultTabError(diffError)) return;
+          console.error("[Tsumugi] failed to measure registry/local difference:", diffError);
+        }
+        if (generation !== vaultGenerationRef.current) return;
+        setVaultMeasure({ generation, lightCheck: measure, diff });
       } catch (error) {
         if (handleStaleVaultTabError(error)) return;
         console.error("[Tsumugi] background vault light check failed (will retry on next launch):", error);
@@ -1170,6 +1263,9 @@ export default function ChatScreen() {
     setLegacyCleanupStatus({ kind: "idle" });
     setLocalOnlyStatus({ kind: "idle" });
     setOrphanStatus({ kind: "idle" });
+    setVaultMeasure(null);
+    setVaultHoldMeasure({ measured: false, count: 0 });
+    setVaultStatusCheck({ kind: "idle" });
     setTopPrompt(null);
     setTopPromptInput("");
     setHistoryInitialMemoryId(undefined);
@@ -1699,6 +1795,7 @@ export default function ChatScreen() {
         try {
           const flushResult = await flushPendingToVault(result.handle);
           setVaultHoldReasons(flushResult.heldCount > 0 ? flushResult.heldByReason : null);
+          setVaultHoldMeasure({ measured: true, count: flushResult.heldCount });
         } catch (error) {
           console.error("Failed to flush pending vault writes on startup", error);
         }
@@ -3094,6 +3191,123 @@ export default function ChatScreen() {
     }
   }
 
+  /**
+   * 統合表示の再測定（「確認する」と、「更新する」「整理する」の実行後に共通）。既存のdry-runを順に実行し
+   * （`collectVaultStatusFindings`。全て読み取りのみ）、結果を測定状態へ反映する。呼び出し元が
+   * `vaultOperationLockRef`を保持している前提。保存先が切り替わった場合はnullを返す。
+   */
+  async function recheckVaultStatus(handle: FileSystemDirectoryHandle, generation: number): Promise<VaultStatusFindings | null> {
+    // 内部のwriteを安全に落ち着かせてから読む（light-checkの「確認する」と同じ安定境界）。
+    const settleDeadline = Date.now() + VAULT_SWITCH_SETTLE_TIMEOUT_MS;
+    const aborted = await abortBackgroundFlushAndWait(VAULT_SWITCH_SETTLE_TIMEOUT_MS);
+    if (aborted.timedOut) throw new Error("settle-timeout");
+    if ((await waitForVaultWrites(Math.max(0, settleDeadline - Date.now()))).timedOut) throw new Error("settle-timeout");
+    if (generation !== vaultGenerationRef.current) return null;
+    const findings = await withVaultWorldRead(() => collectVaultStatusFindings(handle));
+    if (generation !== vaultGenerationRef.current) return null;
+    setVaultMeasure({ generation, lightCheck: findings.measure.lightCheck, diff: findings.measure.diff });
+    setVaultHoldMeasure({ measured: true, count: findings.measure.holdCount });
+    // 既存の「外部の変更」の表示（詳細）も、この再測定の結果に揃える。
+    if (findings.lightCheck.result.counts && unresolvedLightCheckCount(findings.lightCheck.result.counts) > 0) {
+      vaultLightCheckDiscoveryRef.current = { discovery: findings.lightCheck.discovery, generation };
+      setVaultLightCheckStatus({ kind: "classified", result: findings.lightCheck.result, generation });
+    } else {
+      vaultLightCheckDiscoveryRef.current = null;
+      setVaultLightCheckStatus({ kind: "idle" });
+    }
+    return findings;
+  }
+
+  /** 「確認する」。既存のdry-runを順に実行して、必要な対応を導く（何も書き込まない）。 */
+  async function handleCheckVaultStatus() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setVaultStatusCheck({ kind: "checking" });
+    try {
+      const findings = await recheckVaultStatus(vaultHandle, generation);
+      if (!findings) {
+        setVaultStatusCheck({ kind: "idle" });
+        return;
+      }
+      setVaultStatusCheck({ kind: "ready", findings, generation, note: null });
+      // 確認のために中断したflushの残り（通常の保存の未反映分）を再開する。
+      flushPendingToVaultInBackground(vaultHandle);
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setVaultStatusCheck({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] vault status check failed", error);
+      setVaultStatusCheck({ kind: "error", message: "保存先の状態を確認できませんでした。" });
+      flushPendingToVaultInBackground(vaultHandle);
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「更新する」／「整理する」の共通の流れ：実行（既存の実行処理を順に呼ぶ）→ 保存先の状態が変わった可能性が
+   * あれば、既存のUI状態（履歴）と保存の測定を更新 → 全体を再測定。「最新の状態です」は、この再測定の
+   * 結果が全て0のときだけ表示する（実行の成功だけでは表示しない）。
+   */
+  async function runVaultStatusAction(label: string, action: (handle: FileSystemDirectoryHandle, findings: VaultStatusFindings, generation: number) => Promise<{ steps: VaultStatusStep[]; changed: boolean }>) {
+    const status = vaultStatusCheck;
+    if (status.kind !== "ready") return;
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    if (status.generation !== vaultGenerationRef.current) {
+      setVaultStatusCheck({ kind: "idle" });
+      return;
+    }
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setVaultStatusCheck({ kind: "working", label });
+    try {
+      const outcome = await action(vaultHandle, status.findings, generation);
+      if (generation !== vaultGenerationRef.current) {
+        setVaultStatusCheck({ kind: "idle" });
+        return;
+      }
+      if (outcome.changed) bumpHistoryRefreshToken();
+      const findings = await recheckVaultStatus(vaultHandle, generation);
+      if (!findings) {
+        setVaultStatusCheck({ kind: "idle" });
+        return;
+      }
+      setVaultStatusCheck({ kind: "ready", findings, generation, note: outcome.steps.filter((step) => !step.ok) });
+      flushPendingToVaultInBackground(vaultHandle);
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setVaultStatusCheck({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] vault status action failed", error);
+      setVaultStatusCheck({
+        kind: "error",
+        message: "完了できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。",
+      });
+      flushPendingToVaultInBackground(vaultHandle);
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  function handleUpdateVaultStatus() {
+    return runVaultStatusAction("更新しています…", (handle, findings, generation) =>
+      applyVaultStatusUpdate(handle, findings, () => generation !== vaultGenerationRef.current)
+    );
+  }
+
+  function handleCleanupVaultStatus() {
+    return runVaultStatusAction("整理しています…", (handle, findings, generation) =>
+      applyVaultStatusCleanup(handle, findings, () => generation !== vaultGenerationRef.current)
+    );
+  }
+
   async function handleRestoreFromVault() {
     // Vault境界の安全性：Vault操作同士の排他＋切替処理中・stale判定中は新規のRestore
     // 開始をさせない。
@@ -4010,6 +4224,31 @@ export default function ChatScreen() {
                 ? "確認できません"
                 : "この端末のみ";
 
+  // Settings「保存先」の統合表示。「最新の状態です」は、接続済み・light-check測定完了・flush測定済み・
+  // RegistryとIDBの差の測定済みで、未解決が全て0のときだけ（未測定と測定済み0件は区別する）。
+  const vaultStatusView: VaultStatusView = deriveVaultStatusView({
+    connected: vaultStatus === "connected" && vaultHandle !== null && !crossTabStale && !isVaultSwitching,
+    busy:
+      vaultStatusCheck.kind === "checking" ||
+      vaultStatusCheck.kind === "working" ||
+      vaultFlushing ||
+      vaultLightCheckStatus.kind === "checking" ||
+      vaultLightCheckStatus.kind === "classifying" ||
+      vaultLightCheckStatus.kind === "applying" ||
+      vaultRestoreStatus.kind === "scanning" ||
+      vaultRestoreStatus.kind === "restoring" ||
+      legacyCleanupStatus.kind === "scanning" ||
+      legacyCleanupStatus.kind === "executing" ||
+      localOnlyStatus.kind === "scanning" ||
+      localOnlyStatus.kind === "executing" ||
+      orphanStatus.kind === "scanning" ||
+      orphanStatus.kind === "executing",
+    lightCheck: vaultMeasure?.lightCheck ?? null,
+    diff: vaultMeasure?.diff ?? null,
+    hold: vaultHoldMeasure,
+    findings: vaultStatusCheck.kind === "ready" ? vaultStatusCheck.findings : null,
+  });
+
   /*
     起動時（showLaunchTreeがtrueの間）は、通常の画面（どう話す？／会話画面）を
     一切描画せず、木＋ロゴだけのLaunchTreeScreenに差し替える。
@@ -4725,6 +4964,11 @@ export default function ChatScreen() {
             onRunLocalOnlyDryRun={() => void handleRunLocalOnlyDryRun()}
             onToggleLocalOnlyExcluded={(key) => handleToggleLocalOnlyExcluded(key)}
             onExecuteAppendLocal={() => void handleExecuteAppendLocal()}
+            vaultStatusView={vaultStatusView}
+            vaultStatusCheck={vaultStatusCheck}
+            onCheckVaultStatus={() => void handleCheckVaultStatus()}
+            onUpdateVaultStatus={() => void handleUpdateVaultStatus()}
+            onCleanupVaultStatus={() => void handleCleanupVaultStatus()}
             orphanStatus={orphanStatus}
             onRunOrphanDryRun={() => void handleRunOrphanDryRun()}
             onExecuteOrphanCleanup={() => void handleExecuteOrphanCleanup()}
