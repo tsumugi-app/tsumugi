@@ -79,6 +79,12 @@ import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/
 import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
 import { planVaultRestore, restoreMissingRecordsFromVault, type VaultRestoreCounts } from "@/lib/vaultRestore";
 import {
+  appendLocalRecordsToVault,
+  planAppendLocalRecords,
+  type AppendLocalResult,
+  type LocalOnlyPlan,
+} from "@/lib/vaultAppendLocal";
+import {
   executeLegacyCleanup,
   planLegacyCleanup,
   type LegacyCleanupCheck,
@@ -235,6 +241,20 @@ export type LegacyCleanupUiStatus =
       counts: LegacyCleanupRegistryCounts | null;
       idb: { memories: number; conversations: number; sources: number } | null;
     }
+  | { kind: "error"; message: string };
+
+/**
+ * 「保存先にない記録の追加」（IndexedDB → Vault。`vaultAppendLocal.ts`）のUI状態。既存の
+ * 「保存先の記録を端末へ追加」（Vault → IndexedDB）とは逆方向。"plan"は事前確認（何も書き込まない）の
+ * 結果を表示している状態で、ユーザーが明示的に「保存先に追加する」を押した場合だけ"executing"へ進む。
+ * `excluded`は、「内容を確認」で追加対象から外された記録のkey。
+ */
+export type LocalOnlyUiStatus =
+  | { kind: "idle" }
+  | { kind: "scanning" }
+  | { kind: "plan"; plan: LocalOnlyPlan; generation: number; excluded: string[] }
+  | { kind: "executing" }
+  | { kind: "done"; result: AppendLocalResult }
   | { kind: "error"; message: string };
 
 export interface RestoreCandidate {
@@ -496,6 +516,8 @@ export default function ChatScreen() {
   const [vaultRestoreStatus, setVaultRestoreStatus] = useState<VaultRestoreUiStatus>({ kind: "idle" });
   /** 「旧形式ファイルの整理」のUI状態。詳細は`LegacyCleanupUiStatus`参照。 */
   const [legacyCleanupStatus, setLegacyCleanupStatus] = useState<LegacyCleanupUiStatus>({ kind: "idle" });
+  /** 「保存先にない記録の追加」（IndexedDB → Vault）のUI状態。詳細は`LocalOnlyUiStatus`参照。 */
+  const [localOnlyStatus, setLocalOnlyStatus] = useState<LocalOnlyUiStatus>({ kind: "idle" });
   /**
    * UX調査対応（HOLD原因の区別）：background/startup flushが
    * `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
@@ -1130,6 +1152,7 @@ export default function ChatScreen() {
     setRestoreStatus("idle");
     setVaultRestoreStatus({ kind: "idle" });
     setLegacyCleanupStatus({ kind: "idle" });
+    setLocalOnlyStatus({ kind: "idle" });
     setTopPrompt(null);
     setTopPromptInput("");
     setHistoryInitialMemoryId(undefined);
@@ -2864,6 +2887,107 @@ export default function ChatScreen() {
     }
   }
 
+  /**
+   * 「保存先にない記録の追加」の事前確認（dry-run）。IndexedDB・Registry・Vaultを読み取り、保存先へ
+   * 追加できる記録（adoptable）と、確認が必要な記録（blocked＋理由）に分ける。何も書き込まない。
+   */
+  async function handleRunLocalOnlyDryRun() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setLocalOnlyStatus({ kind: "scanning" });
+    try {
+      const plan = await withVaultWorldRead(() => planAppendLocalRecords(vaultHandle));
+      if (generation !== vaultGenerationRef.current) {
+        setLocalOnlyStatus({ kind: "idle" });
+        return;
+      }
+      setLocalOnlyStatus({ kind: "plan", plan, generation, excluded: [] });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setLocalOnlyStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] append-local dry-run failed", error);
+      setLocalOnlyStatus({ kind: "error", message: "保存先の状態を確認できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /** 「内容を確認」で、記録を追加対象から外す／戻す。 */
+  function handleToggleLocalOnlyExcluded(key: string) {
+    setLocalOnlyStatus((current) => {
+      if (current.kind !== "plan") return current;
+      const excluded = current.excluded.includes(key) ? current.excluded.filter((k) => k !== key) : [...current.excluded, key];
+      return { ...current, excluded };
+    });
+  }
+
+  /**
+   * 「保存先に追加する」。dry-run表示後にユーザーが明示的に押した場合だけ実行する。実行時にworld lock
+   * （排他）の中で全条件を検証し直し、通った記録だけを保存先へ書く（`appendLocalRecordsToVault`）。
+   * 実行後は、保存先の状態が変わったため、HOLD表示（flushの再計測）と外部変更確認（light-check）を
+   * 古い結果のまま残さず、再計測する。
+   */
+  async function handleExecuteAppendLocal() {
+    const status = localOnlyStatus;
+    if (status.kind !== "plan") return;
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    if (status.generation !== vaultGenerationRef.current) {
+      setLocalOnlyStatus({ kind: "idle" });
+      return;
+    }
+    const selections = status.plan.adoptable
+      .filter((item) => !status.excluded.includes(item.record.key))
+      .map((item) => ({ key: item.record.key, updatedAt: item.record.updatedAt }));
+    if (selections.length === 0) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setLocalOnlyStatus({ kind: "executing" });
+    try {
+      // Registryを更新するため排他ロック（`runVaultWorldExclusive`は内部で整合性確認まで行うため、
+      // withVaultWorldReadで包まない）。
+      const locked = await runVaultWorldExclusive(() =>
+        appendLocalRecordsToVault(vaultHandle, selections, () => generation !== vaultGenerationRef.current)
+      );
+      if (locked.timedOut || !locked.result) {
+        setLocalOnlyStatus({ kind: "error", message: "他の操作が実行中のため開始できませんでした。しばらくしてからもう一度お試しください。" });
+        return;
+      }
+      const result = locked.result;
+      if (generation !== vaultGenerationRef.current) {
+        setLocalOnlyStatus({ kind: "idle" });
+        return;
+      }
+      setLocalOnlyStatus({ kind: "done", result });
+      if (result.writtenCount > 0) {
+        // 保存先の状態が変わった：古いHOLD表示・light-checkの保存済み結果を残さず、再計測する
+        // （排他ロック解放後に実行する）。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        flushPendingToVaultInBackground(vaultHandle);
+        runVaultLightCheckInBackground(vaultHandle);
+      }
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setLocalOnlyStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] append-local execute failed", error);
+      setLocalOnlyStatus({
+        kind: "error",
+        message: "追加を完了できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。",
+      });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
   async function handleRestoreFromVault() {
     // Vault境界の安全性：Vault操作同士の排他＋切替処理中・stale判定中は新規のRestore
     // 開始をさせない。
@@ -4491,6 +4615,10 @@ export default function ChatScreen() {
             legacyCleanupStatus={legacyCleanupStatus}
             onRunLegacyCleanupDryRun={() => void handleRunLegacyCleanupDryRun()}
             onExecuteLegacyCleanup={() => void handleExecuteLegacyCleanup()}
+            localOnlyStatus={localOnlyStatus}
+            onRunLocalOnlyDryRun={() => void handleRunLocalOnlyDryRun()}
+            onToggleLocalOnlyExcluded={(key) => handleToggleLocalOnlyExcluded(key)}
+            onExecuteAppendLocal={() => void handleExecuteAppendLocal()}
             vaultHoldReasons={vaultHoldReasons}
           />
         </div>

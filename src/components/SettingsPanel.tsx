@@ -8,6 +8,7 @@ import type {
   VaultConnectFeedback,
   VaultLightCheckStatus,
   LegacyCleanupUiStatus,
+  LocalOnlyUiStatus,
   VaultRestoreUiStatus,
   VaultStatus,
 } from "./ChatScreen";
@@ -49,6 +50,10 @@ export default function SettingsPanel({
   legacyCleanupStatus,
   onRunLegacyCleanupDryRun,
   onExecuteLegacyCleanup,
+  localOnlyStatus,
+  onRunLocalOnlyDryRun,
+  onToggleLocalOnlyExcluded,
+  onExecuteAppendLocal,
   vaultHoldReasons,
 }: {
   chatProvider: SupportedChatProvider;
@@ -100,6 +105,10 @@ export default function SettingsPanel({
   legacyCleanupStatus: LegacyCleanupUiStatus;
   onRunLegacyCleanupDryRun: () => void;
   onExecuteLegacyCleanup: () => void;
+  localOnlyStatus: LocalOnlyUiStatus;
+  onRunLocalOnlyDryRun: () => void;
+  onToggleLocalOnlyExcluded: (key: string) => void;
+  onExecuteAppendLocal: () => void;
   /**
    * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
@@ -735,6 +744,171 @@ export default function SettingsPanel({
                   <span>{legacyCleanupStatus.message}</span>
                   <button
                     onClick={onRunLegacyCleanupDryRun}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/*
+            保存先にない記録の追加（この端末 → 保存先。IndexedDB → Vault）。「保存先の記録を端末へ追加」
+            （保存先 → この端末）とは逆方向。この端末にあって、保存先には無い記録（保存先の設定前に作られた
+            記録など）を、確認した上で保存先へ追加する。「確認する」は何も書き込まず、「保存先に追加する」を
+            押した場合だけ書き込む。追加できない記録（確認が必要な記録）は、理由を表示する（今回は解決までは
+            行わない）。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm text-stone-600 dark:text-stone-300">保存先にない記録の追加</span>
+                  <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                    この端末にあって、保存先にない記録を、保存先へ追加します（「保存先の記録を端末へ追加」とは逆方向です）。
+                  </span>
+                </div>
+                <button
+                  onClick={onRunLocalOnlyDryRun}
+                  disabled={vaultActionsDisabled || localOnlyStatus.kind === "scanning" || localOnlyStatus.kind === "executing"}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                >
+                  {localOnlyStatus.kind === "scanning" ? "確認中…" : "確認する"}
+                </button>
+              </div>
+
+              {localOnlyStatus.kind === "plan" && (
+                <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  {localOnlyStatus.plan.adoptable.length > 0 && (
+                    <>
+                      <span>
+                        この端末に、保存先にない記録が{localOnlyStatus.plan.adoptable.length}件あります
+                        （{[
+                          localOnlyStatus.plan.counts.conversations > 0 ? `会話${localOnlyStatus.plan.counts.conversations}件` : null,
+                          localOnlyStatus.plan.counts.memories > 0 ? `記憶${localOnlyStatus.plan.counts.memories}件` : null,
+                          localOnlyStatus.plan.counts.sources > 0 ? `素材${localOnlyStatus.plan.counts.sources}件` : null,
+                        ]
+                          .filter((part): part is string => part !== null)
+                          .join("・")}）
+                      </span>
+                      <span className="text-stone-500 dark:text-stone-400">
+                        保存先を設定する前に作成された記録などです。元の日時のまま、保存先に追加します。
+                      </span>
+                      <details className="text-stone-600 dark:text-stone-300">
+                        <summary className="cursor-pointer">内容を確認</summary>
+                        <div className="mt-2 flex flex-col gap-3">
+                          {localOnlyStatus.plan.adoptable.map((item) => (
+                            <div key={item.record.key} className="flex flex-col gap-1">
+                              <label className="flex items-start gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={!localOnlyStatus.excluded.includes(item.record.key)}
+                                  onChange={() => onToggleLocalOnlyExcluded(item.record.key)}
+                                  className="mt-0.5"
+                                />
+                                <span className="flex flex-col gap-0.5">
+                                  <span>
+                                    {item.record.day}　{item.record.title}
+                                  </span>
+                                  <span className="text-stone-500 dark:text-stone-400">
+                                    作成 {item.record.createdAt.slice(0, 16).replace("T", " ")}（元の日時のまま追加）
+                                  </span>
+                                </span>
+                              </label>
+                              <div className="ml-6 flex flex-col gap-0.5 rounded-lg bg-white/60 px-2 py-1 text-stone-600 dark:bg-black/20 dark:text-stone-300">
+                                {item.record.lines.map((line, i) => (
+                                  <span key={i} className="break-words whitespace-pre-wrap">
+                                    {line}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                      <button
+                        onClick={onExecuteAppendLocal}
+                        disabled={
+                          vaultActionsDisabled ||
+                          localOnlyStatus.plan.adoptable.every((item) => localOnlyStatus.excluded.includes(item.record.key))
+                        }
+                        className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                      >
+                        保存先に追加する
+                        {localOnlyStatus.excluded.length > 0
+                          ? `（${localOnlyStatus.plan.adoptable.length - localOnlyStatus.excluded.length}件）`
+                          : ""}
+                      </button>
+                    </>
+                  )}
+
+                  {localOnlyStatus.plan.blocked.length > 0 && (
+                    <details className="text-stone-700 dark:text-stone-300">
+                      <summary className="cursor-pointer">確認が必要な記録が{localOnlyStatus.plan.blocked.length}件あります</summary>
+                      <div className="mt-1 flex flex-col gap-1 text-stone-500 dark:text-stone-400">
+                        {localOnlyStatus.plan.blocked.map((item) => (
+                          <span key={item.record.key} className="break-all">
+                            {item.record.day}　{item.record.title}：{item.block?.message}
+                            {item.block?.detail ? `（${item.block.detail}）` : ""}
+                          </span>
+                        ))}
+                        <span>これらは今回は追加せず、そのまま残します。</span>
+                      </div>
+                    </details>
+                  )}
+
+                  {localOnlyStatus.plan.items.length === 0 && <span>保存先にない記録はありません。</span>}
+                </div>
+              )}
+
+              {localOnlyStatus.kind === "executing" && (
+                <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">追加しています…</div>
+              )}
+
+              {localOnlyStatus.kind === "done" && (
+                <div className="flex flex-col gap-1 rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                  <span>
+                    {localOnlyStatus.result.status === "nothing-to-do"
+                      ? "追加する記録はありませんでした。"
+                      : localOnlyStatus.result.status === "interrupted"
+                        ? "追加を途中で中断しました。もう一度「確認する」から実行すると、続きから完了できます。"
+                        : localOnlyStatus.result.failedCount + localOnlyStatus.result.skippedCount > 0
+                          ? `${localOnlyStatus.result.writtenCount}件を保存先に追加しました。追加できなかった記録があります。`
+                          : `${localOnlyStatus.result.writtenCount}件を保存先に追加しました。`}
+                  </span>
+                  {localOnlyStatus.result.items
+                    .filter((item) => item.outcome !== "written")
+                    .map((item) => (
+                      <span key={item.key} className="break-all text-red-600 dark:text-red-400">
+                        {item.message}
+                      </span>
+                    ))}
+                  {localOnlyStatus.result.remaining && localOnlyStatus.result.remaining.blocked > 0 && (
+                    <span>確認が必要な記録が{localOnlyStatus.result.remaining.blocked}件あります（「確認する」で理由を確認できます）。</span>
+                  )}
+                  {localOnlyStatus.result.postChecks.length > 0 && (
+                    <details>
+                      <summary className="cursor-pointer">実行後の確認</summary>
+                      <div className="mt-1 flex flex-col gap-0.5">
+                        {localOnlyStatus.result.postChecks.map((check) => (
+                          <span key={check.name} className="break-all">
+                            {check.ok ? "OK" : "NG"}　{check.name}
+                            {check.detail ? `（${check.detail}）` : ""}
+                          </span>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
+
+              {localOnlyStatus.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{localOnlyStatus.message}</span>
+                  <button
+                    onClick={onRunLocalOnlyDryRun}
                     disabled={vaultActionsDisabled}
                     className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
                   >

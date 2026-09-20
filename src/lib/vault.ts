@@ -668,7 +668,7 @@ function enqueueVaultWrite<T>(
   });
 }
 
-type VaultSyncKind = "conversation" | "memory" | "source";
+export type VaultSyncKind = "conversation" | "memory" | "source";
 
 export function vaultSyncKeyFor(kind: VaultSyncKind, id: string): string {
   return `${kind}:${id}`;
@@ -692,7 +692,7 @@ async function markVaultSynced(kind: VaultSyncKind, id: string, updatedAt: strin
  * スキップしてよい）を返す。台帳の読み取り自体に失敗した場合は「未同期」として安全側に
  * 倒し、必ず書き込む（falseを返す）。Vault側のMarkdownファイルは一切読まない。
  */
-async function isAlreadySyncedToVault(kind: VaultSyncKind, id: string, updatedAt: string): Promise<boolean> {
+export async function isAlreadySyncedToVault(kind: VaultSyncKind, id: string, updatedAt: string): Promise<boolean> {
   try {
     const recorded = await getVaultSyncState(vaultSyncKeyFor(kind, id));
     return recorded === updatedAt;
@@ -1352,20 +1352,68 @@ function shortId(id: string) {
 }
 
 /** 旧形式（1 record = 1 file）のファイル名。Reflection/Summary（system-generated）はこの形式を維持する。 */
-function fileNameFor(id: string, isoDate: string) {
+export function fileNameFor(id: string, isoDate: string) {
   const datePart = isoDate.slice(0, 10);
   return `${datePart}-${shortId(id)}.md`;
 }
 
 /** 「1日1Markdown」（通常のMemory）のファイル名。同じ日のMemoryは全てこのファイルへ統合する。 */
-function dayFileNameFor(isoDate: string) {
+export function dayFileNameFor(isoDate: string) {
   return `${isoDate.slice(0, 10)}.md`;
+}
+
+/**
+ * 「保存先にない記録の追加」（`vaultAppendLocal.ts`の専用execute経路）専用の書き込みモード。
+ *
+ * `adoptLocalOnly: true`の場合に限り、「Registryにentryが無く、`createdAt`がbaseline以前」という
+ * 理由だけでの保留（baseline gateの`createdAt`比較）を外す。それ以外は通常の書き込みと完全に同一：
+ * - baseline自体が未確立（null）なら通常どおり保留する
+ * - Registry entryが存在する場合（`ok`以外）の保留は変わらない
+ * - 書き込み先のファイルが既に存在する場合は、既存ファイルの上書きを防ぐため拒否する
+ *   （`VaultAdoptTargetExistsError`）
+ * - 本文・`createdAt`・`updatedAt`は一切書き換えない（渡されたrecordをそのまま保存する）
+ * - 本文・`index.json`・History Index・Registry・sync ledgerの更新は通常の書き込みと同じコードを通る
+ * 呼び出してよいのは`vaultAppendLocal.ts`の`appendLocalRecordsToVault`だけ（dry-run・Vault全体の
+ * 痕跡確認・world lock内での再検証を済ませたrecordに対してのみ）。通常の保存・flushは指定しない。
+ */
+export interface VaultWriteOptions {
+  adoptLocalOnly?: boolean;
+}
+
+/** `adoptLocalOnly`の書き込み先ファイルが既に存在した場合（既存ファイルを上書きしないための拒否）。 */
+export class VaultAdoptTargetExistsError extends Error {
+  readonly fileName: string;
+  constructor(fileName: string) {
+    super(`[Tsumugi] refusing to write: "${fileName}" already exists in the vault (adopt-local-only never overwrites an existing file).`);
+    this.name = "VaultAdoptTargetExistsError";
+    this.fileName = fileName;
+  }
+}
+
+/**
+ * 書き込み先に既存ファイルがある場合は拒否する（上書きしない）。ただし次の2つは書き込んでよい：
+ * - 空（0 byte）のファイル：以前の書き込みが途中で失敗して残った（データを含まない）もの
+ * - 内容が、これから書く内容（`expectedContent`）と完全に一致するファイル：以前の追加が、本文の書き込み後・
+ *   Registry確定前に中断して残ったもの（同じ内容の上書きは無害で、残りの手順を完了できる）
+ */
+async function assertAdoptTargetAbsent(dir: FileSystemDirectoryHandle, fileName: string, expectedContent: string): Promise<void> {
+  let file: File;
+  try {
+    file = await (await dir.getFileHandle(fileName, { create: false })).getFile();
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+  if (file.size === 0) return;
+  if ((await file.text()) === expectedContent) return;
+  throw new VaultAdoptTargetExistsError(fileName);
 }
 
 async function writeConversationMarkdownImpl(
   root: FileSystemDirectoryHandle,
   conversation: Conversation,
-  dirHandleCache?: VaultDirHandleCache
+  dirHandleCache?: VaultDirHandleCache,
+  options?: VaultWriteOptions
 ) {
   const dir = await getCachedVaultTopLevelDir(root, "Conversations", "conversation dirHandle", dirHandleCache);
 
@@ -1386,11 +1434,15 @@ async function writeConversationMarkdownImpl(
   if (lookup.entry === undefined) {
     const meta = await readVaultRegistryMeta(root);
     const baselineEstablishedAt = meta.baselineEstablishedAt;
-    if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(conversation.createdAt, baselineEstablishedAt)) {
+    if (
+      baselineEstablishedAt === null ||
+      (!options?.adoptLocalOnly && !isRecordNewerThanBaseline(conversation.createdAt, baselineEstablishedAt))
+    ) {
       throw new VaultRecordNeedsResyncError("conversation", registryKey, "needs-resync", "baseline-not-established");
     }
     fileName = fileNameFor(conversation.id, conversation.startedAt);
     relativePath = `Conversations/${fileName}`;
+    if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, conversationToMarkdown(conversation));
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
     const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -1443,10 +1495,11 @@ export async function writeConversationMarkdown(
   root: FileSystemDirectoryHandle,
   conversation: Conversation,
   priority: VaultWritePriority = "interactive",
-  dirHandleCache?: VaultDirHandleCache
+  dirHandleCache?: VaultDirHandleCache,
+  options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeConversationMarkdownImpl(root, conversation, dirHandleCache),
+    () => writeConversationMarkdownImpl(root, conversation, dirHandleCache, options),
     priority,
     vaultSyncKeyFor("conversation", conversation.id)
   );
@@ -1461,7 +1514,8 @@ export async function writeConversationMarkdown(
 async function writeSourceMarkdownImpl(
   root: FileSystemDirectoryHandle,
   source: Source,
-  dirHandleCache?: VaultDirHandleCache
+  dirHandleCache?: VaultDirHandleCache,
+  options?: VaultWriteOptions
 ) {
   const dir = await getCachedVaultTopLevelDir(root, "Sources", "source dirHandle", dirHandleCache);
 
@@ -1478,11 +1532,15 @@ async function writeSourceMarkdownImpl(
   if (lookup.entry === undefined) {
     const meta = await readVaultRegistryMeta(root);
     const baselineEstablishedAt = meta.baselineEstablishedAt;
-    if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(source.createdAt, baselineEstablishedAt)) {
+    if (
+      baselineEstablishedAt === null ||
+      (!options?.adoptLocalOnly && !isRecordNewerThanBaseline(source.createdAt, baselineEstablishedAt))
+    ) {
       throw new VaultRecordNeedsResyncError("source", registryKey, "needs-resync", "baseline-not-established");
     }
     fileName = fileNameFor(source.id, source.createdAt);
     relativePath = `Sources/${fileName}`;
+    if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, sourceToMarkdown(source));
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
     const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -1517,10 +1575,11 @@ export async function writeSourceMarkdown(
   root: FileSystemDirectoryHandle,
   source: Source,
   priority: VaultWritePriority = "interactive",
-  dirHandleCache?: VaultDirHandleCache
+  dirHandleCache?: VaultDirHandleCache,
+  options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeSourceMarkdownImpl(root, source, dirHandleCache),
+    () => writeSourceMarkdownImpl(root, source, dirHandleCache, options),
     priority,
     vaultSyncKeyFor("source", source.id)
   );
@@ -1531,7 +1590,7 @@ export async function writeSourceMarkdown(
  * Reflection（「本日はここまで」）が生成する system-generated の Insight（Summary）は、
  * 既存の1record=1fileの保存形式をそのまま維持する（日別ファイルへは統合しない）。
  */
-function isReflectionSummary(memoryObject: MemoryObject): boolean {
+export function isReflectionSummary(memoryObject: MemoryObject): boolean {
   return memoryObject.metadata.source === "system-generated";
 }
 
@@ -1552,7 +1611,7 @@ function isReflectionSummary(memoryObject: MemoryObject): boolean {
  * 呼び出し元が`putMemoryObject`後に呼ぶ）、0件はそれが何らかの理由で見えて
  * いない異常系を意味する。真に0件かどうかをここで推測せず、安全側にHOLDする。
  */
-async function isMemoryDayContainerAllNew(day: string, baselineEstablishedAt: string): Promise<boolean> {
+export async function isMemoryDayContainerAllNew(day: string, baselineEstablishedAt: string): Promise<boolean> {
   const all = await getAllMemoryObjects();
   const dayMembers = all.filter((m) => !isReflectionSummary(m) && m.date.slice(0, 10) === day);
   if (dayMembers.length === 0) return false;
@@ -1581,7 +1640,8 @@ async function readDayFileEntries(
 async function writeMemoryObjectMarkdownImpl(
   root: FileSystemDirectoryHandle,
   memoryObject: MemoryObject,
-  dirHandleCache?: VaultDirHandleCache
+  dirHandleCache?: VaultDirHandleCache,
+  options?: VaultWriteOptions
 ) {
   const dir = await getCachedVaultTopLevelDir(root, "Memories", "memory dirHandle", dirHandleCache);
 
@@ -1599,11 +1659,15 @@ async function writeMemoryObjectMarkdownImpl(
     if (lookup.entry === undefined) {
       const meta = await readVaultRegistryMeta(root);
       const baselineEstablishedAt = meta.baselineEstablishedAt;
-      if (baselineEstablishedAt === null || !isRecordNewerThanBaseline(memoryObject.createdAt, baselineEstablishedAt)) {
+      if (
+        baselineEstablishedAt === null ||
+        (!options?.adoptLocalOnly && !isRecordNewerThanBaseline(memoryObject.createdAt, baselineEstablishedAt))
+      ) {
         throw new VaultRecordNeedsResyncError("reflection", registryKey, "needs-resync", "baseline-not-established");
       }
       fileName = fileNameFor(memoryObject.id, memoryObject.date);
       relativePath = `Memories/${fileName}`;
+      if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, memoryObjectToMarkdown(memoryObject));
     } else if (lookup.entry.status === "ok") {
       relativePath = lookup.path as string;
       const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -1677,11 +1741,15 @@ async function writeMemoryObjectMarkdownImpl(
     // 新しいday-fileを作ってはいけない）。
     const meta = await readVaultRegistryMeta(root);
     const baselineEstablishedAt = meta.baselineEstablishedAt;
-    if (baselineEstablishedAt === null || !(await isMemoryDayContainerAllNew(day, baselineEstablishedAt))) {
+    if (
+      baselineEstablishedAt === null ||
+      (!options?.adoptLocalOnly && !(await isMemoryDayContainerAllNew(day, baselineEstablishedAt)))
+    ) {
       throw new VaultRecordNeedsResyncError("memory-day", registryKey, "needs-resync", "baseline-not-established");
     }
     fileName = dayFileNameFor(memoryObject.date);
     relativePath = `Memories/${fileName}`;
+    if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, serializeMemoryDayFile([memoryObject]));
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
     const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -1759,10 +1827,11 @@ export async function writeMemoryObjectMarkdown(
   root: FileSystemDirectoryHandle,
   memoryObject: MemoryObject,
   priority: VaultWritePriority = "interactive",
-  dirHandleCache?: VaultDirHandleCache
+  dirHandleCache?: VaultDirHandleCache,
+  options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache),
+    () => writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options),
     priority,
     vaultSyncKeyFor("memory", memoryObject.id)
   );
@@ -2700,7 +2769,7 @@ export async function readVaultRegistryMeta(root: FileSystemDirectoryHandle): Pr
  * 「新規」と判定してはいけない（合意済み：parse失敗を新規扱いにしない）ため、
  * 安全側に倒して`false`（＝新規ではない＝write保留）を返す。
  */
-function isRecordNewerThanBaseline(recordCreatedAt: string, baselineEstablishedAt: string): boolean {
+export function isRecordNewerThanBaseline(recordCreatedAt: string, baselineEstablishedAt: string): boolean {
   const recordMs = Date.parse(recordCreatedAt);
   const baselineMs = Date.parse(baselineEstablishedAt);
   if (Number.isNaN(recordMs) || Number.isNaN(baselineMs)) return false;
@@ -3049,7 +3118,7 @@ export class VaultRecordNeedsResyncError extends Error {
 
 /** `lookupVaultRegistryRecord`の結果。`entry`が`undefined`なら「registryに一度も
  *  登録されたことが無い＝真の新規record」を意味する。 */
-interface VaultRegistryLookup {
+export interface VaultRegistryLookup {
   bucket: number;
   path: string | undefined;
   entry: VaultRegistryFileEntry | undefined;
@@ -3069,7 +3138,7 @@ interface VaultRegistryLookup {
  * 分離しており、この関数自体には手を加えない（A1/L4のlookup semanticsを
  * 変更しないため）。
  */
-async function lookupVaultRegistryRecord(root: FileSystemDirectoryHandle, registryKey: string): Promise<VaultRegistryLookup> {
+export async function lookupVaultRegistryRecord(root: FileSystemDirectoryHandle, registryKey: string): Promise<VaultRegistryLookup> {
   const bucket = vaultRegistryBucketOf(registryKey);
   const shard = await readVaultRegistryShard(root, bucket);
   const path = shard.records[registryKey];
@@ -3614,7 +3683,7 @@ export function memoryObjectsSemanticEqual(a: MemoryObject, b: MemoryObject): bo
 }
 
 /** Sourceは`metadata: Metadata`を持たない最小構成のため、全フィールドが素直に往復する。 */
-function sourcesSemanticEqual(a: Source, b: Source): boolean {
+export function sourcesSemanticEqual(a: Source, b: Source): boolean {
   if (a.id !== b.id) return false;
   if (a.sourceType !== b.sourceType) return false;
   if (a.title !== b.title) return false;
