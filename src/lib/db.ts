@@ -516,6 +516,19 @@ export async function addSourceIfAbsentAndMarkSynced(source: Source, syncKey: st
  * クリアしないと「新フォルダには実際は書き込まれていないのに同期済み」と誤判定し、
  * 書き込みが漏れる事故につながる。
  */
+/**
+ * vaultSyncState（Vault同期済み台帳）に1件でも記録があるか。読み取りのみ（readonly transaction）。
+ * 台帳が空＝「この端末は、現在の保存先へ書き込んだ記録を持たない」ことを意味する
+ * （保存先の新規接続・別Vaultへの切替では、直前に`clearVaultSyncState`されるため空になる）。
+ * `ensureVaultBaseline`（vault.ts）が、空に見えるだけの「失われたVault」と本当に新しい空Vaultを
+ * 区別するために使う。
+ */
+export async function hasAnyVaultSyncState(): Promise<boolean> {
+  const db = await getDB();
+  const cursor = await db.transaction("vaultSyncState", "readonly").store.openKeyCursor();
+  return cursor !== null;
+}
+
 export async function clearVaultSyncState(): Promise<void> {
   const db = await getDB();
   await db.clear("vaultSyncState");

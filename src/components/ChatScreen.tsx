@@ -10,7 +10,7 @@ import {
   clearOpfsVault,
   collectAllMarkdownFiles,
   countVaultLightCheckCandidates,
-  ensureAndroidOpfsVaultBaseline,
+  ensureVaultBaseline,
   ensureVaultSkeleton,
   flushPendingToVault,
   getVaultBackend,
@@ -1549,6 +1549,53 @@ export default function ChatScreen() {
     return writeRecordsToIndexedDB(scan, generation);
   }
 
+  /**
+   * baseline確立直後に呼ぶ。
+   *
+   * createdAtレース対応：mount時に同期的に作られた初期Conversation
+   * （createConversation()、useState初期化子。アプリ起動とほぼ同時刻の
+   * createdAtを持つ）は、今まさに確立したbaselineより必ず古い。C1の既存
+   * ガード（baseline確立後のcreatedAtでなければ書き込めない）は変更しないため、
+   * このConversationのまま使い続けると、以後createdAtが不変である以上、
+   * 永久にHOLDされ続ける。
+   *
+   * 対象を厳密に絞る：turnsが1件も無い（まだ一度も使われていない）・
+   * promptedMemoryIdが無い（「過去からの問いかけ」起点ではない）・endedAtが
+   * 無い（終了済みではない）の3条件をすべて満たし、かつcreatedAtが実際に
+   * baseline以前の場合だけを対象にする。turnsが存在する・復元された・
+   * ユーザーが既に使い始めたConversationは絶対に作り直さない。
+   */
+  function refreshUnusedConversationAfterBaseline(baselineEstablishedAt: string) {
+    const current = latestConversationRef.current;
+    const isUnusedPreBaselineConversation =
+      current.turns.length === 0 &&
+      !current.promptedMemoryId &&
+      !current.endedAt &&
+      Date.parse(current.createdAt) <= Date.parse(baselineEstablishedAt);
+    if (isUnusedPreBaselineConversation) {
+      const refreshed = createConversation(current.persona);
+      setConversation(refreshed);
+      latestConversationRef.current = refreshed;
+    }
+  }
+
+  /**
+   * 保存先の接続・切替が確定した直後（recordの書き込み・flushの前）に呼ぶ。検証済みの新規空Vaultなら
+   * Registry baselineを確立する（`ensureVaultBaseline`、vault.ts参照。既存のVault・条件を満たさない
+   * Vaultでは何もしない）。確立できた場合だけ、未使用の初期Conversationを作り直す。
+   * 例外は投げない（失敗しても接続・切替自体は続行し、次回の起動・接続時に再試行される）。
+   */
+  async function ensureBaselineForConnectedVault(handle: FileSystemDirectoryHandle) {
+    try {
+      const baseline = await ensureVaultBaseline(handle);
+      if (baseline.established && baseline.baselineEstablishedAt) {
+        refreshUnusedConversationAfterBaseline(baseline.baselineEstablishedAt);
+      }
+    } catch (error) {
+      console.error("[Tsumugi] ensureVaultBaseline after vault connect failed (will retry on next launch/connect):", error);
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     // Android保存方式の見直し：ensureAndroidOpfsVaultBaseline（resyncVaultRegistryを
@@ -1749,32 +1796,11 @@ export default function ChatScreen() {
       // fail-closedガードにより無害にHOLDされ、次回flush時に自然に再試行される
       // だけである（IndexedDBは一切変更されない）。
       if (cancelled || !androidOpfsBaselineHandle) return;
-      const baseline = await ensureAndroidOpfsVaultBaseline(androidOpfsBaselineHandle);
+      const baseline = await ensureVaultBaseline(androidOpfsBaselineHandle);
       if (cancelled || !baseline.established || !baseline.baselineEstablishedAt) return;
 
-      // createdAtレース対応：mount時に同期的に作られた初期Conversation
-      // （createConversation()、useState初期化子。アプリ起動とほぼ同時刻の
-      // createdAtを持つ）は、今まさに確立したbaselineより必ず古い。C1の既存
-      // ガード（baseline確立後のcreatedAtでなければ書き込めない）は変更しないため、
-      // このConversationのまま使い続けると、以後createdAtが不変である以上、
-      // 永久にHOLDされ続ける。
-      //
-      // 対象を厳密に絞る：turnsが1件も無い（まだ一度も使われていない）・
-      // promptedMemoryIdが無い（「過去からの問いかけ」起点ではない）・endedAtが
-      // 無い（終了済みではない）の3条件をすべて満たし、かつcreatedAtが実際に
-      // baseline以前の場合だけを対象にする。turnsが存在する・復元された・
-      // ユーザーが既に使い始めたConversationは絶対に作り直さない。
-      const current = latestConversationRef.current;
-      const isUnusedPreBaselineConversation =
-        current.turns.length === 0 &&
-        !current.promptedMemoryId &&
-        !current.endedAt &&
-        Date.parse(current.createdAt) <= Date.parse(baseline.baselineEstablishedAt);
-      if (isUnusedPreBaselineConversation) {
-        const refreshed = createConversation(current.persona);
-        setConversation(refreshed);
-        latestConversationRef.current = refreshed;
-      }
+      // createdAtレース対応：詳細は`refreshUnusedConversationAfterBaseline`のコメント参照。
+      refreshUnusedConversationAfterBaseline(baseline.baselineEstablishedAt);
     }).finally(() => {
       endStartupTask();
     });
@@ -2135,6 +2161,9 @@ export default function ChatScreen() {
           return;
         }
 
+        // 検証済みの新規空Vaultならbaselineを確立してから書き込みを始める（flushが先に走ると、
+        // 新規recordがbaseline未確立でHOLDされる）。既存Vault・条件を満たさないVaultでは何もしない。
+        await ensureBaselineForConnectedVault(newHandle);
         setVaultHandle(newHandle);
         setVaultStatus("connected");
         // Android Vault問題（「保存先を変更」ボタン無反応）対応：flush完了を
@@ -2442,6 +2471,7 @@ export default function ChatScreen() {
         // generation capture（呼び出し時点の`vaultGenerationRef.current`を記録し、
         // discovery完了後に不一致なら結果を破棄する）で保証される——ここでは
         // 単に「新Vaultが確定した後に呼ぶ」ことだけを守ればよい。
+        await ensureBaselineForConnectedVault(newHandle);
         runVaultLightCheckInBackground(newHandle);
       } finally {
         // 11. 切替ロック解除（成功・中止・例外いずれの経路でも必ず解除する）。
@@ -2590,6 +2620,7 @@ export default function ChatScreen() {
       resetMemoryWorldState();
       setVaultHandle(outcome.handle);
       setVaultStatus("connected");
+      await ensureBaselineForConnectedVault(outcome.handle);
       // 実機不具合対応（light-check開始漏れ）：incomplete-switch復旧の成功も
       // 「別Vaultへの正常切替」と同じ形（world reset・新handle commit・generation
       // 確定＝この直前の排他ロック内で`vaultGenerationRef.current += 1`済み）

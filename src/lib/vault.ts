@@ -29,6 +29,7 @@ import {
   getRegistryGenerationEpoch,
   getSource,
   getVaultSyncState,
+  hasAnyVaultSyncState,
   isAndroidOpfsVaultInitialized,
   loadVaultHandle,
   markAndroidOpfsVaultInitialized,
@@ -233,9 +234,18 @@ export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
 }
 
 /**
+ * Registry baseline（`baselineEstablishedAt`）の確立結果。
+ */
+export interface VaultBaselineResult {
+  established: boolean;
+  baselineEstablishedAt?: string;
+}
+
+/**
  * Android保存方式の見直し：Androidの既定backendがOPFSへ切り替わった端末で、新しい
  * （空の）OPFS VaultについてRegistry baseline（`baselineEstablishedAt`）を一度だけ
- * 確立する。C1のfail-closed設計（Registry absentなrecordはbaseline確立後の
+ * 確立する（既存の移行経路。`ensureVaultBaseline`の中で、これまでと同じ条件・同じ処理のまま
+ * 呼ばれる）。C1のfail-closed設計（Registry absentなrecordはbaseline確立後の
  * createdAtでなければ書き込めない）は一切変更しない——単に、空のVaultに対して
  * 既存の`resyncVaultRegistry()`（full resync）を、C1が想定する「初回のVault確立」
  * という正規の用途でそのまま1回呼ぶだけである。
@@ -245,30 +255,13 @@ export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
  * しない——これにより、以前File System Access（旧backend）で同期済みだった
  * recordは「同期済み」のまま残り、この後に自動実行される`flushPendingToVault`
  * から静かにスキップされる。新しいOPFS Vaultへ過去recordが誤ってback-fillされる
- * ことを、追加のロジック無しに防ぐ（同期されていなかった一部recordがあれば、
- * C1の既存fail-closed判定により無害にHOLDされるだけで、IndexedDB本体には
- * 一切影響しない）。
+ * ことを、追加のロジック無しに防ぐ。
  *
  * 成功時（`resyncVaultRegistry`がRegistry CLEAN state・baselineの確立まで完了した
  * 場合、`lastFullResyncUpdated === true`）にのみ、db.tsの永続markerを立てる。
- * 失敗時はmarkerを立てず、次回起動時に再試行する（途中失敗を「移行済み」と
- * 誤認しない）。Android以外・OPFS以外では何もしない。
- *
- * 呼び出し元（ChatScreen.tsx）は、必ず起動時の共有"tsumugi-vault-world"ロックが
- * 完全に解放された後で呼ぶこと（内部で`resyncVaultRegistry`がexclusiveロックを
- * 要求するため、共有ロックの内側から呼ぶと自己デッドロックする）。
- *
- * 戻り値：このリクエストで実際にbaselineを新しく確立できた場合のみ
- * `{ established: true, baselineEstablishedAt }`を返す（それ以外＝Android以外・
- * 既に確立済み・失敗、いずれも`{ established: false }`）。呼び出し元はこれを使い、
- * 「baseline確立時点でまだ一度も使われていない初期Conversation」のcreatedAtが
- * baselineより古い場合の対応要否を判断できる。
+ * 失敗時はmarkerを立てず、次回起動時に再試行する。
  */
-export async function ensureAndroidOpfsVaultBaseline(
-  root: FileSystemDirectoryHandle
-): Promise<{ established: boolean; baselineEstablishedAt?: string }> {
-  if (!isAndroid() || getVaultBackend() !== "opfs") return { established: false };
-  if (await isAndroidOpfsVaultInitialized()) return { established: false };
+async function establishAndroidOpfsVaultBaseline(root: FileSystemDirectoryHandle): Promise<VaultBaselineResult> {
   try {
     const result = await resyncVaultRegistry(root);
     if (result.lastFullResyncUpdated) {
@@ -277,6 +270,115 @@ export async function ensureAndroidOpfsVaultBaseline(
     }
   } catch (error) {
     console.error("[Tsumugi] failed to establish Android OPFS vault baseline (will retry on next launch):", error);
+  }
+  return { established: false };
+}
+
+type StrictJsonRead = { status: "absent" } | { status: "ok"; value: unknown } | { status: "error" };
+
+/** `readJSON`（失敗を静かに既定値へfallbackする）と違い、NotFoundと読み取り失敗を区別する。 */
+async function readJsonStrict(dir: FileSystemDirectoryHandle, name: string): Promise<StrictJsonRead> {
+  let fileHandle: FileSystemFileHandle;
+  try {
+    fileHandle = await dir.getFileHandle(name, { create: false });
+  } catch (error) {
+    return isVaultRegistryDirectoryNotFoundError(error) ? { status: "absent" } : { status: "error" };
+  }
+  try {
+    return { status: "ok", value: JSON.parse(await (await fileHandle.getFile()).text()) };
+  } catch {
+    return { status: "error" };
+  }
+}
+
+/**
+ * C3：旧式の管理情報（`.tsumugi/index.json`・History Index）が空であることを、読み取りのみで
+ * 確認する。読み取りに失敗した場合・空でない場合はfalse（＝自動でbaselineを確立しない）。
+ * `.tsumugi/`自体が無い場合は空として扱う。
+ */
+async function isVaultLegacyMetadataEmpty(root: FileSystemDirectoryHandle): Promise<boolean> {
+  let tsumugiDir: FileSystemDirectoryHandle;
+  try {
+    tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: false });
+  } catch (error) {
+    return isVaultRegistryDirectoryNotFoundError(error);
+  }
+
+  const index = await readJsonStrict(tsumugiDir, "index.json");
+  if (index.status === "error") return false;
+  if (index.status === "ok") {
+    if (typeof index.value !== "object" || index.value === null || Array.isArray(index.value)) return false;
+    if (Object.keys(index.value as Record<string, unknown>).length > 0) return false;
+  }
+
+  const historyMeta = await readJsonStrict(tsumugiDir, "history-meta.json");
+  if (historyMeta.status === "error") return false;
+  if (historyMeta.status === "ok") {
+    const meta = historyMeta.value as Partial<HistoryMeta> | null;
+    if (!meta || meta.totalMemories !== 0 || meta.totalConversations !== 0) return false;
+  }
+
+  try {
+    const historyDir = await tsumugiDir.getDirectoryHandle("history", { create: false });
+    for await (const _entry of historyDir.entries()) {
+      void _entry;
+      return false; // History Indexのファイルが1つでもあれば空ではない
+    }
+  } catch (error) {
+    if (!isVaultRegistryDirectoryNotFoundError(error)) return false;
+  }
+  return true;
+}
+
+/**
+ * Registry baselineを、全プラットフォーム共通で安全に確立する（Android専用だった
+ * `ensureAndroidOpfsVaultBaseline`の一般化）。
+ *
+ * baselineは「この時刻より前に、Vaultに存在し得たrecordはRegistryに取り込み済み」という境界であり、
+ * 確立には（`resyncVaultRegistry`＝Vault全体のscan＋取り込み）を伴う。既存のVaultで自動的に
+ * 確立すると、任意のフォルダのMarkdownを黙ってIndexedDBへ取り込むことになる。そのため、
+ * 確立を許可するのは次の全てが成立する場合に限る：
+ *   C0 排他ロック（resyncVaultRegistry内の`runVaultWorldExclusive`）でepoch・整合性を確認できる
+ *   C1 Registry未確立：`registry-meta.json`が存在しない（NotFound）。存在して読めない場合・
+ *      存在してbaselineがnullの場合は何もしない
+ *   C2 Vaultにtsumugiの記録が無い：scanが完走し、Registryのrecordも、Tsumugiのファイルも、
+ *      読めないTsumugiのファイルも0件（resync内で、applyの前・同じ排他区間で判定する）
+ *   C3 旧式の管理情報も空：`.tsumugi/index.json`が空、History Indexが空
+ *   C4 この端末に「以前この保存先へ書いた」痕跡が無い：`vaultSyncState`が空。
+ *      OPFSだけが消えた・外部フォルダが切断された等、空に見えるだけの失われたVaultを
+ *      新しい空Vaultと誤認しないため
+ *
+ * 成立しない場合は何もしない（従来どおり書き込みはHOLDされ、IndexedDBは変更されない）。
+ * baselineより前に作られたIndexedDB上のrecordは、この関数では書き出さない（legacy扱いのまま。
+ * 別途、ユーザーの明示操作で扱う）。
+ *
+ * Androidの既存の移行経路（OPFSへ既定backendが切り替わった端末で、markerが未設定）は、これまでと
+ * 同じ条件・同じ処理のまま最優先で実行する（既存Android端末の挙動を変えない）。
+ *
+ * 呼び出し元は、必ず"tsumugi-vault-world"の共有ロックが解放された状態で呼ぶこと（内部で
+ * `resyncVaultRegistry`がexclusiveロックを要求するため、共有ロック内から呼ぶと自己デッドロックする）。
+ * 例外は投げない（失敗時は`{ established: false }`。次回の起動・接続時に再試行される）。
+ */
+export async function ensureVaultBaseline(root: FileSystemDirectoryHandle): Promise<VaultBaselineResult> {
+  try {
+    if (isAndroid() && getVaultBackend() === "opfs" && !(await isAndroidOpfsVaultInitialized())) {
+      return await establishAndroidOpfsVaultBaseline(root);
+    }
+
+    // C1
+    const pre = await readVaultRegistryMetaForStep0(root);
+    if (pre.status !== "not-found") return { established: false };
+
+    // C3・C4（lock外の事前確認。C2はresync内でapplyの前に、同じ排他区間で確認する）
+    if (!(await isVaultLegacyMetadataEmpty(root))) return { established: false };
+    if (await hasAnyVaultSyncState()) return { established: false };
+
+    const result = await resyncVaultRegistry(root, { requireEmptyVault: true });
+    if (result.lastFullResyncUpdated) {
+      return { established: true, baselineEstablishedAt: result.startedAt };
+    }
+  } catch (error) {
+    console.error("[Tsumugi] failed to establish vault baseline (will retry on next launch/connect):", error);
   }
   return { established: false };
 }
@@ -6129,6 +6231,22 @@ async function readVaultRegistryMetaForStep0(root: FileSystemDirectoryHandle): P
   }
 }
 
+/**
+ * `resyncVaultRegistry(root, { requireEmptyVault: true })`のC2判定（純粋関数）。scan結果が
+ * 「完走し、Registryのrecordも、tsumugiのファイルも、読めないtsumugiのファイルも無い」空のVaultなら
+ * null、そうでなければ理由を返す。
+ */
+export function describeVaultScanNotEmptyForBaseline(
+  scan: Pick<VaultResyncScanResult, "scanCompleted" | "previousSnapshotCompleted" | "previousByKey" | "records" | "unreadableFiles">
+): string | null {
+  if (!scan.scanCompleted) return "vault scan did not complete";
+  if (!scan.previousSnapshotCompleted) return "registry snapshot was incomplete";
+  if (scan.previousByKey.size > 0) return "registry already has records";
+  if (scan.records.length > 0) return "vault already contains tsumugi records";
+  if (scan.unreadableFiles.length > 0) return "vault contains unreadable tsumugi files";
+  return null;
+}
+
 /** Step 0がRegistryへ一切触れずresyncを中止する際に返す合成結果を組み立てる。
  *  meta read失敗・invalidate失敗のいずれの経路からも同じ形を使う。 */
 function buildAbortedVaultResyncApplyResult(reason: string): VaultResyncApplyResult {
@@ -6144,7 +6262,13 @@ function buildAbortedVaultResyncApplyResult(reason: string): VaultResyncApplyRes
   };
 }
 
-export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Promise<VaultResyncResult> {
+export async function resyncVaultRegistry(
+  root: FileSystemDirectoryHandle,
+  // `requireEmptyVault`（`ensureVaultBaseline`専用）：trueの場合、scan結果が「Registryもtsumugiの
+  // ファイルも無い完全に空のVault」でなければ、applyの前（Registry・IndexedDB・History Indexへ
+  // 何も書く前）に中止する。省略時は従来のfull resyncと完全に同一。
+  options?: { requireEmptyVault?: boolean }
+): Promise<VaultResyncResult> {
   const startedAt = new Date().toISOString();
 
   // "tsumugi-vault-world"の排他ロックを1回だけ取得し、snapshot→scan→
@@ -6228,6 +6352,15 @@ export async function resyncVaultRegistry(root: FileSystemDirectoryHandle): Prom
     // （Phase 1）＋apply（Step 4b）。Step 0を通過した（＝無効化が必要無かった、
     // または無効化に成功した）場合にのみここへ到達する。
     const scan = await performVaultResyncScan(root);
+    if (options?.requireEmptyVault) {
+      const notEmptyReason = describeVaultScanNotEmptyForBaseline(scan);
+      if (notEmptyReason !== null) {
+        return {
+          applyResult: buildAbortedVaultResyncApplyResult(`baseline not established: ${notEmptyReason}`),
+          lastFullResyncUpdated: false,
+        };
+      }
+    }
     const applyResult = await applyVaultResyncScanResult(root, scan);
 
     let lastFullResyncUpdated = false;
