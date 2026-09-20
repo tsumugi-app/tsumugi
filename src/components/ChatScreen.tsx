@@ -2810,6 +2810,13 @@ export default function ChatScreen() {
         counts: result.postCheck?.counts ?? null,
         idb: result.postCheck?.idb ?? null,
       });
+      // cleanupでVaultのファイル構成が変わった場合、退避前のlight-check結果（discovery/classify）は古い。
+      // 破棄して、排他ロック解放後に再discoveryする（何も変更していない場合は再実行しない）。
+      if (result.archivedNow > 0 || result.memoryDaysCommitted > 0 || result.conversationsCommitted > 0) {
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        runVaultLightCheckInBackground(vaultHandle);
+      }
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setLegacyCleanupStatus({ kind: "idle" });
