@@ -568,7 +568,7 @@ function enqueueVaultWrite<T>(
 
 type VaultSyncKind = "conversation" | "memory" | "source";
 
-function vaultSyncKeyFor(kind: VaultSyncKind, id: string): string {
+export function vaultSyncKeyFor(kind: VaultSyncKind, id: string): string {
   return `${kind}:${id}`;
 }
 
@@ -1970,6 +1970,12 @@ function isSelfAbortRejection(reason: unknown, signal?: AbortSignal): boolean {
   return reason instanceof DOMException && reason.name === "AbortError" && Boolean(signal?.aborted);
 }
 
+/** collectVaultMarkdownが返す1ファイル分。`name`は（フォルダを含まない）ファイル名のみ。 */
+interface VaultCollectedFile {
+  name: string;
+  text: string;
+}
+
 async function collectVaultMarkdown(
   dir: FileSystemDirectoryHandle,
   folderName: string,
@@ -1982,7 +1988,7 @@ async function collectVaultMarkdown(
   // Android Vault問題（in-flight scanの協調的キャンセル）：省略時（undefined）は
   // 常にabortされない扱い（既存の呼び出し元・挙動を変えない）。
   signal?: AbortSignal
-): Promise<string[]> {
+): Promise<VaultCollectedFile[]> {
   if (!insideTarget && depth > FOLDER_SEARCH_MAX_DEPTH) return [];
 
   // Android Vault問題（in-flight scanの協調的キャンセル）：このディレクトリの処理
@@ -1997,7 +2003,7 @@ async function collectVaultMarkdown(
   logTimingEvent("Vault collectDir:enter", { target: folderName, depth, insideTarget: insideTarget ? 1 : 0 });
   let entryCount = 0;
 
-  const contents: string[] = [];
+  const contents: VaultCollectedFile[] = [];
   for await (const [name, handle] of dir.entries()) {
     // Android Vault問題（in-flight scanの協調的キャンセル）：各ディレクトリ・
     // 各ファイルの処理に入る直前に確認する。abort済みなら、ここまでに集めた
@@ -2093,7 +2099,7 @@ async function collectVaultMarkdown(
       sizeBytes: file.size,
     });
 
-    contents.push(text);
+    contents.push({ name, text });
   }
   logTimingEvent("Vault collectDir:exit", {
     target: folderName,
@@ -2115,6 +2121,36 @@ export interface VaultScanResult {
   sources: Source[];
   /** frontmatterが読めない、`tsumugi: true`が無い等で復元対象外だったファイルの数。 */
   skippedCount: number;
+  /**
+   * 同じidが複数のファイル（旧1record1file形式とday-file、または重複・手動コピー）に
+   * 存在し、1件へ絞り込んだ回数（採用されなかった側の件数）。
+   */
+  duplicatesResolved: { conversations: number; memoryObjects: number; sources: number };
+}
+
+/** 「1日1Markdown」のday-file名（`YYYY-MM-DD.md`）。旧1record1file形式（`YYYY-MM-DD-xxxxxx.md`）とは別。 */
+function isMemoryDayFileName(name: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}\.md$/.test(name);
+}
+
+interface RestoreCandidateMeta {
+  updatedAt: string;
+  fileName: string;
+  /** 小さいほど優先（同じupdatedAtのときだけ使う）。Memoryのday-fileが0、それ以外は1。 */
+  rank: number;
+}
+
+/**
+ * 同じidの候補が複数あるときの採用規則。1) updatedAtが新しい方、2) 同じならday-file
+ * （Memoryのみ。旧形式より優先）、3) それでも同じならファイル名が短い方（`xxx+.md`のような
+ * 重複コピーより元のファイル名を優先）、4) 最後は辞書順。走査順（ファイルシステムの
+ * 列挙順）に結果が依存しないよう、必ず全順序で決める。
+ */
+function shouldReplaceRestoreCandidate(existing: RestoreCandidateMeta, next: RestoreCandidateMeta): boolean {
+  if (existing.updatedAt !== next.updatedAt) return existing.updatedAt < next.updatedAt;
+  if (existing.rank !== next.rank) return next.rank < existing.rank;
+  if (existing.fileName.length !== next.fileName.length) return next.fileName.length < existing.fileName.length;
+  return next.fileName < existing.fileName;
 }
 
 /**
@@ -2141,7 +2177,7 @@ export async function scanVaultForRestore(
   // TEMP-TEST：Android実機でのVault scan停止事象の原因切り分け用。Conversations/
   // Memories/Sourcesのどれが完了していないかをフェーズ単位で観測するだけのラッパー。
   // collectVaultMarkdown自体の戻り値・分岐は変更しない。
-  const collectWithPhaseLog = async (folderName: string): Promise<string[]> => {
+  const collectWithPhaseLog = async (folderName: string): Promise<VaultCollectedFile[]> => {
     const phaseStart = Date.now();
     logTimingEvent("Vault collect:start", { target: folderName });
     const result = await collectVaultMarkdown(root, folderName, false, 0, { value: 0 }, signal);
@@ -2191,61 +2227,71 @@ export async function scanVaultForRestore(
 
   // 4. 全成功。
   const [conversationFiles, memoryFiles, sourceFiles] = settledResults.map(
-    (result) => (result as PromiseFulfilledResult<string[]>).value
+    (result) => (result as PromiseFulfilledResult<VaultCollectedFile[]>).value
   );
   const scanFileCount = conversationFiles.length + memoryFiles.length + sourceFiles.length;
   const scanDurationMs = Date.now() - scanStart;
   console.log(`[Vault] scan:end fileCount=${scanFileCount} durationMs=${scanDurationMs}`);
   logTimingEvent("Vault scan:end", { fileCount: scanFileCount, durationMs: scanDurationMs });
 
-  const conversationsById = new Map<string, Conversation>();
-  for (const raw of conversationFiles) {
-    const parsed = parseConversationMarkdown(raw);
+  const duplicatesResolved = { conversations: 0, memoryObjects: 0, sources: 0 };
+
+  const conversationsById = new Map<string, { value: Conversation; meta: RestoreCandidateMeta }>();
+  for (const file of conversationFiles) {
+    const parsed = parseConversationMarkdown(file.text);
     if (!parsed) {
       skippedCount += 1;
       continue;
     }
+    const meta: RestoreCandidateMeta = { updatedAt: parsed.updatedAt, fileName: file.name, rank: 1 };
     const existing = conversationsById.get(parsed.id);
-    if (!existing || existing.updatedAt < parsed.updatedAt) {
-      conversationsById.set(parsed.id, parsed);
+    if (existing) duplicatesResolved.conversations += 1;
+    if (!existing || shouldReplaceRestoreCandidate(existing.meta, meta)) {
+      conversationsById.set(parsed.id, { value: parsed, meta });
     }
   }
 
-  const memoryObjectsById = new Map<string, MemoryObject>();
-  for (const raw of memoryFiles) {
-    const parsedEntries = parseMemoryDayFile(raw);
+  const memoryObjectsById = new Map<string, { value: MemoryObject; meta: RestoreCandidateMeta }>();
+  for (const file of memoryFiles) {
+    const parsedEntries = parseMemoryDayFile(file.text);
     if (parsedEntries.length === 0) {
       skippedCount += 1;
       continue;
     }
+    const rank = isMemoryDayFileName(file.name) ? 0 : 1;
     for (const parsed of parsedEntries) {
+      const meta: RestoreCandidateMeta = { updatedAt: parsed.updatedAt, fileName: file.name, rank };
       const existing = memoryObjectsById.get(parsed.id);
-      if (!existing || existing.updatedAt < parsed.updatedAt) {
-        memoryObjectsById.set(parsed.id, parsed);
+      if (existing) duplicatesResolved.memoryObjects += 1;
+      if (!existing || shouldReplaceRestoreCandidate(existing.meta, meta)) {
+        memoryObjectsById.set(parsed.id, { value: parsed, meta });
       }
     }
   }
 
-  const sourcesById = new Map<string, Source>();
-  for (const raw of sourceFiles) {
+  const sourcesById = new Map<string, { value: Source; meta: RestoreCandidateMeta }>();
+  for (const file of sourceFiles) {
     let parsed: Source;
     try {
-      parsed = parseSourceMarkdown(raw);
+      parsed = parseSourceMarkdown(file.text);
     } catch {
       skippedCount += 1;
       continue;
     }
+    const meta: RestoreCandidateMeta = { updatedAt: parsed.updatedAt, fileName: file.name, rank: 1 };
     const existing = sourcesById.get(parsed.id);
-    if (!existing || existing.updatedAt < parsed.updatedAt) {
-      sourcesById.set(parsed.id, parsed);
+    if (existing) duplicatesResolved.sources += 1;
+    if (!existing || shouldReplaceRestoreCandidate(existing.meta, meta)) {
+      sourcesById.set(parsed.id, { value: parsed, meta });
     }
   }
 
   return {
-    conversations: [...conversationsById.values()],
-    memoryObjects: [...memoryObjectsById.values()],
-    sources: [...sourcesById.values()],
+    conversations: [...conversationsById.values()].map((entry) => entry.value),
+    memoryObjects: [...memoryObjectsById.values()].map((entry) => entry.value),
+    sources: [...sourcesById.values()].map((entry) => entry.value),
     skippedCount,
+    duplicatesResolved,
   };
 }
 

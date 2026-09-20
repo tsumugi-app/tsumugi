@@ -7,6 +7,7 @@ import type {
   SupportedChatProvider,
   VaultConnectFeedback,
   VaultLightCheckStatus,
+  VaultRestoreUiStatus,
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
@@ -41,6 +42,9 @@ export default function SettingsPanel({
   onConfirmVaultLightCheck,
   onApplyVaultLightCheck,
   onRetryVaultLightCheck,
+  vaultRestoreStatus,
+  onRunVaultRestoreDryRun,
+  onExecuteVaultRestore,
   vaultHoldReasons,
 }: {
   chatProvider: SupportedChatProvider;
@@ -82,6 +86,13 @@ export default function SettingsPanel({
   onApplyVaultLightCheck: () => void;
   /** 「もう一度確認する」：staleまたはerror/partial発生後、古い結果を使わずLevel 1/2からやり直す。 */
   onRetryVaultLightCheck: () => void;
+  /**
+   * 「保存先の記録を端末へ追加」（Vault→IndexedDBの追加専用復元）。dry-run（確認）と
+   * 実行は別の操作で、実行はdry-run結果を見たユーザーが明示的に押した場合だけ行う。
+   */
+  vaultRestoreStatus: VaultRestoreUiStatus;
+  onRunVaultRestoreDryRun: () => void;
+  onExecuteVaultRestore: () => void;
   /**
    * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
@@ -452,6 +463,86 @@ export default function SettingsPanel({
               >
                 もう一度確認する
               </button>
+            </div>
+          )}
+
+          {/*
+            保存先の記録を端末へ追加（追加専用復元）。保存先にあり、この端末に無い記録だけを
+            追加する。この端末にある記録・保存先のファイルは変更しない。「確認する」は何も
+            書き込まず件数を表示するだけで、「端末へ追加する」を押した場合だけ書き込む。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm text-stone-600 dark:text-stone-300">保存先の記録を端末へ追加</span>
+                  <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                    保存先にあり、この端末に無い記録だけを追加します。この端末にある記録は変更しません。
+                  </span>
+                </div>
+                <button
+                  onClick={onRunVaultRestoreDryRun}
+                  disabled={vaultActionsDisabled || vaultRestoreStatus.kind === "scanning" || vaultRestoreStatus.kind === "restoring"}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                >
+                  {vaultRestoreStatus.kind === "scanning" ? "確認中…" : "確認する"}
+                </button>
+              </div>
+
+              {vaultRestoreStatus.kind === "dry-run" && (
+                <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  <span>
+                    追加予定：記憶 {vaultRestoreStatus.counts.memoriesToAdd}件・会話 {vaultRestoreStatus.counts.conversationsToAdd}件・素材{" "}
+                    {vaultRestoreStatus.counts.sourcesToAdd}件
+                  </span>
+                  <span className="text-stone-500 dark:text-stone-400">
+                    この端末に既にあるためスキップ：記憶 {vaultRestoreStatus.counts.existingSkipped.memories}件・会話{" "}
+                    {vaultRestoreStatus.counts.existingSkipped.conversations}件・素材 {vaultRestoreStatus.counts.existingSkipped.sources}件
+                  </span>
+                  <span className="text-stone-500 dark:text-stone-400">
+                    重複を整理：記憶 {vaultRestoreStatus.counts.duplicatesResolved.memories}件・会話{" "}
+                    {vaultRestoreStatus.counts.duplicatesResolved.conversations}件・素材 {vaultRestoreStatus.counts.duplicatesResolved.sources}件
+                    {vaultRestoreStatus.counts.unreadableFiles > 0 ? `／読み込めなかったファイル ${vaultRestoreStatus.counts.unreadableFiles}件` : ""}
+                  </span>
+                  {vaultRestoreStatus.counts.memoriesToAdd + vaultRestoreStatus.counts.conversationsToAdd + vaultRestoreStatus.counts.sourcesToAdd > 0 ? (
+                    <button
+                      onClick={onExecuteVaultRestore}
+                      disabled={vaultActionsDisabled}
+                      className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                    >
+                      端末へ追加する
+                    </button>
+                  ) : (
+                    <span>追加が必要な記録はありません。</span>
+                  )}
+                </div>
+              )}
+
+              {vaultRestoreStatus.kind === "restoring" && (
+                <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">追加しています…</div>
+              )}
+
+              {vaultRestoreStatus.kind === "done" && (
+                <div className="rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                  {vaultRestoreStatus.interrupted ? "追加を途中で中断しました。" : "端末へ追加しました。"}
+                  記憶 {vaultRestoreStatus.inserted.memories}件・会話 {vaultRestoreStatus.inserted.conversations}件・素材{" "}
+                  {vaultRestoreStatus.inserted.sources}件
+                  {vaultRestoreStatus.skippedExisting > 0 ? `（既にあったため ${vaultRestoreStatus.skippedExisting}件はスキップ）` : ""}
+                </div>
+              )}
+
+              {vaultRestoreStatus.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{vaultRestoreStatus.message}</span>
+                  <button
+                    onClick={onRunVaultRestoreDryRun}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </section>

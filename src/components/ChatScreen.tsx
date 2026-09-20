@@ -76,6 +76,7 @@ import {
 import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHeader";
 import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
 import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
+import { planVaultRestore, restoreMissingRecordsFromVault, type VaultRestoreCounts } from "@/lib/vaultRestore";
 import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
 import { logStartupCatchupEnd, logStartupCatchupStart, logTimingEvent, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
@@ -186,6 +187,24 @@ export type VaultLightCheckStatus =
   | { kind: "error"; message: string };
 
 type SendStatus = "idle" | "error" | "authError";
+
+/**
+ * 「保存先の記録を端末へ追加」（Vault→IndexedDBの追加専用復元）のUI状態。"dry-run"は
+ * 事前確認（何も書き込まない）の結果を表示している状態で、ユーザーが明示的に
+ * 「端末へ追加する」を押した場合だけ"restoring"へ進む。
+ */
+export type VaultRestoreUiStatus =
+  | { kind: "idle" }
+  | { kind: "scanning" }
+  | { kind: "dry-run"; counts: VaultRestoreCounts; generation: number }
+  | { kind: "restoring" }
+  | {
+      kind: "done";
+      inserted: { memories: number; conversations: number; sources: number };
+      skippedExisting: number;
+      interrupted: boolean;
+    }
+  | { kind: "error"; message: string };
 
 export interface RestoreCandidate {
   scan: VaultScanResult;
@@ -442,6 +461,8 @@ export default function ChatScreen() {
   const [deleteDataFeedback, setDeleteDataFeedback] = useState<DataActionFeedback | null>(null);
   /** 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。詳細は`VaultLightCheckStatus`参照。 */
   const [vaultLightCheckStatus, setVaultLightCheckStatus] = useState<VaultLightCheckStatus>({ kind: "idle" });
+  /** 「保存先の記録を端末へ追加」（追加専用復元）のUI状態。詳細は`VaultRestoreUiStatus`参照。 */
+  const [vaultRestoreStatus, setVaultRestoreStatus] = useState<VaultRestoreUiStatus>({ kind: "idle" });
   /**
    * UX調査対応（HOLD原因の区別）：background/startup flushが
    * `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
@@ -1074,6 +1095,7 @@ export default function ChatScreen() {
     setReflectionText("");
     setRestoreCandidate(null);
     setRestoreStatus("idle");
+    setVaultRestoreStatus({ kind: "idle" });
     setTopPrompt(null);
     setTopPromptInput("");
     setHistoryInitialMemoryId(undefined);
@@ -2597,6 +2619,85 @@ export default function ChatScreen() {
       setVaultConnectFeedback({ kind: "error", message: "アクセスを再許可できませんでした。" });
       window.setTimeout(() => setVaultConnectFeedback(null), 4000);
     } finally {
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「保存先の記録を端末へ追加」の事前確認（dry-run）。保存先を走査して、IndexedDBに無い
+   * Conversation／Memory／Sourceの件数を数えるだけで、何も書き込まない。
+   */
+  async function handleRunVaultRestoreDryRun() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setVaultRestoreStatus({ kind: "scanning" });
+    try {
+      const plan = await withVaultWorldRead(() => planVaultRestore(vaultHandle));
+      if (generation !== vaultGenerationRef.current) {
+        setVaultRestoreStatus({ kind: "idle" });
+        return;
+      }
+      setVaultRestoreStatus({ kind: "dry-run", counts: plan.counts, generation });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setVaultRestoreStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] vault restore dry-run failed", error);
+      setVaultRestoreStatus({ kind: "error", message: "保存先の記録を確認できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「端末へ追加する」。dry-run表示後にユーザーが明示的に押した場合だけ実行する。
+   * IndexedDBに存在しないrecordだけを追加し（既存recordは上書きしない）、保存先には
+   * 一切書き込まない（`restoreMissingRecordsFromVault`参照）。
+   */
+  async function handleExecuteVaultRestore() {
+    const status = vaultRestoreStatus;
+    if (status.kind !== "dry-run") return;
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    if (status.generation !== vaultGenerationRef.current) {
+      setVaultRestoreStatus({ kind: "idle" });
+      return;
+    }
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setVaultRestoreStatus({ kind: "restoring" });
+    try {
+      const { result } = await withVaultWorldRead(() =>
+        restoreMissingRecordsFromVault(vaultHandle, () => generation !== vaultGenerationRef.current)
+      );
+      bumpHistoryRefreshToken();
+      if (generation !== vaultGenerationRef.current) {
+        setVaultRestoreStatus({ kind: "idle" });
+        return;
+      }
+      setVaultRestoreStatus({
+        kind: "done",
+        inserted: {
+          memories: result.insertedMemories,
+          conversations: result.insertedConversations,
+          sources: result.insertedSources,
+        },
+        skippedExisting: result.skippedExisting,
+        interrupted: result.interrupted,
+      });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setVaultRestoreStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] vault restore failed", error);
+      setVaultRestoreStatus({ kind: "error", message: "端末への追加を完了できませんでした。" });
+    } finally {
+      endTask();
       vaultOperationLockRef.current = false;
     }
   }
@@ -4222,6 +4323,9 @@ export default function ChatScreen() {
             onConfirmVaultLightCheck={() => void handleConfirmVaultLightCheck()}
             onApplyVaultLightCheck={() => void handleApplyVaultLightCheck()}
             onRetryVaultLightCheck={() => handleRetryVaultLightCheck()}
+            vaultRestoreStatus={vaultRestoreStatus}
+            onRunVaultRestoreDryRun={() => void handleRunVaultRestoreDryRun()}
+            onExecuteVaultRestore={() => void handleExecuteVaultRestore()}
             vaultHoldReasons={vaultHoldReasons}
           />
         </div>
