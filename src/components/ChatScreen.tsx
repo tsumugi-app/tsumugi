@@ -75,6 +75,7 @@ import {
 } from "@/lib/vaultWorldLock";
 import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHeader";
 import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
+import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
 import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
 import { logStartupCatchupEnd, logStartupCatchupStart, logTimingEvent, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
@@ -3451,9 +3452,20 @@ export default function ChatScreen() {
     // （handleSend側でも同じガードを持つが、ここで早期returnして無駄なstate更新もしない）。
     if (!text || busy || !topPrompt || isVaultSwitchingRef.current || crossTabStale) return;
 
+    // Time Safety：画面に表示している`topPrompt.question`と、Conversationへrole:"ai"として
+    // 追加する文章は必ず同じ文字列（single source of truth）を使う。送信直前にも
+    // 相対時間表現を含まないことを確認し、unsafeならConversationを一切変更せず、
+    // chat APIにも送らずに止める（表示中の問いかけも取り下げる）。
+    const question = topPrompt.question;
+    if (!isSafeRevisitPromptText(question)) {
+      console.warn("[Tsumugi] top prompt blocked before send: relative time expression detected.");
+      setTopPrompt(null);
+      return;
+    }
+
     const questionTurn: ConversationTurn = {
       role: "ai",
-      content: topPrompt.question,
+      content: question,
       timestamp: new Date().toISOString(),
     };
     // promptedMemoryIdは「この会話がどのMemoryをきっかけに始まったか」の追跡用
