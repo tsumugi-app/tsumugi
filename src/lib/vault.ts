@@ -1160,6 +1160,289 @@ async function updateHistoryIndex(root: FileSystemDirectoryHandle, update: Histo
   logTimingEvent("HistoryIndex update:end", { kind: update.kind, durationMs: Date.now() - historyIndexStart });
 }
 
+// ---------------------------------------------------------------------------
+// 「本体が見つからず、復元元も無い記録」の管理情報の整理（`vaultOrphanCleanup.ts`専用）
+//
+// 通常の保存・light-check・resyncからは呼ばれない。History Index・`.tsumugi/index.json`・
+// Registryの、単一レコード（Conversation／Reflection／Source）の管理情報を、読み取り・削除する
+// プリミティブ。削除系は、既存の書き込みと同じ直列化（`enqueueVaultWrite`／History Indexロック／
+// Registryロック）の下で行い、読み取りエラーは「存在しない」と混同せず必ず例外にする。
+// ---------------------------------------------------------------------------
+
+export type VaultOrphanRecordKind = "conversation" | "reflection" | "source";
+
+/** History Index上の1行（種別・日付・月）。 */
+export interface VaultHistoryRowRef {
+  month: string;
+  day: string;
+  /** Conversationのみ（v2形式の行が持つ情報）。 */
+  conversation?: HistoryConversationSummary;
+}
+
+export interface VaultManagementTrace {
+  /** すべて読み取りに成功したか。falseなら、痕跡の有無を確認できていない。 */
+  ok: boolean;
+  /** `.tsumugi/index.json`の値（無ければundefined）。 */
+  indexPath?: string;
+  historyRows: VaultHistoryRowRef[];
+}
+
+async function readStrictJson(dir: FileSystemDirectoryHandle, name: string): Promise<{ status: "absent" } | { status: "ok"; value: unknown }> {
+  let fileHandle: FileSystemFileHandle;
+  try {
+    fileHandle = await dir.getFileHandle(name, { create: false });
+  } catch (error) {
+    if (isNotFoundError(error)) return { status: "absent" };
+    throw error;
+  }
+  return { status: "ok", value: JSON.parse(await (await fileHandle.getFile()).text()) };
+}
+
+async function getDirIfExists(parent: FileSystemDirectoryHandle, name: string): Promise<FileSystemDirectoryHandle | null> {
+  try {
+    return await parent.getDirectoryHandle(name, { create: false });
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+const HISTORY_MONTH_FILE_PATTERN = /^\d{4}-\d{2}\.json$/;
+
+/** `.tsumugi/history/YYYY-MM.json`を全て厳密に読む（読み取り・parseの失敗は例外）。 */
+async function readAllHistoryMonthsStrict(historyDir: FileSystemDirectoryHandle): Promise<{ name: string; month: string; index: HistoryMonthIndex }[]> {
+  const out: { name: string; month: string; index: HistoryMonthIndex }[] = [];
+  for await (const [name, handle] of historyDir.entries()) {
+    if (handle.kind !== "file" || !HISTORY_MONTH_FILE_PATTERN.test(name)) continue;
+    const read = await readStrictJson(historyDir, name);
+    if (read.status !== "ok") continue;
+    const value = read.value as HistoryMonthIndex | null;
+    if (!value || typeof value !== "object" || typeof value.days !== "object" || value.days === null) {
+      throw new Error(`history month file is malformed: ${name}`);
+    }
+    out.push({ name, month: name.replace(/\.json$/, ""), index: value });
+  }
+  return out;
+}
+
+/**
+ * 1つのレコードの管理情報（`.tsumugi/index.json`・History Indexの行）を読み取る（書き込まない）。
+ * 読み取りに失敗した場合は`ok: false`（痕跡の有無を確認できていない）。
+ */
+export async function inspectVaultManagementTrace(
+  root: FileSystemDirectoryHandle,
+  kind: VaultOrphanRecordKind,
+  id: string
+): Promise<VaultManagementTrace> {
+  const trace: VaultManagementTrace = { ok: true, historyRows: [] };
+  try {
+    const tsumugiDir = await getDirIfExists(root, ".tsumugi");
+    if (!tsumugiDir) return trace;
+    const index = await readStrictJson(tsumugiDir, "index.json");
+    if (index.status === "ok") {
+      if (typeof index.value !== "object" || index.value === null || Array.isArray(index.value)) throw new Error("index.json is malformed");
+      const value = (index.value as Record<string, unknown>)[id];
+      if (typeof value === "string") trace.indexPath = value;
+    }
+    const historyDir = await getDirIfExists(tsumugiDir, "history");
+    if (!historyDir || kind === "source") return trace; // SourceはHistory Indexに載らない
+    for (const { month, index: monthIndex } of await readAllHistoryMonthsStrict(historyDir)) {
+      for (const [day, entry] of Object.entries(monthIndex.days)) {
+        if (isHistoryDayIndexV2(entry)) {
+          if (kind === "conversation") {
+            const row = entry.conversations.find((c) => c.id === id);
+            if (row) trace.historyRows.push({ month, day, conversation: row });
+          } else if (entry.reflections.some((r) => r.id === id)) {
+            trace.historyRows.push({ month, day });
+          }
+        } else {
+          const ids = kind === "conversation" ? entry.conversationIds : entry.reflectionIds;
+          if (ids.includes(id)) trace.historyRows.push({ month, day });
+        }
+      }
+    }
+    return trace;
+  } catch (error) {
+    console.error("[Tsumugi] failed to inspect vault management info:", error);
+    return { ok: false, historyRows: [] };
+  }
+}
+
+function isHistoryDayEmpty(entry: HistoryDayIndex): boolean {
+  return isHistoryDayIndexV2(entry)
+    ? entry.conversations.length === 0 && entry.normalMemories.length === 0 && entry.reflections.length === 0
+    : entry.conversationIds.length === 0 && entry.reflectionIds.length === 0 && entry.normalMemoryCount === 0;
+}
+
+/**
+ * History Indexから、Conversation／Reflectionの1件の行を削除する。月の集計と`history-meta.json`は、
+ * 既存の更新と同じ「現在の状態から求めた絶対値」で再計算する（差分加算はしない）。行が既に無ければ
+ * 何もしない（冪等）。`reconcileMonths`：以前の実行で行の削除だけ済み、集計の更新が済んでいない月
+ * （`YYYY-MM`）を、行が無くても再計算する。読み取り・書き込みの失敗は例外（握りつぶさない）。
+ * 戻り値：削除した行の数。
+ */
+export async function removeVaultHistoryRecordRows(
+  root: FileSystemDirectoryHandle,
+  kind: "conversation" | "reflection",
+  id: string,
+  reconcileMonths: string[] = []
+): Promise<number> {
+  return enqueueVaultWrite(async () => {
+    let removedTotal = 0;
+    await withHistoryIndexLock(async () => {
+      const tsumugiDir = await getDirIfExists(root, ".tsumugi");
+      if (!tsumugiDir) return;
+      const historyDir = await getDirIfExists(tsumugiDir, "history");
+      if (!historyDir) return;
+      const months = await readAllHistoryMonthsStrict(historyDir);
+      const touchedMonths = new Set<string>(reconcileMonths);
+      for (const { name, month, index } of months) {
+        let removed = 0;
+        for (const [day, entry] of Object.entries(index.days)) {
+          if (isHistoryDayIndexV2(entry)) {
+            const list = kind === "conversation" ? entry.conversations : entry.reflections;
+            const next = list.filter((row) => row.id !== id);
+            if (next.length === list.length) continue;
+            removed += list.length - next.length;
+            if (kind === "conversation") entry.conversations = next as HistoryConversationSummary[];
+            else entry.reflections = next as HistoryMemorySummary[];
+          } else {
+            const list = kind === "conversation" ? entry.conversationIds : entry.reflectionIds;
+            const next = list.filter((rowId) => rowId !== id);
+            if (next.length === list.length) continue;
+            removed += list.length - next.length;
+            if (kind === "conversation") entry.conversationIds = next;
+            else {
+              entry.reflectionIds = next;
+              entry.memoryCount = entry.normalMemoryCount + next.length;
+            }
+          }
+          if (isHistoryDayEmpty(entry)) delete index.days[day];
+        }
+        if (removed > 0) {
+          await writeFileInDir(historyDir, name, JSON.stringify(index, null, 2), "history month write");
+          removedTotal += removed;
+          touchedMonths.add(month);
+        }
+      }
+      if (touchedMonths.size === 0) return;
+      const metaRead = await readStrictJson(tsumugiDir, "history-meta.json");
+      const meta: HistoryMeta = metaRead.status === "ok" ? (metaRead.value as HistoryMeta) : emptyHistoryMeta();
+      let metaChanged = false;
+      for (const month of touchedMonths) {
+        const monthIndex = months.find((m) => m.month === month)?.index;
+        if (!monthIndex) continue;
+        const aggregate = computeMonthAggregate(monthIndex);
+        if (!isMonthAggregateEqual(meta.months[month], aggregate)) {
+          meta.months[month] = aggregate;
+          metaChanged = true;
+        }
+      }
+      if (metaChanged) {
+        meta.version = 1;
+        meta.totalMemories = Object.values(meta.months).reduce((sum, m) => sum + m.memories, 0);
+        meta.totalConversations = Object.values(meta.months).reduce((sum, m) => sum + m.conversations, 0);
+        meta.updatedAt = new Date().toISOString();
+        await writeFileInDir(tsumugiDir, "history-meta.json", JSON.stringify(meta, null, 2), "history meta write");
+      }
+    });
+    return removedTotal;
+  }, "interactive", null);
+}
+
+/** History Indexの月の集計（`history-meta.json`）が、月Indexの現在の状態から求めた値と一致するか。 */
+export async function isVaultHistoryMonthAggregateConsistent(root: FileSystemDirectoryHandle, months: string[]): Promise<boolean> {
+  try {
+    const tsumugiDir = await getDirIfExists(root, ".tsumugi");
+    if (!tsumugiDir) return true;
+    const historyDir = await getDirIfExists(tsumugiDir, "history");
+    if (!historyDir) return true;
+    const all = await readAllHistoryMonthsStrict(historyDir);
+    const metaRead = await readStrictJson(tsumugiDir, "history-meta.json");
+    const meta: HistoryMeta = metaRead.status === "ok" ? (metaRead.value as HistoryMeta) : emptyHistoryMeta();
+    for (const month of months) {
+      const monthIndex = all.find((m) => m.month === month)?.index;
+      if (!monthIndex) continue;
+      if (!isMonthAggregateEqual(meta.months[month], computeMonthAggregate(monthIndex))) return false;
+    }
+    const totalConversations = Object.values(meta.months).reduce((sum, m) => sum + m.conversations, 0);
+    return totalConversations === meta.totalConversations;
+  } catch {
+    return false;
+  }
+}
+
+/** `.tsumugi/index.json`から、1件のキーを削除する。無ければ何もしない（冪等）。読み取り失敗は例外。 */
+export async function removeVaultIndexJsonKey(root: FileSystemDirectoryHandle, id: string): Promise<boolean> {
+  return enqueueVaultWrite(async () => {
+    const tsumugiDir = await getDirIfExists(root, ".tsumugi");
+    if (!tsumugiDir) return false;
+    const read = await readStrictJson(tsumugiDir, "index.json");
+    if (read.status !== "ok") return false;
+    if (typeof read.value !== "object" || read.value === null || Array.isArray(read.value)) throw new Error("index.json is malformed");
+    const index = read.value as Record<string, unknown>;
+    if (!(id in index)) return false;
+    delete index[id];
+    await writeFileInDir(tsumugiDir, "index.json", JSON.stringify(index, null, 2), "index write");
+    return true;
+  }, "interactive", null);
+}
+
+/** Registryを厳密に読む（1つでも読めないshardがあれば`completed: false`）。読み取りのみ。 */
+export async function readVaultRegistrySnapshotStrict(
+  root: FileSystemDirectoryHandle
+): Promise<{ completed: boolean; records: Map<string, string>; files: Map<string, VaultRegistryFileEntry> }> {
+  const snapshot = await buildVaultRegistrySnapshotForResync(root);
+  return { completed: snapshot.completed, records: snapshot.previousByKey, files: snapshot.previousEntries };
+}
+
+/** `removeVaultRegistrySingleRecordEntry`が、削除してよい条件を満たさないrecordを拒否した場合。 */
+export class VaultRegistryEntryRemovalRefusedError extends Error {
+  constructor(registryKey: string, reason: string) {
+    super(`[Tsumugi] refusing to remove registry entry "${registryKey}": ${reason}`);
+    this.name = "VaultRegistryEntryRemovalRefusedError";
+  }
+}
+
+/**
+ * Registryから、単一レコード（Conversation／Reflection／Source）のentryを削除する（statusの書き換えではなく、
+ * `records[key]`と`files[path]`自体の除去）。次の全てを、Registryロックの中で確認できた場合だけ行う：
+ * status==="missing"、種別が単一レコード、memberIdsがこのkeyだけ、期待するpathと一致、同じpathを指す他のkeyが無い。
+ * 既にentryが無ければ`"absent"`（冪等）。shardの読み取り・parseの失敗は例外（存在しないと混同しない）。
+ */
+export async function removeVaultRegistrySingleRecordEntry(
+  root: FileSystemDirectoryHandle,
+  registryKey: string,
+  expectedPath: string
+): Promise<"removed" | "absent"> {
+  const bucket = vaultRegistryBucketOf(registryKey);
+  return withVaultRegistryLock(async () => {
+    const tsumugiDir = await getDirIfExists(root, ".tsumugi");
+    const registryDir = tsumugiDir ? await getDirIfExists(tsumugiDir, "registry") : null;
+    if (!registryDir) return "absent";
+    const read = await readStrictJson(registryDir, vaultRegistryBucketFileName(bucket));
+    if (read.status === "absent") return "absent";
+    const shard = validateVaultRegistryShardStructure(read.value);
+    if (shard === null) throw new Error("registry shard is malformed");
+    const path = shard.records[registryKey];
+    if (path === undefined) return "absent";
+    if (path !== expectedPath) throw new VaultRegistryEntryRemovalRefusedError(registryKey, "path changed since the check");
+    const entry = shard.files[path];
+    if (entry.status !== "missing") throw new VaultRegistryEntryRemovalRefusedError(registryKey, `status is "${entry.status}"`);
+    if (entry.recordType === "memory-day") throw new VaultRegistryEntryRemovalRefusedError(registryKey, "memory-day is not supported");
+    if (entry.memberIds.length !== 1 || entry.memberIds[0] !== registryKey) {
+      throw new VaultRegistryEntryRemovalRefusedError(registryKey, "entry has other members");
+    }
+    if (Object.entries(shard.records).some(([key, p]) => key !== registryKey && p === path)) {
+      throw new VaultRegistryEntryRemovalRefusedError(registryKey, "another record shares the path");
+    }
+    delete shard.records[registryKey];
+    delete shard.files[path];
+    await writeVaultRegistryShard(root, bucket, shard);
+    return "removed";
+  });
+}
+
 /**
  * History一覧専用の軽量プレビュー文字列を作る（重要修正2）。通常Memoryの`summary`は
  * 元々20〜40文字程度の一行要約だが、Reflectionの`summary`は振り返り全文そのもの

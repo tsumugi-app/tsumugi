@@ -78,6 +78,7 @@ import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHead
 import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
 import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
 import { planVaultRestore, restoreMissingRecordsFromVault, type VaultRestoreCounts } from "@/lib/vaultRestore";
+import { executeOrphanCleanup, planOrphanCleanup, type OrphanCleanupResult, type OrphanPlan } from "@/lib/vaultOrphanCleanup";
 import {
   appendLocalRecordsToVault,
   planAppendLocalRecords,
@@ -255,6 +256,19 @@ export type LocalOnlyUiStatus =
   | { kind: "plan"; plan: LocalOnlyPlan; generation: number; excluded: string[] }
   | { kind: "executing" }
   | { kind: "done"; result: AppendLocalResult }
+  | { kind: "error"; message: string };
+
+/**
+ * 「保存先に本体が見つからない記録の整理」（`vaultOrphanCleanup.ts`）のUI状態。"plan"は事前確認
+ * （何も書き込まない）の結果を表示している状態で、ユーザーが内容を確認して明示的に「整理する」を押した
+ * 場合だけ"executing"へ進む。
+ */
+export type OrphanUiStatus =
+  | { kind: "idle" }
+  | { kind: "scanning" }
+  | { kind: "plan"; plan: OrphanPlan; generation: number }
+  | { kind: "executing" }
+  | { kind: "done"; result: OrphanCleanupResult }
   | { kind: "error"; message: string };
 
 export interface RestoreCandidate {
@@ -518,6 +532,8 @@ export default function ChatScreen() {
   const [legacyCleanupStatus, setLegacyCleanupStatus] = useState<LegacyCleanupUiStatus>({ kind: "idle" });
   /** 「保存先にない記録の追加」（IndexedDB → Vault）のUI状態。詳細は`LocalOnlyUiStatus`参照。 */
   const [localOnlyStatus, setLocalOnlyStatus] = useState<LocalOnlyUiStatus>({ kind: "idle" });
+  /** 「保存先に本体が見つからない記録の整理」のUI状態。詳細は`OrphanUiStatus`参照。 */
+  const [orphanStatus, setOrphanStatus] = useState<OrphanUiStatus>({ kind: "idle" });
   /**
    * UX調査対応（HOLD原因の区別）：background/startup flushが
    * `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
@@ -1153,6 +1169,7 @@ export default function ChatScreen() {
     setVaultRestoreStatus({ kind: "idle" });
     setLegacyCleanupStatus({ kind: "idle" });
     setLocalOnlyStatus({ kind: "idle" });
+    setOrphanStatus({ kind: "idle" });
     setTopPrompt(null);
     setTopPromptInput("");
     setHistoryInitialMemoryId(undefined);
@@ -2988,6 +3005,95 @@ export default function ChatScreen() {
     }
   }
 
+  /**
+   * 「保存先に本体が見つからない記録の整理」の事前確認（dry-run）。Registry・保存先・退避先・端末を
+   * 読み取り、整理できる記録（本体も復元元も無い）と、整理しない記録（復元できる可能性、別の場所に
+   * ある、判断不能）に分ける。何も書き込まない。
+   */
+  async function handleRunOrphanDryRun() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setOrphanStatus({ kind: "scanning" });
+    try {
+      const plan = await withVaultWorldRead(() => planOrphanCleanup(vaultHandle));
+      if (generation !== vaultGenerationRef.current) {
+        setOrphanStatus({ kind: "idle" });
+        return;
+      }
+      setOrphanStatus({ kind: "plan", plan, generation });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setOrphanStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] orphan cleanup dry-run failed", error);
+      setOrphanStatus({ kind: "error", message: "保存先の状態を確認できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「整理する」。dry-run表示後にユーザーが内容を確認して明示的に押した場合だけ実行する。実行時に
+   * world lock（排他）の中で全条件を検証し直し、整理前の管理情報を退避してから整理する
+   * （`executeOrphanCleanup`）。実行後は、保存先の状態が変わったため、light-checkの保存済み結果を
+   * 古いまま残さず、再計測する。「最新の状態」は、この再計測の結果が空のときだけ表示する。
+   */
+  async function handleExecuteOrphanCleanup() {
+    const status = orphanStatus;
+    if (status.kind !== "plan" || status.plan.orphans.length === 0) return;
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    if (status.generation !== vaultGenerationRef.current) {
+      setOrphanStatus({ kind: "idle" });
+      return;
+    }
+    const keys = status.plan.orphans.map((item) => item.key);
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setOrphanStatus({ kind: "executing" });
+    try {
+      // Registryを更新するため排他ロック（`runVaultWorldExclusive`は内部で整合性確認まで行うため、
+      // withVaultWorldReadで包まない）。
+      const locked = await runVaultWorldExclusive(() =>
+        executeOrphanCleanup(vaultHandle, keys, () => generation !== vaultGenerationRef.current)
+      );
+      if (locked.timedOut || !locked.result) {
+        setOrphanStatus({ kind: "error", message: "他の操作が実行中のため開始できませんでした。しばらくしてからもう一度お試しください。" });
+        return;
+      }
+      const result = locked.result;
+      if (generation !== vaultGenerationRef.current) {
+        setOrphanStatus({ kind: "idle" });
+        return;
+      }
+      setOrphanStatus({ kind: "done", result });
+      if (result.items.some((item) => item.steps.some((step) => step.ok))) {
+        // 管理情報が変わった：light-checkの保存済み結果（discovery/classify）を破棄して再計測する
+        // （排他ロック解放後に実行する）。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        runVaultLightCheckInBackground(vaultHandle);
+      }
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setOrphanStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] orphan cleanup failed", error);
+      setOrphanStatus({
+        kind: "error",
+        message: "整理を完了できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。",
+      });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
   async function handleRestoreFromVault() {
     // Vault境界の安全性：Vault操作同士の排他＋切替処理中・stale判定中は新規のRestore
     // 開始をさせない。
@@ -4619,6 +4725,9 @@ export default function ChatScreen() {
             onRunLocalOnlyDryRun={() => void handleRunLocalOnlyDryRun()}
             onToggleLocalOnlyExcluded={(key) => handleToggleLocalOnlyExcluded(key)}
             onExecuteAppendLocal={() => void handleExecuteAppendLocal()}
+            orphanStatus={orphanStatus}
+            onRunOrphanDryRun={() => void handleRunOrphanDryRun()}
+            onExecuteOrphanCleanup={() => void handleExecuteOrphanCleanup()}
             vaultHoldReasons={vaultHoldReasons}
           />
         </div>

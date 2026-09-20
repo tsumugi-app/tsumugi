@@ -9,6 +9,7 @@ import type {
   VaultLightCheckStatus,
   LegacyCleanupUiStatus,
   LocalOnlyUiStatus,
+  OrphanUiStatus,
   VaultRestoreUiStatus,
   VaultStatus,
 } from "./ChatScreen";
@@ -54,6 +55,9 @@ export default function SettingsPanel({
   onRunLocalOnlyDryRun,
   onToggleLocalOnlyExcluded,
   onExecuteAppendLocal,
+  orphanStatus,
+  onRunOrphanDryRun,
+  onExecuteOrphanCleanup,
   vaultHoldReasons,
 }: {
   chatProvider: SupportedChatProvider;
@@ -109,6 +113,9 @@ export default function SettingsPanel({
   onRunLocalOnlyDryRun: () => void;
   onToggleLocalOnlyExcluded: (key: string) => void;
   onExecuteAppendLocal: () => void;
+  orphanStatus: OrphanUiStatus;
+  onRunOrphanDryRun: () => void;
+  onExecuteOrphanCleanup: () => void;
   /**
    * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
@@ -909,6 +916,166 @@ export default function SettingsPanel({
                   <span>{localOnlyStatus.message}</span>
                   <button
                     onClick={onRunLocalOnlyDryRun}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/*
+            保存先に本体が見つからない記録の整理。「確認が必要（見つからない）」と表示され続ける記録のうち、
+            保存先にも、この端末にも、退避先にも本体が無いもの（管理情報だけが残っているもの）を、内容と
+            理由を確認した上で整理する。「確認する」は何も書き込まず、「整理する」を押した場合だけ書き込む。
+            記憶・会話の内容は変更しない。整理前の管理情報は退避して保存する。
+            「missing」「Registry」「orphan」等の内部用語は出さない。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm text-stone-600 dark:text-stone-300">本体が見つからない記録の整理</span>
+                  <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                    保存先にも端末にも本体が無く、管理情報だけが残っている記録を整理します。
+                  </span>
+                </div>
+                <button
+                  onClick={onRunOrphanDryRun}
+                  disabled={vaultActionsDisabled || orphanStatus.kind === "scanning" || orphanStatus.kind === "executing"}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                >
+                  {orphanStatus.kind === "scanning" ? "確認中…" : "確認する"}
+                </button>
+              </div>
+
+              {orphanStatus.kind === "plan" && (
+                <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  {!orphanStatus.plan.registryReadable && (
+                    <span className="text-red-600 dark:text-red-400">保存先の管理情報を最後まで読み込めなかったため、確認できません。</span>
+                  )}
+                  {orphanStatus.plan.orphans.length > 0 && (
+                    <>
+                      <span>
+                        保存先に本体が見つからず、この端末にも復元元がない記録が{orphanStatus.plan.orphans.length}件あります。
+                        管理情報だけが残っているため整理できます。
+                      </span>
+                      <details className="text-stone-600 dark:text-stone-300">
+                        <summary className="cursor-pointer">内容を確認</summary>
+                        <div className="mt-2 flex flex-col gap-3">
+                          {orphanStatus.plan.orphans.map((item) => (
+                            <div key={item.key} className="flex flex-col gap-1">
+                              <span>{item.title}</span>
+                              <span className="text-stone-500 dark:text-stone-400">
+                                最後に保存された時刻：{new Date(item.lastKnown.mtime).toLocaleString("ja-JP")}
+                              </span>
+                              {item.relatedMemories.length > 0 && (
+                                <div className="flex flex-col gap-0.5 text-stone-500 dark:text-stone-400">
+                                  <span>この記録から作られた記憶{item.relatedMemories.length}件は、そのまま残ります：</span>
+                                  {item.relatedMemories.map((memory) => (
+                                    <span key={memory.id} className="break-words">
+                                      ・{memory.day}　{memory.summary}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                          <span className="text-stone-500 dark:text-stone-400">
+                            記憶の内容は変更しません。整理前の管理情報は、退避して保存します。ごみ箱やバックアップに残っている
+                            場合は、先にそこから戻すこともできます。
+                          </span>
+                        </div>
+                      </details>
+                      <button
+                        onClick={onExecuteOrphanCleanup}
+                        disabled={vaultActionsDisabled}
+                        className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                      >
+                        整理する
+                      </button>
+                    </>
+                  )}
+
+                  {orphanStatus.plan.others.length > 0 && (
+                    <details className="text-stone-700 dark:text-stone-300">
+                      <summary className="cursor-pointer">確認が必要な記録が{orphanStatus.plan.others.length}件あります</summary>
+                      <div className="mt-1 flex flex-col gap-1 text-stone-500 dark:text-stone-400">
+                        {orphanStatus.plan.others.map((item) => (
+                          <span key={item.key} className="break-all">
+                            {item.title}：{item.message}
+                          </span>
+                        ))}
+                        <span>これらは今回は整理せず、そのまま残します。</span>
+                      </div>
+                    </details>
+                  )}
+
+                  {orphanStatus.plan.items.length === 0 && orphanStatus.plan.registryReadable && (
+                    <span>本体が見つからない記録はありません。</span>
+                  )}
+                </div>
+              )}
+
+              {orphanStatus.kind === "executing" && (
+                <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">整理しています…</div>
+              )}
+
+              {orphanStatus.kind === "done" && (
+                <div className="flex flex-col gap-1 rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                  <span>
+                    {orphanStatus.result.status === "nothing-to-do"
+                      ? "整理する記録はありませんでした。"
+                      : orphanStatus.result.status === "interrupted"
+                        ? "整理を途中で中断しました。もう一度「確認する」から実行すると、続きから完了できます。"
+                        : orphanStatus.result.failedCount + orphanStatus.result.skippedCount > 0
+                          ? `${orphanStatus.result.cleanedCount}件を整理しました。整理できなかった記録があります。`
+                          : orphanStatus.result.status === "partial"
+                            ? "整理しましたが、実行後の確認で確認が必要な項目がありました。"
+                            : `${orphanStatus.result.cleanedCount}件を整理しました。`}
+                  </span>
+                  {orphanStatus.result.items
+                    .filter((item) => item.outcome !== "cleaned" && item.message)
+                    .map((item) => (
+                      <span key={item.key} className="break-all text-red-600 dark:text-red-400">
+                        {item.message}
+                      </span>
+                    ))}
+                  {orphanStatus.result.status === "complete" && (
+                    <span>
+                      {vaultLightCheckStatus.kind === "checking" || vaultLightCheckStatus.kind === "classifying"
+                        ? "保存先の状態を確認しています…"
+                        : vaultLightCheckStatus.kind === "idle"
+                          ? "✓ 保存先に、見つからない記録はありません。"
+                          : "まだ確認が必要な項目があります。上の「外部の変更」の表示を確認してください。"}
+                    </span>
+                  )}
+                  {orphanStatus.result.remaining && orphanStatus.result.remaining.others > 0 && (
+                    <span>確認が必要な記録が{orphanStatus.result.remaining.others}件あります（「確認する」で理由を確認できます）。</span>
+                  )}
+                  {orphanStatus.result.postChecks.length > 0 && (
+                    <details>
+                      <summary className="cursor-pointer">実行後の確認</summary>
+                      <div className="mt-1 flex flex-col gap-0.5">
+                        {orphanStatus.result.postChecks.map((check) => (
+                          <span key={check.name} className="break-all">
+                            {check.ok ? "OK" : "NG"}　{check.name}
+                            {check.detail ? `（${check.detail}）` : ""}
+                          </span>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
+
+              {orphanStatus.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{orphanStatus.message}</span>
+                  <button
+                    onClick={onRunOrphanDryRun}
                     disabled={vaultActionsDisabled}
                     className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
                   >

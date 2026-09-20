@@ -529,6 +529,15 @@ export async function hasAnyVaultSyncState(): Promise<boolean> {
   return cursor !== null;
 }
 
+/**
+ * vaultSyncState（Vault同期済み台帳）から、1件のキーだけを削除する。記録本体（conversations等）には
+ * 一切触れない。`vaultOrphanCleanup.ts`が、本体が存在しない記録の台帳だけを整理するために使う。
+ */
+export async function deleteVaultSyncState(key: string): Promise<void> {
+  const db = await getDB();
+  await db.delete("vaultSyncState", key);
+}
+
 export async function clearVaultSyncState(): Promise<void> {
   const db = await getDB();
   await db.clear("vaultSyncState");
