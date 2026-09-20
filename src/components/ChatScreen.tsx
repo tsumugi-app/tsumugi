@@ -68,6 +68,7 @@ import {
   markVaultWorldJournalMigrated,
   notifyVaultSwitched,
   runVaultSwitchExclusive,
+  runVaultWorldExclusive,
   setTabVaultEpoch,
   subscribeVaultSwitchNotifications,
   withStartupSharedLock,
@@ -77,6 +78,14 @@ import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHead
 import { generateRevisitPrompt, generateTopPrompt, type TopPrompt } from "@/lib/topPrompt";
 import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
 import { planVaultRestore, restoreMissingRecordsFromVault, type VaultRestoreCounts } from "@/lib/vaultRestore";
+import {
+  executeLegacyCleanup,
+  planLegacyCleanup,
+  type LegacyCleanupCheck,
+  type LegacyCleanupPlan,
+  type LegacyCleanupRegistryCounts,
+  type LegacyCleanupStatus,
+} from "@/lib/vaultLegacyCleanup";
 import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
 import { logStartupCatchupEnd, logStartupCatchupStart, logTimingEvent, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
@@ -203,6 +212,28 @@ export type VaultRestoreUiStatus =
       inserted: { memories: number; conversations: number; sources: number };
       skippedExisting: number;
       interrupted: boolean;
+    }
+  | { kind: "error"; message: string };
+
+/**
+ * 「旧形式ファイルの整理」（退避＋Registry再確定）のUI状態。"dry-run"は事前確認（何も書き込まない）の
+ * 結果を表示している状態で、ユーザーが明示的に「整理を実行する」を押した場合だけ"executing"へ進む。
+ */
+export type LegacyCleanupUiStatus =
+  | { kind: "idle" }
+  | { kind: "scanning" }
+  | { kind: "dry-run"; plan: LegacyCleanupPlan; generation: number }
+  | { kind: "executing" }
+  | {
+      kind: "done";
+      status: LegacyCleanupStatus;
+      archivedNow: number;
+      memoryDaysCommitted: number;
+      conversationsCommitted: number;
+      errors: string[];
+      postChecks: LegacyCleanupCheck[];
+      counts: LegacyCleanupRegistryCounts | null;
+      idb: { memories: number; conversations: number; sources: number } | null;
     }
   | { kind: "error"; message: string };
 
@@ -463,6 +494,8 @@ export default function ChatScreen() {
   const [vaultLightCheckStatus, setVaultLightCheckStatus] = useState<VaultLightCheckStatus>({ kind: "idle" });
   /** 「保存先の記録を端末へ追加」（追加専用復元）のUI状態。詳細は`VaultRestoreUiStatus`参照。 */
   const [vaultRestoreStatus, setVaultRestoreStatus] = useState<VaultRestoreUiStatus>({ kind: "idle" });
+  /** 「旧形式ファイルの整理」のUI状態。詳細は`LegacyCleanupUiStatus`参照。 */
+  const [legacyCleanupStatus, setLegacyCleanupStatus] = useState<LegacyCleanupUiStatus>({ kind: "idle" });
   /**
    * UX調査対応（HOLD原因の区別）：background/startup flushが
    * `VaultRecordNeedsResyncError`（Tsumugi自身のVault書き込みを安全上保留して
@@ -1096,6 +1129,7 @@ export default function ChatScreen() {
     setRestoreCandidate(null);
     setRestoreStatus("idle");
     setVaultRestoreStatus({ kind: "idle" });
+    setLegacyCleanupStatus({ kind: "idle" });
     setTopPrompt(null);
     setTopPromptInput("");
     setHistoryInitialMemoryId(undefined);
@@ -2696,6 +2730,96 @@ export default function ChatScreen() {
       }
       console.error("[Tsumugi] vault restore failed", error);
       setVaultRestoreStatus({ kind: "error", message: "端末への追加を完了できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「旧形式ファイルの整理」の事前確認（dry-run）。Vault・Registry・IndexedDBを読み取って全対象・
+   * 全前提条件を検証するだけで、何も書き込まない。
+   */
+  async function handleRunLegacyCleanupDryRun() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setLegacyCleanupStatus({ kind: "scanning" });
+    try {
+      const plan = await withVaultWorldRead(() => planLegacyCleanup(vaultHandle));
+      if (generation !== vaultGenerationRef.current) {
+        setLegacyCleanupStatus({ kind: "idle" });
+        return;
+      }
+      setLegacyCleanupStatus({ kind: "dry-run", plan, generation });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setLegacyCleanupStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] legacy cleanup dry-run failed", error);
+      setLegacyCleanupStatus({ kind: "error", message: "保存先の状態を確認できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「整理を実行する」。dry-run表示後にユーザーが明示的に押した場合だけ実行する。旧形式ファイルを
+   * 隠しarchiveへ退避し（削除はしない）、検証に通ったmemory-day／conversationだけをRegistry okへ
+   * 再確定する。実行時に全前提条件を検証し直す（`executeLegacyCleanup`参照）。途中で失敗・中断しても、
+   * もう一度「確認する」→「整理を実行する」で続きから安全に完了できる。
+   */
+  async function handleExecuteLegacyCleanup() {
+    const status = legacyCleanupStatus;
+    if (status.kind !== "dry-run" || !status.plan.executable) return;
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    if (status.generation !== vaultGenerationRef.current) {
+      setLegacyCleanupStatus({ kind: "idle" });
+      return;
+    }
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setLegacyCleanupStatus({ kind: "executing" });
+    try {
+      // Registryを更新するため排他ロック（full resync・light-check applyと同じ）。runVaultWorldExclusiveは
+      // 内部で整合性確認まで行うため、withVaultWorldReadで包まない（同名ロックの二重要求を避ける）。
+      const locked = await runVaultWorldExclusive(() =>
+        executeLegacyCleanup(vaultHandle, () => generation !== vaultGenerationRef.current)
+      );
+      if (locked.timedOut || !locked.result) {
+        setLegacyCleanupStatus({ kind: "error", message: "他の操作が実行中のため開始できませんでした。しばらくしてからもう一度お試しください。" });
+        return;
+      }
+      const result = locked.result;
+      if (generation !== vaultGenerationRef.current) {
+        setLegacyCleanupStatus({ kind: "idle" });
+        return;
+      }
+      setLegacyCleanupStatus({
+        kind: "done",
+        status: result.status,
+        archivedNow: result.archivedNow,
+        memoryDaysCommitted: result.memoryDaysCommitted,
+        conversationsCommitted: result.conversationsCommitted,
+        errors: result.errors,
+        postChecks: result.postCheck?.checks ?? [],
+        counts: result.postCheck?.counts ?? null,
+        idb: result.postCheck?.idb ?? null,
+      });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setLegacyCleanupStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] legacy cleanup failed", error);
+      setLegacyCleanupStatus({
+        kind: "error",
+        message: "整理を完了できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。",
+      });
     } finally {
       endTask();
       vaultOperationLockRef.current = false;
@@ -4326,6 +4450,9 @@ export default function ChatScreen() {
             vaultRestoreStatus={vaultRestoreStatus}
             onRunVaultRestoreDryRun={() => void handleRunVaultRestoreDryRun()}
             onExecuteVaultRestore={() => void handleExecuteVaultRestore()}
+            legacyCleanupStatus={legacyCleanupStatus}
+            onRunLegacyCleanupDryRun={() => void handleRunLegacyCleanupDryRun()}
+            onExecuteLegacyCleanup={() => void handleExecuteLegacyCleanup()}
             vaultHoldReasons={vaultHoldReasons}
           />
         </div>

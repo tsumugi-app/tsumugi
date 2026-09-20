@@ -2129,7 +2129,7 @@ export interface VaultScanResult {
 }
 
 /** 「1日1Markdown」のday-file名（`YYYY-MM-DD.md`）。旧1record1file形式（`YYYY-MM-DD-xxxxxx.md`）とは別。 */
-function isMemoryDayFileName(name: string): boolean {
+export function isMemoryDayFileName(name: string): boolean {
   return /^\d{4}-\d{2}-\d{2}\.md$/.test(name);
 }
 
@@ -3456,7 +3456,7 @@ function normalizedSourceType(source: MemorySource, sourceType: string | undefin
   return sourceType ?? inferSourceType(source);
 }
 
-function conversationsSemanticEqual(a: Conversation, b: Conversation): boolean {
+export function conversationsSemanticEqual(a: Conversation, b: Conversation): boolean {
   if (a.id !== b.id) return false;
   if (a.persona !== b.persona) return false;
   if (a.startedAt !== b.startedAt) return false;
@@ -3482,7 +3482,7 @@ function conversationsSemanticEqual(a: Conversation, b: Conversation): boolean {
  * Markdownへ一切書き出されずparser側が復元しないため比較対象にしない
  * （比較すると往復で失われる情報のせいで常に偽の不一致になるため）。
  */
-function memoryObjectsSemanticEqual(a: MemoryObject, b: MemoryObject): boolean {
+export function memoryObjectsSemanticEqual(a: MemoryObject, b: MemoryObject): boolean {
   if (a.id !== b.id) return false;
   if (a.date.slice(0, 10) !== b.date.slice(0, 10)) return false;
   if (a.types.length !== b.types.length || !a.types.every((t, i) => t === b.types[i])) return false;
@@ -5082,7 +5082,7 @@ async function setVaultRegistryMissing(root: FileSystemDirectoryHandle, registry
  * 内の1回のread-modify-writeで旧pathのfiles entry削除＋新pathのfiles entry
  * 追加＋records[key]更新を行う（Registryをcommit markerとして最後に進める）。
  */
-async function commitVaultRegistrySingleRecordOk(
+export async function commitVaultRegistrySingleRecordOk(
   root: FileSystemDirectoryHandle,
   registryKey: string,
   recordType: VaultRegistryRecordType,
@@ -5113,7 +5113,7 @@ async function commitVaultRegistrySingleRecordOk(
 
 /** normal Memory day-file containerをstatus="ok"へ確定させる（member配列全体を持つ点のみ
  *  `commitVaultRegistrySingleRecordOk`と異なる）。 */
-async function commitVaultRegistryMemoryDayOk(
+export async function commitVaultRegistryMemoryDayOk(
   root: FileSystemDirectoryHandle,
   registryKey: string,
   newPath: string,

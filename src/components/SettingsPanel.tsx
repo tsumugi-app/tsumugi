@@ -7,6 +7,7 @@ import type {
   SupportedChatProvider,
   VaultConnectFeedback,
   VaultLightCheckStatus,
+  LegacyCleanupUiStatus,
   VaultRestoreUiStatus,
   VaultStatus,
 } from "./ChatScreen";
@@ -45,6 +46,9 @@ export default function SettingsPanel({
   vaultRestoreStatus,
   onRunVaultRestoreDryRun,
   onExecuteVaultRestore,
+  legacyCleanupStatus,
+  onRunLegacyCleanupDryRun,
+  onExecuteLegacyCleanup,
   vaultHoldReasons,
 }: {
   chatProvider: SupportedChatProvider;
@@ -93,6 +97,9 @@ export default function SettingsPanel({
   vaultRestoreStatus: VaultRestoreUiStatus;
   onRunVaultRestoreDryRun: () => void;
   onExecuteVaultRestore: () => void;
+  legacyCleanupStatus: LegacyCleanupUiStatus;
+  onRunLegacyCleanupDryRun: () => void;
+  onExecuteLegacyCleanup: () => void;
   /**
    * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
@@ -536,6 +543,198 @@ export default function SettingsPanel({
                   <span>{vaultRestoreStatus.message}</span>
                   <button
                     onClick={onRunVaultRestoreDryRun}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/*
+            旧形式ファイルの整理。旧い保存形式の重複ファイルを隠しフォルダへ退避し（削除はしません）、
+            それが原因で「確認が必要」になっている記録を確認済みに戻す。「確認する」は何も書き込まず、
+            「整理を実行する」を押した場合だけ書き込む。記憶・会話の本文と、この端末の記録は変更しない。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm text-stone-600 dark:text-stone-300">旧形式ファイルの整理</span>
+                  <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                    重複した旧形式のファイルを隠しフォルダへ退避し（削除はしません）、確認が必要な記録を確認済みに戻します。
+                  </span>
+                </div>
+                <button
+                  onClick={onRunLegacyCleanupDryRun}
+                  disabled={vaultActionsDisabled || legacyCleanupStatus.kind === "scanning" || legacyCleanupStatus.kind === "executing"}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                >
+                  {legacyCleanupStatus.kind === "scanning" ? "確認中…" : "確認する"}
+                </button>
+              </div>
+
+              {legacyCleanupStatus.kind === "dry-run" && (
+                <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  <span>
+                    退避する旧形式の記憶ファイル：{legacyCleanupStatus.plan.archiveMemoryFiles.length}件
+                    （Reflection {legacyCleanupStatus.plan.reflectionsExcluded}件は対象外）
+                  </span>
+                  <span>退避する会話のコピー：{legacyCleanupStatus.plan.archiveConversationCopies.length}件</span>
+                  <span>
+                    確認済みに戻す記録：記憶の日別ファイル {legacyCleanupStatus.plan.memoryDays.filter((i) => i.ok).length}/
+                    {legacyCleanupStatus.plan.memoryDays.length}日・会話 {legacyCleanupStatus.plan.conversations.filter((i) => i.ok).length}/
+                    {legacyCleanupStatus.plan.conversations.length}件
+                  </span>
+                  {legacyCleanupStatus.plan.alreadyArchived > 0 && (
+                    <span className="text-stone-500 dark:text-stone-400">前回までに退避済み：{legacyCleanupStatus.plan.alreadyArchived}件</span>
+                  )}
+                  {legacyCleanupStatus.plan.bodyDiffs.length > 0 && (
+                    <div className="flex flex-col gap-0.5">
+                      <span>本文が日別ファイルと異なる旧形式の記憶：{legacyCleanupStatus.plan.bodyDiffs.length}件（退避先に残ります）</span>
+                      {legacyCleanupStatus.plan.bodyDiffs.map((diff) => (
+                        <span key={diff.originalPath} className="break-all text-stone-500 dark:text-stone-400">
+                          {diff.recordId}（{diff.day}・{diff.fields.join("／")}）
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {legacyCleanupStatus.plan.conversationCopyDiffs.length > 0 && (
+                    <div className="flex flex-col gap-0.5">
+                      <span>
+                        内容が正本と異なる会話のコピー：{legacyCleanupStatus.plan.conversationCopyDiffs.length}件（退避先に残ります）
+                      </span>
+                      {legacyCleanupStatus.plan.conversationCopyDiffs.map((diff) => (
+                        <span key={diff.copyPath} className="break-all text-stone-500 dark:text-stone-400">
+                          {diff.copyPath}（{diff.differences.join("／")}）
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {legacyCleanupStatus.plan.skippedConflicts.length > 0 && (
+                    <span className="text-stone-500 dark:text-stone-400">
+                      今回は触らない記録：{legacyCleanupStatus.plan.skippedConflicts.length}件
+                    </span>
+                  )}
+                  <span>
+                    実行後の予測：確認が必要（日別）{legacyCleanupStatus.plan.predicted.memoryDayConflict}件・確認が必要（会話）
+                    {legacyCleanupStatus.plan.predicted.conversationConflict}件・見つからない会話{" "}
+                    {legacyCleanupStatus.plan.predicted.conversationMissing}件・この端末の記録{" "}
+                    {legacyCleanupStatus.plan.idb.memories}/{legacyCleanupStatus.plan.idb.conversations}/{legacyCleanupStatus.plan.idb.sources}
+                    件（変更なし）
+                  </span>
+
+                  <details className="text-stone-500 dark:text-stone-400">
+                    <summary className="cursor-pointer">対象ごとの検証結果</summary>
+                    <div className="mt-1 flex flex-col gap-0.5">
+                      {legacyCleanupStatus.plan.memoryDays.map((item) => (
+                        <span key={item.key} className="break-all">
+                          {item.ok ? "OK" : "要確認"}　{item.day}
+                          {item.ok ? "" : `：${item.checks.filter((c) => !c.ok).map((c) => c.name).join("／")}`}
+                        </span>
+                      ))}
+                      {legacyCleanupStatus.plan.conversations.map((item) => (
+                        <span key={item.key} className="break-all">
+                          {item.ok ? "OK" : "要確認"}　会話 {item.key}
+                          {item.ok ? "" : `：${item.checks.filter((c) => !c.ok).map((c) => c.name).join("／")}`}
+                        </span>
+                      ))}
+                      <span>
+                        旧形式ファイルの検証：
+                        {legacyCleanupStatus.plan.archiveMemoryFiles.filter((i) => i.ok).length}/
+                        {legacyCleanupStatus.plan.archiveMemoryFiles.length}件OK
+                      </span>
+                    </div>
+                  </details>
+
+                  {legacyCleanupStatus.plan.blockers.length > 0 && (
+                    <div className="flex flex-col gap-0.5 text-red-600 dark:text-red-400">
+                      <span>実行できません（確認が必要な項目があります）：</span>
+                      {legacyCleanupStatus.plan.blockers.slice(0, 8).map((blocker) => (
+                        <span key={blocker} className="break-all">
+                          {blocker}
+                        </span>
+                      ))}
+                      {legacyCleanupStatus.plan.blockers.length > 8 && <span>ほか {legacyCleanupStatus.plan.blockers.length - 8}件</span>}
+                    </div>
+                  )}
+
+                  {legacyCleanupStatus.plan.executable ? (
+                    <button
+                      onClick={onExecuteLegacyCleanup}
+                      disabled={vaultActionsDisabled}
+                      className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
+                    >
+                      整理を実行する
+                    </button>
+                  ) : legacyCleanupStatus.plan.nothingToDo ? (
+                    <span>整理が必要なファイルはありません。</span>
+                  ) : null}
+                </div>
+              )}
+
+              {legacyCleanupStatus.kind === "executing" && (
+                <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">整理しています…</div>
+              )}
+
+              {legacyCleanupStatus.kind === "done" && (
+                <div className="flex flex-col gap-1 rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                  <span>
+                    {legacyCleanupStatus.status === "complete"
+                      ? "整理しました。"
+                      : legacyCleanupStatus.status === "nothing-to-do"
+                        ? "整理が必要なファイルはありません。"
+                        : legacyCleanupStatus.status === "interrupted"
+                          ? "整理を途中で中断しました。もう一度「確認する」から実行すると続きから完了できます。"
+                          : legacyCleanupStatus.status === "refused"
+                            ? "確認が必要な項目があるため、何も変更せずに中止しました。"
+                            : "一部を完了できませんでした。もう一度「確認する」から実行すると続きから完了できます。"}
+                  </span>
+                  <span>
+                    退避 {legacyCleanupStatus.archivedNow}件・日別ファイルを確認済みに {legacyCleanupStatus.memoryDaysCommitted}日・会話を確認済みに{" "}
+                    {legacyCleanupStatus.conversationsCommitted}件
+                  </span>
+                  {legacyCleanupStatus.counts && (
+                    <span>
+                      確認が必要（日別）{legacyCleanupStatus.counts.memoryDayConflict}件・確認が必要（会話）
+                      {legacyCleanupStatus.counts.conversationConflict}件・見つからない会話 {legacyCleanupStatus.counts.conversationMissing}件
+                      {legacyCleanupStatus.idb
+                        ? `／この端末の記録 ${legacyCleanupStatus.idb.memories}/${legacyCleanupStatus.idb.conversations}/${legacyCleanupStatus.idb.sources}件`
+                        : ""}
+                    </span>
+                  )}
+                  {legacyCleanupStatus.postChecks.length > 0 && (
+                    <details>
+                      <summary className="cursor-pointer">実行後の確認</summary>
+                      <div className="mt-1 flex flex-col gap-0.5">
+                        {legacyCleanupStatus.postChecks.map((check) => (
+                          <span key={check.name} className="break-all">
+                            {check.ok ? "OK" : "NG"}　{check.name}
+                            {check.detail ? `（${check.detail}）` : ""}
+                          </span>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                  {legacyCleanupStatus.errors.length > 0 && (
+                    <div className="flex flex-col gap-0.5 text-red-600 dark:text-red-400">
+                      {legacyCleanupStatus.errors.slice(0, 5).map((message) => (
+                        <span key={message} className="break-all">
+                          {message}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {legacyCleanupStatus.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{legacyCleanupStatus.message}</span>
+                  <button
+                    onClick={onRunLegacyCleanupDryRun}
                     disabled={vaultActionsDisabled}
                     className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
                   >
