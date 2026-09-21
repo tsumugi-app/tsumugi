@@ -77,7 +77,8 @@ type VaultStatusForDebug =
   | "unsupported"
   | "needs-permission"
   | "incomplete-switch"
-  | "unsupported-journal-version";
+  | "unsupported-journal-version"
+  | "metadata-corrupt";
 
 function debugLogEnabled(): boolean {
   if (typeof window === "undefined") return false;

@@ -55,6 +55,13 @@ import {
 } from "./markdown";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 import { isWipePending, WipeInProgressError } from "./wipeState";
+import {
+  VaultWriterUnavailableError,
+  checkOpfsWriter,
+  getOpfsWriterState,
+  hasNativeWritable,
+  writeViaWorker,
+} from "./vaultWriter";
 
 /**
  * B1（軽量Registry index・多tab安全性設計）：このpage load（session）固有の
@@ -142,10 +149,20 @@ function isAndroid() {
  * ため）。使えない場合のみOPFSへフォールバックする。どちらも使えなければnull。
  */
 export function getVaultBackend(): VaultBackend | null {
-  if (isAndroid()) return isOpfsSupported() ? "opfs" : null;
+  if (isAndroid()) return isOpfsSupported() ? opfsBackendIfWritable() : null;
   if (isFsAccessSupported()) return "file-system-access";
-  if (isOpfsSupported()) return "opfs";
+  if (isOpfsSupported()) return opfsBackendIfWritable();
   return null;
+}
+
+/**
+ * OPFSは、`createWritable`があるか、Worker経路で書き込めることを確認できた場合だけ使える。
+ * 書き込み方式を確認できなかった端末（例：Workerを作れない、`createSyncAccessHandle`が無い）では、
+ * `connected`と表示してしまう偽陽性を避けるため、backendをnull（＝未対応）にする。
+ * まだ確認していない間（"unknown"）は、従来どおり"opfs"を返す（起動時の`restoreVaultHandle`が確認する）。
+ */
+function opfsBackendIfWritable(): VaultBackend | null {
+  return getOpfsWriterState() === "unavailable" ? null : "opfs";
 }
 
 async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boolean): Promise<boolean> {
@@ -178,6 +195,11 @@ async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boo
 export type VaultRestoreResult =
   | { status: "connected"; handle: FileSystemDirectoryHandle }
   | { status: "needs-permission"; handle: FileSystemDirectoryHandle }
+  /**
+   * 保存先の管理ファイル（`.tsumugi/schema-version.json`・`index.json`）が壊れている（またはfail-closedにすべき状態）。
+   * 自動では上書きせず、connectedにしない。`files`は該当するファイル名（内容は含まない）。
+   */
+  | { status: "metadata-corrupt"; files: string[] }
   | { status: "none" };
 
 /**
@@ -211,6 +233,17 @@ export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
       try {
         await ensureVaultSkeleton(root);
       } catch (error) {
+        if (error instanceof VaultWriterUnavailableError) {
+          // このブラウザでは、OPFSへ書き込む方式が無い。connectedにせず、「未対応」（getVaultBackend()がnull）にする。
+          logTimingEvent("Vault ensureVaultSkeleton:writer-unavailable");
+          logTimingEvent("Vault restoreVaultHandle:result", { result: "none" });
+          return { status: "none" };
+        }
+        if (error instanceof VaultMetadataCorruptError) {
+          logTimingEvent("Vault ensureVaultSkeleton:metadata-corrupt", { count: error.files.length });
+          logTimingEvent("Vault restoreVaultHandle:result", { result: "metadata-corrupt" });
+          return { status: "metadata-corrupt", files: error.files };
+        }
         logTimingEvent("Vault ensureVaultSkeleton:error");
         throw error;
       }
@@ -452,19 +485,67 @@ export async function checkVaultIdentity(
  * schema-version.json / index.json の作成のみで、既存ファイルの上書き・削除は行わない）。
  */
 export async function ensureVaultSkeleton(root: FileSystemDirectoryHandle) {
+  // OPFS（Tsumugiだけが使う、オリジン専用の領域）かどうか。外部Vault（PCのフォルダ）はユーザーのものなので、
+  // 0バイトのファイルを自動修復しない。
+  const isOpfsVault = getVaultBackend() === "opfs";
   for (const dir of VAULT_DIRS) {
     await root.getDirectoryHandle(dir, { create: true });
   }
   const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
-  await writeJSONIfMissing(tsumugiDir, "schema-version.json", { schemaVersion: "0.1" });
-  await writeJSONIfMissing(tsumugiDir, "index.json", {});
+
+  // createWritableが無いOPFSでは、Worker経路で書き込めることを、骨組みのファイルを書く前に確認する
+  // （書けない環境を、connectedにしない）。createWritableがある環境では何もしない。
+  if (isOpfsVault) await checkOpfsWriter(root);
+
+  // 先に両方を検査する。壊れている管理ファイルがあれば、何も書かずにfail-closedで止める。
+  const targets: { name: string; value: unknown }[] = [
+    { name: "schema-version.json", value: { schemaVersion: "0.1" } },
+    { name: "index.json", value: {} },
+  ];
+  const inspected: { name: string; value: unknown; state: SkeletonJsonState }[] = [];
+  for (const t of targets) inspected.push({ ...t, state: await inspectSkeletonJson(tsumugiDir, t.name) });
+  const corrupt = inspected
+    .filter((t) => t.state === "invalid" || (t.state === "empty" && !isOpfsVault))
+    .map((t) => t.name);
+  if (corrupt.length > 0) throw new VaultMetadataCorruptError(corrupt);
+
+  for (const t of inspected) {
+    if (t.state === "missing") {
+      await writeFileInDir(tsumugiDir, t.name, JSON.stringify(t.value, null, 2));
+    } else if (t.state === "empty") {
+      // OPFSの0バイト：iPhone SafariでcreateWritableが無く、書き込みに失敗した残骸（失われる内容は無い）。修復する。
+      logTimingEvent("Vault skeleton:repair-empty");
+      await writeFileInDir(tsumugiDir, t.name, JSON.stringify(t.value, null, 2));
+    }
+  }
 }
 
-async function writeJSONIfMissing(dir: FileSystemDirectoryHandle, name: string, value: unknown) {
+/** 保存先の管理ファイルが壊れている（自動では上書きせず、connectedにしない）。`files`は名前だけ（内容は含まない）。 */
+export class VaultMetadataCorruptError extends Error {
+  constructor(readonly files: string[]) {
+    super(`Vault metadata is corrupt: ${files.join(", ")}`);
+    this.name = "VaultMetadataCorruptError";
+  }
+}
+
+type SkeletonJsonState = "missing" | "empty" | "valid" | "invalid";
+
+/** 骨組みのJSONファイルの状態を、読み取りだけで判定する。存在するだけで正常とは扱わない。 */
+async function inspectSkeletonJson(dir: FileSystemDirectoryHandle, name: string): Promise<SkeletonJsonState> {
+  let handle: FileSystemFileHandle;
   try {
-    await dir.getFileHandle(name, { create: false });
+    handle = await dir.getFileHandle(name, { create: false });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "NotFoundError") return "missing";
+    throw error;
+  }
+  const file = await handle.getFile();
+  if (file.size === 0) return "empty";
+  try {
+    JSON.parse(await file.text());
+    return "valid";
   } catch {
-    await writeFileInDir(dir, name, JSON.stringify(value, null, 2));
+    return "invalid";
   }
 }
 
@@ -496,9 +577,15 @@ function logSyncStep(label: string, durationMs: number): void {
 
 async function writeFileInDir(dir: FileSystemDirectoryHandle, name: string, content: string, label = "file") {
   const fileHandle = await timedIOStep(`${label} fileHandle`, () => dir.getFileHandle(name, { create: true }));
-  const writable = await timedIOStep(`${label} createWritable`, () => fileHandle.createWritable());
-  await timedIOStep(`${label} write`, () => writable.write(content));
-  await timedIOStep(`${label} close`, () => writable.close());
+  if (hasNativeWritable(fileHandle)) {
+    // Android・PC・createWritableのあるSafari：従来どおり（Worker・読み戻し・ロックは使わない）。
+    const writable = await timedIOStep(`${label} createWritable`, () => fileHandle.createWritable());
+    await timedIOStep(`${label} write`, () => writable.write(content));
+    await timedIOStep(`${label} close`, () => writable.close());
+    return;
+  }
+  // createWritableが無いOPFS（iPhone Safari等）：Dedicated Worker + createSyncAccessHandle（vaultWriter.ts）。
+  await timedIOStep(`${label} workerWrite`, () => writeViaWorker(fileHandle, content));
 }
 
 async function readJSON<T>(dir: FileSystemDirectoryHandle, name: string, fallback: T, label = "json"): Promise<T> {

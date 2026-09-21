@@ -335,7 +335,7 @@ export default function SettingsPanel({
 
           {vaultStatus === "unsupported" && (
             <div className="rounded-xl bg-stone-100 px-3 py-2 text-sm text-stone-600 dark:bg-stone-900 dark:text-stone-400">
-              このブラウザではファイルへの直接保存に対応していません。Chrome / Edge でお試しください（会話は一時的にこの端末内にのみ保存されます）。
+              この端末のブラウザでは、保存先へのファイルの書き込みに対応していません（会話は一時的にこの端末内にのみ保存されます）。
             </div>
           )}
 
@@ -365,6 +365,16 @@ export default function SettingsPanel({
             （onConnectVault経由）はversion自体を書き換えないため、ボタンを出しても
             復旧できない。再読み込みを促すだけの読み取り専用表示にする（ボタン無し）。
           */}
+          {/*
+            保存先の管理ファイル（.tsumugi 内）が壊れている。自動では上書きせず、接続もしない（fail-closed）。
+            会話・記憶は、引き続きこの端末内に保存される。
+          */}
+          {vaultStatus === "metadata-corrupt" && (
+            <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              保存先の管理ファイルが壊れているため、この保存先には接続していません。ファイルは自動では変更していません。
+            </div>
+          )}
+
           {vaultStatus === "unsupported-journal-version" && (
             <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               保存データのバージョンを確認できません。ページを再読み込みしてください。

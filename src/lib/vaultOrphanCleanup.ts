@@ -46,6 +46,7 @@
  */
 "use client";
 
+import { writeFileHandleContent } from "./vaultWriter";
 import {
   deleteVaultSyncState,
   getAllConversations,
@@ -425,9 +426,7 @@ async function writeText(root: FileSystemDirectoryHandle, path: string, text: st
   const segments = path.split("/");
   const dir = await resolveDir(root, segments.slice(0, -1), true);
   const handle = await dir.getFileHandle(segments[segments.length - 1], { create: true });
-  const writable = await handle.createWritable();
-  await writable.write(text);
-  await writable.close();
+  await writeFileHandleContent(handle, text);
 }
 
 /** 整理前の管理情報をarchiveへ退避し、SHA-256で検証する。既に退避済み（再実行）なら、それを再利用する。 */

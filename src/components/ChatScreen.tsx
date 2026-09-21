@@ -163,7 +163,9 @@ export type VaultStatus =
   | "unsupported"
   | "needs-permission"
   | "incomplete-switch"
-  | "unsupported-journal-version";
+  | "unsupported-journal-version"
+  /** 保存先の管理ファイル（.tsumugi/schema-version.json・index.json）が壊れている。自動では上書きせず、接続しない（fail-closed）。 */
+  | "metadata-corrupt";
 /** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
 export type VaultConnectFeedback = { kind: "cancelled" | "error"; message: string };
 type CaptureStatus = "idle" | "saving" | "saved" | "partial" | "error";
@@ -1822,6 +1824,10 @@ export default function ChatScreen() {
         // 開始する（awaitしない——起動UI・Tree表示・会話開始を一切ブロックしない）。
         // full resync（`resyncVaultRegistry`）は呼ばない。
         runVaultLightCheckInBackground(result.handle);
+      } else if (result.status === "metadata-corrupt") {
+        // 保存先の管理ファイルが壊れている（自動では上書きしない）。connectedにせず、vaultHandleも持たない
+        // （Vaultへの書き込みは行われない）。会話・Memoryは従来どおりこの端末内（IndexedDB）に保存される。
+        setVaultStatus("metadata-corrupt");
       } else if (result.status === "needs-permission") {
         // Android等：以前選択したフォルダのFileSystemDirectoryHandle自体はIndexedDBに
         // 有効なまま残っているが、ブラウザ管理の書き込み許可がリロードで失効している状態。
@@ -4229,7 +4235,9 @@ export default function ChatScreen() {
               ? "要再接続"
               : vaultStatus === "unsupported-journal-version"
                 ? "確認できません"
-                : "この端末のみ";
+                : vaultStatus === "metadata-corrupt"
+                  ? "要確認"
+                  : "この端末のみ";
 
   // Settings「保存先」の統合表示。「最新の状態です」は、接続済み・light-check測定完了・flush測定済み・
   // RegistryとIDBの差の測定済みで、未解決が全て0のときだけ（未測定と測定済み0件は区別する）。

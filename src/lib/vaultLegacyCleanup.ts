@@ -42,6 +42,7 @@
  */
 "use client";
 
+import { writeFileHandleContent } from "./vaultWriter";
 import { getAllConversations, getAllMemoryObjects, getAllSources } from "./db";
 import { parseConversationMarkdown, parseMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
 import {
@@ -733,9 +734,7 @@ async function readBytesIfExists(root: FileSystemDirectoryHandle, path: string):
 async function writeNewFile(root: FileSystemDirectoryHandle, path: string, bytes: ArrayBuffer | string): Promise<void> {
   const { dir, name } = await resolveParentDir(root, path, true);
   const handle = await dir.getFileHandle(name, { create: true });
-  const writable = await handle.createWritable();
-  await writable.write(bytes);
-  await writable.close();
+  await writeFileHandleContent(handle, bytes);
 }
 
 export interface LegacyCleanupPostCheck {
