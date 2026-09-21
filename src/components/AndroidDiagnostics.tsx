@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { renderReportText, runAndroidDiagnostics, type DiagnosticsReport } from "@/lib/androidDiagnostics";
+import { renderReportText, runAndroidDiagnostics, V3_NO_GROWTH_MESSAGE, type DiagnosticsReport } from "@/lib/androidDiagnostics";
 
 /**
  * Android実機の診断ページ（一時的な、診断専用）。ページを開いただけでは何も読まない（副作用のあるhook・
@@ -88,6 +88,28 @@ export default function AndroidDiagnostics() {
               </>
             ) : (
               <p>{state.report.v2?.unavailableReason ?? "算出できませんでした。"}</p>
+            )}
+          </section>
+
+          <section className="flex flex-col gap-1 rounded-xl border border-stone-300/60 px-3 py-2 dark:border-stone-600/60">
+            <h2 className="font-medium">診断v3：日付別データ整合性</h2>
+            {state.report.v3?.available ? (
+              <>
+                <p>
+                  {state.report.v3.fromDay}以降 — IDB {state.report.v3.totals.idb} / OPFS {state.report.v3.totals.opfs} / IDB-only{" "}
+                  {state.report.v3.totals.idbOnly} / OPFS-only {state.report.v3.totals.opfsOnly}
+                </p>
+                <p>
+                  baseline以前に始まったactive Conversation: {state.report.v3.legacyActive.beforeBaselineActive}件（startup Capture対象{" "}
+                  {state.report.v3.legacyActive.catchUpCandidates}件）
+                </p>
+                {state.report.v3.noGrowth && <p>{V3_NO_GROWTH_MESSAGE}</p>}
+                <p className="text-xs text-stone-500 dark:text-stone-400">
+                  書き込みの失敗など別系統（H4等）までは否定していません。実データで確認したのは、この診断を実行した端末だけです。
+                </p>
+              </>
+            ) : (
+              <p>{state.report.v3?.unavailableReason ?? "算出できませんでした。"}</p>
             )}
           </section>
 

@@ -141,6 +141,74 @@ export interface DiagnosticsReport {
   verdict: { level: DiagnosticsLevel; lines: string[]; details: string[] };
   /** 診断v2：baseline以降のIDB-only記録の、予測されるHOLDの理由。 */
   v2: DiagnosticsV2 | null;
+  /** 診断v3：Memory.dateの日付別の整合性（2026-09-17以降）と、baseline以前に始まったactive Conversation。 */
+  v3: DiagnosticsV3 | null;
+}
+
+/** v3の集計を始める日（Memory.dateのISO先頭10桁。day-fileの判定に使う日付基準と同じ）。 */
+export const V3_FROM_DAY = "2026-09-17";
+
+export interface V3DayRow {
+  day: string;
+  idb: number;
+  /** その日のIDB MemoryのうちOPFSにもあるもの。 */
+  opfs: number;
+  idbOnly: number;
+  /** その日のday-fileにあるがIDBに無いMemory。 */
+  opfsOnly: number;
+  registryDay: V2RegistryInfo;
+  dayFile: boolean;
+  ledgerSynced: number;
+  ledgerMissing: number;
+  /** 台帳に値はあるが、updatedAtと一致しない（同期済みとは言えない）。 */
+  ledgerOther: number;
+}
+
+export interface V3IdbOnlyRow {
+  id: string;
+  date: string;
+  createdAt: string;
+  updatedAt: string;
+  types: string[];
+  conversationId: string | null;
+  conversationInIdb: boolean | null;
+  conversationInOpfs: boolean | null;
+  registry: V2RegistryInfo;
+  ledger: "none" | "synced" | "other";
+  dayFile: boolean;
+}
+
+export interface V3LegacyActiveRow {
+  id: string;
+  startedAt: string;
+  updatedAt: string;
+  status: string;
+  turns: number;
+  memoryObjectIds: number;
+  inOpfs: boolean;
+}
+
+export interface DiagnosticsV3 {
+  available: boolean;
+  unavailableReason: string | null;
+  baseline: string | null;
+  fromDay: string;
+  totals: { idb: number; opfs: number; idbOnly: number; opfsOnly: number; opfsOnlyUnknownDay: number };
+  days: V3DayRow[];
+  idbOnlyRows: V3IdbOnlyRow[];
+  /** baseline以前に始まり、いまもstatus=activeで残っているConversation（startup Captureの対象条件はactive かつ turns>0）。 */
+  legacyActive: {
+    activeTotal: number;
+    beforeBaselineActive: number;
+    /** うち、startup Captureの対象条件（turns>0）を満たすもの。 */
+    catchUpCandidates: number;
+    /** うち、まだMemoryを1件も作っていない（memoryObjectIds空）もの。 */
+    uncaptured: number;
+    unparseableStartedAt: number;
+    rows: V3LegacyActiveRow[];
+  };
+  /** 2026-09-17以降のIDB-only Memoryが0、かつbaseline以前のcatch-up対象Conversationが0。 */
+  noGrowth: boolean;
 }
 
 export type V2MemoryCause = "H1" | "Registry";
@@ -333,6 +401,8 @@ interface OpfsScan {
   registryEntries: Map<string, { recordType: string; status: string; path: string }>;
   /** OPFS内のMarkdownの相対path（`Memories/2026-09-19.md`等）。 */
   markdownPaths: Map<string, true>;
+  /** OPFS上のMemory id → その日付（day-fileのファイル名・Registryの`day:`keyから。特定できないidは含まない）。 */
+  memoryDayById: Map<string, string>;
 }
 
 async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
@@ -351,6 +421,7 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
     markdownFiles: { memories: 0, conversations: 0, sources: 0 },
     registryEntries: new Map(),
     markdownPaths: new Map(),
+    memoryDayById: new Map(),
   };
   for await (const [name, handle] of root.entries()) scan.rootEntries.push(name + (handle.kind === "directory" ? "/" : ""));
 
@@ -390,7 +461,13 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
           if (entry.recordType === "conversation") scan.conversationIds.set(key, true);
           else if (entry.recordType === "source") scan.sourceIds.set(key, true);
           else if (entry.recordType === "reflection") scan.memoryIds.set(key, true);
-          else for (const id of entry.memberIds ?? []) scan.memoryIds.set(id, true);
+          else {
+            const registryDay = /^day:(\d{4}-\d{2}-\d{2})$/.exec(key);
+            for (const id of entry.memberIds ?? []) {
+              scan.memoryIds.set(id, true);
+              if (registryDay) scan.memoryDayById.set(id, registryDay[1]);
+            }
+          }
         }
       }
     }
@@ -415,7 +492,11 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
       const text = await (await (handle as FileSystemFileHandle).getFile()).text();
       if (area === "Memories") {
         scan.markdownFiles.memories += 1;
-        for (const match of text.matchAll(/^id: (\S+)$/gm)) scan.memoryIds.set(match[1], true);
+        const fileDay = /(\d{4}-\d{2}-\d{2})\.md$/.exec(name);
+        for (const match of text.matchAll(/^id: (\S+)$/gm)) {
+          scan.memoryIds.set(match[1], true);
+          if (fileDay) scan.memoryDayById.set(match[1], fileDay[1]);
+        }
       } else if (area === "Conversations") {
         scan.markdownFiles.conversations += 1;
         const match = /^id: (\S+)$/m.exec(text);
@@ -481,6 +562,7 @@ export async function runAndroidDiagnostics(env: DiagnosticsEnv = defaultDiagnos
     matchTotals: { total: 0, idbOnly: 0 },
     verdict: { level: "undetermined", lines: [], details: [] },
     v2: null,
+    v3: null,
   };
 
   let db: IDBDatabase | null = null;
@@ -627,6 +709,7 @@ export async function runAndroidDiagnostics(env: DiagnosticsEnv = defaultDiagnos
 
     if (opfs) {
       report.v2 = await analyzeV2({ memories, conversations, opfs, reader, ledgerKeys });
+      report.v3 = await analyzeV3({ memories, conversations, opfs, reader, ledgerKeys });
     }
 
     report.verdict = judge(report, allHits);
@@ -866,6 +949,164 @@ async function analyzeV2(args: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 診断v3：Memory.dateの日付別整合性と、baseline以前に始まったactive Conversation
+// ---------------------------------------------------------------------------
+
+const MAX_V3_LEGACY_ROWS = 30;
+
+async function analyzeV3(args: {
+  memories: StoredMemory[];
+  conversations: StoredConversation[];
+  opfs: OpfsScan;
+  reader: StoreReader;
+  ledgerKeys: Set<string>;
+}): Promise<DiagnosticsV3> {
+  const { memories, conversations, opfs, reader, ledgerKeys } = args;
+  const baseline = opfs.baselineEstablishedAt;
+  const emptyLegacy = { activeTotal: 0, beforeBaselineActive: 0, catchUpCandidates: 0, uncaptured: 0, unparseableStartedAt: 0, rows: [] as V3LegacyActiveRow[] };
+  const empty = (reason: string): DiagnosticsV3 => ({
+    available: false,
+    unavailableReason: reason,
+    baseline,
+    fromDay: V3_FROM_DAY,
+    totals: { idb: 0, opfs: 0, idbOnly: 0, opfsOnly: 0, opfsOnlyUnknownDay: 0 },
+    days: [],
+    idbOnlyRows: [],
+    legacyActive: emptyLegacy,
+    noGrowth: false,
+  });
+  if (baseline === null) return empty("OPFSにbaselineが記録されていないため、算出できません。");
+
+  const isReflection = (m: StoredMemory) => m.metadata?.source === "system-generated";
+  const dayOf = (m: StoredMemory) => String(m.date ?? "").slice(0, 10);
+  const inRange = (day: string) => /^\d{4}-\d{2}-\d{2}$/.test(day) && day >= V3_FROM_DAY;
+
+  const registryInfo = (key: string): V2RegistryInfo => {
+    const entry = opfs.registryEntries.get(key);
+    return {
+      key,
+      present: entry !== undefined,
+      status: entry ? entry.status : null,
+      path: entry ? entry.path : null,
+      fileExists: entry ? opfs.markdownPaths.has(entry.path) : null,
+    };
+  };
+  const dayFileExists = (day: string) => opfs.markdownPaths.has(`Memories/${day}.md`);
+
+  const idbIds = new Map<string, true>();
+  for (const m of memories) idbIds.set(m.id, true);
+
+  const byDay = new Map<string, StoredMemory[]>();
+  for (const m of memories) {
+    const day = dayOf(m);
+    if (!inRange(day)) continue;
+    byDay.set(day, [...(byDay.get(day) ?? []), m]);
+  }
+  const opfsOnlyByDay = new Map<string, number>();
+  let opfsOnlyUnknownDay = 0;
+  for (const id of opfs.memoryIds.keys()) {
+    if (idbIds.has(id)) continue;
+    const day = opfs.memoryDayById.get(id);
+    if (day === undefined) opfsOnlyUnknownDay += 1;
+    else if (inRange(day)) opfsOnlyByDay.set(day, (opfsOnlyByDay.get(day) ?? 0) + 1);
+  }
+
+  const idbConversationIds = new Map(conversations.map((c) => [c.id, true as const]));
+  const days = [...new Set([...byDay.keys(), ...opfsOnlyByDay.keys()])].sort();
+  const dayRows: V3DayRow[] = [];
+  const idbOnlyRows: V3IdbOnlyRow[] = [];
+  const totals = { idb: 0, opfs: 0, idbOnly: 0, opfsOnly: 0, opfsOnlyUnknownDay };
+  for (const day of days) {
+    const list = byDay.get(day) ?? [];
+    let opfsCount = 0;
+    let synced = 0;
+    let missing = 0;
+    let other = 0;
+    for (const m of list) {
+      const present = opfs.memoryIds.has(m.id);
+      if (present) opfsCount += 1;
+      const state = ledgerStateOf(ledgerKeys.has(`memory:${m.id}`) ? await reader.get("vaultSyncState", `memory:${m.id}`) : undefined, m.updatedAt);
+      if (state === "synced") synced += 1;
+      else if (state === "none") missing += 1;
+      else other += 1;
+      if (!present) {
+        idbOnlyRows.push({
+          id: m.id,
+          date: String(m.date ?? ""),
+          createdAt: String(m.createdAt ?? ""),
+          updatedAt: String(m.updatedAt ?? ""),
+          types: m.types ?? [],
+          conversationId: m.conversationId ?? null,
+          conversationInIdb: m.conversationId ? idbConversationIds.has(m.conversationId) : null,
+          conversationInOpfs: m.conversationId ? opfs.conversationIds.has(m.conversationId) : null,
+          registry: registryInfo(isReflection(m) ? m.id : `day:${day}`),
+          ledger: state,
+          dayFile: dayFileExists(day),
+        });
+      }
+    }
+    const opfsOnly = opfsOnlyByDay.get(day) ?? 0;
+    dayRows.push({
+      day,
+      idb: list.length,
+      opfs: opfsCount,
+      idbOnly: list.length - opfsCount,
+      opfsOnly,
+      registryDay: registryInfo(`day:${day}`),
+      dayFile: dayFileExists(day),
+      ledgerSynced: synced,
+      ledgerMissing: missing,
+      ledgerOther: other,
+    });
+    totals.idb += list.length;
+    totals.opfs += opfsCount;
+    totals.idbOnly += list.length - opfsCount;
+    totals.opfsOnly += opfsOnly;
+  }
+
+  // baseline以前に始まり、いまもactiveのConversation
+  const legacy = { ...emptyLegacy, rows: [] as V3LegacyActiveRow[] };
+  for (const c of conversations) {
+    if (c.status !== "active") continue;
+    legacy.activeTotal += 1;
+    const startedMs = Date.parse(c.startedAt ?? "");
+    if (Number.isNaN(startedMs)) {
+      legacy.unparseableStartedAt += 1;
+      continue;
+    }
+    if (isNewerThan(c.startedAt, baseline)) continue;
+    legacy.beforeBaselineActive += 1;
+    const turns = (c.turns ?? []).length;
+    const objects = (c.memoryObjectIds ?? []).length;
+    if (turns > 0) legacy.catchUpCandidates += 1;
+    if (objects === 0) legacy.uncaptured += 1;
+    if (legacy.rows.length < MAX_V3_LEGACY_ROWS) {
+      legacy.rows.push({
+        id: c.id,
+        startedAt: String(c.startedAt ?? ""),
+        updatedAt: String(c.updatedAt ?? ""),
+        status: String(c.status ?? ""),
+        turns,
+        memoryObjectIds: objects,
+        inOpfs: opfs.conversationIds.has(c.id),
+      });
+    }
+  }
+
+  return {
+    available: true,
+    unavailableReason: null,
+    baseline,
+    fromDay: V3_FROM_DAY,
+    totals,
+    days: dayRows,
+    idbOnlyRows,
+    legacyActive: legacy,
+    noGrowth: totals.idbOnly === 0 && legacy.catchUpCandidates === 0 && legacy.unparseableStartedAt === 0,
+  };
+}
+
 /** 判定（断定できない場合は断定しない）。 */
 function judge(report: DiagnosticsReport, allHits: KeywordMatch[]): DiagnosticsReport["verdict"] {
   const diff = report.diff;
@@ -979,6 +1220,7 @@ export function renderReportText(report: DiagnosticsReport): string {
   }
   if (report.matchTotals.total > report.matches.length) out.push(`…ほか${report.matchTotals.total - report.matches.length}件`);
   out.push(...renderV2Lines(report.v2));
+  out.push(...renderV3Lines(report.v3));
   return out.join("\n");
 }
 
@@ -1066,5 +1308,76 @@ export function renderV2Lines(v2: DiagnosticsV2 | null): string[] {
     );
   }
   if (v2.conversation.omitted > 0) out.push(`…ほか${v2.conversation.omitted}件（集計には含まれています）`);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 診断v3の表示用テキスト
+// ---------------------------------------------------------------------------
+
+export const V3_NO_GROWTH_MESSAGE =
+  "現在の通常利用でH1由来の新しいIDB-only Memoryが増え続ける状態は確認されません。";
+
+export function renderV3Lines(v3: DiagnosticsV3 | null): string[] {
+  const out: string[] = [];
+  out.push("\n■ 診断v3：日付別データ整合性");
+  out.push("日付の基準: Memory.dateのISO先頭10桁（day-fileの判定に使う日付。createdAtではありません）。");
+  out.push(
+    "H1の日単位baselineゲート（writeMemoryObjectMarkdownImpl）は、Android OPFS / iPhone・iPad OPFS / PCの外部Vaultで共通のコードです（コード調査の結果）。実データで確認したのは、この診断を実行した端末（Android）だけです。"
+  );
+  if (!v3) {
+    out.push("(OPFSを読めなかったため、算出できません)");
+    return out;
+  }
+  if (!v3.available) {
+    out.push(v3.unavailableReason ?? "(算出できません)");
+    return out;
+  }
+  out.push(`baseline: ${v3.baseline}`);
+  out.push(`\n■ ${v3.fromDay}以降のMemory（Memory.date基準）`);
+  out.push(`IDB Memory総数: ${v3.totals.idb}件`);
+  out.push(`OPFSに存在するMemory数: ${v3.totals.opfs}件`);
+  out.push(`IDB-only Memory数: ${v3.totals.idbOnly}件`);
+  out.push(`OPFS-only Memory数: ${v3.totals.opfsOnly}件（日付を特定できないOPFS-only: ${v3.totals.opfsOnlyUnknownDay}件は集計外）`);
+
+  out.push("\n■ 日付別");
+  if (v3.days.length === 0) out.push("(該当する日はありません)");
+  for (const d of v3.days) {
+    out.push(`${d.day}`);
+    out.push(`  IDB: ${d.idb} / OPFS: ${d.opfs} / IDB-only: ${d.idbOnly} / OPFS-only: ${d.opfsOnly}`);
+    out.push(`  Registry day entry: ${registryLabel(d.registryDay)} / day-file: ${yn(d.dayFile)}`);
+    out.push(`  vaultSyncState synced: ${d.ledgerSynced} / missing: ${d.ledgerMissing}${d.ledgerOther > 0 ? ` / 値が不一致: ${d.ledgerOther}` : ""}`);
+  }
+
+  if (v3.idbOnlyRows.length > 0) {
+    out.push(`\n■ ${v3.fromDay}以降のIDB-only Memory 詳細`);
+    for (const r of v3.idbOnlyRows) {
+      out.push(`- ${r.id} date=${r.date} created=${r.createdAt} updated=${r.updatedAt} types=${r.types.join(",") || "-"}`);
+      out.push(
+        `    conversationId=${r.conversationId ?? "-"} 元会話 IDB=${yn(r.conversationInIdb)} OPFS=${yn(r.conversationInOpfs)} / Registry: ${registryLabel(r.registry)} / 台帳: ${ledgerLabel(r.ledger)} / day-file: ${yn(r.dayFile)}`
+      );
+    }
+  }
+
+  const l = v3.legacyActive;
+  out.push("\n■ baseline以前に始まったactive Conversation");
+  out.push(`active Conversation全体: ${l.activeTotal}件`);
+  out.push(`baseline以前に開始・いまもactive: ${l.beforeBaselineActive}件`);
+  out.push(`  うちstartup Captureの対象条件（turns>0）: ${l.catchUpCandidates}件 / うちMemory未作成（memoryObjectIds空）: ${l.uncaptured}件`);
+  if (l.unparseableStartedAt > 0) out.push(`  startedAtを解釈できないactive: ${l.unparseableStartedAt}件（baseline前後を判定できません）`);
+  for (const r of l.rows) {
+    out.push(`- ${r.id} started=${r.startedAt} updated=${r.updatedAt} status=${r.status} turns=${r.turns} memoryObjectIds=${r.memoryObjectIds} OPFS=${yn(r.inOpfs)}`);
+  }
+  if (l.beforeBaselineActive > l.rows.length) out.push(`…ほか${l.beforeBaselineActive - l.rows.length}件`);
+
+  out.push("\n■ v3 判定");
+  if (v3.noGrowth) {
+    out.push(V3_NO_GROWTH_MESSAGE);
+  } else {
+    if (v3.totals.idbOnly > 0) out.push(`${v3.fromDay}以降にIDB-only Memoryが${v3.totals.idbOnly}件あります。H1が移行境界だけの問題とは言えません。`);
+    if (l.catchUpCandidates > 0) out.push(`baseline以前に始まったactive Conversationが${l.catchUpCandidates}件残っており、startup Captureで古い日付の新しいIDB-only Memoryが有限に追加される可能性があります。`);
+    if (l.unparseableStartedAt > 0) out.push("startedAtを解釈できないactive Conversationがあるため、判定できません。");
+  }
+  out.push("※ この判定はH1（日単位baselineゲート）についてのものです。書き込みの失敗・未再試行など、別系統（H4等）の失敗までは否定していません。");
   return out;
 }
