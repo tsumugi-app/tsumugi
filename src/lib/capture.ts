@@ -14,7 +14,8 @@ import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "
 import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, EventTimePrecision, MemoryObject, MemoryType, Persona } from "./types";
-import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
+import { getJstTodayDateString, isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
+import { PROFILE_LIMITS, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 
 const AI_PROVIDER = "gemini";
@@ -68,6 +69,11 @@ interface ExtractedMemory {
   /** Time Axis Phase 2（Event Time, v1）。/api/capture参照。 */
   eventTime?: string;
   eventTimePrecision?: EventTimePrecision;
+  /**
+   * Personal Profile v1（optional）。/api/captureが検証済みの候補を返す。ここでも同じ関数で再検証してから使う
+   * （idやslot等はTsumugi側が決定的に付与する）。無い会話では未設定。
+   */
+  profileClaims?: unknown;
 }
 
 /**
@@ -272,6 +278,27 @@ async function captureConversationImpl(
   // 本文・summary・keywords・topicId自体は出さない（列挙値と件数のみ）。
   const candidateCount = existingMemoryObjects.length + relatedMemoryObjects.length;
 
+  // Personal Profile v1：候補を、この会話のユーザー発言に対して再検証し（サーバーの検証と同じ関数）、Tsumugi側で
+  // id・slot・statedAt・sourceConversationId・recordedAt等を確定する。1回のCapture全体で最大perCapture件。
+  const todayJst = getJstTodayDateString();
+  const fallbackStatedAt = conversation.turns.find((turn) => turn.role === "user" && !Number.isNaN(Date.parse(turn.timestamp)))?.timestamp ?? conversation.startedAt;
+  let profileBudget = PROFILE_LIMITS.perCapture;
+  let profileProposed = 0;
+  let profileAccepted = 0;
+  function buildProfileClaimsFor(item: ExtractedMemory) {
+    if (item.profileClaims === undefined) return [];
+    const validated = validateProfileCandidates(item.profileClaims, {
+      turns: conversation.turns,
+      todayJst,
+      maxItems: Math.min(PROFILE_LIMITS.perMemoryItem, Math.max(0, profileBudget)),
+      fallbackStatedAt,
+    });
+    profileProposed += validated.proposed;
+    profileAccepted += validated.drafts.length;
+    profileBudget -= validated.drafts.length;
+    return draftsToClaims(validated.drafts, { conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
+  }
+
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
     const existing = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
     const resolvedTopicId = resolveTopicId(item, existing);
@@ -282,7 +309,11 @@ async function captureConversationImpl(
       topicIdPresent: resolvedTopicId ? 1 : 0,
     });
 
+    const newProfileClaims = buildProfileClaimsFor(item);
+
     if (existing) {
+      // Personal Profile v1：追加のみ。既存のclaimは削除せず、新しいclaimだけを重複排除して足す。
+      const mergedProfileClaims = mergeProfileClaims(existing.profileClaims ? sanitizeStoredProfileClaims(existing.profileClaims) : undefined, newProfileClaims);
       return {
         ...existing,
         content: item.content,
@@ -292,6 +323,7 @@ async function captureConversationImpl(
         topicId: resolvedTopicId,
         eventTime: resolvedEventTime.eventTime,
         eventTimePrecision: resolvedEventTime.eventTimePrecision,
+        ...(mergedProfileClaims.length > 0 ? { profileClaims: mergedProfileClaims } : {}),
         updatedAt: timestamp,
         metadata: {
           ...existing.metadata,
@@ -321,6 +353,7 @@ async function captureConversationImpl(
       topicId: resolvedTopicId,
       eventTime: resolvedEventTime.eventTime,
       eventTimePrecision: resolvedEventTime.eventTimePrecision,
+      ...(newProfileClaims.length > 0 ? { profileClaims: newProfileClaims } : {}),
       createdAt: timestamp,
       updatedAt: timestamp,
       metadata: {
@@ -334,6 +367,9 @@ async function captureConversationImpl(
       },
     };
   });
+
+  // 品質の観測用（件数のみ。会話・claimの内容は含めない）
+  if (profileProposed > 0) logTimingEvent("Capture profileClaims", { proposed: profileProposed, accepted: profileAccepted });
 
   const updatedConversation: Conversation = {
     ...conversation,

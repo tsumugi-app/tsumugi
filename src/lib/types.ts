@@ -167,6 +167,56 @@ export interface Link extends Identifiable {
   createdAt: ISODateString;
 }
 
+/**
+ * Personal Profile v1（Personal Modelの最初の層）。ユーザー自身の明示的な発言だけを根拠にした、
+ * 「会話の前提として使う価値が高い安定情報」の候補（claim）。MemoryObjectに付随して保存され
+ * （`MemoryObject.profileClaims`、追加のみのoptionalフィールド。IndexedDBバージョンアップ・Vault migration不要）、
+ * ProfileFact（現在有効か・過去か・予定か）は、全Memoryのclaimから決定的に計算する派生ビューであり、保存しない
+ * （src/lib/profile.ts）。AIの推測（性格・価値観・感情等）は保存しない：`stated`は"explicit"のみ。
+ */
+export const PROFILE_CATEGORIES_V1 = ["residence", "occupation", "household", "project", "goal", "preference"] as const;
+export type ProfileCategoryV1 = (typeof PROFILE_CATEGORIES_V1)[number];
+/**
+ * 将来のcategory（大切にしていること・長期的な方針・自己認識など、ユーザー自身が明示したもの）を、データ移行なしで
+ * 足せるよう文字列として保持する。未知のcategoryは読み込み時に保持するが、v1のviewでは使わない。
+ */
+export type ProfileCategory = ProfileCategoryV1 | (string & {});
+export type ProfileTense = "current" | "former" | "planned";
+/** none：通常の言明／began：「〜した・〜になった」という変化の完了／ended：「〜をやめた・辞めた」という終了。 */
+export type ProfileChange = "none" | "began" | "ended";
+export type HouseholdRelation = "partner" | "child" | "parent" | "sibling" | "pet" | "other";
+
+export interface ProfileClaim {
+  /** ULID。Tsumugiが採番する（LLMは採番しない）。 */
+  id: ID;
+  category: ProfileCategory;
+  /** Tsumugiが決定的に作る、同一対象の識別キー（例："residence:primary"、"household:child"、"project:レンタカー事業"）。 */
+  slot: string;
+  /** 比較用の短い値（residence:"千葉"、occupation:"A社 営業"）。 */
+  value?: string;
+  /** ユーザー視点の、時間に依存しない短い言明（「千葉に住んでいる」）。 */
+  statement: string;
+  tense: ProfileTense;
+  change: ProfileChange;
+  /** v1は常に"explicit"（ユーザーが明示した内容）のみ。推測（inferred）の値は作らない。 */
+  stated: "explicit";
+  /** ユーザー発言からの逐語の抜粋（根拠）。 */
+  quote: string;
+  /** quoteを含むユーザーturnのtimestamp（Recorded Time。事実が成立した時期＝validFromとは別）。 */
+  statedAt: ISODateString;
+  /** 由来の会話。Capture UPDATEは別Conversationの関連Memoryも更新しうるため、claim自身が持つ。 */
+  sourceConversationId: ID;
+  /** この事実（または予定）が成立する（した）時期。Event Timeと同じ形式。会話に明示されている場合のみ。 */
+  validFrom?: string;
+  validFromPrecision?: EventTimePrecision;
+  /** Tsumugiがclaimを保存した時刻。 */
+  recordedAt: ISODateString;
+  confidence?: number;
+  /** 将来"user-authored"（ユーザーが直接追加・修正）を足せる。 */
+  origin: "ai-extracted";
+  schemaVersion: 1;
+}
+
 export interface MemoryObject extends Identifiable, Timestamped {
   id: ID;
   date: ISODateString;
@@ -220,6 +270,12 @@ export interface MemoryObject extends Identifiable, Timestamped {
    */
   eventTime?: string;
   eventTimePrecision?: EventTimePrecision;
+  /**
+   * Personal Profile v1。この記憶の元になった会話で、ユーザー自身が明示した「安定した前提」の候補
+   * （追加のみ。Capture UPDATEでも既存のclaimは削除しない）。Profile候補が無い会話では未設定（キー自体を持たない）。
+   * `eventTime`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・Vault migration不要）。
+   */
+  profileClaims?: ProfileClaim[];
   metadata: Metadata;
 }
 

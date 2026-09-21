@@ -3,6 +3,7 @@ import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 import { stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { getJstTodayDateString, isValidEventTimeSource, resolveEventTimeSourceDate } from "@/lib/eventTimeResolver";
+import { PROFILE_LIMITS, draftsToCandidates, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
 
 export const runtime = "nodejs";
 
@@ -302,7 +303,7 @@ function buildServerTimingHeader(requestStart: number, geminiCallStart: number, 
   return `pre-gemini;dur=${preGemini}, gemini;dur=${gemini}, post-gemini;dur=${postGemini}`;
 }
 
-const MEMORIES_SCHEMA: AISchema = {
+const MEMORIES_SCHEMA_BASE: AISchema = {
   type: "object",
   properties: {
     memories: {
@@ -379,6 +380,109 @@ const MEMORIES_SCHEMA: AISchema = {
   required: ["memories"],
 };
 
+/**
+ * Personal Profile v1（optional出力）。既存のCapture呼び出しに、Profile候補（profileClaims）を任意で出させる。
+ * 既存のMemory抽出（件数・NEW/UPDATE・topicDecision・summary/content・Event Time）を悪化させないことが最優先のため、
+ * 無い会話では出力しない（0件が正常）。環境変数`PROFILE_CLAIMS_ENABLED=false`（または0）で、プロンプト・schema・
+ * 出力の全てを従来と同一に戻せる（品質が悪化した場合のキルスイッチ）。
+ */
+function profileClaimsEnabled(): boolean {
+  const v = (process.env.PROFILE_CLAIMS_ENABLED ?? "").trim().toLowerCase();
+  return v !== "false" && v !== "0" && v !== "off";
+}
+
+const PROFILE_PROMPT_SECTION = `
+
+Profile候補（任意。ほとんどの会話では出力しない。0件が正常）:
+- Memory候補ごとに、ユーザー本人の「安定した前提」がUSER'S ACTUAL STATEMENTSに明示されている場合だけ、
+  profileClaimsに候補を入れてよい。無い会話（雑談・質問・一時的な相談など）では省略する。無理に作らない。
+- 出してよいcategoryはこの6つだけ。residence（居住地域。市区町村まで。詳細な住所は不可）／
+  occupation（職業・勤務先）／household（家族構成上の「存在」の事実だけ。配偶者・パートナー、子ども、親、
+  兄弟姉妹、ペット。関係の良し悪し・感情・価値観は不可）／project（継続的な取り組み）／goal（長期的な目標）／
+  preference（本人が明確に述べた好み）。
+- 根拠はユーザー本人の発言だけ。quoteはUSER'S ACTUAL STATEMENTSからの逐語の抜粋（80字以内）。AIの発言・提案・
+  要約・形容は根拠にしない。ユーザー以外の人の話、仮定・冗談・創作・伝聞・迷い（「〜かも」「〜しようかな」）は出さない。
+- 推測しない。性格・価値観・感情・恐れ・大切にしていること・人物像（例：「家族を大切にしている」「〜がつらい」
+  「家庭を壊したくない」）は出さない。健康・宗教・性的指向・政治・お金の詳細・家庭の事情などの機微な情報も出さない。
+  迷ったら出さない。
+- statementは時間に依存しない短い言明（例：「千葉に住んでいる」）。「今」「最近」「来月」などの相対的な時間語は含めない。
+- tense: current（今そうである）／former（以前はそうだった）／planned（予定・決まっている未来）。
+  change: none／began（「〜した・〜になった」と変化の完了を述べている）／ended（「〜をやめた・辞めた」と終了を述べている）。
+  stated は常に "explicit"。
+- residence・occupationにはvalueに短い値（例：「千葉」「A社 営業」）。householdにはrelation
+  （partner/child/parent/sibling/pet/other）。project・goal・preferenceにはkey（短い名詞句）。
+- validFromSource（今日・昨日・一昨日・明日・明後日）または validFrom+validFromPrecision（会話に明示された年月日のみ）は、
+  その変化・予定の時期が会話に明示されている場合だけ。分からなければ省略する。
+- 既存Memoryを更新する場合でも、今回の会話で新しく明示された前提だけを出す。この判断は、上のMemory抽出の判断
+  （粒度・existingMemoryId・topicDecision・Event Time）に影響させない。`;
+
+const PROFILE_CLAIMS_ITEM_SCHEMA: AISchema = {
+  type: "array",
+  description:
+    "任意。ユーザー本人が明示した安定した前提（居住・職業・家族構成・継続的な取り組み・長期的な目標・明確な好み）の候補。" +
+    "無い会話では省略する（0件が正常）。推測・感情・価値観・機微な情報は出さない",
+  items: {
+    type: "object",
+    properties: {
+      category: { type: "string", enum: ["residence", "occupation", "household", "project", "goal", "preference"] },
+      key: { type: "string", description: "project・goal・preferenceの短い名詞句（householdでrelationがotherの場合も）" },
+      relation: { type: "string", enum: ["partner", "child", "parent", "sibling", "pet", "other"], description: "householdのみ" },
+      value: { type: "string", description: "residence・occupationの短い値（例：千葉／A社 営業）" },
+      statement: { type: "string", description: "時間に依存しない短い言明（60字以内）" },
+      tense: { type: "string", enum: ["current", "former", "planned"] },
+      change: { type: "string", enum: ["none", "began", "ended"] },
+      stated: { type: "string", enum: ["explicit"], description: "常にexplicit（ユーザーが明示した内容のみ）" },
+      quote: { type: "string", description: "USER'S ACTUAL STATEMENTSからの逐語の抜粋（80字以内）" },
+      validFromSource: {
+        type: "string",
+        enum: ["today", "yesterday", "day-before-yesterday", "tomorrow", "day-after-tomorrow"],
+        description: "変化・予定の時期が今日・昨日等で明示されている場合のみ",
+      },
+      validFrom: { type: "string", description: "会話に明示された年月日のみ（YYYY-MM-DD / YYYY-MM / YYYY）" },
+      validFromPrecision: { type: "string", enum: ["day", "month", "year"] },
+      confidence: { type: "number" },
+    },
+    required: ["category", "statement", "tense", "change", "stated", "quote"],
+  },
+};
+
+function buildMemoriesSchema(includeProfile: boolean): AISchema {
+  if (!includeProfile) return MEMORIES_SCHEMA_BASE;
+  const clone = JSON.parse(JSON.stringify(MEMORIES_SCHEMA_BASE)) as {
+    properties: { memories: { items: { properties: Record<string, unknown> } } };
+  };
+  clone.properties.memories.items.properties.profileClaims = PROFILE_CLAIMS_ITEM_SCHEMA;
+  return clone as unknown as AISchema;
+}
+
+/**
+ * Profile候補を、決定的に検証する（LLMの出力は候補にすぎない）。クライアントは同じ検証を再度行う。
+ * 検証を通らなかった候補だけを破棄し、Memory自体には影響しない。破棄の内訳は、件数のみを返す（内容は含めない）。
+ */
+function finalizeProfileClaimsForMemory(
+  memory: Record<string, unknown>,
+  turns: ConversationTurn[],
+  todayDateString: string,
+  budget: { remaining: number },
+  stats: { proposed: number; accepted: number; dropped: Partial<Record<ProfileDropReason, number>> }
+): Record<string, unknown> {
+  const { profileClaims, ...rest } = memory;
+  if (profileClaims === undefined) return rest;
+  const result = validateProfileCandidates(profileClaims, {
+    turns,
+    todayJst: todayDateString,
+    maxItems: Math.min(PROFILE_LIMITS.perMemoryItem, Math.max(0, budget.remaining)),
+    fallbackStatedAt: turns.find((turn) => turn.role === "user" && !Number.isNaN(Date.parse(turn.timestamp)))?.timestamp,
+  });
+  stats.proposed += result.proposed;
+  stats.accepted += result.drafts.length;
+  for (const [reason, count] of Object.entries(result.dropped)) {
+    stats.dropped[reason as ProfileDropReason] = (stats.dropped[reason as ProfileDropReason] ?? 0) + (count ?? 0);
+  }
+  budget.remaining -= result.drafts.length;
+  return result.drafts.length > 0 ? { ...rest, profileClaims: draftsToCandidates(result.drafts) } : rest;
+}
+
 export async function POST(request: Request) {
   const providerName = resolveProviderForFeature("capture");
   // TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用に、
@@ -411,16 +515,17 @@ export async function POST(request: Request) {
   const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}${buildEventTimeReferenceSection(todayDateString)}`;
 
   const provider = getProvider(providerName);
+  const profileEnabled = profileClaimsEnabled();
   let response: { text: string };
   const geminiCallStart = Date.now();
   try {
     response = await provider.generateStructured({
       model: resolveModel(providerName),
       apiKey,
-      systemInstruction: SYSTEM_PROMPT,
+      systemInstruction: profileEnabled ? `${SYSTEM_PROMPT}${PROFILE_PROMPT_SECTION}` : SYSTEM_PROMPT,
       userContent: transcript,
       providerOptions: { gemini: { thinkingBudget: computeThinkingBudget(transcript) } },
-      schema: MEMORIES_SCHEMA,
+      schema: buildMemoriesSchema(profileEnabled),
     });
   } catch (error) {
     console.error("[Tsumugi Capture] generateContent failed:", error);
@@ -442,13 +547,25 @@ export async function POST(request: Request) {
   try {
     const parsed = JSON.parse(text) as { memories?: unknown };
     const memories = Array.isArray(parsed.memories) ? parsed.memories : [];
-    const finalizedMemories = memories.map((memory) =>
-      isRecord(memory) ? finalizeEventTimeForMemory(memory, todayDateString) : memory
-    );
-    return Response.json(
-      { ...parsed, memories: finalizedMemories },
-      { headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) } }
-    );
+    const profileBudget = { remaining: PROFILE_LIMITS.perCapture };
+    const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
+    const finalizedMemories = memories.map((memory) => {
+      if (!isRecord(memory)) return memory;
+      const withEventTime = finalizeEventTimeForMemory(memory, todayDateString);
+      if (!profileEnabled) {
+        // 無効時は、profileClaimsを一切返さない（従来と同一の出力）
+        const { profileClaims: _ignored, ...rest } = withEventTime;
+        void _ignored;
+        return rest;
+      }
+      return finalizeProfileClaimsForMemory(withEventTime, turns, todayDateString, profileBudget, profileStats);
+    });
+    const headers: Record<string, string> = { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) };
+    if (profileEnabled) {
+      // 品質の観測用（件数のみ。会話・claimの内容は含めない）
+      headers["X-Tsumugi-Profile-Claims"] = `proposed=${profileStats.proposed};accepted=${profileStats.accepted};dropped=${Object.values(profileStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
+    }
+    return Response.json({ ...parsed, memories: finalizedMemories }, { headers });
   } catch {
     return Response.json(
       { error: "Failed to parse AI response as JSON." },

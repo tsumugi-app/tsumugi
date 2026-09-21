@@ -2,6 +2,7 @@
 
 import { requestFullWipe } from "@/lib/dataWipe";
 import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
+import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
@@ -4047,9 +4048,19 @@ export default function ChatScreen() {
       // 委ねる（新しいAPI/LLM callは追加しない）。取得失敗は既存recentConversationと同じ
       // 方針：StaleVaultTabErrorのみ上位へ再送出、それ以外は会話送信をブロックせずnullで続行。
       let topicContext: TopicContinuityCandidate[] | null = null;
+      // Personal Profile v1：同じMemory一覧から、派生ビュー（ProfileFact）を計算し、今回の話題に関連する少量だけを選ぶ
+      // （追加のAPI呼び出し・保存は無い。失敗しても会話送信をブロックしない）。
+      let profileContext: ProfileContext | null = null;
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
         topicContext = buildTopicContinuityPayload(allMemoriesForTopicContinuity, text);
+        try {
+          const recentUserTexts = updated.turns.filter((turn) => turn.role === "user").slice(-3).map((turn) => turn.content).reverse();
+          const selected = selectProfileContext(computeProfileFacts(allMemoriesForTopicContinuity), { userTexts: recentUserTexts.length > 0 ? recentUserTexts : [text] });
+          if (selected.core.length + selected.relevant.length > 0) profileContext = selected;
+        } catch (profileError) {
+          console.error("Failed to build profile context", profileError);
+        }
       } catch (topicError) {
         if (topicError instanceof StaleVaultTabError) throw topicError;
         console.error("Failed to load topic continuity context", topicError);
@@ -4093,6 +4104,7 @@ export default function ChatScreen() {
           retrievedMemories,
           ...(recentConversation ? { recentConversation } : {}),
           ...(topicContext ? { topicContext } : {}),
+          ...(profileContext ? { profile: profileContext } : {}),
         }),
       });
 

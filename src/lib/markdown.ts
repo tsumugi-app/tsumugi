@@ -22,6 +22,7 @@ import type {
   SourceType,
 } from "./types";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
+import { sanitizeStoredProfileClaims } from "./profile";
 
 function yamlScalar(value: string): string {
   const looksSpecial =
@@ -69,6 +70,8 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     eventTimePrecision: memoryObject.eventTimePrecision,
     summary: memoryObject.summary,
     links: memoryObject.links.length > 0 ? JSON.stringify(memoryObject.links) : undefined,
+    // Personal Profile v1：`links`と同じパターン（JSON文字列）。claimが無いMemoryには、キー自体を書かない。
+    profile: memoryObject.profileClaims && memoryObject.profileClaims.length > 0 ? JSON.stringify(memoryObject.profileClaims) : undefined,
     source: memoryObject.metadata.source,
     sourceType: memoryObject.metadata.sourceType,
     sourceDetail: stringifySourceDetail(memoryObject.metadata.sourceDetail),
@@ -253,6 +256,20 @@ function parseLinks(raw: unknown): Link[] {
   }
 }
 
+/**
+ * Personal Profile v1：`profile`は`links`と同じパターン（JSON文字列）。fail-soft：JSONが壊れている・形が違うclaimは、
+ * そのclaimだけ捨てる。Memory本体の読み込みは、この値の状態に関わらず必ず成功させる（例外を投げない）。
+ * 古いMemory Markdownにはこのキー自体が無いため、その場合は空配列（＝従来どおり）になる。
+ */
+function parseProfileClaims(raw: unknown) {
+  if (typeof raw !== "string") return [];
+  try {
+    return sanitizeStoredProfileClaims(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
 /** `parseLinks`と同じパターン：`stringifySourceDetail`で文字列化された値をJSON.parseし直す。 */
 function parseSourceDetail(raw: unknown): Record<string, string> | undefined {
   if (typeof raw !== "string") return undefined;
@@ -354,6 +371,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
       ? rawEventTimePrecision
       : undefined;
   const eventTime = eventTimePrecision ? rawEventTime : undefined;
+  const profileClaims = parseProfileClaims(frontmatter.profile);
 
   return {
     id,
@@ -373,6 +391,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     ideaIds: [],
     eventIds: [],
     links: parseLinks(frontmatter.links),
+    ...(profileClaims.length > 0 ? { profileClaims } : {}),
     createdAt,
     updatedAt,
     metadata: {

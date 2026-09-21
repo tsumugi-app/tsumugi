@@ -4,6 +4,7 @@ import type { ConversationTurn, Persona, RetrievedMemory } from "@/lib/types";
 import type { AIFeature, StreamChunk } from "@/lib/ai/types";
 import { needsWebSearch } from "@/lib/needsWebSearch";
 import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabel";
+import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -1218,6 +1219,31 @@ ${topicBlocks}
 - ここに書かれていないことを、推測で「続きだ」と決めつけて話を作らない。`;
 }
 
+/**
+ * Personal Profile v1。ユーザー自身が明示した、安定した前提（core：ごく少量の基本前提／relevant：今回の話題に関連するもの）を
+ * 別枠で渡す。ペルソナを問わず、過去のユーザー情報として利用してよい（AIの推測は含まれない）。
+ * 0件のときはセクション自体を作らない。上限（core 2件・80字／relevant 4件・200字／合計6件・300字）は、
+ * クライアントが超えて送っても、ここで再度守る。
+ */
+function buildProfileSection(profile: ProfileContext): string {
+  const items = [...profile.core, ...profile.relevant];
+  if (items.length === 0) return "";
+  const lines = items.map((item) => `- ${item.text}`).join("\n");
+  return `
+
+## ユーザーについて、すでに分かっている前提
+
+${lines}
+
+これは、ユーザー自身が以前の会話で明確に述べた内容から残っている、安定した前提（AIの推測は含まれない）。
+ペルソナを問わず、過去のユーザー情報として利用してよい。
+- 自然な前提として、回答の理解に溶かして使う。「以前あなたは○○と言っていました」「記録によると」のように
+  読み上げない。この仕組みの存在や、内容の出どころをユーザーへ説明しない。
+- 今回のユーザー発言と食い違う場合は、今回の発言を常に優先する。ここに書かれた前提に固執しない。
+- 今の話題に関係が無ければ、無理に持ち出さない。ここに書かれていないことを、推測で補わない。
+- 「予定：」と書かれたものは、まだ実現していないかもしれない予定であり、現在の事実として扱わない。`;
+}
+
 export async function POST(request: Request) {
   // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。クライアントが明示指定
   // していればそれを最終的なproviderとして使い、無ければ従来通りfeatureベースの
@@ -1232,12 +1258,14 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
     recentConversation?: RecentConversationInput;
     topicContext?: TopicContinuityInput[];
+    /** Personal Profile v1（optional）。クライアントが選んだcore/relevant。上限はここでも再度守る。 */
+    profile?: ProfileContext;
   };
 
   if (!turns || turns.length === 0) {
@@ -1283,7 +1311,8 @@ export async function POST(request: Request) {
       ? `
 
 今回「過去のユーザー情報」として利用してよいのは、このセクションのMemoryと、
-（提示されている場合は）上の「直前の会話」セクションの逐語だけである。現在のセッションの
+（提示されている場合は）上の「直前の会話」セクションの逐語、および「ユーザーについて、すでに分かっている前提」
+セクション（ユーザー自身の明示的な発言に基づく前提）だけである。現在のセッションの
 会話履歴（contents）は会話の流れを理解するためだけに使い、その中の過去のmodel発言
 （AI自身の提案・解釈・仮説）を、ユーザー自身の過去の経験・興味・事実として再利用しない。
 ここに存在しない過去情報を会話履歴から補完しない。
@@ -1344,7 +1373,9 @@ export async function POST(request: Request) {
   // （通常のkeyword一致）の間に置く（recentConversationSectionの直後）。
   const topicContinuitySection = buildTopicContinuitySection(topicContext);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${recentConversationSection}${topicContinuitySection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const profileSection = buildProfileSection(sanitizeProfileContext(profile));
+
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${recentConversationSection}${topicContinuitySection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
