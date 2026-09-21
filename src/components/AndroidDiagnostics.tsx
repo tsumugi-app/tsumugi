@@ -113,6 +113,23 @@ export default function AndroidDiagnostics() {
             )}
           </section>
 
+          <section className="flex flex-col gap-1 rounded-xl border border-stone-300/60 px-3 py-2 dark:border-stone-600/60">
+            <h2 className="font-medium">診断v4：createWritable と .tsumugi</h2>
+            <p>createWritable の型: {state.report.v4?.createWritableType ?? "(取得できませんでした)"}</p>
+            {state.report.v4?.tsumugiExists ? (
+              ["schema-version.json", "index.json"].map((name) => {
+                const entry = state.report.v4?.entries.find((e) => e.name === name && e.kind === "file");
+                return (
+                  <p key={name}>
+                    {name}: {entry ? `${entry.size ?? "?"}バイト${entry.size === 0 ? "（空）" : ""} / JSON ${entry.json ?? "-"}` : "存在しません"}
+                  </p>
+                );
+              })
+            ) : (
+              <p>.tsumugi/ {state.report.v4?.opfsReadable ? "は存在しません" : "を読めませんでした"}</p>
+            )}
+          </section>
+
           <pre className="whitespace-pre-wrap break-all rounded-xl bg-stone-50 px-3 py-2 font-mono text-[11px] leading-relaxed dark:bg-stone-950">
             {state.text}
           </pre>

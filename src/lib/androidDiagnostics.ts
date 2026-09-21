@@ -56,6 +56,8 @@ export interface DiagnosticsEnv {
   isStandalone: boolean;
   userAgent: string;
   origin: string;
+  /** 診断v4：FileSystemFileHandle.prototype.createWritable の型（"function" / "undefined" / "no FileSystemFileHandle"）。 */
+  createWritableType?: string;
 }
 
 export function defaultDiagnosticsEnv(): DiagnosticsEnv {
@@ -72,7 +74,18 @@ export function defaultDiagnosticsEnv(): DiagnosticsEnv {
     isStandalone: standalone,
     userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
     origin: typeof location !== "undefined" ? location.origin : "",
+    createWritableType: detectCreateWritableType(),
   };
+}
+
+/** 存在の型を調べるだけ（呼び出さない）。 */
+function detectCreateWritableType(): string {
+  try {
+    if (typeof FileSystemFileHandle === "undefined") return "no FileSystemFileHandle";
+    return typeof FileSystemFileHandle.prototype.createWritable;
+  } catch (error) {
+    return `error:${error instanceof Error ? error.name : "unknown"}`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +156,28 @@ export interface DiagnosticsReport {
   v2: DiagnosticsV2 | null;
   /** 診断v3：Memory.dateの日付別の整合性（2026-09-17以降）と、baseline以前に始まったactive Conversation。 */
   v3: DiagnosticsV3 | null;
+  /** 診断v4：createWritableの有無と、OPFS `.tsumugi/` の管理ファイル（一覧・サイズ・JSONとして解釈できるか）。 */
+  v4: DiagnosticsV4 | null;
+}
+
+export interface V4TsumugiEntry {
+  name: string;
+  kind: "file" | "directory";
+  size: number | null;
+  /** ファイルのみ。内容は表示せず、JSONとして解釈できるかだけ。 */
+  json: "valid" | "invalid" | "skipped" | "unreadable" | null;
+  /** ディレクトリのみ。中のエントリ数（名前は出さない）。 */
+  childCount: number | null;
+}
+
+export interface DiagnosticsV4 {
+  userAgent: string;
+  createWritableType: string;
+  opfsReadable: boolean;
+  error: string | null;
+  tsumugiExists: boolean;
+  entries: V4TsumugiEntry[];
+  omitted: number;
 }
 
 /** v3の集計を始める日（Memory.dateのISO先頭10桁。day-fileの判定に使う日付基準と同じ）。 */
@@ -563,7 +598,11 @@ export async function runAndroidDiagnostics(env: DiagnosticsEnv = defaultDiagnos
     verdict: { level: "undetermined", lines: [], details: [] },
     v2: null,
     v3: null,
+    v4: null,
   };
+
+  // 診断v4：IndexedDBとは独立（DBが無くても実行する）。OPFSは読み取りのみ。
+  report.v4 = await inspectVaultManagementFiles(env);
 
   let db: IDBDatabase | null = null;
   try {
@@ -1107,6 +1146,80 @@ async function analyzeV3(args: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 診断v4：createWritableの有無と、OPFS `.tsumugi/` の管理ファイル（READ ONLY）
+// ---------------------------------------------------------------------------
+
+const V4_MAX_ENTRIES = 60;
+const V4_MAX_PARSE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * `.tsumugi/`直下のエントリ（名前・種別・サイズ）と、各ファイルがJSONとして解釈できるか、を調べる。
+ * ファイルの内容そのものは保持・表示しない（解釈できたかどうかだけ）。ディレクトリは中のエントリ数だけ数える
+ * （名前は出さない）。OPFSへは何も作らず（create指定なし）、何も書かず、何も削除しない。
+ */
+async function inspectVaultManagementFiles(env: DiagnosticsEnv): Promise<DiagnosticsV4> {
+  const v4: DiagnosticsV4 = {
+    userAgent: env.userAgent,
+    createWritableType: env.createWritableType ?? "(未取得)",
+    opfsReadable: false,
+    error: null,
+    tsumugiExists: false,
+    entries: [],
+    omitted: 0,
+  };
+  if (!env.getOpfsRoot) return v4;
+  try {
+    const root = await env.getOpfsRoot();
+    v4.opfsReadable = true;
+    const dir = await dirOf(root, ".tsumugi");
+    if (!dir) return v4;
+    v4.tsumugiExists = true;
+    const rows: V4TsumugiEntry[] = [];
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === "directory") {
+        let count = 0;
+        try {
+          for await (const _child of (handle as FileSystemDirectoryHandle).entries()) {
+            void _child;
+            count += 1;
+            if (count >= 1000) break;
+          }
+        } catch {
+          count = -1;
+        }
+        rows.push({ name, kind: "directory", size: null, json: null, childCount: count });
+        continue;
+      }
+      let size: number | null = null;
+      let json: V4TsumugiEntry["json"] = "unreadable";
+      try {
+        const file = await (handle as FileSystemFileHandle).getFile();
+        size = file.size;
+        if (file.size > V4_MAX_PARSE_BYTES) {
+          json = "skipped";
+        } else {
+          try {
+            JSON.parse(await file.text());
+            json = "valid";
+          } catch {
+            json = "invalid";
+          }
+        }
+      } catch {
+        json = "unreadable";
+      }
+      rows.push({ name, kind: "file", size, json, childCount: null });
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    v4.entries = rows.slice(0, V4_MAX_ENTRIES);
+    v4.omitted = Math.max(0, rows.length - v4.entries.length);
+  } catch (error) {
+    v4.error = error instanceof Error ? error.name : String(error);
+  }
+  return v4;
+}
+
 /** 判定（断定できない場合は断定しない）。 */
 function judge(report: DiagnosticsReport, allHits: KeywordMatch[]): DiagnosticsReport["verdict"] {
   const diff = report.diff;
@@ -1221,6 +1334,7 @@ export function renderReportText(report: DiagnosticsReport): string {
   if (report.matchTotals.total > report.matches.length) out.push(`…ほか${report.matchTotals.total - report.matches.length}件`);
   out.push(...renderV2Lines(report.v2));
   out.push(...renderV3Lines(report.v3));
+  out.push(...renderV4Lines(report.v4));
   return out.join("\n");
 }
 
@@ -1379,5 +1493,57 @@ export function renderV3Lines(v3: DiagnosticsV3 | null): string[] {
     if (l.unparseableStartedAt > 0) out.push("startedAtを解釈できないactive Conversationがあるため、判定できません。");
   }
   out.push("※ この判定はH1（日単位baselineゲート）についてのものです。書き込みの失敗・未再試行など、別系統（H4等）の失敗までは否定していません。");
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 診断v4の表示用テキスト
+// ---------------------------------------------------------------------------
+
+function v4JsonLabel(entry: V4TsumugiEntry): string {
+  if (entry.kind !== "file") return "";
+  if (entry.size === 0) return "JSON: invalid（空ファイル・0バイト）";
+  switch (entry.json) {
+    case "valid":
+      return "JSON: valid";
+    case "invalid":
+      return "JSON: invalid";
+    case "skipped":
+      return "JSON: 未確認（大きいファイル）";
+    default:
+      return "JSON: 読み取れません";
+  }
+}
+
+export function renderV4Lines(v4: DiagnosticsV4 | null): string[] {
+  const out: string[] = [];
+  out.push("\n■ 診断v4：createWritable と .tsumugi の管理ファイル");
+  out.push("（READ ONLY：作成・書き込み・削除・修復はしていません。ファイルの内容は表示しません）");
+  if (!v4) {
+    out.push("(算出できませんでした)");
+    return out;
+  }
+  out.push(`User-Agent: ${v4.userAgent || "(なし)"}`);
+  out.push(`FileSystemFileHandle.prototype.createWritable の型: ${v4.createWritableType}`);
+  if (!v4.opfsReadable) {
+    out.push(v4.error ? `OPFSを読めませんでした（${v4.error}）` : "OPFS非対応です。");
+    return out;
+  }
+  if (v4.error) out.push(`一覧の途中でエラー: ${v4.error}`);
+  if (!v4.tsumugiExists) {
+    out.push(".tsumugi/ は存在しません。");
+    return out;
+  }
+  out.push(`.tsumugi/ 直下のエントリ: ${v4.entries.length + v4.omitted}件`);
+  for (const key of ["schema-version.json", "index.json"]) {
+    const entry = v4.entries.find((e) => e.name === key && e.kind === "file");
+    out.push(entry ? `  ${key}: 存在 / ${entry.size ?? "?"}バイト / ${v4JsonLabel(entry)}` : `  ${key}: 存在しません`);
+  }
+  out.push("一覧:");
+  for (const entry of v4.entries) {
+    if (entry.kind === "directory") out.push(`  - ${entry.name}/ （中のエントリ ${entry.childCount === null || entry.childCount < 0 ? "?" : entry.childCount}件）`);
+    else out.push(`  - ${entry.name}  ${entry.size ?? "?"}バイト  ${v4JsonLabel(entry)}`);
+  }
+  if (v4.omitted > 0) out.push(`…ほか${v4.omitted}件`);
   return out;
 }
