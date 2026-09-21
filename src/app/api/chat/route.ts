@@ -3,6 +3,7 @@ import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
 import type { ConversationTurn, Persona, RetrievedMemory } from "@/lib/types";
 import type { AIFeature, StreamChunk } from "@/lib/ai/types";
 import { needsWebSearch } from "@/lib/needsWebSearch";
+import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -829,6 +830,10 @@ AI自身の考えを話したあと、心理的意味づけ（「あなたが惹
   「今の会話で」のように、現在進行中のこととして語らない。ただし直近数分〜十数分程度の
   turnについて「さっき」のような自然な表現を使うこと自体は禁止しない。毎回の応答で経過
   時間を数値で言う必要はなく、あくまで時間的な位置関係を正しく理解するための材料として使う
+- この「[YYYY-MM-DD HH:mm JST]」のラベルは、入力コンテキスト専用の情報である。回答本文には
+  絶対に出力しない・書き写さない・ラベルそのものをユーザーに説明しない（過去のTsumugiの発言に
+  ラベルが付いて見えても、自分の回答の先頭にラベルを付けない）。ただし、日時そのものが会話上
+  必要な場合に、「今日は9月21日ですね」のように自然な言葉で日時を使うことは構わない
 - register に合った長さで。雑談（A）は1〜3文で軽く、相談（B）は必要なだけ深く、調査（C）は
   必要な情報量を確保する。雑談で「考えた跡を見せる」ために無理に長くしない。ただし「軽い」と
   「中身がない（相槌だけ）」は違う。可能なら対象について一つ何か返す
@@ -1126,7 +1131,10 @@ function buildRecentConversationSection(recent: RecentConversationInput | undefi
     .map((turn) => {
       const timestampLabel = formatTurnTimestampLabel(turn.timestamp);
       const prefix = timestampLabel ? `${timestampLabel} ` : "";
-      return `${prefix}${turn.role === "user" ? "ユーザー" : "Tsumugi"}：${turn.content}`;
+      // 過去のTsumugiの発言の先頭に、モデルが出力してしまった日時ラベルが保存されていても、
+      // ここで取り除いてから（正しいラベルを1つだけ）付ける。保存済みのデータ自体は書き換えない。
+      const content = turn.role === "user" ? turn.content : stripLeadingTimeLabels(turn.content);
+      return `${prefix}${turn.role === "user" ? "ユーザー" : "Tsumugi"}：${content}`;
     })
     .join("\n");
 
@@ -1382,7 +1390,11 @@ export async function POST(request: Request) {
     // schema自体（role/content構造）は変えず、contentの先頭にラベルとして付与する
     // （必要なければ何も付けない＝既存の見た目を壊さない）。
     const timestampLabel = formatTurnTimestampLabel(turn.timestamp);
-    const contentWithTimestamp = timestampLabel ? `${timestampLabel}\n${turn.content}` : turn.content;
+    // 過去のAI発言の先頭に、モデルが出力した日時ラベルが保存されている場合は、先に取り除いてから、
+    // 正しいラベルを1つだけ付ける（[日時]\n[日時]\n本文 という自己増幅を止める）。ユーザー発言は、
+    // 本文の一部として意図的に書かれた日付表記かもしれないため、変更しない。保存済みのデータ自体は書き換えない。
+    const baseContent = turn.role === "user" ? turn.content : stripLeadingTimeLabels(turn.content);
+    const contentWithTimestamp = timestampLabel ? `${timestampLabel}\n${baseContent}` : baseContent;
     providerTurns.push({ role: turn.role === "user" ? "user" : "ai", content: contentWithTimestamp });
   }
 
@@ -1428,14 +1440,22 @@ export async function POST(request: Request) {
 
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // モデルが返答の先頭に日時ラベル（入力コンテキスト専用）を出力した場合は、ユーザーへ流す前に取り除く
+      // （複数チャンクに分割されていても対応する。先頭以外は変更しない）。
+      const labelStripper = new LeadingTimeLabelStripper();
       try {
         for await (const chunk of stream) {
-          if (chunk.text) controller.enqueue(encoder.encode(chunk.text));
+          if (chunk.text) {
+            const text = labelStripper.push(chunk.text);
+            if (text) controller.enqueue(encoder.encode(text));
+          }
 
           if (chunk.finishReason && chunk.finishReason !== "stop") {
             console.warn(`[Tsumugi Chat] stream finished with reason: ${chunk.rawFinishReason ?? chunk.finishReason}`);
           }
         }
+        const tail = labelStripper.flush();
+        if (tail) controller.enqueue(encoder.encode(tail));
         controller.close();
       } catch (error) {
         controller.error(error);

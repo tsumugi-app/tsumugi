@@ -1,6 +1,7 @@
 import type { ConversationTurn, MemoryType, Persona } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { getJstTodayDateString, isValidEventTimeSource, resolveEventTimeSourceDate } from "@/lib/eventTimeResolver";
 
 export const runtime = "nodejs";
@@ -191,9 +192,11 @@ function buildTranscript(turns: ConversationTurn[]): string {
     .filter((turn) => turn.role === "user")
     .map((turn) => turn.content)
     .join("\n");
+  // AI発言の先頭に、モデルが出力した入力専用の日時ラベルが保存されていても、Captureの入力へ混ぜない
+  // （保存済みのデータ自体は書き換えない。ユーザー発言は変更しない）。
   const aiLines = turns
     .filter((turn) => turn.role !== "user")
-    .map((turn) => turn.content)
+    .map((turn) => stripLeadingTimeLabels(turn.content))
     .join("\n");
 
   return `=== USER'S ACTUAL STATEMENTS ===

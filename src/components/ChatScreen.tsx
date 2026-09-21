@@ -1,6 +1,7 @@
 "use client";
 
 import { requestFullWipe } from "@/lib/dataWipe";
+import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
@@ -4113,13 +4114,15 @@ export default function ChatScreen() {
         const { done, value } = await reader.read();
         if (done) break;
         full += decoder.decode(value, { stream: true });
-        setStreamingText(full);
+        // サーバーが先頭の日時ラベル（入力専用）を取り除くが、念のためクライアントでも表示前に防御する。
+        setStreamingText(stripLeadingTimeLabelsForDisplay(full));
         stopWaiting();
       }
 
       const aiTurn: ConversationTurn = {
         role: "ai",
-        content: full,
+        // 保存（IndexedDB・Vault Markdown・以降のCapture）へ日時ラベルが混入しないよう、保存直前にも正規化する。
+        content: normalizeAiResponseText(full),
         timestamp: new Date().toISOString(),
         ...(webSearchRequested !== undefined ? { webSearchRequested } : {}),
       };
