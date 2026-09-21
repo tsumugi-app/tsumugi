@@ -17,6 +17,15 @@
  * キーを固定の許可リストに限る）。
  *
  * 外部（環境）を引数で差し替えられる（テスト用）。
+ *
+ * 【診断v2】baseline以降に作られたIDB-onlyのMemory / Conversationについて、コード上の保存ゲート
+ * （`vault.ts`の書き込みゲートと同じ規則）を、実データに当てはめて「予測されるHOLDの理由」を付ける：
+ *   H1 Memoryの日単位baselineゲート（その日にbaseline以前のIDB Memoryがあり、Registryにその日のentryが無い）
+ *   H2 baseline以前に開始されたConversation（`createdAt`がbaseline以前で、Registryにentryが無い）
+ *   H3 旧Conversationのstartup Capture候補（全ターンがbaseline以前で、baselineの後にupdatedAt／Memoryが作られた）
+ *   Registry Registryのstatusが`ok`以外（needs-resync／conflict／missing）、またはentryはあるがファイルが無い
+ * 複数該当する場合は全て表示し、無理に1つへ決めない。どれにも該当しないものは「該当なし」（＝H4：書き込みの失敗・
+ * 未再試行などを排除できない）として、推測で分類しない。
  */
 
 export const DIAGNOSTIC_KEYWORDS = ["関係ない", "嫉妬", "SNS", "距離", "ルール", "職場"] as const;
@@ -130,6 +139,94 @@ export interface DiagnosticsReport {
   matches: KeywordMatch[];
   matchTotals: { total: number; idbOnly: number };
   verdict: { level: DiagnosticsLevel; lines: string[]; details: string[] };
+  /** 診断v2：baseline以降のIDB-only記録の、予測されるHOLDの理由。 */
+  v2: DiagnosticsV2 | null;
+}
+
+export type V2MemoryCause = "H1" | "Registry";
+export type V2ConversationCause = "H2" | "H3" | "Registry";
+
+export interface V2RegistryInfo {
+  key: string;
+  present: boolean;
+  status: string | null;
+  path: string | null;
+  /** entryのpathのファイルがOPFSに存在するか（entryが無ければnull）。 */
+  fileExists: boolean | null;
+}
+
+export interface V2ConversationInfo {
+  inIdb: boolean;
+  createdAt: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  status: string | null;
+  turns: number | null;
+  lastTurnAt: string | null;
+  memoryObjectIds: number | null;
+  inOpfs: boolean;
+  beforeBaseline: boolean | null;
+}
+
+export interface V2MemoryRow {
+  id: string;
+  createdAt: string;
+  date: string;
+  dateDay: string;
+  /** Memory自身のcreatedAtがbaseline以前か（v2の対象は「以後」なので通常false）。 */
+  beforeBaseline: boolean;
+  kind: "通常" | "振り返り";
+  types: string[];
+  conversationId: string | null;
+  conversation: V2ConversationInfo | null;
+  ledger: "none" | "synced" | "other";
+  registry: V2RegistryInfo;
+  dayFileInOpfs: boolean;
+  /** 同じdateの日に存在する、baseline以前のIDB Memory（通常）の件数。 */
+  legacyDayMates: number;
+  /** 直接の原因（この記録の書き込みゲート）。 */
+  causes: V2MemoryCause[];
+  /** 文脈（元Conversationがbaseline以前に開始／startup Capture候補）。この記録自体のHOLDの直接原因ではない。 */
+  context: ("H2" | "H3")[];
+  captureGapMinutes: number | null;
+}
+
+export interface V2ConversationRow {
+  id: string;
+  createdAt: string;
+  startedAt: string;
+  updatedAt: string;
+  beforeBaseline: boolean;
+  status: string;
+  turns: number;
+  lastTurnAt: string | null;
+  memoryObjectIds: string[];
+  ledger: "none" | "synced" | "other";
+  registry: V2RegistryInfo;
+  inOpfs: boolean;
+  causes: V2ConversationCause[];
+}
+
+export interface V2Counts {
+  total: number;
+  H1: number;
+  H2: number;
+  H3: number;
+  registry: number;
+  /** 直接の原因が無い（Memoryは H1・Registry が無い／Conversationは H2・H3・Registry が無い）。 */
+  unresolved: number;
+  /** どの仮説にも該当しない（文脈のH2/H3も含めて無い）。 */
+  noneAtAll: number;
+  /** 2つ以上に該当する記録の数。 */
+  multiple: number;
+}
+
+export interface DiagnosticsV2 {
+  available: boolean;
+  unavailableReason: string | null;
+  baseline: string | null;
+  memory: { rows: V2MemoryRow[]; omitted: number; counts: V2Counts; pre: number };
+  conversation: { rows: V2ConversationRow[]; omitted: number; counts: V2Counts; pre: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +329,10 @@ interface OpfsScan {
   conversationIds: Map<string, true>;
   sourceIds: Map<string, true>;
   markdownFiles: { memories: number; conversations: number; sources: number };
+  /** Registryのkey（会話・振り返り・素材はid、通常Memoryは`day:YYYY-MM-DD`）→ entry。 */
+  registryEntries: Map<string, { recordType: string; status: string; path: string }>;
+  /** OPFS内のMarkdownの相対path（`Memories/2026-09-19.md`等）。 */
+  markdownPaths: Map<string, true>;
 }
 
 async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
@@ -248,6 +349,8 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
     conversationIds: new Map(),
     sourceIds: new Map(),
     markdownFiles: { memories: 0, conversations: 0, sources: 0 },
+    registryEntries: new Map(),
+    markdownPaths: new Map(),
   };
   for await (const [name, handle] of root.entries()) scan.rootEntries.push(name + (handle.kind === "directory" ? "/" : ""));
 
@@ -281,6 +384,7 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
         for (const [key, path] of Object.entries(shard.records)) {
           const entry: { recordType?: string; status?: string; memberIds?: string[] } | undefined = shard.files[path];
           if (!entry) continue;
+          scan.registryEntries.set(key, { recordType: String(entry.recordType), status: String(entry.status), path });
           const label = `${entry.recordType}:${entry.status}`;
           scan.registryStatuses[label] = (scan.registryStatuses[label] ?? 0) + 1;
           if (entry.recordType === "conversation") scan.conversationIds.set(key, true);
@@ -293,15 +397,21 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
   }
 
   // Markdown実体（Registryが空・不完全でも判定できるよう、ファイル側のidも集める）
-  const walk = async (dir: FileSystemDirectoryHandle, area: "Memories" | "Conversations" | "Sources", depth: number): Promise<void> => {
+  const walk = async (
+    dir: FileSystemDirectoryHandle,
+    area: "Memories" | "Conversations" | "Sources",
+    depth: number,
+    prefix: string
+  ): Promise<void> => {
     if (depth > 6) return;
     for await (const [name, handle] of dir.entries()) {
       if (name.startsWith(".")) continue;
       if (handle.kind === "directory") {
-        await walk(handle as FileSystemDirectoryHandle, area, depth + 1);
+        await walk(handle as FileSystemDirectoryHandle, area, depth + 1, `${prefix}${name}/`);
         continue;
       }
       if (!name.endsWith(".md")) continue;
+      scan.markdownPaths.set(`${prefix}${name}`, true);
       const text = await (await (handle as FileSystemFileHandle).getFile()).text();
       if (area === "Memories") {
         scan.markdownFiles.memories += 1;
@@ -319,7 +429,7 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
   };
   for (const area of ["Memories", "Conversations", "Sources"] as const) {
     const dir = await dirOf(root, area);
-    if (dir) await walk(dir, area, 0);
+    if (dir) await walk(dir, area, 0, `${area}/`);
   }
   return scan;
 }
@@ -327,6 +437,9 @@ async function scanOpfs(root: FileSystemDirectoryHandle): Promise<OpfsScan> {
 interface StoredMemory {
   id: string;
   createdAt?: string;
+  date?: string;
+  types?: string[];
+  metadata?: { source?: string };
   updatedAt?: string;
   summary?: string;
   content?: string;
@@ -338,7 +451,11 @@ interface StoredMemory {
 interface StoredConversation {
   id: string;
   createdAt?: string;
-  turns?: { content?: string }[];
+  startedAt?: string;
+  updatedAt?: string;
+  status?: string;
+  memoryObjectIds?: string[];
+  turns?: { content?: string; timestamp?: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +480,7 @@ export async function runAndroidDiagnostics(env: DiagnosticsEnv = defaultDiagnos
     matches: [],
     matchTotals: { total: 0, idbOnly: 0 },
     verdict: { level: "undetermined", lines: [], details: [] },
+    v2: null,
   };
 
   let db: IDBDatabase | null = null;
@@ -507,6 +625,10 @@ export async function runAndroidDiagnostics(env: DiagnosticsEnv = defaultDiagnos
       allHits = hits;
     }
 
+    if (opfs) {
+      report.v2 = await analyzeV2({ memories, conversations, opfs, reader, ledgerKeys });
+    }
+
     report.verdict = judge(report, allHits);
     return report;
   } catch (error) {
@@ -521,6 +643,227 @@ export async function runAndroidDiagnostics(env: DiagnosticsEnv = defaultDiagnos
       // no-op
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 診断v2：baseline以降のIDB-only記録の、予測されるHOLDの理由
+// ---------------------------------------------------------------------------
+
+const MAX_V2_ROWS = 100;
+
+/** `vault.ts`の`isRecordNewerThanBaseline`と同じ規則（どちらかがparseできなければ「新しくない」）。 */
+function isNewerThan(iso: string | undefined | null, baseline: string): boolean {
+  const a = Date.parse(iso ?? "");
+  const b = Date.parse(baseline);
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+  return a > b;
+}
+
+function lastTurnAtOf(conversation: StoredConversation): string | null {
+  let best: string | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  for (const turn of conversation.turns ?? []) {
+    const ms = Date.parse(turn.timestamp ?? "");
+    if (!Number.isNaN(ms) && ms > bestMs) {
+      bestMs = ms;
+      best = turn.timestamp ?? null;
+    }
+  }
+  return best;
+}
+
+function ledgerStateOf(value: unknown, updatedAt: string | undefined): "none" | "synced" | "other" {
+  if (value === undefined) return "none";
+  return value === updatedAt ? "synced" : "other";
+}
+
+function emptyCounts(): V2Counts {
+  return { total: 0, H1: 0, H2: 0, H3: 0, registry: 0, unresolved: 0, noneAtAll: 0, multiple: 0 };
+}
+
+async function analyzeV2(args: {
+  memories: StoredMemory[];
+  conversations: StoredConversation[];
+  opfs: OpfsScan;
+  reader: StoreReader;
+  ledgerKeys: Set<string>;
+}): Promise<DiagnosticsV2> {
+  const { memories, conversations, opfs, reader, ledgerKeys } = args;
+  const baseline = opfs.baselineEstablishedAt;
+  const empty = (reason: string): DiagnosticsV2 => ({
+    available: false,
+    unavailableReason: reason,
+    baseline,
+    memory: { rows: [], omitted: 0, counts: emptyCounts(), pre: 0 },
+    conversation: { rows: [], omitted: 0, counts: emptyCounts(), pre: 0 },
+  });
+  if (baseline === null) return empty("OPFSにbaselineが記録されていないため、baseline前後の分類ができません。");
+
+  const dayFileDays = new Map<string, true>();
+  for (const path of opfs.markdownPaths.keys()) {
+    const m = /(?:^|\/)(\d{4}-\d{2}-\d{2})\.md$/.exec(path);
+    if (m) dayFileDays.set(m[1], true);
+  }
+  const idbConversationById = new Map(conversations.map((c) => [c.id, c]));
+  const isReflection = (m: StoredMemory) => m.metadata?.source === "system-generated";
+  const dayOf = (m: StoredMemory) => String(m.date ?? "").slice(0, 10);
+
+  // 通常Memoryの、日ごとの「baseline以前に作られたIDB Memory」の件数（日単位ゲートの条件そのもの）
+  const legacyByDay = new Map<string, number>();
+  for (const m of memories) {
+    if (isReflection(m)) continue;
+    if (!isNewerThan(m.createdAt, baseline)) legacyByDay.set(dayOf(m), (legacyByDay.get(dayOf(m)) ?? 0) + 1);
+  }
+
+  const registryInfo = (key: string): V2RegistryInfo => {
+    const entry = opfs.registryEntries.get(key);
+    return {
+      key,
+      present: entry !== undefined,
+      status: entry ? entry.status : null,
+      path: entry ? entry.path : null,
+      fileExists: entry ? opfs.markdownPaths.has(entry.path) : null,
+    };
+  };
+  const registryProblem = (r: V2RegistryInfo) => r.present && (r.status !== "ok" || r.fileExists === false);
+
+  // ---- Memory（IDB-only かつ baseline以降に作成） ----
+  const idbOnlyMemories = memories.filter((m) => !opfs.memoryIds.has(m.id));
+  const postMemories = idbOnlyMemories
+    .filter((m) => isNewerThan(m.createdAt, baseline))
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const memoryCounts = emptyCounts();
+  memoryCounts.total = postMemories.length;
+  const memoryRows: V2MemoryRow[] = [];
+  for (const m of postMemories) {
+    const reflection = isReflection(m);
+    const dateDay = dayOf(m);
+    const registry = registryInfo(reflection ? m.id : `day:${dateDay}`);
+    const legacyDayMates = reflection ? 0 : legacyByDay.get(dateDay) ?? 0;
+    const causes: V2MemoryCause[] = [];
+    // 通常Memoryのゲートは、Registryにその日のentryが無いときだけ働く（vault.tsのlookup.entry===undefined）。
+    if (!reflection && !registry.present && legacyDayMates > 0) causes.push("H1");
+    if (registryProblem(registry)) causes.push("Registry");
+
+    const conv = m.conversationId ? idbConversationById.get(m.conversationId) : undefined;
+    const lastTurnAt = conv ? lastTurnAtOf(conv) : null;
+    const convLegacy = conv !== undefined && !isNewerThan(conv.createdAt, baseline);
+    const context: ("H2" | "H3")[] = [];
+    if (convLegacy) context.push("H2");
+    if (convLegacy && lastTurnAt !== null && !isNewerThan(lastTurnAt, baseline) && isNewerThan(m.createdAt, baseline)) context.push("H3");
+    let gap: number | null = null;
+    if (lastTurnAt !== null) {
+      const ms = Date.parse(String(m.createdAt)) - Date.parse(lastTurnAt);
+      gap = Number.isNaN(ms) ? null : Math.round(ms / 60000);
+    }
+
+    if (causes.includes("H1")) memoryCounts.H1 += 1;
+    if (causes.includes("Registry")) memoryCounts.registry += 1;
+    if (context.includes("H2")) memoryCounts.H2 += 1;
+    if (context.includes("H3")) memoryCounts.H3 += 1;
+    if (causes.length === 0) memoryCounts.unresolved += 1;
+    if (causes.length === 0 && context.length === 0) memoryCounts.noneAtAll += 1;
+    if (causes.length + context.length >= 2) memoryCounts.multiple += 1;
+
+    if (memoryRows.length < MAX_V2_ROWS) {
+      memoryRows.push({
+        id: m.id,
+        createdAt: String(m.createdAt ?? ""),
+        date: String(m.date ?? ""),
+        dateDay,
+        beforeBaseline: !isNewerThan(m.createdAt, baseline),
+        kind: reflection ? "振り返り" : "通常",
+        types: m.types ?? [],
+        conversationId: m.conversationId ?? null,
+        conversation: m.conversationId
+          ? {
+              inIdb: conv !== undefined,
+              createdAt: conv?.createdAt ?? null,
+              startedAt: conv?.startedAt ?? null,
+              updatedAt: conv?.updatedAt ?? null,
+              status: conv?.status ?? null,
+              turns: conv ? (conv.turns ?? []).length : null,
+              lastTurnAt,
+              memoryObjectIds: conv ? (conv.memoryObjectIds ?? []).length : null,
+              inOpfs: opfs.conversationIds.has(m.conversationId),
+              beforeBaseline: conv ? !isNewerThan(conv.createdAt, baseline) : null,
+            }
+          : null,
+        ledger: ledgerStateOf(ledgerKeys.has(`memory:${m.id}`) ? await reader.get("vaultSyncState", `memory:${m.id}`) : undefined, m.updatedAt),
+        registry,
+        dayFileInOpfs: dayFileDays.has(dateDay),
+        legacyDayMates,
+        causes,
+        context,
+        captureGapMinutes: gap,
+      });
+    }
+  }
+
+  // ---- Conversation（IDB-only かつ baseline以降に作成または更新） ----
+  const idbOnlyConversations = conversations.filter((c) => !opfs.conversationIds.has(c.id));
+  const postConversations = idbOnlyConversations
+    .filter((c) => isNewerThan(c.updatedAt, baseline) || isNewerThan(c.createdAt, baseline))
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  const conversationCounts = emptyCounts();
+  conversationCounts.total = postConversations.length;
+  const conversationRows: V2ConversationRow[] = [];
+  for (const c of postConversations) {
+    const registry = registryInfo(c.id);
+    const lastTurnAt = lastTurnAtOf(c);
+    const legacy = !isNewerThan(c.createdAt, baseline);
+    const causes: V2ConversationCause[] = [];
+    // 会話のゲートは、Registryにentryが無く、createdAtがbaseline以前のときに保留する。
+    if (!registry.present && legacy) causes.push("H2");
+    // startup Capture候補：baseline以前に始まり、全ターンがbaseline以前で、baselineの後にupdatedAtが更新された。
+    if (legacy && lastTurnAt !== null && !isNewerThan(lastTurnAt, baseline) && isNewerThan(c.updatedAt, baseline)) causes.push("H3");
+    if (registryProblem(registry)) causes.push("Registry");
+
+    if (causes.includes("H2")) conversationCounts.H2 += 1;
+    if (causes.includes("H3")) conversationCounts.H3 += 1;
+    if (causes.includes("Registry")) conversationCounts.registry += 1;
+    if (causes.length === 0) {
+      conversationCounts.unresolved += 1;
+      conversationCounts.noneAtAll += 1;
+    }
+    if (causes.length >= 2) conversationCounts.multiple += 1;
+
+    if (conversationRows.length < MAX_V2_ROWS) {
+      conversationRows.push({
+        id: c.id,
+        createdAt: String(c.createdAt ?? ""),
+        startedAt: String(c.startedAt ?? ""),
+        updatedAt: String(c.updatedAt ?? ""),
+        beforeBaseline: legacy,
+        status: String(c.status ?? ""),
+        turns: (c.turns ?? []).length,
+        lastTurnAt,
+        memoryObjectIds: c.memoryObjectIds ?? [],
+        ledger: ledgerStateOf(ledgerKeys.has(`conversation:${c.id}`) ? await reader.get("vaultSyncState", `conversation:${c.id}`) : undefined, c.updatedAt),
+        registry,
+        inOpfs: opfs.conversationIds.has(c.id),
+        causes,
+      });
+    }
+  }
+
+  return {
+    available: true,
+    unavailableReason: null,
+    baseline,
+    memory: {
+      rows: memoryRows,
+      omitted: Math.max(0, postMemories.length - memoryRows.length),
+      counts: memoryCounts,
+      pre: idbOnlyMemories.length - postMemories.length,
+    },
+    conversation: {
+      rows: conversationRows,
+      omitted: Math.max(0, postConversations.length - conversationRows.length),
+      counts: conversationCounts,
+      pre: idbOnlyConversations.length - postConversations.length,
+    },
+  };
 }
 
 /** 判定（断定できない場合は断定しない）。 */
@@ -635,5 +978,93 @@ export function renderReportText(report: DiagnosticsReport): string {
     out.push(`    ${h.snippet}`);
   }
   if (report.matchTotals.total > report.matches.length) out.push(`…ほか${report.matchTotals.total - report.matches.length}件`);
+  out.push(...renderV2Lines(report.v2));
   return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// 診断v2の表示用テキスト
+// ---------------------------------------------------------------------------
+
+function yn(value: boolean | null): string {
+  return value === null ? "不明" : value ? "有" : "無";
+}
+
+function ledgerLabel(state: "none" | "synced" | "other"): string {
+  return state === "none" ? "なし" : state === "synced" ? "あり(同期済み)" : "あり(別の値)";
+}
+
+function registryLabel(r: V2RegistryInfo): string {
+  if (!r.present) return `entryなし(${r.key})`;
+  return `entryあり(${r.key}) status=${r.status} ファイル=${yn(r.fileExists)}`;
+}
+
+function countsLine(c: V2Counts, kind: "memory" | "conversation"): string[] {
+  const lines: string[] = [];
+  lines.push(`合計 ${c.total}件`);
+  if (kind === "memory") {
+    lines.push(`  H1（日単位のbaselineゲート）: ${c.H1}件`);
+    lines.push(`  Registry HOLD: ${c.registry}件`);
+    lines.push(`  H2（元会話がbaseline以前に開始・文脈）: ${c.H2}件 / H3候補（元会話の全ターンがbaseline以前・startup Capture・文脈）: ${c.H3}件`);
+    lines.push(`  直接の原因（H1・Registry）が無い: ${c.unresolved}件 / どの仮説にも該当しない: ${c.noneAtAll}件 / 複数該当: ${c.multiple}件`);
+  } else {
+    lines.push(`  H2（baseline以前に開始・Registryにentryなし）: ${c.H2}件`);
+    lines.push(`  H3候補（startup Capture）: ${c.H3}件`);
+    lines.push(`  Registry HOLD: ${c.registry}件`);
+    lines.push(`  原因未解決（該当なし）: ${c.unresolved}件 / 複数該当: ${c.multiple}件`);
+  }
+  return lines;
+}
+
+export function renderV2Lines(v2: DiagnosticsV2 | null): string[] {
+  const out: string[] = [];
+  out.push("\n■ 診断v2：baseline以降のIDB-only（予測されるHOLDの理由）");
+  if (!v2) {
+    out.push("(OPFSを読めなかったため、算出できません)");
+    return out;
+  }
+  if (!v2.available) {
+    out.push(v2.unavailableReason ?? "(算出できません)");
+    return out;
+  }
+  out.push(`baseline: ${v2.baseline}`);
+  out.push("※ 複数該当する記録は全て表示し、1つには決めません。「該当なし」は推測で分類していません（H4：書き込みの失敗・未再試行などを排除できません）。");
+
+  out.push("\n■ v2 集計：baseline後に作られたIDB-only Memory");
+  out.push(...countsLine(v2.memory.counts, "memory"));
+  out.push(`（参考）baseline以前に作られたIDB-only Memory: ${v2.memory.pre}件`);
+  out.push("\n■ v2 集計：baseline後に作成または更新されたIDB-only Conversation");
+  out.push(...countsLine(v2.conversation.counts, "conversation"));
+  out.push(`（参考）baseline以前のまま更新の無いIDB-only Conversation: ${v2.conversation.pre}件`);
+
+  out.push(`\n■ v2 Memory 詳細（新しい順・最大${MAX_V2_ROWS}件）`);
+  for (const r of v2.memory.rows) {
+    out.push(
+      `- ${r.id} [${r.kind}] created=${r.createdAt} date=${r.date}(UTC日 ${r.dateDay}) baseline=${r.beforeBaseline ? "前" : "後"} types=${r.types.join(",") || "-"}`
+    );
+    out.push(`    予測HOLD理由: ${r.causes.length ? r.causes.join(" + ") : "直接原因なし"}${r.context.length ? ` / 文脈: ${r.context.map((c) => (c === "H3" ? "H3候補" : c)).join(" + ")}` : ""}${r.causes.length + r.context.length === 0 ? "（該当なし）" : ""}`);
+    if (r.conversation) {
+      const c = r.conversation;
+      out.push(
+        `    元会話 ${r.conversationId}: IDB=${yn(c.inIdb)} OPFS=${yn(c.inOpfs)} created=${c.createdAt ?? "-"} started=${c.startedAt ?? "-"} updated=${c.updatedAt ?? "-"} baseline=${c.beforeBaseline === null ? "不明" : c.beforeBaseline ? "前" : "後"} status=${c.status ?? "-"} turns=${c.turns ?? "-"} 最終ターン=${c.lastTurnAt ?? "-"} memoryObjectIds=${c.memoryObjectIds ?? "-"} 最終ターン→Capture=${r.captureGapMinutes === null ? "-" : r.captureGapMinutes + "分"}`
+      );
+    } else {
+      out.push("    元会話: conversationIdなし");
+    }
+    out.push(`    台帳: ${ledgerLabel(r.ledger)} / Registry: ${registryLabel(r.registry)} / OPFSのその日のday-file: ${yn(r.dayFileInOpfs)} / 同じ日のbaseline以前のIDB Memory: ${r.legacyDayMates}件`);
+  }
+  if (v2.memory.omitted > 0) out.push(`…ほか${v2.memory.omitted}件（集計には含まれています）`);
+
+  out.push(`\n■ v2 Conversation 詳細（新しい順・最大${MAX_V2_ROWS}件）`);
+  for (const r of v2.conversation.rows) {
+    out.push(
+      `- ${r.id} created=${r.createdAt} started=${r.startedAt} updated=${r.updatedAt} baseline(作成)=${r.beforeBaseline ? "前" : "後"} status=${r.status} turns=${r.turns} 最終ターン=${r.lastTurnAt ?? "-"}`
+    );
+    out.push(`    予測HOLD理由: ${r.causes.length ? r.causes.map((c) => (c === "H3" ? "H3候補" : c)).join(" + ") : "該当なし"}`);
+    out.push(
+      `    memoryObjectIds: ${r.memoryObjectIds.length ? r.memoryObjectIds.join(",") : "なし"} / 台帳: ${ledgerLabel(r.ledger)} / Registry: ${registryLabel(r.registry)} / OPFS: ${yn(r.inOpfs)}`
+    );
+  }
+  if (v2.conversation.omitted > 0) out.push(`…ほか${v2.conversation.omitted}件（集計には含まれています）`);
+  return out;
 }

@@ -69,6 +69,28 @@ export default function AndroidDiagnostics() {
             ))}
           </section>
 
+          <section className="flex flex-col gap-1 rounded-xl border border-stone-300/60 px-3 py-2 dark:border-stone-600/60">
+            <h2 className="font-medium">診断v2：baseline以降のIDB-only</h2>
+            {state.report.v2?.available ? (
+              <>
+                <p>
+                  Memory {state.report.v2.memory.counts.total}件（H1: {state.report.v2.memory.counts.H1} / Registry HOLD:{" "}
+                  {state.report.v2.memory.counts.registry} / 直接原因なし: {state.report.v2.memory.counts.unresolved}）
+                </p>
+                <p>
+                  Conversation {state.report.v2.conversation.counts.total}件（H2: {state.report.v2.conversation.counts.H2} / H3候補:{" "}
+                  {state.report.v2.conversation.counts.H3} / Registry HOLD: {state.report.v2.conversation.counts.registry} / 原因未解決:{" "}
+                  {state.report.v2.conversation.counts.unresolved}）
+                </p>
+                <p className="text-xs text-stone-500 dark:text-stone-400">
+                  該当なしは推測で分類していません（書き込みの失敗などは、データだけでは排除できません）。詳細は下の結果をコピーしてください。
+                </p>
+              </>
+            ) : (
+              <p>{state.report.v2?.unavailableReason ?? "算出できませんでした。"}</p>
+            )}
+          </section>
+
           <pre className="whitespace-pre-wrap break-all rounded-xl bg-stone-50 px-3 py-2 font-mono text-[11px] leading-relaxed dark:bg-stone-950">
             {state.text}
           </pre>
