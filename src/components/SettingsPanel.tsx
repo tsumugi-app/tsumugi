@@ -1242,15 +1242,18 @@ export default function SettingsPanel({
         </section>
 
         {/*
-          データ管理（エクスポート・削除）。iPhone/iPad等、OPFS（この端末の安全な領域）に
-          保存している場合のみ表示する。PC/AndroidのFile System Access API Vault
-          （ユーザーが選んだ実フォルダ）は、Finder/エクスプローラーから直接読み書き
-          できるため、この導線自体を出さない（vaultBackend !== "opfs"では非表示）。
+          データ管理。「データ」セクションは全プラットフォームで表示する。
+          - Markdownエクスポート：OPFS（この端末の安全な領域）に保存している場合のみ。PC等のFile System
+            Access API Vault（ユーザーが選んだ実フォルダ）は、Finder/エクスプローラーから直接読み書きできる。
+          - 「この端末のTsumugiデータを完全に削除」：全プラットフォーム。通常の操作とは分けた危険操作として、
+            セクション末尾の赤い枠に置き、確認画面（チェック＋明示ボタン）を通った場合だけ削除を開始する
+            （実際の削除はdataWipe.ts）。
         */}
-        {vaultBackend === "opfs" && (
-          <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
-            <p className="text-sm text-stone-500 dark:text-stone-400">データ</p>
+        <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
+          <p className="text-sm text-stone-500 dark:text-stone-400">データ</p>
 
+          {vaultBackend === "opfs" && (
+          <>
             <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
               <div className="flex flex-col gap-0.5">
                 <span>Markdownをエクスポート</span>
@@ -1277,19 +1280,16 @@ export default function SettingsPanel({
                 {exportDataFeedback.message}
               </p>
             )}
-          </section>
-        )}
+          </>
+          )}
 
-        {/*
-          「この端末のTsumugiデータを完全に削除」。PC / Android / iPhone / iPadの全てで表示する。
-          確認画面（チェック＋明示ボタン）を通った場合だけ、削除を開始する（実際の削除はdataWipe.ts）。
-        */}
-        <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
-          <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
+          <div className="mt-2 flex flex-col gap-2 rounded-xl border border-red-300/60 bg-red-50/40 px-3 py-3 dark:border-red-800/60 dark:bg-red-950/20">
+            <p className="text-xs font-medium text-red-600 dark:text-red-400">危険な操作</p>
+          <div className="flex items-center justify-between gap-4 text-xs text-stone-600 dark:text-stone-300">
             <div className="flex flex-col gap-0.5">
               <span>この端末のTsumugiデータを完全に削除</span>
-              <span className="text-[11px] text-stone-400 dark:text-stone-500">
-                会話・記憶・設定・APIキー・端末内の保存先を消し、初期状態に戻します。
+              <span className="text-[11px] text-stone-500 dark:text-stone-400">
+                会話・記憶・設定・APIキー・端末内の保存先を消し、初期状態に戻します。元に戻せません。
               </span>
             </div>
             <button
@@ -1306,6 +1306,7 @@ export default function SettingsPanel({
           {deleteDataFeedback && deleteDataFeedback.kind !== "busy" && (
             <p className="text-xs text-red-600 dark:text-red-400">{deleteDataFeedback.message}</p>
           )}
+          </div>
         </section>
       </div>
 
@@ -1324,9 +1325,15 @@ export default function SettingsPanel({
             <ul className="flex list-disc flex-col gap-1 pl-5 text-xs">
               <li>Conversation（会話）</li>
               <li>Memory（記憶）</li>
+              <li>Source（取り込んだ資料）</li>
               <li>設定</li>
               <li>APIキー（削除後は入力し直しが必要です）</li>
-              {vaultBackend === "opfs" ? <li>この端末内の保存先（Vault）</li> : <li>保存先への接続（選んだフォルダとの紐づけ）</li>}
+              <li>アプリ内のデータベース（IndexedDB）</li>
+              {vaultBackend === "opfs" ? (
+                <li>この端末内のVault（OPFS）に保存された記録のすべて</li>
+              ) : (
+                <li>保存先への接続情報（選んだフォルダとの紐づけ）</li>
+              )}
             </ul>
             <p className="font-medium">この操作は元に戻せません。</p>
             {vaultBackend === "file-system-access" && (
