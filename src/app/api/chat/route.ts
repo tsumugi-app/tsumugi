@@ -173,11 +173,13 @@ const PERSONA_SYSTEM_PROMPT: Record<Persona, string> = {
 
 ## 過去の記憶（Retrieved Memories）の扱い方
 
-「過去の根拠」として語ってよいのは、**今回のリクエストで実際に提示されたRetrieved Memories**と、
-**現在の会話でユーザー自身が明示的に話した内容**だけ。会話履歴（turns）の中のAI自身の過去の
-発言（「あなたは余白を大切にしているのでは？」等の提案・比喩・仮説）は、それがRetrieved
-Memoriesに含まれていない限り、ユーザーの過去の事実・興味・経験として再利用しない。過去を
-参照するたびに今回のRetrieved Memoriesの中身だけを見て判断し直す。
+「過去の根拠」として語ってよいのは、**今回のリクエストで実際に提示されたRetrieved Memories・
+「直前の会話」・「ユーザーについて、すでに分かっている前提」**（提示されている場合）と、
+**現在の会話でユーザー自身が明示的に話した内容**だけ。会話履歴（turns）や「直前の会話」の中のAI
+自身の過去の発言（「あなたは余白を大切にしているのでは？」等の提案・比喩・仮説）は、それが
+Retrieved Memoriesに含まれていない限り、ユーザー自身の発言に根拠が無ければ、ユーザーの過去の
+事実・興味・経験として再利用しない。過去を参照するたびに、今回提示された情報源の中身だけを
+見て判断し直す。
 
 Memoryは事実の報告に使わない（「以前もこのことについて話されていましたね」のように引用・報告
 しない）。使うときは、今との違い・継続・変化など、今を理解するための背景として観察に自然に
@@ -926,6 +928,20 @@ function buildMemoryTimeLabel(memory: Pick<RetrievedMemory, "date" | "eventTime"
   return `[記録日: ${recordedDate} / 出来事: ${eventLabel}]`;
 }
 
+/**
+ * Conversation Evidence Boundary（全personaに常時適用。Retrieved Memoriesの有無に関わらず入る）。
+ * 禁止するのは、過去のTsumugi自身の解釈・提案だけを根拠に、ユーザーについての事実を確認済みとして扱うこと
+ * （自己増幅）だけ。直前の会話にTsumugiの発言を含めること、現在の回答でTsumugiが仮説・見方を述べることは妨げない。
+ * OK/NGの具体例は、ここには入れず、テストに固定している。
+ */
+const EVIDENCE_BOUNDARY_SECTION = `
+
+## 根拠の役割分担（常に適用）
+- ユーザーについての根拠：今回のユーザー発言、「直前の会話」の「ユーザー：」、ユーザーについての前提。
+- 過去の記憶・話題候補はAI要約を含みうる。解釈的な表現を、確認済みの事実として断定しない。
+- 今回・「直前の会話」の「Tsumugi：」は流れを理解する文脈。その発言だけを根拠に、ユーザーの事実・感情・意図・好み・性格・関係を確定しない（ユーザー自身の発言に根拠があれば使ってよい）。
+- 今の回答での仮説や見方は妨げない。過去のTsumugiの解釈を、確認済みのユーザー事実にしない。`;
+
 const MEMORY_TIME_INSTRUCTIONS = `
 ## 過去Memoryの時間の扱い（通常の記憶・話題候補・つながり・起点Memoryに共通）
 - 記録日はConversation／記録の日時であり、出来事の日付ではない。
@@ -1157,7 +1173,8 @@ ${transcript}
   と同じ判断基準）。「さっき◯◯と言っていましたね」と毎回説明することが目的ではなく、返答の
   理解が自然に深くなることを優先する。
 - この逐語に書かれていないことを、推測で「覚えている」と言わない。ここにもRetrieved Memories
-  にも根拠が無い過去について「さっき話した」と話を作らない。`;
+  にも根拠が無い過去について「さっき話した」と話を作らない。
+- 「Tsumugi：」の行は会話の流れのための文脈であり、それだけをユーザーについての事実の根拠にしない。`;
 }
 
 /**
@@ -1375,7 +1392,7 @@ export async function POST(request: Request) {
 
   const profileSection = buildProfileSection(sanitizeProfileContext(profile));
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${recentConversationSection}${topicContinuitySection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
