@@ -1,5 +1,6 @@
 "use client";
 
+import { requestFullWipe } from "@/lib/dataWipe";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
@@ -7,7 +8,6 @@ import {
   applyVaultLightCheckCandidates,
   checkVaultIdentity,
   classifyVaultLightCheckCandidates,
-  clearOpfsVault,
   collectAllMarkdownFiles,
   countVaultLightCheckCandidates,
   ensureVaultBaseline,
@@ -3409,35 +3409,23 @@ export default function ChatScreen() {
   }
 
   /**
-   * 「この端末に保存されているデータを削除」（データ管理機能・OPFSバックエンドのみ）。
-   * 削除するのはtsumugiが自分で作成・管理しているデータだけ：
-   *   - OPFS Vault本体（Conversations/Memories/Sources等のMarkdown一式）
-   *   - IndexedDBの派生キャッシュ（conversations/memoryObjects/sources/connectState）
-   * ブラウザ全体のデータ・他アプリのデータ・OSのストレージ・PC/Androidのユーザー選択
-   * Vault・APIキー等の設定（settings）・Vaultフォルダの参照（handles）には一切触れない
-   * （clearOpfsVault/clearMemoryDataそれぞれのコメント参照）。
-   *
-   * 実行前に必ずwindow.confirm()で明示的な確認を挟み、キャンセルされた場合は何もしない。
-   * 削除に成功したら、Vault・IndexedDB双方から復元されるはずの古いstate（会話・Memory等）
-   * が画面に残り続けないよう、ページごとリロードする。
+   * 「この端末のTsumugiデータを完全に削除」（PC / Android / iPhone / iPad共通）。
+   * ここでは削除しない。確認画面（SettingsPanel）を通った後、durable wipe markerを書いてページを
+   * リロードするだけ。実際の削除は、リロード後にアプリ本体が起動する前に`WipeGate`が行う
+   * （実行中のCapture・Connect・Reflection・会話保存・Vault書き込み等が古いデータを書き戻さないようにするため。
+   * 詳細は`dataWipe.ts`）。markerを書けなかった場合は何も変更せず、エラーを表示する。
    */
-  async function handleDeleteData() {
-    if (vaultBackend !== "opfs" || !vaultHandle) return;
-    const confirmed = window.confirm(
-      "この端末に保存されているtsumugiのデータを削除します。\nこの操作は元に戻せません。\n本当に削除しますか？"
-    );
-    if (!confirmed) return;
-
-    setDeleteDataFeedback({ kind: "busy", message: "削除しています…" });
+  function handleWipeAllData() {
+    setDeleteDataFeedback({ kind: "busy", message: "削除を開始しています…" });
     try {
-      await clearOpfsVault(vaultHandle);
-      await clearMemoryData();
-      window.location.reload();
+      requestFullWipe();
     } catch (error) {
-      console.error("Failed to delete data", error);
-      setDeleteDataFeedback({ kind: "error", message: "データの削除に失敗しました。" });
-      window.setTimeout(() => setDeleteDataFeedback(null), 4000);
+      console.error("Failed to start full wipe", error);
+      setDeleteDataFeedback({ kind: "error", message: "削除を開始できませんでした。何も削除していません。" });
+      window.setTimeout(() => setDeleteDataFeedback(null), 6000);
+      return;
     }
+    window.location.reload();
   }
 
   /**
@@ -4949,7 +4937,7 @@ export default function ChatScreen() {
             exportDataFeedback={exportDataFeedback}
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}
-            onDeleteData={() => void handleDeleteData()}
+            onWipeAllData={handleWipeAllData}
             vaultLightCheckStatus={vaultLightCheckStatus}
             onConfirmVaultLightCheck={() => void handleConfirmVaultLightCheck()}
             onApplyVaultLightCheck={() => void handleApplyVaultLightCheck()}

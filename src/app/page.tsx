@@ -1,5 +1,10 @@
 import ChatScreen from "@/components/ChatScreen";
+import WipeGate from "@/components/WipeGate";
 
 export default function Home() {
-  return <ChatScreen />;
+  return (
+    <WipeGate>
+      <ChatScreen />
+    </WipeGate>
+  );
 }

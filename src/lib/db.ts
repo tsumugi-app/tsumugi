@@ -7,6 +7,7 @@
 
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
+import { isWipePending, WipeInProgressError } from "./wipeState";
 import type { Conversation, MemoryObject, Source } from "./types";
 import type { AIProviderName } from "./ai/types";
 
@@ -82,6 +83,10 @@ let dbPromise: Promise<IDBPDatabase<TsumugiDB>> | null = null;
  * （openDB呼び出しの前後にログを追加するだけ）。原因調査が終わり次第削除すること。
  */
 function getDB() {
+  // 完全削除が開始済み（durable markerあり）なら、接続が既にキャッシュされていても、新規に開く場合でも、
+  // 以降のIndexedDBアクセスを全て拒否する。削除中・削除後に遅れて動く古い処理（Capture/Connect/
+  // Reflection/revisitPrompt/会話保存等）が、消したデータを書き戻す・空DBを作り直すことを防ぐ。
+  if (isWipePending()) return Promise.reject(new WipeInProgressError());
   if (!dbPromise) {
     const openStart = Date.now();
     console.log(`[DB] open:start hidden=${hiddenFlag()}`);
@@ -131,6 +136,13 @@ function getDB() {
         const durationMs = Date.now() - openStart;
         console.log(`[DB] open:blocking hidden=${hiddenFlag()} durationMs=${durationMs}`);
         logTimingEvent("DB open:blocking", { hidden: hiddenFlag(), durationMs });
+        // 完全削除（deleteDatabase）が別タブから要求されている間だけ、接続を閉じて削除を通す。
+        // それ以外（通常のアップグレード待ち等）の挙動は変えない。
+        if (isWipePending()) {
+          const pending = dbPromise;
+          dbPromise = null;
+          void pending?.then((db) => db.close()).catch(() => undefined);
+        }
       },
       terminated() {
         const durationMs = Date.now() - openStart;

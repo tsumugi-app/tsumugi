@@ -43,7 +43,7 @@ export default function SettingsPanel({
   exportDataFeedback,
   deleteDataFeedback,
   onExportData,
-  onDeleteData,
+  onWipeAllData,
   vaultLightCheckStatus,
   onConfirmVaultLightCheck,
   onApplyVaultLightCheck,
@@ -92,7 +92,7 @@ export default function SettingsPanel({
   exportDataFeedback: DataActionFeedback | null;
   deleteDataFeedback: DataActionFeedback | null;
   onExportData: () => void;
-  onDeleteData: () => void;
+  onWipeAllData: () => void;
   /**
    * 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。"idle"の間は何も
    * 表示しない（起動時のLevel 1/2で候補が1件も無い場合も含む）。
@@ -143,6 +143,8 @@ export default function SettingsPanel({
 }) {
   // 保存先の技術的な確認機能（既存の4つの入口・外部変更の詳細表示）は、通常のUIには出さず、
   // `?debugLog=1`のときだけ「詳細（開発者向け）」に表示する（機能・handler・stateは削除していない）。
+  const [wipeConfirmOpen, setWipeConfirmOpen] = useState(false);
+  const [wipeAcknowledged, setWipeAcknowledged] = useState(false);
   const [showAdvancedVaultTools] = useState(() => {
     try {
       return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debugLog") === "1";
@@ -1275,28 +1277,93 @@ export default function SettingsPanel({
                 {exportDataFeedback.message}
               </p>
             )}
-
-            <div className="flex items-center justify-between gap-4 pt-1 text-xs text-stone-500 dark:text-stone-400">
-              <div className="flex flex-col gap-0.5">
-                <span>この端末のデータを削除</span>
-                <span className="text-[11px] text-stone-400 dark:text-stone-500">
-                  この端末に保存されているtsumugiのデータを削除します。
-                </span>
-              </div>
-              <button
-                onClick={onDeleteData}
-                disabled={deleteDataFeedback?.kind === "busy"}
-                className="shrink-0 rounded-full border border-red-300/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-500/10 disabled:opacity-50 dark:border-red-700/60 dark:text-red-400 dark:hover:bg-red-500/10"
-              >
-                {deleteDataFeedback?.kind === "busy" ? "削除中…" : "削除する"}
-              </button>
-            </div>
-            {deleteDataFeedback && deleteDataFeedback.kind !== "busy" && (
-              <p className="text-xs text-red-600 dark:text-red-400">{deleteDataFeedback.message}</p>
-            )}
           </section>
         )}
+
+        {/*
+          「この端末のTsumugiデータを完全に削除」。PC / Android / iPhone / iPadの全てで表示する。
+          確認画面（チェック＋明示ボタン）を通った場合だけ、削除を開始する（実際の削除はdataWipe.ts）。
+        */}
+        <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
+          <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
+            <div className="flex flex-col gap-0.5">
+              <span>この端末のTsumugiデータを完全に削除</span>
+              <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                会話・記憶・設定・APIキー・端末内の保存先を消し、初期状態に戻します。
+              </span>
+            </div>
+            <button
+              onClick={() => {
+                setWipeAcknowledged(false);
+                setWipeConfirmOpen(true);
+              }}
+              disabled={deleteDataFeedback?.kind === "busy"}
+              className="shrink-0 rounded-full border border-red-300/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-500/10 disabled:opacity-50 dark:border-red-700/60 dark:text-red-400 dark:hover:bg-red-500/10"
+            >
+              {deleteDataFeedback?.kind === "busy" ? "削除中…" : "削除する…"}
+            </button>
+          </div>
+          {deleteDataFeedback && deleteDataFeedback.kind !== "busy" && (
+            <p className="text-xs text-red-600 dark:text-red-400">{deleteDataFeedback.message}</p>
+          )}
+        </section>
       </div>
+
+      {wipeConfirmOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="wipe-confirm-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+        >
+          <div className="flex max-h-[90vh] w-full max-w-sm flex-col gap-4 overflow-y-auto rounded-2xl bg-white p-5 text-sm text-stone-700 shadow-xl dark:bg-stone-900 dark:text-stone-300">
+            <h2 id="wipe-confirm-title" className="text-base font-medium text-red-600 dark:text-red-400">
+              この端末のTsumugiデータを完全に削除しますか？
+            </h2>
+            <p>次のものが、この端末から削除されます。</p>
+            <ul className="flex list-disc flex-col gap-1 pl-5 text-xs">
+              <li>Conversation（会話）</li>
+              <li>Memory（記憶）</li>
+              <li>設定</li>
+              <li>APIキー（削除後は入力し直しが必要です）</li>
+              {vaultBackend === "opfs" ? <li>この端末内の保存先（Vault）</li> : <li>保存先への接続（選んだフォルダとの紐づけ）</li>}
+            </ul>
+            <p className="font-medium">この操作は元に戻せません。</p>
+            {vaultBackend === "file-system-access" && (
+              <p className="rounded-xl bg-stone-100 px-3 py-2 text-xs dark:bg-stone-800">
+                外部保存先のファイルは削除されません。同じ保存先を再接続すると、記録を再読み込みできます。
+              </p>
+            )}
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={wipeAcknowledged}
+                onChange={(event) => setWipeAcknowledged(event.target.checked)}
+                className="mt-0.5"
+              />
+              <span>元に戻せないことを理解しました</span>
+            </label>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setWipeConfirmOpen(false)}
+                className="rounded-full border border-stone-300/60 px-4 py-2 text-xs transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:hover:bg-white/5"
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={() => {
+                  setWipeConfirmOpen(false);
+                  onWipeAllData();
+                }}
+                disabled={!wipeAcknowledged}
+                className="rounded-full border border-red-400/60 bg-red-600 px-4 py-2 text-xs text-white transition hover:bg-red-700 disabled:opacity-40"
+              >
+                完全に削除する
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

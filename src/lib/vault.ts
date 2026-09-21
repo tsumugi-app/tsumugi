@@ -54,6 +54,7 @@ import {
   sourceToMarkdown,
 } from "./markdown";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
+import { isWipePending, WipeInProgressError } from "./wipeState";
 
 /**
  * B1（軽量Registry index・多tab安全性設計）：このpage load（session）固有の
@@ -641,6 +642,8 @@ function enqueueVaultWrite<T>(
   priority: VaultWritePriority = "interactive",
   conflictKey: string | null = null
 ): Promise<T> {
+  // 完全削除が開始済みなら、新しいVault書き込みは受け付けない（消したデータの書き戻し防止）。
+  if (isWipePending()) return Promise.reject(new WipeInProgressError());
   const seq = ++vaultWriteSeq;
   const enqueuedAt = Date.now();
   console.log(`[Vault] write:enqueue seq=${seq} priority=${priority}`);
