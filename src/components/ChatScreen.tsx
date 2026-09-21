@@ -1,6 +1,7 @@
 "use client";
 
 import { requestFullWipe } from "@/lib/dataWipe";
+import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
@@ -818,6 +819,17 @@ export default function ChatScreen() {
    * （入力中の下書きを保護するため。ユーザー操作でのリロードのみ）。
    */
   const [crossTabStale, setCrossTabStale] = useState(false);
+  /**
+   * 起動時のVault初期化が終わる前（tabVaultEpoch未確定かつvaultStatus==="checking"）に、Memory World操作が
+   * 拒否された場合の一時的な案内。crossTabStale（実際の別タブ切替・epoch不一致）とは別物。表示は
+   * `vaultStatus === "checking"`の間だけ（下のバナー参照）なので、初期化が終われば自動的に消える。
+   */
+  const [vaultPreparingNotice, setVaultPreparingNotice] = useState(false);
+  // 非同期に遅れて呼ばれるhandleStaleVaultTabErrorが、古いrenderのvaultStatusを見ないよう、最新値をrefへ持つ。
+  const vaultStatusRef = useRef<VaultStatus>("checking");
+  useEffect(() => {
+    vaultStatusRef.current = vaultStatus;
+  }, [vaultStatus]);
 
   useEffect(() => {
     const unsubscribe = subscribeVaultSwitchNotifications((epoch) => {
@@ -959,6 +971,13 @@ export default function ChatScreen() {
    */
   function handleStaleVaultTabError(error: unknown): boolean {
     if (error instanceof StaleVaultTabError) {
+      // 起動時のVault初期化が終わる前の拒否は、別タブの切替ではない。crossTabStaleにせず、一時的な準備中案内にする
+      // （操作自体は、withVaultWorldReadが既に拒否している＝fail-closedのまま）。
+      if (isVaultStartupInProgress(getTabVaultEpoch(), vaultStatusRef.current)) {
+        console.warn("[Tsumugi] Memory World operation refused: the vault is still being prepared.", error);
+        setVaultPreparingNotice(true);
+        return true;
+      }
       console.error("[Tsumugi] Memory World operation refused: this tab is stale relative to the active vault.", error);
       setCrossTabStale(true);
       return true;
@@ -4257,6 +4276,11 @@ export default function ChatScreen() {
         場合のバナー。UX通知専用（安全性の根拠にはしない。実際の保護は各Memory World操作
         自身のロック＋epoch確認）。自動リロードはしない（入力中の下書きを保護するため）。
       */}
+      {vaultPreparingNotice && vaultStatus === "checking" && (
+        <div role="status" className="shrink-0 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
+          保存先を準備中です。少し待ってからもう一度お試しください。
+        </div>
+      )}
       {crossTabStale && (
         <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
           <span>別のタブで保存先が変更されました。再読み込みしてください。</span>

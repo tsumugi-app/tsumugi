@@ -260,6 +260,18 @@ export default function SettingsPanel({
             </div>
           )}
 
+          {/*
+            起動時のVault初期化中（vaultStatus==="checking"）。以前はこの間、見出しだけが表示されていた。
+            初回（完全削除後・新規インストール直後）は、保存先の準備に時間がかかることがある。
+            端末内OPFSでもPCの外部フォルダでも不自然にならない、platform共通の文言にする。
+          */}
+          {vaultStatus === "checking" && (
+            <div role="status" className="flex flex-col gap-0.5 text-xs text-stone-500 dark:text-stone-400">
+              <span>保存先を準備しています…</span>
+              <span className="text-[11px] text-stone-400 dark:text-stone-500">初回は少し時間がかかることがあります</span>
+            </div>
+          )}
+
           {vaultStatus === "connected" && vaultHandle && (
             <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
               <span>保存先：{vaultBackend === "opfs" ? "この端末の安全な領域" : vaultHandle.name}</span>
