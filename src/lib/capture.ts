@@ -9,7 +9,7 @@
 import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObject } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
-import { writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
+import { isReflectionSummary, writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "./retrieval";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
@@ -103,6 +103,23 @@ const CROSS_CONVERSATION_MIN_SCORE = KEYWORD_WEIGHT;
  * existingMemoryObjects（このConversationから既に生成済みのMemory）と同じMemoryが
  * 二重に候補へ入らないよう、conversationIdによる除外に加えてid自体でも除外する。
  */
+/**
+ * Capture Reflection保護（2026-09-23）：Reflection（`isReflectionSummary`、
+ * `metadata.source === "system-generated"`）は、別Conversationからの類似候補
+ * （relatedMemories）として通常CaptureのexistingMemoryId対象に含めない。
+ *
+ * 実データで確認された不具合：Reflectionは会話の要約・洞察をAIが独自に統合して
+ * 作る記録であり、topicの類似度だけなら通常Memory以上に幅広い会話とマッチしやすい。
+ * 除外しないと、無関係な新しいUser発言から生成されたMemory候補が、LLMの
+ * existingMemoryId判断によって既存のReflectionへ「UPDATE」として統合され、
+ * Reflection本来の内容（content/summary/types）を上書きしてしまう
+ * （実例：2026-08-23生成のReflection`01M0Q9P2JNZYFX42RXFHF3JE2X`が、無関係な
+ * 2026-09-22のCaptureによって上書きされた）。
+ *
+ * Reflection自体のRetrieval参照・Reflection生成処理（reflection.ts、
+ * /api/reflect）はこの関数の対象外であり、一切変更しない——ここで除外するのは
+ * 「通常CaptureのUPDATE候補として提示するかどうか」という一点だけ。
+ */
 async function findRelatedMemoriesFromOtherConversations(
   conversation: Conversation,
   existingMemoryObjects: MemoryObject[]
@@ -118,6 +135,7 @@ async function findRelatedMemoriesFromOtherConversations(
   const existingIds = new Set(existingMemoryObjects.map((memory) => memory.id));
 
   return all
+    .filter((memory) => !isReflectionSummary(memory))
     .filter((memory) => !isSameConversation(memory.conversationId, conversation.id))
     .filter((memory) => !existingIds.has(memory.id))
     .map((memory) => ({ memory, score: scoreMemory(memory, queryText) }))
@@ -341,7 +359,16 @@ async function captureConversationImpl(
   }
 
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
-    const existing = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
+    const matched = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
+    // Capture Reflection保護・二重防御（2026-09-23）：`findRelatedMemoriesFromOtherConversations`
+    // が既にReflectionを候補から除外しているため通常はここに来ないはずだが、
+    // existingMemoryObjects（このConversation自身から既に生成済みのMemory）側に
+    // 万一Reflectionが含まれていた場合や、将来の変更で候補構築ロジックが変わった
+    // 場合に備え、UPDATE適用の直前でもう一度fail-safeとして確認する。Reflectionが
+    // 一致した場合はUPDATE対象として扱わず（`existing`をundefinedにフォールバック
+    // し）、常にNEW Memoryとして作成する——ReflectionのUPDATEは通常Captureの
+    // どの経路からも一切発生させない。
+    const existing = matched && isReflectionSummary(matched) ? undefined : matched;
     const resolvedTopicId = resolveTopicId(item, existing);
     const resolvedEventTime = resolveEventTime(item, existing);
     logTimingEvent("Capture topicDecision", {
