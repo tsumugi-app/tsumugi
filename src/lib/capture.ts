@@ -135,6 +135,46 @@ async function findRelatedMemoriesFromOtherConversations(
  * 送らない。トークン節約と、AIに既存Memoryをまるごと書き直させないため）。
  * /api/capture側で、この2つは別のセクションとしてAIへ提示され、区別される。
  */
+/**
+ * Capture Evidence Boundary観測性（2026-09-23、挙動は一切変更しない）：/api/captureが
+ * 返す`X-Tsumugi-Evidence`ヘッダ（proposed/accepted/dropped件数、任意でdrop理由ごとの
+ * 内訳）を、既存のCapture診断ログ経路（`logTimingEvent`、Capture topicDecision/
+ * profileClaimsと同じ仕組み）へそのまま記録するだけの副作用。会話内容・User/Assistant
+ * 発言・evidenceQuotes・Memory本文・個人情報は一切渡さない（渡すのは件数と、
+ * ハイフン区切りの理由ラベルだけ）。
+ *
+ * ヘッダが無い・想定外の形式の場合は、既存の実装が無かった場合と同じく単に記録を
+ * skipする（例外を投げない）。ヘッダの有無・内容は、Captureの成否・戻り値
+ * （`extractMemories`が返すMemory候補の内容）に一切影響しない——この関数の戻り値は
+ * 常に`void`で、呼び出し元はこの関数の結果を一切利用しない。
+ */
+function logEvidenceBoundaryHeader(res: Response): void {
+  const header = res.headers.get("X-Tsumugi-Evidence");
+  if (!header) return;
+  try {
+    const params: Record<string, number | string> = {};
+    for (const part of header.split(";")) {
+      const [key, value] = part.split("=");
+      if (!key || value === undefined) continue;
+      if (key === "proposed" || key === "accepted" || key === "dropped") {
+        const n = Number(value);
+        if (Number.isFinite(n)) params[key] = n;
+      } else if (key === "dropReasons" && value) {
+        // "not-found:1,missing:2" のような形式。理由ラベルごとの件数だけを個別キーへ展開する。
+        for (const pair of value.split(",")) {
+          const [reason, countStr] = pair.split(":");
+          if (!reason || countStr === undefined) continue;
+          const count = Number(countStr);
+          if (Number.isFinite(count)) params[`drop_${reason}`] = count;
+        }
+      }
+    }
+    if (Object.keys(params).length > 0) logTimingEvent("Capture evidenceBoundary", params);
+  } catch {
+    // 診断目的のヘッダparseであり、失敗してもCapture本体には一切影響させない。
+  }
+}
+
 async function extractMemories(
   persona: Persona,
   turns: ConversationTurn[],
@@ -166,6 +206,7 @@ async function extractMemories(
   if (!res.ok) {
     throw new Error(`capture request failed with status ${res.status}`);
   }
+  logEvidenceBoundaryHeader(res);
   const data = (await res.json()) as { memories: ExtractedMemory[] };
   return data.memories ?? [];
 }

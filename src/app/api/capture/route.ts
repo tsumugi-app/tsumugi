@@ -379,6 +379,14 @@ function finalizeEventTimeForMemory(memory: Record<string, unknown>, turns: Conv
 }
 
 /**
+ * 観測性のみの追加（2026-09-23）。dropの理由をログ集計するためだけの列挙値。
+ * validation自体のロジック・判定結果には一切影響しない（既存のboolean判定をそのまま
+ * 維持し、その判定に至った理由をラベル付けするだけ）。値そのものにUser/Assistant発言・
+ * quote本文は一切含まない（列挙値のみ）。
+ */
+type EvidenceDropReason = "missing" | "invalid-count" | "invalid-type" | "empty-quote" | "not-found";
+
+/**
  * Capture Evidence Boundary（Memory本体、2026-09-23）。「このMemory候補を成立させる根拠」
  * としてLLM自身が提出した`evidenceQuotes`を、実際のUser turnへ決定的に照合する。
  * Profile v1の`quote`検証（profile.ts `validateProfileCandidates`）・Event Time Phase 2の
@@ -399,22 +407,30 @@ function finalizeEventTimeForMemory(memory: Record<string, unknown>, turns: Conv
  * - 各要素は、normalizeText後、USER turn（role: "user"）のいずれかのcontentに
  *   normalizeText後の状態で部分一致（exact substring）すること。AI turn（role: "ai"）
  *   にしか存在しない・どこにも存在しない場合は無効
- * 1つでも上記を満たさない要素があれば、この関数はfalseを返す（呼び出し元がMemory候補
- * 全体を破棄する）。
+ * 1つでも上記を満たさない要素があれば、この関数はvalid:falseを返す（呼び出し元が
+ * Memory候補全体を破棄する。判定ロジック自体は観測性追加の前後で一切変更していない）。
+ *
+ * 観測性のみの追加：戻り値を`boolean`から`{valid, reason?}`へ変更した。`valid`の
+ * 計算式・分岐条件・判定順序は変更前と完全に同一で、各`return false`の位置に、その
+ * 場所を表す`reason`ラベルを付けただけ（新しい判定条件は追加していない）。
  */
-function validateMemoryEvidenceQuotes(turns: ConversationTurn[], rawEvidenceQuotes: unknown): boolean {
-  if (!Array.isArray(rawEvidenceQuotes) || rawEvidenceQuotes.length < 1 || rawEvidenceQuotes.length > 4) return false;
+function validateMemoryEvidenceQuotes(
+  turns: ConversationTurn[],
+  rawEvidenceQuotes: unknown
+): { valid: boolean; reason?: EvidenceDropReason } {
+  if (!Array.isArray(rawEvidenceQuotes)) return { valid: false, reason: "missing" };
+  if (rawEvidenceQuotes.length < 1 || rawEvidenceQuotes.length > 4) return { valid: false, reason: "invalid-count" };
   const userTurns = turns.filter((turn) => turn.role === "user");
   for (const rawQuote of rawEvidenceQuotes) {
-    if (typeof rawQuote !== "string") return false;
+    if (typeof rawQuote !== "string") return { valid: false, reason: "invalid-type" };
     const quote = rawQuote.trim();
-    if (!quote) return false;
+    if (!quote) return { valid: false, reason: "empty-quote" };
     const nq = normalizeText(quote);
-    if (!nq) return false;
+    if (!nq) return { valid: false, reason: "empty-quote" };
     const existsInUserTurn = userTurns.some((turn) => normalizeText(turn.content).includes(nq));
-    if (!existsInUserTurn) return false;
+    if (!existsInUserTurn) return { valid: false, reason: "not-found" };
   }
-  return true;
+  return { valid: true };
 }
 
 /**
@@ -722,12 +738,18 @@ export async function POST(request: Request) {
     // このゲートの対象外として従来通り後続へ素通りさせる（isRecordチェック自体は
     // 既存のfinalizeEventTimeForMemory呼び出し前のガードで担っており、ここでの責務は
     // 「evidenceQuotesを持つMemory候補の根拠検証」だけに限定する）。
+    // 観測性のみの追加：dropReasonsは件数集計のためだけに保持する（内容は一切含まない）。
+    // filterの採否判定（`result.valid`）自体は観測性追加の前後で完全に同一。
     let evidenceDroppedCount = 0;
+    const evidenceDropReasons: Partial<Record<EvidenceDropReason, number>> = {};
     const memories = memoriesRaw.filter((memory) => {
       if (!isRecord(memory)) return true;
-      const grounded = validateMemoryEvidenceQuotes(turns, memory.evidenceQuotes);
-      if (!grounded) evidenceDroppedCount += 1;
-      return grounded;
+      const result = validateMemoryEvidenceQuotes(turns, memory.evidenceQuotes);
+      if (!result.valid) {
+        evidenceDroppedCount += 1;
+        if (result.reason) evidenceDropReasons[result.reason] = (evidenceDropReasons[result.reason] ?? 0) + 1;
+      }
+      return result.valid;
     });
 
     const profileBudget = { remaining: PROFILE_LIMITS.perCapture };
@@ -749,8 +771,14 @@ export async function POST(request: Request) {
       return finalizeProfileClaimsForMemory(withEventTime, turns, todayDateString, profileBudget, profileStats);
     });
     const headers: Record<string, string> = { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) };
-    // 品質の観測用（件数のみ。会話・Memory本文・quoteの内容は含めない）。
-    headers["X-Tsumugi-Evidence"] = `proposed=${memoriesRaw.length};accepted=${memories.length};dropped=${evidenceDroppedCount}`;
+    // 品質の観測用（件数・理由の列挙値のみ。会話・Memory本文・quoteの内容は含めない）。
+    // dropReasonsは"reason:count"をカンマ区切りで並べるだけ（0件の理由キーは出力しない）。
+    const dropReasonsPart = Object.entries(evidenceDropReasons)
+      .map(([reason, count]) => `${reason}:${count}`)
+      .join(",");
+    headers["X-Tsumugi-Evidence"] =
+      `proposed=${memoriesRaw.length};accepted=${memories.length};dropped=${evidenceDroppedCount}` +
+      (dropReasonsPart ? `;dropReasons=${dropReasonsPart}` : "");
     if (profileEnabled) {
       // 品質の観測用（件数のみ。会話・claimの内容は含めない）
       headers["X-Tsumugi-Profile-Claims"] = `proposed=${profileStats.proposed};accepted=${profileStats.accepted};dropped=${Object.values(profileStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
