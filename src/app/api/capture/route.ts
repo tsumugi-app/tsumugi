@@ -176,28 +176,75 @@ Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは�
 - summaryとcontentは会話が使われた言語（通常は日本語）で書く
 - 必ず指定されたJSON形式のみで出力する
 
-Memory grounding rules（記憶として保存してよい根拠の境界）:
-1. Memoryとして保存する事実・経験・関心・意向・判断は、USER'S ACTUAL STATEMENTSに
-   明示的に根拠があるものだけを採用する。
-2. AI RESPONSESに含まれる提案、推測、質問、例、店名、サービス名、アプリ名、人物名、
-   価値観、人物像、アイデア、予定などを、Userが述べた事実としてMemory化してはいけない。
-   これに加えて、AIが説明した対象の特徴・属性・評価・形容・雰囲気・味・印象なども、
-   Userが実際にそう述べていない限り、Userの好み・希望・事実として保存してはいけない。
-   例：AI「落ち着いた雰囲気の店です」「パスタがおいしい店です」
-   　→ Userがそれについて何も言っていなければ、「Userは落ち着いた店を好む」
-   　　「Userはおいしいパスタを求めている」のようにUserの好みとして保存してはいけない。
-3. AI RESPONSESはUSER'S ACTUAL STATEMENTSの意味や文脈を理解するためだけに使用する。
-   AIによる説明・形容・評価も同様に、あくまで文脈理解のためだけに使う。
-4. UserがAIの提案に明示的または文脈上明確に同意・選択・反応した場合、そのUser発言に
-   基づいて、その対象への関心・選択・意向をMemory化してよい。
-   例：AI「Obsidianで記録してみるのはどうですか？」User「それいいね」
-   　→「Obsidianに関心を示した」はMemory化してよい。
-   一方：AI「Obsidianで記録してみるのはどうですか？」User「なるほど」
-   　→ UserがObsidianを使っている／関心がある、とは断定しない。
-5. AIが会話中に新しく作った概念・テーマ・人物像・理論・メソッド・比喩などを、それだけを
-   根拠としてUserの過去の関心や価値観として保存してはいけない。
-6. Userが実際に述べた内容を超えて推測・補完しない。
-7. Memoryの文章は、可能な限りUserが実際に話した具体的な内容に基づいて作成する。`;
+Memory Evidence Boundary（記憶として保存してよい根拠の境界。最重要。既存Memoryを
+UPDATEする場合も、新規Memoryを作る場合も、この境界は同じように適用される）:
+
+Assistant responses are context, not evidence.
+AI RESPONSESは、USER'S ACTUAL STATEMENTSの意味・対象を正しく理解するための文脈情報
+です。AI RESPONSES自体が新しく述べた内容を、Userについての事実としてMemory化しては
+いけません。
+
+- AI RESPONSESを使ってよいのは、次のようにUserの発言の意味を正しく理解するためだけです：
+  - 直前の質問が何についてのものだったか（質問対象）
+  - 代名詞・指示語が指すもの
+  - 省略された主語・目的語
+  - 「はい」「そう」「かなり好き」のような短い返答が、何に対する返答か
+  - 会話のトピック
+- AI RESPONSESで新しく登場した、次のような内容を、それ単独でMemoryへ昇格させては
+  いけません：
+  - Userの感情・性格・意図・好み・人間関係についての、AI自身の解釈や推測
+  - AIによる評価・形容・印象（「落ち着いた雰囲気」「パスタがおいしい」等）
+  - AIが述べた外部の事実（店名・サービス名・仕様・人物の役職等）
+  - AIが会話中に新しく作った概念・テーマ・理論・比喩・物語的な意味づけ
+  - AIの提案・例・アイデア・予定
+- Userが、AIの提案・説明・言い換えに対して明示的または文脈上明確に同意・選択・反応
+  した場合は、その反応そのもの（Userの発言）を根拠にMemory化してよい。
+  例：AI「Obsidianで記録してみるのはどうですか？」User「それいいね」
+  　→「Obsidianに関心を示した」はMemory化してよい（根拠はUserの「それいいね」）。
+  一方：AI「Obsidianで記録してみるのはどうですか？」User「なるほど」
+  　→ UserがObsidianを使っている／関心がある、とは断定しない。
+- AIが会話中に新しく作った概念・テーマ・人物像・理論・メソッド・比喩などを、それだけを
+  根拠としてUserの過去の関心や価値観として保存してはいけない。
+- Userが実際に述べた内容を超えて推測・補完しない。
+
+evidenceQuotes（この記憶を成立させる直接の根拠。必須）:
+- 各Memory候補について、その記憶の内容を裏付ける、USER'S ACTUAL STATEMENTSからの
+  短い逐語引用（要約や言い換えではなく、実際にUserが書いた文字列そのもの）を1〜4件、
+  evidenceQuotesへ設定する。
+- evidenceQuotesに含めるquoteは、すべて実際のUser発言に文字通り存在するものだけに
+  する。AI RESPONSESにしか存在しない文言・要約・言い換え・実際には無い発言を、
+  quoteとして作り出してはいけない。1件でもUser発言に存在しないquoteが含まれていると、
+  そのMemory候補は全体としてTsumugi側で破棄される（他のquoteが正しくても救済されない）。
+- evidenceQuotesは「このMemoryの根拠になったUser発言」であり、content/summaryは
+  それらを引用符のまま連結する必要はない。paraphrase（言い換え）・表現の正規化・
+  主語や目的語の補完・代名詞の解決は許可される。ただし、evidenceQuotesおよびUserの
+  発言が持つ意味の範囲を超えて、新しい意味・感情・評価・解釈を追加してはいけない。
+
+content/summaryの境界（許可される整理 と 許可されない追加の区別）:
+- 許可される（意味の整理）：paraphrase、表現の正規化、主語・目的語の補完、代名詞の
+  解決、Assistantの質問を利用した短い返答の意味解決。
+  OK例：AI「運転するのは好きですか？」User「かなり好き。」
+  　→ evidenceQuotes: ["かなり好き。"]、content:「車を運転するのが好き」→ OK
+  　　（「運転」という対象はAIの質問を参照して補っただけで、新しい意味は加えていない）
+- 許可されない（意味の追加）：AI RESPONSESが述べた感情・意図・評価・物語的な意味づけを、
+  Userの発言であるかのようにcontent/summaryへ含めること。summaryもcontentと同じ境界に
+  従う（summaryだけ安全というのは誤り）。
+  NG例1：User「運転は好き。」／AI「運転するとリフレッシュになりますよね。」
+  　→ content「運転がリフレッシュになっている」→ NG
+  　　（「リフレッシュ」はAIが述べただけで、Userは言っていない）
+  NG例2：User「長男はいつも後ろで騒いでいる。」／AI「それも家族ドライブらしい光景ですね。」
+  　→ content「長男が騒ぐことを家族ドライブの光景として受け入れている」→ NG
+  　　（「受け入れている」というUserの心情はAIが加えたもので、Userは述べていない）
+
+keywords:
+- keywordsも、Userの発言・検証済みevidenceQuotesが表すトピックに対応する語を優先する。
+- AI RESPONSESにしか登場しない、Assistant独自の解釈・言い換えの語をkeywordとして
+  追加しない。
+  例：User「車で移動した。運転は好き」、AI「家族ドライブですね」の場合、「車」「運転」は
+  User発言に直接対応するため良いが、「ドライブ」はAIが使った語であり、User発言に直接
+  対応しないなら避ける。
+
+Memoryの文章は、可能な限りUserが実際に話した具体的な内容に基づいて作成する。`;
 
 function buildTranscript(turns: ConversationTurn[]): string {
   const userLines = turns
@@ -332,6 +379,45 @@ function finalizeEventTimeForMemory(memory: Record<string, unknown>, turns: Conv
 }
 
 /**
+ * Capture Evidence Boundary（Memory本体、2026-09-23）。「このMemory候補を成立させる根拠」
+ * としてLLM自身が提出した`evidenceQuotes`を、実際のUser turnへ決定的に照合する。
+ * Profile v1の`quote`検証（profile.ts `validateProfileCandidates`）・Event Time Phase 2の
+ * `eventTimeQuote`検証（`resolveEventTimeQuoteBasisJstDate`、本ファイル）と同じ
+ * 「normalizeTextで正規化してからexact substring match、User turnのみを証拠として認める」
+ * パターンを再利用する（`normalizeText`はprofile.tsから読み取り専用でimportするだけで、
+ * Profile自体のロジック・挙動は一切変更しない）。
+ *
+ * fail-closed（Event Time・Profileより厳しい）：evidenceQuotesのうち1件でも実際のUser turn
+ * に存在しなければ、そのMemory候補**全体**を破棄する。他の有効なquoteがあっても部分的に
+ * 救済しない——「この記憶の根拠」としてLLMが自ら提出した集合の中にAI由来・捏造のquoteが
+ * 1件でも混ざっている時点で、そのMemory候補の生成過程自体を信頼できないと判断するため
+ * （承認済み設計：evidenceQuotesは全件validでなければMemory候補ごと破棄）。
+ *
+ * 条件：
+ * - `evidenceQuotes`は配列で、要素数が1〜4件であること
+ * - 各要素は空でない文字列であること
+ * - 各要素は、normalizeText後、USER turn（role: "user"）のいずれかのcontentに
+ *   normalizeText後の状態で部分一致（exact substring）すること。AI turn（role: "ai"）
+ *   にしか存在しない・どこにも存在しない場合は無効
+ * 1つでも上記を満たさない要素があれば、この関数はfalseを返す（呼び出し元がMemory候補
+ * 全体を破棄する）。
+ */
+function validateMemoryEvidenceQuotes(turns: ConversationTurn[], rawEvidenceQuotes: unknown): boolean {
+  if (!Array.isArray(rawEvidenceQuotes) || rawEvidenceQuotes.length < 1 || rawEvidenceQuotes.length > 4) return false;
+  const userTurns = turns.filter((turn) => turn.role === "user");
+  for (const rawQuote of rawEvidenceQuotes) {
+    if (typeof rawQuote !== "string") return false;
+    const quote = rawQuote.trim();
+    if (!quote) return false;
+    const nq = normalizeText(quote);
+    if (!nq) return false;
+    const existsInUserTurn = userTurns.some((turn) => normalizeText(turn.content).includes(nq));
+    if (!existsInUserTurn) return false;
+  }
+  return true;
+}
+
+/**
  * chat/route.ts と同じ理由（Gemini 3.6系の既定thinkingが重い）でthinking予算を明示する。
  * Captureは会話全体を読む処理なので、会話が長いほど予算を増やす。
  */
@@ -384,18 +470,36 @@ const MEMORIES_SCHEMA_BASE: AISchema = {
             description:
               "topicDecisionがsameTopicの場合のみ、同じテーマだと判断した既存Memory・関連Memory候補のid",
           },
+          evidenceQuotes: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "この記憶を成立させる直接の根拠（必須）。USER'S ACTUAL STATEMENTSからの短い逐語" +
+              "引用を1〜4件。要約・言い換えではなく実際にUserが書いた文字列そのものを引用する。" +
+              "AI RESPONSESからの引用・存在しない発言の捏造は不可——1件でも実際のUser発言に" +
+              "存在しないquoteが含まれていると、この記憶候補は全体として破棄される",
+          },
           summary: {
             type: "string",
-            description: "この記憶をひと目で思い出せる一行の要約（20〜40文字程度）",
+            description:
+              "この記憶をひと目で思い出せる一行の要約（20〜40文字程度）。ユーザー自身が明示した" +
+              "事実・感情・意図・好みは含めてよいが、AIが推測・解釈した感情・性格・意図・好み・" +
+              "関係性を追加してはいけない（evidenceQuotesの意味の範囲を超えない）",
           },
           content: {
             type: "string",
-            description: "後から読んで意味が通る2〜4文程度の文章。事実に加え、話し手の様子や気持ちも含めてよい",
+            description:
+              "後から読んで意味が通る2〜4文程度の文章。ユーザー自身が明示した事実・感情・意図・" +
+              "好みは含めてよいが、AIが推測・解釈した感情・性格・意図・好み・関係性を追加しては" +
+              "いけない（evidenceQuotesの意味の範囲を超えない。paraphrase・主語補完・代名詞解決は可）",
           },
           keywords: {
             type: "array",
             items: { type: "string" },
-            description: "検索やリンクの手がかりになるキーワード（3〜8個）",
+            description:
+              "検索やリンクの手がかりになるキーワード（3〜8個）。Userの発言・evidenceQuotesが" +
+              "表すトピックに対応する語を優先し、AI RESPONSESにしか登場しないAssistant独自の" +
+              "解釈語は避ける",
           },
           types: {
             type: "array",
@@ -438,7 +542,7 @@ const MEMORIES_SCHEMA_BASE: AISchema = {
             description: "eventTimeを設定した場合のみ、その値が示す精度",
           },
         },
-        required: ["summary", "content", "keywords", "types", "confidence", "topicDecision", "eventTimeSource"],
+        required: ["evidenceQuotes", "summary", "content", "keywords", "types", "confidence", "topicDecision", "eventTimeSource"],
       },
     },
   },
@@ -611,12 +715,31 @@ export async function POST(request: Request) {
 
   try {
     const parsed = JSON.parse(text) as { memories?: unknown };
-    const memories = Array.isArray(parsed.memories) ? parsed.memories : [];
+    const memoriesRaw = Array.isArray(parsed.memories) ? parsed.memories : [];
+
+    // Capture Evidence Boundary（Memory本体）：evidenceQuotesの全件検証をパイプラインの
+    // 最初（Event Time/Profileの検証より前）で行う。型不正（isRecordでない）要素は、
+    // このゲートの対象外として従来通り後続へ素通りさせる（isRecordチェック自体は
+    // 既存のfinalizeEventTimeForMemory呼び出し前のガードで担っており、ここでの責務は
+    // 「evidenceQuotesを持つMemory候補の根拠検証」だけに限定する）。
+    let evidenceDroppedCount = 0;
+    const memories = memoriesRaw.filter((memory) => {
+      if (!isRecord(memory)) return true;
+      const grounded = validateMemoryEvidenceQuotes(turns, memory.evidenceQuotes);
+      if (!grounded) evidenceDroppedCount += 1;
+      return grounded;
+    });
+
     const profileBudget = { remaining: PROFILE_LIMITS.perCapture };
     const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
     const finalizedMemories = memories.map((memory) => {
       if (!isRecord(memory)) return memory;
-      const withEventTime = finalizeEventTimeForMemory(memory, turns);
+      // evidenceQuotesは一時的なLLM判定情報であり、eventTimeSource/eventTimeQuoteと同じく
+      // MemoryObject/Markdownへ永続化しないため、検証後は必ず取り除く
+      // （クライアント側へ一切渡さない）。
+      const { evidenceQuotes: _evidenceQuotes, ...groundedMemory } = memory;
+      void _evidenceQuotes;
+      const withEventTime = finalizeEventTimeForMemory(groundedMemory, turns);
       if (!profileEnabled) {
         // 無効時は、profileClaimsを一切返さない（従来と同一の出力）
         const { profileClaims: _ignored, ...rest } = withEventTime;
@@ -626,6 +749,8 @@ export async function POST(request: Request) {
       return finalizeProfileClaimsForMemory(withEventTime, turns, todayDateString, profileBudget, profileStats);
     });
     const headers: Record<string, string> = { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) };
+    // 品質の観測用（件数のみ。会話・Memory本文・quoteの内容は含めない）。
+    headers["X-Tsumugi-Evidence"] = `proposed=${memoriesRaw.length};accepted=${memories.length};dropped=${evidenceDroppedCount}`;
     if (profileEnabled) {
       // 品質の観測用（件数のみ。会話・claimの内容は含めない）
       headers["X-Tsumugi-Profile-Claims"] = `proposed=${profileStats.proposed};accepted=${profileStats.accepted};dropped=${Object.values(profileStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
