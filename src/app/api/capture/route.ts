@@ -3,7 +3,8 @@ import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 import { stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { getJstTodayDateString, isValidEventTimeSource, resolveEventTimeSourceDate } from "@/lib/eventTimeResolver";
-import { PROFILE_LIMITS, draftsToCandidates, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
+import { PROFILE_LIMITS, draftsToCandidates, normalizeText, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
+import { jstDateOf } from "@/lib/dateModel";
 
 export const runtime = "nodejs";
 
@@ -105,10 +106,20 @@ Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは�
   いずれかに対応するかを判断し、eventTimeSourceへ必ず設定する。
   - 対応する場合：実際の日付は自分で計算せず、該当する表現（today/yesterday/
     day-before-yesterday/tomorrow/day-after-tomorrow）だけを設定する。実際の日付は
-    Tsumugi側があなたのリクエストを処理した基準日から確定するため、eventTime/
-    eventTimePrecisionは省略してよい。
+    Tsumugi側が計算するため、eventTime/eventTimePrecisionは省略してよい。
   - 対応しない、または確信が持てない場合："none"を設定する（安全な既定値。少しでも
     根拠が薄ければ必ず"none"を選ぶ）。
+- 【必須・eventTimeSourceが"none"以外の場合のみ】その判断の根拠になった、
+  USER'S ACTUAL STATEMENTS中の該当箇所を、短い逐語の引用としてeventTimeQuoteへ
+  必ず設定する（15字程度、長くしすぎない。要約・言い換えではなく、実際にユーザーが
+  書いた文字列そのものを引用すること）。
+  - 実際の日付は、この引用が実際にどのユーザー発言に含まれていたか（その発言の
+    実時刻）から、Tsumugi側が機械的に計算する。AI RESPONSESからの引用は無効
+    （その場合Event Timeは付与されない）。
+  - 引用元にできるのはUSER'S ACTUAL STATEMENTSだけ。AI RESPONSESの中で「今日」
+    「昨日」等と述べていても、それを根拠にeventTimeSourceを設定してはいけない
+    （その出来事の中心がユーザー自身の発言に無いなら"none"を選ぶ）。
+  - eventTimeSourceが"none"の場合はeventTimeQuoteを省略してよい。
 - eventTimeSourceの判断は「その単語が文中のどこかに存在するか」ではなく「その記憶の
   中心的な出来事そのものを表しているか」で行う。
   - 肯定例：「昨日、公園を散歩した」という記憶 → eventTimeSource: "yesterday"
@@ -251,26 +262,71 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Time Axis Phase 2（Event Time, v1）。「deterministic resolverを最終決定者にする」設計：
- * LLMが選んだeventTimeSourceが固定語彙5値（today/yesterday/day-before-yesterday/
- * tomorrow/day-after-tomorrow）のいずれかであれば、このCaptureリクエストで確定した
- * 同一のJST基準日（todayDateString）からresolveEventTimeSourceDate()で機械的に解決し
- * 直し、LLM自身が返したeventTime/eventTimePrecisionがあっても無条件で上書きする
- * （値そのものの最終決定権をTsumugi側に置く）。
+ * JST日付モデル Phase 2（Event Time, Message Time基準への変更）。
+ *
+ * `eventTimeQuote`（LLMが返した、USER'S ACTUAL STATEMENTSからの短い逐語引用）を、
+ * 実際のUser turnへ決定的に照合し、一致したturnの`timestamp`（Message Time）のJST暦日を
+ * 「今日」の基準にする。Capture実行時刻（サーバーがこのリクエストを処理した時刻）は
+ * 一切使わない——これにより、日付が変わった後に実行されるstartup catch-up Capture・
+ * 遅延Captureでも、実際にユーザーが「今日」と述べた時点を基準に正しく解決できる
+ * （Profile v1の`validateProfileCandidates`と同じ「quoteをユーザーturnへ逐語照合する」
+ * 決定的な検証パターンを再利用する。`normalizeText`はprofile.tsからそのままimportし、
+ * Profile側のロジック・挙動は一切変更しない）。
+ *
+ * fail-closed：以下のいずれかに該当する場合、Event Timeは付与しない
+ * （Capture実行日など、もっともらしい値へのfallbackは行わない）。
+ * - eventTimeQuoteが無い・空・文字列でない
+ * - USER turnのどれにも一致しない（AI turnにしか無い場合を含む。Conversation Evidence
+ *   Boundaryと同じ原則——Assistant/Tsumugi発言の「今日」「昨日」「明日」を根拠にしない）
+ * - 一致したUser turnが複数あり、かつそれらのMessage TimeのJST暦日が割れる場合
+ *   （日を跨いで同じ短い言い回しが複数回登場したケース。安全側で推測しない）
+ * - 一致したUser turnに有効なtimestampが1件も無い場合
+ *
+ * それ以外（一致が1件、または複数だが全て同じJST暦日）は、その暦日から
+ * `resolveEventTimeSourceDate()`で機械的に日付を計算する（この関数自体の実装は
+ * 「基準日文字列＋固定語彙→日付」という既存のまま変更しない。Tsumugi側が最終決定者、
+ * という既存原則も維持する）。
  *
  * eventTimeSourceが"none"（固定語彙のどれにも対応しないというLLMの判断結果）・無い・
- * 不正な場合は、eventTimeSourceだけを取り除き、LLMが返したeventTime/eventTimePrecision
- * （「2024年に〜」のような明示的な絶対時間の抽出結果）があればそのまま素通しする
- * （precision・実在暦日の検証はcapture.ts側の既存ロジックが引き続き担当する）。
+ * 不正な場合は、eventTimeSource/eventTimeQuoteだけを取り除き、LLMが返したeventTime/
+ * eventTimePrecision（「2024年に〜」のような明示的な絶対時間の抽出結果）があれば
+ * そのまま素通しする（precision・実在暦日の検証はcapture.ts側の既存ロジックが
+ * 引き続き担当する。この経路はMessage Time基準化の対象外——「今日/昨日」等の相対表現
+ * ではなく、会話に明示された絶対時間の抽出結果のため）。
  *
- * eventTimeSource自体は一時的なLLM判定情報でありMemoryObject/Markdownへ永続化しないため、
- * どちらの経路でもレスポンスからは必ず取り除く（クライアント側へ一切渡さない）。
+ * eventTimeSource/eventTimeQuoteはいずれも一時的なLLM判定情報でありMemoryObject/
+ * Markdownへ永続化しないため、どの経路でもレスポンスからは必ず取り除く
+ * （クライアント側へ一切渡さない）。
  */
-function finalizeEventTimeForMemory(memory: Record<string, unknown>, todayDateString: string): Record<string, unknown> {
-  const { eventTimeSource, ...rest } = memory;
+function resolveEventTimeQuoteBasisJstDate(turns: ConversationTurn[], rawQuote: unknown): string | null {
+  const quote = typeof rawQuote === "string" ? rawQuote.trim() : "";
+  if (!quote) return null;
+  const nq = normalizeText(quote);
+  if (!nq) return null;
+
+  const userTurns = turns.filter((turn) => turn.role === "user");
+  const matchedUserTurns = userTurns.filter((turn) => normalizeText(turn.content).includes(nq));
+  if (matchedUserTurns.length === 0) return null; // AI発言にしか無い、または存在しない（fail-closed）
+
+  const jstDates = new Set<string>();
+  for (const turn of matchedUserTurns) {
+    const d = jstDateOf(turn.timestamp);
+    if (d) jstDates.add(d);
+  }
+  if (jstDates.size !== 1) return null; // timestampが1件も有効でない、または複数の異なるJST日に割れる
+
+  return [...jstDates][0];
+}
+
+function finalizeEventTimeForMemory(memory: Record<string, unknown>, turns: ConversationTurn[]): Record<string, unknown> {
+  const { eventTimeSource, eventTimeQuote, ...rest } = memory;
   if (isValidEventTimeSource(eventTimeSource) && eventTimeSource !== "none") {
-    const resolvedDate = resolveEventTimeSourceDate(todayDateString, eventTimeSource);
-    return { ...rest, eventTime: resolvedDate, eventTimePrecision: "day" };
+    const basisJstDate = resolveEventTimeQuoteBasisJstDate(turns, eventTimeQuote);
+    if (basisJstDate) {
+      const resolvedDate = resolveEventTimeSourceDate(basisJstDate, eventTimeSource);
+      return { ...rest, eventTime: resolvedDate, eventTimePrecision: "day" };
+    }
+    return rest; // 根拠を検証できない → Event Timeを推測せず付けない（fail-closed）
   }
   return rest;
 }
@@ -359,6 +415,15 @@ const MEMORIES_SCHEMA_BASE: AISchema = {
               "（日付そのものの計算はTsumugi側が行うため、ここでは表現の選択だけを行う。" +
               "eventTime/eventTimePrecisionは省略してよい）。対応しない・確信が持てない" +
               '場合は"none"を設定する（安全な既定値。少しでも根拠が薄ければ"none"を選ぶこと）',
+          },
+          eventTimeQuote: {
+            type: "string",
+            description:
+              'eventTimeSourceが"none"以外の場合のみ設定する（必須）。その判断の根拠になった、' +
+              "USER'S ACTUAL STATEMENTS中の該当箇所の短い逐語引用（15字程度）。実際の日付は、" +
+              "この引用が実際にどのユーザー発言に含まれていたかから機械的に計算するため、" +
+              "要約や言い換えではなく実際の文字列をそのまま引用すること。AI RESPONSESからの" +
+              "引用は無効（Event Timeが付与されない）。eventTimeSourceが\"none\"の場合は省略する",
           },
           eventTime: {
             type: "string",
@@ -551,7 +616,7 @@ export async function POST(request: Request) {
     const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
     const finalizedMemories = memories.map((memory) => {
       if (!isRecord(memory)) return memory;
-      const withEventTime = finalizeEventTimeForMemory(memory, todayDateString);
+      const withEventTime = finalizeEventTimeForMemory(memory, turns);
       if (!profileEnabled) {
         // 無効時は、profileClaimsを一切返さない（従来と同一の出力）
         const { profileClaims: _ignored, ...rest } = withEventTime;

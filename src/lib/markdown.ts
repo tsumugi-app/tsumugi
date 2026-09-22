@@ -96,6 +96,13 @@ export function conversationToMarkdown(conversation: Conversation): string {
     startedAt: conversation.startedAt,
     endedAt: conversation.endedAt,
     memoryObjectIds: conversation.memoryObjectIds.length > 0 ? conversation.memoryObjectIds : undefined,
+    // JST日付モデル Phase 2（Message Time）：`links`/`profile`と同じパターン（JSON文字列）。
+    // 各turnの実発言時刻（`ConversationTurn.timestamp`）を、turns配列と同じ順序・同じ件数の
+    // 配列として保存する。本文（`**User:**`/`**Tsumugi:**`によるtranscript形式）は一切変更
+    // しない——このfrontmatterフィールドだけが、restore時にturn単位のMessage Timeを
+    // 取り戻すための追加情報（`parseTranscript`参照）。turnが無いConversationにはキー自体を
+    // 書かない（`links`/`profile`と同じ、既存の空値省略ルール）。
+    turnTimes: conversation.turns.length > 0 ? JSON.stringify(conversation.turns.map((turn) => turn.timestamp)) : undefined,
     source: conversation.metadata.source,
     sourceType: conversation.metadata.sourceType,
     sourceDetail: stringifySourceDetail(conversation.metadata.sourceDetail),
@@ -410,12 +417,47 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
 }
 
 /**
+ * JST日付モデル Phase 2（Message Time）：`turnTimes`frontmatterの値をturn単位の
+ * timestamp配列へ復元する。`links`/`profile`と同じfail-softパターンで、以下のいずれの
+ * 異常でもConversation全体の読み込みを失敗させない（`null`を返さない）——異常な要素・
+ * 配列そのものは単に「使えない」ものとして扱い、呼び出し元（`parseTranscript`）が
+ * turnごとに個別フォールバックする：
+ * - キー自体が無い（旧Conversation）→ 空配列（全turnがfallback）
+ * - 値が文字列でない・JSONとして壊れている → 空配列（全turnがfallback）
+ * - 配列でない → 空配列（全turnがfallback）
+ * - 要素が文字列でない（個別の壊れた要素） → その位置だけ`undefined`にする
+ *   （配列内の他要素とturnとのindex対応を保つため、フィルタで詰めない）
+ *
+ * 個数不一致（turns配列より長い／短い）はここでは判定しない。`parseTranscript`側が
+ * index単位で存在確認するため、自然に「無い位置はfallback」になる。
+ */
+function parseTurnTimes(raw: unknown): (string | undefined)[] {
+  if (typeof raw !== "string") return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((value) => (typeof value === "string" ? value : undefined));
+  } catch {
+    return [];
+  }
+}
+
+/** `Date.parse`で解釈できる文字列かどうか（実在暦日までの厳密な検証はしない。turn timestampは
+ *  表示・並び替え用途のみのため、Event Time同等の厳密なcalendar検証は過剰）。 */
+function isValidIsoTimestamp(value: string): boolean {
+  return !Number.isNaN(Date.parse(value));
+}
+
+/**
  * `Conversations/*.md` を復元する。トランスクリプトは `**User:** ` / `**Tsumugi:** `
  * という行頭マーカーで区切って各turnへ分解する（空行ではなくマーカー行で区切るため、
  * 複数段落にまたがる発言も1つのturnとして正しく復元できる）。
  *
- * 既知の制約：turn単位の`timestamp`はMarkdownに保存されていないため、
- * 会話全体の`startedAt`を全turnへ暫定的に割り当てる（フォーマットの大きな変更を避けるため）。
+ * JST日付モデル Phase 2：turn単位の`timestamp`は、`turnTimes`frontmatter（本ファイルが
+ * 書き出したもの、`parseTurnTimes`参照）から、turnと同じ順序のindexで復元する。
+ * `turnTimes`が無い・使えない古いConversation、またはindexに対応する要素が無い／不正な
+ * turnについては、従来どおり会話全体の`startedAt`をそのturnへ暫定的に割り当てる
+ * （fail-soft、turn単位。1件の異常が他のturn・Conversation全体の復元を妨げない）。
  */
 export function parseConversationMarkdown(raw: string): Conversation | null {
   const parsed = parseFrontmatter(raw);
@@ -433,13 +475,14 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const status = (asString(frontmatter.status) ?? "captured") as Conversation["status"];
   const source = (asString(frontmatter.source) ?? "import") as MemorySource;
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
+  const turnTimes = parseTurnTimes(frontmatter.turnTimes);
 
   return {
     id,
     persona,
     startedAt,
     endedAt: asString(frontmatter.endedAt),
-    turns: parseTranscript(body, startedAt),
+    turns: parseTranscript(body, startedAt, turnTimes),
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
     createdAt,
@@ -456,7 +499,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   };
 }
 
-function parseTranscript(body: string, fallbackTimestamp: string): ConversationTurn[] {
+function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[]): ConversationTurn[] {
   const marker = "## Transcript\n\n";
   const markerIndex = body.indexOf(marker);
   const transcriptText = markerIndex === -1 ? "" : body.slice(markerIndex + marker.length);
@@ -465,7 +508,9 @@ function parseTranscript(body: string, fallbackTimestamp: string): ConversationT
   const USER_PREFIX = "**User:** ";
   const AI_PREFIX = "**Tsumugi:** ";
 
-  const turns: ConversationTurn[] = [];
+  // turnTimesとのindex対応を、本文のparseロジック（役割・改行の扱い等）に一切触れずに
+  // 取るため、まずrole/contentだけを順番に集め、turnTimesの適用は最後にまとめて行う。
+  const rawTurns: { role: ConversationTurn["role"]; content: string }[] = [];
   let currentRole: ConversationTurn["role"] | null = null;
   let currentLines: string[] = [];
 
@@ -473,7 +518,7 @@ function parseTranscript(body: string, fallbackTimestamp: string): ConversationT
     if (currentRole && currentLines.length > 0) {
       const content = currentLines.join("\n").trim();
       if (content) {
-        turns.push({ role: currentRole, content, timestamp: fallbackTimestamp });
+        rawTurns.push({ role: currentRole, content });
       }
     }
     currentLines = [];
@@ -494,7 +539,11 @@ function parseTranscript(body: string, fallbackTimestamp: string): ConversationT
   }
   flush();
 
-  return turns;
+  return rawTurns.map((turn, index) => {
+    const candidate = turnTimes[index];
+    const timestamp = candidate !== undefined && isValidIsoTimestamp(candidate) ? candidate : fallbackTimestamp;
+    return { ...turn, timestamp };
+  });
 }
 
 /**

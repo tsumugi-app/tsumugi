@@ -5873,6 +5873,13 @@ async function getExistingSingleRecordUpdatedAt(
  * Conversationのedited merge（D節）。Fをベースに、Markdown非往復fieldだけLから
  * 上書きする。day（History上の日付）が変わっている、またはturn数が異なる場合は
  * 安全に自動適用できないためnullを返す（呼び出し元がconflictへ切り替える）。
+ *
+ * JST日付モデル Phase 2：`timestamp`（Message Time）は`turnTimes`frontmatter経由で
+ * 往復するようになったが、この関数は引き続き意図的にL（ローカルIDB）側の値を採用する。
+ * このmerge経路はVault Markdownが外部で編集された場合の再統合であり、外部編集者が
+ * `turnTimes`のJSONをturns本文の編集と正しく同期させる保証は無いため、Fの`turnTimes`を
+ * 信頼するより、ローカルIDBが持つ値を保持する方が安全側の選択として妥当なため
+ * （webSearchRequested/isRecordTurnと同じ扱いに揃える）。
  */
 function mergeConversationForApply(f: Conversation, l: Conversation): Conversation | null {
   if (f.startedAt.slice(0, 10) !== l.startedAt.slice(0, 10)) return null;
