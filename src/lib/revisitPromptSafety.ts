@@ -11,6 +11,8 @@
  * 「未生成」とは扱わない（unsafeを理由に再生成APIを呼ばない）。
  */
 
+import { jstDateOf } from "./dateModel";
+
 /**
  * 固定の、狭い相対時間語彙。曖昧な正規表現にはしない（部分文字列の一致のみ）。
  * 「昨日」は「一昨日」、「明日」は「明後日」の一部ではないため、後者は別に持つ。
@@ -154,9 +156,13 @@ export function describeEventTimeForRevisitPrompt(
   return `${eventTime}（年精度。月日は不明。「YYYY年」まで。月日を補わない）`;
 }
 
-/** /api/promptがLLMへ渡すMemory情報。記録日と出来事日時は別の行として区別する。 */
+/**
+ * /api/promptがLLMへ渡すMemory情報。記録日と出来事日時は別の行として区別する。
+ * 記録日はLogical Date（JST）で示す（Phase 1修正：以前はUTCベースの`slice(0, 10)`で
+ * あったため、JST 0:00〜8:59に記録されたMemoryの記録日が実際より1日早く表示されていた）。
+ */
 export function buildRevisitPromptRecord(memory: RevisitPromptSourceMemory): string {
-  const recordDate = memory.date ? memory.date.slice(0, 10) : "不明";
+  const recordDate = memory.date ? (jstDateOf(memory.date) ?? "不明") : "不明";
   const keywords = memory.keywords.length > 0 ? memory.keywords.join(", ") : "なし";
   return [
     `記録日: ${recordDate}（Tsumugiに保存された日。出来事が起きた日とは限らない）`,

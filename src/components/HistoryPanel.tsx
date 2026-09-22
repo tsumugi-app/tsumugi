@@ -10,9 +10,10 @@ import {
   truncateHistoryPreview,
   upgradeHistoryDayToV2,
 } from "@/lib/vault";
-import type { HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
+import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
+import { jstDateOf, jstDateOfUlid, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -46,11 +47,17 @@ function pad2(n: number): string {
 
 /**
  * 画面上の「今日」はAsia/Tokyo（JST）基準で判定する（`@/lib/jstDate`、日本時間0:00〜8:59に
- * UTC日付が前日にずれる不具合の修正）。なお、Vault内のMarkdown命名規則
- * （`fileNameFor`/`dayFileNameFor`、`src/lib/vault.ts`）は引き続きUTC基準の日付文字列を
- * ファイルバケット単位にしており、ここは変更していない。そのため、JST 0:00〜8:59台に
- * 作られた記録は、画面が「今日」と表示する日と、実際に書き込まれるVaultファイルの
- * 日付バケットとがずれる場合がある（既知の、今回のスコープ外の特性）。
+ * UTC日付が前日にずれる不具合の修正）。
+ *
+ * JST日付モデル Phase 1（Logical Date / Storage Bucket分離）：このコンポーネント内で
+ * `selectedDay`・カレンダーのマス目・`todayKey()`が表す日付は、すべて**Logical
+ * Date**（JST）である。一方、Vault内のMarkdown命名規則・History Indexのkey
+ * （`fileNameFor`/`dayFileNameFor`、`src/lib/vault.ts`）は、既存Vaultとの後方互換の
+ * ため引き続きUTC基準の日付文字列（**Storage Bucket**）のまま変更していない。
+ * そのため、Logical Date 1日分のレコードは、Storage Bucket上ではその日自身と前日
+ * （`@/lib/dateModel`の`previousDateKey`）の2つのbucketにまたがって存在しうる。
+ * 下記`resolveBucketDayRecords`・`loadLogicalDay`が、この2bucket分をまとめて読み、
+ * 各レコードの実時刻からLogical Dateを計算して選び直す（詳細は各関数のコメント参照）。
  */
 function todayKey(): string {
   return getJstTodayDateString();
@@ -92,11 +99,18 @@ function addMonths(year: number, month: number, delta: number): { year: number; 
  * `HistoryConversationSummary`から直接作る（`full`は未設定＝本体未読）。v1
  * fallbackの日はConversation本体を読み終えているため`full`を設定し、詳細表示時に
  * 追加のreadを発生させない。
+ *
+ * `bucketDay`（JST日付モデル Phase 1追加）：このrowが実際に存在するStorage Bucket
+ * （UTC基準の日付文字列。`selectedDay`＝Logical Dateとは別物）。詳細読み込み時に
+ * `readConversationById(handle, id, bucketDay)`へそのまま渡す——Vault側の
+ * `fileNameFor`/Registryのfallback pathはStorage Bucket基準のため、Logical Date
+ * を渡すと誤ったファイル名を組み立ててしまう。
  */
 interface ConversationRow {
   id: string;
   modeLabel: string;
   turnCount: number;
+  bucketDay: string;
   full?: Conversation;
 }
 
@@ -104,14 +118,52 @@ interface ConversationRow {
  * 通常Memory／Reflection共通の一覧行。`origin`で詳細表示時にどちらの本体read経路
  * （`readMemoriesForDay`+find／`readReflectionById`）を使うかを判定する
  * （`types`だけでは判別できない——通常Memoryも`types`に"insight"を持ちうるため）。
+ *
+ * `bucketDay`：`ConversationRow`と同じ理由（Storage Bucket、詳細read時のpath解決に使う）。
+ * `date`（JST日付モデル Phase 1追加、通常Memoryのみ）：`MemoryObject.date`
+ * （Conversation Date）。History Index v2の`HistoryMemorySummary.date`、または
+ * v1 fallbackで読んだ本体の`.date`をそのまま持つ。Reflectionは設定しない
+ * （ReflectionのLogical Dateは`createdAt`＝生成時刻そのもの、という既存の意味を
+ * 変えないため）。`logicalDateOfMemoryRow`参照。
  */
 interface MemoryRow {
   id: string;
   types: MemoryType[];
   preview: string;
   createdAt: string;
+  date?: string;
   origin: "normal" | "reflection";
+  bucketDay: string;
   full?: MemoryObject;
+}
+
+/**
+ * ConversationのLogical Date（JST）。本体を読み終えている（`full`）場合は
+ * `startedAt`から正確に求める。未読（v2の一覧行）の場合は、追加のMarkdown readを
+ * 行わず、`id`（ULID）の生成時刻から近似する（`conversation.id`は`conversation.startedAt`
+ * とほぼ同時に採番されるため、実務上ずれない。`src/lib/dateModel.ts`の
+ * `jstDateOfUlid`コメント参照）。いずれも失敗した場合は`bucketDay`（Storage Bucket）
+ * へfail-softにfallbackする（表示上「1日ずれる可能性はあるが、記録自体は必ずどこかに
+ * 表示される」ことを優先する）。
+ */
+function logicalDateOfConversationRow(row: ConversationRow): string {
+  const fromFull = row.full ? jstDateOf(row.full.startedAt) : null;
+  return fromFull ?? jstDateOfUlid(row.id) ?? row.bucketDay;
+}
+
+/**
+ * 通常Memory/ReflectionのLogical Date（JST）。
+ * - 通常Memory：`Memory.date`（＝Conversation Date、由来Conversationの開始時刻）を
+ *   基準にする（`row.date`、または本体を読み終えていれば`row.full.date`）。
+ * - Reflection：`createdAt`（生成時刻）を基準にする（既存の意味のまま、変更しない）。
+ * いずれもparse失敗時は`bucketDay`へfail-softにfallbackする。
+ */
+function logicalDateOfMemoryRow(row: MemoryRow): string {
+  if (row.origin === "reflection") {
+    return jstDateOf(row.createdAt) ?? row.bucketDay;
+  }
+  const basis = row.full?.date ?? row.date ?? row.createdAt;
+  return jstDateOf(basis) ?? row.bucketDay;
 }
 
 /** 同一History表示セッション内だけの短期キャッシュ1件分。 */
@@ -183,6 +235,14 @@ export default function HistoryPanel({
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
+  /**
+   * JST日付モデル Phase 1追加：表示中の月（`viewYear`/`viewMonth`、Logical Date基準）の
+   * 1つ前の月のStorage Bucket月Index。月初日（Logical Dateの1日）のLogical Dateを
+   * 解決するには、前日にあたるStorage Bucket（前月最終日になりうる）も見る必要があるため
+   * （`previousDateKey`/`resolveBucketDayRecords`参照）。`monthIndex`と同じ読み込み
+   * effectでペアとして取得・破棄する。
+   */
+  const [prevMonthIndex, setPrevMonthIndex] = useState<HistoryMonthIndex | null>(null);
   const [monthLoading, setMonthLoading] = useState(true);
   const [conversationRows, setConversationRows] = useState<ConversationRow[]>([]);
   const [memoryRows, setMemoryRows] = useState<MemoryRow[]>([]);
@@ -279,6 +339,7 @@ export default function HistoryPanel({
       lastMonthFetchKeyRef.current = "";
       monthRequestRef.current += 1;
       setMonthIndex(null);
+      setPrevMonthIndex(null);
       setMonthLoading(false);
       return;
     }
@@ -291,14 +352,19 @@ export default function HistoryPanel({
 
     if (vaultChanged) {
       vaultGenerationRef.current += 1;
-      const now = new Date();
-      targetYear = now.getFullYear();
-      targetMonth = now.getMonth() + 1;
+      // JST日付モデル Phase 1修正：以前は`new Date().getFullYear()/getMonth()`という
+      // 端末のローカルタイムゾーン基準の「今月」を使っていた（デバイスが海外時間帯に
+      // 設定されている場合、JSTの「今月」とずれうる）。Logical Dateは常にJST基準の
+      // ため、ここも`getJstYearMonth()`に揃える。
+      const jstNow = getJstYearMonth();
+      targetYear = jstNow.year;
+      targetMonth = jstNow.month;
       setSelectedDay(todayKey());
       setSelectedMemory(null);
       setSelectedConversation(null);
       setDetailUnavailable(false);
       setMonthIndex(null);
+      setPrevMonthIndex(null);
       pendingInitialMemoryIdRef.current = initialMemoryId;
       if (targetYear !== viewYear || targetMonth !== viewMonth) {
         setViewYear(targetYear);
@@ -312,17 +378,27 @@ export default function HistoryPanel({
 
     const requestId = ++monthRequestRef.current;
     const handle = vaultHandle;
+    // JST日付モデル Phase 1：前月のStorage Bucket月Indexも合わせて読む（月初日の
+    // Logical Dateが前月最終日のStorage Bucketに属しうるため。`prevMonthIndex`の
+    // コメント参照）。取得失敗時はその月に記録が無いのと同じ扱い（月末境界のみ影響、
+    // 詳細な安全側の扱いは`monthLoading`ガードで既存の日詳細effectに委ねる）。
+    const prevYearMonth = addMonths(targetYear, targetMonth, -1);
     setMonthLoading(true);
-    readHistoryMonthIndex(handle, monthKeyOf(targetYear, targetMonth))
-      .then((index) => {
+    Promise.all([
+      readHistoryMonthIndex(handle, monthKeyOf(targetYear, targetMonth)),
+      readHistoryMonthIndex(handle, monthKeyOf(prevYearMonth.year, prevYearMonth.month)),
+    ])
+      .then(([index, prevIndex]) => {
         if (monthRequestRef.current !== requestId) return; // 月移動／Vault切替で既に無効化された要求
         setMonthIndex(index);
+        setPrevMonthIndex(prevIndex);
         setMonthLoading(false);
       })
       .catch((error) => {
         if (monthRequestRef.current !== requestId) return;
         console.error("Failed to load history month index", error);
         setMonthIndex(null);
+        setPrevMonthIndex(null);
         setMonthLoading(false);
       });
     // initialMemoryIdは「vaultHandleが変わった時にリセットする」という目的だけで
@@ -417,17 +493,21 @@ export default function HistoryPanel({
   }, [vaultHandle, selectedDay, refreshToken]);
 
   /**
-   * 日付詳細読み込み・その2（解決）：`monthIndex.days[selectedDay]`がHistory Index v2
-   * 形状（`isHistoryDayIndexV2`）であれば、Vault本体を一切読まずに一覧を組み立てる
-   * （Conversation/Reflection/通常MemoryのMarkdownはいずれも読まない）。
+   * 日付詳細読み込み・その2（解決、JST日付モデル Phase 1で全面改訂）：`selectedDay`は
+   * Logical Date（JST）。この1日分の記録は、Storage Bucket上では`selectedDay`自身と
+   * その前日（`previousDateKey`、JST 0:00〜8:59台の記録が置かれるbucket）の2つに
+   * またがって存在しうるため、両方のbucketを独立して解決してから、各レコードの
+   * 実時刻から計算したLogical Dateで`selectedDay`に一致するものだけへ絞り込み、
+   * マージする。
    *
-   * v1形状（既存Vaultで、まだ一度も開かれていない日）またはエントリ未登録の場合は、
-   * 従来通りid経由でMarkdown本体を読むfallbackを行う。fallback完了後、取得済みの
-   * データ（追加のMarkdown readを一切行わない）からv2 entryを組み立て、その日だけ
-   * `upgradeHistoryDayToV2`でfire-and-forgetに永続化する（lazy upgrade）。失敗しても
-   * console.errorに残すだけで、既に確定している表示（fallbackの結果）には影響させない。
+   * bucket単位の解決自体（v2ならVault本体read 0回、v1ならid経由でMarkdown本体を
+   *読むfallback＋lazy upgrade）は、既存のロジックを`resolveBucketDayRecords`
+   * （bucket 1つ分）へそのまま移しただけで、read経路・lazy upgradeの発火条件は
+   * 変更していない。upgradeHistoryDayToV2は引き続きbucket day単位（Storage Bucket
+   * のkeyそのもの）で書き込む——Logical Dateでbucketを書き換えることは無い
+   * （Storage Bucketは後方互換のため変更しない、という前提を保つ）。
    *
-   * monthLoading完了を待つ（月Indexが無いとv1/v2の判定自体ができないため）。
+   * monthLoading完了を待つ（月Index・前月Indexが無いとv1/v2の判定自体ができないため）。
    * `skipDayFetchRef`がtrue（キャッシュヒット、またはvaultHandle/selectedDayが無い）
    * の場合は何もしない。
    */
@@ -435,136 +515,181 @@ export default function HistoryPanel({
     if (!vaultHandle || !selectedDay || monthLoading || skipDayFetchRef.current) return;
     const requestId = dayRequestRef.current;
     const handle = vaultHandle;
-    const day = selectedDay;
-    const dayEntry = monthIndex?.days[day];
+    const logicalDay = selectedDay;
     const monthIndexAtStart = monthIndex;
+    const prevMonthIndexAtStart = prevMonthIndex;
 
-    if (dayEntry && isHistoryDayIndexV2(dayEntry)) {
-      // v2：Vault本体read 0回で一覧を構築する。
-      const conversations: ConversationRow[] = dayEntry.conversations.map((c) => ({
-        id: c.id,
-        modeLabel: c.mode === "diary" ? "日記" : "会話",
-        turnCount: c.turnCount,
-      }));
-      const memories: MemoryRow[] = [
-        ...dayEntry.normalMemories.map((m) => ({
-          id: m.id,
-          types: m.types,
-          preview: m.preview,
-          createdAt: m.createdAt,
-          origin: "normal" as const,
-        })),
-        ...dayEntry.reflections.map((m) => ({
-          id: m.id,
-          types: m.types,
-          preview: m.preview,
-          createdAt: m.createdAt,
-          origin: "reflection" as const,
-        })),
-      ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-      setConversationRows(conversations);
-      setMemoryRows(memories);
-      dayCacheRef.current.set(day, { conversationRows: conversations, memoryRows: memories });
-      setDayLoading(false);
-      return;
+    /** `bucketDay`（Storage Bucket）が属する月Indexのスナップショットを選ぶ。
+     *  `HistoryMonthIndex.month`フィールド（そのIndex自身が表す月）で判定するため、
+     *  `viewYear`/`viewMonth`（表示中の月、Logical Date基準）とは独立に正しく解決できる。 */
+    function snapshotFor(bucketDay: string): { snapshot: HistoryMonthIndex | null; isCurrent: boolean } {
+      const bucketMonth = monthKeyOfDateKey(bucketDay);
+      if (monthIndexAtStart && monthIndexAtStart.month === bucketMonth) {
+        return { snapshot: monthIndexAtStart, isCurrent: true };
+      }
+      if (prevMonthIndexAtStart && prevMonthIndexAtStart.month === bucketMonth) {
+        return { snapshot: prevMonthIndexAtStart, isCurrent: false };
+      }
+      return { snapshot: null, isCurrent: true };
     }
 
-    // v1（またはエントリ未登録）：既存のfallback経路で本体を直接読む。
-    const reflectionIds = dayEntry?.reflectionIds ?? [];
-    const conversationIds = dayEntry?.conversationIds ?? [];
+    /**
+     * Storage Bucket 1日分を解決する（既存のv2直読み／v1 fallback＋lazy upgradeの
+     * ロジックそのもの、bucket単位に切り出しただけ）。返す行はLogical Dateによる
+     * 絞り込みをまだ行っていない未フィルタの状態（呼び出し側がまとめて絞り込む）。
+     */
+    async function resolveBucketDayRecords(
+      bucketDay: string
+    ): Promise<{ conversations: ConversationRow[]; memories: MemoryRow[] }> {
+      const { snapshot, isCurrent } = snapshotFor(bucketDay);
+      const dayEntry: HistoryDayIndex | undefined = snapshot?.days[bucketDay];
+
+      if (dayEntry && isHistoryDayIndexV2(dayEntry)) {
+        // v2：Vault本体read 0回で一覧を構築する。
+        const conversations: ConversationRow[] = dayEntry.conversations.map((c) => ({
+          id: c.id,
+          modeLabel: c.mode === "diary" ? "日記" : "会話",
+          turnCount: c.turnCount,
+          bucketDay,
+        }));
+        const memories: MemoryRow[] = [
+          ...dayEntry.normalMemories.map((m) => ({
+            id: m.id,
+            types: m.types,
+            preview: m.preview,
+            createdAt: m.createdAt,
+            date: m.date,
+            origin: "normal" as const,
+            bucketDay,
+          })),
+          ...dayEntry.reflections.map((m) => ({
+            id: m.id,
+            types: m.types,
+            preview: m.preview,
+            createdAt: m.createdAt,
+            origin: "reflection" as const,
+            bucketDay,
+          })),
+        ];
+        return { conversations, memories };
+      }
+
+      // v1（またはエントリ未登録）：既存のfallback経路で本体を直接読む。
+      const reflectionIds = dayEntry?.reflectionIds ?? [];
+      const conversationIds = dayEntry?.conversationIds ?? [];
+
+      const [memoriesDir, conversationsDir] = await Promise.all([
+        reflectionIds.length > 0
+          ? handle.getDirectoryHandle("Memories", { create: false }).catch(() => undefined)
+          : Promise.resolve(undefined),
+        conversationIds.length > 0
+          ? handle.getDirectoryHandle("Conversations", { create: false }).catch(() => undefined)
+          : Promise.resolve(undefined),
+      ]);
+      const [normalMemoriesFull, reflectionResults, conversationResults] = await Promise.all([
+        readMemoriesForDay(handle, bucketDay),
+        Promise.all(reflectionIds.map((id) => readReflectionById(handle, id, bucketDay, memoriesDir))),
+        Promise.all(conversationIds.map((id) => readConversationById(handle, id, bucketDay, conversationsDir))),
+      ]);
+
+      const reflectionsFull = reflectionResults.filter((memory): memory is MemoryObject => memory !== null);
+      const conversationsFull = conversationResults.filter(
+        (conversation): conversation is Conversation => conversation !== null
+      );
+
+      const conversations: ConversationRow[] = conversationsFull.map((c) => ({
+        id: c.id,
+        modeLabel: personaModeLabel(c.persona),
+        turnCount: c.turns.length,
+        full: c,
+        bucketDay,
+      }));
+      const memories: MemoryRow[] = [
+        ...normalMemoriesFull.map((m) => ({
+          id: m.id,
+          types: m.types,
+          preview: m.summary,
+          createdAt: m.createdAt,
+          date: m.date,
+          origin: "normal" as const,
+          full: m,
+          bucketDay,
+        })),
+        ...reflectionsFull.map((m) => ({
+          id: m.id,
+          types: m.types,
+          preview: m.summary,
+          createdAt: m.createdAt,
+          origin: "reflection" as const,
+          full: m,
+          bucketDay,
+        })),
+      ];
+
+      // lazy upgrade：fallbackで既に取得済みのデータだけから組み立てる（追加read無し）。
+      // v1エントリが元々存在した日、または（エントリ未登録でも）何かデータが
+      // 見つかった日だけを対象にする——完全に空の日を新規に書き込む必要は無いため。
+      const hadExistingEntry = !!dayEntry;
+      const hasAnyData = conversationsFull.length > 0 || normalMemoriesFull.length > 0 || reflectionsFull.length > 0;
+      if (hadExistingEntry || hasAnyData) {
+        const v2Entry: HistoryDayIndexV2 = {
+          conversations: conversationsFull.map((c) => ({
+            id: c.id,
+            mode: c.persona === "companion" ? "diary" : "conversation",
+            turnCount: c.turns.length,
+          })),
+          normalMemories: normalMemoriesFull.map((m) => ({
+            id: m.id,
+            types: m.types,
+            preview: truncateHistoryPreview(m.summary),
+            createdAt: m.createdAt,
+            date: m.date,
+          })),
+          reflections: reflectionsFull.map((m) => ({
+            id: m.id,
+            types: m.types,
+            preview: truncateHistoryPreview(m.summary),
+            createdAt: m.createdAt,
+          })),
+        };
+        void upgradeHistoryDayToV2(handle, bucketDay, v2Entry)
+          .then(() => {
+            // 対応するスナップショット自体が（Vault切替・月移動・別のupgrade等で）
+            // 既に別のものへ変わっていれば何もしない（stale patchを防ぐ。参照の一致で判定する）。
+            const setter = isCurrent ? setMonthIndex : setPrevMonthIndex;
+            setter((current) => {
+              if (current !== snapshot || !current) return current;
+              return { ...current, days: { ...current.days, [bucketDay]: v2Entry } };
+            });
+          })
+          .catch((error) => {
+            // 失敗してもHistory表示自体（既にfallbackで確定している表示）は
+            // 失敗させない。次にこの日を開いた時、再度fallback→upgradeを試みる。
+            console.error("[Tsumugi] failed to lazily upgrade history day index (display unaffected):", error);
+          });
+      }
+
+      return { conversations, memories };
+    }
 
     (async () => {
       try {
-        const [memoriesDir, conversationsDir] = await Promise.all([
-          reflectionIds.length > 0
-            ? handle.getDirectoryHandle("Memories", { create: false }).catch(() => undefined)
-            : Promise.resolve(undefined),
-          conversationIds.length > 0
-            ? handle.getDirectoryHandle("Conversations", { create: false }).catch(() => undefined)
-            : Promise.resolve(undefined),
-        ]);
-        const [normalMemoriesFull, reflectionResults, conversationResults] = await Promise.all([
-          readMemoriesForDay(handle, day),
-          Promise.all(reflectionIds.map((id) => readReflectionById(handle, id, day, memoriesDir))),
-          Promise.all(conversationIds.map((id) => readConversationById(handle, id, day, conversationsDir))),
-        ]);
+        const bucketDays = [logicalDay, previousDateKey(logicalDay)];
+        const perBucket = await Promise.all(bucketDays.map((bucketDay) => resolveBucketDayRecords(bucketDay)));
         if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
 
-        const reflectionsFull = reflectionResults.filter((memory): memory is MemoryObject => memory !== null);
-        const conversationsFull = conversationResults.filter(
-          (conversation): conversation is Conversation => conversation !== null
-        );
-
-        const conversationRowsNext: ConversationRow[] = conversationsFull.map((c) => ({
-          id: c.id,
-          modeLabel: personaModeLabel(c.persona),
-          turnCount: c.turns.length,
-          full: c,
-        }));
-        const memoryRowsNext: MemoryRow[] = [
-          ...normalMemoriesFull.map((m) => ({
-            id: m.id,
-            types: m.types,
-            preview: m.summary,
-            createdAt: m.createdAt,
-            origin: "normal" as const,
-            full: m,
-          })),
-          ...reflectionsFull.map((m) => ({
-            id: m.id,
-            types: m.types,
-            preview: m.summary,
-            createdAt: m.createdAt,
-            origin: "reflection" as const,
-            full: m,
-          })),
-        ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        const conversationRowsNext = perBucket
+          .flatMap((r) => r.conversations)
+          .filter((row) => logicalDateOfConversationRow(row) === logicalDay);
+        const memoryRowsNext = perBucket
+          .flatMap((r) => r.memories)
+          .filter((row) => logicalDateOfMemoryRow(row) === logicalDay)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
         setConversationRows(conversationRowsNext);
         setMemoryRows(memoryRowsNext);
-        dayCacheRef.current.set(day, { conversationRows: conversationRowsNext, memoryRows: memoryRowsNext });
+        dayCacheRef.current.set(logicalDay, { conversationRows: conversationRowsNext, memoryRows: memoryRowsNext });
         setDayLoading(false);
-
-        // lazy upgrade：fallbackで既に取得済みのデータだけから組み立てる（追加read無し）。
-        // v1エントリが元々存在した日、または（エントリ未登録でも）何かデータが
-        // 見つかった日だけを対象にする——完全に空の日を新規に書き込む必要は無いため。
-        const hadExistingEntry = !!dayEntry;
-        const hasAnyData = conversationsFull.length > 0 || normalMemoriesFull.length > 0 || reflectionsFull.length > 0;
-        if (hadExistingEntry || hasAnyData) {
-          const v2Entry: HistoryDayIndexV2 = {
-            conversations: conversationsFull.map((c) => ({
-              id: c.id,
-              mode: c.persona === "companion" ? "diary" : "conversation",
-              turnCount: c.turns.length,
-            })),
-            normalMemories: normalMemoriesFull.map((m) => ({
-              id: m.id,
-              types: m.types,
-              preview: truncateHistoryPreview(m.summary),
-              createdAt: m.createdAt,
-            })),
-            reflections: reflectionsFull.map((m) => ({
-              id: m.id,
-              types: m.types,
-              preview: truncateHistoryPreview(m.summary),
-              createdAt: m.createdAt,
-            })),
-          };
-          void upgradeHistoryDayToV2(handle, day, v2Entry)
-            .then(() => {
-              // monthIndex自体が（Vault切替・月移動・別のupgrade等で）既に別のものへ
-              // 変わっていれば何もしない（stale patchを防ぐ。参照の一致で判定する）。
-              setMonthIndex((current) => {
-                if (current !== monthIndexAtStart || !current) return current;
-                return { ...current, days: { ...current.days, [day]: v2Entry } };
-              });
-            })
-            .catch((error) => {
-              // 失敗してもHistory表示自体（既にfallbackで確定している表示）は
-              // 失敗させない。次にこの日を開いた時、再度fallback→upgradeを試みる。
-              console.error("[Tsumugi] failed to lazily upgrade history day index (display unaffected):", error);
-            });
-        }
       } catch (error) {
         if (dayRequestRef.current !== requestId) return;
         console.error("Failed to load day records", error);
@@ -573,7 +698,7 @@ export default function HistoryPanel({
         setDayLoading(false);
       }
     })();
-  }, [vaultHandle, selectedDay, monthIndex, monthLoading, refreshToken]);
+  }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, monthLoading, refreshToken]);
 
   /**
    * 一覧行タップ時のオンデマンド詳細読み込み。`full`が既に設定済み（v1 fallbackで
@@ -590,7 +715,9 @@ export default function HistoryPanel({
     setDetailLoading(true);
     setDetailUnavailable(false);
     try {
-      const conversation = await readConversationById(vaultHandle, row.id, selectedDay);
+      // JST日付モデル Phase 1：`selectedDay`（Logical Date）ではなく`row.bucketDay`
+      // （Storage Bucket、この行が実際に置かれているVaultファイルの日付キー）を渡す。
+      const conversation = await readConversationById(vaultHandle, row.id, row.bucketDay);
       if (detailRequestRef.current !== requestId) return;
       // 実機不具合対応（原則B）：一覧に行として存在する（＝過去に記録された）
       // Conversationであるにもかかわらず本体が読めない場合、無言で何も起きな
@@ -613,16 +740,18 @@ export default function HistoryPanel({
     setDetailLoading(true);
     setDetailUnavailable(false);
     try {
+      // JST日付モデル Phase 1：ここも`row.bucketDay`（Storage Bucket）を使う
+      // （理由は`openConversationRow`と同じ）。
       if (row.origin === "reflection") {
-        const memory = await readReflectionById(vaultHandle, row.id, selectedDay);
+        const memory = await readReflectionById(vaultHandle, row.id, row.bucketDay);
         if (detailRequestRef.current !== requestId) return;
         if (memory) setSelectedMemory(memory);
         else setDetailUnavailable(true);
       } else {
         // 通常Memoryは1日1Markdown（複数件統合）のため、1件だけを取り出すファイル形式が
-        // 無い。その日のday-fileを1回読み、対象idをfindする（既存のreadMemoriesForDay
-        // を再利用するだけで、新しいvault.ts関数は追加しない）。
-        const dayMemories = await readMemoriesForDay(vaultHandle, selectedDay);
+        // 無い。そのbucket dayのday-fileを1回読み、対象idをfindする（既存の
+        // readMemoriesForDayを再利用するだけで、新しいvault.ts関数は追加しない）。
+        const dayMemories = await readMemoriesForDay(vaultHandle, row.bucketDay);
         if (detailRequestRef.current !== requestId) return;
         const memory = dayMemories.find((m) => m.id === row.id);
         if (memory) setSelectedMemory(memory);
@@ -664,13 +793,24 @@ export default function HistoryPanel({
     }
     const seenIds = new Set(memoryRows.map((row) => row.id));
     const todaysSessionRows: MemoryRow[] = sessionCapturedMemories
-      .filter((memory) => memory.date.slice(0, 10) === selectedDay && !seenIds.has(memory.id))
+      // JST日付モデル Phase 1修正：`memory.date`のLogical Date（JST）で判定する
+      // （以前はUTCベースの`slice(0, 10)`で、JST 0:00〜8:59台に保存された今回
+      // セッションのMemoryが「今日」の一覧から漏れることがあった）。
+      .filter((memory) => jstDateOf(memory.date) === selectedDay && !seenIds.has(memory.id))
       .map((memory) => ({
         id: memory.id,
         types: memory.types,
         preview: memory.summary,
         createdAt: memory.createdAt,
+        date: memory.date,
         origin: "normal" as const,
+        // sessionCapturedMemoriesはIndexedDB由来（まだVault writeが確定していない
+        // 可能性がある）のため、bucketDayはVault書き込み側と同じ規則
+        // （`memoryObject.date.slice(0, 10)`、Storage Bucket＝UTC）で計算する
+        // だけで、実際にそのファイルへ書き込み済みとは限らない（detail readには
+        // 使わない——このrowは常に`full`を持つため、openMemoryRowが`row.bucketDay`を
+        // 使う経路そのものに入らない）。
+        bucketDay: memory.date.slice(0, 10),
         full: memory,
       }));
     if (todaysSessionRows.length === 0) return memoryRows;
@@ -678,17 +818,42 @@ export default function HistoryPanel({
   }, [memoryRows, selectedDay, sessionCapturedMemories]);
 
   const hasSessionRecordToday = useMemo(
-    () => sessionCapturedMemories.some((memory) => memory.date.slice(0, 10) === todayKey()),
+    () => sessionCapturedMemories.some((memory) => jstDateOf(memory.date) === todayKey()),
     [sessionCapturedMemories]
   );
 
+  /**
+   * カレンダーのマス目1日分（Logical Date）に記録があるかどうか（丸印の表示用）。
+   * JST日付モデル Phase 1：Logical Date `day`自身のStorage Bucketに加え、前日の
+   * Storage Bucket（JST 0:00〜8:59台の記録の置き場所）も見る。
+   *
+   * 精度：Conversation・Reflection・v2の通常Memoryは、実時刻（ULID生成時刻／
+   * `date`／`createdAt`）から正確にLogical Dateを判定する。v1（まだ一度もその日を
+   * 開いていない既存Vaultの日）の通常Memoryは、個々のidを持たない`normalMemoryCount`
+   * （件数のみ）でしか把握できないため、Storage Bucket日＝Logical Dateとして
+   * 近似する（その日を一度開けばv2へlazy upgradeされ、以降は正確になる。既知の
+   * Phase 1の制約——最終報告のリスク欄参照）。
+   */
   function dayHasRecord(day: string): boolean {
-    const entry = monthIndex?.days[day];
-    if (entry) {
-      const hasEntryRecord = isHistoryDayIndexV2(entry)
-        ? entry.conversations.length > 0 || entry.normalMemories.length > 0 || entry.reflections.length > 0
-        : entry.conversationIds.length > 0 || entry.memoryCount > 0;
-      if (hasEntryRecord) return true;
+    const buckets = [day, previousDateKey(day)];
+    for (const bucketDay of buckets) {
+      const bucketMonth = monthKeyOfDateKey(bucketDay);
+      const entry =
+        monthIndex && monthIndex.month === bucketMonth
+          ? monthIndex.days[bucketDay]
+          : prevMonthIndex && prevMonthIndex.month === bucketMonth
+            ? prevMonthIndex.days[bucketDay]
+            : undefined;
+      if (!entry) continue;
+      if (isHistoryDayIndexV2(entry)) {
+        if (entry.conversations.some((c) => (jstDateOfUlid(c.id) ?? bucketDay) === day)) return true;
+        if (entry.normalMemories.some((m) => (jstDateOf(m.date ?? m.createdAt) ?? bucketDay) === day)) return true;
+        if (entry.reflections.some((r) => (jstDateOf(r.createdAt) ?? bucketDay) === day)) return true;
+      } else {
+        if (entry.conversationIds.some((id) => (jstDateOfUlid(id) ?? bucketDay) === day)) return true;
+        if (entry.reflectionIds.some((id) => (jstDateOfUlid(id) ?? bucketDay) === day)) return true;
+        if (entry.normalMemoryCount > 0 && bucketDay === day) return true; // 近似（上記コメント参照）
+      }
     }
     return day === todayKey() && hasSessionRecordToday;
   }
@@ -882,7 +1047,8 @@ export default function HistoryPanel({
                     戻る
                   </button>
                   <p className="text-xs text-stone-400 dark:text-stone-500">
-                    {selectedConversation.startedAt.slice(0, 10)}・{personaModeLabel(selectedConversation.persona)}
+                    {jstDateOf(selectedConversation.startedAt) ?? selectedConversation.startedAt.slice(0, 10)}・
+                    {personaModeLabel(selectedConversation.persona)}
                   </p>
                   <div className="flex flex-col gap-3">
                     {selectedConversation.turns.map((turn, index) => (
@@ -900,7 +1066,7 @@ export default function HistoryPanel({
                     戻る
                   </button>
                   <div className="flex flex-wrap items-center gap-2 text-[11px] text-stone-400 dark:text-stone-500">
-                    <span>{selectedMemory.date.slice(0, 10)}</span>
+                    <span>{jstDateOf(selectedMemory.date) ?? selectedMemory.date.slice(0, 10)}</span>
                     {selectedMemory.types.map((type) => (
                       <span
                         key={type}
@@ -932,7 +1098,8 @@ export default function HistoryPanel({
                       if (!origin) return null;
                       return (
                         <p className="border-t border-black/5 pt-3 text-xs text-stone-400 dark:border-white/10 dark:text-stone-500">
-                          由来：{origin.startedAt.slice(0, 10)}の{personaModeLabel(origin.persona)}の会話
+                          由来：{jstDateOf(origin.startedAt) ?? origin.startedAt.slice(0, 10)}の
+                          {personaModeLabel(origin.persona)}の会話
                         </p>
                       );
                     })()}

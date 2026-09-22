@@ -1,4 +1,5 @@
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
+import { jstDateOf } from "@/lib/dateModel";
 import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
 import type { ConversationTurn, Persona, RetrievedMemory } from "@/lib/types";
 import type { AIFeature, StreamChunk } from "@/lib/ai/types";
@@ -911,9 +912,13 @@ function looksLikeRecordRequest(text: string): boolean {
  * Retrieval Engine（src/lib/retrieval.ts）が見つけた記憶をプロンプトに注入する。
  * 0件のときはセクション自体を作らない（「見つかりませんでした」とAIに伝える必要は無い）。
  */
-/** 全Memory経路で、記録日と出来事日時を同じ規則で区別する。 */
+/**
+ * 全Memory経路で、記録日と出来事日時を同じ規則で区別する。
+ * 記録日はLogical Date（JST）で示す（Phase 1修正：以前はUTCベースの`slice(0, 10)`で
+ * あったため、JST 0:00〜8:59に記録されたMemoryの記録日がAIへ実際より1日早く伝わっていた）。
+ */
 function buildMemoryTimeLabel(memory: Pick<RetrievedMemory, "date" | "eventTime" | "eventTimePrecision">): string {
-  const recordedDate = memory.date.slice(0, 10);
+  const recordedDate = jstDateOf(memory.date) ?? memory.date.slice(0, 10);
   const { eventTime, eventTimePrecision } = memory;
   if (!isValidEventTimePrecision(eventTimePrecision) || !isValidEventTimeValue(eventTime, eventTimePrecision)) {
     return `[記録日: ${recordedDate}]`;

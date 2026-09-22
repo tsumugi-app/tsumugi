@@ -1,6 +1,7 @@
 "use client";
 
 import { requestFullWipe } from "@/lib/dataWipe";
+import { getJstTodayDateString } from "@/lib/jstDate";
 import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
 import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
@@ -3397,7 +3398,8 @@ export default function ChatScreen() {
       }
 
       const blob = createZipBlob(files);
-      const fileName = `tsumugi-export-${new Date().toISOString().slice(0, 10)}.zip`;
+      // Logical Date（JST、Phase 1修正）：以前はUTC基準の日付をファイル名に使っていた。
+      const fileName = `tsumugi-export-${getJstTodayDateString()}.zip`;
       const zipFile = new File([blob], fileName, { type: "application/zip" });
 
       let shared = false;

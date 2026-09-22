@@ -28,6 +28,7 @@ import {
 } from "./db";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 import { getJstTodayDateString } from "./jstDate";
+import { jstDateOf } from "./dateModel";
 import {
   findRelativeTimeExpression,
   isSafeRevisitPromptText,
@@ -44,9 +45,15 @@ export interface TopPrompt {
   persona: Persona;
 }
 
+/**
+ * Logical Date（JST）で「今日」を判定する（Phase 1修正：以前はUTCベースの
+ * `dateISO.slice(0, 10)`と比較していたため、JST 0:00〜8:59に記録されたMemoryが
+ * 「今日ではない」と誤判定され、当日生成回避（tier1/tier4）の対象から漏れていた）。
+ * `jstDateOf`がparse不能でnullを返した場合はfail-soft（「今日ではない」扱い）にする。
+ */
 function isToday(dateISO: string): boolean {
   const today = getJstTodayDateString();
-  return dateISO.slice(0, 10) === today;
+  return jstDateOf(dateISO) === today;
 }
 
 function pickRandom<T>(items: T[]): T | undefined {

@@ -24,6 +24,7 @@
 "use client";
 
 import { getAllConversations, getAllMemoryObjects, getAllSources } from "./db";
+import { jstDateOf } from "./dateModel";
 import {
   applyVaultLightCheckCandidates,
   classifyVaultLightCheckCandidates,
@@ -296,8 +297,8 @@ export async function collectVaultStatusFindings(root: FileSystemDirectoryHandle
     fromVault.push(`${what}：${recordLabel(r)}`);
   }
   if (restorePlan) {
-    for (const c of restorePlan.conversationsToAdd) fromVault.push(`保存先にあり、この端末にまだ無い会話：${c.startedAt.slice(0, 10)}（${c.turns.length}件のやり取り）`);
-    for (const m of restorePlan.memoriesToAdd) fromVault.push(`保存先にあり、この端末にまだ無い記憶：${m.date.slice(0, 10)}　${m.summary.slice(0, 40)}`);
+    for (const c of restorePlan.conversationsToAdd) fromVault.push(`保存先にあり、この端末にまだ無い会話：${jstDateOf(c.startedAt) ?? c.startedAt.slice(0, 10)}（${c.turns.length}件のやり取り）`);
+    for (const m of restorePlan.memoriesToAdd) fromVault.push(`保存先にあり、この端末にまだ無い記憶：${jstDateOf(m.date) ?? m.date.slice(0, 10)}　${m.summary.slice(0, 40)}`);
     for (const s of restorePlan.sourcesToAdd) fromVault.push(`保存先にあり、この端末にまだ無い素材：${s.title}`);
   }
   for (const item of appendPlan.adoptable) toVault.push(`この端末にあり、保存先にまだ無い記録：${item.record.day}　${item.record.title}`);

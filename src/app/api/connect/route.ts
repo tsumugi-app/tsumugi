@@ -1,6 +1,7 @@
 import type { LinkAxis } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { jstDateOf } from "@/lib/dateModel";
 
 export const runtime = "nodejs";
 
@@ -46,7 +47,7 @@ function buildPrompt(
   const candidateLines = candidates
     .map(
       (c, i) =>
-        `${i + 1}. id: ${c.id}\n   日付: ${c.date.slice(0, 10)}\n   要約: ${c.summary}\n   キーワード: ${c.keywords.join(", ") || "なし"}`
+        `${i + 1}. id: ${c.id}\n   日付: ${jstDateOf(c.date) ?? "不明"}\n   要約: ${c.summary}\n   キーワード: ${c.keywords.join(", ") || "なし"}`
     )
     .join("\n\n");
 

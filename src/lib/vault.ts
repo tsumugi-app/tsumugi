@@ -864,12 +864,25 @@ export interface HistoryConversationSummary {
  * `preview`はHistory一覧専用の軽量表示データであり、Markdown本体の
  * `summary`/`content`を置き換えるものではない（`truncateHistoryPreview`参照）。
  * `createdAt`は同日内の通常Memory・Reflectionを時系列でマージ表示するためだけに使う。
+ *
+ * `date`（JST日付モデル Phase 1で追加、optional）：通常Memoryの`MemoryObject.date`
+ * （Conversation Date、＝会話開始時刻`conversation.startedAt`）をそのままコピーしたもの。
+ * Logical Date（`src/lib/dateModel.ts`の`jstDateOf`）の算出専用で、Markdown本体・
+ * `MemoryObject.date`の保存形式には一切影響しない（このHistory Index JSON側だけの
+ * 追加フィールド）。Reflectionには設定しない（ReflectionのLogical Dateは`createdAt`
+ * そのもの——生成時刻＝日付という既存の意味を変えないため）。
+ * 追加のみのoptionalフィールドのため後方互換：この修正より前に書かれたv2 entry（history
+ * Index v2導入後、Phase 1より前に書かれたもの）には存在せず、その場合は呼び出し側が
+ * `createdAt`のLogical Dateへfallbackする（HistoryPanel.tsx参照）。次にそのdayへ
+ * 書き込みが起きた時点（`writeMemoryObjectMarkdownImpl`のretry/追記、または
+ * lazy upgrade）で自然に補われる。
  */
 export interface HistoryMemorySummary {
   id: string;
   types: MemoryType[];
   preview: string;
   createdAt: string;
+  date?: string;
 }
 
 /**
@@ -1111,6 +1124,10 @@ function isHistoryMemorySummaryEqual(a: HistoryMemorySummary, b: HistoryMemorySu
     a.id === b.id &&
     a.preview === b.preview &&
     a.createdAt === b.createdAt &&
+    // `date`（JST日付モデル Phase 1追加）も比較対象に含める：これが無いと、この修正
+    // より前に書かれた既存v2 entry（`date`欠落）を「変化なし」としてskipしてしまい、
+    // 次に同じ内容でretry/上書きされても`date`が永久に補われなくなる。
+    a.date === b.date &&
     a.types.length === b.types.length &&
     a.types.every((type, i) => type === b.types[i])
   );
@@ -2165,6 +2182,7 @@ async function writeMemoryObjectMarkdownImpl(
       types: m.types,
       preview: truncateHistoryPreview(m.summary),
       createdAt: m.createdAt,
+      date: m.date,
     })),
   });
 
@@ -6246,6 +6264,7 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
       types: current.types,
       preview: truncateHistoryPreview(current.summary),
       createdAt: current.createdAt,
+      date: current.date,
     });
   }
   historySummaries.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
