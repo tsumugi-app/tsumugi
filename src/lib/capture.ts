@@ -16,6 +16,13 @@ import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, EventTimePrecision, MemoryObject, MemoryType, Persona } from "./types";
 import { getJstTodayDateString, isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
 import { PROFILE_LIMITS, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
+import {
+  PERSON_MEMORY_LIMITS,
+  draftsToPersonMentions,
+  mergePersonMentions,
+  sanitizeStoredPersonMentions,
+  validatePersonMentionCandidates,
+} from "./person";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 
 const AI_PROVIDER = "gemini";
@@ -74,6 +81,11 @@ interface ExtractedMemory {
    * （idやslot等はTsumugi側が決定的に付与する）。無い会話では未設定。
    */
   profileClaims?: unknown;
+  /**
+   * Person Memory v1（optional）。/api/captureが検証済みの候補を返す。ここでも同じ関数で
+   * 再検証してから使う（idやgroupingKey等はTsumugi側が決定的に付与する）。無い会話では未設定。
+   */
+  personMentions?: unknown;
 }
 
 /**
@@ -358,6 +370,24 @@ async function captureConversationImpl(
     return draftsToClaims(validated.drafts, { conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
   }
 
+  // Person Memory v1：Profileと同じ二重検証パターン（サーバーの検証結果を、クライアントで
+  // 同じ関数を使って再検証してからid・groupingKey等をTsumugi側で確定する）。
+  let personBudget = PERSON_MEMORY_LIMITS.perCapture;
+  let personProposed = 0;
+  let personAccepted = 0;
+  function buildPersonMentionsFor(item: ExtractedMemory) {
+    if (item.personMentions === undefined) return [];
+    const validated = validatePersonMentionCandidates(item.personMentions, {
+      turns: conversation.turns,
+      maxItems: Math.min(PERSON_MEMORY_LIMITS.perMemoryItem, Math.max(0, personBudget)),
+      fallbackStatedAt,
+    });
+    personProposed += validated.proposed;
+    personAccepted += validated.drafts.length;
+    personBudget -= validated.drafts.length;
+    return draftsToPersonMentions(validated.drafts, { conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
+  }
+
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
     const matched = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
     // Capture Reflection保護・二重防御（2026-09-23）：`findRelatedMemoriesFromOtherConversations`
@@ -378,10 +408,13 @@ async function captureConversationImpl(
     });
 
     const newProfileClaims = buildProfileClaimsFor(item);
+    const newPersonMentions = buildPersonMentionsFor(item);
 
     if (existing) {
       // Personal Profile v1：追加のみ。既存のclaimは削除せず、新しいclaimだけを重複排除して足す。
       const mergedProfileClaims = mergeProfileClaims(existing.profileClaims ? sanitizeStoredProfileClaims(existing.profileClaims) : undefined, newProfileClaims);
+      // Person Memory v1：同じく追加のみ。既存のmention（Correction含む）は削除・編集しない。
+      const mergedPersonMentions = mergePersonMentions(existing.personMentions ? sanitizeStoredPersonMentions(existing.personMentions) : undefined, newPersonMentions);
       return {
         ...existing,
         content: item.content,
@@ -392,6 +425,7 @@ async function captureConversationImpl(
         eventTime: resolvedEventTime.eventTime,
         eventTimePrecision: resolvedEventTime.eventTimePrecision,
         ...(mergedProfileClaims.length > 0 ? { profileClaims: mergedProfileClaims } : {}),
+        ...(mergedPersonMentions.length > 0 ? { personMentions: mergedPersonMentions } : {}),
         updatedAt: timestamp,
         metadata: {
           ...existing.metadata,
@@ -422,6 +456,7 @@ async function captureConversationImpl(
       eventTime: resolvedEventTime.eventTime,
       eventTimePrecision: resolvedEventTime.eventTimePrecision,
       ...(newProfileClaims.length > 0 ? { profileClaims: newProfileClaims } : {}),
+      ...(newPersonMentions.length > 0 ? { personMentions: newPersonMentions } : {}),
       createdAt: timestamp,
       updatedAt: timestamp,
       metadata: {
@@ -438,6 +473,8 @@ async function captureConversationImpl(
 
   // 品質の観測用（件数のみ。会話・claimの内容は含めない）
   if (profileProposed > 0) logTimingEvent("Capture profileClaims", { proposed: profileProposed, accepted: profileAccepted });
+  // 品質の観測用（件数のみ。会話・mention内容は含めない）
+  if (personProposed > 0) logTimingEvent("Capture personMentions", { proposed: personProposed, accepted: personAccepted });
 
   const updatedConversation: Conversation = {
     ...conversation,

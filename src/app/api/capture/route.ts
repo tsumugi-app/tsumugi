@@ -1,10 +1,16 @@
-import type { ConversationTurn, MemoryType, Persona } from "@/lib/types";
+import { PERSON_RELATIONS, type ConversationTurn, type MemoryType, type Persona } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 import { stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { getJstTodayDateString, isValidEventTimeSource, resolveEventTimeSourceDate } from "@/lib/eventTimeResolver";
 import { PROFILE_LIMITS, draftsToCandidates, normalizeText, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
 import { jstDateOf } from "@/lib/dateModel";
+import {
+  PERSON_MEMORY_LIMITS,
+  draftsToPersonMentionCandidates,
+  validatePersonMentionCandidates,
+  type PersonMentionDropReason,
+} from "@/lib/person";
 
 export const runtime = "nodejs";
 
@@ -644,12 +650,66 @@ const PROFILE_CLAIMS_ITEM_SCHEMA: AISchema = {
   },
 };
 
-function buildMemoriesSchema(includeProfile: boolean): AISchema {
-  if (!includeProfile) return MEMORIES_SCHEMA_BASE;
+/**
+ * Person Memory v1（optional出力）。既存のCapture呼び出しに、第三者への言及候補
+ * （personMentions）を任意で出させる。Personal Profile（ユーザー本人）とは明確に別軸
+ * ——ここで扱うのは会話に登場する第三者だけ。既存のMemory抽出・Profileを悪化させない
+ * ことが最優先のため、無い会話では出力しない（0件が正常）。環境変数
+ * `PERSON_MEMORY_ENABLED=false`（または0）で、プロンプト・schema・出力の全てを
+ * 従来と同一に戻せる（品質が悪化した場合のキルスイッチ、Profileと同じ仕組み）。
+ */
+function personMemoryEnabled(): boolean {
+  const v = (process.env.PERSON_MEMORY_ENABLED ?? "").trim().toLowerCase();
+  return v !== "false" && v !== "0" && v !== "off";
+}
+
+const PERSON_MENTIONS_PROMPT_SECTION = `
+
+Person Mentions候補（任意。ほとんどの会話では出力しない。0件が正常）:
+- Memory候補ごとに、Userが名前または明示的な呼称（「さきさん」「妻」「長男」「上司」等）で
+  特定した第三者について、personMentionsに候補を入れてよい。無ければ省略する。
+- displayNameはUserが実際に使った呼び方をそのまま使う（言い換えない）。relationは
+  分かる範囲でのみ設定する（現状のカテゴリのみ。性格・感情・関係の良し悪しは含めない）。
+- 根拠はUser本人の発言だけ。quoteはUSER'S ACTUAL STATEMENTSからの逐語の抜粋。
+  AIの発言だけを根拠に人物の存在・relationを作らない。
+- Userが、既存のrelationを明示的に否定・訂正する発言をした場合（例：「さきさんは
+  友人じゃなくて同僚だよ」）だけ、correctionへ{invalidatesRelation, replacementRelation}
+  （置き換えが無い場合はinvalidatesRelationのみ）を設定してよい。訂正かどうか迷う場合、
+  または単に状況が変わっただけ（「以前は同僚だったけど、今は別の会社にいる」）の場合は
+  correctionを付けない（最終的な適用可否はTsumugi側が決定的に検証する）。`;
+
+const PERSON_MENTION_ITEM_SCHEMA: AISchema = {
+  type: "array",
+  description:
+    "任意。Userが名前または明示的な呼称で特定した第三者への言及の候補。" +
+    "無い会話では省略する（0件が正常）。推測・性格・感情・関係の良し悪しは出さない",
+  items: {
+    type: "object",
+    properties: {
+      displayName: { type: "string", description: "Userが実際に使った呼び方（例：さきさん／妻／長男／上司）" },
+      relation: { type: "string", enum: [...PERSON_RELATIONS], description: "Userとの関係。分かる範囲でのみ" },
+      quote: { type: "string", description: "USER'S ACTUAL STATEMENTSからの逐語の抜粋" },
+      correction: {
+        type: "object",
+        description: "Userが既存のrelationを明示的に否定・訂正した場合のみ設定する",
+        properties: {
+          invalidatesRelation: { type: "string", enum: [...PERSON_RELATIONS], description: "Userが明示的に否定したrelation" },
+          replacementRelation: { type: "string", enum: [...PERSON_RELATIONS], description: "置き換え後のrelation（無い場合は省略）" },
+        },
+        required: ["invalidatesRelation"],
+      },
+    },
+    required: ["displayName", "quote"],
+  },
+};
+
+function buildMemoriesSchema(includeProfile: boolean, includePersonMemory: boolean): AISchema {
+  if (!includeProfile && !includePersonMemory) return MEMORIES_SCHEMA_BASE;
   const clone = JSON.parse(JSON.stringify(MEMORIES_SCHEMA_BASE)) as {
     properties: { memories: { items: { properties: Record<string, unknown> } } };
   };
-  clone.properties.memories.items.properties.profileClaims = PROFILE_CLAIMS_ITEM_SCHEMA;
+  if (includeProfile) clone.properties.memories.items.properties.profileClaims = PROFILE_CLAIMS_ITEM_SCHEMA;
+  if (includePersonMemory) clone.properties.memories.items.properties.personMentions = PERSON_MENTION_ITEM_SCHEMA;
   return clone as unknown as AISchema;
 }
 
@@ -679,6 +739,35 @@ function finalizeProfileClaimsForMemory(
   }
   budget.remaining -= result.drafts.length;
   return result.drafts.length > 0 ? { ...rest, profileClaims: draftsToCandidates(result.drafts) } : rest;
+}
+
+/**
+ * Person Mentions候補を、決定的に検証する（LLMの出力は候補にすぎない）。クライアントは
+ * 同じ検証を再度行う。検証を通らなかった候補だけを破棄し、Memory自体には影響しない。
+ * Correction（既存relationの明示的な否定・訂正）の成立可否も、ここで呼ぶ
+ * `validatePersonMentionCandidates`がquote本文への決定的な検証で確定する
+ * （LLMの自己申告だけでは成立しない。person.ts参照）。破棄の内訳は件数のみを返す。
+ */
+function finalizePersonMentionsForMemory(
+  memory: Record<string, unknown>,
+  turns: ConversationTurn[],
+  budget: { remaining: number },
+  stats: { proposed: number; accepted: number; dropped: Partial<Record<PersonMentionDropReason, number>> }
+): Record<string, unknown> {
+  const { personMentions, ...rest } = memory;
+  if (personMentions === undefined) return rest;
+  const result = validatePersonMentionCandidates(personMentions, {
+    turns,
+    maxItems: Math.min(PERSON_MEMORY_LIMITS.perMemoryItem, Math.max(0, budget.remaining)),
+    fallbackStatedAt: turns.find((turn) => turn.role === "user" && !Number.isNaN(Date.parse(turn.timestamp)))?.timestamp,
+  });
+  stats.proposed += result.proposed;
+  stats.accepted += result.drafts.length;
+  for (const [reason, count] of Object.entries(result.dropped)) {
+    stats.dropped[reason as PersonMentionDropReason] = (stats.dropped[reason as PersonMentionDropReason] ?? 0) + (count ?? 0);
+  }
+  budget.remaining -= result.drafts.length;
+  return result.drafts.length > 0 ? { ...rest, personMentions: draftsToPersonMentionCandidates(result.drafts) } : rest;
 }
 
 export async function POST(request: Request) {
@@ -714,16 +803,18 @@ export async function POST(request: Request) {
 
   const provider = getProvider(providerName);
   const profileEnabled = profileClaimsEnabled();
+  const personEnabled = personMemoryEnabled();
   let response: { text: string };
   const geminiCallStart = Date.now();
   try {
     response = await provider.generateStructured({
       model: resolveModel(providerName),
       apiKey,
-      systemInstruction: profileEnabled ? `${SYSTEM_PROMPT}${PROFILE_PROMPT_SECTION}` : SYSTEM_PROMPT,
+      systemInstruction:
+        SYSTEM_PROMPT + (profileEnabled ? PROFILE_PROMPT_SECTION : "") + (personEnabled ? PERSON_MENTIONS_PROMPT_SECTION : ""),
       userContent: transcript,
       providerOptions: { gemini: { thinkingBudget: computeThinkingBudget(transcript) } },
-      schema: buildMemoriesSchema(profileEnabled),
+      schema: buildMemoriesSchema(profileEnabled, personEnabled),
     });
   } catch (error) {
     console.error("[Tsumugi Capture] generateContent failed:", error);
@@ -767,6 +858,8 @@ export async function POST(request: Request) {
 
     const profileBudget = { remaining: PROFILE_LIMITS.perCapture };
     const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
+    const personBudget = { remaining: PERSON_MEMORY_LIMITS.perCapture };
+    const personStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<PersonMentionDropReason, number>> };
     const finalizedMemories = memories.map((memory) => {
       if (!isRecord(memory)) return memory;
       // evidenceQuotesは一時的なLLM判定情報であり、eventTimeSource/eventTimeQuoteと同じく
@@ -775,13 +868,24 @@ export async function POST(request: Request) {
       const { evidenceQuotes: _evidenceQuotes, ...groundedMemory } = memory;
       void _evidenceQuotes;
       const withEventTime = finalizeEventTimeForMemory(groundedMemory, turns);
+
+      let withPerson: Record<string, unknown>;
+      if (personEnabled) {
+        withPerson = finalizePersonMentionsForMemory(withEventTime, turns, personBudget, personStats);
+      } else {
+        // 無効時は、personMentionsを一切返さない（従来と同一の出力）
+        const { personMentions: _ignoredPerson, ...rest } = withEventTime;
+        void _ignoredPerson;
+        withPerson = rest;
+      }
+
       if (!profileEnabled) {
         // 無効時は、profileClaimsを一切返さない（従来と同一の出力）
-        const { profileClaims: _ignored, ...rest } = withEventTime;
+        const { profileClaims: _ignored, ...rest } = withPerson;
         void _ignored;
         return rest;
       }
-      return finalizeProfileClaimsForMemory(withEventTime, turns, todayDateString, profileBudget, profileStats);
+      return finalizeProfileClaimsForMemory(withPerson, turns, todayDateString, profileBudget, profileStats);
     });
     const headers: Record<string, string> = { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) };
     // 品質の観測用（件数・理由の列挙値のみ。会話・Memory本文・quoteの内容は含めない）。
@@ -795,6 +899,10 @@ export async function POST(request: Request) {
     if (profileEnabled) {
       // 品質の観測用（件数のみ。会話・claimの内容は含めない）
       headers["X-Tsumugi-Profile-Claims"] = `proposed=${profileStats.proposed};accepted=${profileStats.accepted};dropped=${Object.values(profileStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
+    }
+    if (personEnabled) {
+      // 品質の観測用（件数のみ。会話・mention内容は含めない）
+      headers["X-Tsumugi-Person-Mentions"] = `proposed=${personStats.proposed};accepted=${personStats.accepted};dropped=${Object.values(personStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
     }
     return Response.json({ ...parsed, memories: finalizedMemories }, { headers });
   } catch {

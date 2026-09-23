@@ -217,6 +217,69 @@ export interface ProfileClaim {
   schemaVersion: 1;
 }
 
+/**
+ * Person Memory v1（Personal Modelの第三者層。Personal Profileとは明確に分離する：
+ * Profileはユーザー本人についての安定した前提、Person Memoryは会話に登場する第三者を
+ * 人物軸で束ねるための仕組み）。ユーザー自身の発言からgroundedな「人物への言及」だけを
+ * 保存する。src/lib/person.ts参照。
+ */
+export const PERSON_RELATIONS = [
+  "spouse",
+  "child",
+  "parent",
+  "sibling",
+  "pet",
+  "colleague",
+  "boss",
+  "friend",
+  "acquaintance",
+  "other",
+] as const;
+export type PersonRelation = (typeof PERSON_RELATIONS)[number];
+
+/**
+ * Userが既存のrelationを明示的に否定・訂正した場合にのみ設定する（v1、person.ts参照）。
+ * 「以前は〜だったが今は〜」のような時間変化（Change）はここに含めない
+ * （Current State、将来フェーズのスコープ）。
+ */
+export interface PersonRelationCorrection {
+  /** Userが明示的に否定したrelation。 */
+  invalidatesRelation: PersonRelation;
+  /** Userが明示的に述べた、置き換え後のrelation（無効化のみで置き換えが無い場合は省略）。 */
+  replacementRelation?: PersonRelation;
+}
+
+export interface PersonMention {
+  /** ULID。Tsumugiが採番する（LLMは採番しない）。 */
+  id: ID;
+  /**
+   * v1の安全なgrouping key（`normalizeKey(displayName)`）。恒久的なPerson IDではない
+   * ——異なる呼称（「さきさん」と「妻」等）は別のgroupingKeyのまま統合しない。
+   */
+  groupingKey: string;
+  /** Userが実際に使った呼び方（「さきさん」「妻」「長男」「上司」等）。 */
+  displayName: string;
+  /** Userが明示した場合のみ。カテゴリのみ（性格・感情・関係の良し悪しは含めない）。 */
+  relation?: PersonRelation;
+  /** このmentionの位置づけ。LLMの自己申告ではなく、quoteに対する決定的な検証を
+   *  通った場合にのみ"correction"になる（person.ts参照）。 */
+  assertion: "mention" | "correction";
+  /** assertion==="correction"の場合のみ設定。 */
+  correction?: PersonRelationCorrection;
+  /** v1は常に"explicit"（ユーザーが明示した内容）のみ。 */
+  stated: "explicit";
+  /** USER'S ACTUAL STATEMENTSからの逐語の抜粋（根拠）。 */
+  quote: string;
+  /** quoteを含むユーザーturnのtimestamp。 */
+  statedAt: ISODateString;
+  /** 由来の会話。 */
+  sourceConversationId: ID;
+  /** Tsumugiがこのmentionを保存した時刻。 */
+  recordedAt: ISODateString;
+  origin: "ai-extracted";
+  schemaVersion: 1;
+}
+
 export interface MemoryObject extends Identifiable, Timestamped {
   id: ID;
   date: ISODateString;
@@ -276,6 +339,13 @@ export interface MemoryObject extends Identifiable, Timestamped {
    * `eventTime`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・Vault migration不要）。
    */
   profileClaims?: ProfileClaim[];
+  /**
+   * Person Memory v1。この記憶の元になった会話で、ユーザー自身が明示した第三者への言及の候補
+   * （追加のみ。Capture UPDATEでも既存のmentionは削除しない）。候補が無い会話では未設定
+   * （キー自体を持たない）。`profileClaims`と同じ、追加のみのoptionalフィールド
+   * （IndexedDBバージョンアップ・Vault migration不要）。
+   */
+  personMentions?: PersonMention[];
   metadata: Metadata;
 }
 

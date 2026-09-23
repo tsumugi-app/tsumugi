@@ -23,6 +23,7 @@ import type {
 } from "./types";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
 import { sanitizeStoredProfileClaims } from "./profile";
+import { sanitizeStoredPersonMentions } from "./person";
 
 function yamlScalar(value: string): string {
   const looksSpecial =
@@ -72,6 +73,8 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     links: memoryObject.links.length > 0 ? JSON.stringify(memoryObject.links) : undefined,
     // Personal Profile v1：`links`と同じパターン（JSON文字列）。claimが無いMemoryには、キー自体を書かない。
     profile: memoryObject.profileClaims && memoryObject.profileClaims.length > 0 ? JSON.stringify(memoryObject.profileClaims) : undefined,
+    // Person Memory v1：`profile`と同じパターン（JSON文字列）。mentionが無いMemoryには、キー自体を書かない。
+    person: memoryObject.personMentions && memoryObject.personMentions.length > 0 ? JSON.stringify(memoryObject.personMentions) : undefined,
     source: memoryObject.metadata.source,
     sourceType: memoryObject.metadata.sourceType,
     sourceDetail: stringifySourceDetail(memoryObject.metadata.sourceDetail),
@@ -277,6 +280,21 @@ function parseProfileClaims(raw: unknown) {
   }
 }
 
+/**
+ * Person Memory v1：`person`は`profile`と同じパターン（JSON文字列）。fail-soft：JSONが壊れている・
+ * 形が違うmention（Correction情報を含む）は、そのmentionだけ捨てる。Memory本体の読み込みは、
+ * この値の状態に関わらず必ず成功させる（例外を投げない）。古いMemory Markdownにはこのキー
+ * 自体が無いため、その場合は空配列（＝従来どおり）になる。
+ */
+function parsePersonMentions(raw: unknown) {
+  if (typeof raw !== "string") return [];
+  try {
+    return sanitizeStoredPersonMentions(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
 /** `parseLinks`と同じパターン：`stringifySourceDetail`で文字列化された値をJSON.parseし直す。 */
 function parseSourceDetail(raw: unknown): Record<string, string> | undefined {
   if (typeof raw !== "string") return undefined;
@@ -379,6 +397,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
       : undefined;
   const eventTime = eventTimePrecision ? rawEventTime : undefined;
   const profileClaims = parseProfileClaims(frontmatter.profile);
+  const personMentions = parsePersonMentions(frontmatter.person);
 
   return {
     id,
@@ -399,6 +418,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     eventIds: [],
     links: parseLinks(frontmatter.links),
     ...(profileClaims.length > 0 ? { profileClaims } : {}),
+    ...(personMentions.length > 0 ? { personMentions } : {}),
     createdAt,
     updatedAt,
     metadata: {
