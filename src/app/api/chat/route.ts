@@ -8,6 +8,7 @@ import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabe
 import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
 import { sanitizePersonViewContext, type PersonView } from "@/lib/person";
 import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
+import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -1390,7 +1391,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -1402,6 +1403,14 @@ export async function POST(request: Request) {
     personView?: PersonView[];
     /** Topic / Current State v1（optional）。クライアントが`computeTopicTimelines()`で計算した、grounded evidenceの時系列。上限はここでも再度守る。 */
     topicTimeline?: TopicTimeline[];
+    /**
+     * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
+     * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
+     * debug envelope（本ファイル末尾のstart(controller)参照）を追加で付け足す。存在しない
+     * 通常リクエストでは、この値の有無に関わる分岐を一切通らず、レスポンスは従来と
+     * 完全に同一（バイト単位で変化しない）。
+     */
+    debugGenerationId?: string;
   };
 
   if (!turns || turns.length === 0) {
@@ -1510,11 +1519,16 @@ export async function POST(request: Request) {
   const topicContinuitySection = buildTopicContinuitySection(topicContext);
   // Topic / Current State v1：Topic Continuity Context（話題候補・Memory summary）とは
   // 別の情報源（人物軸で関連付けたtopicIdのUser逐語履歴）。追加のLLM呼び出しは発生しない。
-  const topicTimelineSection = buildTopicTimelineSection(sanitizeTopicTimelineContext(topicTimeline));
+  // Conversation Debugger v1：sanitize後の値を変数として持ち、[Server Accepted]の
+  // 元データとしてそのまま再利用する（Debuggerのためだけの再計算はしない）。
+  const sanitizedTopicTimeline = sanitizeTopicTimelineContext(topicTimeline);
+  const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline);
   // Person Memory v1をここで初めてChat Contextへ接続する（今までは保存されるだけだった）。
-  const personViewSection = buildPersonViewSection(sanitizePersonViewContext(personView));
+  const sanitizedPersonView = sanitizePersonViewContext(personView);
+  const personViewSection = buildPersonViewSection(sanitizedPersonView);
 
-  const profileSection = buildProfileSection(sanitizeProfileContext(profile));
+  const sanitizedProfile = sanitizeProfileContext(profile);
+  const profileSection = buildProfileSection(sanitizedProfile);
 
   const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
@@ -1610,6 +1624,45 @@ export async function POST(request: Request) {
 
   const encoder = new TextEncoder();
 
+  // Conversation Debugger v1（開発専用）：`debugGenerationId`が無い通常リクエストでは
+  // `debugEnvelope`は常にnullで、下のstart(controller)内の分岐へ一切入らない
+  // （通常レスポンスはこの変更の前後でバイト単位で同一）。含めるのはPersonal Model
+  // contextの動的部分（sanitize後、実際にsystemInstructionへ使われた値）だけ——
+  // system prompt本文（persona固定文・共有prompt・Evidence Boundary本文）・API key・
+  // その他secretは一切含めない。
+  const debugEnvelope: GenerationDebugEnvelope | null = debugGenerationId
+    ? {
+        generationId: debugGenerationId,
+        generation: {
+          persona,
+          provider: providerName,
+          model: resolveModel(providerName),
+          thinkingBudget,
+          maxOutputTokens: 4096,
+          searchNeeded,
+        },
+        serverAccepted: {
+          recentConversation: recentConversation ?? null,
+          profile: sanitizedProfile,
+          personView: sanitizedPersonView,
+          // buildTopicTimelineSection()はsanitizedTopicTimelineへさらに
+          // selectTimelineEventsForBudget()（最古1件＋直近N-1件）を適用してから
+          // systemInstructionへ載せる。「LLMが実際に見たcontext」を正確に反映するため、
+          // ここでも同じ選択を適用する（sanitize結果そのままではない）。
+          topicTimeline: sanitizedTopicTimeline.map((timeline) => ({
+            topicId: timeline.topicId,
+            events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic),
+          })),
+          // buildTopicContinuitySection()はmemories.length>0のtopicだけを使う。
+          // 同じ絞り込みをここでも適用する。
+          topicContinuity: topicContext
+            ? topicContext.filter((t) => t.memories.length > 0).map((t) => ({ topicId: t.topicId, memories: t.memories }))
+            : null,
+          retrievedMemory: memoriesForContext,
+        },
+      }
+    : null;
+
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
       // モデルが返答の先頭に日時ラベル（入力コンテキスト専用）を出力した場合は、ユーザーへ流す前に取り除く
@@ -1628,6 +1681,13 @@ export async function POST(request: Request) {
         }
         const tail = labelStripper.flush();
         if (tail) controller.enqueue(encoder.encode(tail));
+        // Conversation Debugger v1：可視本文が全て流れ終わった後にだけ、区切り文字列＋
+        // debug envelopeを追記する。区切り文字列はNUL文字を含み、Gemini出力に実質
+        // 出現し得ないため、通常の可視本文と混同されない。クライアントは自分が
+        // `debugGenerationId`を送った場合だけこの区切りを探す。
+        if (debugEnvelope) {
+          controller.enqueue(encoder.encode(DEBUG_ENVELOPE_DELIMITER + JSON.stringify(debugEnvelope)));
+        }
         controller.close();
       } catch (error) {
         controller.error(error);

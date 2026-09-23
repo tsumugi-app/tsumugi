@@ -6,6 +6,8 @@ import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib
 import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
 import { computePersonViews, PERSON_VIEW_CONTEXT_LIMIT, type PersonView } from "@/lib/person";
 import { computeTopicTimelines, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
+import { appendGenerationDebugEntry, createGenerationId, debugLogEnabled as generationDebugLogEnabled } from "@/lib/generationDebugLog";
+import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
@@ -127,6 +129,10 @@ import DebugTimingPanel from "./DebugTimingPanel";
 // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用診断パネル。
 // `?debugLog=1`以外では何も描画しない（DebugTimingPanelと同じ設計）。
 import ConversationDebugPanel from "./ConversationDebugPanel";
+// Conversation Debugger v1（開発専用）。`?debugLog=1`以外ではDOMへ一切出さない。
+// 役割はConversationDebugPanel（画面固定の一覧）とは別（AI返答1件ごとの生成contextを
+// そのメッセージの近くで確認する）——削除・統合しない。
+import GenerationDebugBadge from "./GenerationDebugBadge";
 import HistoryPanel from "./HistoryPanel";
 import {
   computeLeafColorProgress,
@@ -4125,6 +4131,20 @@ export default function ChatScreen() {
       // chatだけは選択中provider（既定Gemini）を使う。他機能（Capture/Connect/Reflection/
       // 問いかけ生成）はloadApiKey()を引数なしで呼ぶため、常にGeminiのままである。
       const storedApiKey = await loadApiKey(chatProvider);
+      // Conversation Debugger v1（開発専用）：`?debugLog=1`のときだけgenerationIdを発行する。
+      // これはrequest→response→debug entry→対応するAI返答を紐付けるためだけの、
+      // このモジュール専用の一時識別子——ConversationTurnの永続スキーマへは一切追加しない。
+      const generationId = generationDebugLogEnabled() ? createGenerationId() : undefined;
+      // [Client Sent]として保存する値は、実際にfetch bodyへ入れる値をそのまま参照する
+      // （Debuggerのためだけに再計算・再構築しない）。
+      const clientSentContext: GenerationDebugContext = {
+        recentConversation: recentConversation ?? null,
+        profile: profileContext ?? null,
+        personView: personViewContext ?? null,
+        topicTimeline: topicTimelineContext ?? null,
+        topicContinuity: topicContext ? topicContext.map((t) => ({ topicId: t.topicId, memories: t.memories })) : null,
+        retrievedMemory: retrievedMemories,
+      };
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -4141,6 +4161,7 @@ export default function ChatScreen() {
           ...(profileContext ? { profile: profileContext } : {}),
           ...(personViewContext ? { personView: personViewContext } : {}),
           ...(topicTimelineContext ? { topicTimeline: topicTimelineContext } : {}),
+          ...(generationId ? { debugGenerationId: generationId } : {}),
         }),
       });
 
@@ -4162,15 +4183,37 @@ export default function ChatScreen() {
         const { done, value } = await reader.read();
         if (done) break;
         full += decoder.decode(value, { stream: true });
+        // Conversation Debugger v1：generationIdを送った場合だけ、サーバーが応答末尾に
+        // 付け足すdebug envelope区切りを探し、表示にはその手前までしか使わない
+        // （通常ユーザーの表示は従来通りfullをそのまま使う＝区切りが見つかることが無い）。
+        const delimiterIdx = generationId ? full.indexOf(DEBUG_ENVELOPE_DELIMITER) : -1;
+        const displayText = delimiterIdx === -1 ? full : full.slice(0, delimiterIdx);
         // サーバーが先頭の日時ラベル（入力専用）を取り除くが、念のためクライアントでも表示前に防御する。
-        setStreamingText(stripLeadingTimeLabelsForDisplay(full));
+        setStreamingText(stripLeadingTimeLabelsForDisplay(displayText));
         stopWaiting();
+      }
+
+      // Conversation Debugger v1：最終的なfullから、可視本文とdebug envelopeを分離する。
+      // generationIdを送っていない通常リクエストでは、サーバーは区切りを一切付け足さない
+      // ため、delimiterIdxは常に-1＝visibleTextは従来のfullと完全に同じになる。
+      let visibleText = full;
+      let debugEnvelope: GenerationDebugEnvelope | null = null;
+      if (generationId) {
+        const delimiterIdx = full.indexOf(DEBUG_ENVELOPE_DELIMITER);
+        if (delimiterIdx !== -1) {
+          visibleText = full.slice(0, delimiterIdx);
+          try {
+            debugEnvelope = JSON.parse(full.slice(delimiterIdx + DEBUG_ENVELOPE_DELIMITER.length)) as GenerationDebugEnvelope;
+          } catch (error) {
+            console.warn("[GenerationDebug] failed to parse debug envelope", error);
+          }
+        }
       }
 
       const aiTurn: ConversationTurn = {
         role: "ai",
         // 保存（IndexedDB・Vault Markdown・以降のCapture）へ日時ラベルが混入しないよう、保存直前にも正規化する。
-        content: normalizeAiResponseText(full),
+        content: normalizeAiResponseText(visibleText),
         timestamp: new Date().toISOString(),
         ...(webSearchRequested !== undefined ? { webSearchRequested } : {}),
       };
@@ -4178,6 +4221,20 @@ export default function ChatScreen() {
       setConversation(updated);
       latestConversationRef.current = updated;
       setStreamingText("");
+
+      // Conversation Debugger v1：localStorageのみへ保存（Vault/IndexedDB/Conversation/
+      // Memoryには一切書き込まない）。generationIdはdebug entryの識別だけに使い、
+      // turnTimestampは表示側（GenerationDebugBadge）がこのAIターンと突き合わせるためだけに
+      // 使う（ConversationTurn自体は変更しない）。
+      if (generationId && debugEnvelope) {
+        appendGenerationDebugEntry({
+          generationId,
+          turnTimestamp: aiTurn.timestamp,
+          clientSent: clientSentContext,
+          serverAccepted: debugEnvelope.serverAccepted,
+          generation: debugEnvelope.generation,
+        });
+      }
 
       // Conversation本文の保存とMemory生成（Capture）は分離する（今回の再設計）。
       // ここではConversation本文だけを保存し、Captureの成否とは無関係に会話が
@@ -4584,7 +4641,10 @@ export default function ChatScreen() {
             </div>
 
             {conversation.turns.map((turn, index) => (
-              <TurnBubble key={index} turn={turn} />
+              <div key={index}>
+                <TurnBubble turn={turn} />
+                {turn.role === "ai" && <GenerationDebugBadge turnTimestamp={turn.timestamp} />}
+              </div>
             ))}
 
             {busy && streamingText && (
