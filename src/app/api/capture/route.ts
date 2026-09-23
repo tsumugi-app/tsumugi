@@ -752,7 +752,7 @@ function finalizePersonMentionsForMemory(
   memory: Record<string, unknown>,
   turns: ConversationTurn[],
   budget: { remaining: number },
-  stats: { proposed: number; accepted: number; dropped: Partial<Record<PersonMentionDropReason, number>> }
+  stats: { proposed: number; accepted: number; dropped: Partial<Record<PersonMentionDropReason, number>>; relationStripped: number }
 ): Record<string, unknown> {
   const { personMentions, ...rest } = memory;
   if (personMentions === undefined) return rest;
@@ -766,6 +766,7 @@ function finalizePersonMentionsForMemory(
   for (const [reason, count] of Object.entries(result.dropped)) {
     stats.dropped[reason as PersonMentionDropReason] = (stats.dropped[reason as PersonMentionDropReason] ?? 0) + (count ?? 0);
   }
+  stats.relationStripped += result.relationStripped;
   budget.remaining -= result.drafts.length;
   return result.drafts.length > 0 ? { ...rest, personMentions: draftsToPersonMentionCandidates(result.drafts) } : rest;
 }
@@ -859,7 +860,7 @@ export async function POST(request: Request) {
     const profileBudget = { remaining: PROFILE_LIMITS.perCapture };
     const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
     const personBudget = { remaining: PERSON_MEMORY_LIMITS.perCapture };
-    const personStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<PersonMentionDropReason, number>> };
+    const personStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<PersonMentionDropReason, number>>, relationStripped: 0 };
     const finalizedMemories = memories.map((memory) => {
       if (!isRecord(memory)) return memory;
       // evidenceQuotesは一時的なLLM判定情報であり、eventTimeSource/eventTimeQuoteと同じく
@@ -912,7 +913,8 @@ export async function POST(request: Request) {
         .join(",");
       headers["X-Tsumugi-Person-Mentions"] =
         `enabled=1;proposed=${personStats.proposed};accepted=${personStats.accepted};dropped=${personDroppedTotal}` +
-        (personDropReasonsPart ? `;dropReasons=${personDropReasonsPart}` : "");
+        (personDropReasonsPart ? `;dropReasons=${personDropReasonsPart}` : "") +
+        (personStats.relationStripped > 0 ? `;relationStripped=${personStats.relationStripped}` : "");
     } else {
       headers["X-Tsumugi-Person-Mentions"] = "enabled=0";
     }

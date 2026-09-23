@@ -158,6 +158,12 @@ export interface PersonMentionValidationResult {
   drafts: PersonMentionDraft[];
   proposed: number;
   dropped: Partial<Record<PersonMentionDropReason, number>>;
+  /**
+   * relationのgroundingに失敗し（quote本文に根拠語が無い、またはenumとして不正）、
+   * PersonMention自体は採用しつつrelationだけ取り除いた件数。droppedには含めない
+   * （droppedは「PersonMention候補そのものがreject された件数」の意味を維持する）。
+   */
+  relationStripped: number;
 }
 
 /**
@@ -175,6 +181,7 @@ export function validatePersonMentionCandidates(
   };
   const list = Array.isArray(raw) ? raw : [];
   const result: PersonMentionDraft[] = [];
+  let relationStripped = 0;
   const maxItems = ctx.maxItems ?? PERSON_MEMORY_LIMITS.perMemoryItem;
   const userTurns = ctx.turns.filter((turn) => turn.role === "user");
   const aiTurns = ctx.turns.filter((turn) => turn.role !== "user");
@@ -214,13 +221,19 @@ export function validatePersonMentionCandidates(
       continue;
     }
 
+    // relationはUser evidence（このPersonMentionのquote本文）に明示された場合だけ採用する。
+    // enumとして妥当なだけ（Correctionと違い、quoteとの語彙照合をしない）では採用しない
+    // ——既存Memory summary・Assistant発言・別のmentionなど、今回のquote以外の文脈から
+    // relationが「引き継がれる」ことを防ぐ（Evidence Boundary）。groundingに失敗しても
+    // PersonMention自体はdropしない（displayName/quoteのfail-closed validationとは独立の
+    // fail-soft）——relationだけ未設定のPersonMentionとして採用する。
     let relation: PersonRelation | undefined;
     if (c.relation !== undefined) {
-      if (!isValidRelation(c.relation)) {
-        drop("relation");
-        continue;
+      if (isValidRelation(c.relation) && PERSON_RELATION_WORDS[c.relation].test(nq)) {
+        relation = c.relation;
+      } else {
+        relationStripped += 1;
       }
-      relation = c.relation;
     }
 
     // 3. Correction（LLMの自己申告だけでは確定しない。quote本文への決定的な検証を通った
@@ -253,7 +266,7 @@ export function validatePersonMentionCandidates(
     });
   }
 
-  return { drafts: result, proposed: list.length, dropped };
+  return { drafts: result, proposed: list.length, dropped, relationStripped };
 }
 
 /**

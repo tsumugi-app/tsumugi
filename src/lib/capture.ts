@@ -208,7 +208,9 @@ function logEvidenceBoundaryHeader(res: Response): void {
 /**
  * Person Memory v1観測性（2026-09-23、挙動・判定ロジックは一切変更しない）：/api/captureが
  * 常に返す`X-Tsumugi-Person-Mentions`ヘッダ（kill switchの実際の状態`enabled`、有効時は
- * proposed/accepted/dropped、および`PersonMentionDropReason`ごとの内訳）を、
+ * proposed/accepted/dropped、`PersonMentionDropReason`ごとの内訳、およびrelationの
+ * groundingに失敗しPersonMention自体は採用しつつrelationだけ取り除いた件数
+ * `relationStripped`）を、
  * `logEvidenceBoundaryHeader`と同じ仕組みでそのまま記録するだけの副作用。会話内容・
  * User/Assistant発言・quote・displayName・Memory本文・個人情報は一切渡さない
  * （渡すのは件数と、既存のdrop理由ラベルだけ）。disabled時（enabled=0）もヘッダは
@@ -226,7 +228,7 @@ function logPersonMentionsHeader(res: Response): void {
     for (const part of header.split(";")) {
       const [key, value] = part.split("=");
       if (!key || value === undefined) continue;
-      if (key === "enabled" || key === "proposed" || key === "accepted" || key === "dropped") {
+      if (key === "enabled" || key === "proposed" || key === "accepted" || key === "dropped" || key === "relationStripped") {
         const n = Number(value);
         if (Number.isFinite(n)) params[key] = n;
       } else if (key === "dropReasons" && value) {
