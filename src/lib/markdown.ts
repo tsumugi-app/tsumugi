@@ -24,6 +24,7 @@ import type {
 import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
 import { sanitizeStoredProfileClaims } from "./profile";
 import { sanitizeStoredPersonMentions } from "./person";
+import { sanitizeStoredTopicEvents } from "./topicEvent";
 
 function yamlScalar(value: string): string {
   const looksSpecial =
@@ -75,6 +76,8 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     profile: memoryObject.profileClaims && memoryObject.profileClaims.length > 0 ? JSON.stringify(memoryObject.profileClaims) : undefined,
     // Person Memory v1：`profile`と同じパターン（JSON文字列）。mentionが無いMemoryには、キー自体を書かない。
     person: memoryObject.personMentions && memoryObject.personMentions.length > 0 ? JSON.stringify(memoryObject.personMentions) : undefined,
+    // Topic / Current State v1：`person`と同じパターン（JSON文字列）。eventが無いMemoryには、キー自体を書かない。
+    topicEvents: memoryObject.topicEvents && memoryObject.topicEvents.length > 0 ? JSON.stringify(memoryObject.topicEvents) : undefined,
     source: memoryObject.metadata.source,
     sourceType: memoryObject.metadata.sourceType,
     sourceDetail: stringifySourceDetail(memoryObject.metadata.sourceDetail),
@@ -295,6 +298,21 @@ function parsePersonMentions(raw: unknown) {
   }
 }
 
+/**
+ * Topic / Current State v1：`topicEvents`は`person`と同じパターン（JSON文字列）。fail-soft：
+ * JSONが壊れている・形が違うeventは、そのeventだけ捨てる。Memory本体の読み込みは、この値の
+ * 状態に関わらず必ず成功させる（例外を投げない）。古いMemory Markdownにはこのキー自体が
+ * 無いため、その場合は空配列（＝従来どおり）になる。
+ */
+function parseTopicEvents(raw: unknown) {
+  if (typeof raw !== "string") return [];
+  try {
+    return sanitizeStoredTopicEvents(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
 /** `parseLinks`と同じパターン：`stringifySourceDetail`で文字列化された値をJSON.parseし直す。 */
 function parseSourceDetail(raw: unknown): Record<string, string> | undefined {
   if (typeof raw !== "string") return undefined;
@@ -398,6 +416,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
   const eventTime = eventTimePrecision ? rawEventTime : undefined;
   const profileClaims = parseProfileClaims(frontmatter.profile);
   const personMentions = parsePersonMentions(frontmatter.person);
+  const topicEvents = parseTopicEvents(frontmatter.topicEvents);
 
   return {
     id,
@@ -419,6 +438,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     links: parseLinks(frontmatter.links),
     ...(profileClaims.length > 0 ? { profileClaims } : {}),
     ...(personMentions.length > 0 ? { personMentions } : {}),
+    ...(topicEvents.length > 0 ? { topicEvents } : {}),
     createdAt,
     updatedAt,
     metadata: {

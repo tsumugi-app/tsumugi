@@ -23,6 +23,13 @@ import {
   sanitizeStoredPersonMentions,
   validatePersonMentionCandidates,
 } from "./person";
+import {
+  TOPIC_EVENT_LIMITS,
+  draftsToTopicEvents,
+  mergeTopicEvents,
+  sanitizeStoredTopicEvents,
+  validateTopicEventQuotes,
+} from "./topicEvent";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 
 const AI_PROVIDER = "gemini";
@@ -86,6 +93,13 @@ interface ExtractedMemory {
    * 再検証してから使う（idやgroupingKey等はTsumugi側が決定的に付与する）。無い会話では未設定。
    */
   personMentions?: unknown;
+  /**
+   * Topic / Current State v1（optional）。/api/captureが検証済みのquote文字列配列を返す。
+   * ここでも同じ関数で再検証してから使う（id・topicId等はTsumugi側が決定的に付与する）。
+   * topicIdは`resolveTopicId()`の結果（`resolvedTopicId`）が存在する場合のみ付与できる
+   * ——topicIdが確定しない候補は、evidence自体は有効でも保存しない（buildTopicEventsFor参照）。
+   */
+  topicEvents?: unknown;
 }
 
 /**
@@ -248,6 +262,46 @@ function logPersonMentionsHeader(res: Response): void {
   }
 }
 
+/**
+ * Topic / Current State v1観測性（挙動・判定ロジックは一切変更しない）：/api/captureが
+ * 常に返す`X-Tsumugi-Topic-Events`ヘッダ（kill switchの実際の状態`enabled`、有効時は
+ * proposed/accepted/dropped、`TopicEventDropReason`ごとの内訳）を、`logPersonMentionsHeader`
+ * と同じ仕組みでそのまま記録するだけの副作用。会話内容・quote本文は一切渡さない
+ * （渡すのは件数と、既存のdrop理由ラベルだけ）。disabled時（enabled=0）もヘッダは
+ * 常に返るため、kill switchが意図せず無効化されていないかを、常にログから確認できる。
+ *
+ * ヘッダが無い・想定外の形式の場合は記録をskipする（例外を投げない）。ヘッダの有無・内容は、
+ * Captureの成否・戻り値に一切影響しない——この関数の戻り値は常に`void`で、
+ * 呼び出し元はこの関数の結果を一切利用しない。
+ */
+function logTopicEventsHeader(res: Response): void {
+  const header = res.headers.get("X-Tsumugi-Topic-Events");
+  if (!header) return;
+  try {
+    const params: Record<string, number | string> = {};
+    for (const part of header.split(";")) {
+      const [key, value] = part.split("=");
+      if (!key || value === undefined) continue;
+      if (key === "enabled" || key === "proposed" || key === "accepted" || key === "dropped") {
+        const n = Number(value);
+        if (Number.isFinite(n)) params[key] = n;
+      } else if (key === "dropReasons" && value) {
+        // "quote:1,not-user:1" のような形式。理由ラベル（TopicEventDropReasonの値）
+        // ごとの件数だけを個別キーへ展開する。
+        for (const pair of value.split(",")) {
+          const [reason, countStr] = pair.split(":");
+          if (!reason || countStr === undefined) continue;
+          const count = Number(countStr);
+          if (Number.isFinite(count)) params[`drop_${reason}`] = count;
+        }
+      }
+    }
+    if (Object.keys(params).length > 0) logTimingEvent("Capture topicEvents", params);
+  } catch {
+    // 診断目的のヘッダparseであり、失敗してもCapture本体には一切影響させない。
+  }
+}
+
 async function extractMemories(
   persona: Persona,
   turns: ConversationTurn[],
@@ -281,6 +335,7 @@ async function extractMemories(
   }
   logEvidenceBoundaryHeader(res);
   logPersonMentionsHeader(res);
+  logTopicEventsHeader(res);
   const data = (await res.json()) as { memories: ExtractedMemory[] };
   return data.memories ?? [];
 }
@@ -432,6 +487,27 @@ async function captureConversationImpl(
     return draftsToPersonMentions(validated.drafts, { conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
   }
 
+  // Topic / Current State v1：Profile/Person Memoryと同じ二重検証パターンに加え、
+  // 「resolvedTopicIdが存在する場合のみ保存する」という決定的なゲートを持つ
+  // （topicEvent.ts参照）。topicIdが確定しない（Topic Continuityがuncertainと判定した）
+  // 候補は、quote自体は有効でも一切保存しない——無差別なTopicEvent化を防ぐ主機構。
+  let topicBudget = TOPIC_EVENT_LIMITS.perCapture;
+  let topicProposed = 0;
+  let topicAccepted = 0;
+  function buildTopicEventsFor(item: ExtractedMemory, resolvedTopicId: string | undefined) {
+    if (item.topicEvents === undefined) return [];
+    if (resolvedTopicId === undefined) return [];
+    const validated = validateTopicEventQuotes(item.topicEvents, {
+      turns: conversation.turns,
+      maxItems: Math.min(TOPIC_EVENT_LIMITS.perMemoryItem, Math.max(0, topicBudget)),
+      fallbackStatedAt,
+    });
+    topicProposed += validated.proposed;
+    topicAccepted += validated.drafts.length;
+    topicBudget -= validated.drafts.length;
+    return draftsToTopicEvents(validated.drafts, { topicId: resolvedTopicId, conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
+  }
+
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
     const matched = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
     // Capture Reflection保護・二重防御（2026-09-23）：`findRelatedMemoriesFromOtherConversations`
@@ -453,12 +529,15 @@ async function captureConversationImpl(
 
     const newProfileClaims = buildProfileClaimsFor(item);
     const newPersonMentions = buildPersonMentionsFor(item);
+    const newTopicEvents = buildTopicEventsFor(item, resolvedTopicId);
 
     if (existing) {
       // Personal Profile v1：追加のみ。既存のclaimは削除せず、新しいclaimだけを重複排除して足す。
       const mergedProfileClaims = mergeProfileClaims(existing.profileClaims ? sanitizeStoredProfileClaims(existing.profileClaims) : undefined, newProfileClaims);
       // Person Memory v1：同じく追加のみ。既存のmention（Correction含む）は削除・編集しない。
       const mergedPersonMentions = mergePersonMentions(existing.personMentions ? sanitizeStoredPersonMentions(existing.personMentions) : undefined, newPersonMentions);
+      // Topic / Current State v1：同じく追加のみ。既存のeventは削除・編集しない。
+      const mergedTopicEvents = mergeTopicEvents(existing.topicEvents ? sanitizeStoredTopicEvents(existing.topicEvents) : undefined, newTopicEvents);
       return {
         ...existing,
         content: item.content,
@@ -470,6 +549,7 @@ async function captureConversationImpl(
         eventTimePrecision: resolvedEventTime.eventTimePrecision,
         ...(mergedProfileClaims.length > 0 ? { profileClaims: mergedProfileClaims } : {}),
         ...(mergedPersonMentions.length > 0 ? { personMentions: mergedPersonMentions } : {}),
+        ...(mergedTopicEvents.length > 0 ? { topicEvents: mergedTopicEvents } : {}),
         updatedAt: timestamp,
         metadata: {
           ...existing.metadata,
@@ -501,6 +581,7 @@ async function captureConversationImpl(
       eventTimePrecision: resolvedEventTime.eventTimePrecision,
       ...(newProfileClaims.length > 0 ? { profileClaims: newProfileClaims } : {}),
       ...(newPersonMentions.length > 0 ? { personMentions: newPersonMentions } : {}),
+      ...(newTopicEvents.length > 0 ? { topicEvents: newTopicEvents } : {}),
       createdAt: timestamp,
       updatedAt: timestamp,
       metadata: {
@@ -519,6 +600,8 @@ async function captureConversationImpl(
   if (profileProposed > 0) logTimingEvent("Capture profileClaims", { proposed: profileProposed, accepted: profileAccepted });
   // 品質の観測用（件数のみ。会話・mention内容は含めない）
   if (personProposed > 0) logTimingEvent("Capture personMentions", { proposed: personProposed, accepted: personAccepted });
+  // 品質の観測用（件数のみ。会話・quote内容は含めない）
+  if (topicProposed > 0) logTimingEvent("Capture topicEvents", { proposed: topicProposed, accepted: topicAccepted });
 
   const updatedConversation: Conversation = {
     ...conversation,

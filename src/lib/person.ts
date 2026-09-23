@@ -474,3 +474,36 @@ export function computePersonViews(memories: MemoryObject[]): PersonView[] {
 export function computePersonView(memories: MemoryObject[], groupingKey: string): PersonView | undefined {
   return computePersonViews(memories).find((view) => view.groupingKey === groupingKey);
 }
+
+// ---------------------------------------------------------------------------
+// Chat Context Assembly（Topic / Current State v1と同時に接続）：PersonViewは
+// PERSON_MEMORY_ENABLEDの責務のまま——ここではPersonViewを、クライアントが計算し、
+// サーバー（/api/chat）が受け取った際に再検証するためのfail-soft sanitizerだけを持つ
+// （Profileの`sanitizeProfileContext`と同じパターン）。
+// ---------------------------------------------------------------------------
+
+/** Chat Contextへ渡すPersonViewの最大人数（v1のdeterministic budget rule）。 */
+export const PERSON_VIEW_CONTEXT_LIMIT = 5;
+
+export function sanitizePersonViewContext(raw: unknown): PersonView[] {
+  if (!Array.isArray(raw)) return [];
+  const out: PersonView[] = [];
+  for (const item of raw) {
+    if (out.length >= PERSON_VIEW_CONTEXT_LIMIT) break;
+    if (typeof item !== "object" || item === null) continue;
+    const v = item as Record<string, unknown>;
+    if (typeof v.groupingKey !== "string" || !v.groupingKey) continue;
+    if (typeof v.displayName !== "string" || !v.displayName) continue;
+    if (typeof v.relationContested !== "boolean") continue;
+    if (!Array.isArray(v.memoryIds)) continue;
+    const relation = v.relation !== undefined && isValidRelation(v.relation) ? v.relation : undefined;
+    out.push({
+      groupingKey: v.groupingKey.slice(0, PERSON_MEMORY_LIMITS.displayNameMax),
+      displayName: v.displayName.slice(0, PERSON_MEMORY_LIMITS.displayNameMax),
+      ...(relation !== undefined ? { relation } : {}),
+      relationContested: v.relationContested,
+      memoryIds: v.memoryIds.filter((id): id is string => typeof id === "string").slice(0, 50),
+    });
+  }
+  return out;
+}

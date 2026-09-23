@@ -1,11 +1,13 @@
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
 import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
-import type { ConversationTurn, Persona, RetrievedMemory } from "@/lib/types";
+import type { ConversationTurn, Persona, PersonRelation, RetrievedMemory } from "@/lib/types";
 import type { AIFeature, StreamChunk } from "@/lib/ai/types";
 import { needsWebSearch } from "@/lib/needsWebSearch";
 import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
+import { sanitizePersonViewContext, type PersonView } from "@/lib/person";
+import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -1266,6 +1268,84 @@ ${lines}
 - 「予定：」と書かれたものは、まだ実現していないかもしれない予定であり、現在の事実として扱わない。`;
 }
 
+/** PersonRelationのenum値→表示ラベル（人物像・感情は含まない、カテゴリ名のみ）。 */
+const PERSON_RELATION_LABEL: Record<PersonRelation, string> = {
+  spouse: "配偶者・パートナー",
+  child: "子",
+  parent: "親",
+  sibling: "兄弟姉妹",
+  pet: "ペット",
+  colleague: "仕事上の関係者（同僚）",
+  boss: "上司",
+  friend: "友人",
+  acquaintance: "知人",
+  other: "関係者",
+};
+
+/**
+ * Person Memory v1をChat Contextへ接続する（Topic / Current State v1と同時実装）。
+ * `computePersonViews()`が計算した、grounded（Userが明示した）relationだけを渡す
+ * ——AIの推測でrelationを補わない。`relationContested`（矛盾が解消していない）場合は、
+ * どちらか一方を確定値として書かず、relation行自体を出さない（fail-closed）。
+ * 追加のLLM呼び出しは発生しない。0件のときはセクション自体を作らない。
+ */
+function buildPersonViewSection(views: PersonView[]): string {
+  if (views.length === 0) return "";
+  const lines = views
+    .map((view) => {
+      const relationLabel = view.relation && !view.relationContested ? PERSON_RELATION_LABEL[view.relation] : undefined;
+      return relationLabel ? `- ${view.displayName}：${relationLabel}` : `- ${view.displayName}`;
+    })
+    .join("\n");
+  return `
+
+## 関係する人物について分かっていること
+
+${lines}
+
+これは、ユーザー自身が以前の会話で明確に述べた内容から残っている、第三者についての情報（AIの推測は含まれない）。
+- 自然な前提として使い、「以前あなたは○○と言っていました」のように読み上げない。この仕組みの存在をユーザーへ説明しない。
+- ここに書かれていない性格・感情・関係の良し悪しを、推測で補わない。
+- 今の話題に関係が無ければ、無理に持ち出さない。`;
+}
+
+/** TopicTimelineEntry.time（ISO文字列）を、JST日付ラベルへ変換する（失敗時は先頭10文字にfallback）。 */
+function formatTimelineTimeLabel(time: string): string {
+  return jstDateOf(time) ?? time.slice(0, 10);
+}
+
+/**
+ * Topic / Current State v1。`computeTopicTimeline()`が計算した、grounded evidence
+ * （time/quote/sourceConversationIdのみ）をそのまま渡す——AIによる要約・統合は一切
+ * 生成・保存しない。「一度距離を置いていたが、最近また接点が生まれている」のような
+ * 統合的理解は、この情報を材料にchat応答生成の瞬間にAI自身が行う（保存しない）。
+ * 追加のLLM呼び出しは発生しない。0件のときはセクション自体を作らない。
+ * 既存の「継続中かもしれない話題の候補」（Topic Continuity Context）とは別の情報源
+ * （こちらは人物軸で関連付けたtopicIdのUser逐語履歴）であり、内容が重複するとは限らない。
+ */
+function buildTopicTimelineSection(timelines: TopicTimeline[]): string {
+  if (timelines.length === 0) return "";
+  const blocks = timelines
+    .map((timeline, index) => {
+      const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic)
+        .map((event) => `  - ${formatTimelineTimeLabel(event.time)}：「${event.quote}」`)
+        .join("\n");
+      return `経緯${index + 1}：\n${eventLines}`;
+    })
+    .join("\n\n");
+  return `
+
+## これまでの経緯（ユーザー自身の発言そのもの、時系列）
+
+${blocks}
+
+- これはユーザー自身の発言の逐語であり、AIによる要約・解釈・評価は一切含まれない。
+- ここに書かれていない関係性・感情の変化や評価を、AI自身が推測で断定しない。
+- 現在の発言の意味を最優先で読み、この経緯が実際に関係する場合にのみ、自然な理解として使う。
+  関係が無ければ無理に持ち出さない。
+- ここに書かれた内容やこの仕組みの存在をユーザーへ説明したり見せたりしない。`;
+}
+
 export async function POST(request: Request) {
   // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。クライアントが明示指定
   // していればそれを最終的なproviderとして使い、無ければ従来通りfeatureベースの
@@ -1280,7 +1360,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -1288,6 +1368,10 @@ export async function POST(request: Request) {
     topicContext?: TopicContinuityInput[];
     /** Personal Profile v1（optional）。クライアントが選んだcore/relevant。上限はここでも再度守る。 */
     profile?: ProfileContext;
+    /** Person Memory v1（optional）。クライアントが`computePersonViews()`で計算し、今回の会話に関連する人物だけを選んだもの。上限はここでも再度守る。 */
+    personView?: PersonView[];
+    /** Topic / Current State v1（optional）。クライアントが`computeTopicTimelines()`で計算した、grounded evidenceの時系列。上限はここでも再度守る。 */
+    topicTimeline?: TopicTimeline[];
   };
 
   if (!turns || turns.length === 0) {
@@ -1394,10 +1478,15 @@ export async function POST(request: Request) {
   // クライアントが渡す話題候補。「直前の会話」（逐語・時間的に直前）と「関連する過去の記憶」
   // （通常のkeyword一致）の間に置く（recentConversationSectionの直後）。
   const topicContinuitySection = buildTopicContinuitySection(topicContext);
+  // Topic / Current State v1：Topic Continuity Context（話題候補・Memory summary）とは
+  // 別の情報源（人物軸で関連付けたtopicIdのUser逐語履歴）。追加のLLM呼び出しは発生しない。
+  const topicTimelineSection = buildTopicTimelineSection(sanitizeTopicTimelineContext(topicTimeline));
+  // Person Memory v1をここで初めてChat Contextへ接続する（今までは保存されるだけだった）。
+  const personViewSection = buildPersonViewSection(sanitizePersonViewContext(personView));
 
   const profileSection = buildProfileSection(sanitizeProfileContext(profile));
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /

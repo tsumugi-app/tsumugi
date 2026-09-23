@@ -11,6 +11,12 @@ import {
   validatePersonMentionCandidates,
   type PersonMentionDropReason,
 } from "@/lib/person";
+import {
+  TOPIC_EVENT_LIMITS,
+  draftsToTopicEventQuotes,
+  validateTopicEventQuotes,
+  type TopicEventDropReason,
+} from "@/lib/topicEvent";
 
 export const runtime = "nodejs";
 
@@ -703,13 +709,47 @@ const PERSON_MENTION_ITEM_SCHEMA: AISchema = {
   },
 };
 
-function buildMemoriesSchema(includeProfile: boolean, includePersonMemory: boolean): AISchema {
-  if (!includeProfile && !includePersonMemory) return MEMORIES_SCHEMA_BASE;
+/**
+ * Topic / Current State v1（optional出力）。既存のCapture呼び出しに、既存の継続的テーマ
+ * （topicId）についての出来事・状態のgrounded evidence候補（topicEvents）を任意で出させる。
+ * Person Memoryとは明確に別軸——ここで扱うのはUser逐語の`quote`だけで、AI生成の要約・
+ * statement・relationのような構造化解釈は一切持たない（topicEvent.ts参照）。既存の
+ * Memory抽出・Profile・Person Memoryを悪化させないことが最優先のため、無い会話では
+ * 出力しない（0件が正常）。環境変数`TOPIC_STATE_ENABLED=false`（または0）で、
+ * プロンプト・schema・出力の全てを従来と同一に戻せる（品質が悪化した場合のキル
+ * スイッチ、Profile/Person Memoryと同じ仕組み）。
+ */
+function topicStateEnabled(): boolean {
+  const v = (process.env.TOPIC_STATE_ENABLED ?? "").trim().toLowerCase();
+  return v !== "false" && v !== "0" && v !== "off";
+}
+
+const TOPIC_EVENTS_PROMPT_SECTION = `
+
+Topic Events候補（任意。ほとんどの会話では出力しない。0件が正常）:
+- Memory候補が、既存の継続的なテーマ（topicDecisionがsameTopicまたはnewTopicの場合）
+  について、Userが具体的な出来事・状態を述べている場合だけ、topicEventsに、その根拠
+  となるUSER'S ACTUAL STATEMENTSからの逐語の抜粋を、文字列としてそのまま入れてよい。
+  要約・言い換え・解釈は一切含めない（quoteそのもの以外、何も追加しない）。
+- 根拠はUser本人の発言だけ。AIの発言だけを根拠にしない。関係の良し悪し・感情・
+  因果関係の推測は書かない。topicDecisionがuncertainの場合は出さない。`;
+
+const TOPIC_EVENT_ITEM_SCHEMA: AISchema = {
+  type: "array",
+  description:
+    "任意。既存の継続的テーマについてUserが述べた具体的な出来事・状態の、USER'S ACTUAL " +
+    "STATEMENTSからの逐語の抜粋のみ（要約・解釈は不可）。無い会話では省略する（0件が正常）",
+  items: { type: "string", description: "USER'S ACTUAL STATEMENTSからの逐語の抜粋" },
+};
+
+function buildMemoriesSchema(includeProfile: boolean, includePersonMemory: boolean, includeTopicEvents: boolean): AISchema {
+  if (!includeProfile && !includePersonMemory && !includeTopicEvents) return MEMORIES_SCHEMA_BASE;
   const clone = JSON.parse(JSON.stringify(MEMORIES_SCHEMA_BASE)) as {
     properties: { memories: { items: { properties: Record<string, unknown> } } };
   };
   if (includeProfile) clone.properties.memories.items.properties.profileClaims = PROFILE_CLAIMS_ITEM_SCHEMA;
   if (includePersonMemory) clone.properties.memories.items.properties.personMentions = PERSON_MENTION_ITEM_SCHEMA;
+  if (includeTopicEvents) clone.properties.memories.items.properties.topicEvents = TOPIC_EVENT_ITEM_SCHEMA;
   return clone as unknown as AISchema;
 }
 
@@ -771,6 +811,36 @@ function finalizePersonMentionsForMemory(
   return result.drafts.length > 0 ? { ...rest, personMentions: draftsToPersonMentionCandidates(result.drafts) } : rest;
 }
 
+/**
+ * Topic Events候補を、決定的に検証する（LLMの出力は候補にすぎない）。クライアントは
+ * 同じ検証を再度行う。quoteのUser turn逐語一致だけを見る（PersonMentionのような
+ * relation・correctionは無い）。検証を通らなかった候補だけを破棄し、Memory自体には
+ * 影響しない。破棄の内訳は件数のみを返す。topicIdそのものの決定（`resolvedTopicId`
+ * が存在するかのゲート）はここでは行わない——サーバーはtopicIdの実際の値を持たない
+ * ため、これはクライアント（capture.ts）の責務。
+ */
+function finalizeTopicEventsForMemory(
+  memory: Record<string, unknown>,
+  turns: ConversationTurn[],
+  budget: { remaining: number },
+  stats: { proposed: number; accepted: number; dropped: Partial<Record<TopicEventDropReason, number>> }
+): Record<string, unknown> {
+  const { topicEvents, ...rest } = memory;
+  if (topicEvents === undefined) return rest;
+  const result = validateTopicEventQuotes(topicEvents, {
+    turns,
+    maxItems: Math.min(TOPIC_EVENT_LIMITS.perMemoryItem, Math.max(0, budget.remaining)),
+    fallbackStatedAt: turns.find((turn) => turn.role === "user" && !Number.isNaN(Date.parse(turn.timestamp)))?.timestamp,
+  });
+  stats.proposed += result.proposed;
+  stats.accepted += result.drafts.length;
+  for (const [reason, count] of Object.entries(result.dropped)) {
+    stats.dropped[reason as TopicEventDropReason] = (stats.dropped[reason as TopicEventDropReason] ?? 0) + (count ?? 0);
+  }
+  budget.remaining -= result.drafts.length;
+  return result.drafts.length > 0 ? { ...rest, topicEvents: draftsToTopicEventQuotes(result.drafts) } : rest;
+}
+
 export async function POST(request: Request) {
   const providerName = resolveProviderForFeature("capture");
   // TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用に、
@@ -805,6 +875,7 @@ export async function POST(request: Request) {
   const provider = getProvider(providerName);
   const profileEnabled = profileClaimsEnabled();
   const personEnabled = personMemoryEnabled();
+  const topicEnabled = topicStateEnabled();
   let response: { text: string };
   const geminiCallStart = Date.now();
   try {
@@ -812,10 +883,13 @@ export async function POST(request: Request) {
       model: resolveModel(providerName),
       apiKey,
       systemInstruction:
-        SYSTEM_PROMPT + (profileEnabled ? PROFILE_PROMPT_SECTION : "") + (personEnabled ? PERSON_MENTIONS_PROMPT_SECTION : ""),
+        SYSTEM_PROMPT +
+        (profileEnabled ? PROFILE_PROMPT_SECTION : "") +
+        (personEnabled ? PERSON_MENTIONS_PROMPT_SECTION : "") +
+        (topicEnabled ? TOPIC_EVENTS_PROMPT_SECTION : ""),
       userContent: transcript,
       providerOptions: { gemini: { thinkingBudget: computeThinkingBudget(transcript) } },
-      schema: buildMemoriesSchema(profileEnabled, personEnabled),
+      schema: buildMemoriesSchema(profileEnabled, personEnabled, topicEnabled),
     });
   } catch (error) {
     console.error("[Tsumugi Capture] generateContent failed:", error);
@@ -861,6 +935,8 @@ export async function POST(request: Request) {
     const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
     const personBudget = { remaining: PERSON_MEMORY_LIMITS.perCapture };
     const personStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<PersonMentionDropReason, number>>, relationStripped: 0 };
+    const topicBudget = { remaining: TOPIC_EVENT_LIMITS.perCapture };
+    const topicStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<TopicEventDropReason, number>> };
     const finalizedMemories = memories.map((memory) => {
       if (!isRecord(memory)) return memory;
       // evidenceQuotesは一時的なLLM判定情報であり、eventTimeSource/eventTimeQuoteと同じく
@@ -870,12 +946,22 @@ export async function POST(request: Request) {
       void _evidenceQuotes;
       const withEventTime = finalizeEventTimeForMemory(groundedMemory, turns);
 
+      let withTopic: Record<string, unknown>;
+      if (topicEnabled) {
+        withTopic = finalizeTopicEventsForMemory(withEventTime, turns, topicBudget, topicStats);
+      } else {
+        // 無効時は、topicEventsを一切返さない（従来と同一の出力）
+        const { topicEvents: _ignoredTopic, ...rest } = withEventTime;
+        void _ignoredTopic;
+        withTopic = rest;
+      }
+
       let withPerson: Record<string, unknown>;
       if (personEnabled) {
-        withPerson = finalizePersonMentionsForMemory(withEventTime, turns, personBudget, personStats);
+        withPerson = finalizePersonMentionsForMemory(withTopic, turns, personBudget, personStats);
       } else {
         // 無効時は、personMentionsを一切返さない（従来と同一の出力）
-        const { personMentions: _ignoredPerson, ...rest } = withEventTime;
+        const { personMentions: _ignoredPerson, ...rest } = withTopic;
         void _ignoredPerson;
         withPerson = rest;
       }
@@ -917,6 +1003,21 @@ export async function POST(request: Request) {
         (personStats.relationStripped > 0 ? `;relationStripped=${personStats.relationStripped}` : "");
     } else {
       headers["X-Tsumugi-Person-Mentions"] = "enabled=0";
+    }
+    // 観測性のみ（Person Mentionsと同じ設計）：kill switchの実際の状態（enabled=0/1）を
+    // 含め、常にヘッダを返す。「LLMが出さなかったのかvalidationで落ちたのか分からない」
+    // という状態を避けるため、有効時はproposed/accepted/dropped・drop理由ごとの内訳
+    // （TopicEventDropReasonの値ごとの件数のみ、内容は含めない）を必ず付ける。
+    if (topicEnabled) {
+      const topicDroppedTotal = Object.values(topicStats.dropped).reduce((n, v) => n + (v ?? 0), 0);
+      const topicDropReasonsPart = Object.entries(topicStats.dropped)
+        .map(([reason, count]) => `${reason}:${count}`)
+        .join(",");
+      headers["X-Tsumugi-Topic-Events"] =
+        `enabled=1;proposed=${topicStats.proposed};accepted=${topicStats.accepted};dropped=${topicDroppedTotal}` +
+        (topicDropReasonsPart ? `;dropReasons=${topicDropReasonsPart}` : "");
+    } else {
+      headers["X-Tsumugi-Topic-Events"] = "enabled=0";
     }
     return Response.json({ ...parsed, memories: finalizedMemories }, { headers });
   } catch {

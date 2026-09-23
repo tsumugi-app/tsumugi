@@ -4,6 +4,8 @@ import { requestFullWipe } from "@/lib/dataWipe";
 import { getJstTodayDateString } from "@/lib/jstDate";
 import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
 import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
+import { computePersonViews, PERSON_VIEW_CONTEXT_LIMIT, type PersonView } from "@/lib/person";
+import { computeTopicTimelines, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
@@ -4053,6 +4055,12 @@ export default function ChatScreen() {
       // Personal Profile v1：同じMemory一覧から、派生ビュー（ProfileFact）を計算し、今回の話題に関連する少量だけを選ぶ
       // （追加のAPI呼び出し・保存は無い。失敗しても会話送信をブロックしない）。
       let profileContext: ProfileContext | null = null;
+      // Topic / Current State v1 + Person View Context Assembly：Person Memoryは今まで
+      // 保存されるだけでChat Contextへ一切接続されていなかった。ここで初めて接続する。
+      // どちらも追加のAPI呼び出し・保存は無い（computePersonViews()/computeTopicTimelines()は
+      // ローカルの純粋関数。失敗しても会話送信をブロックしない）。
+      let personViewContext: PersonView[] | null = null;
+      let topicTimelineContext: TopicTimeline[] | null = null;
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
         topicContext = buildTopicContinuityPayload(allMemoriesForTopicContinuity, text);
@@ -4062,6 +4070,30 @@ export default function ChatScreen() {
           if (selected.core.length + selected.relevant.length > 0) profileContext = selected;
         } catch (profileError) {
           console.error("Failed to build profile context", profileError);
+        }
+        try {
+          // 「今回の会話に関係する人物・topicIdだけ」を、既存Retrievalが選んだMemory
+          // （retrievedMemories）を起点に特定する（新しいセマンティック検索は作らない。
+          // 既にIDBから読み込み済みのallMemoriesForTopicContinuityを再利用するだけで、
+          // 追加のIDB読み込みは発生させない）。
+          const retrievedIds = new Set(retrievedMemories.map((memory) => memory.id));
+          const relevantMemories = allMemoriesForTopicContinuity.filter((memory) => retrievedIds.has(memory.id));
+          const relevantGroupingKeys = new Set(
+            relevantMemories.flatMap((memory) => (memory.personMentions ?? []).map((mention) => mention.groupingKey))
+          );
+          if (relevantGroupingKeys.size > 0) {
+            const views = computePersonViews(allMemoriesForTopicContinuity).filter((view) => relevantGroupingKeys.has(view.groupingKey));
+            if (views.length > 0) personViewContext = views.slice(0, PERSON_VIEW_CONTEXT_LIMIT);
+          }
+          const relevantTopicIds = [
+            ...new Set(relevantMemories.map((memory) => memory.topicId).filter((id): id is string => Boolean(id))),
+          ].slice(0, TOPIC_TIMELINE_BUDGET.maxTopics);
+          if (relevantTopicIds.length > 0) {
+            const timelines = computeTopicTimelines(allMemoriesForTopicContinuity, relevantTopicIds);
+            if (timelines.length > 0) topicTimelineContext = timelines;
+          }
+        } catch (personTopicError) {
+          console.error("Failed to build person view / topic timeline context", personTopicError);
         }
       } catch (topicError) {
         if (topicError instanceof StaleVaultTabError) throw topicError;
@@ -4107,6 +4139,8 @@ export default function ChatScreen() {
           ...(recentConversation ? { recentConversation } : {}),
           ...(topicContext ? { topicContext } : {}),
           ...(profileContext ? { profile: profileContext } : {}),
+          ...(personViewContext ? { personView: personViewContext } : {}),
+          ...(topicTimelineContext ? { topicTimeline: topicTimelineContext } : {}),
         }),
       });
 

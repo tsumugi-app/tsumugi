@@ -280,6 +280,29 @@ export interface PersonMention {
   schemaVersion: 1;
 }
 
+/**
+ * Topic / Current State v1（Personal Modelの時系列層）。あるtopicId（Topic Continuity
+ * Phase 1で既に判定済みの継続テーマ軸）について、Userが明示した出来事・状態のgrounded
+ * evidenceだけを保存する。AI生成の要約・解釈（statement）は一切持たない
+ * ——quoteのみが根拠。src/lib/topicEvent.ts参照。
+ */
+export interface TopicEvent {
+  /** ULID。Tsumugiが採番する（LLMは採番しない）。 */
+  id: ID;
+  /** 既存のTopic Continuity軸（`MemoryObject.topicId`）をそのまま再利用する。新しいTopic Entityは作らない。 */
+  topicId: ID;
+  /** USER'S ACTUAL STATEMENTSからの逐語の抜粋（根拠）。要約・言い換えは含めない。 */
+  quote: string;
+  /** quoteを含むユーザーturnのtimestamp（Message Time）。 */
+  statedAt: ISODateString;
+  /** 由来の会話。 */
+  sourceConversationId: ID;
+  /** Tsumugiがこのイベントを保存した時刻。 */
+  recordedAt: ISODateString;
+  origin: "ai-extracted";
+  schemaVersion: 1;
+}
+
 export interface MemoryObject extends Identifiable, Timestamped {
   id: ID;
   date: ISODateString;
@@ -346,6 +369,14 @@ export interface MemoryObject extends Identifiable, Timestamped {
    * （IndexedDBバージョンアップ・Vault migration不要）。
    */
   personMentions?: PersonMention[];
+  /**
+   * Topic / Current State v1。この記憶の元になった会話で、ユーザー自身が明示した
+   * topicId軸上の出来事・状態のgrounded evidence候補（追加のみ。Capture UPDATEでも
+   * 既存のeventは削除しない）。候補が無い会話・topicIdが未確定の会話では未設定
+   * （キー自体を持たない）。`personMentions`と同じ、追加のみのoptionalフィールド
+   * （IndexedDBバージョンアップ・Vault migration不要）。
+   */
+  topicEvents?: TopicEvent[];
   metadata: Metadata;
 }
 
