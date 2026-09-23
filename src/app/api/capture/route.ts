@@ -900,9 +900,21 @@ export async function POST(request: Request) {
       // 品質の観測用（件数のみ。会話・claimの内容は含めない）
       headers["X-Tsumugi-Profile-Claims"] = `proposed=${profileStats.proposed};accepted=${profileStats.accepted};dropped=${Object.values(profileStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
     }
+    // 観測性のみ（2026-09-23、判定ロジックは一切変更しない）：kill switchの実際の状態
+    // （enabled=0/1）を含め、常にヘッダを返す。有効時はproposed/accepted/dropped、および
+    // drop理由ごとの内訳（PersonMentionDropReasonの値ごとの件数のみ、内容は含めない）を
+    // X-Tsumugi-Evidenceと同じ形式で付ける。無効時はenabled=0だけを返す
+    // （PERSON_MEMORY_ENABLEDが意図せず無効化されていないかを、常にログから判別できるようにする）。
     if (personEnabled) {
-      // 品質の観測用（件数のみ。会話・mention内容は含めない）
-      headers["X-Tsumugi-Person-Mentions"] = `proposed=${personStats.proposed};accepted=${personStats.accepted};dropped=${Object.values(personStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
+      const personDroppedTotal = Object.values(personStats.dropped).reduce((n, v) => n + (v ?? 0), 0);
+      const personDropReasonsPart = Object.entries(personStats.dropped)
+        .map(([reason, count]) => `${reason}:${count}`)
+        .join(",");
+      headers["X-Tsumugi-Person-Mentions"] =
+        `enabled=1;proposed=${personStats.proposed};accepted=${personStats.accepted};dropped=${personDroppedTotal}` +
+        (personDropReasonsPart ? `;dropReasons=${personDropReasonsPart}` : "");
+    } else {
+      headers["X-Tsumugi-Person-Mentions"] = "enabled=0";
     }
     return Response.json({ ...parsed, memories: finalizedMemories }, { headers });
   } catch {

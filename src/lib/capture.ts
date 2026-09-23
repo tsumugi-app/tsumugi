@@ -205,6 +205,47 @@ function logEvidenceBoundaryHeader(res: Response): void {
   }
 }
 
+/**
+ * Person Memory v1観測性（2026-09-23、挙動・判定ロジックは一切変更しない）：/api/captureが
+ * 常に返す`X-Tsumugi-Person-Mentions`ヘッダ（kill switchの実際の状態`enabled`、有効時は
+ * proposed/accepted/dropped、および`PersonMentionDropReason`ごとの内訳）を、
+ * `logEvidenceBoundaryHeader`と同じ仕組みでそのまま記録するだけの副作用。会話内容・
+ * User/Assistant発言・quote・displayName・Memory本文・個人情報は一切渡さない
+ * （渡すのは件数と、既存のdrop理由ラベルだけ）。disabled時（enabled=0）もヘッダは
+ * 常に返るため、kill switchが意図せず無効化されていないかを、常にログから確認できる。
+ *
+ * ヘッダが無い・想定外の形式の場合は記録をskipする（例外を投げない）。ヘッダの有無・内容は、
+ * Captureの成否・戻り値に一切影響しない——この関数の戻り値は常に`void`で、
+ * 呼び出し元はこの関数の結果を一切利用しない。
+ */
+function logPersonMentionsHeader(res: Response): void {
+  const header = res.headers.get("X-Tsumugi-Person-Mentions");
+  if (!header) return;
+  try {
+    const params: Record<string, number | string> = {};
+    for (const part of header.split(";")) {
+      const [key, value] = part.split("=");
+      if (!key || value === undefined) continue;
+      if (key === "enabled" || key === "proposed" || key === "accepted" || key === "dropped") {
+        const n = Number(value);
+        if (Number.isFinite(n)) params[key] = n;
+      } else if (key === "dropReasons" && value) {
+        // "quote:1,displayName:1" のような形式。理由ラベル（PersonMentionDropReasonの値）
+        // ごとの件数だけを個別キーへ展開する。
+        for (const pair of value.split(",")) {
+          const [reason, countStr] = pair.split(":");
+          if (!reason || countStr === undefined) continue;
+          const count = Number(countStr);
+          if (Number.isFinite(count)) params[`drop_${reason}`] = count;
+        }
+      }
+    }
+    if (Object.keys(params).length > 0) logTimingEvent("Capture personMentions", params);
+  } catch {
+    // 診断目的のヘッダparseであり、失敗してもCapture本体には一切影響させない。
+  }
+}
+
 async function extractMemories(
   persona: Persona,
   turns: ConversationTurn[],
@@ -237,6 +278,7 @@ async function extractMemories(
     throw new Error(`capture request failed with status ${res.status}`);
   }
   logEvidenceBoundaryHeader(res);
+  logPersonMentionsHeader(res);
   const data = (await res.json()) as { memories: ExtractedMemory[] };
   return data.memories ?? [];
 }
