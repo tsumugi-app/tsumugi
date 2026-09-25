@@ -850,13 +850,15 @@ export async function POST(request: Request) {
   // （buildServerTimingHeader参照）。thinkingBudget・プロンプト・処理順序・
   // ロジック自体は一切変更していない。
   const requestStart = Date.now();
-  const apiKey = resolveApiKey(request, providerName);
-  if (!apiKey) {
+  const resolvedApiKey = resolveApiKey(request, providerName);
+  if (!resolvedApiKey) {
     return Response.json(
       { error: "Gemini APIキーが設定されていません。" },
       { status: 401 }
     );
   }
+  // attemptExtraction()（下のクロージャ）で使うため、undefinedを含まない型として確定させる。
+  const apiKey: string = resolvedApiKey;
 
   const { persona, turns, existingMemories, relatedMemories } = (await request.json()) as {
     persona: Persona;
@@ -876,40 +878,68 @@ export async function POST(request: Request) {
   const profileEnabled = profileClaimsEnabled();
   const personEnabled = personMemoryEnabled();
   const topicEnabled = topicStateEnabled();
-  let response: { text: string };
-  const geminiCallStart = Date.now();
-  try {
-    response = await provider.generateStructured({
-      model: resolveModel(providerName),
-      apiKey,
-      systemInstruction:
-        SYSTEM_PROMPT +
-        (profileEnabled ? PROFILE_PROMPT_SECTION : "") +
-        (personEnabled ? PERSON_MENTIONS_PROMPT_SECTION : "") +
-        (topicEnabled ? TOPIC_EVENTS_PROMPT_SECTION : ""),
-      userContent: transcript,
-      providerOptions: { gemini: { thinkingBudget: computeThinkingBudget(transcript) } },
-      schema: buildMemoriesSchema(profileEnabled, personEnabled, topicEnabled),
-    });
-  } catch (error) {
-    console.error("[Tsumugi Capture] generateContent failed:", error);
-    return Response.json(
-      { error: "Failed to generate a memory extraction from the AI model." },
-      { status: 502 }
-    );
-  }
-  const geminiCallEnd = Date.now();
 
-  const text = response.text;
-  if (!text) {
-    return Response.json(
-      { error: "AI did not return a structured memory extraction." },
-      { status: 502 }
-    );
-  }
+  const systemInstruction =
+    SYSTEM_PROMPT +
+    (profileEnabled ? PROFILE_PROMPT_SECTION : "") +
+    (personEnabled ? PERSON_MENTIONS_PROMPT_SECTION : "") +
+    (topicEnabled ? TOPIC_EVENTS_PROMPT_SECTION : "");
+  const schema = buildMemoriesSchema(profileEnabled, personEnabled, topicEnabled);
 
-  try {
-    const parsed = JSON.parse(text) as { memories?: unknown };
+  /**
+   * Capture Evidence Boundary false negative対策（2026-09-25）：1回のgenerateStructured呼び出し
+   * ＋JSON.parse＋evidenceQuotes検証を1セットにまとめただけのヘルパー。判定ロジック
+   * （validateMemoryEvidenceQuotes）自体は一切変更していない——単に「同じ厳格な検証を
+   * 独立したattemptとして複数回試せるようにする」ための抽出であり、Evidence Boundaryを
+   * 弱めるものではない。
+   */
+  async function attemptExtraction(): Promise<
+    | {
+        ok: true;
+        parsed: { memories?: unknown };
+        memoriesRaw: unknown[];
+        memories: unknown[];
+        evidenceDroppedCount: number;
+        evidenceDropReasons: Partial<Record<EvidenceDropReason, number>>;
+        geminiCallStart: number;
+        geminiCallEnd: number;
+      }
+    | { ok: false; errorResponse: Response }
+  > {
+    const attemptStart = Date.now();
+    let response: { text: string };
+    try {
+      response = await provider.generateStructured({
+        model: resolveModel(providerName),
+        apiKey,
+        systemInstruction,
+        userContent: transcript,
+        providerOptions: { gemini: { thinkingBudget: computeThinkingBudget(transcript) } },
+        schema,
+      });
+    } catch (error) {
+      console.error("[Tsumugi Capture] generateContent failed:", error);
+      return {
+        ok: false,
+        errorResponse: Response.json({ error: "Failed to generate a memory extraction from the AI model." }, { status: 502 }),
+      };
+    }
+    const attemptEnd = Date.now();
+
+    const text = response.text;
+    if (!text) {
+      return {
+        ok: false,
+        errorResponse: Response.json({ error: "AI did not return a structured memory extraction." }, { status: 502 }),
+      };
+    }
+
+    let parsed: { memories?: unknown };
+    try {
+      parsed = JSON.parse(text) as { memories?: unknown };
+    } catch {
+      return { ok: false, errorResponse: Response.json({ error: "Failed to parse AI response as JSON." }, { status: 502 }) };
+    }
     const memoriesRaw = Array.isArray(parsed.memories) ? parsed.memories : [];
 
     // Capture Evidence Boundary（Memory本体）：evidenceQuotesの全件検証をパイプラインの
@@ -931,6 +961,55 @@ export async function POST(request: Request) {
       return result.valid;
     });
 
+    return { ok: true, parsed, memoriesRaw, memories, evidenceDroppedCount, evidenceDropReasons, geminiCallStart: attemptStart, geminiCallEnd: attemptEnd };
+  }
+
+  const first = await attemptExtraction();
+  if (!first.ok) return first.errorResponse;
+
+  /**
+   * Capture Evidence Boundary false negative対策（2026-09-25、実データ検証済み：
+   * 同一の長い実Conversationを8回Captureしたところ、8/8回でLLMがMemory候補を提案した
+   * にもかかわらず、1/8回でevidenceQuotesの逐語一致失敗により候補が全件dropし、
+   * 正当なMemoryが丸ごと失われることを確認した）。
+   *
+   * 対処は「evidenceQuotes検証を緩める」のではなく、「同じ厳格な検証にもう一度だけ
+   * 独立したattemptで挑戦させる」こと——retry後も同一のvalidateMemoryEvidenceQuotes()を
+   * 一切変更せず通過したものだけを採用する。部分的に検証を通過したquoteだけで
+   * summary/contentを書き換えるような救済（未検証の因果・感情・関係を含んだまま
+   * 一部だけ承認する等）は行わない：各attemptは常に「そのattemptのMemory候補全体が
+   * 検証を通過したか」で判定し、通過しなかったattemptの結果は使わない。
+   *
+   * 発火条件を「proposed>0 かつ accepted=0 かつ dropReasonsにnot-foundを含む」に限定する
+   * 理由：(1) 実際に確認された故障モード（提案はされたが逐語検証だけで全滅）に対処を
+   * 絞るため。(2) 既に1件以上acceptedがある場合はretryしない——複数Memory候補の一部だけ
+   * retryすると、retry結果との対応関係が取れず「同じ話題のMemoryが重複する／元のacceptedの
+   * 内容が意図せず variant違いに置き換わる」リスクが生じるため、あえて対象外とする
+   * （このケースは今回のスコープ外として次回以降の課題とする）。(3) not-found以外の
+   * dropReason（invalid-count/invalid-type/empty-quote等）はLLMの出力形式自体が
+   * 不正なケースであり、確率的なquote言い回しの揺らぎとは性質が異なるため、単純retryで
+   * 改善する根拠が無く対象外とする。retryは最大1回のみ（無限retry禁止）。
+   */
+  const shouldRetry =
+    first.memoriesRaw.length > 0 && first.memories.length === 0 && (first.evidenceDropReasons["not-found"] ?? 0) > 0;
+
+  let finalResult = first;
+  let retryAttempted = false;
+  let retryRecovered = false;
+  if (shouldRetry) {
+    retryAttempted = true;
+    const retry = await attemptExtraction();
+    // retry自体がAPIエラー・空応答・JSON parse失敗になった場合は、retryが役に立たなかった
+    // だけとして扱い、1回目の結果（0件）をそのまま使う。retryの失敗を新たなエラー応答には
+    // しない（1回目が既に正常応答である以上、リクエスト全体としては成功のまま）。
+    if (retry.ok && retry.memories.length > 0) {
+      finalResult = retry;
+      retryRecovered = true;
+    }
+  }
+  const { parsed, memoriesRaw, memories, evidenceDroppedCount, evidenceDropReasons, geminiCallStart, geminiCallEnd } = finalResult;
+
+  try {
     const profileBudget = { remaining: PROFILE_LIMITS.perCapture };
     const profileStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<ProfileDropReason, number>> };
     const personBudget = { remaining: PERSON_MEMORY_LIMITS.perCapture };
@@ -983,6 +1062,12 @@ export async function POST(request: Request) {
     headers["X-Tsumugi-Evidence"] =
       `proposed=${memoriesRaw.length};accepted=${memories.length};dropped=${evidenceDroppedCount}` +
       (dropReasonsPart ? `;dropReasons=${dropReasonsPart}` : "");
+    // 観測性のみ（2026-09-25）：not-found全滅時のretryが実際に発火したか・救済できたかを
+    // ログから判別できるようにする。retryの判定条件・validateMemoryEvidenceQuotes自体には
+    // 一切影響しない。
+    if (retryAttempted) {
+      headers["X-Tsumugi-Evidence-Retry"] = `attempted=1;recovered=${retryRecovered ? 1 : 0}`;
+    }
     if (profileEnabled) {
       // 品質の観測用（件数のみ。会話・claimの内容は含めない）
       headers["X-Tsumugi-Profile-Claims"] = `proposed=${profileStats.proposed};accepted=${profileStats.accepted};dropped=${Object.values(profileStats.dropped).reduce((n, v) => n + (v ?? 0), 0)}`;
