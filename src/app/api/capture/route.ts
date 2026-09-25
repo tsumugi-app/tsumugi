@@ -55,8 +55,8 @@ interface ExistingMemoryRef {
  *
  * 「1 Conversation → 1 Memory」ではなく、会話の中から意味のある単位ごとに複数のMemory候補を
  * 抽出する（Tsumugi Capture改善）。既存Memory（同一Conversationから既に生成済みのもの）に加え、
- * 別Conversationからローカル検索で見つけた少数の類似候補（relatedMemories）も参考情報として渡し、
- * 続きの話題は更新、新しい話題は新規として区別させる。統合するかどうかの判断は常にAI（この
+ * 別Conversationからローカル検索で見つけた少数の類似候補（relatedMemories）も参考情報として渡す
+ * （話題判定・topicId継承にだけ使い、UPDATE対象にはしない。別Conversationで得た情報は常に新規Memory）。統合するかどうかの判断は常にAI（この
  * プロンプト）が行い、類似度による自動統合はしない（capture.ts側のスコアリングは候補選定のみ）。
  */
 const SYSTEM_PROMPT = `あなたはTsumugiという個人向けAIプロダクトの記憶エンジン(Memory Engine)の一部として、
@@ -167,19 +167,15 @@ Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは�
   保持するか上書きするかはCapture処理側が別途判断するため、あなたは今回分かる範囲の
   判定を素直に出力すればよい）。
 
-別Conversationからの関連Memory候補との対応付け（重要）:
-- 「既存Memory」とは別に、過去の別Conversationから機械的な検索で見つかった、話題が
-  近い可能性のある「関連Memory候補」が提示される場合がある。
-- これはあくまで候補であり、類似しているというだけで自動的に同じ記憶とはみなさない。
-  「似ているが別の記憶」は、統合せず新しいMemoryとして残してよい（むしろ望ましい）。
-  例：「マックのハッピーセットに興味がある」という関連候補に対して、今回の内容が
-  「子供と一緒にハッピーセットのおもちゃを集めたい」であれば、話題は近いが新しい
-  視点（子供と一緒に、という要素）を含むため、新規Memoryとして残してよい。
-- 今回の会話内容が、関連Memory候補のいずれかと**明確に同一の出来事・関心・事実**を
-  指している場合に限り、既存Memoryの場合と同じ扱いで、その候補のidをexistingMemoryId
-  に設定して更新してよい。判断基準は既存Memoryの場合と同じ「明確に同じ話題」であり、
-  関連Memory候補だからといって基準を緩めない。
-- 迷う場合は統合せず、新しいMemory候補として出力する方を優先する。
+別Conversationからの関連Memory候補（重要。参考情報であり、更新対象ではない）:
+- 「関連Memory候補」は、過去の別Conversationから機械的な検索で見つかった、話題が近い可能性の
+  あるMemoryである。これは**更新対象ではない**。これらのidをexistingMemoryIdに設定してはいけない。
+- 今回の会話で新しく得られた情報・出来事・状態の変化は、関連Memory候補と同じ人物・同じ
+  テーマであっても、常に新しいMemory候補として出力する（existingMemoryIdは付けない）。
+  過去のMemoryを書き換えたり、まとめ直したりしない。
+- 関連Memory候補は、Topic判定（下記）の参考にだけ使う。今回の内容がその候補の続きのテーマである
+  場合は、新規Memoryのまま、topicDecisionをsameTopicにしてその候補のidをsameTopicMemoryIdに
+  設定する（同じ話題として関連づけられる）。
 
 厳守事項:
 - 実際に語られていないことを作り出さない(事実の捏造禁止)
@@ -311,7 +307,7 @@ function buildExistingMemoriesSection(existingMemories: ExistingMemoryRef[]): st
 function buildRelatedMemoriesSection(relatedMemories: ExistingMemoryRef[]): string {
   if (relatedMemories.length === 0) return "";
 
-  return `\n\n=== 関連Memory候補（別のConversationから、ローカル検索で見つかった候補。類似しているだけで同じ記憶とは限らない） ===\n${formatMemoryRefLines(relatedMemories)}\n=== END 関連Memory候補 ===`;
+  return `\n\n=== 関連Memory候補（別のConversationから、ローカル検索で見つかった参考情報。更新対象ではない。話題判定にだけ使う） ===\n${formatMemoryRefLines(relatedMemories)}\n=== END 関連Memory候補 ===`;
 }
 
 /**
@@ -493,7 +489,9 @@ const MEMORIES_SCHEMA_BASE: AISchema = {
         properties: {
           existingMemoryId: {
             type: "string",
-            description: "既存Memoryのいずれかの続き・更新である場合のみ、そのid。新規Memoryの場合は省略する",
+            description:
+              "このConversationから既に生成済みの既存Memoryセクションに提示されたMemoryの続き・更新である場合のみ、そのid。" +
+              "関連Memory候補（別Conversation由来）のidは指定しない。新規Memoryの場合は省略する",
           },
           topicDecision: {
             type: "string",

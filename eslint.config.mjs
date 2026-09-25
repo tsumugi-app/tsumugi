@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // `npm run test:capture`のコンパイル出力（tsconfig.test.json）
+    ".test-out/**",
   ]),
 ]);
 

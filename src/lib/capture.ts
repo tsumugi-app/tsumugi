@@ -178,6 +178,7 @@ async function findRelatedMemoriesFromOtherConversations(
  * 少数の類似候補。どちらもsummary/keywordsだけの軽量な形に絞って送る（contentは
  * 送らない。トークン節約と、AIに既存Memoryをまるごと書き直させないため）。
  * /api/capture側で、この2つは別のセクションとしてAIへ提示され、区別される。
+ * relatedMemoryObjectsは参考情報（話題判定・topicId継承）専用で、UPDATE対象ではない（M1）。
  */
 /**
  * Capture Evidence Boundary観測性（2026-09-23、挙動は一切変更しない）：/api/captureが
@@ -353,8 +354,9 @@ export interface CaptureResult {
  *
  * 戻り値のConversation.memoryObjectIdsは「そのConversationから新規生成された
  * MemoryのID一覧」を意味する（MemoryObject.conversationIdという単一の血統情報と
- * 意味を一致させる）。既存Memoryの更新（同一Conversation由来・別Conversation由来の
- * どちらも）では、更新対象のMemoryのidをmemoryObjectIdsへ追加しない。
+ * 意味を一致させる）。既存Memoryの更新では、更新対象のMemoryのidをmemoryObjectIdsへ追加しない。
+ * なお、更新（UPDATE）の対象になるのは、existingMemoryObjects（このConversation自身のMemory）
+ * だけ。別Conversation由来のMemoryは、内容を書き換えられることは決してない（M1）。
  */
 /**
  * Vault境界の安全性（H4対応）：Memory World（他Conversation由来の類似Memory探索を含む）を
@@ -382,17 +384,19 @@ async function captureConversationImpl(
     relatedMemoryObjects
   );
   const timestamp = nowISO();
-  // existingMemoryIdは、同一Conversationの既存Memoryだけでなく、別Conversationからの
-  // 類似候補（relatedMemoryObjects）のidを指すこともある。両方をマージしておかないと、
-  // AIが「別Conversationの候補を更新する」と判断したケースを拾えず、意図せず新規
-  // MemoryObjectとして重複生成してしまう。
-  const existingById = new Map(
-    [...existingMemoryObjects, ...relatedMemoryObjects].map((memory) => [memory.id, memory])
-  );
+  // Memory UPDATE破壊の停止（M1、2026-09-25）：UPDATE（content/summary/keywords/typesの置換）の
+  // 対象にできるのは、このConversation自身から既に生成済みのMemory（existingMemoryObjects）だけ。
+  // 別Conversation由来の類似候補（relatedMemoryObjects）は「参考情報」であり、UPDATE対象にしない。
+  // 以前は両方を1つのMapへマージしており、LLMが関連候補のidをexistingMemoryIdに指定すると、
+  // 過去のConversationのMemoryが、summary/keywordsしか見ていないLLMの出力で全置換され、
+  // 過去の詳細が永久に失われていた（実データに近い入力で、ほぼ毎回この経路になることを確認）。
+  // 別Conversationで新しく得た情報は、同じ人物・同じ話題であっても、常に新しいMemoryとして保存する。
+  const updatableById = new Map(existingMemoryObjects.map((memory) => [memory.id, memory]));
+  // topicIdの継承（sameTopicMemoryId）には、関連候補も引き続き使う（参照するだけで、書き込まない）。
+  const topicRefById = new Map([...existingMemoryObjects, ...relatedMemoryObjects].map((memory) => [memory.id, memory]));
 
   // newlyCreatedIdsには、このConversationから今回実際に新規作成されたMemoryのidだけを
-  // 集める（既存Memoryの更新は、それが同一Conversation由来か別Conversation由来かに
-  // 関わらず一切含めない）。conversation.memoryObjectIdsの意味を「そのConversationから
+  // 集める（既存Memoryの更新は一切含めない）。conversation.memoryObjectIdsの意味を「そのConversationから
   // 新規生成されたMemoryのID一覧」に統一するため（MemoryObject.conversationIdという
   // 単一の血統情報と、意味を一致させる）。
   const newlyCreatedIds: string[] = [];
@@ -410,7 +414,11 @@ async function captureConversationImpl(
   //   というだけの理由でそれを消さない（維持する）。
   function resolveTopicId(item: ExtractedMemory, existing: MemoryObject | undefined): string | undefined {
     if (item.topicDecision === "sameTopic") {
-      const target = item.sameTopicMemoryId ? existingById.get(item.sameTopicMemoryId) : undefined;
+      // sameTopicMemoryIdが無く、代わりにexistingMemoryIdが別Conversation由来の候補を指していた場合
+      // （関連候補を「更新してよい」と誤解した出力）も、同じ話題の続きという意図として、そのidから
+      // topicIdを継承する。この場合もUPDATEはしない（新規Memoryとして保存される）。
+      const refId = item.sameTopicMemoryId ?? item.existingMemoryId;
+      const target = refId ? topicRefById.get(refId) : undefined;
       if (target?.topicId) return target.topicId;
       return ulid();
     }
@@ -509,7 +517,10 @@ async function captureConversationImpl(
   }
 
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
-    const matched = item.existingMemoryId ? existingById.get(item.existingMemoryId) : undefined;
+    // UPDATE対象は、このConversation自身のMemoryだけ（上のupdatableById参照）。別Conversation由来の
+    // 候補のidが返ってきても一致しない＝undefined＝新規Memoryとして保存される（コード側の保証。
+    // LLMの指示違反があっても、過去のConversationのMemoryは書き換えられない）。
+    const matched = item.existingMemoryId ? updatableById.get(item.existingMemoryId) : undefined;
     // Capture Reflection保護・二重防御（2026-09-23）：`findRelatedMemoriesFromOtherConversations`
     // が既にReflectionを候補から除外しているため通常はここに来ないはずだが、
     // existingMemoryObjects（このConversation自身から既に生成済みのMemory）側に

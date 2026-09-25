@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:capture": "tsc -p tsconfig.test.json && node --test .test-out/lib/capture.regression.test.js"
   },
   "dependencies": {
     "@google/genai": "^2.13.0",
