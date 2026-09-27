@@ -16,7 +16,7 @@ import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, EventTimePrecision, MemoryObject, MemoryType, Persona } from "./types";
 import { getJstTodayDateString, isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
-import { PROFILE_LIMITS, normalizeText, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
+import { PROFILE_LIMITS, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
 import {
   PERSON_MEMORY_LIMITS,
   draftsToPersonMentions,
@@ -103,7 +103,7 @@ interface ExtractedMemory {
   topicEvents?: unknown;
   /**
    * この記憶の根拠になった、ユーザー発言からの逐語quote（/api/captureが検証済みのものだけ返す）。
-   * ここでは既存validatorと同じ正規化・部分一致を再確認し、保存上限を適用してMemoryObject.evidenceQuotesへ保存する
+   * ここではUser原文との完全一致を再確認し、保存上限を適用してMemoryObject.evidenceQuotesへ保存する
    * （追跡用の付随情報。summary/contentの生成・検証には関与しない）。
    */
   evidenceQuotes?: unknown;
@@ -546,19 +546,17 @@ async function captureConversationImpl(
     return draftsToTopicEvents(validated.drafts, { topicId: resolvedTopicId, conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
   }
 
-  // 根拠quote：/api/captureの検証結果を、クライアントでも同じ正規化・部分一致で再検証する
-  // （Profile/Person/Topicと同じ二重検証。通らないquoteは静かに捨てる。追跡用の付随情報であり、
-  // Memoryの採否・summary/contentには影響しない）。
-  const userTurnTexts = conversation.turns.filter((turn) => turn.role === "user").map((turn) => normalizeText(turn.content));
+  // Server resolves whole original User messages. Exact equality preserves whitespace;
+  // storage still caps at 12 distinct quotes / 200 chars, after provenance verification.
+  // This existing storage limit is not an Evidence adoption rule.
+  const originalUserMessages = new Set(conversation.turns.filter(turn => turn.role === "user").map(turn => turn.content));
   function buildEvidenceQuotesFor(item: ExtractedMemory): string[] {
     if (!Array.isArray(item.evidenceQuotes)) return [];
     const out: string[] = [];
     for (const raw of item.evidenceQuotes) {
       if (typeof raw !== "string") continue;
-      const quote = raw.trim();
-      const nq = normalizeText(quote);
-      if (!nq || !userTurnTexts.some((text) => text.includes(nq))) continue;
-      const stored = quote.slice(0, EVIDENCE_QUOTE_STORE_MAX_CHARS);
+      if (!originalUserMessages.has(raw)) continue;
+      const stored = raw.slice(0, EVIDENCE_QUOTE_STORE_MAX_CHARS);
       if (!out.includes(stored)) out.push(stored);
       if (out.length >= EVIDENCE_QUOTES_STORE_MAX) break;
     }

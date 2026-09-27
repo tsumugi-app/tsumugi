@@ -5,10 +5,12 @@ import { getTabVaultEpoch, withVaultWorldRead } from "./vaultWorldLock";
 
 export interface CaptureDebugAttempt {
   candidates: unknown[];
-  validation: Array<{ index: number; verdict: string; reason?: string; quotes?: unknown[] }>;
+  validation: Array<{ index: number; verdict: string; reason?: string; quotes?: unknown[]; rawEvidenceUserMessageIndexes?: unknown; validatedEvidenceUserMessageIndexes?: number[]; indexValidationResult?: unknown; resolvedOriginalEvidenceQuotes?: string[] }>;
+  retryReason?: unknown;
   failure?: string;
 }
 export interface CaptureDebugServer {
+  userMessages?: readonly string[];
   attempts: CaptureDebugAttempt[];
   selectedAttempt: number;
   finalized: unknown[];
