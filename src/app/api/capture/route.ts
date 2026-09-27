@@ -1,3 +1,4 @@
+import type { CaptureDebugAttempt } from "@/lib/captureDebug";
 import { PERSON_RELATIONS, type ConversationTurn, type MemoryType, type Persona } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
@@ -858,7 +859,8 @@ export async function POST(request: Request) {
   // attemptExtraction()（下のクロージャ）で使うため、undefinedを含まない型として確定させる。
   const apiKey: string = resolvedApiKey;
 
-  const { persona, turns, existingMemories, relatedMemories } = (await request.json()) as {
+  const { persona, turns, existingMemories, relatedMemories, captureDebug } = (await request.json()) as {
+    captureDebug?: boolean;
     persona: Persona;
     turns: ConversationTurn[];
     existingMemories?: ExistingMemoryRef[];
@@ -891,6 +893,10 @@ export async function POST(request: Request) {
    * 独立したattemptとして複数回試せるようにする」ための抽出であり、Evidence Boundaryを
    * 弱めるものではない。
    */
+  const debugAttempts: CaptureDebugAttempt[] = [];
+  function captureError(message: string): Response {
+    return Response.json({ error: message, ...(captureDebug === true ? { captureDebug: { attempts: debugAttempts, selectedAttempt: 0, finalized: [] } } : {}) }, { status: 502 });
+  }
   async function attemptExtraction(): Promise<
     | {
         ok: true;
@@ -904,6 +910,8 @@ export async function POST(request: Request) {
       }
     | { ok: false; errorResponse: Response }
   > {
+    const debugAttempt: CaptureDebugAttempt | undefined = captureDebug === true ? { candidates: [], validation: [] } : undefined;
+    if (debugAttempt) debugAttempts.push(debugAttempt);
     const attemptStart = Date.now();
     let response: { text: string };
     try {
@@ -916,19 +924,21 @@ export async function POST(request: Request) {
         schema,
       });
     } catch (error) {
+      if (debugAttempt) debugAttempt.failure = "provider-error";
       console.error("[Tsumugi Capture] generateContent failed:", error);
       return {
         ok: false,
-        errorResponse: Response.json({ error: "Failed to generate a memory extraction from the AI model." }, { status: 502 }),
+        errorResponse: captureError("Failed to generate a memory extraction from the AI model."),
       };
     }
     const attemptEnd = Date.now();
 
     const text = response.text;
     if (!text) {
+      if (debugAttempt) debugAttempt.failure = "empty-response";
       return {
         ok: false,
-        errorResponse: Response.json({ error: "AI did not return a structured memory extraction." }, { status: 502 }),
+        errorResponse: captureError("AI did not return a structured memory extraction."),
       };
     }
 
@@ -936,7 +946,8 @@ export async function POST(request: Request) {
     try {
       parsed = JSON.parse(text) as { memories?: unknown };
     } catch {
-      return { ok: false, errorResponse: Response.json({ error: "Failed to parse AI response as JSON." }, { status: 502 }) };
+      if (debugAttempt) debugAttempt.failure = "parse-error";
+      return { ok: false, errorResponse: captureError("Failed to parse AI response as JSON.") };
     }
     const memoriesRaw = Array.isArray(parsed.memories) ? parsed.memories : [];
 
@@ -949,9 +960,17 @@ export async function POST(request: Request) {
     // filterの採否判定（`result.valid`）自体は観測性追加の前後で完全に同一。
     let evidenceDroppedCount = 0;
     const evidenceDropReasons: Partial<Record<EvidenceDropReason, number>> = {};
-    const memories = memoriesRaw.filter((memory) => {
-      if (!isRecord(memory)) return true;
+    if (debugAttempt) debugAttempt.candidates = memoriesRaw.map(memory => isRecord(memory)
+      ? { types: memory.types, summary: memory.summary, content: memory.content, evidenceQuotes: memory.evidenceQuotes } : { invalidCandidateType: typeof memory });
+    const memories = memoriesRaw.filter((memory, index) => {
+      if (!isRecord(memory)) {
+        debugAttempt?.validation.push({ index, verdict: "not-validated", reason: "non-record (existing pass-through)" });
+        return true;
+      }
       const result = validateMemoryEvidenceQuotes(turns, memory.evidenceQuotes);
+      if (debugAttempt) debugAttempt.validation.push({ index, verdict: result.valid ? "accepted" : "dropped", reason: result.reason,
+        // Reuse the same validator per quote for observation only, never for adoption.
+        quotes: Array.isArray(memory.evidenceQuotes) ? memory.evidenceQuotes.map((quote, quoteIndex) => ({ quoteIndex, quote, ...validateMemoryEvidenceQuotes(turns, [quote]) })) : undefined });
       if (!result.valid) {
         evidenceDroppedCount += 1;
         if (result.reason) evidenceDropReasons[result.reason] = (evidenceDropReasons[result.reason] ?? 0) + 1;
@@ -1016,11 +1035,8 @@ export async function POST(request: Request) {
     const topicStats = { proposed: 0, accepted: 0, dropped: {} as Partial<Record<TopicEventDropReason, number>> };
     const finalizedMemories = memories.map((memory) => {
       if (!isRecord(memory)) return memory;
-      // evidenceQuotesは一時的なLLM判定情報であり、eventTimeSource/eventTimeQuoteと同じく
-      // MemoryObject/Markdownへ永続化しないため、検証後は必ず取り除く
-      // （クライアント側へ一切渡さない）。
-      const { evidenceQuotes: _evidenceQuotes, ...groundedMemory } = memory;
-      void _evidenceQuotes;
+      // Preserve already validated evidence for persistence and local Debug.
+      const groundedMemory = memory;
       const withEventTime = finalizeEventTimeForMemory(groundedMemory, turns);
 
       let withTopic: Record<string, unknown>;
@@ -1102,11 +1118,8 @@ export async function POST(request: Request) {
     } else {
       headers["X-Tsumugi-Topic-Events"] = "enabled=0";
     }
-    return Response.json({ ...parsed, memories: finalizedMemories }, { headers });
+    return Response.json({ ...parsed, memories: finalizedMemories, ...(captureDebug === true ? { captureDebug: { attempts: debugAttempts, selectedAttempt: retryRecovered ? 2 : 1, finalized: finalizedMemories } } : {}) }, { headers });
   } catch {
-    return Response.json(
-      { error: "Failed to parse AI response as JSON." },
-      { status: 502 }
-    );
+    return captureError("Failed to parse AI response as JSON.");
   }
 }

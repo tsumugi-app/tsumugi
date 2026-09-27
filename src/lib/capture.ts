@@ -6,6 +6,7 @@
  */
 "use client";
 
+import { beginCaptureDebug, bindCaptureDebug, captureDebugId, observeCapture, observeCaptureSave, type CaptureDebugServer } from "./captureDebug";
 import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObject } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
@@ -15,7 +16,7 @@ import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, EventTimePrecision, MemoryObject, MemoryType, Persona } from "./types";
 import { getJstTodayDateString, isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
-import { PROFILE_LIMITS, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
+import { PROFILE_LIMITS, normalizeText, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
 import {
   PERSON_MEMORY_LIMITS,
   draftsToPersonMentions,
@@ -100,7 +101,17 @@ interface ExtractedMemory {
    * ——topicIdが確定しない候補は、evidence自体は有効でも保存しない（buildTopicEventsFor参照）。
    */
   topicEvents?: unknown;
+  /**
+   * この記憶の根拠になった、ユーザー発言からの逐語quote（/api/captureが検証済みのものだけ返す）。
+   * ここでは既存validatorと同じ正規化・部分一致を再確認し、保存上限を適用してMemoryObject.evidenceQuotesへ保存する
+   * （追跡用の付随情報。summary/contentの生成・検証には関与しない）。
+   */
+  evidenceQuotes?: unknown;
 }
+
+/** 根拠quoteの保存上限（保存サイズの抑制のみ。検証は件数によらず全件行う）。 */
+const EVIDENCE_QUOTES_STORE_MAX = 12;
+const EVIDENCE_QUOTE_STORE_MAX_CHARS = 200;
 
 /**
  * 別Conversationからの類似Memory候補の件数上限。retrieval.tsのDEFAULT_LIMIT
@@ -307,7 +318,8 @@ async function extractMemories(
   persona: Persona,
   turns: ConversationTurn[],
   existingMemoryObjects: MemoryObject[],
-  relatedMemoryObjects: MemoryObject[]
+  relatedMemoryObjects: MemoryObject[],
+  debugId?: string
 ): Promise<ExtractedMemory[]> {
   const apiKey = await loadApiKey();
   const toRef = (memory: MemoryObject) => ({
@@ -318,6 +330,7 @@ async function extractMemories(
   // TEMP-TEST：20〜40秒の異常遅延の原因切り分け用。原因調査が終わり次第削除すること。
   console.log(`[Capture] request:start`);
   logTimingEvent("Capture request:start");
+  observeCapture(debugId, e => { e.phase = "request-sent"; });
   const res = await fetch("/api/capture", {
     method: "POST",
     headers: {
@@ -327,17 +340,26 @@ async function extractMemories(
     body: JSON.stringify({
       persona,
       turns,
+      ...(debugId ? { captureDebug: true } : {}),
       existingMemories: existingMemoryObjects.map(toRef),
       relatedMemories: relatedMemoryObjects.map(toRef),
     }),
   });
   if (!res.ok) {
+    observeCapture(debugId, e => { e.phase = `api-failed HTTP ${res.status}`; });
+    if (debugId) {
+      try {
+        const failure = await res.clone().json() as { captureDebug?: CaptureDebugServer };
+        observeCapture(debugId, e => { e.server = failure.captureDebug; });
+      } catch { /* Non-JSON errors do not change the existing exception. */ }
+    }
     throw new Error(`capture request failed with status ${res.status}`);
   }
   logEvidenceBoundaryHeader(res);
   logPersonMentionsHeader(res);
   logTopicEventsHeader(res);
-  const data = (await res.json()) as { memories: ExtractedMemory[] };
+  const data = (await res.json()) as { memories: ExtractedMemory[]; captureDebug?: CaptureDebugServer };
+  observeCapture(debugId, e => { e.server = data.captureDebug; e.phase = "api-response"; });
   return data.memories ?? [];
 }
 
@@ -369,19 +391,27 @@ export async function captureConversation(
   conversation: Conversation,
   existingMemoryObjects: MemoryObject[]
 ): Promise<CaptureResult> {
-  return withVaultWorldRead(() => captureConversationImpl(conversation, existingMemoryObjects));
+  const debugId = beginCaptureDebug(conversation);
+  try {
+    return await withVaultWorldRead(() => captureConversationImpl(conversation, existingMemoryObjects, debugId));
+  } catch (error) {
+    observeCapture(debugId, e => { e.phase += "; capture-failed"; });
+    throw error;
+  }
 }
 
 async function captureConversationImpl(
   conversation: Conversation,
-  existingMemoryObjects: MemoryObject[]
+  existingMemoryObjects: MemoryObject[],
+  debugId?: string
 ): Promise<CaptureResult> {
   const relatedMemoryObjects = await findRelatedMemoriesFromOtherConversations(conversation, existingMemoryObjects);
   const extracted = await extractMemories(
     conversation.persona,
     conversation.turns,
     existingMemoryObjects,
-    relatedMemoryObjects
+    relatedMemoryObjects,
+    debugId
   );
   const timestamp = nowISO();
   // Memory UPDATE破壊の停止（M1、2026-09-25）：UPDATE（content/summary/keywords/typesの置換）の
@@ -516,6 +546,25 @@ async function captureConversationImpl(
     return draftsToTopicEvents(validated.drafts, { topicId: resolvedTopicId, conversationId: conversation.id, recordedAt: timestamp, newId: ulid });
   }
 
+  // 根拠quote：/api/captureの検証結果を、クライアントでも同じ正規化・部分一致で再検証する
+  // （Profile/Person/Topicと同じ二重検証。通らないquoteは静かに捨てる。追跡用の付随情報であり、
+  // Memoryの採否・summary/contentには影響しない）。
+  const userTurnTexts = conversation.turns.filter((turn) => turn.role === "user").map((turn) => normalizeText(turn.content));
+  function buildEvidenceQuotesFor(item: ExtractedMemory): string[] {
+    if (!Array.isArray(item.evidenceQuotes)) return [];
+    const out: string[] = [];
+    for (const raw of item.evidenceQuotes) {
+      if (typeof raw !== "string") continue;
+      const quote = raw.trim();
+      const nq = normalizeText(quote);
+      if (!nq || !userTurnTexts.some((text) => text.includes(nq))) continue;
+      const stored = quote.slice(0, EVIDENCE_QUOTE_STORE_MAX_CHARS);
+      if (!out.includes(stored)) out.push(stored);
+      if (out.length >= EVIDENCE_QUOTES_STORE_MAX) break;
+    }
+    return out;
+  }
+
   const memoryObjects: MemoryObject[] = extracted.map((item) => {
     // UPDATE対象は、このConversation自身のMemoryだけ（上のupdatableById参照）。別Conversation由来の
     // 候補のidが返ってきても一致しない＝undefined＝新規Memoryとして保存される（コード側の保証。
@@ -541,8 +590,11 @@ async function captureConversationImpl(
     const newProfileClaims = buildProfileClaimsFor(item);
     const newPersonMentions = buildPersonMentionsFor(item);
     const newTopicEvents = buildTopicEventsFor(item, resolvedTopicId);
+    const newEvidenceQuotes = buildEvidenceQuotesFor(item);
 
     if (existing) {
+      // 根拠quote：追加のみ。既存のquoteは残したまま、新しいquoteを重複排除して足す（上限内）。
+      const mergedEvidenceQuotes = [...(existing.evidenceQuotes ?? []), ...newEvidenceQuotes.filter((q) => !(existing.evidenceQuotes ?? []).includes(q))].slice(0, EVIDENCE_QUOTES_STORE_MAX);
       // Personal Profile v1：追加のみ。既存のclaimは削除せず、新しいclaimだけを重複排除して足す。
       const mergedProfileClaims = mergeProfileClaims(existing.profileClaims ? sanitizeStoredProfileClaims(existing.profileClaims) : undefined, newProfileClaims);
       // Person Memory v1：同じく追加のみ。既存のmention（Correction含む）は削除・編集しない。
@@ -561,6 +613,7 @@ async function captureConversationImpl(
         ...(mergedProfileClaims.length > 0 ? { profileClaims: mergedProfileClaims } : {}),
         ...(mergedPersonMentions.length > 0 ? { personMentions: mergedPersonMentions } : {}),
         ...(mergedTopicEvents.length > 0 ? { topicEvents: mergedTopicEvents } : {}),
+        ...(mergedEvidenceQuotes.length > 0 ? { evidenceQuotes: mergedEvidenceQuotes } : {}),
         updatedAt: timestamp,
         metadata: {
           ...existing.metadata,
@@ -593,6 +646,7 @@ async function captureConversationImpl(
       ...(newProfileClaims.length > 0 ? { profileClaims: newProfileClaims } : {}),
       ...(newPersonMentions.length > 0 ? { personMentions: newPersonMentions } : {}),
       ...(newTopicEvents.length > 0 ? { topicEvents: newTopicEvents } : {}),
+      ...(newEvidenceQuotes.length > 0 ? { evidenceQuotes: newEvidenceQuotes } : {}),
       createdAt: timestamp,
       updatedAt: timestamp,
       metadata: {
@@ -624,6 +678,7 @@ async function captureConversationImpl(
     updatedAt: timestamp,
   };
 
+  bindCaptureDebug(debugId, updatedConversation, memoryObjects);
   return { conversation: updatedConversation, memoryObjects };
 }
 
@@ -834,6 +889,7 @@ async function persistCaptureImpl(
   priority: VaultWritePriority = "interactive",
   awaitVaultSync: boolean = true
 ): Promise<PersistCaptureImplResult> {
+  const debugId = captureDebugId(conversation);
   // ネスト回避のため、公開版persistConversation（ロック付き）ではなく
   // persistConversationImpl（ロック無し）を直接呼ぶ（vaultWorldLock.ts参照）。
   const { conversationFailed, startBackgroundSync: conversationStartBackgroundSync } = await persistConversationImpl(
@@ -843,6 +899,7 @@ async function persistCaptureImpl(
     awaitVaultSync
   );
 
+  observeCapture(debugId, e => { e.phase = conversationFailed ? "conversation-persist-failed; saving memories" : "saving memories"; });
   const failedMemoryIds: string[] = [];
   // H4 Codexレビュー指摘High-2対応：conversation分と合わせて、まだ実行していない
   // 背景sync（サンク）をここへ集める。ここで`void`発火・awaitはしない
@@ -851,16 +908,21 @@ async function persistCaptureImpl(
   for (const memoryObject of memoryObjects) {
     try {
       await putMemoryObject(memoryObject);
+      observeCaptureSave(debugId, memoryObject.id, "indexedDB", "success");
     } catch (error) {
       console.error(`[Tsumugi Capture] memory IndexedDB write failed for ${memoryObject.id}:`, error);
       failedMemoryIds.push(memoryObject.id);
+      observeCaptureSave(debugId, memoryObject.id, "indexedDB", "failed");
     }
 
+    observeCaptureSave(debugId, memoryObject.id, "vault", vaultHandle ? "pending" : "deferred: no connected vault");
     if (vaultHandle) {
       const syncToVault = async () => {
         try {
           await writeMemoryObjectMarkdown(vaultHandle, memoryObject, priority);
+          observeCaptureSave(debugId, memoryObject.id, "vault", "success");
         } catch (error) {
+          observeCaptureSave(debugId, memoryObject.id, "vault", error instanceof Error && error.name === "VaultRecordNeedsResyncError" ? "held" : "failed (write or sync bookkeeping)");
           console.error(
             `[Tsumugi Capture] memory markdown write failed for ${memoryObject.id} (will retry on next vault flush):`,
             error
@@ -870,7 +932,11 @@ async function persistCaptureImpl(
       if (awaitVaultSync) {
         await syncToVault();
       } else {
-        memoryStartBackgroundSyncs.push(scheduleBackgroundVaultSync(syncToVault));
+        const start = scheduleBackgroundVaultSync(syncToVault);
+        memoryStartBackgroundSyncs.push(() => start().catch(error => {
+          observeCaptureSave(debugId, memoryObject.id, "vault", "not-completed: background sync rejected");
+          throw error;
+        }));
       }
     }
   }
@@ -884,5 +950,6 @@ async function persistCaptureImpl(
   const startBackgroundSync =
     allStarts.length > 0 ? () => Promise.all(allStarts.map((start) => start())).then(() => undefined) : null;
 
+  observeCapture(debugId, e => { e.phase = `persistence returned; conversation IndexedDB=${conversationFailed ? "failed" : "success"}; background=${startBackgroundSync ? "scheduled" : "none"}`; });
   return { conversationFailed, failedMemoryIds, startBackgroundSync };
 }

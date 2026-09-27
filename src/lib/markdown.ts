@@ -78,6 +78,8 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     person: memoryObject.personMentions && memoryObject.personMentions.length > 0 ? JSON.stringify(memoryObject.personMentions) : undefined,
     // Topic / Current State v1：`person`と同じパターン（JSON文字列）。eventが無いMemoryには、キー自体を書かない。
     topicEvents: memoryObject.topicEvents && memoryObject.topicEvents.length > 0 ? JSON.stringify(memoryObject.topicEvents) : undefined,
+    // 根拠quote（ユーザー発言の逐語）：`topicEvents`と同じパターン（JSON文字列）。無いMemoryには、キー自体を書かない。
+    evidence: memoryObject.evidenceQuotes && memoryObject.evidenceQuotes.length > 0 ? JSON.stringify(memoryObject.evidenceQuotes) : undefined,
     source: memoryObject.metadata.source,
     sourceType: memoryObject.metadata.sourceType,
     sourceDetail: stringifySourceDetail(memoryObject.metadata.sourceDetail),
@@ -313,6 +315,17 @@ function parseTopicEvents(raw: unknown) {
   }
 }
 
+/** 根拠quote：`topicEvents`と同じfail-soft（壊れていれば空配列。Memory本体の読み込みは必ず成功させる）。 */
+function parseEvidenceQuotes(raw: unknown): string[] {
+  if (typeof raw !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((q): q is string => typeof q === "string" && q.length > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
 /** `parseLinks`と同じパターン：`stringifySourceDetail`で文字列化された値をJSON.parseし直す。 */
 function parseSourceDetail(raw: unknown): Record<string, string> | undefined {
   if (typeof raw !== "string") return undefined;
@@ -417,6 +430,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
   const profileClaims = parseProfileClaims(frontmatter.profile);
   const personMentions = parsePersonMentions(frontmatter.person);
   const topicEvents = parseTopicEvents(frontmatter.topicEvents);
+  const evidenceQuotes = parseEvidenceQuotes(frontmatter.evidence);
 
   return {
     id,
@@ -439,6 +453,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     ...(profileClaims.length > 0 ? { profileClaims } : {}),
     ...(personMentions.length > 0 ? { personMentions } : {}),
     ...(topicEvents.length > 0 ? { topicEvents } : {}),
+    ...(evidenceQuotes.length > 0 ? { evidenceQuotes } : {}),
     createdAt,
     updatedAt,
     metadata: {

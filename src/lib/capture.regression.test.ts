@@ -23,7 +23,7 @@ interface StoredMemory extends Json {
   id: string;
 }
 interface CaptureResult {
-  conversation: { memoryObjectIds: string[] };
+  conversation: { memoryObjectIds: string[]; status: string };
   memoryObjects: StoredMemory[];
 }
 interface ProviderRequest {
@@ -54,11 +54,12 @@ const fakeProvider = {
     return { text: JSON.stringify({ memories: rec.fixed }) };
   },
 };
+let debugEpoch = 1;
 const stubs: Record<string, unknown> = {
   "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini" },
   "./db": new Proxy({ loadApiKey: async () => "k", getAllMemoryObjects: async () => rec.allMemories }, { get: (t: Record<string, unknown>, k: string) => (k in t ? t[k] : async () => undefined) }),
   "./vault": { isReflectionSummary: (m: { metadata: { source: string } }) => m.metadata.source === "system-generated" },
-  "./vaultWorldLock": { withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn() },
+  "./vaultWorldLock": { getTabVaultEpoch: () => debugEpoch, withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn() },
   "./debugTimingLog": { logTimingEvent: () => {} },
 };
 const mod = Module as unknown as {
@@ -318,4 +319,125 @@ test("retry: retry自体の失敗（例外・空応答・不正JSON）は、再�
     assert.equal(first.calls, 1);
     assert.equal(first.retry, null);
   }
+});
+
+const captureDebug = require(path.join(ROOT, "lib/captureDebug.js")) as {
+  getCaptureDebugText: () => Promise<string>;
+  clearCaptureDebug: () => void;
+};
+async function withCaptureDebug(fn: () => Promise<void>) {
+  const old = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { location: { search: "?debugLog=1" } } });
+  captureDebug.clearCaptureDebug();
+  try { await fn(); }
+  finally {
+    captureDebug.clearCaptureDebug();
+    if (old) Object.defineProperty(globalThis, "window", old);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
+}
+function debugEntry(text: string): Json {
+  return JSON.parse(text.replace("[D] Capture Debug\n", "")) as Json;
+}
+const DEBUG_GOOD = { ...BASE, summary: "所有している喜び", content: "このベースを所有している喜びがある", keywords: ["ベース"], evidenceQuotes: ["所有している喜びがある"] };
+const DEBUG_BAD = { ...DEBUG_GOOD, summary: "候補だが根拠不一致", evidenceQuotes: ["実際には言っていない"] };
+
+test("Capture Debug: opt-in retains proposed/drop detail without changing prompt or accepted output", async () => {
+  const turns = [user("このベースには所有している喜びがある"), ai("そうなんですね")];
+  const normal = await runCapture(turns, [DEBUG_GOOD, DEBUG_BAD]);
+  assert.equal(await captureDebug.getCaptureDebugText(), "");
+  await withCaptureDebug(async () => {
+    const debug = await runCapture(turns, [DEBUG_GOOD, DEBUG_BAD]);
+    assert.deepEqual(debug.firstReq, normal.firstReq); // prompt, transcript, schema unchanged
+    assert.deepEqual(debug.out.memoryObjects.map(m => [m.summary, m.content, m.evidenceQuotes]), normal.out.memoryObjects.map(m => [m.summary, m.content, m.evidenceQuotes]));
+    const text = await captureDebug.getCaptureDebugText();
+    const entry = debugEntry(text);
+    assert.equal(entry.conversationId, "CONV-B");
+    assert.equal(entry.turnCount, 2);
+    assert.equal(entry.userMessageCount, 1);
+    assert.equal(entry.assistantMessageCount, 1);
+    assert.deepEqual(entry.userMessages, ["このベースには所有している喜びがある"]);
+    const server = entry.server as { attempts: Array<{ candidates: Json[]; validation: Json[] }>; selectedAttempt: number };
+    assert.equal(server.attempts[0].candidates.length, 2);
+    assert.equal(server.attempts[0].validation[1].verdict, "dropped");
+    assert.equal(server.attempts[0].validation[1].reason, "not-found");
+    assert.ok(text.includes("実際には言っていない"));
+    assert.equal((entry.memories as Json[])[0].proposedIndex, 0);
+    debugEpoch = 2;
+    assert.equal(await captureDebug.getCaptureDebugText(), "");
+    debugEpoch = 1;
+  });
+});
+
+test("Capture Debug: retry preserves both attempts and selects only recovered output", async () => {
+  await withCaptureDebug(async () => {
+    await runCapture([user("所有している喜びがある")], null, { script: [{ memories: [DEBUG_BAD] }, { memories: [DEBUG_GOOD] }] });
+    const entry = debugEntry(await captureDebug.getCaptureDebugText());
+    const server = entry.server as { attempts: unknown[]; selectedAttempt: number };
+    assert.equal(server.attempts.length, 2);
+    assert.equal(server.selectedAttempt, 2);
+    assert.deepEqual(entry.totals, { proposed: 1, accepted: 1, dropped: 0, saved: 0 });
+  });
+});
+
+test("Capture Debug: parse failure is observable, with no raw model response or secrets", async () => {
+  await withCaptureDebug(async () => {
+    await assert.rejects(runCapture([user("所有している喜びがある")], null, { script: [{ text: "invalid JSON secret-marker" }] }));
+    const text = await captureDebug.getCaptureDebugText();
+    assert.ok(text.includes("parse-error"));
+    assert.ok(!text.includes("secret-marker"));
+  });
+});
+
+test("Capture Debug: observes IndexedDB success/failure and Vault success/held/failure/deferred", async () => {
+  await withCaptureDebug(async () => {
+    const db = stubs["./db"] as Record<string, unknown>;
+    const vault = stubs["./vault"] as Record<string, unknown>;
+    const oldPut = db.putMemoryObject;
+    const oldWrite = vault.writeMemoryObjectMarkdown;
+    const oldConversationWrite = vault.writeConversationMarkdown;
+    vault.writeConversationMarkdown = async () => {};
+    const persist = (captureClient as unknown as { persistCapture: (handle: unknown, conversation: unknown, memories: unknown[], priority: string, awaitSync: boolean) => Promise<{ failedMemoryIds: string[]; backgroundSyncPromise: Promise<void> | null }> }).persistCapture;
+    try {
+      for (const mode of ["success", "held", "failed", "deferred", "idb-failed"]) {
+        captureDebug.clearCaptureDebug();
+        db.putMemoryObject = async () => { if (mode === "idb-failed") throw new Error("test IDB failure"); };
+        vault.writeMemoryObjectMarkdown = async () => {
+          if (mode === "held") { const e = new Error("test hold"); e.name = "VaultRecordNeedsResyncError"; throw e; }
+          if (mode === "failed") throw new Error("test Vault failure");
+        };
+        const { out } = await runCapture([user("所有している喜びがある")], [DEBUG_GOOD]);
+        const saved = await persist(mode === "deferred" ? null : {}, out.conversation, out.memoryObjects, "interactive", false);
+        if (saved.backgroundSyncPromise) await saved.backgroundSyncPromise;
+        const entry = debugEntry(await captureDebug.getCaptureDebugText());
+        const memory = (entry.memories as Json[])[0];
+        assert.equal(memory.indexedDB, mode === "idb-failed" ? "failed" : "success");
+        assert.equal((entry.totals as Json).saved, mode === "idb-failed" ? 0 : 1);
+        assert.equal(memory.vault, mode === "deferred" ? "deferred: no connected vault" : mode === "held" ? "held" : mode === "failed" ? "failed (write or sync bookkeeping)" : "success");
+        assert.equal(saved.failedMemoryIds.length, mode === "idb-failed" ? 1 : 0);
+      }
+    } finally { db.putMemoryObject = oldPut; vault.writeMemoryObjectMarkdown = oldWrite; vault.writeConversationMarkdown = oldConversationWrite; }
+  });
+});
+
+
+const markdownMod = require(path.join(ROOT, "lib/markdown.js")) as {
+  memoryObjectToMarkdown: (m: unknown) => string;
+  parseMemoryObjectMarkdown: (s: string) => { evidenceQuotes?: string[] } | null;
+};
+test("evidence persistence: validated quotes round-trip; legacy Markdown remains readable", async () => {
+  const { out } = await runCapture([user("所有している喜びがある")], [DEBUG_GOOD]);
+  const m = out.memoryObjects[0];
+  assert.deepEqual(m.evidenceQuotes, ["所有している喜びがある"]);
+  const md = markdownMod.memoryObjectToMarkdown(m);
+  assert.deepEqual(markdownMod.parseMemoryObjectMarkdown(md)?.evidenceQuotes, m.evidenceQuotes);
+  const legacy = md.split("\n").filter(line => !line.startsWith("evidence:")).join("\n");
+  assert.equal(markdownMod.parseMemoryObjectMarkdown(legacy)?.evidenceQuotes, undefined);
+});
+
+test("foundation preserves existing quote count gate and captured status", async () => {
+  const { out, calls } = await runCapture([user("所有している喜びがある")], [{ ...DEBUG_GOOD, evidenceQuotes: Array(5).fill("所有している喜びがある") }]);
+  assert.equal(out.memoryObjects.length, 0);
+  assert.equal(calls, 1);
+  assert.equal(out.conversation.status, "captured");
 });

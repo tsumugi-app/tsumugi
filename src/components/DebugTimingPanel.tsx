@@ -7,6 +7,7 @@
  * 目視・コピーできるようにするためのもの。原因調査が終わり次第、このファイルと
  * ChatScreen.tsxからの呼び出しごと削除すること。
  */
+import CaptureDebugPanel from "./CaptureDebugPanel";
 import { useEffect, useState } from "react";
 import { clearTimingLog, getTimingLog, type TimingLogEntry } from "@/lib/debugTimingLog";
 
@@ -114,6 +115,7 @@ export default function DebugTimingPanel() {
         <span>{entries.length}件</span>
         {feedback && <span>{feedback}</span>}
       </div>
+      <CaptureDebugPanel />
       {entries.map((entry, index) => (
         <div key={index}>{formatEntry(entry)}</div>
       ))}
