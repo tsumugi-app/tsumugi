@@ -951,6 +951,25 @@ export async function markVaultWorldJournalMigrated(): Promise<void> {
 }
 
 /**
+ * Vault Recovery Apply（旧記録の安全な復旧）の永続journal。既存の`settings`ストアへ1キー追加するだけで、
+ * DB schemaの変更は行わない。値はJSON文字列1つ（内容の解釈・検証は`vaultRecoveryJournal.ts`の責務）。
+ * Vault切替でIndexedDBのMemory dataをclearしても、このキーは消えない（journal自身がworld epochを
+ * 持ち、別のworldのjournalは通常の書き込みを止めない）。完全削除ではDB全体が消えるため一緒に消える。
+ */
+const VAULT_RECOVERY_JOURNAL_KEY = "vaultRecoveryJournal";
+
+export async function readRecoveryJournalRaw(): Promise<string | undefined> {
+  const db = await getDB();
+  const raw = await db.get("settings", VAULT_RECOVERY_JOURNAL_KEY);
+  return typeof raw === "string" ? raw : undefined;
+}
+
+export async function writeRecoveryJournalRaw(text: string): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", text, VAULT_RECOVERY_JOURNAL_KEY);
+}
+
+/**
  * Android保存方式の見直し：Androidの既定Vault backendをFile System Access
  * （SAF/document provider経由）からOPFS（この端末専有の内部領域）へ切り替えるにあたり、
  * 新しい空のOPFS VaultについてRegistry baseline（`resyncVaultRegistry`の初回実行）を

@@ -56,6 +56,12 @@ import {
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 import { isWipePending, WipeInProgressError } from "./wipeState";
 import {
+  assertNoPendingRecovery,
+  isRecoveryBlockingNormalWrites,
+  isRecoveryWriteAccessActive,
+  runWithRecoveryWriteAccess,
+} from "./vaultRecoveryJournal";
+import {
   VaultWriterUnavailableError,
   checkOpfsWriter,
   getOpfsWriterState,
@@ -395,6 +401,8 @@ async function isVaultLegacyMetadataEmpty(root: FileSystemDirectoryHandle): Prom
  */
 export async function ensureVaultBaseline(root: FileSystemDirectoryHandle): Promise<VaultBaselineResult> {
   try {
+    // 未完了のRecovery journalがある間は、baseline確立（Vault管理情報の変更）を先に行わない。
+    await assertNoPendingRecovery();
     if (isAndroid() && getVaultBackend() === "opfs" && !(await isAndroidOpfsVaultInitialized())) {
       return await establishAndroidOpfsVaultBaseline(root);
     }
@@ -485,6 +493,16 @@ export async function checkVaultIdentity(
  * schema-version.json / index.json の作成のみで、既存ファイルの上書き・削除は行わない）。
  */
 export async function ensureVaultSkeleton(root: FileSystemDirectoryHandle) {
+  // Codexレビュー指摘H1（write gateの抜け）対応：この関数は`enqueueVaultWrite`を経由しない直接writeであり、
+  // 通常の書き込みキューのgateが効かない。未完了のRecovery journalがある間は、骨組みの検査・修復を一切
+  // 行わない（何も読み書きせず、静かに戻る）。これはthrow（従来の`VaultMetadataCorruptError`）ではなく、
+  // 「今回は何もしない」という無害なno-opにする——起動時に破損metadataが見つかった場合でも、Recoveryが
+  // 完了するまではmetadata-corrupt扱いで起動をブロックせず、ユーザーがSettings（Recovery UI）へ到達できる
+  // ようにするため（この関数が呼ばれる場所自体が起動・接続のたびの通常経路であり、専用のロック取得を持たない
+  // ため、事前の確認しかできない。実際のwriteはさらに個々の`writeFileInDir`呼び出しの直前ではなく、この
+  // 関数冒頭で確認する——`corrupt`判定より前に必ず確認することで、H1の「破損metadataがRecovery UIより
+  // 先に起動をブロックする」問題を防ぐ）。
+  if (await isRecoveryBlockingNormalWrites()) return;
   // OPFS（Tsumugiだけが使う、オリジン専用の領域）かどうか。外部Vault（PCのフォルダ）はユーザーのものなので、
   // 0バイトのファイルを自動修復しない。
   const isOpfsVault = getVaultBackend() === "opfs";
@@ -731,6 +749,10 @@ function enqueueVaultWrite<T>(
 ): Promise<T> {
   // 完全削除が開始済みなら、新しいVault書き込みは受け付けない（消したデータの書き戻し防止）。
   if (isWipePending()) return Promise.reject(new WipeInProgressError());
+  // Vault Recovery Apply：Recovery自身の書き込み（`runRecoveryVaultWrite`の同期スコープ内で積まれたもの）だけを
+  // 通し、それ以外は、未完了のRecovery journalがある間は実行直前に拒否する（下のrun内）。journalが無い通常状態では
+  // ここは常にfalseを返すだけで、従来の保存フローは変わらない。積む時点（同期）でフラグを読む。
+  const recoveryBypass = isRecoveryWriteAccessActive();
   const seq = ++vaultWriteSeq;
   const enqueuedAt = Date.now();
   console.log(`[Vault] write:enqueue seq=${seq} priority=${priority}`);
@@ -743,6 +765,8 @@ function enqueueVaultWrite<T>(
       logTimingEvent("Vault write:start", { seq, waitMs });
       const startedAt = Date.now();
       try {
+        // 実行直前（キューで順番が来た時点）に確認する：積んだ後にRecoveryが始まっていても、状態を変更しない。
+        if (!recoveryBypass) await assertNoPendingRecovery();
         const result = await task();
         resolve(result);
       } catch (error) {
@@ -1176,7 +1200,7 @@ function dayConversationCount(day: HistoryDayIndex): number {
  * v1の日・v2の日・両者が混在する月のいずれでも正しく集計する
  * （`dayMemoryCount`/`dayConversationCount`が形状を吸収するため）。
  */
-function computeMonthAggregate(monthIndex: HistoryMonthIndex): HistoryMonthAggregate {
+export function computeMonthAggregate(monthIndex: HistoryMonthIndex): HistoryMonthAggregate {
   let memories = 0;
   let conversations = 0;
   for (const day of Object.values(monthIndex.days)) {
@@ -1522,6 +1546,7 @@ export async function removeVaultRegistrySingleRecordEntry(
   registryKey: string,
   expectedPath: string
 ): Promise<"removed" | "absent"> {
+  await assertNoPendingRecovery();
   const bucket = vaultRegistryBucketOf(registryKey);
   return withVaultRegistryLock(async () => {
     const tsumugiDir = await getDirIfExists(root, ".tsumugi");
@@ -2317,6 +2342,18 @@ export async function flushPendingToVault(
   const totalCount = conversations.length + memoryObjects.length + sources.length;
   console.log(`[Vault] flush:start count=${totalCount}`);
   logTimingEvent("Vault flush:start", { count: totalCount });
+
+  // Vault Recovery Apply：未完了のRecovery journalがある間は、通常のflushは何も書かない。まだ同期されていない
+  // recordは「失敗（未反映のまま残る）」として数える（Vault切替等が「全件同期済み」と誤認しないため）。
+  // Recoveryが完了・破棄されれば、次のflushで通常どおり再試行される。journalが無い通常状態では何も変わらない。
+  if (await isRecoveryBlockingNormalWrites()) {
+    let unsynced = 0;
+    for (const conversation of conversations) if (!(await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt))) unsynced += 1;
+    for (const memoryObject of memoryObjects) if (!(await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt))) unsynced += 1;
+    for (const source of sources) if (!(await isAlreadySyncedToVault("source", source.id, source.updatedAt))) unsynced += 1;
+    logTimingEvent("Vault flush:recovery-pending", { count: totalCount, unsynced });
+    return { totalCount, writtenCount: 0, failedCount: unsynced, heldCount: 0, heldByReason: emptyHeldByReason() };
+  }
 
   let writtenCount = 0;
   let failedCount = 0;
@@ -6737,6 +6774,9 @@ export async function resyncVaultRegistry(
   // 何も書く前）に中止する。省略時は従来のfull resyncと完全に同一。
   options?: { requireEmptyVault?: boolean }
 ): Promise<VaultResyncResult> {
+  // Codexレビュー指摘H1（gate race）対応：ロック取得を待っている間にRecoveryが開始する
+  // 可能性があるため、ロック取得前の確認だけでは不十分。ロックを実際に取得した直後
+  // （このコールバック内の最初の行）で、もう一度確認する。
   const startedAt = new Date().toISOString();
 
   // "tsumugi-vault-world"の排他ロックを1回だけ取得し、snapshot→scan→
@@ -6745,6 +6785,7 @@ export async function resyncVaultRegistry(
   // withVaultWorldRead/runVaultSwitchExclusive/runVaultWorldExclusiveの
   // いずれも再帰的に呼ばない（呼び出し元のscan/apply実装がそれを保証する）。
   const lockResult = await runVaultWorldExclusive(async () => {
+    await assertNoPendingRecovery();
     // Step 0（fail-closed invalidation contract、Codexレビュー再指摘対応）：
     // Registryへ一切触れる前に、現在の状態が「CLEAN」（owner===null かつ
     // registryGeneration確立済み）に見える場合、必ずここで無条件にinvalidateする。
@@ -8089,7 +8130,9 @@ export async function applyVaultLightCheckCandidates(
   records: VaultResyncRecordResult[],
   localSnapshots: Map<string, VaultLightCheckLocalSnapshot>
 ): Promise<VaultLightCheckApplyOutcome> {
+  // Codexレビュー指摘H1（gate race）対応：ロック取得前ではなく、取得直後にもう一度確認する。
   const lockResult = await runVaultWorldExclusive(async () => {
+    await assertNoPendingRecovery();
     const applicable: VaultResyncRecordResult[] = [];
     const staleSkipped: VaultLightCheckStaleCandidate[] = [];
 
@@ -8126,3 +8169,25 @@ export async function applyVaultLightCheckCandidates(
   const { counts, applyErrors, staleSkipped } = lockResult.result!;
   return { timedOut: false, counts, applyErrors, staleSkipped };
 }
+
+// ---------------------------------------------------------------------------
+// Vault Recovery Apply（`vaultRecoveryApply.ts`専用）
+//
+// 旧記録の安全な復旧が、通常の保存と同じ管理情報の書き方（Markdown・`.tsumugi/index.json`・History Index・
+// Registry）を使うための、既存の内部関数への薄い入口。挙動は変えない（新しいロジックは持たない）。
+// 呼び出してよいのは`vaultRecoveryApply.ts`だけ。書き込みは必ず`runRecoveryVaultWrite`を通す
+// （通常のwrite queueで直列化され、未完了journalによる通常書き込みのゲートを、Recovery自身だけが通れる）。
+// ---------------------------------------------------------------------------
+
+/** Recovery Apply自身の書き込みをwrite queueへ積む（ゲートを通れるのはこの入口だけ）。 */
+export function runRecoveryVaultWrite<T>(task: () => Promise<T>): Promise<T> {
+  return runWithRecoveryWriteAccess(() => enqueueVaultWrite(task, "interactive", null));
+}
+
+export const vaultRecoveryPrimitives = {
+  writeFileInDir,
+  updateIndex,
+  updateHistoryIndex,
+  upsertVaultRegistryRecord,
+  readVaultFileStat,
+};

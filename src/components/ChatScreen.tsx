@@ -88,6 +88,16 @@ import { isSafeRevisitPromptText } from "@/lib/revisitPromptSafety";
 import { planVaultRestore, restoreMissingRecordsFromVault, type VaultRestoreCounts } from "@/lib/vaultRestore";
 import { executeOrphanCleanup, planOrphanCleanup, type OrphanCleanupResult, type OrphanPlan } from "@/lib/vaultOrphanCleanup";
 import {
+  applyRecovery,
+  createRecoveryApplyEnv,
+  planRecoveryApply,
+  readRecoveryState,
+  type RecoveryApplyResult,
+  type RecoveryApplyPlan,
+} from "@/lib/vaultRecoveryApply";
+import { dbRecoveryJournalStore } from "@/lib/vaultRecoveryJournal";
+import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
+import {
   VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
   applyVaultStatusCleanup,
   applyVaultStatusUpdate,
@@ -292,6 +302,20 @@ export type LocalOnlyUiStatus =
  * （何も書き込まない）の結果を表示している状態で、ユーザーが内容を確認して明示的に「整理する」を押した
  * 場合だけ"executing"へ進む。
  */
+/**
+ * Vault Recovery Apply（Phase 2初期版）のUI状態。"plan"は事前確認（何も書き込まない）の結果。
+ * "interrupted"は、前回セッションで中断した未完了journalが今のVaultに残っている状態
+ * （ページ再読み込み・アプリ再起動をまたいでも検出できる。「再確認して続ける」で再開する）。
+ */
+export type RecoveryUiStatus =
+  | { kind: "idle" }
+  | { kind: "scanning" }
+  | { kind: "plan"; applyPlan: RecoveryApplyPlan; generation: number }
+  | { kind: "interrupted" }
+  | { kind: "executing" }
+  | { kind: "done"; result: RecoveryApplyResult }
+  | { kind: "error"; message: string };
+
 export type OrphanUiStatus =
   | { kind: "idle" }
   | { kind: "scanning" }
@@ -576,6 +600,12 @@ export default function ChatScreen() {
   /** 「保存先に本体が見つからない記録の整理」のUI状態。詳細は`OrphanUiStatus`参照。 */
   const [orphanStatus, setOrphanStatus] = useState<OrphanUiStatus>({ kind: "idle" });
   /**
+   * Vault Recovery Apply（安全性を証明できた旧記録の復旧）のUI状態。詳細は`RecoveryUiStatus`参照。
+   * "確認が必要な記録があります"→"確認する"→"安全に復旧できる記録があります"→"復旧する"、という
+   * 既存の他機能と同じ導線を使う。内部のclassification・journalの中身はUIには一切出さない。
+   */
+  const [recoveryStatus, setRecoveryStatus] = useState<RecoveryUiStatus>({ kind: "idle" });
+  /**
    * 統合表示の測定結果。`null`は「未測定」（測定済みで0件、とは別）。light-check・RegistryとIDBの差は
    * 起動時・保存先の接続／変更時・保存先関連の操作の実行後に測る。flushの測定は`vaultHoldMeasure`。
    */
@@ -666,6 +696,7 @@ export default function ChatScreen() {
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
+  const startupRecoveryCheckRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
@@ -1295,6 +1326,10 @@ export default function ChatScreen() {
     setLegacyCleanupStatus({ kind: "idle" });
     setLocalOnlyStatus({ kind: "idle" });
     setOrphanStatus({ kind: "idle" });
+    // M1/M2対応：Vault世代（world）が変わった以上、古いconfirmed set・resume用の中断表示は
+    // もう有効ではない（`applyRecovery`自体もworld不一致でconfirmation-expired/resumeOnly拒否に
+    // なるが、UI側の古い表示自体も先に破棄し、新worldで古い「再確認して続ける」が残らないようにする）。
+    setRecoveryStatus({ kind: "idle" });
     setVaultMeasure(null);
     setVaultHoldMeasure({ measured: false, count: 0 });
     setVaultStatusCheck({ kind: "idle" });
@@ -2104,6 +2139,28 @@ export default function ChatScreen() {
       cancelled = true;
     };
   }, [vaultStatus, vaultHandle, runConversationBoundary]);
+
+  /**
+   * Vault Recovery Apply：前回セッションで中断した未完了journalが今のVaultに残っていないかを、
+   * 起動のたびに一度だけ確認する（何も書き込まない。Safari終了・アプリ強制終了後の再起動でも、
+   * ユーザーがSettingsを開くのを待たず「復旧処理が途中です」を出せるようにするため）。
+   * 別Vault（journalのworldと今のworldが違う）なら関係ないものとして無視する（readRecoveryState自身が判定する）。
+   */
+  useEffect(() => {
+    if (vaultStatus !== "connected" || !vaultHandle || startupRecoveryCheckRanRef.current) return;
+    startupRecoveryCheckRanRef.current = true;
+    void trackMemoryTask(
+      (async () => {
+        try {
+          const state = await readRecoveryState({ store: dbRecoveryJournalStore, readWorld: () => createRecoveryApplyEnv(vaultHandle).readWorld() });
+          if (state.kind === "interrupted") setRecoveryStatus((current) => (current.kind === "idle" ? { kind: "interrupted" } : current));
+        } catch (error) {
+          if (handleStaleVaultTabError(error)) return;
+          console.error("[Tsumugi] recovery state check failed", error);
+        }
+      })()
+    );
+  }, [vaultStatus, vaultHandle]);
 
   useEffect(() => {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -3221,6 +3278,121 @@ export default function ChatScreen() {
         kind: "error",
         message: "整理を完了できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。",
       });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * Vault Recovery Apply の事前確認（dry-run）。実行直前にもう一度Planを作り直すため、ここで見せる件数は
+   * あくまで目安（実行時に対象が減ることがある。UIはその場合の文言を別途出す）。何も書き込まない。
+   */
+  async function handleRunRecoveryDryRun() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setRecoveryStatus({ kind: "scanning" });
+    try {
+      const applyPlan = await withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(vaultHandle)));
+      if (generation !== vaultGenerationRef.current) {
+        setRecoveryStatus({ kind: "idle" });
+        return;
+      }
+      setRecoveryStatus({ kind: "plan", applyPlan, generation });
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setRecoveryStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] recovery apply dry-run failed", error);
+      setRecoveryStatus({ kind: "error", message: "保存先の状態を確認できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * 「復旧する」／「再確認して続ける」。前回の実行結果に関わらず同じ関数で良い——`applyRecovery`自体が、
+   * 未完了journalがあれば実体を再確認して続きから完了させ（idempotent）、無ければ実行直前にPlanを
+   * 作り直してから新規に始める。ユーザーが明示的に押した場合だけ呼ぶ。
+   */
+  async function handleExecuteRecoveryApply() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    // M1対応：直前に見せていたPlan（"確認する"の結果）があれば、そのconfirmed set（世界＋対象record ID集合）を
+    // そのままApplyへ渡す。"再確認して続ける"（中断からの再開）にはconfirmed setを渡さず、代わりに
+    // `resumeOnly: true`を渡す——これにより、今のworldと一致する未完了journalが無い場合（別worldの古い
+    // journalしか無い、またはjournalが既に消えている場合を含む）、確認なしで新worldの安全な記録を
+    // 自動的にApplyしてしまう（Codexレビュー再指摘）ことを防ぐ。
+    const confirmed = recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan.confirmed : undefined;
+    const resumeOnly = recoveryStatus.kind === "interrupted";
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setRecoveryStatus({ kind: "executing" });
+    try {
+      const locked = await runVaultWorldExclusive(() =>
+        applyRecovery(createRecoveryApplyEnv(vaultHandle, { isStale: () => generation !== vaultGenerationRef.current }), confirmed, resumeOnly)
+      );
+      if (locked.timedOut || !locked.result) {
+        setRecoveryStatus({ kind: "error", message: "他の操作が実行中のため開始できませんでした。しばらくしてからもう一度お試しください。" });
+        return;
+      }
+      const result = locked.result;
+      if (generation !== vaultGenerationRef.current) {
+        setRecoveryStatus({ kind: "idle" });
+        return;
+      }
+      if (result.status === "interrupted") {
+        setRecoveryStatus({ kind: "interrupted" });
+        return;
+      }
+      // M1対応：確認した内容がその後変わった（world変更等）ため、Applyを拒否した状態。確認済みPlanは
+      // 破棄し、もう一度「確認する」からやり直してもらう（idleへ戻し、その旨のメッセージだけを残す）。
+      if (result.status === "confirmation-expired") {
+        setRecoveryStatus({ kind: "error", message: "確認した内容がその後変わったため、復旧しませんでした。もう一度「確認する」からやり直してください。" });
+        return;
+      }
+      if (result.status === "unavailable" || result.status === "journal-unavailable") {
+        setRecoveryStatus({ kind: "error", message: "復旧を開始できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。" });
+        return;
+      }
+      setRecoveryStatus({ kind: "done", result });
+      if (recoveryDoneLooksLikeSuccess(result)) {
+        // 管理情報が変わった：light-checkの保存済み結果を破棄して再計測する（排他ロック解放後に実行する）。
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        flushPendingToVaultInBackground(vaultHandle);
+        runVaultLightCheckInBackground(vaultHandle);
+        // M2対応：Recovery成功後、Vault確認結果・Settings表示・History/Calendarが古いstate/cacheの
+        // ままにならないよう、既存のHistory refresh tokenを進めて明示的に再取得させる
+        // （表示側の「成功扱いにするか」の判定＝`recoveryDoneLooksLikeSuccess`と条件を一致させる）。
+        bumpHistoryRefreshToken();
+        // Codexレビュー再指摘M2対応：単にidleへ戻すだけでは、古い警告件数・状態がSettingsに
+        // 残ったまま見えることがある。「確認する」（`handleCheckVaultStatus`）と同じproduction経路
+        // （`recheckVaultStatus`）を実際に再実行し、その結果をSettingsへ反映する
+        // （排他ロック解放後に実行する。`runVaultLightCheckInBackground`と同じ非同期の扱い）。
+        setVaultStatusCheck({ kind: "checking" });
+        recheckVaultStatus(vaultHandle, generation)
+          .then((findings) => {
+            if (generation !== vaultGenerationRef.current) return;
+            setVaultStatusCheck(findings ? { kind: "ready", findings, generation, note: null } : { kind: "idle" });
+          })
+          .catch((error) => {
+            if (handleStaleVaultTabError(error)) return;
+            console.error("[Tsumugi] recovery post-check vault status failed", error);
+            if (generation === vaultGenerationRef.current) setVaultStatusCheck({ kind: "idle" });
+          });
+      }
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) {
+        setRecoveryStatus({ kind: "idle" });
+        return;
+      }
+      console.error("[Tsumugi] recovery apply failed", error);
+      setRecoveryStatus({ kind: "error", message: "復旧を完了できませんでした。もう一度「確認する」から実行すると、続きから安全に完了できます。" });
     } finally {
       endTask();
       vaultOperationLockRef.current = false;
@@ -5103,6 +5275,9 @@ export default function ChatScreen() {
             orphanStatus={orphanStatus}
             onRunOrphanDryRun={() => void handleRunOrphanDryRun()}
             onExecuteOrphanCleanup={() => void handleExecuteOrphanCleanup()}
+            recoveryStatus={recoveryStatus}
+            onRunRecoveryDryRun={() => void handleRunRecoveryDryRun()}
+            onExecuteRecoveryApply={() => void handleExecuteRecoveryApply()}
             vaultHoldReasons={vaultHoldReasons}
           />
         </div>

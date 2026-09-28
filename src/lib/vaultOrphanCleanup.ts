@@ -47,6 +47,7 @@
 "use client";
 
 import { writeFileHandleContent } from "./vaultWriter";
+import { assertNoPendingRecovery } from "./vaultRecoveryJournal";
 import {
   deleteVaultSyncState,
   getAllConversations,
@@ -516,6 +517,10 @@ export async function executeOrphanCleanup(
   keys: string[],
   isStale?: () => boolean
 ): Promise<OrphanCleanupResult> {
+  // Codexレビュー指摘H1（write gateの抜け）対応：`removeVaultHistoryRecordRows`等の一部はenqueueVaultWrite
+  // 経由だが、`writeFileHandleContent`直接writeの経路も含むため、ここでも確認する（呼び出し元は既に
+  // `runVaultWorldExclusive`を保持している前提。ロック取得後の再確認に相当）。
+  await assertNoPendingRecovery();
   const result: OrphanCleanupResult = {
     status: "complete",
     items: [],

@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/vaultRecoveryApply.test.ts",
+    "src/lib/vaultRecoveryApply.ts",
+    "src/lib/vaultRecoveryJournal.ts",
+    "src/lib/vaultRecovery.ts",
+    "src/lib/vault.ts",
+    "src/lib/markdown.ts",
+    "src/lib/db.ts"
+  ]
+}

@@ -43,6 +43,7 @@
 "use client";
 
 import { writeFileHandleContent } from "./vaultWriter";
+import { assertNoPendingRecovery } from "./vaultRecoveryJournal";
 import { getAllConversations, getAllMemoryObjects, getAllSources } from "./db";
 import { parseConversationMarkdown, parseMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
 import {
@@ -770,6 +771,11 @@ export async function executeLegacyCleanup(
   root: FileSystemDirectoryHandle,
   isStale?: () => boolean
 ): Promise<LegacyCleanupResult> {
+  // Codexレビュー指摘H1（write gateの抜け）対応：この関数は`writeFileHandleContent`で直接writeしており、
+  // 通常の書き込みキュー（`enqueueVaultWrite`）を経由しないため、そちらのgateが効かない。呼び出し元が
+  // 既に`runVaultWorldExclusive`を保持している前提（ロック取得後）のため、ここでの確認がH1の「lock取得後の
+  // 再確認」に相当する。未完了のRecovery journalがある間は、何も書かず開始しない。
+  await assertNoPendingRecovery();
   const before = await collectLegacyCleanupSnapshot(root);
   const planBefore = computeLegacyCleanupPlan(before);
   const result: LegacyCleanupResult = {

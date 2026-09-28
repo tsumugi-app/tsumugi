@@ -11,11 +11,13 @@ import type {
   LegacyCleanupUiStatus,
   LocalOnlyUiStatus,
   OrphanUiStatus,
+  RecoveryUiStatus,
   VaultStatusCheckUi,
   VaultRestoreUiStatus,
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
+import { recoveryDoneMessage, recoveryHeadingText } from "@/lib/vaultRecoveryUiText";
 import type { VaultStatusView } from "@/lib/vaultStatus";
 
 /**
@@ -66,6 +68,9 @@ export default function SettingsPanel({
   orphanStatus,
   onRunOrphanDryRun,
   onExecuteOrphanCleanup,
+  recoveryStatus,
+  onRunRecoveryDryRun,
+  onExecuteRecoveryApply,
   vaultHoldReasons,
 }: {
   chatProvider: SupportedChatProvider;
@@ -130,6 +135,14 @@ export default function SettingsPanel({
   orphanStatus: OrphanUiStatus;
   onRunOrphanDryRun: () => void;
   onExecuteOrphanCleanup: () => void;
+  /**
+   * Vault Recovery Apply（安全性を証明できた旧記録の復旧）。既存の「確認する」→「◯件を復旧する」と
+   * 同じ導線。"interrupted"は、前回セッションで中断した未完了journalが残っている状態
+   * （起動時に自動検出される。「再確認して続ける」は`onExecuteRecoveryApply`をそのまま呼ぶ）。
+   */
+  recoveryStatus: RecoveryUiStatus;
+  onRunRecoveryDryRun: () => void;
+  onExecuteRecoveryApply: () => void;
   /**
    * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
@@ -1251,6 +1264,113 @@ export default function SettingsPanel({
                     onClick={onRunOrphanDryRun}
                     disabled={vaultActionsDisabled}
                     className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400 dark:hover:bg-white/5"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/*
+            Vault Recovery Apply（Phase 2初期版）。「安全性を証明できた旧記録」だけを保存先へ復旧する。
+            内部のclassification・journalの中身はここには出さない（件数と、対象の日付・種別の要約だけ）。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-col gap-0.5">
+                  {/*
+                    M2対応：「確認が必要な記録があります」は、実際にそう分かった場合（recoveryStatus.kind==="plan"
+                    かつheldCount>0）だけ表示する。診断前・正常Vault（heldCount===0）に固定文言で
+                    「確認が必要な記録があります」と表示し続けていた不具合を修正した。
+                  */}
+                  <span className="text-sm text-stone-600 dark:text-stone-300">
+                    {recoveryHeadingText(
+                      recoveryStatus.kind === "plan" ? { kind: "plan", heldCount: recoveryStatus.applyPlan.heldCount } : { kind: recoveryStatus.kind }
+                    )}
+                  </span>
+                  <span className="text-[11px] text-stone-400 dark:text-stone-500">
+                    この端末に残っている古い記録のうち、安全に復旧できるかどうかを確認します。
+                  </span>
+                </div>
+                <button
+                  onClick={onRunRecoveryDryRun}
+                  disabled={vaultActionsDisabled || recoveryStatus.kind === "scanning" || recoveryStatus.kind === "executing"}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300"
+                >
+                  {recoveryStatus.kind === "scanning" ? "確認中…" : "確認する"}
+                </button>
+              </div>
+
+              {recoveryStatus.kind === "interrupted" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  <span>復旧処理が途中です。元の記録は保持されています。</span>
+                  <button
+                    onClick={onExecuteRecoveryApply}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300"
+                  >
+                    再確認して続ける
+                  </button>
+                </div>
+              )}
+
+              {recoveryStatus.kind === "plan" && (
+                <div className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  {recoveryStatus.applyPlan.recoverableCount > 0 ? (
+                    <>
+                      <span>
+                        {recoveryStatus.applyPlan.recoverableCount}件の記録を安全に復旧できます。
+                        {recoveryStatus.applyPlan.heldCount > 0 ? `${recoveryStatus.applyPlan.heldCount}件は内容の確認が必要です。` : ""}
+                      </span>
+                      <button
+                        onClick={onExecuteRecoveryApply}
+                        disabled={vaultActionsDisabled}
+                        className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300"
+                      >
+                        {recoveryStatus.applyPlan.recoverableCount}件を復旧する
+                      </button>
+                    </>
+                  ) : recoveryStatus.applyPlan.heldCount > 0 ? (
+                    <span>{recoveryStatus.applyPlan.heldCount}件は内容の確認が必要です。今回は変更しません。</span>
+                  ) : (
+                    <span>確認が必要な記録はありません。</span>
+                  )}
+                </div>
+              )}
+
+              {recoveryStatus.kind === "executing" && (
+                <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">復旧しています…</div>
+              )}
+
+              {recoveryStatus.kind === "done" && (
+                <div className="flex flex-col gap-1 rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                  {/*
+                    M2対応：recovered===0の場合に「0件を復旧しました。」という、成功したかのような文言へ
+                    潰さない。「復旧する記録はありませんでした」（対象自体が無かった）と「今回は復旧できません
+                    でした」（対象はあったが確認できなかった／保留になった）を分ける。
+                  */}
+                  {(() => {
+                    const message = recoveryDoneMessage(recoveryStatus.result);
+                    return (
+                      <>
+                        <span>{message.primary}</span>
+                        {message.heldNote && <span>{message.heldNote}</span>}
+                        {message.failedNote && <span className="text-red-600 dark:text-red-400">{message.failedNote}</span>}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {recoveryStatus.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{recoveryStatus.message}</span>
+                  <button
+                    onClick={onRunRecoveryDryRun}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400"
                   >
                     もう一度確認する
                   </button>

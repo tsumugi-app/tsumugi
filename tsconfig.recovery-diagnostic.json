@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/vaultRecovery.test.ts",
+    "src/lib/vaultRecovery.ts",
+    "src/lib/vaultRecoverySession.ts",
+    "src/lib/markdown.ts",
+    "src/lib/vault.ts",
+    "src/lib/db.ts",
+    "src/app/recovery-debug/page.tsx",
+    "src/components/VaultRecoveryDebugPanel.tsx"
+  ]
+}

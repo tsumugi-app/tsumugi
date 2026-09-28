@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/vaultWriteGate.test.ts",
+    "src/lib/vault.ts",
+    "src/lib/vaultLegacyCleanup.ts",
+    "src/lib/vaultOrphanCleanup.ts",
+    "src/lib/vaultRecoveryJournal.ts",
+    "src/lib/vaultWorldLock.ts",
+    "src/lib/markdown.ts"
+  ]
+}
