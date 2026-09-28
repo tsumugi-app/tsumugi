@@ -128,7 +128,7 @@ function conversation(id: string, overrides: Partial<Conversation> = {}): Conver
 
 const VAULT_ID = "vault-abc-123";
 function identity(): VaultIdentityRecord {
-  return { id: "current", vaultId: VAULT_ID, activeVaultEpoch: 0, registryGeneration: "gen-1", pairedAt: T, updatedAt: T };
+  return { id: "current", vaultId: VAULT_ID, activeVaultEpoch: 0, registryGeneration: "gen-1", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
 }
 function seedVaultIdentityFile(vault: FakeVault, vaultId: string = VAULT_ID) {
   vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId, createdAt: T }));

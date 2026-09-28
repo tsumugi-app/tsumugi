@@ -162,7 +162,7 @@ test("deleteVaultOutboxEntry：entryを削除できる", async () => {
 
 test("vaultIdentity：CRUDのround-trip（未ペア状態から開始する）", async () => {
   assert.equal(await dbMod.getVaultIdentityRecord(), undefined, "初期状態はまだ何も保存されていない");
-  const record = { id: "current" as const, vaultId: "vault-abc", activeVaultEpoch: 3, registryGeneration: "gen-1", pairedAt: T, updatedAt: T };
+  const record = { id: "current" as const, vaultId: "vault-abc", activeVaultEpoch: 3, registryGeneration: "gen-1", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
   await dbMod.putVaultIdentityRecord(record);
   const stored = await dbMod.getVaultIdentityRecord();
   assert.deepEqual(stored, record);

@@ -1,14 +1,11 @@
 /**
- * Vault Identity（新保存基盤 Phase 3-1）。
+ * Vault Identity（新保存基盤 Phase 3-1／Phase 3-4）。
  *
  * 「このIndexedDB（＝このTsumugi world）は、今接続しているVaultと本当に対だったか」を
  * 判定するための、IndexedDB側のペアリング記録の型。
  *
- * Phase 3-1では型とDB CRUD（db.ts）のみ実装する。実際の照合ロジック——
- * `.tsumugi/vault-identity.json`が無いことを即「新規Vault」と判定せず、
- * 既存Markdown/.tsumugi/Registry/Historyの有無からlegacy Vaultを安全に見分け、
- * 同一性を確認できた場合にのみペアリングする——はPhase 3-4で設計・実装する
- * （このファイルはその際に拡張する）。
+ * 実際の照合・legacy Vault adoptionロジックは`vaultIdentityAdoption.ts`（Phase 3-4）を
+ * 参照。このファイルは型とDB CRUD（db.ts）用の最小限のヘルパーだけを持つ。
  */
 
 /** 固定key（singleton record。IndexedDBには常に高々1件）。 */
@@ -25,6 +22,13 @@ export interface VaultIdentityRecord {
   registryGeneration: string | null;
   /** 安全にペアリングできたと判定した時刻。未ペアはnull。 */
   pairedAt: string | null;
+  /**
+   * Phase 3-4：adoption/新規発行の途中で、`vaultId`が確定する前に必ずここへ
+   * durable保存するcandidate ID（`crypto.randomUUID()`等で生成）。
+   * kill→restart後も、ここに値があれば同じcandidateをそのまま使い続け、
+   * 新しいIDを発行し直さない（req 8）。`vaultId`が確定すればnullへ戻す。
+   */
+  pendingCandidateVaultId: string | null;
   updatedAt: string;
 }
 
@@ -35,6 +39,7 @@ export function emptyVaultIdentityRecord(now: string): VaultIdentityRecord {
     activeVaultEpoch: null,
     registryGeneration: null,
     pairedAt: null,
+    pendingCandidateVaultId: null,
     updatedAt: now,
   };
 }
