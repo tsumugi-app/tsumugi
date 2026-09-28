@@ -1271,10 +1271,15 @@ export default function SettingsPanel({
               )}
             </div>
           )}
+              </div>
+            </details>
+          )}
 
           {/*
             Vault Recovery Apply（Phase 2初期版）。「安全性を証明できた旧記録」だけを保存先へ復旧する。
             内部のclassification・journalの中身はここには出さない（件数と、対象の日付・種別の要約だけ）。
+            通常ユーザー向け機能のため、`showAdvancedVaultTools`（`?debugLog=1`限定の開発者向け詳細）の
+            外に置く——中に入れると通常アクセスでは一切表示されなくなる（実機で発覚・修正）。
           */}
           {vaultStatus === "connected" && vaultHandle && (
             <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
@@ -1377,9 +1382,6 @@ export default function SettingsPanel({
                 </div>
               )}
             </div>
-          )}
-              </div>
-            </details>
           )}
         </section>
 
