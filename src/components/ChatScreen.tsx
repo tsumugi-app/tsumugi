@@ -42,10 +42,12 @@ import {
   clearVaultSyncState,
   getAllConversations,
   getAllMemoryObjects,
+  getConversation,
   loadApiKey,
   loadChatProvider,
   loadVaultHandle,
   putConversation,
+  putConversationWithOutbox,
   putMemoryObject,
   saveChatProvider,
   saveSource,
@@ -4183,6 +4185,18 @@ export default function ChatScreen() {
     latestConversationRef.current = updated;
 
     try {
+      // 新保存基盤 Phase 3-2（Invariant 6）：Userが送信したturnは、Gemini requestより
+      // 前に必ずdurable canonical保存する（canonical write＋同一IndexedDB transactionでの
+      // outbox upsert。db.tsの`putConversationWithOutbox`、Invariant 1/2）。ここが失敗した
+      // 場合はGemini requestを一切開始せず、下のcatchで送信失敗として扱う——Gemini応答中に
+      // Safari/PWAが終了しても、User発言だけは必ずIndexedDBに残っていることを保証するため。
+      // `recordType: "conversation"`のまま既存のoutbox unpivotedを使う（`conversation-
+      // turn-durable`のような特殊recordTypeは作らない。「canonical更新＝projection対象」
+      // というInvariantをUser-onlyの時点から維持する）。
+      // 既存のVault保存経路（下の`persistConversation`）はPhase 3-2ではまだ置き換えない
+      // （Phase 3-3のProjection Engine移行まで、outboxはまだ誰にも消費されない）。
+      await putConversationWithOutbox(updated);
+
       // Retrieval Engine（ローカルのみ・AIを呼ばない）。毎ターン実行し、
       // 使うかどうかの判断は/api/chat側のAIに委ねる（0件ならそのまま0件で渡す）。
       // 明示的Reflection（ROADMAP.md Phase 2）：ローカル判定のみでlimitとLink経由上限を広げる。
@@ -4389,10 +4403,35 @@ export default function ChatScreen() {
         timestamp: new Date().toISOString(),
         ...(webSearchRequested !== undefined ? { webSearchRequested } : {}),
       };
-      updated = appendTurn(updated, aiTurn);
+      // 新保存基盤 Phase 3-2：User turn送信からGemini応答までの間にcanonicalが
+      // （このタブの別処理等で）先へ進んでいる可能性を考慮し、React state（`updated`、
+      // fetch開始時点のclosure snapshot）をそのままAssistant turn追加のbaseにしない。
+      // IndexedDB上の最新値を読み直し、より新しいupdatedAtがあればそちらを基準にする
+      // （古いsnapshotで途中の変更を消さない）。読み直しに失敗した場合はfetch開始時点の
+      // snapshotをそのまま使う（この再確認自体の失敗でAssistant応答の保存を止めない）。
+      let assistantBase = updated;
+      try {
+        const latestBeforeAssistant = await getConversation(updated.id);
+        if (latestBeforeAssistant && latestBeforeAssistant.updatedAt > updated.updatedAt) assistantBase = latestBeforeAssistant;
+      } catch (error) {
+        console.error("[Tsumugi] failed to re-read latest conversation before appending assistant turn", error);
+      }
+      updated = appendTurn(assistantBase, aiTurn);
       setConversation(updated);
       latestConversationRef.current = updated;
       setStreamingText("");
+      // 新保存基盤 Phase 3-2：Assistant turn追加後もcanonical + outboxを更新する（同じ
+      // Conversation IDのentryを新しいrecordUpdatedAtでupsertし、projection stepsを
+      // pendingへ戻す——`buildOutboxEntryForUpdate`が自動で行う。User-only versionと
+      // User+Assistant versionで別Conversationを作らない。失敗しても、既に確定済みの
+      // User turn（上のGemini requestより前のdurable保存）は失われないため、ここは
+      // 致命的エラー扱いにしない（実際のVault反映は既存の`persistConversation`が
+      // 別途担う。ログのみ）。
+      try {
+        await putConversationWithOutbox(updated);
+      } catch (error) {
+        console.error("[Tsumugi] failed to durably persist assistant turn (existing user turn is not lost)", error);
+      }
 
       // Conversation Debugger v1：localStorageのみへ保存（Vault/IndexedDB/Conversation/
       // Memoryには一切書き込まない）。generationIdはdebug entryの識別だけに使い、
