@@ -8191,3 +8191,26 @@ export const vaultRecoveryPrimitives = {
   upsertVaultRegistryRecord,
   readVaultFileStat,
 };
+
+// ---------------------------------------------------------------------------
+// Vault Projection Engine（`vaultProjection.ts`専用、新保存基盤 Phase 3-3）
+//
+// 新Projection Engineが、既存の安全性が確認済みの書き込みprimitive（Markdown本体・
+// `.tsumugi/index.json`・History Index・Registry）をそのまま再利用するための、薄い入口。
+// `vaultRecoveryPrimitives`と同じ構成だが、別の入口として分ける——Recovery
+// （`vaultRecoveryApply.ts`、legacy事故救済専用）とProjection Engine（通常保存の新経路）は
+// 役割が異なるため、呼び出し元を混同しない。挙動は変えない（新しいロジックは持たない。
+// read/compare/decide/verifyはすべて`vaultProjection.ts`側の責務）。
+//
+// Phase 3-3時点ではまだ本番のwrite queue（`enqueueVaultWrite`）を経由しない
+// （このEngine自体がまだどの本番経路からも呼ばれておらず、他の書き込みと競合しないため）。
+// 本番接続時（Phase 3-4以降）には、既存の書き込みと直列化するための統合を検討すること。
+// ---------------------------------------------------------------------------
+
+export const vaultProjectionPrimitives = {
+  writeFileInDir,
+  updateIndex,
+  updateHistoryIndex,
+  upsertVaultRegistryRecord,
+  readVaultFileStat,
+};

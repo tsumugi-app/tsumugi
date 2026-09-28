@@ -29,6 +29,8 @@ class FakeIDBDatabase {
   stores = new Map<string, FakeStoreState>();
   /** テスト専用：次の1回のtransactionだけ、このstore名への`put`を失敗させる（一発だけ有効）。 */
   failOnPutForNextTransaction = new Set<string>();
+  /** テスト専用：次の1回の「単発put」（`db.put(storeName, ...)`、transaction経由ではない）だけを失敗させる（一発だけ有効）。 */
+  failOnPlainPutOnce = new Set<string>();
   createObjectStore(name: string, options?: { keyPath?: string }) {
     const store: FakeStoreState = { committed: new Map(), keyPath: options?.keyPath, indexKeyPath: new Map() };
     this.stores.set(name, store);
@@ -129,6 +131,10 @@ class FakeIDBPDatabase {
     return this.db.stores.get(storeName)?.committed.get(key);
   }
   async put(storeName: string, value: unknown, key?: Key) {
+    if (this.db.failOnPlainPutOnce.has(storeName)) {
+      this.db.failOnPlainPutOnce.delete(storeName);
+      throw new Error(`fakeIdb: simulated plain put failure on store "${storeName}"`);
+    }
     const store = this.db.stores.get(storeName)!;
     const k = keyOf(store, value, key);
     store.committed.set(k, value);
@@ -167,12 +173,21 @@ export function __resetFakeIdbDatabases(): void {
  * （`namedFakeDatabases`は`openDB`と同じ名前空間を共有する）。
  */
 export function __failNextPutOn(dbName: string, storeName: string): void {
+  const fakeDb = getOrCreateNamedFakeDb(dbName);
+  fakeDb.failOnPutForNextTransaction.add(storeName);
+}
+/** テスト専用：`db.put(storeName, ...)`（transactionを介さない単発put）を次の1回だけ失敗させる。 */
+export function __failNextPlainPutOn(dbName: string, storeName: string): void {
+  const fakeDb = getOrCreateNamedFakeDb(dbName);
+  fakeDb.failOnPlainPutOnce.add(storeName);
+}
+function getOrCreateNamedFakeDb(dbName: string): FakeIDBDatabase {
   let fakeDb = namedFakeDatabases.get(dbName);
   if (!fakeDb) {
     fakeDb = new FakeIDBDatabase();
     namedFakeDatabases.set(dbName, fakeDb);
   }
-  fakeDb.failOnPutForNextTransaction.add(storeName);
+  return fakeDb;
 }
 
 export async function openDB(
