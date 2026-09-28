@@ -1,5 +1,5 @@
 /**
- * Production Bootstrap / Legacy Migration（新保存基盤 Phase 3-5）。
+ * Production Bootstrap / Legacy Migration（新保存基盤 Phase 3-5、Phase 3-6でMemory拡張）。
  *
  * 目的：既存ProductionユーザーのIndexedDB canonical・Vault Markdown・Registry・
  * History・sync ledger・legacy Recovery対象・no-baseline状態を、新しい
@@ -8,16 +8,26 @@
  * 基本原則（req 2）：IndexedDBだけ／Vaultだけを信用しない。導入時だけは両側を
  * record ID単位でinventoryし、突き合わせる。
  *
- * 対象はConversationのみ（Phase 3-3/3-4と同じ範囲。Memory day-fileはPhase 3-6以降）。
+ * 対象はConversation（Phase 3-3/3-4）とnormal Memory day-file（Phase 3-6）。
+ * Memoryはday-fileが複数recordを共有するため、Conversationのようなrecord単位の
+ * 分類ではなく、member単位（1 canonical MemoryObject＝1 member）で分類する
+ * （下記`classifyMemoryDay`参照）。
  *
  * このファイルはまだどの本番経路（app startup等）からも呼ばれない
- * （Phase 3-5はlibrary＋testまで）。
+ * （Phase 3-5/3-6はlibrary＋testまで）。
  */
-import { getAllConversations, putConversationWithOutbox, readProductionMigrationStateRaw, writeProductionMigrationStateRaw } from "./db";
-import { collectAllMarkdownFiles, fileNameFor, type VaultFileEntry } from "./vault";
-import { conversationToMarkdown, parseConversationMarkdown } from "./markdown";
-import { isLegitimatePredecessor } from "./vaultProjection";
-import type { Conversation } from "./types";
+import {
+  getAllConversations,
+  getAllMemoryObjects,
+  putConversationWithOutbox,
+  putMemoryObjectWithOutbox,
+  readProductionMigrationStateRaw,
+  writeProductionMigrationStateRaw,
+} from "./db";
+import { collectAllMarkdownFiles, dayFileNameFor, fileNameFor, type VaultFileEntry } from "./vault";
+import { conversationToMarkdown, memoryObjectToMarkdown, parseConversationMarkdown, parseMemoryDayFile } from "./markdown";
+import { isLegitimatePredecessor, isMemoryLegitimateSuccessor } from "./vaultProjection";
+import type { Conversation, MemoryObject } from "./types";
 
 // ---------------------------------------------------------------------------
 // 実体の読み込み（vaultProjection.ts／vaultIdentityAdoption.tsと同じ考え方：
@@ -112,6 +122,105 @@ async function findVaultOnlyConversationPaths(root: FileSystemDirectoryHandle, c
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3-6 req 14：Memory day-file member単位の分類
+// ---------------------------------------------------------------------------
+
+export type MemoryMemberClassificationKind =
+  | "idb-only" // IDB-only member
+  | "both-same" // both-same member
+  | "legitimate-successor" // legitimate-successor member
+  | "conflict" // conflict member
+  | "unreadable-dayfile"; // day-file自体が読めない
+// Vault-only memberはcanonical member単位ではないため別枠（`MemoryVaultOnlyMember`）。
+
+export interface MemoryMemberClassification {
+  kind: MemoryMemberClassificationKind;
+  recordId: string;
+  day: string;
+  reason?: string;
+}
+
+export interface MemoryVaultOnlyMember {
+  day: string;
+  id: string;
+  path: string;
+}
+
+/**
+ * day-fileは複数memberを共有するため、同じdayのcanonical member全員をまとめて
+ * 1回のday-file読み込みで分類する（memberごとに毎回読み直さない）。
+ *
+ * 「legitimate successor」の判定はPhase 3-3の`isMemoryLegitimateSuccessor`を
+ * そのまま再利用する（Conversationの`isLegitimatePredecessor`と同じく、
+ * 二重実装しない）。
+ */
+async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: string, canonicalMembers: MemoryObject[]): Promise<MemoryMemberClassification[]> {
+  const path = `Memories/${dayFileNameFor(day)}`;
+  const read = await readTextAt(root, path);
+  if (read.state === "error") {
+    return canonicalMembers.map((m) => ({ kind: "unreadable-dayfile" as const, recordId: m.id, day, reason: "dayfile-unreadable" }));
+  }
+  if (read.state === "absent") {
+    return canonicalMembers.map((m) => ({ kind: "idb-only" as const, recordId: m.id, day }));
+  }
+  const parsed = parseMemoryDayFile(read.text);
+  if (parsed.length === 0 && read.text.trim().length > 0) {
+    // parseMemoryDayFileは個別entryのparse失敗を黙って除外するため、「1件も読めず、
+    // かつ元のtextが空でない」場合だけをday-file全体のunreadableとして扱う
+    // （vaultProjection.tsの`mergeMemoryIntoDayFile`と同じ判定基準）。
+    return canonicalMembers.map((m) => ({ kind: "unreadable-dayfile" as const, recordId: m.id, day, reason: "dayfile-unreadable" }));
+  }
+  const onDiskById = new Map(parsed.map((m) => [m.id, m]));
+  return canonicalMembers.map((canonical) => {
+    const onDisk = onDiskById.get(canonical.id);
+    if (!onDisk) return { kind: "idb-only" as const, recordId: canonical.id, day };
+    if (memoryObjectToMarkdown(onDisk) === memoryObjectToMarkdown(canonical)) return { kind: "both-same" as const, recordId: canonical.id, day };
+    if (isMemoryLegitimateSuccessor(onDisk, canonical)) return { kind: "legitimate-successor" as const, recordId: canonical.id, day };
+    return { kind: "conflict" as const, recordId: canonical.id, day, reason: "member-content-conflict" };
+  });
+}
+
+/**
+ * Vault-only member（IndexedDBに存在しないid）の検出。`Memories/`配下の全day-fileを
+ * 列挙し、canonical id集合に含まれないmemberをvault-onlyとする——このmemberは
+ * 削除も自動importもしない（保全のみ。req 14「Vault-only memberは絶対に削除しない」）。
+ *
+ * 既知の限界：day-file自体が全く読めない（parse 0件）場合、そのday-fileの中身は
+ * 列挙できないため、そこに含まれていたかもしれないvault-only memberはこの集計には
+ * 現れない。ただしこの関数はVault側のファイルを一切書き換えないため、実体としての
+ * 保全（delete/overwriteしない）は常に満たされている——欠けるのは集計上の可視性のみ。
+ */
+async function findVaultOnlyMemoryMembers(root: FileSystemDirectoryHandle, canonicalMemories: MemoryObject[]): Promise<MemoryVaultOnlyMember[]> {
+  const canonicalIds = new Set(canonicalMemories.map((m) => m.id));
+  let files: VaultFileEntry[];
+  try {
+    const dir = await root.getDirectoryHandle("Memories", { create: false });
+    files = await collectAllMarkdownFiles(dir, "Memories");
+  } catch {
+    return [];
+  }
+  const vaultOnly: MemoryVaultOnlyMember[] = [];
+  for (const f of files) {
+    const members = parseMemoryDayFile(f.content);
+    for (const m of members) {
+      if (!canonicalIds.has(m.id)) vaultOnly.push({ day: m.date.slice(0, 10), id: m.id, path: f.path });
+    }
+  }
+  return vaultOnly;
+}
+
+function groupMemoriesByDay(memories: MemoryObject[]): Map<string, MemoryObject[]> {
+  const byDay = new Map<string, MemoryObject[]>();
+  for (const m of memories) {
+    const day = m.date.slice(0, 10);
+    const list = byDay.get(day);
+    if (list) list.push(m);
+    else byDay.set(day, [m]);
+  }
+  return byDay;
+}
+
+// ---------------------------------------------------------------------------
 // req 10：Migration Journal（restartable/idempotent）
 // ---------------------------------------------------------------------------
 
@@ -126,6 +235,16 @@ export interface ProductionMigrationSummary {
   unreadable: number;
 }
 
+/** Phase 3-6：Memory day-file member単位の集計。 */
+export interface MemoryMigrationSummary {
+  idbOnly: number;
+  vaultOnly: number;
+  bothSame: number;
+  legitimateSuccessor: number;
+  conflict: number;
+  unreadableDayfiles: number;
+}
+
 export interface ProductionMigrationState {
   version: 1;
   phase: MigrationPhase;
@@ -138,6 +257,13 @@ export interface ProductionMigrationState {
   unreadableRecordIds: string[];
   vaultOnlyPaths: string[];
   outboxEnsuredCount: number;
+  // Phase 3-6：Memory拡張（Conversationと対になるフィールドを追加するのみ。既存フィールドの
+  // 意味・書式は一切変更しない）。
+  memorySummary: MemoryMigrationSummary | null;
+  memoryConflictRecordIds: string[];
+  memoryUnreadableRecordIds: string[];
+  memoryVaultOnlyMembers: MemoryVaultOnlyMember[];
+  memoryOutboxEnsuredCount: number;
 }
 
 function freshState(now: string): ProductionMigrationState {
@@ -152,6 +278,11 @@ function freshState(now: string): ProductionMigrationState {
     unreadableRecordIds: [],
     vaultOnlyPaths: [],
     outboxEnsuredCount: 0,
+    memorySummary: null,
+    memoryConflictRecordIds: [],
+    memoryUnreadableRecordIds: [],
+    memoryVaultOnlyMembers: [],
+    memoryOutboxEnsuredCount: 0,
   };
 }
 
@@ -161,7 +292,17 @@ async function loadState(): Promise<ProductionMigrationState | null> {
   try {
     const parsed = JSON.parse(raw) as ProductionMigrationState;
     if (parsed.version !== 1) return null;
-    return parsed;
+    // Phase 3-6でstate形状にMemory用フィールドを追加した。Phase 3-5時点で永続化された
+    // 既存stateにはこれらのキーが無いため、欠けていれば安全な既定値で補う
+    // （version自体は変えない——Conversation側の既存フィールドの意味は一切変更しないため）。
+    return {
+      ...parsed,
+      memorySummary: parsed.memorySummary ?? null,
+      memoryConflictRecordIds: parsed.memoryConflictRecordIds ?? [],
+      memoryUnreadableRecordIds: parsed.memoryUnreadableRecordIds ?? [],
+      memoryVaultOnlyMembers: parsed.memoryVaultOnlyMembers ?? [],
+      memoryOutboxEnsuredCount: parsed.memoryOutboxEnsuredCount ?? 0,
+    };
   } catch {
     return null;
   }
@@ -200,6 +341,12 @@ export interface ProductionMigrationResult {
   unreadableRecordIds: string[];
   vaultOnlyPaths: string[];
   outboxEnsuredCount: number;
+  // Phase 3-6：Memory拡張
+  memorySummary: MemoryMigrationSummary;
+  memoryConflictRecordIds: string[];
+  memoryUnreadableRecordIds: string[];
+  memoryVaultOnlyMembers: MemoryVaultOnlyMember[];
+  memoryOutboxEnsuredCount: number;
 }
 
 function nowOf(env: ProductionMigrationEnv): string {
@@ -218,6 +365,11 @@ async function ensureOutbox(c: Conversation): Promise<void> {
   await putConversationWithOutbox(c);
 }
 
+/** Memory版`ensureOutbox`。1 canonical MemoryObject＝1 outbox entryは変わらない（req 14）。 */
+async function ensureMemoryOutbox(m: MemoryObject): Promise<void> {
+  await putMemoryObjectWithOutbox(m);
+}
+
 function tally(classifications: ConversationClassification[], vaultOnlyCount: number): ProductionMigrationSummary {
   const summary: ProductionMigrationSummary = { idbOnly: 0, vaultOnly: vaultOnlyCount, bothSame: 0, legitimateSuccessor: 0, conflict: 0, unreadable: 0 };
   for (const c of classifications) {
@@ -226,6 +378,18 @@ function tally(classifications: ConversationClassification[], vaultOnlyCount: nu
     else if (c.kind === "legitimate-successor") summary.legitimateSuccessor += 1;
     else if (c.kind === "conflict") summary.conflict += 1;
     else if (c.kind === "unreadable") summary.unreadable += 1;
+  }
+  return summary;
+}
+
+function tallyMemory(classifications: MemoryMemberClassification[], vaultOnlyCount: number): MemoryMigrationSummary {
+  const summary: MemoryMigrationSummary = { idbOnly: 0, vaultOnly: vaultOnlyCount, bothSame: 0, legitimateSuccessor: 0, conflict: 0, unreadableDayfiles: 0 };
+  for (const c of classifications) {
+    if (c.kind === "idb-only") summary.idbOnly += 1;
+    else if (c.kind === "both-same") summary.bothSame += 1;
+    else if (c.kind === "legitimate-successor") summary.legitimateSuccessor += 1;
+    else if (c.kind === "conflict") summary.conflict += 1;
+    else if (c.kind === "unreadable-dayfile") summary.unreadableDayfiles += 1;
   }
   return summary;
 }
@@ -250,8 +414,11 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
   await persistState(state);
 
   let knownConversations = await getAllConversations();
+  let knownMemories = await getAllMemoryObjects();
   let classifications: ConversationClassification[] = [];
   let vaultOnlyPaths: string[] = [];
+  let memoryClassifications: MemoryMemberClassification[] = [];
+  let memoryVaultOnlyMembers: MemoryVaultOnlyMember[] = [];
 
   for (let pass = 0; pass <= MAX_RESCANS; pass++) {
     state = { ...state, phase: "classify", updatedAt: nowOf(env) };
@@ -259,6 +426,14 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
 
     classifications = await Promise.all(knownConversations.map((c) => classifyConversation(env.root, c)));
     vaultOnlyPaths = await findVaultOnlyConversationPaths(env.root, knownConversations);
+
+    // Phase 3-6：Memoryはday単位でまとめてclassifyする（day-fileの重複読み込みを避ける）。
+    const memoriesByDay = groupMemoriesByDay(knownMemories);
+    const memoryClassificationLists = await Promise.all(
+      [...memoriesByDay.entries()].map(([day, members]) => classifyMemoryDay(env.root, day, members))
+    );
+    memoryClassifications = memoryClassificationLists.flat();
+    memoryVaultOnlyMembers = await findVaultOnlyMemoryMembers(env.root, knownMemories);
 
     state = { ...state, phase: "enqueue-safe-records", updatedAt: nowOf(env) };
     await persistState(state);
@@ -273,7 +448,18 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       }
     }
 
+    let memoryEnsuredThisPass = 0;
+    for (const classification of memoryClassifications) {
+      if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
+        const canonical = knownMemories.find((m) => m.id === classification.recordId);
+        if (!canonical) continue; // 理論上到達しない（防御的）
+        await ensureMemoryOutbox(canonical);
+        memoryEnsuredThisPass += 1;
+      }
+    }
+
     const summary = tally(classifications, vaultOnlyPaths.length);
+    const memorySummary = tallyMemory(memoryClassifications, memoryVaultOnlyMembers.length);
     state = {
       ...state,
       phase: "verify",
@@ -284,19 +470,34 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       unreadableRecordIds: classifications.filter((c) => c.kind === "unreadable").map((c) => c.recordId),
       vaultOnlyPaths,
       outboxEnsuredCount: state.outboxEnsuredCount + ensuredThisPass,
+      memorySummary,
+      memoryConflictRecordIds: memoryClassifications.filter((c) => c.kind === "conflict").map((c) => c.recordId),
+      memoryUnreadableRecordIds: memoryClassifications.filter((c) => c.kind === "unreadable-dayfile").map((c) => c.recordId),
+      memoryVaultOnlyMembers,
+      memoryOutboxEnsuredCount: state.memoryOutboxEnsuredCount + memoryEnsuredThisPass,
     };
     await persistState(state);
 
     // req 11：verify＝終了時rescan。classify対象にした集合と、今読み直した最新集合を
-    // 比較し、新規／`updatedAt`が進んだrecordがあれば、それらを含めて再度classifyする。
+    // 比較し、新規／`updatedAt`が進んだrecordがあれば、それらを含めて再度classifyする
+    // （Conversation・Memory両方について同じ基準で判定する）。
     const latestConversations = await getAllConversations();
     const priorById = new Map(knownConversations.map((c) => [c.id, c]));
-    const hasNewOrChanged = latestConversations.some((c) => {
+    const hasNewOrChangedConversation = latestConversations.some((c) => {
       const prior = priorById.get(c.id);
       return !prior || prior.updatedAt !== c.updatedAt;
     });
-    if (!hasNewOrChanged) break;
+
+    const latestMemories = await getAllMemoryObjects();
+    const priorMemoryById = new Map(knownMemories.map((m) => [m.id, m]));
+    const hasNewOrChangedMemory = latestMemories.some((m) => {
+      const prior = priorMemoryById.get(m.id);
+      return !prior || prior.updatedAt !== m.updatedAt;
+    });
+
+    if (!hasNewOrChangedConversation && !hasNewOrChangedMemory) break;
     knownConversations = latestConversations;
+    knownMemories = latestMemories;
   }
 
   state = { ...state, phase: "done", updatedAt: nowOf(env) };
@@ -309,6 +510,11 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
     unreadableRecordIds: state.unreadableRecordIds,
     vaultOnlyPaths: state.vaultOnlyPaths,
     outboxEnsuredCount: state.outboxEnsuredCount,
+    memorySummary: state.memorySummary!,
+    memoryConflictRecordIds: state.memoryConflictRecordIds,
+    memoryUnreadableRecordIds: state.memoryUnreadableRecordIds,
+    memoryVaultOnlyMembers: state.memoryVaultOnlyMembers,
+    memoryOutboxEnsuredCount: state.memoryOutboxEnsuredCount,
   };
 }
 

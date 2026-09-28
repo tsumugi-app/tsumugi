@@ -1,5 +1,6 @@
 /**
- * Vault Projection Engine（Phase 3-3、Conversationのみ）の回帰テスト。
+ * Vault Projection Engine（Phase 3-3、Conversation／Phase 3-6、normal Memory day-file）の
+ * 回帰テスト。
  *
  * 実IndexedDBは使わない（`fakeIdb.ts`をModule._loadで`require("idb")`へ差し替える。
  * Phase 3-1/3-2の`db.foundation.test.ts`と同じ方式）。実Vaultも使わず、in-memoryの
@@ -31,14 +32,33 @@ const dbMod = require(path.join(OUT, "lib/db.js")) as typeof import("./db");
 const vaultMod = require(path.join(OUT, "lib/vault.js")) as typeof import("./vault");
 const markdownMod = require(path.join(OUT, "lib/markdown.js")) as typeof import("./markdown");
 const projectionMod = require(path.join(OUT, "lib/vaultProjection.js")) as typeof import("./vaultProjection");
+const migrationMod = require(path.join(OUT, "lib/vaultProductionMigration.js")) as typeof import("./vaultProductionMigration");
 const fakeIdbMod = require(path.join(OUT, "lib/fakeIdb.js")) as {
   __failNextPutOn: (dbName: string, storeName: string) => void;
   __failNextPlainPutOn: (dbName: string, storeName: string) => void;
 };
 
 type Conversation = import("./types").Conversation;
+type MemoryObject = import("./types").MemoryObject;
 type VaultOutboxEntry = import("./vaultOutbox").VaultOutboxEntry;
 type VaultIdentityRecord = import("./vaultIdentity").VaultIdentityRecord;
+
+/** テスト専用：実FIFO排他ロックのfake navigator.locks（Phase 3-6 Memory G専用）。 */
+class FakeLockManager {
+  private tail: Promise<void> = Promise.resolve();
+  async request<T>(name: string, optionsOrCb: unknown, maybeCb?: (lock: { name: string } | null) => Promise<T>): Promise<T> {
+    const cb = (typeof optionsOrCb === "function" ? optionsOrCb : maybeCb) as (lock: { name: string } | null) => Promise<T>;
+    const myTurn = this.tail;
+    let release!: () => void;
+    this.tail = new Promise((resolve) => { release = resolve; });
+    await myTurn;
+    try {
+      return await cb({ name });
+    } finally {
+      release();
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // in-memory疑似ファイルシステム（`vaultRecoveryApply.test.ts`のFakeVaultと同じ考え方）
@@ -53,6 +73,17 @@ class FakeVault {
   private clock = 1;
   writeShouldFail = new Set<string>();
   writeCount = 0;
+  /**
+   * テスト専用（Phase 3-6 Memory Projection G：lost update検証）：指定pathの
+   * lookup（`getDirectoryHandle`/`getFileHandle`）が呼ばれた際に、意図的に1 macrotask
+   * だけ遅延させる。これにより、`Promise.all`で本当に「同時に」2つのreconcile呼び出しを
+   * 走らせた場合の実際の非同期interleavingを、決定的に発生させられる
+   * （lockが無ければ両方のreadがwriteより先に完了し、lost updateが起きる）。
+   */
+  delayPaths = new Set<string>();
+  private async maybeDelay(p: string) {
+    if (this.delayPaths.has(p)) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 
   root(): FileSystemDirectoryHandle {
     return this.dir("");
@@ -62,16 +93,36 @@ class FakeVault {
     const self = this;
     return {
       kind: "directory",
+      name: prefix.split("/").pop() ?? "",
       async getDirectoryHandle(name: string, options?: { create?: boolean }) {
         const p = prefix ? `${prefix}/${name}` : name;
+        await self.maybeDelay(p);
         const hasChildren = [...self.files.keys()].some((k) => k.startsWith(`${p}/`));
         if (!hasChildren && !options?.create) throw new DOMException("no such directory", "NotFoundError");
         return self.dir(p);
       },
       async getFileHandle(name: string, options?: { create?: boolean }) {
         const p = prefix ? `${prefix}/${name}` : name;
+        await self.maybeDelay(p);
         if (!self.files.has(p) && !options?.create) throw new DOMException("no such file", "NotFoundError");
         return self.file(p);
+      },
+      // `collectAllMarkdownFiles`（vault.ts、Phase 3-6 migration拡張のVault-only検出が使う）が
+      // ディレクトリを再帰的に`entries()`で列挙するため、`vaultProductionMigration.test.ts`の
+      // FakeVaultと同じ形で実装する。
+      async *entries() {
+        const children = new Map<string, "directory" | "file">();
+        for (const p of self.files.keys()) {
+          if (prefix && !p.startsWith(`${prefix}/`)) continue;
+          if (!prefix && p.includes("/")) continue;
+          const rel = prefix ? p.slice(prefix.length + 1) : p;
+          const first = rel.split("/")[0];
+          children.set(first, rel.includes("/") ? "directory" : "file");
+        }
+        for (const [name, kind] of children) {
+          const childPath = prefix ? `${prefix}/${name}` : name;
+          yield [name, kind === "directory" ? self.dir(childPath) : self.file(childPath)] as [string, FileSystemHandle];
+        }
       },
     } as unknown as FileSystemDirectoryHandle;
   }
@@ -80,6 +131,7 @@ class FakeVault {
     const self = this;
     return {
       kind: "file",
+      name: p.split("/").pop(),
       async getFile() {
         const f = self.files.get(p);
         if (!f) throw new DOMException("no such file", "NotFoundError");
@@ -450,4 +502,494 @@ test("reconcilePendingConversations: pendingなconversation entryだけをまと
   assert.equal(result.done, 2);
   assert.equal(result.pending, 0);
   assert.equal(result.held, 0);
+});
+
+// ===========================================================================
+// Memory day-file Projection（Phase 3-6）
+// ===========================================================================
+
+// `sourceType`を明示する（"chat" = `inferSourceType("ai-capture")`と同じ値）。
+// 明示しないと、Markdown化→parse往復で`sourceType`が補完され、canonicalとonDiskの
+// 再シリアライズテキストが完全一致しなくなる（`vaultProductionMigration.test.ts`の
+// 同名fixtureと同じ理由）。
+const memMeta = { id: "meta", source: "ai-capture" as const, sourceType: "chat" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
+function memory(id: string, day: string, overrides: Partial<MemoryObject> = {}): MemoryObject {
+  const iso = `${day}T09:00:00.000Z`;
+  return {
+    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["event"] as MemoryObject["types"], conversationId: "c1",
+    keywords: [], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
+    createdAt: iso, updatedAt: iso, metadata: { ...memMeta },
+    ...overrides,
+  } as MemoryObject;
+}
+
+/** canonicalをIndexedDBへ保存し、対応するoutbox entryを返す（Phase 3-1のAPIをそのまま使う）。 */
+async function seedMemoryCanonical(m: MemoryObject): Promise<VaultOutboxEntry> {
+  return dbMod.putMemoryObjectWithOutbox(m);
+}
+
+const memoryDayPath = (day: string) => `Memories/${vaultMod.dayFileNameFor(day)}`;
+const memoryShardPathFor = (day: string) => shardPath(vaultMod.dayFileRegistryKey(day));
+
+// ===========================================================================
+// A〜F：基本の収束（member単位のcreate/append/no-op/update・未知member保護）
+// ===========================================================================
+
+test("Projection Memory A: day-fileが無い状態から、1件のmemberをcreateしてMarkdown/Registry/index/Historyすべてを生成しdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-01";
+  const a = memory("mem-a-1", day);
+  const entry = await seedMemoryCanonical(a);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const path = memoryDayPath(day);
+  assert.equal(vault.get(path), markdownMod.serializeMemoryDayFile([a]));
+  const shard = JSON.parse(vault.get(memoryShardPathFor(day))!);
+  const registryKey = vaultMod.dayFileRegistryKey(day);
+  assert.equal(shard.records[registryKey], path);
+  assert.deepEqual(shard.files[path].memberIds, [a.id]);
+  const index = JSON.parse(vault.get(".tsumugi/index.json")!);
+  assert.equal(index[a.id], path);
+  const month = JSON.parse(vault.get(monthPath(day))!);
+  assert.ok(month.days[day].normalMemories.some((r: { id: string }) => r.id === a.id));
+});
+
+test("Projection Memory B: day-fileに既にA（同一内容）がある場合はno-opでdoneになる（重複write無し）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-02";
+  const a = memory("mem-b-1", day);
+  const entry = await seedMemoryCanonical(a);
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.writeCount, writesBefore, "既に正しいため何も書き込まれない");
+});
+
+test("Projection Memory C: day-fileに未知member Xがある状態でAを追加しても、Xが保持される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-03";
+  const x = memory("mem-c-x", day, { createdAt: `${day}T08:00:00.000Z` }); // IndexedDBには存在しない未知member
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([x]));
+  const a = memory("mem-c-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  const entry = await seedMemoryCanonical(a);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(members.length, 2);
+  assert.ok(members.some((m) => m.id === x.id), "未知member Xは削除されない");
+  assert.ok(members.some((m) => m.id === a.id));
+});
+
+test("Projection Memory D: 既存A・未知Xがある状態でAが正当に更新（メタデータのみ変化）されても、Xは保持されAだけ更新される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-04";
+  const aOld = memory("mem-d-a", day, { createdAt: `${day}T09:00:00.000Z`, updatedAt: `${day}T09:00:00.000Z` });
+  const x = memory("mem-d-x", day, { createdAt: `${day}T08:00:00.000Z` });
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([x, aOld]));
+  const aNew: MemoryObject = { ...aOld, summary: "更新後の要約", updatedAt: `${day}T09:05:00.000Z` };
+  const entry = await seedMemoryCanonical(aNew);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(members.length, 2);
+  assert.ok(members.some((m) => m.id === x.id), "未知member Xは保持される");
+  const updated = members.find((m) => m.id === aNew.id)!;
+  assert.equal(updated.summary, "更新後の要約");
+});
+
+test("Projection Memory E: A/B/X共存の状態でAだけprojectionしても、B/Xは完全に保持される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-05";
+  const a = memory("mem-e-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  const b = memory("mem-e-b", day, { createdAt: `${day}T09:01:00.000Z` });
+  const x = memory("mem-e-x", day, { createdAt: `${day}T08:00:00.000Z` }); // 未知member
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([x, a, b]));
+  const entry = await seedMemoryCanonical(a); // IndexedDB canonicalはaと同一内容
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(members.length, 3);
+  assert.ok(members.some((m) => m.id === b.id), "Bは完全に保持される");
+  assert.ok(members.some((m) => m.id === x.id), "未知member Xも完全に保持される");
+});
+
+test("Projection Memory F: 同じdayのA/Bを順番にprojectionすると、両方がday-fileに残る（先のmemberが消えない）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-06";
+  const a = memory("mem-f-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  const b = memory("mem-f-b", day, { createdAt: `${day}T09:01:00.000Z` });
+  const entryA = await seedMemoryCanonical(a);
+  const entryB = await seedMemoryCanonical(b);
+  const resultA = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entryA);
+  assert.equal(resultA.status, "done");
+  const resultB = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entryB);
+  assert.equal(resultB.status, "done");
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(members.length, 2);
+  assert.ok(members.some((m) => m.id === a.id));
+  assert.ok(members.some((m) => m.id === b.id));
+});
+
+// ===========================================================================
+// G：同一day-fileへの並行(相当)projectionでlost updateが起きない（lock必須）
+// ===========================================================================
+
+test("Projection Memory G: 同一day-fileへの並行(相当)projectionでlost updateが起きない", async () => {
+  const vault = new FakeVault();
+  vault.delayPaths.add("Memories");
+  const day = "2026-04-07";
+  vault.delayPaths.add(memoryDayPath(day));
+  seedVaultIdentityFile(vault);
+  const a = memory("mem-g-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  const b = memory("mem-g-b", day, { createdAt: `${day}T09:01:00.000Z` });
+  const entryA = await seedMemoryCanonical(a);
+  const entryB = await seedMemoryCanonical(b);
+
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { value: { locks: new FakeLockManager() }, configurable: true, writable: true });
+  try {
+    const [resultA, resultB] = await Promise.all([
+      projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entryA),
+      projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entryB),
+    ]);
+    assert.equal(resultA.status, "done");
+    assert.equal(resultB.status, "done");
+  } finally {
+    if (originalNavigatorDescriptor) Object.defineProperty(globalThis, "navigator", originalNavigatorDescriptor);
+  }
+
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(members.length, 2, "lockにより、並行実行でも両方のmemberが失われず残っている");
+  assert.ok(members.some((m) => m.id === a.id));
+  assert.ok(members.some((m) => m.id === b.id));
+});
+
+// ===========================================================================
+// H/I/J：restart・kill耐性（Conversationと同じ考え方をmember単位に適用）
+// ===========================================================================
+
+test("Projection Memory H: day-file write直後にkillしても、restartでsame判定され、残りのprojectionが完了してdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-08";
+  const a = memory("mem-h-a", day);
+  const entry = await seedMemoryCanonical(a);
+  vault.writeShouldFail.add(memoryShardPathFor(day)); // day-fileの直後、Registry writeでkill相当
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([a]), "day-fileは既に正しく書けている");
+  vault.writeShouldFail.delete(memoryShardPathFor(day));
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+  assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([a]), "day-fileは再書き込みされていない（no-op）");
+  assert.ok(vault.writeCount > writesBefore, "Registry/index/Historyは書かれている");
+});
+
+test("Projection Memory I: Registry write直後にkillしても、restartでrepair/no-opしてdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-09";
+  const a = memory("mem-i-a", day);
+  const entry = await seedMemoryCanonical(a);
+  vault.writeShouldFail.add(".tsumugi/index.json"); // Registryの直後、index writeでkill相当
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  const shard = JSON.parse(vault.get(memoryShardPathFor(day))!);
+  assert.equal(shard.records[vaultMod.dayFileRegistryKey(day)], memoryDayPath(day), "Registryは既に正しい");
+  vault.writeShouldFail.delete(".tsumugi/index.json");
+  const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+test("Projection Memory J: History/index write直後にkillしても、restartでdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-10";
+  const a = memory("mem-j-a", day);
+  const entry = await seedMemoryCanonical(a);
+  vault.writeShouldFail.add(monthPath(day)); // indexの直後、History writeでkill相当
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  const index = JSON.parse(vault.get(".tsumugi/index.json")!);
+  assert.equal(index[a.id], memoryDayPath(day), "indexは既に正しい");
+  vault.writeShouldFail.delete(monthPath(day));
+  const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+// ===========================================================================
+// K/L：Registry memberIds/memberHashesの修復（未知member分も含む）
+// ===========================================================================
+
+test("Projection Memory K: RegistryのmemberIds/memberHashesが欠落・不整合でも、day-file実体から再構築される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-11";
+  const a = memory("mem-k-a", day);
+  const path = memoryDayPath(day);
+  vault.put(path, markdownMod.serializeMemoryDayFile([a]));
+  const registryKey = vaultMod.dayFileRegistryKey(day);
+  const bucket = vaultMod.vaultRegistryBucketOf(registryKey);
+  vault.put(memoryShardPathFor(day), JSON.stringify({
+    schemaVersion: 1, bucket, records: { [registryKey]: path },
+    files: { [path]: { recordType: "memory-day", mtime: 1, size: 1, contentHash: "stale-hash", status: "ok" } }, // memberIds/memberHashes欠落
+  }));
+  const entry = await seedMemoryCanonical(a);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const shard = JSON.parse(vault.get(memoryShardPathFor(day))!);
+  assert.deepEqual(shard.files[path].memberIds, [a.id]);
+  assert.equal(shard.files[path].memberHashes[a.id], vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(a)));
+});
+
+test("Projection Memory L: 未知memberのRegistry情報も、day-fileの最終実体から再構築される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-12";
+  const a = memory("mem-l-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  const x = memory("mem-l-x", day, { createdAt: `${day}T08:00:00.000Z` }); // 未知member
+  const path = memoryDayPath(day);
+  vault.put(path, markdownMod.serializeMemoryDayFile([x, a]));
+  // Registry自体が丸ごと無い状態から始める。
+  const entry = await seedMemoryCanonical(a);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const shard = JSON.parse(vault.get(memoryShardPathFor(day))!);
+  const registryKey = vaultMod.dayFileRegistryKey(day);
+  assert.deepEqual(new Set(shard.files[path].memberIds), new Set([a.id, x.id]), "未知member Xのidもmemberリストに含まれる");
+  assert.equal(shard.files[path].memberHashes[x.id], vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(x)), "未知member Xのhashも再構築される");
+  assert.equal(shard.records[registryKey], path);
+});
+
+// ===========================================================================
+// M/N：conflict・unreadable
+// ===========================================================================
+
+test("Projection Memory M: 対象memberが真の外部conflictの場合はheldになり、同じday-fileの他memberは変更されない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-13";
+  const aCanonical = memory("mem-m-a", day, { createdAt: `${day}T09:00:00.000Z`, content: "元の内容" });
+  const aExternallyEdited: MemoryObject = { ...aCanonical, content: "外部で書き換えられた内容" }; // content不一致＝正当な後継と認められない
+  const y = memory("mem-m-y", day, { createdAt: `${day}T08:00:00.000Z` });
+  const path = memoryDayPath(day);
+  vault.put(path, markdownMod.serializeMemoryDayFile([y, aExternallyEdited]));
+  const entry = await seedMemoryCanonical(aCanonical);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  const members = markdownMod.parseMemoryDayFile(vault.get(path)!);
+  assert.equal(members.length, 2, "書き込みは一切行われない（他memberも変化しない）");
+  const stillA = members.find((m) => m.id === aCanonical.id)!;
+  assert.equal(stillA.content, "外部で書き換えられた内容", "外部データは上書きされない");
+  const stillY = members.find((m) => m.id === y.id)!;
+  assert.equal(stillY.content, y.content, "Yは一切変更されない");
+});
+
+test("Projection Memory N: day-fileがunreadable（parse不能）な場合はheldになり、上書きしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-14";
+  const a = memory("mem-n-a", day);
+  vault.put(memoryDayPath(day), "not a tsumugi memory day-file at all, no frontmatter");
+  const entry = await seedMemoryCanonical(a);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.get(memoryDayPath(day)), "not a tsumugi memory day-file at all, no frontmatter");
+});
+
+// ===========================================================================
+// O：同一day-fileに安全なmemberとconflictなmemberが混在する場合のisolation policy
+// ===========================================================================
+
+test("Projection Memory O: 同一day-file内でAが安全・Bがconflictでも、Aは独立してrepairされ、Bのconflictに引きずられない（member単位のpartial repair）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-15";
+  const bOnDisk = memory("mem-o-b", day, { createdAt: `${day}T08:00:00.000Z`, content: "Bの元の内容" });
+  const bCanonical: MemoryObject = { ...bOnDisk, content: "Bの外部と食い違う内容変更" };
+  const path = memoryDayPath(day);
+  vault.put(path, markdownMod.serializeMemoryDayFile([bOnDisk])); // day-fileにはまだBだけ（外部版）
+  const aCanonical = memory("mem-o-a", day, { createdAt: `${day}T09:00:00.000Z` }); // day-fileには未登場＝安全にappendできる
+
+  const entryA = await seedMemoryCanonical(aCanonical);
+  const entryB = await seedMemoryCanonical(bCanonical);
+
+  // 採用したisolation policy：day-file単位で一律holdにはしない。安全なAは
+  // 独立してrepairされ、conflictなBだけがheldのまま残る（read-modify-write +
+  // final verifyをmember単位で行うため、Aの処理はBの内容を一切判定しない）。
+  const resultA = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entryA);
+  assert.equal(resultA.status, "done", "Aは他memberのconflictに妨げられず収束する");
+
+  const resultB = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entryB);
+  assert.equal(resultB.status, "held", "Bは真のconflictとしてheldのまま");
+
+  const members = markdownMod.parseMemoryDayFile(vault.get(path)!);
+  assert.equal(members.length, 2);
+  assert.ok(members.some((m) => m.id === aCanonical.id), "Aは追加されている");
+  const stillB = members.find((m) => m.id === bOnDisk.id)!;
+  assert.equal(stillB.content, "Bの元の内容", "Bの外部データは一切上書きされない");
+});
+
+// ===========================================================================
+// P/Q/R：outbox doneの信用しすぎ防止・baseline null・冪等性
+// ===========================================================================
+
+test("Projection Memory P: outboxがdoneだが対象memberがday-fileから消えている場合、検出して再度追加しdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-16";
+  const a = memory("mem-p-a", day);
+  const entry = await seedMemoryCanonical(a);
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  // outboxはdoneのまま、day-file実体だけを（Aを含まない）空の状態に書き換える（例：将来の破損シナリオを模す）。
+  vault.put(memoryDayPath(day), "");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  assert.equal(doneEntry.status, "done", "outboxは（実体の変化を知らないまま）doneのまま");
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(result.status, "done", "outboxのdoneを信用せず、実体を検証して再修復する");
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.ok(members.some((m) => m.id === a.id));
+});
+
+test("Projection Memory Q: baseline（registry-meta.json）が一切無くても正常にprojectionされる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  assert.equal(vault.get(".tsumugi/registry-meta.json"), undefined);
+  const day = "2026-04-17";
+  const a = memory("mem-q-a", day);
+  const entry = await seedMemoryCanonical(a);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done", "baseline未確立を一切参照しない");
+});
+
+test("Projection Memory R: projection完了後にもう一度reconcileしても完全no-opで、duplicateが生じない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-18";
+  const a = memory("mem-r-a", day);
+  const entry = await seedMemoryCanonical(a);
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.writeCount, writesBefore, "duplicateを作らない（何も書かない）");
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(members.length, 1);
+});
+
+// ===========================================================================
+// reconcilePendingMemories（startup reconcile、library単体。まだ本番未接続）
+// ===========================================================================
+
+test("reconcilePendingMemories: pendingなmemory entryだけをまとめて処理する", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-19";
+  const a = memory("mem-batch-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  const b = memory("mem-batch-b", day, { createdAt: `${day}T09:01:00.000Z` });
+  await seedMemoryCanonical(a);
+  await seedMemoryCanonical(b);
+  const result = await projectionMod.reconcilePendingMemories(makeEnv(vault));
+  assert.equal(result.done, 2);
+  assert.equal(result.pending, 0);
+  assert.equal(result.held, 0);
+});
+
+// ===========================================================================
+// 永久iPhone Memory fixture（Phase 3-6 req 15）
+// ===========================================================================
+
+test("Projection Memory iPhone fixture（永久回帰テスト）: migration → Memory Projection reconcileで、A保持/B追加/C安全更新/X保全のすべてが安全に収束する", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-04-20";
+
+  // A：IndexedDBとVaultが完全一致。
+  const a = memory("iphone-mem-a", day, { createdAt: `${day}T09:00:00.000Z` });
+  // B：IDB-only（day-fileには無い）。
+  const b = memory("iphone-mem-b", day, { createdAt: `${day}T09:01:00.000Z` });
+  // C：Vaultは旧version、IDBは正当な後継（メタデータのみ更新）。
+  const cOld = memory("iphone-mem-c", day, { createdAt: `${day}T09:02:00.000Z`, updatedAt: `${day}T09:02:00.000Z` });
+  const cNew: MemoryObject = { ...cOld, summary: "更新後の要約（安全な更新）", updatedAt: `${day}T09:10:00.000Z` };
+  // X：Vault-only（IndexedDBに存在しない未知member）。
+  const x = memory("iphone-mem-x", day, { createdAt: `${day}T08:00:00.000Z` });
+
+  const path = memoryDayPath(day);
+  vault.put(path, markdownMod.serializeMemoryDayFile([x, a, cOld]));
+
+  // RegistryはmemberIds/memberHashesが部分的に欠落した状態（実機で確認された状態を再現）。
+  const registryKey = vaultMod.dayFileRegistryKey(day);
+  const bucket = vaultMod.vaultRegistryBucketOf(registryKey);
+  vault.put(`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`, JSON.stringify({
+    schemaVersion: 1, bucket, records: { [registryKey]: path },
+    files: { [path]: { recordType: "memory-day", mtime: 1, size: 1, contentHash: "stale-hash", status: "ok" } }, // memberIds/memberHashes欠落
+  }));
+
+  // Historyはstale（Aしか記録されていない）。
+  vault.put(monthPath(day), JSON.stringify({
+    version: 2, month: day.slice(0, 7),
+    days: { [day]: { conversations: [], normalMemories: [{ id: a.id, types: a.types, preview: a.summary, createdAt: a.createdAt, date: a.date }], reflections: [] } },
+  }));
+
+  // baselineは一切seedしない（registry-meta.jsonを置かない＝null相当）。
+
+  await dbMod.putMemoryObject(a);
+  await dbMod.putMemoryObject(b);
+  await dbMod.putMemoryObject(cNew);
+
+  // Vault identityは既にpair済み。
+  const identity: VaultIdentityRecord = { id: "current", vaultId: "iphone-mem-vault-id", activeVaultEpoch: 0, registryGeneration: "g1", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "iphone-mem-vault-id", createdAt: T }));
+
+  // Production migrationでoutbox化する（Registry不在・baseline null状態でも、safeなmemberはoutbox化される）。
+  const migrationResult = await migrationMod.runProductionBootstrapMigration({ root: vault.root(), now: () => T });
+  assert.equal(migrationResult.phase, "done");
+  assert.equal(migrationResult.memorySummary.bothSame, 1, "A：both-same");
+  assert.equal(migrationResult.memorySummary.idbOnly, 1, "B：idb-only");
+  assert.equal(migrationResult.memorySummary.legitimateSuccessor, 1, "C：legitimate-successor");
+  assert.equal(migrationResult.memorySummary.vaultOnly, 1, "X：Vault-only");
+  assert.equal(migrationResult.memorySummary.conflict, 0, "Recovery対象になるconflictは無い");
+  assert.deepEqual(migrationResult.memoryVaultOnlyMembers.map((v) => v.id), [x.id]);
+
+  const projEnv: import("./vaultProjection").ProjectionEnv = { root: vault.root(), vaultIdentity: identity, now: () => T };
+  for (const m of [a, b, cNew]) {
+    const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
+    assert.ok(entry, `${m.id}のoutbox entryが無い`);
+    const reconcileResult = await projectionMod.reconcileMemoryOutboxEntry(projEnv, entry!);
+    assert.equal(reconcileResult.status, "done", `${m.id}がdoneにならなかった: ${JSON.stringify(reconcileResult)}`);
+  }
+
+  // 最終状態の確認：A保持・B追加・C安全更新・X保全のすべてが揃っている。
+  const finalMembers = markdownMod.parseMemoryDayFile(vault.get(path)!);
+  assert.equal(finalMembers.length, 4, "X/A/B/Cの4件が最終的に揃う");
+  assert.ok(finalMembers.some((m) => m.id === x.id), "X：Vault-onlyは最後まで保全される");
+  assert.ok(finalMembers.some((m) => m.id === a.id), "A：保持される");
+  assert.ok(finalMembers.some((m) => m.id === b.id), "B：新規追加される");
+  const finalC = finalMembers.find((m) => m.id === cNew.id)!;
+  assert.equal(finalC.summary, "更新後の要約（安全な更新）", "C：安全な更新が反映される");
+
+  const finalShard = JSON.parse(vault.get(`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`)!);
+  assert.deepEqual(new Set(finalShard.files[path].memberIds), new Set([x.id, a.id, b.id, cNew.id]), "Registryはfinal実体から修復される");
+
+  const finalMonth = JSON.parse(vault.get(monthPath(day))!);
+  const historyIds = finalMonth.days[day].normalMemories.map((r: { id: string }) => r.id);
+  assert.deepEqual(new Set(historyIds), new Set([x.id, a.id, b.id, cNew.id]), "Historyも最終実体から修復される");
+
+  for (const m of [a, b, cNew]) {
+    const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
+    assert.equal(entry!.status, "done", "Recovery不要（すべてdone）");
+  }
 });

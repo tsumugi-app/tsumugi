@@ -38,6 +38,7 @@ const fakeIdbMod = require(path.join(OUT, "lib/fakeIdb.js")) as {
 };
 
 type Conversation = import("./types").Conversation;
+type MemoryObject = import("./types").MemoryObject;
 type VaultIdentityRecord = import("./vaultIdentity").VaultIdentityRecord;
 
 // ---------------------------------------------------------------------------
@@ -151,6 +152,27 @@ function makeEnv(vault: FakeVault): import("./vaultProductionMigration").Product
 async function seedIdbConversation(c: Conversation) {
   await dbMod.putConversation(c);
 }
+
+// Phase 3-6：Memory拡張のfixture。
+// `sourceType`を明示しておく（"chat"＝`inferSourceType("ai-capture")`と同じ値）。
+// 明示しないと、Markdown化→parse往復で`parseMemoryObjectMarkdown`が
+// `inferSourceType`によって`sourceType`を補完してしまい、canonical（元のオブジェクト、
+// sourceType未設定）とonDisk（parse後、sourceType="chat"が補完済み）の再シリアライズ
+// テキストが完全一致しなくなる（回帰：意図しない`unreadable`/`conflict`誤判定）。
+const memMeta = { id: "meta", source: "ai-capture" as const, sourceType: "chat" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
+function memory(id: string, day: string, overrides: Partial<MemoryObject> = {}): MemoryObject {
+  const iso = `${day}T09:00:00.000Z`;
+  return {
+    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["event"] as MemoryObject["types"], conversationId: "c1",
+    keywords: [], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
+    createdAt: iso, updatedAt: iso, metadata: { ...memMeta },
+    ...overrides,
+  } as MemoryObject;
+}
+async function seedIdbMemory(m: MemoryObject) {
+  await dbMod.putMemoryObject(m);
+}
+const memoryDayPath = (day: string) => `Memories/${vaultMod.dayFileNameFor(day)}`;
 
 async function clearAllIndexedDbState() {
   // 各テストがまっさらな状態から始められるよう、conversations/vaultOutbox/settings
@@ -460,4 +482,76 @@ test("Migration O（今回のiPhone事故のend-to-endの永久回帰テスト�
     const entry = await dbMod.getVaultOutboxEntry(`conversation:${id}`);
     assert.equal(entry!.status, "done");
   }
+});
+
+// ===========================================================================
+// Phase 3-6：Memory拡張（member単位のclassification・migration）
+// ===========================================================================
+
+test("Migration S: normal MemoryのIDB-only／both-same／Vault-only memberが混在していても、safeなmemberだけがoutbox化され、Vault-onlyは保全される", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-05-10";
+
+  // both-same：day-fileに既に同一内容で存在。
+  const bothSame = memory("mig-s-both-same", day);
+  // idb-only：day-fileには無い。
+  const idbOnly = memory("mig-s-idb-only", day, { createdAt: `${day}T09:01:00.000Z` });
+  // Vault-only：day-fileにあるがIndexedDBには無いmember（保全対象、絶対に削除しない）。
+  const vaultOnly = memory("mig-s-vault-only", day, { createdAt: `${day}T08:00:00.000Z` });
+
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([vaultOnly, bothSame]));
+  await seedIdbMemory(bothSame);
+  await seedIdbMemory(idbOnly);
+
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.equal(result.memorySummary.bothSame, 1, "both-same member");
+  assert.equal(result.memorySummary.idbOnly, 1, "idb-only member");
+  assert.equal(result.memorySummary.vaultOnly, 1, "Vault-only member");
+  assert.equal(result.memorySummary.conflict, 0);
+  assert.deepEqual(result.memoryVaultOnlyMembers.map((v) => v.id), [vaultOnly.id]);
+
+  assert.ok(await dbMod.getVaultOutboxEntry(`memory:${bothSame.id}`), "both-same memberはoutbox化される");
+  assert.ok(await dbMod.getVaultOutboxEntry(`memory:${idbOnly.id}`), "idb-only memberもoutbox化される");
+  assert.equal(await dbMod.getVaultOutboxEntry(`memory:${vaultOnly.id}`), undefined, "Vault-only member自体はIndexedDBに無いためoutboxを作らない");
+
+  // Vault側のday-fileは、migration自体では一切書き換えられない（outboxへの登録のみ）。
+  const stillOnDisk = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.ok(stillOnDisk.some((m) => m.id === vaultOnly.id), "Vault-onlyのmemberはmigration中も一切削除されない");
+
+  // 実際にProjection Engineでreconcileすると、Vault-onlyは保持されたまま安全なmemberだけ収束する。
+  const identity: VaultIdentityRecord = { id: "current", vaultId: "mig-s-vault-id", activeVaultEpoch: 0, registryGeneration: "g1", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "mig-s-vault-id", createdAt: T }));
+  const projEnv: import("./vaultProjection").ProjectionEnv = { root: vault.root(), vaultIdentity: identity, now: () => T };
+  for (const m of [bothSame, idbOnly]) {
+    const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
+    const reconcileResult = await projectionMod.reconcileMemoryOutboxEntry(projEnv, entry!);
+    assert.equal(reconcileResult.status, "done", `${m.id}: ${JSON.stringify(reconcileResult)}`);
+  }
+  const finalMembers = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.equal(finalMembers.length, 3, "vaultOnly + bothSame + idbOnlyの3件が最終的に揃う");
+  assert.ok(finalMembers.some((m) => m.id === vaultOnly.id), "Vault-onlyは最後まで保持される");
+});
+
+test("Migration T: Memory memberのenqueue途中でkillしても、restartで残りが完了しdoneになる（Vault-onlyは影響を受けない）", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-05-11";
+  const m1 = memory("mig-t-1", day);
+  const m2 = memory("mig-t-2", day, { createdAt: `${day}T09:01:00.000Z` });
+  const vaultOnly = memory("mig-t-vault-only", day, { createdAt: `${day}T08:00:00.000Z` });
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([vaultOnly]));
+  await seedIdbMemory(m1);
+  await seedIdbMemory(m2);
+
+  fakeIdbMod.__failNextPutOn("tsumugi", "vaultOutbox"); // m1・m2どちらか1件のoutbox transactionを失敗させる
+  await assert.rejects(migrationMod.runProductionBootstrapMigration(makeEnv(vault)));
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.ok(await dbMod.getVaultOutboxEntry(`memory:${m1.id}`));
+  assert.ok(await dbMod.getVaultOutboxEntry(`memory:${m2.id}`));
+  // Vault-onlyはmigrationの中断・再開を跨いでも一切変更されない。
+  const onDisk = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
+  assert.deepEqual(onDisk.map((m) => m.id), [vaultOnly.id]);
 });

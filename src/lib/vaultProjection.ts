@@ -8,22 +8,23 @@
  * update/no-op/conflict/heldを判定する）→project（必要な分だけ書く）→verify（書いた後に
  * 実際に整合しているか確認する）を、このファイルで明示的に実装する。
  *
- * 対象はPhase 3-3時点ではConversationのみ（Memory day-file・Reflection・Sourceは
- * Phase 3-4以降）。
+ * 対象はConversation（Phase 3-3）とnormal Memory day-file（Phase 3-6）。
+ * Reflection・SourceはPhase 3-6でも対応しない（day-file実装を複雑にしないため、
+ * 意図的に次Phaseへ残す。Phase 3-6報告参照）。
  *
  * 重要：baselineEstablishedAtはwrite permissionとして一切使わない（Phase 1で特定した
  * 今回のiPhone事故の根本原因）。projection許可条件は (1) Vault identityが一致
  * (2) canonical recordが存在 (3) 対象Vault実体との比較でconflictがない、の3つだけ。
  *
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
- * （Phase 3-3は、テストから呼べるlibraryとして完成させるところまで）。
+ * （テストから呼べるlibraryとして完成させるところまで）。
  */
-import { getConversation, getPendingVaultOutboxEntries, putVaultOutboxEntry } from "./db";
+import { getConversation, getMemoryObject, getPendingVaultOutboxEntries, putVaultOutboxEntry } from "./db";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
-import type { Conversation } from "./types";
-import { conversationToMarkdown, parseConversationMarkdown } from "./markdown";
-import { fileNameFor, vaultRegistryBucketOf, hashVaultText, vaultProjectionPrimitives } from "./vault";
+import type { Conversation, MemoryObject } from "./types";
+import { conversationToMarkdown, parseConversationMarkdown, memoryObjectToMarkdown, parseMemoryDayFile, serializeMemoryDayFile } from "./markdown";
+import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, vaultProjectionPrimitives } from "./vault";
 
 // ---------------------------------------------------------------------------
 // path
@@ -84,6 +85,7 @@ async function dirAndFileNameFor(root: FileSystemDirectoryHandle, path: string, 
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+type Obj = Record<string, unknown>;
 
 // ---------------------------------------------------------------------------
 // Vault Identity（req 7・req 13：既にpair済みの場合のみ照合する。legacy Vaultの
@@ -400,6 +402,384 @@ export async function reconcilePendingConversations(env: ProjectionEnv): Promise
   for (const entry of pending) {
     if (entry.recordType !== "conversation") continue;
     const outcome = await reconcileConversationOutboxEntry(env, entry);
+    result[outcome.status] += 1;
+  }
+  return result;
+}
+
+// ===========================================================================
+// Memory day-file Projection（新保存基盤 Phase 3-6）
+//
+// Conversationとの最大の違い：canonicalは個々のMemoryObject（1 record）だが、
+// projection先（day-file）は複数recordを共有する。したがって「canonicalからday-file
+// を丸ごと再生成して上書き」は禁止（req 1）——read existing day-file→parse members→
+// 対象memberだけ比較→unknown membersを保持→safe merge→write→verify、という
+// read-modify-writeを、対象memberの数だけ繰り返す設計にする。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// req 5：Lock。同一day-fileへの複数member projectionが、互いのwriteを
+// 消し合わない（lost update防止）よう、day単位の専用lockで直列化する。
+// 既存のwithVaultRegistryLock/withHistoryIndexLock（vault.ts、非export）と
+// 同じ`navigator.locks`パターンをこのEngine専用のlock nameで再利用する
+// （Phase 3-6はまだ本番write queueへ未接続のため、Engine自身の直列化が必要）。
+// ---------------------------------------------------------------------------
+
+const MEMORY_DAYFILE_LOCK_PREFIX = "tsumugi-projection-memory-dayfile";
+
+function isLockSupported(): boolean {
+  return typeof navigator !== "undefined" && typeof navigator.locks !== "undefined";
+}
+
+async function withMemoryDayFileLock<T>(day: string, fn: () => Promise<T>): Promise<T> {
+  if (!isLockSupported()) return fn();
+  return navigator.locks.request(`${MEMORY_DAYFILE_LOCK_PREFIX}:${day}`, fn);
+}
+
+// ---------------------------------------------------------------------------
+// req 9：Memory version判定。
+//
+// ConversationのprefixチェックはMemoryへは使えない（turnsのような追記専用構造が
+// 無いため）。day-fileの各member entryは`memoryObjectToMarkdown`でシリアライズ
+// される（`serializeMemoryDayFile`参照）ため、「same」はConversationと同じく
+// 全文一致で判定する。
+//
+// 「legitimate successor」はcontent（捕捉した事実の本文）が一致していることを
+// 必須とする——content以外（summary・types・keywords・links・themeIds・
+// personIds・emotionIds・goalIds・ideaIds・eventIds・topicId・
+// evidenceQuotes・personMentions・topicEvents・profileClaims・metadata等）は
+// Tsumugi自身の後続処理（topic付与・person mention紐付け・感情/目標/アイデア/
+// 出来事抽出・evidence検証等）が事実を変えずに随時更新しうる項目であり、
+// これらだけが変化した更新は「証明できないupdateの無理な上書き」には当たらない。
+// 一方、content自体が変わっている場合は、Tsumugi自身の後続処理が本文を書き換える
+// 設計にはなっていない以上、正当な更新か外部編集かをこの判定だけでは区別できない
+// ため、安全側でconflictとして保留する（Conversationのturn内容保護と同じ考え方）。
+// ---------------------------------------------------------------------------
+
+function memoryEntryMarkdown(m: MemoryObject): string {
+  return memoryObjectToMarkdown(m);
+}
+
+function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boolean {
+  return memoryEntryMarkdown(onDisk) === memoryEntryMarkdown(canonical);
+}
+
+/**
+ * Phase 3-6のmigration（vaultProductionMigration.ts）もこの判定を共有する（二重実装しない）。
+ *
+ * `date`は日付部分（`YYYY-MM-DD`）だけをMarkdown frontmatterへ書く
+ * （`memoryObjectToMarkdown`）ため、`onDisk`（day-fileから読み直した実体）の`date`は
+ * 常に時刻部分が`T00:00:00.000Z`へ正規化済みになる。`canonical`（IndexedDB上の値、
+ * 例：会話開始時刻など元の時刻を保持している場合がある）とここを完全一致で比較すると、
+ * 内容として同一のmemberが時刻精度の違いだけでconflict誤判定される
+ * （`decideAndProjectMemoryHistory`で発見した同じ根本原因）。日付部分だけを比較する。
+ */
+export function isMemoryLegitimateSuccessor(onDisk: MemoryObject, canonical: MemoryObject): boolean {
+  if (onDisk.id !== canonical.id) return false;
+  if (onDisk.date.slice(0, 10) !== canonical.date.slice(0, 10)) return false;
+  if (onDisk.createdAt !== canonical.createdAt) return false;
+  if (onDisk.content !== canonical.content) return false;
+  return canonical.updatedAt > onDisk.updatedAt;
+}
+
+// ---------------------------------------------------------------------------
+// req 2〜4：member単位の判定とsafe merge
+// ---------------------------------------------------------------------------
+
+const memoryDayFilePath = (m: MemoryObject) => `Memories/${dayFileNameFor(m.date)}`;
+
+export type MemoryMemberVerdictKind = "create" | "append" | "no-op" | "update";
+
+interface MemoryMergeResult {
+  path: string;
+  verdict: MemoryMemberVerdictKind;
+  /** merge後のday-file全member（既知canonical＋未知member。安定した順序＝createdAt昇順）。 */
+  finalMembers: MemoryObject[];
+  finalContent: string;
+}
+
+/**
+ * 対象1 memberを、day-fileの現在の実体へ安全にmergeする。既存の未知member
+ * （IndexedDBに存在しないid）は一切削除しない（req 3、最重要）。呼び出しの
+ * たびに必ずday-fileを読み直す（`withMemoryDayFileLock`と組み合わせることで、
+ * req 4の「常に最新実体を基準にする」を満たす）。
+ */
+async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<MemoryMergeResult> {
+  const read = await readTextAt(env.root, path);
+  if (read.state === "error") throw new ProjectionConflictError("memory-dayfile-unreadable");
+
+  let existingMembers: MemoryObject[] = [];
+  if (read.state === "ok") {
+    const parsed = parseMemoryDayFile(read.text);
+    // parseMemoryDayFile自体はparse不能なentryを黙って除外する実装のため、
+    // 「1件も読めなかった」かつ「元のtextが空でない」場合だけをunreadableとして扱う
+    // （0件のday-fileという状態は無い——create前は必ずabsentのため）。
+    if (parsed.length === 0 && read.text.trim().length > 0) throw new ProjectionConflictError("memory-dayfile-unreadable");
+    existingMembers = parsed;
+  }
+
+  const idx = existingMembers.findIndex((m) => m.id === canonical.id);
+  let verdict: MemoryMemberVerdictKind;
+  let mergedMembers: MemoryObject[];
+
+  if (idx === -1) {
+    verdict = existingMembers.length === 0 ? "create" : "append";
+    mergedMembers = [...existingMembers, canonical];
+  } else {
+    const existing = existingMembers[idx];
+    if (isMemorySame(existing, canonical)) {
+      verdict = "no-op";
+      mergedMembers = existingMembers;
+    } else if (isMemoryLegitimateSuccessor(existing, canonical)) {
+      verdict = "update";
+      mergedMembers = existingMembers.map((m, i) => (i === idx ? canonical : m));
+    } else {
+      throw new ProjectionConflictError("memory-member-conflict");
+    }
+  }
+
+  const sortedMembers = [...mergedMembers].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const finalContent = serializeMemoryDayFile(sortedMembers);
+
+  if (verdict !== "no-op") {
+    const { dir, fileName } = await dirAndFileNameFor(env.root, path, true);
+    try {
+      await vaultProjectionPrimitives.writeFileInDir(dir, fileName, finalContent, "projection memory day-file");
+    } catch (error) {
+      throw new ProjectionRetryableError(error instanceof Error ? error.message : "memory-dayfile-write-failed");
+    }
+  }
+
+  return { path, verdict, finalMembers: sortedMembers, finalContent };
+}
+
+// ---------------------------------------------------------------------------
+// req 6：Registry。memberIds/memberHashesは、最終day-file実体（known+unknown
+// member全員）から構築する——対象memberだけを直す際に、他member（未知member含む）
+// のRegistry情報を落とさない。
+// ---------------------------------------------------------------------------
+
+async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string): Promise<void> {
+  const day = finalMembers[0]?.date.slice(0, 10) ?? "";
+  const registryKey = dayFileRegistryKey(day);
+  const bucket = vaultRegistryBucketOf(registryKey);
+  const shardPath = registryShardPath(bucket);
+  const read = await readJsonAt(env.root, shardPath);
+  if (read.state === "error") throw new ProjectionConflictError("registry-unreadable");
+  const records = read.state === "ok" && isObj(read.value.records) ? (read.value.records as Record<string, unknown>) : {};
+  const files = read.state === "ok" && isObj(read.value.files) ? (read.value.files as Record<string, unknown>) : {};
+  const currentPath = records[registryKey];
+
+  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
+  let stat: { mtime: number; size: number };
+  try {
+    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "memory-dayfile-stat-failed");
+  }
+  const memberIds = finalMembers.map((m) => m.id);
+  const memberHashes = Object.fromEntries(finalMembers.map((m) => [m.id, hashVaultText(memoryEntryMarkdown(m))]));
+  const expected = { recordType: "memory-day" as const, mtime: stat.mtime, size: stat.size, contentHash: hashVaultText(finalContent), memberIds, memberHashes, status: "ok" as const };
+
+  const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;
+  const alreadyCorrect =
+    currentPath === path &&
+    isObj(currentEntry) &&
+    currentEntry.recordType === expected.recordType &&
+    currentEntry.contentHash === expected.contentHash &&
+    currentEntry.status === "ok" &&
+    Array.isArray(currentEntry.memberIds) &&
+    sameStringSet(currentEntry.memberIds as unknown[], memberIds) &&
+    isObj(currentEntry.memberHashes) &&
+    memberIds.every((id) => (currentEntry.memberHashes as Obj)[id] === memberHashes[id]);
+  if (alreadyCorrect) return;
+
+  try {
+    await vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey, path, ...expected });
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "registry-write-failed");
+  }
+}
+
+function sameStringSet(a: unknown[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const setA = new Set(a);
+  return b.every((x) => setA.has(x));
+}
+
+/** 配列の要素順序まで一致するかを見る（`types`は保存時に順序が保たれる前提のため）。 */
+function sameStringArray(a: unknown, b: unknown[]): boolean {
+  if (!Array.isArray(a)) return false;
+  if (a.length !== b.length) return false;
+  return a.every((x, i) => x === b[i]);
+}
+
+// ---------------------------------------------------------------------------
+// index.json：対象canonical memberの自分自身のid→pathだけを確認・更新する
+// （他memberのentryには一切触れない。updateIndex自体がread-modify-writeで
+// 他keyを保護する）。
+// ---------------------------------------------------------------------------
+
+async function decideAndProjectMemoryIndex(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<void> {
+  const read = await readJsonAt(env.root, INDEX_PATH);
+  if (read.state === "error") throw new ProjectionConflictError("index-unreadable");
+  const current = read.state === "ok" ? read.value[canonical.id] : undefined;
+  if (current === path) return;
+  try {
+    await vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "index-write-failed");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// req 7：History。day-fileの最終実体（known+unknown member全員）からnormalMemories
+// 行を再構築する——`updateHistoryIndex`自体が絶対値書き込みで、対象日のnormalMemories
+// 配列以外（同じ日のconversations/reflections行、他の日・他の月）には一切触れない
+// （Recovery B1の「対象外rowを変更しない」と同じ既存の安全性を、この同じprimitiveの
+// 再利用によってそのまま引き継ぐ）。
+// ---------------------------------------------------------------------------
+
+async function decideAndProjectMemoryHistory(env: ProjectionEnv, day: string, finalMembers: MemoryObject[]): Promise<void> {
+  const monthPath = historyMonthPath(day);
+  const monthRead = await readJsonAt(env.root, monthPath);
+  if (monthRead.state === "error") throw new ProjectionConflictError("history-unreadable");
+  const metaRead = await readJsonAt(env.root, HISTORY_META_PATH);
+  if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
+  // `date`は日付部分だけをMarkdown frontmatterへ書く（`memoryObjectToMarkdown`）ため、
+  // day-fileから再読み込みしたmember（`mergeMemoryIntoDayFile`がparse経由で返す既存member）
+  // の`date`は常に`T00:00:00.000Z`へ正規化済みになる。一方、まだ一度もday-fileへ
+  // 書かれていない直近canonical（`finalMembers`に含まれる、たった今追加/更新した
+  // member）は、IndexedDB上の`date`（会話開始時刻等、時刻付きの場合がある）を
+  // そのまま持つ。この2つの由来が混在するmemberの間で`date`の粒度が食い違うと、
+  // 同じ内容のはずのHistory rowが「毎回変化した」と誤判定され、無限にrewriteし続ける
+  // （実際にProjection Memory B/Rのmutation testingで検出：2回目の何もしないはずの
+  // reconcileで、この不一致だけを理由にHistory月ファイルが再書き込みされていた）。
+  // 呼び出し元の由来に関わらず、ここで一律に日付部分だけへ正規化することで、
+  // 常に同じ値へ収束させる（真の冪等性。Invariant 3）。
+  const rows = finalMembers.map((m) => ({ id: m.id, types: m.types, preview: truncateHistoryPreview(m.summary), createdAt: m.createdAt, date: `${m.date.slice(0, 10)}T00:00:00.000Z` }));
+  try {
+    await vaultProjectionPrimitives.updateHistoryIndex(env.root, { kind: "memory", day, normalMemories: rows });
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "history-write-failed");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// req 10：final verify。対象memberについて、doneにする前に必ずday-file・Registry・
+// index・Historyが実際に整合していることを確認する。
+// ---------------------------------------------------------------------------
+
+async function finalVerifyMemory(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const dayRead = await readTextAt(env.root, path);
+  if (dayRead.state !== "ok") return { ok: false, reason: "verify-memory-dayfile-missing" };
+  const members = parseMemoryDayFile(dayRead.text);
+  const member = members.find((m) => m.id === canonical.id);
+  if (!member || memoryEntryMarkdown(member) !== memoryEntryMarkdown(canonical)) return { ok: false, reason: "verify-memory-member-mismatch" };
+
+  const day = canonical.date.slice(0, 10);
+  const registryKey = dayFileRegistryKey(day);
+  const bucket = vaultRegistryBucketOf(registryKey);
+  const registryRead = await readJsonAt(env.root, registryShardPath(bucket));
+  if (registryRead.state !== "ok") return { ok: false, reason: "verify-registry-missing" };
+  const records = isObj(registryRead.value.records) ? registryRead.value.records : {};
+  const files = isObj(registryRead.value.files) ? registryRead.value.files : {};
+  const entry = records[registryKey] === path ? files[path] : undefined;
+  if (!isObj(entry) || entry.status !== "ok" || !isObj(entry.memberHashes) || (entry.memberHashes as Obj)[canonical.id] !== hashVaultText(memoryEntryMarkdown(canonical))) {
+    return { ok: false, reason: "verify-registry-mismatch" };
+  }
+
+  const indexRead = await readJsonAt(env.root, INDEX_PATH);
+  if (indexRead.state !== "ok" || indexRead.value[canonical.id] !== path) return { ok: false, reason: "verify-index-mismatch" };
+
+  const historyRead = await readJsonAt(env.root, historyMonthPath(day));
+  if (historyRead.state !== "ok") return { ok: false, reason: "verify-history-missing" };
+  const days = isObj(historyRead.value.days) ? historyRead.value.days : {};
+  const dayEntry = days[day];
+  const row = isObj(dayEntry) && Array.isArray(dayEntry.normalMemories) ? dayEntry.normalMemories.find((r) => isObj(r) && r.id === canonical.id) : undefined;
+  if (!isObj(row) || row.preview !== truncateHistoryPreview(canonical.summary) || !sameStringArray(row.types, canonical.types)) return { ok: false, reason: "verify-history-mismatch" };
+
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// 公開API
+// ---------------------------------------------------------------------------
+
+/**
+ * outbox entry 1件（1 canonical MemoryObject）を、実際にVaultへ収束させる。
+ *
+ * req 8（conflict isolation）：day-file内の他memberが本当のconflictであっても、
+ * このmemberの安全なrepairを妨げない——`mergeMemoryIntoDayFile`は対象memberだけを
+ * 判定し、他memberはunknown/preservedとしてそのまま素通りする（他memberの内容比較・
+ * conflict判定はこの関数の責務ではない。他member自身のoutbox entryが別途あれば、
+ * その member自身のreconcile呼び出しが独立して判定する）。read-modify-write +
+ * final verifyの組み合わせにより、「対象memberだけの安全なrepair」であることを
+ * 実行のたびに証明してからdoneにする（証明できなければpending/heldのまま。
+ * day-file単位で一律holdにはしない——1 memberのconflict/一時失敗が、同じ
+ * day-fileの他の安全なmemberの収束を妨げないため）。
+ */
+export async function reconcileMemoryOutboxEntry(env: ProjectionEnv, entry: VaultOutboxEntry): Promise<ReconcileConversationResult> {
+  const now = (env.now ?? (() => new Date().toISOString()))();
+  const steps = emptySteps();
+
+  if (!(await vaultIdentityMatches(env))) {
+    await persistOutcome(entry, steps, "held", "vault-identity-mismatch", now);
+    return { status: "held", reason: "vault-identity-mismatch" };
+  }
+
+  const canonical = await getMemoryObject(entry.recordId);
+  if (!canonical) {
+    await persistOutcome(entry, steps, "held", "canonical-record-missing", now);
+    return { status: "held", reason: "canonical-record-missing" };
+  }
+  if (canonical.updatedAt !== entry.recordUpdatedAt) {
+    await persistOutcome(entry, steps, "pending", "outbox-entry-stale", now);
+    return { status: "pending", reason: "outbox-entry-stale" };
+  }
+
+  const path = memoryDayFilePath(canonical);
+  const day = canonical.date.slice(0, 10);
+
+  try {
+    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path));
+    steps.markdown = "done";
+
+    await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent);
+    steps.registry = "done";
+
+    await decideAndProjectMemoryIndex(env, canonical, path);
+    steps.index = "done";
+
+    await decideAndProjectMemoryHistory(env, day, merge.finalMembers);
+    steps.history = "done";
+
+    const verify = await finalVerifyMemory(env, canonical, path);
+    if (!verify.ok) {
+      await persistOutcome(entry, steps, "pending", verify.reason, now);
+      return { status: "pending", reason: verify.reason };
+    }
+
+    await persistOutcome(entry, steps, "done", null, now);
+    return { status: "done" };
+  } catch (error) {
+    if (error instanceof ProjectionConflictError) {
+      await persistOutcome(entry, steps, "held", error.message, now);
+      return { status: "held", reason: error.message };
+    }
+    const reason = error instanceof Error ? error.message : "unknown-projection-error";
+    await persistOutcome(entry, steps, "pending", reason, now);
+    return { status: "pending", reason };
+  }
+}
+
+/** `memory`種別のpending outbox entryだけを対象に、1件ずつreconcileする。まだ本番未接続。 */
+export async function reconcilePendingMemories(env: ProjectionEnv): Promise<ReconcileAllResult> {
+  const pending = await getPendingVaultOutboxEntries();
+  const result: ReconcileAllResult = { done: 0, pending: 0, held: 0 };
+  for (const entry of pending) {
+    if (entry.recordType !== "memory") continue;
+    const outcome = await reconcileMemoryOutboxEntry(env, entry);
     result[outcome.status] += 1;
   }
   return result;
