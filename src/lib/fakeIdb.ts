@@ -31,6 +31,8 @@ class FakeIDBDatabase {
   failOnPutForNextTransaction = new Set<string>();
   /** テスト専用：次の1回の「単発put」（`db.put(storeName, ...)`、transaction経由ではない）だけを失敗させる（一発だけ有効）。 */
   failOnPlainPutOnce = new Set<string>();
+  /** テスト専用：storeName→「次からN回目のput」（1-indexed）で失敗させる。それより前の呼び出しは成功する。 */
+  failOnNthPlainPut = new Map<string, number>();
   createObjectStore(name: string, options?: { keyPath?: string }) {
     const store: FakeStoreState = { committed: new Map(), keyPath: options?.keyPath, indexKeyPath: new Map() };
     this.stores.set(name, store);
@@ -135,6 +137,14 @@ class FakeIDBPDatabase {
       this.db.failOnPlainPutOnce.delete(storeName);
       throw new Error(`fakeIdb: simulated plain put failure on store "${storeName}"`);
     }
+    const nth = this.db.failOnNthPlainPut.get(storeName);
+    if (nth !== undefined) {
+      if (nth <= 1) {
+        this.db.failOnNthPlainPut.delete(storeName);
+        throw new Error(`fakeIdb: simulated Nth put failure on store "${storeName}"`);
+      }
+      this.db.failOnNthPlainPut.set(storeName, nth - 1);
+    }
     const store = this.db.stores.get(storeName)!;
     const k = keyOf(store, value, key);
     store.committed.set(k, value);
@@ -142,6 +152,9 @@ class FakeIDBPDatabase {
   }
   async delete(storeName: string, key: Key) {
     this.db.stores.get(storeName)?.committed.delete(key);
+  }
+  async clear(storeName: string) {
+    this.db.stores.get(storeName)?.committed.clear();
   }
   async getAll(storeName: string) {
     return [...(this.db.stores.get(storeName)?.committed.values() ?? [])];
@@ -180,6 +193,11 @@ export function __failNextPutOn(dbName: string, storeName: string): void {
 export function __failNextPlainPutOn(dbName: string, storeName: string): void {
   const fakeDb = getOrCreateNamedFakeDb(dbName);
   fakeDb.failOnPlainPutOnce.add(storeName);
+}
+/** テスト専用：`db.put(storeName, ...)`の、これから数えてN回目（1-indexed）の呼び出しだけを失敗させる。 */
+export function __failOnNthPlainPut(dbName: string, storeName: string, n: number): void {
+  const fakeDb = getOrCreateNamedFakeDb(dbName);
+  fakeDb.failOnNthPlainPut.set(storeName, n);
 }
 function getOrCreateNamedFakeDb(dbName: string): FakeIDBDatabase {
   let fakeDb = namedFakeDatabases.get(dbName);

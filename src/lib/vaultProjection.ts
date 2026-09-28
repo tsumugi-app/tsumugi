@@ -124,7 +124,12 @@ export class ProjectionConflictError extends Error {}
  * 書き換えられた・turnが削除された・順序が変わった場合は、prefix一致が崩れるため
  * 必ずfalseになり、conflictとして保留される（req 3の「無条件上書きしない」を満たす）。
  */
-function isLegitimatePredecessor(onDisk: Conversation, canonical: Conversation): boolean {
+/**
+ * Phase 3-5（Production Bootstrap Migration）もこの判定を共有する
+ * （`vaultIdentityAdoption.ts`・`vaultProductionMigration.ts`が同じ意味論の判定を
+ * 二重実装しないため、export する）。
+ */
+export function isLegitimatePredecessor(onDisk: Conversation, canonical: Conversation): boolean {
   if (onDisk.id !== canonical.id) return false;
   if (onDisk.persona !== canonical.persona) return false;
   if (onDisk.startedAt !== canonical.startedAt) return false;

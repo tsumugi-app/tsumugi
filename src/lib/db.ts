@@ -1133,6 +1133,24 @@ export async function writeRecoveryJournalRaw(text: string): Promise<void> {
 }
 
 /**
+ * 新保存基盤 Phase 3-5：Production Bootstrap Migrationの永続状態。既存Recovery
+ * journalと同じパターン（`settings`ストアへ1キー、値はJSON文字列1つ）で、
+ * `vaultProductionMigration.ts`がrestartable/idempotentなmigrationを行うために使う。
+ */
+const PRODUCTION_MIGRATION_STATE_KEY = "productionBootstrapMigration";
+
+export async function readProductionMigrationStateRaw(): Promise<string | undefined> {
+  const db = await getDB();
+  const raw = await db.get("settings", PRODUCTION_MIGRATION_STATE_KEY);
+  return typeof raw === "string" ? raw : undefined;
+}
+
+export async function writeProductionMigrationStateRaw(text: string): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", text, PRODUCTION_MIGRATION_STATE_KEY);
+}
+
+/**
  * Android保存方式の見直し：Androidの既定Vault backendをFile System Access
  * （SAF/document provider経由）からOPFS（この端末専有の内部領域）へ切り替えるにあたり、
  * 新しい空のOPFS VaultについてRegistry baseline（`resyncVaultRegistry`の初回実行）を
