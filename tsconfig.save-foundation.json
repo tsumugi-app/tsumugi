@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/db.foundation.test.ts",
+    "src/lib/vaultOutbox.test.ts",
+    "src/lib/recordAdapter.test.ts",
+    "src/lib/db.ts",
+    "src/lib/vaultOutbox.ts",
+    "src/lib/vaultIdentity.ts",
+    "src/lib/vaultMigrationJournal.ts",
+    "src/lib/recordAdapter.ts",
+    "src/lib/fakeIdb.ts",
+    "src/lib/markdown.ts"
+  ]
+}

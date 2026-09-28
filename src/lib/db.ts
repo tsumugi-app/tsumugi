@@ -10,6 +10,9 @@ import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
 import { isWipePending, WipeInProgressError } from "./wipeState";
 import type { Conversation, MemoryObject, Source } from "./types";
 import type { AIProviderName } from "./ai/types";
+import { type VaultOutboxEntry, vaultOutboxIdFor, buildOutboxEntryForUpdate } from "./vaultOutbox";
+import { type VaultIdentityRecord, VAULT_IDENTITY_RECORD_ID } from "./vaultIdentity";
+import type { MigrationJournalEntry } from "./vaultMigrationJournal";
 
 interface TsumugiDB extends DBSchema {
   conversations: {
@@ -66,6 +69,35 @@ interface TsumugiDB extends DBSchema {
     key: string;
     value: string;
   };
+  /**
+   * 新保存基盤（Phase 3）：Vault Outbox。canonical record（conversations/memoryObjects/
+   * sources）が更新されるたびに、対応するprojection taskをここへupsertする。必ず
+   * canonical record本体と同一transactionで書く（`putCanonicalRecordWithOutbox`参照。
+   * Invariant 1/2）。Phase 3-1時点ではまだどの保存経路からもこのstoreへ書き込まれない
+   * （基盤のみ。既存の保存経路には一切影響しない）。
+   */
+  vaultOutbox: {
+    key: string;
+    value: VaultOutboxEntry;
+    indexes: { "by-status": string };
+  };
+  /**
+   * 新保存基盤（Phase 3）：Vault Identity。このIndexedDBが今どのVaultとペア済みかを
+   * 記録する（singleton、key固定）。実際の照合ロジックはPhase 3-4で実装する。
+   */
+  vaultIdentity: {
+    key: string;
+    value: VaultIdentityRecord;
+  };
+  /**
+   * 新保存基盤（Phase 3）：schema migrationの進捗journal。実際のmigration runnerは
+   * Phase 3-6で実装する。
+   */
+  migrationJournal: {
+    key: string;
+    value: MigrationJournalEntry;
+    indexes: { "by-status": string };
+  };
 }
 
 export interface ConnectStateRecord {
@@ -92,7 +124,7 @@ function getDB() {
     console.log(`[DB] open:start hidden=${hiddenFlag()}`);
     logTimingEvent("DB open:start", { hidden: hiddenFlag() });
 
-    dbPromise = openDB<TsumugiDB>("tsumugi", 5, {
+    dbPromise = openDB<TsumugiDB>("tsumugi", 6, {
       upgrade(db, oldVersion) {
         if (oldVersion < 1) {
           const conversations = db.createObjectStore("conversations", {
@@ -121,6 +153,18 @@ function getDB() {
         }
         if (oldVersion < 5) {
           db.createObjectStore("vaultSyncState");
+        }
+        if (oldVersion < 6) {
+          // 新保存基盤（Phase 3-1）。既存store（conversations/memoryObjects/sources/
+          // vaultSyncState等）は一切変更しない——新storeの追加のみで、既存の保存経路の
+          // 挙動には影響しない。
+          const outbox = db.createObjectStore("vaultOutbox", { keyPath: "id" });
+          outbox.createIndex("by-status", "status");
+
+          db.createObjectStore("vaultIdentity", { keyPath: "id" });
+
+          const migrations = db.createObjectStore("migrationJournal", { keyPath: "id" });
+          migrations.createIndex("by-status", "status");
         }
       },
       // 同一originの別接続（古いバージョンを開いたままの別タブ・ページインスタンス等）が
@@ -520,6 +564,125 @@ export async function addSourceIfAbsentAndMarkSynced(source: Source, syncKey: st
   }
   await tx.done;
   return inserted;
+}
+
+// ---------------------------------------------------------------------------
+// 新保存基盤（Phase 3-1）：Vault Outbox / Vault Identity / Migration Journal
+//
+// Phase 3-1時点ではまだどの既存保存経路からも呼ばれない（基盤のみ。既存の
+// `putConversation`/`putConversationAndMarkSynced`等・既存のVault保存経路
+// （vault.ts）には一切影響しない）。
+// ---------------------------------------------------------------------------
+
+export async function getVaultOutboxEntry(id: string): Promise<VaultOutboxEntry | undefined> {
+  const db = await getDB();
+  return db.get("vaultOutbox", id);
+}
+
+export async function putVaultOutboxEntry(entry: VaultOutboxEntry): Promise<void> {
+  const db = await getDB();
+  await db.put("vaultOutbox", entry);
+}
+
+/** `status:"pending"`のentryだけを取得する（起動時reconcileが全record走査をしなくて済むための索引）。 */
+export async function getPendingVaultOutboxEntries(): Promise<VaultOutboxEntry[]> {
+  const db = await getDB();
+  return db.getAllFromIndex("vaultOutbox", "by-status", "pending");
+}
+
+export async function deleteVaultOutboxEntry(id: string): Promise<void> {
+  const db = await getDB();
+  await db.delete("vaultOutbox", id);
+}
+
+export async function getVaultIdentityRecord(): Promise<VaultIdentityRecord | undefined> {
+  const db = await getDB();
+  return db.get("vaultIdentity", VAULT_IDENTITY_RECORD_ID);
+}
+
+export async function putVaultIdentityRecord(record: VaultIdentityRecord): Promise<void> {
+  const db = await getDB();
+  await db.put("vaultIdentity", record);
+}
+
+export async function getMigrationJournalEntry(id: string): Promise<MigrationJournalEntry | undefined> {
+  const db = await getDB();
+  return db.get("migrationJournal", id);
+}
+
+export async function putMigrationJournalEntry(entry: MigrationJournalEntry): Promise<void> {
+  const db = await getDB();
+  await db.put("migrationJournal", entry);
+}
+
+export async function getPendingMigrationJournalEntries(): Promise<MigrationJournalEntry[]> {
+  const db = await getDB();
+  return db.getAllFromIndex("migrationJournal", "by-status", "pending");
+}
+
+/** canonical storeの名前と、そこに入るrecordの型を対応付ける（下の関数群の型安全のためだけに使う）。 */
+interface CanonicalStoreValueMap {
+  conversations: Conversation;
+  memoryObjects: MemoryObject;
+  sources: Source;
+}
+
+/**
+ * 新保存基盤 Invariant 1・Invariant 2の実装本体：
+ *   Invariant 1：canonical recordとoutbox enqueueは同一IndexedDB transaction。
+ *   Invariant 2：canonical更新がcommitされたのにoutboxが存在しない状態を、
+ *                通常write pathでは作れない。
+ *
+ * `addSourceIfAbsentAndMarkSynced`（上）・`putConversationAndMarkSynced`（下）と
+ * 同じ、既存の「record本体と付随する台帳を同一transactionで書く」パターンを、
+ * 通常の保存経路向けに一般化したものである。IndexedDBのtransactionはstore横断で
+ * atomicなため、このtransactionが失敗すれば（例：vaultOutbox側のput失敗）、
+ * canonical record側の書き込みも一切反映されない——「canonical recordだけ更新
+ * できたがoutboxへの登録に失敗した」という中間状態は構造的に発生しない
+ * （`vaultOutbox.test.ts`・`db.foundation.test.ts`のInvariant 1/2テスト参照）。
+ *
+ * `record.updatedAt`が既存outbox entryの`recordUpdatedAt`と異なる場合、
+ * 既存entryの進捗（steps/status/attempt）に関わらず必ず新しいpending entryへ
+ * 差し替える（`buildOutboxEntryForUpdate`参照）——「Vault projection不要な
+ * canonical更新」という特殊状態を作らないため。
+ */
+async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalStoreValueMap>(
+  storeName: S,
+  recordType: string,
+  record: CanonicalStoreValueMap[S] & { id: string; updatedAt: string },
+  now: string
+): Promise<VaultOutboxEntry> {
+  const db = await getDB();
+  const outboxId = vaultOutboxIdFor(recordType, record.id);
+  const tx = db.transaction([storeName, "vaultOutbox"], "readwrite");
+  let entry: VaultOutboxEntry;
+  try {
+    const outboxStore = tx.objectStore("vaultOutbox");
+    const existing = await outboxStore.get(outboxId);
+    entry = buildOutboxEntryForUpdate(existing, recordType, record.id, record.updatedAt, now);
+    await Promise.all([tx.objectStore(storeName).put(record), outboxStore.put(entry)]);
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return entry!;
+}
+
+export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
+  return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now);
+}
+
+/** `recordType`は既定で`"memory"`（normal Memory）。Reflectionを書く場合は`"reflection"`を渡す。 */
+export async function putMemoryObjectWithOutbox(
+  memoryObject: MemoryObject,
+  recordType: "memory" | "reflection" = "memory",
+  now: string = new Date().toISOString()
+): Promise<VaultOutboxEntry> {
+  return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now);
+}
+
+export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
+  return putCanonicalRecordWithOutboxInternal("sources", "source", source, now);
 }
 
 /**
