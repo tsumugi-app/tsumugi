@@ -1,11 +1,16 @@
 /**
- * Save Foundation Bootstrap（新保存基盤 Phase 3-7 req 7）。
+ * Save Foundation Bootstrap（新保存基盤 Phase 3-7 req 7、Phase 3-7.1でdone
+ * integrity検証を追加）。
  *
  * Production接続直前の統合API。1回の呼び出しで、
  *   identity確認／必要ならlegacy adoption・resume
  *   → Production Bootstrap Migration（resume可能、Phase 3-5/3-6/3-7拡張）
  *   → pending outboxのunified reconcile（Conversation/Memory/Reflection/Source）
- *   → 追加reconcile（migration/reconcileの間に生じた取りこぼしの最終確認、有限回）
+ *   → done outboxのintegrity検証（Phase 3-7.1：doneのまま実体が欠落・破損した
+ *     recordを自動修復する。詳細は`vaultProjection.ts`の
+ *     `reconcileDoneVaultOutboxIntegrity`のdoc comment参照）
+ *   → 追加reconcile（migration/reconcile/integrityの間に生じた取りこぼしの
+ *     最終確認、有限回）
  * を順に行い、「あるべき状態」へ収束させる。
  *
  * 重要（req 8）：`baselineEstablishedAt`を正常処理のgateとして一切使わない
@@ -33,7 +38,7 @@
 import { getVaultIdentityRecord } from "./db";
 import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultIdentityEnsureResult } from "./vaultIdentityAdoption";
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
-import { reconcilePendingVaultOutbox, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
+import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // ---------------------------------------------------------------------------
 // req 1（内部順序の最初のstep）：Bootstrap自身の再入防止用exclusive lock。
@@ -77,6 +82,8 @@ export interface SaveFoundationBootstrapResult {
    */
   migration: ProductionMigrationResult | null;
   reconcile: ReconcileAllRecordTypesResult | null;
+  /** Phase 3-7.1：done outboxのintegrity検証結果（`reconcileDoneVaultOutboxIntegrity`）。 */
+  integrity: ReconcileAllRecordTypesResult | null;
   /** req 9：最終rescan後の追加reconcile（1回だけ。無限loopにしない）。 */
   finalReconcile: ReconcileAllRecordTypesResult | null;
 }
@@ -93,7 +100,7 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     if (identity.kind !== "identified" && identity.kind !== "newly-paired") {
       // req 11：Recoveryへ残すもの（identity conflict／unrelated Vault／読めない
       // 状態）。ここでmigration/reconcileを一切実行しない——1byteも書かない。
-      return { identity, migration: null, reconcile: null, finalReconcile: null };
+      return { identity, migration: null, reconcile: null, integrity: null, finalReconcile: null };
     }
 
     const vaultIdentityRecord = await getVaultIdentityRecord();
@@ -109,15 +116,24 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     //    1件のheld/conflictが他recordの処理を止めない。req 10）。
     const reconcile = await reconcilePendingVaultOutbox(projectionEnv);
 
+    // Phase 3-7.1：done outboxのintegrity検証。「doneだから見ない」は禁止
+    // （Phase 3-7.1 req 4）——`status`に関わらず、done entry全件についても
+    // 実際にVault実体（Markdown・Registry・History・index）が今なお整合している
+    // ことを、既存のreconcile*OutboxEntry関数を再利用してそのつど確認する。
+    // 実体が既に正しいrecordは、各stepの既存no-op検出により1byteも書き込まれない
+    // （Phase 3-7.1 req 3-F）。
+    const integrity = await reconcileDoneVaultOutboxIntegrity(projectionEnv);
+
     // 6. final rescanはmigration自身の内部rescanで既に完結している。
-    // 7. 必要なら追加outbox reconcile：migrationの最終rescanとreconcileの間に
-    //    生じうる取りこぼし（例：reconcile中の一時I/Oエラーからのretry対象）を
-    //    もう一度だけ確認する。無限loopにしない（req 9）——ここでの追加は
-    //    たかだか1回。それでも収束しない分はpendingのまま次回のBootstrap呼び出し
-    //    （＝次回startup）へ委ねる。
+    // 7. 必要なら追加outbox reconcile：migrationの最終rescan・reconcile・
+    //    done integrity検証の間に生じうる取りこぼし（例：一時I/Oエラーからの
+    //    retry対象、integrity検証がRegistry等の欠落を検出しつつも一時的な書込
+    //    エラーでpendingへ落ちたrecord）を、もう一度だけ確認する。無限loopに
+    //    しない（req 9）——ここでの追加はたかだか1回。それでも収束しない分は
+    //    pendingのまま次回のBootstrap呼び出し（＝次回startup）へ委ねる。
     const finalReconcile = await reconcilePendingVaultOutbox(projectionEnv);
 
     // 8. summary返却。
-    return { identity, migration, reconcile, finalReconcile };
+    return { identity, migration, reconcile, integrity, finalReconcile };
   });
 }

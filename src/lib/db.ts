@@ -590,6 +590,16 @@ export async function getPendingVaultOutboxEntries(): Promise<VaultOutboxEntry[]
   return db.getAllFromIndex("vaultOutbox", "by-status", "pending");
 }
 
+/**
+ * Phase 3-7.1：`status:"done"`のentry一覧（done outbox integrity検証専用）。
+ * `by-status`は同じ`status`フィールド上のindexのため、"pending"と同じくindexed
+ * range query1回で済み、全件走査（`getAll`＋フィルタ）より軽量。
+ */
+export async function getDoneVaultOutboxEntries(): Promise<VaultOutboxEntry[]> {
+  const db = await getDB();
+  return db.getAllFromIndex("vaultOutbox", "by-status", "done");
+}
+
 export async function deleteVaultOutboxEntry(id: string): Promise<void> {
   const db = await getDB();
   await db.delete("vaultOutbox", id);

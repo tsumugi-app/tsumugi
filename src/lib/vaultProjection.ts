@@ -19,7 +19,7 @@
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
-import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, putVaultOutboxEntry } from "./db";
+import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, putVaultOutboxEntry } from "./db";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
 import type { Conversation, MemoryObject, Source } from "./types";
@@ -1143,10 +1143,14 @@ function bumpRecordTypeTally(result: ReconcileAllRecordTypesResult, recordType: 
   result.byRecordType[recordType] = bucket;
 }
 
-export async function reconcilePendingVaultOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
-  const pending = await getPendingVaultOutboxEntries();
+/**
+ * entry一覧を、record typeに応じた適切なProjectionへdispatchしてまとめて処理する
+ * 共通実装（`reconcilePendingVaultOutbox`・`reconcileDoneVaultOutboxIntegrity`の
+ * どちらも、対象entryの集め方が違うだけで、処理自体はこの1つを共有する）。
+ */
+async function reconcileOutboxEntries(env: ProjectionEnv, entries: VaultOutboxEntry[]): Promise<ReconcileAllRecordTypesResult> {
   const result = emptyReconcileAllRecordTypesResult();
-  for (const entry of pending) {
+  for (const entry of entries) {
     result.processed += 1;
     try {
       let outcome: ReconcileConversationResult;
@@ -1173,8 +1177,48 @@ export async function reconcilePendingVaultOutbox(env: ProjectionEnv): Promise<R
     } catch (error) {
       result.failed += 1;
       bumpRecordTypeTally(result, entry.recordType, "failed");
-      console.error(`[Tsumugi] reconcilePendingVaultOutbox: unexpected error for ${entry.recordType}:${entry.recordId}, continuing with other records:`, error);
+      console.error(`[Tsumugi] reconcileOutboxEntries: unexpected error for ${entry.recordType}:${entry.recordId}, continuing with other records:`, error);
     }
   }
   return result;
+}
+
+export async function reconcilePendingVaultOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
+  return reconcileOutboxEntries(env, await getPendingVaultOutboxEntries());
+}
+
+/**
+ * Phase 3-7.1：done outbox entryのintegrity検証。
+ *
+ * 原則（req 1）：outbox `status === "done"`は「最後に確認した時点では整合していた」
+ * というcache/progress hintであって、永続的truthではない。`getPendingVaultOutboxEntries()`
+ * は`status==="pending"`のindexしか見ないため、doneになった後でVault実体（Markdown・
+ * Registry・History・index）の一部が外部から欠落・破損しても、通常のpending-only
+ * reconcileは二度とそのentryへ到達しない——これがPhase 3-7で発見した自己修復の
+ * gapであり、この関数で閉じる。
+ *
+ * 新しい整合性判定は作らない（req 6）：doneのentryも、既存の
+ * `reconcile{Conversation,Memory,Reflection,Source}OutboxEntry`へそのまま渡すだけで
+ * よい——これらは元々entryの`status`を一切信用せず、呼ばれるたびに必ず
+ * read→compare→decide→project→verifyをやり直す設計（Invariant 3、Phase 3-3で
+ * 確立・Phase 3-6/3-7でも踏襲）。したがって：
+ *   - Registry/History/index欠落 → 該当stepだけ再生成される（req 3-A/B）
+ *   - Markdown欠落 → canonicalから安全に再projectionされる（req 3-C）
+ *   - 内容が対象外の形で食い違う（genuine conflict） → held、上書きしない（req 3-D）
+ *   - parse不能・読めない → held（req 3-E）
+ *   - 実体が既に正しい → 各stepの既存のno-op検出により、1byteも書き込まれない（req 3-F）
+ * のいずれも、この関数自身は何も新しく判定しない——単に「doneも対象に含める」
+ * ことだけが新しい振る舞い。
+ *
+ * コスト（req 2、詳細はPhase 3-7.1報告参照）：`by-status`indexによる
+ * `getDoneVaultOutboxEntries()`自体は軽量（indexed range query）。実際のI/Oコストは
+ * 1 entryあたり最大4回のVault read（Markdown・Registry shard・index.json・History
+ * 月ファイル。Source等Historyを持たないrecord typeはさらに少ない）で、Beta規模
+ * （個人ユーザー1人あたりのConversation/Memory総数）では、これをbootstrapのたびに
+ * 全件行っても許容範囲と判断した（過剰設計をしない。req 5）。将来的にrecord数が
+ * 増えた場合は、rotating verification・Registry mtimeベースのdirty detection等への
+ * 発展余地を残すに留め、今回は実装しない。
+ */
+export async function reconcileDoneVaultOutboxIntegrity(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
+  return reconcileOutboxEntries(env, await getDoneVaultOutboxEntries());
 }

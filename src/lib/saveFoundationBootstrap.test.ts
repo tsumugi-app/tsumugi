@@ -410,6 +410,13 @@ test("Bootstrap K（Combined E2E Foundation Fixture、永久回帰テスト）: 
   vault.put(`Sources/${vaultMod.fileNameFor(srcSame.id, srcSame.createdAt)}`, markdownMod.sourceToMarkdown(srcSame));
   const srcIdbOnly = source("e2e-src-idb-only");
 
+  // Phase 3-7.1 req 8：「outbox doneだがVault実体が一部欠落」を最低1件混ぜる。
+  // Markdownは正しく存在するが、Registryだけ（過去のbootstrap後に外部で消えた、
+  // という体で）意図的にseedしない状態で、outbox自体を"done"にしておく。
+  const srcDoneDegraded = source("e2e-src-done-degraded");
+  const srcDoneDegradedPath = `Sources/${vaultMod.fileNameFor(srcDoneDegraded.id, srcDoneDegraded.createdAt)}`;
+  vault.put(srcDoneDegradedPath, markdownMod.sourceToMarkdown(srcDoneDegraded));
+
   // Registry/History/index/baselineは一切seedしない（全部欠落・null状態から始める）。
 
   await dbMod.putConversation(convA);
@@ -422,6 +429,9 @@ test("Bootstrap K（Combined E2E Foundation Fixture、永久回帰テスト）: 
   await dbMod.putMemoryObject(reflIdbOnly);
   await dbMod.saveSource(srcSame);
   await dbMod.saveSource(srcIdbOnly);
+  await dbMod.saveSource(srcDoneDegraded);
+  const srcDoneDegradedOutbox = await dbMod.putSourceWithOutbox(srcDoneDegraded);
+  await dbMod.putVaultOutboxEntry({ ...srcDoneDegradedOutbox, status: "done" }); // 実際にはRegistry欠落のまま
 
   // outbox：一部pending（convAに既存entryを手動で仕込む。既存の進捗を壊さず、
   // かつ改めて実体を検証してdoneへ収束させることを確認する）・一部無し
@@ -452,12 +462,18 @@ test("Bootstrap K（Combined E2E Foundation Fixture、永久回帰テスト）: 
     ["conversation", convA.id], ["conversation", convB.id], ["conversation", convCNew.id],
     ["memory", memA.id], ["memory", memB.id], ["memory", memCNew.id],
     ["reflection", reflSame.id], ["reflection", reflIdbOnly.id],
-    ["source", srcSame.id], ["source", srcIdbOnly.id],
+    ["source", srcSame.id], ["source", srcIdbOnly.id], ["source", srcDoneDegraded.id],
   ];
   for (const [kind, id] of allSafeIds) {
     const entry = await dbMod.getVaultOutboxEntry(`${kind}:${id}`);
     assert.equal(entry?.status, "done", `${kind}:${id}がdoneになっていない: ${JSON.stringify(entry)}`);
   }
+
+  // Phase 3-7.1：doneだがRegistryが欠落していたsrcDoneDegradedが、integrity検証で
+  // repairされていることの確認。
+  const degradedShardPath = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(srcDoneDegraded.id).toString(16).padStart(2, "0")}.json`;
+  const degradedShard = JSON.parse(vault.get(degradedShardPath)!);
+  assert.equal(degradedShard.records[srcDoneDegraded.id], srcDoneDegradedPath, "doneだったが欠落していたRegistryがintegrity検証で復旧される");
 
   // 最終Vault状態の確認。
   assert.equal(vault.get(convAPath), markdownMod.conversationToMarkdown(convA));
@@ -551,3 +567,222 @@ test("Bootstrap L（Conflict混在fixture）: Conversation 1件・Memory 1件が
 function memoryDayPathOf(day: string): string {
   return `Memories/${vaultMod.dayFileNameFor(day)}`;
 }
+
+// ===========================================================================
+// Phase 3-7.1：Done Outbox Integrity / Self-Healing Gap
+// ===========================================================================
+
+test("Integrity 1: doneなConversationのRegistryが削除されても、bootstrapでrepairされてdoneのまま", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-1-conv");
+  await dbMod.putConversation(c);
+  const first = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.equal((await dbMod.getVaultOutboxEntry(`conversation:${c.id}`))!.status, "done");
+  void first;
+
+  const shardPath = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(c.id).toString(16).padStart(2, "0")}.json`;
+  vault.files.delete(shardPath);
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1, "integrity検証でrepairされる");
+  const entry = await dbMod.getVaultOutboxEntry(`conversation:${c.id}`);
+  assert.equal(entry!.status, "done");
+  const shard = JSON.parse(vault.get(shardPath)!);
+  assert.equal(shard.records[c.id], `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`);
+});
+
+test("Integrity 2: doneなConversationのMarkdownが削除されても、bootstrapでcanonicalから再projectionされてdoneのまま", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-2-conv");
+  await dbMod.putConversation(c);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
+  assert.ok(vault.get(path));
+  vault.files.delete(path);
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1);
+  assert.equal(vault.get(path), markdownMod.conversationToMarkdown(c), "Markdownが再生成される");
+  const entry = await dbMod.getVaultOutboxEntry(`conversation:${c.id}`);
+  assert.equal(entry!.status, "done");
+});
+
+test("Integrity 3: doneなConversationのHistoryが削除されても、bootstrapでrepairされる", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-3-conv");
+  await dbMod.putConversation(c);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const monthPath = `.tsumugi/history/${c.startedAt.slice(0, 7)}.json`;
+  assert.ok(vault.get(monthPath));
+  vault.files.delete(monthPath);
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1);
+  const month = JSON.parse(vault.get(monthPath)!);
+  const day = c.startedAt.slice(0, 10);
+  assert.ok(month.days[day].conversations.some((r: { id: string }) => r.id === c.id));
+});
+
+test("Integrity 4: doneなMemoryのday-fileから対象memberだけ削除されても、bootstrapでmember復旧・未知member保持のまま", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const day = "2026-08-01";
+  const m = memory("integrity-4-mem", day, { createdAt: `${day}T09:00:00.000Z` });
+  const unknown = memory("integrity-4-unknown", day, { createdAt: `${day}T08:00:00.000Z` }); // 未知member（Vault-only）
+  await dbMod.putMemoryObject(m);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  // bootstrap後のday-fileに、未知memberを追記する（IndexedDBには存在しない）。
+  const path = memoryDayPathOf(day);
+  const existing = markdownMod.parseMemoryDayFile(vault.get(path)!);
+  vault.put(path, markdownMod.serializeMemoryDayFile([unknown, ...existing]));
+  // 対象memberだけをday-fileから削除する（外部で消えたことを模す）。
+  const afterUnknownAdd = markdownMod.parseMemoryDayFile(vault.get(path)!);
+  vault.put(path, markdownMod.serializeMemoryDayFile(afterUnknownAdd.filter((x) => x.id !== m.id)));
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1);
+  const members = markdownMod.parseMemoryDayFile(vault.get(path)!);
+  assert.ok(members.some((x) => x.id === m.id), "対象memberが復旧される");
+  assert.ok(members.some((x) => x.id === unknown.id), "未知memberは保持される");
+});
+
+test("Integrity 5: doneなMemoryのRegistry memberHashが欠落していても、bootstrapでrepairされる", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const day = "2026-08-02";
+  const m = memory("integrity-5-mem", day);
+  await dbMod.putMemoryObject(m);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const path = memoryDayPathOf(day);
+  const registryKey = vaultMod.dayFileRegistryKey(day);
+  const shardPath = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(registryKey).toString(16).padStart(2, "0")}.json`;
+  const shard = JSON.parse(vault.get(shardPath)!);
+  delete shard.files[path].memberHashes;
+  vault.put(shardPath, JSON.stringify(shard));
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1);
+  const repaired = JSON.parse(vault.get(shardPath)!);
+  assert.equal(repaired.files[path].memberHashes[m.id], vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(m)));
+});
+
+test("Integrity 6: doneなReflectionのmetadata（Registry）が欠落していても、bootstrapでrepairされる", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const day = "2026-08-03";
+  const r = reflection("integrity-6-refl", day);
+  await dbMod.putMemoryObject(r);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const shardPath = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(r.id).toString(16).padStart(2, "0")}.json`;
+  vault.files.delete(shardPath);
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1);
+  const shard = JSON.parse(vault.get(shardPath)!);
+  assert.equal(shard.records[r.id], `Memories/${vaultMod.fileNameFor(r.id, r.date)}`);
+});
+
+test("Integrity 7: doneなSourceのMarkdownが削除されても、bootstrapでcanonicalから再作成される", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const s = source("integrity-7-src");
+  await dbMod.saveSource(s);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const path = `Sources/${vaultMod.fileNameFor(s.id, s.createdAt)}`;
+  assert.ok(vault.get(path));
+  vault.files.delete(path);
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.ok((result.integrity?.done ?? 0) + (result.finalReconcile?.done ?? 0) >= 1);
+  assert.equal(vault.get(path), markdownMod.sourceToMarkdown(s));
+});
+
+test("Integrity 8: doneなrecordのMarkdownが外部でconflictな内容に書き換わっても、held化され外部内容が上書きされない", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-8-conv");
+  await dbMod.putConversation(c);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
+  const externallyEdited = markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "外部で書き換えられた内容", timestamp: T }] });
+  vault.put(path, externallyEdited);
+
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const entry = await dbMod.getVaultOutboxEntry(`conversation:${c.id}`);
+  assert.equal(entry!.status, "held", "doneのままにせず、外部conflictを検出してheldへ切り替わる");
+  assert.equal(vault.get(path), externallyEdited, "外部データは上書きされない");
+});
+
+test("Integrity 9: doneなrecordが外部でunreadableになっても、held化され上書きされない", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-9-conv");
+  await dbMod.putConversation(c);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
+  vault.put(path, "not a tsumugi markdown at all");
+
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const entry = await dbMod.getVaultOutboxEntry(`conversation:${c.id}`);
+  assert.equal(entry!.status, "held");
+  assert.equal(vault.get(path), "not a tsumugi markdown at all");
+});
+
+test("Integrity 10: 全done実体が正常な状態でbootstrapしても、write 0でstatus doneが維持される", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-10-conv");
+  const m = memory("integrity-10-mem", "2026-08-04");
+  const r = reflection("integrity-10-refl", "2026-08-04");
+  const s = source("integrity-10-src");
+  await dbMod.putConversation(c);
+  await dbMod.putMemoryObject(m);
+  await dbMod.putMemoryObject(r);
+  await dbMod.saveSource(s);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+
+  const writesBefore = vault.writeCount;
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.equal(vault.writeCount, writesBefore, "実体が既に正しいため、integrity検証は1byteも書き込まない");
+  assert.equal(result.integrity?.processed, 4, "4件のdone entryすべてがintegrity検証の対象になる");
+  for (const [kind, id] of [["conversation", c.id], ["memory", m.id], ["reflection", r.id], ["source", s.id]] as [string, string][]) {
+    const entry = await dbMod.getVaultOutboxEntry(`${kind}:${id}`);
+    assert.equal(entry?.status, "done");
+  }
+});
+
+test("Integrity 11: bootstrapを2回連続実行しても、2回目もintegrity検証によるwriteは0", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const c = conversation("integrity-11-conv");
+  await dbMod.putConversation(c);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  const writesBefore = vault.writeCount;
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.equal(vault.writeCount, writesBefore);
+});
+
+test("Integrity 12: 多数のdone entryがあっても、integrity検証はduplicateを作らない", async () => {
+  const vault = new FakeVault();
+  await resetAll();
+  const day = "2026-08-05";
+  const convs = Array.from({ length: 5 }, (_, i) => conversation(`integrity-12-conv-${i}`));
+  const mems = Array.from({ length: 5 }, (_, i) => memory(`integrity-12-mem-${i}`, day, { createdAt: `${day}T09:0${i}:00.000Z` }));
+  for (const c of convs) await dbMod.putConversation(c);
+  for (const m of mems) await dbMod.putMemoryObject(m);
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+
+  const result = await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.equal(result.integrity?.processed, 10);
+  assert.equal(result.integrity?.done, 10);
+  // index.jsonはcanonical id単位（1 id = 1 entry）のため、day-fileへ統合される
+  // Memoryも含めConversation 5件＋Memory 5件＝10 entryのまま、duplicateが無い
+  // （Registry側はcontainer単位＝day-fileにつき1 entryだが、index.jsonはそうではない）。
+  const index = JSON.parse(vault.get(".tsumugi/index.json")!);
+  assert.equal(Object.keys(index).length, 10);
+  const members = markdownMod.parseMemoryDayFile(vault.get(memoryDayPathOf(day))!);
+  assert.equal(members.length, 5, "Memory 5件がday-fileに1件ずつ、重複無く存在する");
+});
