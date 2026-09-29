@@ -993,3 +993,392 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
     assert.equal(entry!.status, "done", "Recovery不要（すべてdone）");
   }
 });
+
+// ===========================================================================
+// Reflection / Source Projection（Phase 3-7）
+// ===========================================================================
+
+type Source = import("./types").Source;
+
+const reflectionMeta = { id: "meta", source: "system-generated" as const, sourceType: "system" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
+function reflection(id: string, day: string, overrides: Partial<MemoryObject> = {}): MemoryObject {
+  const iso = `${day}T09:00:00.000Z`;
+  return {
+    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["insight"] as MemoryObject["types"],
+    keywords: [], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
+    createdAt: iso, updatedAt: iso, metadata: { ...reflectionMeta },
+    ...overrides,
+  } as MemoryObject;
+}
+async function seedReflectionCanonical(r: MemoryObject): Promise<VaultOutboxEntry> {
+  return dbMod.putMemoryObjectWithOutbox(r, "reflection");
+}
+const reflectionPath = (r: MemoryObject) => `Memories/${vaultMod.fileNameFor(r.id, r.date)}`;
+
+function source(id: string, overrides: Partial<Source> = {}): Source {
+  return { id, sourceType: "note" as Source["sourceType"], title: `タイトル-${id}`, content: `内容-${id}`, createdAt: T, updatedAt: T, ...overrides } as Source;
+}
+async function seedSourceCanonical(s: Source): Promise<VaultOutboxEntry> {
+  return dbMod.putSourceWithOutbox(s);
+}
+const sourcePath = (s: Source) => `Sources/${vaultMod.fileNameFor(s.id, s.createdAt)}`;
+
+// ---------------------------------------------------------------------------
+// Reflection A〜L
+// ---------------------------------------------------------------------------
+
+test("Projection Reflection A: Vault実体が何も無い状態から、Markdown/Registry/index/Historyすべてを生成してdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-01";
+  const r = reflection("refl-a-1", day);
+  const entry = await seedReflectionCanonical(r);
+  const result = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const path = reflectionPath(r);
+  assert.equal(vault.get(path), markdownMod.memoryObjectToMarkdown(r));
+  const shard = JSON.parse(vault.get(shardPath(r.id))!);
+  assert.equal(shard.records[r.id], path);
+  assert.deepEqual(shard.files[path].memberIds, [r.id]);
+  const index = JSON.parse(vault.get(".tsumugi/index.json")!);
+  assert.equal(index[r.id], path);
+  const month = JSON.parse(vault.get(monthPath(day))!);
+  assert.ok(month.days[day].reflections.some((row: { id: string }) => row.id === r.id));
+});
+
+test("Projection Reflection B: 既に同一内容が書かれている場合はno-opでdoneになる（重複write無し）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-02";
+  const r = reflection("refl-b-1", day);
+  const entry = await seedReflectionCanonical(r);
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.writeCount, writesBefore, "既に正しいため何も書き込まれない");
+});
+
+test("Projection Reflection C: 正当な後継（summaryのみ変化、MemoryObjectとしてのlegitimate successor判定を再利用）はMarkdownが更新されてdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-03";
+  const r1 = reflection("refl-c-1", day);
+  const entry1 = await seedReflectionCanonical(r1);
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry1);
+  assert.equal(first.status, "done");
+  const r2: MemoryObject = { ...r1, summary: "更新後の要約", updatedAt: `${day}T09:05:00.000Z` };
+  const entry2 = await seedReflectionCanonical(r2);
+  const second = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry2);
+  assert.equal(second.status, "done");
+  const path = reflectionPath(r1);
+  assert.equal(vault.get(path), markdownMod.memoryObjectToMarkdown(r2));
+});
+
+test("Projection Reflection D: 外部内容と食い違う場合はheldになり、外部データを上書きしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-04";
+  const r = reflection("refl-d-1", day);
+  const path = reflectionPath(r);
+  const externallyEdited = markdownMod.memoryObjectToMarkdown({ ...r, content: "外部で書き換えられた内容" });
+  vault.put(path, externallyEdited);
+  const entry = await seedReflectionCanonical(r);
+  const result = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.get(path), externallyEdited);
+});
+
+test("Projection Reflection E: Markdown unreadable（parse不能）はheldになり、上書きしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-05";
+  const r = reflection("refl-e-1", day);
+  const path = reflectionPath(r);
+  vault.put(path, "not a tsumugi markdown at all");
+  const entry = await seedReflectionCanonical(r);
+  const result = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.get(path), "not a tsumugi markdown at all");
+});
+
+test("Projection Reflection F: Vault identity mismatchはheldになり、1byteもwriteしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault, "a-totally-different-vault-id");
+  const r = reflection("refl-f-1", "2026-05-06");
+  const entry = await seedReflectionCanonical(r);
+  const writesBefore = vault.writeCount;
+  const result = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.writeCount, writesBefore);
+});
+
+test("Projection Reflection G: Markdown write直後にkillしても、restartでsame判定され残りが完了しdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-07";
+  const r = reflection("refl-g-1", day);
+  const path = reflectionPath(r);
+  const entry = await seedReflectionCanonical(r);
+  vault.writeShouldFail.add(shardPath(r.id));
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  assert.equal(vault.get(path), markdownMod.memoryObjectToMarkdown(r));
+  vault.writeShouldFail.delete(shardPath(r.id));
+  const second = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+test("Projection Reflection H: Registry write直後にkillしても、restartでdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-08";
+  const r = reflection("refl-h-1", day);
+  const entry = await seedReflectionCanonical(r);
+  vault.writeShouldFail.add(".tsumugi/index.json");
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  vault.writeShouldFail.delete(".tsumugi/index.json");
+  const second = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+test("Projection Reflection I: index write直後（History前）にkillしても、restartでdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-09";
+  const r = reflection("refl-i-1", day);
+  const entry = await seedReflectionCanonical(r);
+  vault.writeShouldFail.add(monthPath(day));
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  vault.writeShouldFail.delete(monthPath(day));
+  const second = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+test("Projection Reflection J: outboxがdoneだがRegistryが欠落している場合、検出して修復しdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-10";
+  const r = reflection("refl-j-1", day);
+  const entry = await seedReflectionCanonical(r);
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  vault.delete(shardPath(r.id));
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const result = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(result.status, "done");
+  const shard = JSON.parse(vault.get(shardPath(r.id))!);
+  assert.equal(shard.records[r.id], reflectionPath(r));
+});
+
+test("Projection Reflection K: projection完了後にもう一度reconcileしても完全no-opで、duplicateが生じない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-11";
+  const r = reflection("refl-k-1", day);
+  const entry = await seedReflectionCanonical(r);
+  const first = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileReflectionOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.writeCount, writesBefore);
+});
+
+test("reconcilePendingReflections: pendingなreflection entryだけをまとめて処理する", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const r1 = reflection("refl-batch-1", "2026-05-12");
+  const r2 = reflection("refl-batch-2", "2026-05-12");
+  await seedReflectionCanonical(r1);
+  await seedReflectionCanonical(r2);
+  const result = await projectionMod.reconcilePendingReflections(makeEnv(vault));
+  assert.equal(result.done, 2);
+  assert.equal(result.pending, 0);
+  assert.equal(result.held, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Source A〜J
+// ---------------------------------------------------------------------------
+
+test("Projection Source A: Vault実体が何も無い状態から、Markdown/Registry/indexを生成してdoneになる（Historyは対象外）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-a-1");
+  const entry = await seedSourceCanonical(s);
+  const result = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  const path = sourcePath(s);
+  assert.equal(vault.get(path), markdownMod.sourceToMarkdown(s));
+  const shard = JSON.parse(vault.get(shardPath(s.id))!);
+  assert.equal(shard.records[s.id], path);
+  const index = JSON.parse(vault.get(".tsumugi/index.json")!);
+  assert.equal(index[s.id], path);
+  assert.equal(vault.get(monthPath(s.createdAt.slice(0, 10))), undefined, "SourceはHistory対象外——月ファイルは一切作られない");
+});
+
+test("Projection Source B: 既に同一内容が書かれている場合はno-opでdoneになる（重複write無し）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-b-1");
+  const entry = await seedSourceCanonical(s);
+  const first = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.writeCount, writesBefore);
+});
+
+test("Projection Source C: 内容が食い違う場合、legitimate successor概念が無いため無条件でheldになり、外部データを上書きしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-c-1");
+  const path = sourcePath(s);
+  const externallyEdited = markdownMod.sourceToMarkdown({ ...s, content: "外部で書き換えられた内容" });
+  vault.put(path, externallyEdited);
+  const entry = await seedSourceCanonical(s);
+  const result = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.get(path), externallyEdited);
+});
+
+test("Projection Source D: Markdown unreadable（parse不能、parseSourceMarkdownの例外がnullへ変換される）はheldになり、上書きしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-d-1");
+  const path = sourcePath(s);
+  vault.put(path, "not a tsumugi markdown at all");
+  const entry = await seedSourceCanonical(s);
+  const result = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.get(path), "not a tsumugi markdown at all");
+});
+
+test("Projection Source E: Vault identity mismatchはheldになり、1byteもwriteしない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault, "a-totally-different-vault-id");
+  const s = source("src-e-1");
+  const entry = await seedSourceCanonical(s);
+  const writesBefore = vault.writeCount;
+  const result = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "held");
+  assert.equal(vault.writeCount, writesBefore);
+});
+
+test("Projection Source F: Markdown write直後にkillしても、restartでsame判定され残りが完了しdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-f-1");
+  const path = sourcePath(s);
+  const entry = await seedSourceCanonical(s);
+  vault.writeShouldFail.add(shardPath(s.id));
+  const first = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  assert.equal(vault.get(path), markdownMod.sourceToMarkdown(s));
+  vault.writeShouldFail.delete(shardPath(s.id));
+  const second = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+test("Projection Source G: Registry write直後にkillしても、restartでdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-g-1");
+  const entry = await seedSourceCanonical(s);
+  vault.writeShouldFail.add(".tsumugi/index.json");
+  const first = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "pending");
+  vault.writeShouldFail.delete(".tsumugi/index.json");
+  const second = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+  assert.equal(second.status, "done");
+});
+
+test("Projection Source H: outboxがdoneだがRegistryが欠落している場合、検出して修復しdoneになる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-h-1");
+  const entry = await seedSourceCanonical(s);
+  const first = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  vault.delete(shardPath(s.id));
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const result = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(result.status, "done");
+});
+
+test("Projection Source I: projection完了後にもう一度reconcileしても完全no-opで、duplicateが生じない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s = source("src-i-1");
+  const entry = await seedSourceCanonical(s);
+  const first = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const writesBefore = vault.writeCount;
+  const second = await projectionMod.reconcileSourceOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.writeCount, writesBefore);
+});
+
+test("reconcilePendingSources: pendingなsource entryだけをまとめて処理する", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const s1 = source("src-batch-1");
+  const s2 = source("src-batch-2");
+  await seedSourceCanonical(s1);
+  await seedSourceCanonical(s2);
+  const result = await projectionMod.reconcilePendingSources(makeEnv(vault));
+  assert.equal(result.done, 2);
+  assert.equal(result.pending, 0);
+  assert.equal(result.held, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Unified Reconcile（reconcilePendingVaultOutbox）
+// ---------------------------------------------------------------------------
+
+test("reconcilePendingVaultOutbox: Conversation/Memory/Reflection/Sourceが混在しても、record typeごとに正しくdispatchされ、1件のheldが他を止めない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+
+  const c = conversation("unified-conv-1");
+  await seedCanonical(c);
+
+  const day = "2026-05-13";
+  const m = memory("unified-mem-1", day);
+  await seedMemoryCanonical(m);
+
+  const r = reflection("unified-refl-1", day);
+  await seedReflectionCanonical(r);
+
+  // Source側だけ、事前に外部conflictを仕込んでheldになるようにする。
+  const sHeld = source("unified-src-held");
+  vault.put(sourcePath(sHeld), markdownMod.sourceToMarkdown({ ...sHeld, content: "外部で食い違う内容" }));
+  await seedSourceCanonical(sHeld);
+
+  const sOk = source("unified-src-ok");
+  await seedSourceCanonical(sOk);
+
+  const result = await projectionMod.reconcilePendingVaultOutbox(makeEnv(vault));
+
+  assert.equal(result.processed, 5);
+  assert.equal(result.done, 4, "conversation/memory/reflection/source(ok)の4件がdone");
+  assert.equal(result.held, 1, "conflictなsourceだけがheld");
+  assert.equal(result.failed, 0);
+  assert.equal(result.byRecordType.conversation.done, 1);
+  assert.equal(result.byRecordType.memory.done, 1);
+  assert.equal(result.byRecordType.reflection.done, 1);
+  assert.equal(result.byRecordType.source.done, 1);
+  assert.equal(result.byRecordType.source.held, 1);
+
+  // heldになったsourceの外部データは一切変更されていない。
+  assert.ok(vault.get(sourcePath(sHeld))?.includes("外部で食い違う内容"));
+});

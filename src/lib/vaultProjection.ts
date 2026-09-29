@@ -1,5 +1,5 @@
 /**
- * Vault Projection Engine（新保存基盤 Phase 3-3）。
+ * Vault Projection Engine（新保存基盤 Phase 3-3〜3-7）。
  *
  * IndexedDB canonical record（`conversations`等） + `vaultOutbox`（Phase 3-1）から、
  * Vault側（Markdown本体・Registry・`.tsumugi/index.json`・History）を「あるべき状態」へ
@@ -8,9 +8,9 @@
  * update/no-op/conflict/heldを判定する）→project（必要な分だけ書く）→verify（書いた後に
  * 実際に整合しているか確認する）を、このファイルで明示的に実装する。
  *
- * 対象はConversation（Phase 3-3）とnormal Memory day-file（Phase 3-6）。
- * Reflection・SourceはPhase 3-6でも対応しない（day-file実装を複雑にしないため、
- * 意図的に次Phaseへ残す。Phase 3-6報告参照）。
+ * 対象：Conversation（Phase 3-3）・normal Memory day-file（Phase 3-6）・
+ * Reflection／Source（Phase 3-7、1 canonical = 1 fileの共通engine `SingleFileRecordConfig`
+ * を介して実装。下記「1 canonical = 1 fileの汎用engine」参照）。
  *
  * 重要：baselineEstablishedAtはwrite permissionとして一切使わない（Phase 1で特定した
  * 今回のiPhone事故の根本原因）。projection許可条件は (1) Vault identityが一致
@@ -19,11 +19,20 @@
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
-import { getConversation, getMemoryObject, getPendingVaultOutboxEntries, putVaultOutboxEntry } from "./db";
+import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, putVaultOutboxEntry } from "./db";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
-import type { Conversation, MemoryObject } from "./types";
-import { conversationToMarkdown, parseConversationMarkdown, memoryObjectToMarkdown, parseMemoryDayFile, serializeMemoryDayFile } from "./markdown";
+import type { Conversation, MemoryObject, Source } from "./types";
+import {
+  conversationToMarkdown,
+  parseConversationMarkdown,
+  memoryObjectToMarkdown,
+  parseMemoryObjectMarkdown,
+  parseMemoryDayFile,
+  serializeMemoryDayFile,
+  sourceToMarkdown,
+  parseSourceMarkdown,
+} from "./markdown";
 import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, vaultProjectionPrimitives } from "./vault";
 
 // ---------------------------------------------------------------------------
@@ -781,6 +790,391 @@ export async function reconcilePendingMemories(env: ProjectionEnv): Promise<Reco
     if (entry.recordType !== "memory") continue;
     const outcome = await reconcileMemoryOutboxEntry(env, entry);
     result[outcome.status] += 1;
+  }
+  return result;
+}
+
+// ===========================================================================
+// 1 canonical = 1 fileの汎用engine（新保存基盤 Phase 3-7）
+//
+// Reflection・Sourceはどちらも「1 canonical record = 1 Vault file」であり、
+// Conversationと同じ安全モデル（read→compare→decide→project→verify）がそのまま
+// 成立する。record typeごとの違い（path・registryKeyの作り方・Markdown
+// シリアライズ／パース・「legitimate successor」の意味・Historyを持つかどうか）
+// だけを`SingleFileRecordConfig`という設定オブジェクトへ吸収し、実際のdecide/
+// project/verifyロジックは1つだけ実装する（Conversation固有の既存関数
+// `decideMarkdown`等は、既にtest済みの経路を壊さないためそのまま残す——
+// この汎用engineが後からConversationを飲み込むことはしない）。
+// ===========================================================================
+
+export interface SingleFileRecordConfig<T extends { id: string; createdAt: string; updatedAt: string }> {
+  recordType: "reflection" | "source";
+  pathFor: (canonical: T) => string;
+  registryKeyFor: (canonical: T) => string;
+  toMarkdown: (record: T) => string;
+  /** parse不能は`null`を返すこと（Sourceの`parseSourceMarkdown`は例外を投げるため、configの実装側でtry/catchしてnullへ変換する）。 */
+  parseMarkdown: (text: string) => T | null;
+  /**
+   * `null`は「legitimate successor概念自体が存在しない」ことを意味する
+   * （Source：既存実装に「安全に進化してよいフィールド」の前例が無いため、
+   * 内容が一致しない全てのケースを無条件でconflictとして扱う。req 2で
+   * 明示された「実データ構造に合う判定をする、無理に流用しない」の適用）。
+   */
+  isLegitimateSuccessor: ((onDisk: T, canonical: T) => boolean) | null;
+  /** Historyへ計上するrecord type（Reflectionのみ）。Sourceは存在しないため省略する。 */
+  historyRowFor?: (canonical: T) => { day: string; preview: string; createdAt: string };
+  getCanonical: (id: string) => Promise<T | undefined>;
+}
+
+type SingleFileMarkdownVerdict<T> =
+  | { kind: "create" | "update"; path: string }
+  | { kind: "no-op"; path: string; onDisk: T };
+
+async function decideSingleFileMarkdown<T extends { id: string; createdAt: string; updatedAt: string }>(
+  env: ProjectionEnv,
+  canonical: T,
+  registryPath: string | undefined,
+  config: SingleFileRecordConfig<T>
+): Promise<SingleFileMarkdownVerdict<T>> {
+  const path = registryPath ?? config.pathFor(canonical);
+  const expectedContent = config.toMarkdown(canonical);
+  const read = await readTextAt(env.root, path);
+  if (read.state === "error") throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);
+  if (read.state === "absent") return { kind: "create", path };
+  const parsed = config.parseMarkdown(read.text);
+  if (read.text === expectedContent) return { kind: "no-op", path, onDisk: parsed ?? canonical };
+  if (!parsed) throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);
+  if (config.isLegitimateSuccessor && config.isLegitimateSuccessor(parsed, canonical)) return { kind: "update", path };
+  throw new ProjectionConflictError(`${config.recordType}-markdown-conflict`);
+}
+
+async function projectSingleFileMarkdown<T extends { id: string; createdAt: string; updatedAt: string }>(
+  env: ProjectionEnv,
+  canonical: T,
+  verdict: SingleFileMarkdownVerdict<T>,
+  config: SingleFileRecordConfig<T>
+): Promise<void> {
+  if (verdict.kind === "no-op") return;
+  const { dir, fileName } = await dirAndFileNameFor(env.root, verdict.path, true);
+  try {
+    await vaultProjectionPrimitives.writeFileInDir(dir, fileName, config.toMarkdown(canonical), `projection ${config.recordType}`);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : `${config.recordType}-write-failed`);
+  }
+}
+
+async function decideAndProjectSingleFileRegistry<T extends { id: string; createdAt: string; updatedAt: string }>(
+  env: ProjectionEnv,
+  canonical: T,
+  path: string,
+  config: SingleFileRecordConfig<T>
+): Promise<void> {
+  const registryKey = config.registryKeyFor(canonical);
+  const bucket = vaultRegistryBucketOf(registryKey);
+  const shardPath = registryShardPath(bucket);
+  const read = await readJsonAt(env.root, shardPath);
+  if (read.state === "error") throw new ProjectionConflictError("registry-unreadable");
+  const records = read.state === "ok" && isObj(read.value.records) ? (read.value.records as Record<string, unknown>) : {};
+  const files = read.state === "ok" && isObj(read.value.files) ? (read.value.files as Record<string, unknown>) : {};
+  const currentPath = records[registryKey];
+  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
+  let stat: { mtime: number; size: number };
+  try {
+    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : `${config.recordType}-stat-failed`);
+  }
+  const content = config.toMarkdown(canonical);
+  const expected = { recordType: config.recordType, mtime: stat.mtime, size: stat.size, contentHash: hashVaultText(content), memberIds: [registryKey], status: "ok" as const };
+  const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;
+  const alreadyCorrect =
+    currentPath === path &&
+    isObj(currentEntry) &&
+    currentEntry.recordType === expected.recordType &&
+    currentEntry.contentHash === expected.contentHash &&
+    currentEntry.status === "ok" &&
+    Array.isArray(currentEntry.memberIds) &&
+    currentEntry.memberIds.length === 1 &&
+    currentEntry.memberIds[0] === registryKey;
+  if (alreadyCorrect) return;
+  try {
+    await vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey, path, ...expected });
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "registry-write-failed");
+  }
+}
+
+async function decideAndProjectSingleFileIndex<T extends { id: string }>(env: ProjectionEnv, canonical: T, path: string): Promise<void> {
+  const read = await readJsonAt(env.root, INDEX_PATH);
+  if (read.state === "error") throw new ProjectionConflictError("index-unreadable");
+  const current = read.state === "ok" ? read.value[canonical.id] : undefined;
+  if (current === path) return;
+  try {
+    await vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "index-write-failed");
+  }
+}
+
+/** Historyを持つrecord type（Reflection）専用。Sourceはこの関数自体を呼ばない。 */
+async function decideAndProjectSingleFileHistory<T extends { id: string; createdAt: string; updatedAt: string }>(
+  env: ProjectionEnv,
+  canonical: T,
+  config: SingleFileRecordConfig<T>
+): Promise<void> {
+  const row = config.historyRowFor!(canonical);
+  const monthPath = historyMonthPath(row.day);
+  const monthRead = await readJsonAt(env.root, monthPath);
+  if (monthRead.state === "error") throw new ProjectionConflictError("history-unreadable");
+  const metaRead = await readJsonAt(env.root, HISTORY_META_PATH);
+  if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
+  try {
+    await vaultProjectionPrimitives.updateHistoryIndex(env.root, { kind: "reflection", id: canonical.id, day: row.day, preview: row.preview, createdAt: row.createdAt });
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "history-write-failed");
+  }
+}
+
+async function finalVerifySingleFile<T extends { id: string; createdAt: string; updatedAt: string }>(
+  env: ProjectionEnv,
+  canonical: T,
+  path: string,
+  config: SingleFileRecordConfig<T>
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const expectedContent = config.toMarkdown(canonical);
+  const markdownRead = await readTextAt(env.root, path);
+  if (markdownRead.state !== "ok" || markdownRead.text !== expectedContent) return { ok: false, reason: `verify-${config.recordType}-markdown-mismatch` };
+
+  const registryKey = config.registryKeyFor(canonical);
+  const bucket = vaultRegistryBucketOf(registryKey);
+  const registryRead = await readJsonAt(env.root, registryShardPath(bucket));
+  if (registryRead.state !== "ok") return { ok: false, reason: "verify-registry-missing" };
+  const records = isObj(registryRead.value.records) ? registryRead.value.records : {};
+  const files = isObj(registryRead.value.files) ? registryRead.value.files : {};
+  const entry = records[registryKey] === path ? files[path] : undefined;
+  if (!isObj(entry) || entry.status !== "ok" || entry.contentHash !== hashVaultText(expectedContent)) return { ok: false, reason: "verify-registry-mismatch" };
+
+  const indexRead = await readJsonAt(env.root, INDEX_PATH);
+  if (indexRead.state !== "ok" || indexRead.value[canonical.id] !== path) return { ok: false, reason: "verify-index-mismatch" };
+
+  if (config.historyRowFor) {
+    const row = config.historyRowFor(canonical);
+    const historyRead = await readJsonAt(env.root, historyMonthPath(row.day));
+    if (historyRead.state !== "ok") return { ok: false, reason: "verify-history-missing" };
+    const days = isObj(historyRead.value.days) ? historyRead.value.days : {};
+    const dayEntry = days[row.day];
+    const historyRow = isObj(dayEntry) && Array.isArray(dayEntry.reflections) ? dayEntry.reflections.find((r) => isObj(r) && r.id === canonical.id) : undefined;
+    if (!isObj(historyRow) || historyRow.preview !== row.preview) return { ok: false, reason: "verify-history-mismatch" };
+  }
+
+  return { ok: true };
+}
+
+async function reconcileSingleFileOutboxEntry<T extends { id: string; createdAt: string; updatedAt: string }>(
+  env: ProjectionEnv,
+  entry: VaultOutboxEntry,
+  config: SingleFileRecordConfig<T>
+): Promise<ReconcileConversationResult> {
+  const now = (env.now ?? (() => new Date().toISOString()))();
+  const steps = emptySteps();
+
+  if (!(await vaultIdentityMatches(env))) {
+    await persistOutcome(entry, steps, "held", "vault-identity-mismatch", now);
+    return { status: "held", reason: "vault-identity-mismatch" };
+  }
+
+  const canonical = await config.getCanonical(entry.recordId);
+  if (!canonical) {
+    await persistOutcome(entry, steps, "held", "canonical-record-missing", now);
+    return { status: "held", reason: "canonical-record-missing" };
+  }
+  if (canonical.updatedAt !== entry.recordUpdatedAt) {
+    await persistOutcome(entry, steps, "pending", "outbox-entry-stale", now);
+    return { status: "pending", reason: "outbox-entry-stale" };
+  }
+
+  const registryKey = config.registryKeyFor(canonical);
+  const bucket = vaultRegistryBucketOf(registryKey);
+  const registryPeek = await readJsonAt(env.root, registryShardPath(bucket));
+  const registryPath =
+    registryPeek.state === "ok" && isObj(registryPeek.value.records) && typeof registryPeek.value.records[registryKey] === "string"
+      ? (registryPeek.value.records[registryKey] as string)
+      : undefined;
+
+  try {
+    const markdownVerdict = await decideSingleFileMarkdown(env, canonical, registryPath, config);
+    await projectSingleFileMarkdown(env, canonical, markdownVerdict, config);
+    steps.markdown = "done";
+
+    await decideAndProjectSingleFileRegistry(env, canonical, markdownVerdict.path, config);
+    steps.registry = "done";
+
+    await decideAndProjectSingleFileIndex(env, canonical, markdownVerdict.path);
+    steps.index = "done";
+
+    if (config.historyRowFor) {
+      await decideAndProjectSingleFileHistory(env, canonical, config);
+      steps.history = "done";
+    } else {
+      steps.history = "not-needed";
+    }
+
+    const verify = await finalVerifySingleFile(env, canonical, markdownVerdict.path, config);
+    if (!verify.ok) {
+      await persistOutcome(entry, steps, "pending", verify.reason, now);
+      return { status: "pending", reason: verify.reason };
+    }
+
+    await persistOutcome(entry, steps, "done", null, now);
+    return { status: "done" };
+  } catch (error) {
+    if (error instanceof ProjectionConflictError) {
+      await persistOutcome(entry, steps, "held", error.message, now);
+      return { status: "held", reason: error.message };
+    }
+    const reason = error instanceof Error ? error.message : "unknown-projection-error";
+    await persistOutcome(entry, steps, "pending", reason, now);
+    return { status: "pending", reason };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reflection：1record1file、`Memories/`配下（既存`writeMemoryObjectMarkdownImpl`の
+// `isReflectionSummary`分岐と同じpath規則）。MemoryObjectそのものであり、Markdown
+// シリアライズ／パースはnormal Memoryと完全に同一（`memoryObjectToMarkdown`／
+// `parseMemoryObjectMarkdown`）。「legitimate successor」もPhase 3-6で定義した
+// `isMemoryLegitimateSuccessor`をそのまま再利用する（req 2：ConversationのPrefix
+// 判定を無理に流用せず、実データ構造＝MemoryObjectとしての判定を自然に適用した結果、
+// Memory day-fileと同じ関数がそのまま使える）。
+// ---------------------------------------------------------------------------
+
+const reflectionConfig: SingleFileRecordConfig<MemoryObject> = {
+  recordType: "reflection",
+  pathFor: (r) => `Memories/${fileNameFor(r.id, r.date)}`,
+  registryKeyFor: (r) => r.id,
+  toMarkdown: memoryObjectToMarkdown,
+  parseMarkdown: parseMemoryObjectMarkdown,
+  isLegitimateSuccessor: isMemoryLegitimateSuccessor,
+  historyRowFor: (r) => ({ day: r.date.slice(0, 10), preview: truncateHistoryPreview(r.summary), createdAt: r.createdAt }),
+  getCanonical: getMemoryObject,
+};
+
+export async function reconcileReflectionOutboxEntry(env: ProjectionEnv, entry: VaultOutboxEntry): Promise<ReconcileConversationResult> {
+  return reconcileSingleFileOutboxEntry(env, entry, reflectionConfig);
+}
+
+export async function reconcilePendingReflections(env: ProjectionEnv): Promise<ReconcileAllResult> {
+  const pending = await getPendingVaultOutboxEntries();
+  const result: ReconcileAllResult = { done: 0, pending: 0, held: 0 };
+  for (const entry of pending) {
+    if (entry.recordType !== "reflection") continue;
+    const outcome = await reconcileReflectionOutboxEntry(env, entry);
+    result[outcome.status] += 1;
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Source：1record1file、`Sources/`配下。`Metadata`を持たない最小構成のため
+// Historyを持たない（`writeSourceMarkdownImpl`にHistory呼び出しが無いのと同じ）。
+// 「legitimate successor」の前例が既存実装に無い（`createSource`はcreatedAt===
+// updatedAtで生成し、以後の更新経路が存在しない）ため、無理に条件を作らず
+// `isLegitimateSuccessor: null`（＝内容不一致は無条件でconflict）とする
+// （req 2「実データ構造に合う判定をする」の適用）。
+// ---------------------------------------------------------------------------
+
+const sourceConfig: SingleFileRecordConfig<Source> = {
+  recordType: "source",
+  pathFor: (s) => `Sources/${fileNameFor(s.id, s.createdAt)}`,
+  registryKeyFor: (s) => s.id,
+  toMarkdown: sourceToMarkdown,
+  parseMarkdown: (text) => {
+    try {
+      return parseSourceMarkdown(text);
+    } catch {
+      return null;
+    }
+  },
+  isLegitimateSuccessor: null,
+  getCanonical: getSource,
+};
+
+export async function reconcileSourceOutboxEntry(env: ProjectionEnv, entry: VaultOutboxEntry): Promise<ReconcileConversationResult> {
+  return reconcileSingleFileOutboxEntry(env, entry, sourceConfig);
+}
+
+export async function reconcilePendingSources(env: ProjectionEnv): Promise<ReconcileAllResult> {
+  const pending = await getPendingVaultOutboxEntries();
+  const result: ReconcileAllResult = { done: 0, pending: 0, held: 0 };
+  for (const entry of pending) {
+    if (entry.recordType !== "source") continue;
+    const outcome = await reconcileSourceOutboxEntry(env, entry);
+    result[outcome.status] += 1;
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Unified Reconcile（Phase 3-7 req 6）：Conversation/Memory/Reflection/Sourceの
+// pending outboxを、record typeごとの適切なProjectionへdispatchしてまとめて処理する。
+// 1件のheld/conflictが他recordのsafe reconcileを止めないこと（`for`ループの中で
+// 1件ずつ例外を握りつぶす——各reconcile*OutboxEntry自体が既に内部でtry/catchして
+// pending/heldを返す設計だが、想定外の例外に対する最後の防波堤として、ここでも
+// 1件のthrowでループ全体を止めない）。
+// ---------------------------------------------------------------------------
+
+export interface ReconcileAllRecordTypesResult {
+  processed: number;
+  done: number;
+  pending: number;
+  held: number;
+  /** 想定外の例外（reconcile*OutboxEntry自体は通常throwしない設計のため、フェイルセーフ用）。 */
+  failed: number;
+  byRecordType: Record<string, { done: number; pending: number; held: number; failed: number }>;
+}
+
+function emptyReconcileAllRecordTypesResult(): ReconcileAllRecordTypesResult {
+  return { processed: 0, done: 0, pending: 0, held: 0, failed: 0, byRecordType: {} };
+}
+
+function bumpRecordTypeTally(result: ReconcileAllRecordTypesResult, recordType: string, key: "done" | "pending" | "held" | "failed"): void {
+  const bucket = result.byRecordType[recordType] ?? { done: 0, pending: 0, held: 0, failed: 0 };
+  bucket[key] += 1;
+  result.byRecordType[recordType] = bucket;
+}
+
+export async function reconcilePendingVaultOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
+  const pending = await getPendingVaultOutboxEntries();
+  const result = emptyReconcileAllRecordTypesResult();
+  for (const entry of pending) {
+    result.processed += 1;
+    try {
+      let outcome: ReconcileConversationResult;
+      switch (entry.recordType) {
+        case "conversation":
+          outcome = await reconcileConversationOutboxEntry(env, entry);
+          break;
+        case "memory":
+          outcome = await reconcileMemoryOutboxEntry(env, entry);
+          break;
+        case "reflection":
+          outcome = await reconcileReflectionOutboxEntry(env, entry);
+          break;
+        case "source":
+          outcome = await reconcileSourceOutboxEntry(env, entry);
+          break;
+        default:
+          // 未知record type（将来のPerson/Topic等がoutboxへ紛れ込んだ場合の防御）。
+          // このEngineはまだ対応していないrecord typeを黙って処理済み扱いにはしない。
+          outcome = { status: "held", reason: `unknown-record-type:${entry.recordType}` };
+      }
+      result[outcome.status] += 1;
+      bumpRecordTypeTally(result, entry.recordType, outcome.status);
+    } catch (error) {
+      result.failed += 1;
+      bumpRecordTypeTally(result, entry.recordType, "failed");
+      console.error(`[Tsumugi] reconcilePendingVaultOutbox: unexpected error for ${entry.recordType}:${entry.recordId}, continuing with other records:`, error);
+    }
   }
   return result;
 }

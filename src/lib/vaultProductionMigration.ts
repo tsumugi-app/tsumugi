@@ -19,15 +19,54 @@
 import {
   getAllConversations,
   getAllMemoryObjects,
+  getAllSources,
   putConversationWithOutbox,
   putMemoryObjectWithOutbox,
+  putSourceWithOutbox,
   readProductionMigrationStateRaw,
   writeProductionMigrationStateRaw,
 } from "./db";
-import { collectAllMarkdownFiles, dayFileNameFor, fileNameFor, type VaultFileEntry } from "./vault";
-import { conversationToMarkdown, memoryObjectToMarkdown, parseConversationMarkdown, parseMemoryDayFile } from "./markdown";
+import { collectAllMarkdownFiles, dayFileNameFor, fileNameFor, isReflectionSummary, type VaultFileEntry } from "./vault";
+import {
+  conversationToMarkdown,
+  memoryObjectToMarkdown,
+  parseConversationMarkdown,
+  parseMemoryDayFile,
+  parseMemoryObjectMarkdown,
+  sourceToMarkdown,
+  parseSourceMarkdown,
+} from "./markdown";
 import { isLegitimatePredecessor, isMemoryLegitimateSuccessor } from "./vaultProjection";
-import type { Conversation, MemoryObject } from "./types";
+import type { Conversation, MemoryObject, Source } from "./types";
+
+/**
+ * day-file（`YYYY-MM-DD.md`、`dayFileNameFor`）とReflection（`YYYY-MM-DD-<shortId>.md`、
+ * `fileNameFor`）は、どちらも`Memories/`直下に置かれる（Phase 3-7で発見・修正した
+ * 重要な区別点）。normal Memoryのday-file単位のVault-only検出がReflectionファイルまで
+ * 誤って「day-fileのmember」として読み込まないよう、ファイル名の形（shortId接尾辞の
+ * 有無）で区別する。
+ */
+const DAY_FILE_NAME_PATTERN = /^\d{4}-\d{2}-\d{2}\.md$/;
+function isDayFilePath(path: string): boolean {
+  const fileName = path.slice(path.lastIndexOf("/") + 1);
+  return DAY_FILE_NAME_PATTERN.test(fileName);
+}
+
+/**
+ * `getAllMemoryObjects()`はnormal MemoryとReflectionの両方を返す（IndexedDB上は
+ * 同じ`memoryObjects`storeを共有するため）。normal Memory day-fileのclassify・
+ * Vault-only検出はnormal Memoryだけを対象にすること——Reflectionを紛れ込ませると、
+ * 「day-fileには存在しないreflection id」を誤って"idb-only"のday-file memberとして
+ * 分類し、実際には1record1fileであるReflectionをday-fileへmergeしようとする
+ * outbox entryを作ってしまう（Phase 3-7で実際に再現・確認したbug。修正前は
+ * `memory:<reflectionId>`という誤ったoutbox entryが生成されていた）。
+ */
+function onlyNormalMemories(all: MemoryObject[]): MemoryObject[] {
+  return all.filter((m) => !isReflectionSummary(m));
+}
+function onlyReflections(all: MemoryObject[]): MemoryObject[] {
+  return all.filter(isReflectionSummary);
+}
 
 // ---------------------------------------------------------------------------
 // 実体の読み込み（vaultProjection.ts／vaultIdentityAdoption.tsと同じ考え方：
@@ -201,6 +240,7 @@ async function findVaultOnlyMemoryMembers(root: FileSystemDirectoryHandle, canon
   }
   const vaultOnly: MemoryVaultOnlyMember[] = [];
   for (const f of files) {
+    if (!isDayFilePath(f.path)) continue; // Reflectionファイル（1record1file）はここでは扱わない
     const members = parseMemoryDayFile(f.content);
     for (const m of members) {
       if (!canonicalIds.has(m.id)) vaultOnly.push({ day: m.date.slice(0, 10), id: m.id, path: f.path });
@@ -218,6 +258,111 @@ function groupMemoriesByDay(memories: MemoryObject[]): Map<string, MemoryObject[
     else byDay.set(day, [m]);
   }
   return byDay;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3-7：1 canonical = 1 fileの汎用classification（Reflection・Source）。
+// Conversationの`classifyConversation`と同じ判断（read→same/absent/error判定→
+// legitimate successor判定→conflict）だが、record typeごとの違い（path・
+// シリアライズ／パース・successor判定の有無）を設定オブジェクトへ吸収する
+// （vaultProjection.tsの`SingleFileRecordConfig`と対になる、migration側の
+// 同じ考え方の実装）。
+// ---------------------------------------------------------------------------
+
+export type SingleFileClassificationKind = "idb-only" | "both-same" | "legitimate-successor" | "conflict" | "unreadable";
+
+export interface SingleFileClassification {
+  kind: SingleFileClassificationKind;
+  recordId: string;
+  reason?: string;
+}
+
+interface SingleFileMigrationConfig<T extends { id: string }> {
+  pathFor: (canonical: T) => string;
+  toMarkdown: (record: T) => string;
+  parseMarkdown: (text: string) => T | null;
+  isLegitimateSuccessor: ((onDisk: T, canonical: T) => boolean) | null;
+}
+
+async function classifySingleFileRecord<T extends { id: string }>(
+  root: FileSystemDirectoryHandle,
+  canonical: T,
+  config: SingleFileMigrationConfig<T>
+): Promise<SingleFileClassification> {
+  const path = config.pathFor(canonical);
+  const read = await readTextAt(root, path);
+  if (read.state === "error") return { kind: "unreadable", recordId: canonical.id, reason: "markdown-unreadable" };
+  if (read.state === "absent") return { kind: "idb-only", recordId: canonical.id };
+  if (read.text === config.toMarkdown(canonical)) return { kind: "both-same", recordId: canonical.id };
+  const parsed = config.parseMarkdown(read.text);
+  if (!parsed) return { kind: "unreadable", recordId: canonical.id, reason: "markdown-unreadable" };
+  if (config.isLegitimateSuccessor && config.isLegitimateSuccessor(parsed, canonical)) return { kind: "legitimate-successor", recordId: canonical.id };
+  return { kind: "conflict", recordId: canonical.id, reason: "content-conflict" };
+}
+
+/**
+ * `pathFilter`はReflection専用（`Memories/`はnormal Memoryのday-fileと共有する
+ * フォルダのため、day-file形式のファイル名は対象から除く。`isDayFilePath`参照）。
+ */
+async function findVaultOnlySingleFileRecords<T extends { id: string }>(
+  root: FileSystemDirectoryHandle,
+  dirName: string,
+  canonicalRecords: T[],
+  parseMarkdown: (text: string) => T | null,
+  pathFilter?: (path: string) => boolean
+): Promise<string[]> {
+  const canonicalIds = new Set(canonicalRecords.map((c) => c.id));
+  let files: VaultFileEntry[];
+  try {
+    const dir = await root.getDirectoryHandle(dirName, { create: false });
+    files = await collectAllMarkdownFiles(dir, dirName);
+  } catch {
+    return [];
+  }
+  const vaultOnly: string[] = [];
+  for (const f of files) {
+    if (pathFilter && !pathFilter(f.path)) continue;
+    const parsed = parseMarkdown(f.content);
+    if (!parsed || !canonicalIds.has(parsed.id)) vaultOnly.push(f.path);
+  }
+  return vaultOnly;
+}
+
+function parseMemoryObjectMarkdownSafe(text: string): MemoryObject | null {
+  return parseMemoryObjectMarkdown(text);
+}
+function parseSourceMarkdownSafe(text: string): Source | null {
+  try {
+    return parseSourceMarkdown(text);
+  } catch {
+    return null;
+  }
+}
+
+const reflectionMigrationConfig: SingleFileMigrationConfig<MemoryObject> = {
+  pathFor: (r) => `Memories/${fileNameFor(r.id, r.date)}`,
+  toMarkdown: memoryObjectToMarkdown,
+  parseMarkdown: parseMemoryObjectMarkdownSafe,
+  isLegitimateSuccessor: isMemoryLegitimateSuccessor,
+};
+
+const sourceMigrationConfig: SingleFileMigrationConfig<Source> = {
+  pathFor: (s) => `Sources/${fileNameFor(s.id, s.createdAt)}`,
+  toMarkdown: sourceToMarkdown,
+  parseMarkdown: parseSourceMarkdownSafe,
+  isLegitimateSuccessor: null, // Source：既存実装に安全な後継版の前例が無いため、内容不一致は無条件でconflict
+};
+
+function tallySingleFile(classifications: SingleFileClassification[], vaultOnlyCount: number): ProductionMigrationSummary {
+  const summary: ProductionMigrationSummary = { idbOnly: 0, vaultOnly: vaultOnlyCount, bothSame: 0, legitimateSuccessor: 0, conflict: 0, unreadable: 0 };
+  for (const c of classifications) {
+    if (c.kind === "idb-only") summary.idbOnly += 1;
+    else if (c.kind === "both-same") summary.bothSame += 1;
+    else if (c.kind === "legitimate-successor") summary.legitimateSuccessor += 1;
+    else if (c.kind === "conflict") summary.conflict += 1;
+    else if (c.kind === "unreadable") summary.unreadable += 1;
+  }
+  return summary;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +409,18 @@ export interface ProductionMigrationState {
   memoryUnreadableRecordIds: string[];
   memoryVaultOnlyMembers: MemoryVaultOnlyMember[];
   memoryOutboxEnsuredCount: number;
+  // Phase 3-7：Reflection／Source拡張（Conversationと同じ1record1fileの形のため、
+  // 既存の`ProductionMigrationSummary`型をそのまま再利用する）。
+  reflectionSummary: ProductionMigrationSummary | null;
+  reflectionConflictRecordIds: string[];
+  reflectionUnreadableRecordIds: string[];
+  reflectionVaultOnlyPaths: string[];
+  reflectionOutboxEnsuredCount: number;
+  sourceSummary: ProductionMigrationSummary | null;
+  sourceConflictRecordIds: string[];
+  sourceUnreadableRecordIds: string[];
+  sourceVaultOnlyPaths: string[];
+  sourceOutboxEnsuredCount: number;
 }
 
 function freshState(now: string): ProductionMigrationState {
@@ -283,6 +440,16 @@ function freshState(now: string): ProductionMigrationState {
     memoryUnreadableRecordIds: [],
     memoryVaultOnlyMembers: [],
     memoryOutboxEnsuredCount: 0,
+    reflectionSummary: null,
+    reflectionConflictRecordIds: [],
+    reflectionUnreadableRecordIds: [],
+    reflectionVaultOnlyPaths: [],
+    reflectionOutboxEnsuredCount: 0,
+    sourceSummary: null,
+    sourceConflictRecordIds: [],
+    sourceUnreadableRecordIds: [],
+    sourceVaultOnlyPaths: [],
+    sourceOutboxEnsuredCount: 0,
   };
 }
 
@@ -292,9 +459,10 @@ async function loadState(): Promise<ProductionMigrationState | null> {
   try {
     const parsed = JSON.parse(raw) as ProductionMigrationState;
     if (parsed.version !== 1) return null;
-    // Phase 3-6でstate形状にMemory用フィールドを追加した。Phase 3-5時点で永続化された
-    // 既存stateにはこれらのキーが無いため、欠けていれば安全な既定値で補う
-    // （version自体は変えない——Conversation側の既存フィールドの意味は一切変更しないため）。
+    // Phase 3-6/3-7でstate形状にMemory/Reflection/Source用フィールドを追加した。
+    // それ以前に永続化された既存stateにはこれらのキーが無いため、欠けていれば
+    // 安全な既定値で補う（version自体は変えない——Conversation側の既存フィールドの
+    // 意味は一切変更しないため）。
     return {
       ...parsed,
       memorySummary: parsed.memorySummary ?? null,
@@ -302,6 +470,16 @@ async function loadState(): Promise<ProductionMigrationState | null> {
       memoryUnreadableRecordIds: parsed.memoryUnreadableRecordIds ?? [],
       memoryVaultOnlyMembers: parsed.memoryVaultOnlyMembers ?? [],
       memoryOutboxEnsuredCount: parsed.memoryOutboxEnsuredCount ?? 0,
+      reflectionSummary: parsed.reflectionSummary ?? null,
+      reflectionConflictRecordIds: parsed.reflectionConflictRecordIds ?? [],
+      reflectionUnreadableRecordIds: parsed.reflectionUnreadableRecordIds ?? [],
+      reflectionVaultOnlyPaths: parsed.reflectionVaultOnlyPaths ?? [],
+      reflectionOutboxEnsuredCount: parsed.reflectionOutboxEnsuredCount ?? 0,
+      sourceSummary: parsed.sourceSummary ?? null,
+      sourceConflictRecordIds: parsed.sourceConflictRecordIds ?? [],
+      sourceUnreadableRecordIds: parsed.sourceUnreadableRecordIds ?? [],
+      sourceVaultOnlyPaths: parsed.sourceVaultOnlyPaths ?? [],
+      sourceOutboxEnsuredCount: parsed.sourceOutboxEnsuredCount ?? 0,
     };
   } catch {
     return null;
@@ -347,6 +525,17 @@ export interface ProductionMigrationResult {
   memoryUnreadableRecordIds: string[];
   memoryVaultOnlyMembers: MemoryVaultOnlyMember[];
   memoryOutboxEnsuredCount: number;
+  // Phase 3-7：Reflection／Source拡張
+  reflectionSummary: ProductionMigrationSummary;
+  reflectionConflictRecordIds: string[];
+  reflectionUnreadableRecordIds: string[];
+  reflectionVaultOnlyPaths: string[];
+  reflectionOutboxEnsuredCount: number;
+  sourceSummary: ProductionMigrationSummary;
+  sourceConflictRecordIds: string[];
+  sourceUnreadableRecordIds: string[];
+  sourceVaultOnlyPaths: string[];
+  sourceOutboxEnsuredCount: number;
 }
 
 function nowOf(env: ProductionMigrationEnv): string {
@@ -368,6 +557,15 @@ async function ensureOutbox(c: Conversation): Promise<void> {
 /** Memory版`ensureOutbox`。1 canonical MemoryObject＝1 outbox entryは変わらない（req 14）。 */
 async function ensureMemoryOutbox(m: MemoryObject): Promise<void> {
   await putMemoryObjectWithOutbox(m);
+}
+
+/** Phase 3-7：Reflectionは`memoryObjects`storeを共有するが、`recordType`を明示して`"reflection"`のoutboxを作る。 */
+async function ensureReflectionOutbox(r: MemoryObject): Promise<void> {
+  await putMemoryObjectWithOutbox(r, "reflection");
+}
+
+async function ensureSourceOutbox(s: Source): Promise<void> {
+  await putSourceWithOutbox(s);
 }
 
 function tally(classifications: ConversationClassification[], vaultOnlyCount: number): ProductionMigrationSummary {
@@ -414,26 +612,46 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
   await persistState(state);
 
   let knownConversations = await getAllConversations();
-  let knownMemories = await getAllMemoryObjects();
+  // `getAllMemoryObjects()`はnormal MemoryとReflectionの両方を含む（同じstoreを共有する
+  // ため）。Phase 3-7で発見・修正した重要な区別：day-file処理にはnormal Memoryだけを渡し
+  // （`onlyNormalMemories`）、Reflectionは別途1record1fileとして扱う（`onlyReflections`）。
+  let knownMemoriesRaw = await getAllMemoryObjects();
+  let knownSources = await getAllSources();
   let classifications: ConversationClassification[] = [];
   let vaultOnlyPaths: string[] = [];
   let memoryClassifications: MemoryMemberClassification[] = [];
   let memoryVaultOnlyMembers: MemoryVaultOnlyMember[] = [];
+  let reflectionClassifications: SingleFileClassification[] = [];
+  let reflectionVaultOnlyPaths: string[] = [];
+  let sourceClassifications: SingleFileClassification[] = [];
+  let sourceVaultOnlyPaths: string[] = [];
 
   for (let pass = 0; pass <= MAX_RESCANS; pass++) {
     state = { ...state, phase: "classify", updatedAt: nowOf(env) };
     await persistState(state);
 
+    const knownNormalMemories = onlyNormalMemories(knownMemoriesRaw);
+    const knownReflections = onlyReflections(knownMemoriesRaw);
+
     classifications = await Promise.all(knownConversations.map((c) => classifyConversation(env.root, c)));
     vaultOnlyPaths = await findVaultOnlyConversationPaths(env.root, knownConversations);
 
     // Phase 3-6：Memoryはday単位でまとめてclassifyする（day-fileの重複読み込みを避ける）。
-    const memoriesByDay = groupMemoriesByDay(knownMemories);
+    // Reflectionは混ぜない（`onlyNormalMemories`参照）。
+    const memoriesByDay = groupMemoriesByDay(knownNormalMemories);
     const memoryClassificationLists = await Promise.all(
       [...memoriesByDay.entries()].map(([day, members]) => classifyMemoryDay(env.root, day, members))
     );
     memoryClassifications = memoryClassificationLists.flat();
-    memoryVaultOnlyMembers = await findVaultOnlyMemoryMembers(env.root, knownMemories);
+    memoryVaultOnlyMembers = await findVaultOnlyMemoryMembers(env.root, knownNormalMemories);
+
+    // Phase 3-7：Reflection（1record1file、`Memories/`配下だがday-file形式は除く）。
+    reflectionClassifications = await Promise.all(knownReflections.map((r) => classifySingleFileRecord(env.root, r, reflectionMigrationConfig)));
+    reflectionVaultOnlyPaths = await findVaultOnlySingleFileRecords(env.root, "Memories", knownReflections, parseMemoryObjectMarkdownSafe, (p) => !isDayFilePath(p));
+
+    // Phase 3-7：Source（1record1file、`Sources/`配下）。
+    sourceClassifications = await Promise.all(knownSources.map((s) => classifySingleFileRecord(env.root, s, sourceMigrationConfig)));
+    sourceVaultOnlyPaths = await findVaultOnlySingleFileRecords(env.root, "Sources", knownSources, parseSourceMarkdownSafe);
 
     state = { ...state, phase: "enqueue-safe-records", updatedAt: nowOf(env) };
     await persistState(state);
@@ -451,15 +669,37 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
     let memoryEnsuredThisPass = 0;
     for (const classification of memoryClassifications) {
       if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
-        const canonical = knownMemories.find((m) => m.id === classification.recordId);
+        const canonical = knownNormalMemories.find((m) => m.id === classification.recordId);
         if (!canonical) continue; // 理論上到達しない（防御的）
         await ensureMemoryOutbox(canonical);
         memoryEnsuredThisPass += 1;
       }
     }
 
+    let reflectionEnsuredThisPass = 0;
+    for (const classification of reflectionClassifications) {
+      if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
+        const canonical = knownReflections.find((r) => r.id === classification.recordId);
+        if (!canonical) continue; // 理論上到達しない（防御的）
+        await ensureReflectionOutbox(canonical);
+        reflectionEnsuredThisPass += 1;
+      }
+    }
+
+    let sourceEnsuredThisPass = 0;
+    for (const classification of sourceClassifications) {
+      if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
+        const canonical = knownSources.find((s) => s.id === classification.recordId);
+        if (!canonical) continue; // 理論上到達しない（防御的）
+        await ensureSourceOutbox(canonical);
+        sourceEnsuredThisPass += 1;
+      }
+    }
+
     const summary = tally(classifications, vaultOnlyPaths.length);
     const memorySummary = tallyMemory(memoryClassifications, memoryVaultOnlyMembers.length);
+    const reflectionSummary = tallySingleFile(reflectionClassifications, reflectionVaultOnlyPaths.length);
+    const sourceSummary = tallySingleFile(sourceClassifications, sourceVaultOnlyPaths.length);
     state = {
       ...state,
       phase: "verify",
@@ -475,12 +715,22 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       memoryUnreadableRecordIds: memoryClassifications.filter((c) => c.kind === "unreadable-dayfile").map((c) => c.recordId),
       memoryVaultOnlyMembers,
       memoryOutboxEnsuredCount: state.memoryOutboxEnsuredCount + memoryEnsuredThisPass,
+      reflectionSummary,
+      reflectionConflictRecordIds: reflectionClassifications.filter((c) => c.kind === "conflict").map((c) => c.recordId),
+      reflectionUnreadableRecordIds: reflectionClassifications.filter((c) => c.kind === "unreadable").map((c) => c.recordId),
+      reflectionVaultOnlyPaths,
+      reflectionOutboxEnsuredCount: state.reflectionOutboxEnsuredCount + reflectionEnsuredThisPass,
+      sourceSummary,
+      sourceConflictRecordIds: sourceClassifications.filter((c) => c.kind === "conflict").map((c) => c.recordId),
+      sourceUnreadableRecordIds: sourceClassifications.filter((c) => c.kind === "unreadable").map((c) => c.recordId),
+      sourceVaultOnlyPaths,
+      sourceOutboxEnsuredCount: state.sourceOutboxEnsuredCount + sourceEnsuredThisPass,
     };
     await persistState(state);
 
     // req 11：verify＝終了時rescan。classify対象にした集合と、今読み直した最新集合を
     // 比較し、新規／`updatedAt`が進んだrecordがあれば、それらを含めて再度classifyする
-    // （Conversation・Memory両方について同じ基準で判定する）。
+    // （Conversation・Memory・Reflection・Source全てについて同じ基準で判定する）。
     const latestConversations = await getAllConversations();
     const priorById = new Map(knownConversations.map((c) => [c.id, c]));
     const hasNewOrChangedConversation = latestConversations.some((c) => {
@@ -488,16 +738,24 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       return !prior || prior.updatedAt !== c.updatedAt;
     });
 
-    const latestMemories = await getAllMemoryObjects();
-    const priorMemoryById = new Map(knownMemories.map((m) => [m.id, m]));
-    const hasNewOrChangedMemory = latestMemories.some((m) => {
+    const latestMemoriesRaw = await getAllMemoryObjects();
+    const priorMemoryById = new Map(knownMemoriesRaw.map((m) => [m.id, m]));
+    const hasNewOrChangedMemory = latestMemoriesRaw.some((m) => {
       const prior = priorMemoryById.get(m.id);
       return !prior || prior.updatedAt !== m.updatedAt;
     });
 
-    if (!hasNewOrChangedConversation && !hasNewOrChangedMemory) break;
+    const latestSources = await getAllSources();
+    const priorSourceById = new Map(knownSources.map((s) => [s.id, s]));
+    const hasNewOrChangedSource = latestSources.some((s) => {
+      const prior = priorSourceById.get(s.id);
+      return !prior || prior.updatedAt !== s.updatedAt;
+    });
+
+    if (!hasNewOrChangedConversation && !hasNewOrChangedMemory && !hasNewOrChangedSource) break;
     knownConversations = latestConversations;
-    knownMemories = latestMemories;
+    knownMemoriesRaw = latestMemoriesRaw;
+    knownSources = latestSources;
   }
 
   state = { ...state, phase: "done", updatedAt: nowOf(env) };
@@ -515,6 +773,16 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
     memoryUnreadableRecordIds: state.memoryUnreadableRecordIds,
     memoryVaultOnlyMembers: state.memoryVaultOnlyMembers,
     memoryOutboxEnsuredCount: state.memoryOutboxEnsuredCount,
+    reflectionSummary: state.reflectionSummary!,
+    reflectionConflictRecordIds: state.reflectionConflictRecordIds,
+    reflectionUnreadableRecordIds: state.reflectionUnreadableRecordIds,
+    reflectionVaultOnlyPaths: state.reflectionVaultOnlyPaths,
+    reflectionOutboxEnsuredCount: state.reflectionOutboxEnsuredCount,
+    sourceSummary: state.sourceSummary!,
+    sourceConflictRecordIds: state.sourceConflictRecordIds,
+    sourceUnreadableRecordIds: state.sourceUnreadableRecordIds,
+    sourceVaultOnlyPaths: state.sourceVaultOnlyPaths,
+    sourceOutboxEnsuredCount: state.sourceOutboxEnsuredCount,
   };
 }
 

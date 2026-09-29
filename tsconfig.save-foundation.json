@@ -18,6 +18,8 @@
     "src/lib/vaultProjection.test.ts",
     "src/lib/vaultIdentityAdoption.test.ts",
     "src/lib/vaultProductionMigration.test.ts",
+    "src/lib/storagePersistence.test.ts",
+    "src/lib/saveFoundationBootstrap.test.ts",
     "src/lib/db.ts",
     "src/lib/vaultOutbox.ts",
     "src/lib/vaultIdentity.ts",
@@ -26,6 +28,8 @@
     "src/lib/recordAdapter.ts",
     "src/lib/vaultProjection.ts",
     "src/lib/vaultProductionMigration.ts",
+    "src/lib/storagePersistence.ts",
+    "src/lib/saveFoundationBootstrap.ts",
     "src/lib/fakeIdb.ts",
     "src/lib/markdown.ts",
     "src/lib/vault.ts"

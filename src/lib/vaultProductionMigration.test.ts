@@ -39,6 +39,7 @@ const fakeIdbMod = require(path.join(OUT, "lib/fakeIdb.js")) as {
 
 type Conversation = import("./types").Conversation;
 type MemoryObject = import("./types").MemoryObject;
+type Source = import("./types").Source;
 type VaultIdentityRecord = import("./vaultIdentity").VaultIdentityRecord;
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,30 @@ async function seedIdbMemory(m: MemoryObject) {
   await dbMod.putMemoryObject(m);
 }
 const memoryDayPath = (day: string) => `Memories/${vaultMod.dayFileNameFor(day)}`;
+
+// Phase 3-7：Reflection／Sourceのfixture。
+const reflectionMeta = { id: "meta", source: "system-generated" as const, sourceType: "system" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
+function reflection(id: string, day: string, overrides: Partial<MemoryObject> = {}): MemoryObject {
+  const iso = `${day}T09:00:00.000Z`;
+  return {
+    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["insight"] as MemoryObject["types"],
+    keywords: [], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
+    createdAt: iso, updatedAt: iso, metadata: { ...reflectionMeta },
+    ...overrides,
+  } as MemoryObject;
+}
+async function seedIdbReflection(r: MemoryObject) {
+  await dbMod.putMemoryObject(r);
+}
+const reflectionPath = (r: MemoryObject) => `Memories/${vaultMod.fileNameFor(r.id, r.date)}`;
+
+function source(id: string, overrides: Partial<Source> = {}): Source {
+  return { id, sourceType: "note" as Source["sourceType"], title: `タイトル-${id}`, content: `内容-${id}`, createdAt: T, updatedAt: T, ...overrides } as Source;
+}
+async function seedIdbSource(s: Source) {
+  await dbMod.saveSource(s);
+}
+const sourcePath = (s: Source) => `Sources/${vaultMod.fileNameFor(s.id, s.createdAt)}`;
 
 async function clearAllIndexedDbState() {
   // 各テストがまっさらな状態から始められるよう、conversations/vaultOutbox/settings
@@ -554,4 +579,141 @@ test("Migration T: Memory memberのenqueue途中でkillしても、restartで残
   // Vault-onlyはmigrationの中断・再開を跨いでも一切変更されない。
   const onDisk = markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!);
   assert.deepEqual(onDisk.map((m) => m.id), [vaultOnly.id]);
+});
+
+// ===========================================================================
+// Phase 3-7：Reflection／Source拡張
+// ===========================================================================
+
+test("Migration U（永久回帰テスト）: ReflectionがIndexedDB上でnormal Memoryと同じstoreを共有していても、day-file処理へ紛れ込まない", async () => {
+  // Phase 3-7で実際に発見・再現したbug：修正前は`getAllMemoryObjects()`の結果を
+  // フィルタせずday-file classifyへ渡していたため、Reflectionが「day-fileに
+  // 存在しないidb-only member」と誤判定され、`memory:<reflectionId>`という
+  // 誤ったoutbox entryが生成されていた（Projection Engineが実行されれば、
+  // 1record1fileのReflectionをday-fileへmergeしようとして壊れうる）。
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-06-01";
+  const r = reflection("mig-u-refl-1", day);
+  const path = reflectionPath(r);
+  vault.put(path, markdownMod.memoryObjectToMarkdown(r)); // Vault側は既に正しい（both-same）
+  await seedIdbReflection(r);
+
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.equal(result.memorySummary.idbOnly, 0, "normal Memoryとしては1件も検出されない");
+  assert.equal(result.memorySummary.bothSame, 0);
+  assert.equal(result.reflectionSummary.bothSame, 1, "Reflectionとして正しくboth-same分類される");
+  assert.equal(await dbMod.getVaultOutboxEntry(`memory:${r.id}`), undefined, "誤ったmemory outbox entryは作られない");
+  const reflOutbox = await dbMod.getVaultOutboxEntry(`reflection:${r.id}`);
+  assert.ok(reflOutbox, "正しくreflection outbox entryが作られる");
+});
+
+test("Migration V: Reflectionのidb-only／both-same／conflict／Vault-onlyが混在していても、safeなものだけがoutbox化される", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-06-02";
+
+  const idbOnly = reflection("mig-v-idb-only", day);
+  const bothSame = reflection("mig-v-both-same", day);
+  vault.put(reflectionPath(bothSame), markdownMod.memoryObjectToMarkdown(bothSame));
+  const conflictOnDisk = reflection("mig-v-conflict", day);
+  const conflictCanonical: MemoryObject = { ...conflictOnDisk, content: "canonical側だけ書き換わった内容" };
+  vault.put(reflectionPath(conflictOnDisk), markdownMod.memoryObjectToMarkdown(conflictOnDisk));
+  // Vault-only：IndexedDBに対応するcanonicalが無いReflectionファイル。
+  const vaultOnlyRefl = reflection("mig-v-vault-only", day);
+  vault.put(reflectionPath(vaultOnlyRefl), markdownMod.memoryObjectToMarkdown(vaultOnlyRefl));
+
+  await seedIdbReflection(idbOnly);
+  await seedIdbReflection(bothSame);
+  await seedIdbReflection(conflictCanonical);
+
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.equal(result.reflectionSummary.idbOnly, 1);
+  assert.equal(result.reflectionSummary.bothSame, 1);
+  assert.equal(result.reflectionSummary.conflict, 1);
+  assert.equal(result.reflectionSummary.vaultOnly, 1);
+  assert.deepEqual(result.reflectionConflictRecordIds, [conflictCanonical.id]);
+  assert.deepEqual(result.reflectionVaultOnlyPaths, [reflectionPath(vaultOnlyRefl)]);
+
+  assert.ok(await dbMod.getVaultOutboxEntry(`reflection:${idbOnly.id}`));
+  assert.ok(await dbMod.getVaultOutboxEntry(`reflection:${bothSame.id}`));
+  assert.equal(await dbMod.getVaultOutboxEntry(`reflection:${conflictCanonical.id}`), undefined, "conflictはoutbox化されない");
+
+  // Vault-onlyのReflectionファイルは一切変更されない。
+  assert.equal(vault.get(reflectionPath(vaultOnlyRefl)), markdownMod.memoryObjectToMarkdown(vaultOnlyRefl));
+  assert.equal(vault.get(reflectionPath(conflictOnDisk)), markdownMod.memoryObjectToMarkdown(conflictOnDisk), "conflictなVault側の内容も変更されない");
+});
+
+test("Migration W: Sourceのidb-only／both-same／conflict／Vault-onlyが混在していても、safeなものだけがoutbox化される", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+
+  const idbOnly = source("mig-w-idb-only");
+  const bothSame = source("mig-w-both-same");
+  vault.put(sourcePath(bothSame), markdownMod.sourceToMarkdown(bothSame));
+  const conflictOnDisk = source("mig-w-conflict");
+  const conflictCanonical: Source = { ...conflictOnDisk, content: "canonical側だけ書き換わった内容" };
+  vault.put(sourcePath(conflictOnDisk), markdownMod.sourceToMarkdown(conflictOnDisk));
+  const vaultOnlySrc = source("mig-w-vault-only");
+  vault.put(sourcePath(vaultOnlySrc), markdownMod.sourceToMarkdown(vaultOnlySrc));
+
+  await seedIdbSource(idbOnly);
+  await seedIdbSource(bothSame);
+  await seedIdbSource(conflictCanonical);
+
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.equal(result.sourceSummary.idbOnly, 1);
+  assert.equal(result.sourceSummary.bothSame, 1);
+  assert.equal(result.sourceSummary.conflict, 1);
+  assert.equal(result.sourceSummary.vaultOnly, 1);
+  assert.deepEqual(result.sourceConflictRecordIds, [conflictCanonical.id]);
+  assert.deepEqual(result.sourceVaultOnlyPaths, [sourcePath(vaultOnlySrc)]);
+
+  assert.ok(await dbMod.getVaultOutboxEntry(`source:${idbOnly.id}`));
+  assert.ok(await dbMod.getVaultOutboxEntry(`source:${bothSame.id}`));
+  assert.equal(await dbMod.getVaultOutboxEntry(`source:${conflictCanonical.id}`), undefined);
+  assert.equal(vault.get(sourcePath(vaultOnlySrc)), markdownMod.sourceToMarkdown(vaultOnlySrc));
+});
+
+test("Migration X: Reflection/Source両方のenqueue途中でkillしても、restartで残りが完了しdoneになる", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-06-03";
+  const r1 = reflection("mig-x-refl-1", day);
+  const r2 = reflection("mig-x-refl-2", day);
+  const s1 = source("mig-x-src-1");
+  await seedIdbReflection(r1);
+  await seedIdbReflection(r2);
+  await seedIdbSource(s1);
+
+  fakeIdbMod.__failNextPutOn("tsumugi", "vaultOutbox");
+  await assert.rejects(migrationMod.runProductionBootstrapMigration(makeEnv(vault)));
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.ok(await dbMod.getVaultOutboxEntry(`reflection:${r1.id}`));
+  assert.ok(await dbMod.getVaultOutboxEntry(`reflection:${r2.id}`));
+  assert.ok(await dbMod.getVaultOutboxEntry(`source:${s1.id}`));
+});
+
+test("Migration Y: normal Memory day-fileとReflectionファイルが同じMemories/フォルダに共存しても、互いのVault-only検出へ混線しない", async () => {
+  const vault = new FakeVault();
+  await dbMod.clearMemoryData();
+  const day = "2026-06-04";
+
+  // day-file側：Vault-onlyのnormal Memory member（IndexedDBに対応canonicalが無い）。
+  const memVaultOnly = memory("mig-y-mem-vault-only", day);
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([memVaultOnly]));
+
+  // 同じフォルダのReflection側：Vault-onlyのReflectionファイル。
+  const reflVaultOnly = reflection("mig-y-refl-vault-only", day);
+  vault.put(reflectionPath(reflVaultOnly), markdownMod.memoryObjectToMarkdown(reflVaultOnly));
+
+  // IndexedDB側にはどちらも対応するcanonicalが無い（両方Vault-onlyのまま）。
+  const result = await migrationMod.runProductionBootstrapMigration(makeEnv(vault));
+  assert.equal(result.phase, "done");
+  assert.deepEqual(result.memoryVaultOnlyMembers.map((v) => v.id), [memVaultOnly.id], "day-fileのVault-only検出にReflectionファイルが紛れ込まない");
+  assert.deepEqual(result.reflectionVaultOnlyPaths, [reflectionPath(reflVaultOnly)], "ReflectionのVault-only検出にday-fileが紛れ込まない");
 });

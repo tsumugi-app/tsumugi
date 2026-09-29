@@ -12,7 +12,7 @@
     "test:recovery-apply": "tsc -p tsconfig.recovery.json && node --test .test-out/lib/vaultRecoveryApply.test.js",
     "test:write-gate": "tsc -p tsconfig.write-gate.json && node --test .test-out/lib/vaultWriteGate.test.js",
     "test:recovery-ui-text": "tsc -p tsconfig.recovery-ui-text.json && node --test .test-out/lib/vaultRecoveryUiText.test.js",
-    "test:save-foundation": "tsc -p tsconfig.save-foundation.json && node --test .test-out/lib/db.foundation.test.js .test-out/lib/vaultOutbox.test.js .test-out/lib/recordAdapter.test.js .test-out/lib/vaultProjection.test.js .test-out/lib/vaultIdentityAdoption.test.js .test-out/lib/vaultProductionMigration.test.js"
+    "test:save-foundation": "tsc -p tsconfig.save-foundation.json && node --test .test-out/lib/db.foundation.test.js .test-out/lib/vaultOutbox.test.js .test-out/lib/recordAdapter.test.js .test-out/lib/vaultProjection.test.js .test-out/lib/vaultIdentityAdoption.test.js .test-out/lib/vaultProductionMigration.test.js .test-out/lib/storagePersistence.test.js .test-out/lib/saveFoundationBootstrap.test.js"
   },
   "dependencies": {
     "@google/genai": "^2.13.0",
