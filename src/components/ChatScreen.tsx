@@ -98,6 +98,7 @@ import {
   type RecoveryApplyPlan,
 } from "@/lib/vaultRecoveryApply";
 import { dbRecoveryJournalStore } from "@/lib/vaultRecoveryJournal";
+import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
 import {
   VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
@@ -699,6 +700,8 @@ export default function ChatScreen() {
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
   const startupRecoveryCheckRanRef = useRef(false);
+  /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
+  const startupSaveFoundationBootstrapRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
@@ -2018,6 +2021,51 @@ export default function ChatScreen() {
       cancelled = true;
     };
   }, []);
+
+  /**
+   * 新保存基盤 Phase 3-8：Save Foundation Bootstrap（Phase 3-7で完成させたlibrary）を
+   * 実際のstartupへ接続する。
+   *
+   * 挿入位置：`vaultStatus === "connected" && vaultHandle`（＝Vault handle/backendが
+   * 実際に使用可能になった後）を条件にする、上の主起動effectとは別のeffect。
+   * Connect catch-up・Recovery interrupted-journal確認（どちらも後続のeffect）より
+   * 前に定義することで、self-healingで解決できる状態（IDB-only・metadata欠落・
+   * done-but-degraded等）が、legacy Recoveryの誘導対象として先に扱われてしまう前に
+   * 新Engineが収束を試みる（Phase 3-8報告「7. startup ordering」参照）。
+   *
+   * - `vaultStatus`が"needs-permission"（PC等でVault handleはあるが許可がまだ無い）
+   *   の間はこのeffect自体の条件が満たされないため、bootstrapを一切実行しない。
+   *   IndexedDB canonicalは引き続き使用可能なまま（req 8）。ユーザーが再許可した後
+   *   （`handleReauthorizeVault`が`vaultStatus`を"connected"へ進める）、このeffectの
+   *   依存配列（`vaultStatus`）が変化して再評価され、`.current`ガードはまだfalseの
+   *   ままなので、このタイミングで初めてbootstrapが実行される（req 8「permission
+   *   取得後にbootstrapを再実行できること」）。
+   * - iPhone/OPFS（req 9）はrequestPermission UIが無く`restoreVaultHandle`が直接
+   *   "connected"を返すため、他のバックエンドと同じこの1本のeffectで自然に対応する
+   *   （backendによる分岐は追加しない）。
+   * - `runProductionBootstrapOnce`（productionBootstrap.ts）がsingle-flightを保証する
+   *   ため、React StrictModeの二重実行やこのeffect自体の再評価があっても、実際の
+   *   bootstrap実行が重複することは無い。
+   * - `withVaultWorldRead`で包み、H4（複数タブ間のVault境界）の通常Read/Write操作と
+   *   同じ枠組みへ参加させる（Capture/Connect等の既存操作と同じ扱い。単独の
+   *   独自ロックだけに頼らない）。StaleVaultTabError／IncompleteVaultWorldErrorは
+   *   ここでは他の非致命的操作と同じくログのみに留め、UI初期表示・会話送信を
+   *   ブロックしない（req 6）。
+   * - `runProductionBootstrapOnce`自体が内部で例外を握り潰す設計のため、この
+   *   effect側で追加のtry/catchを重ねる必要はないが、`withVaultWorldRead`が
+   *   投げうる上記エラーに備えて念のため包む。
+   */
+  useEffect(() => {
+    if (vaultStatus !== "connected" || !vaultHandle || startupSaveFoundationBootstrapRanRef.current) return;
+    startupSaveFoundationBootstrapRanRef.current = true;
+    void trackMemoryTask(
+      withVaultWorldRead(() => runProductionBootstrapOnce(vaultHandle)).catch((error) => {
+        if (!handleStaleVaultTabError(error)) {
+          console.error("[Tsumugi] Save Foundation Bootstrap failed to start (app continues; next startup will retry)", error);
+        }
+      })
+    );
+  }, [vaultStatus, vaultHandle]);
 
   /**
    * ROADMAP.md Phase 2「Connect」。セッション終了ボタンを押さずにブラウザを閉じた場合の
