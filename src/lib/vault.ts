@@ -54,6 +54,7 @@ import {
   sourceToMarkdown,
 } from "./markdown";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
+import { withVaultSaveLock } from "./vaultSaveLock";
 import { isWipePending, WipeInProgressError } from "./wipeState";
 import {
   assertNoPendingRecovery,
@@ -766,8 +767,10 @@ function enqueueVaultWrite<T>(
       const startedAt = Date.now();
       try {
         // 実行直前（キューで順番が来た時点）に確認する：積んだ後にRecoveryが始まっていても、状態を変更しない。
-        if (!recoveryBypass) await assertNoPendingRecovery();
-        const result = await task();
+        const result = await withVaultSaveLock(async () => {
+          if (!recoveryBypass) await assertNoPendingRecovery();
+          return task();
+        });
         resolve(result);
       } catch (error) {
         reject(error);
@@ -1969,6 +1972,17 @@ async function writeSourceMarkdownImpl(
 
   const renderStart = Date.now();
   const content = sourceToMarkdown(source);
+  // Sourceにはsafe successorがない。Registryと一致する旧本文でも、
+  // canonicalと異なる内容を通常writer経由で上書きしてはいけない。
+  let existingHandle: FileSystemFileHandle | undefined;
+  try {
+    existingHandle = await targetDir.getFileHandle(fileName, { create: false });
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === "NotFoundError")) throw error;
+  }
+  if (existingHandle && await (await existingHandle.getFile()).text() !== content) {
+    throw new VaultRecordNeedsResyncError("source", registryKey, "conflict", "conflict");
+  }
   logSyncStep("source render", Date.now() - renderStart);
   await writeFileInDir(targetDir, fileName, content, "source");
   await updateIndex(root, source.id, relativePath);

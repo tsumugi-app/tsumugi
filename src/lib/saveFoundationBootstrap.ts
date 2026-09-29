@@ -40,30 +40,8 @@ import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultId
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
 import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
-// ---------------------------------------------------------------------------
-// req 1（内部順序の最初のstep）：Bootstrap自身の再入防止用exclusive lock。
-//
-// 既存の"tsumugi-vault-world"（H4、`vaultWorldLock.ts`）は、複数タブ間の
-// epoch整合性チェック（`tabVaultEpoch`）と一体になっており、実際のタブの
-// 起動シーケンス（`withStartupSharedLock`でepochを確定させる）を経ていない
-// 状態から呼ぶと必ず`StaleVaultTabError`になる。Phase 3-7はまだapp startupへ
-// 接続しない（library＋testまで）ため、本物のH4 epoch統合はProduction接続時に
-// 行うこととし、ここではBootstrap呼び出し自体の同時実行を防ぐための、
-// 別名・専用のexclusive lockだけを用意する（既存の"tsumugi-vault-world"・
-// "tsumugi-vault-registry-write"・"tsumugi-history-index-write"・
-// Phase 3-6の"tsumugi-projection-memory-dayfile:*"のいずれとも異なる名前）。
-// ---------------------------------------------------------------------------
-
-const BOOTSTRAP_LOCK_NAME = "tsumugi-save-foundation-bootstrap";
-
-function isLockSupported(): boolean {
-  return typeof navigator !== "undefined" && typeof navigator.locks !== "undefined";
-}
-
-async function withBootstrapLock<T>(fn: () => Promise<T>): Promise<T> {
-  if (!isLockSupported()) return fn();
-  return navigator.locks.request(BOOTSTRAP_LOCK_NAME, fn);
-}
+// legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
+import { withVaultSaveLock } from "./vaultSaveLock";
 
 export interface SaveFoundationBootstrapEnv {
   root: FileSystemDirectoryHandle;
@@ -89,7 +67,7 @@ export interface SaveFoundationBootstrapResult {
 }
 
 export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv): Promise<SaveFoundationBootstrapResult> {
-  return withBootstrapLock(async () => {
+  return withVaultSaveLock(async () => {
     // 2. Vault identity確認。
     // 3. 必要ならlegacy adoption/resume（`ensureVaultIdentityForCurrentWorld`自身が
     //    empty/legacy/identified/indeterminateの分類・safe-to-adopt判定・

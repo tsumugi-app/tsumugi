@@ -22,6 +22,7 @@
     "src/lib/saveFoundationBootstrap.test.ts",
     "src/lib/productionBootstrap.test.ts",
     "src/lib/productionWiring.test.ts",
+    "src/lib/productionMemoryWiring.test.ts",
     "src/lib/db.ts",
     "src/lib/vaultOutbox.ts",
     "src/lib/vaultIdentity.ts",
@@ -36,6 +37,8 @@
     "src/lib/generationDebugLog.ts",
     "src/lib/generationDebugProtocol.ts",
     "src/lib/vaultWorldLock.ts",
+    "src/lib/capture.ts",
+    "src/lib/source.ts",
     "src/lib/fakeIdb.ts",
     "src/lib/markdown.ts",
     "src/lib/vault.ts"

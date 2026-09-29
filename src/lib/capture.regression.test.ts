@@ -500,7 +500,11 @@ test("Capture Debug: observes IndexedDB success/failure and Vault success/held/f
   await withCaptureDebug(async () => {
     const db = stubs["./db"] as Record<string, unknown>;
     const vault = stubs["./vault"] as Record<string, unknown>;
-    const oldPut = db.putMemoryObject;
+    // 新保存基盤 Phase 3-9：capture.tsのcanonical writeが`db.putMemoryObject`から
+    // `db.putMemoryObjectWithOutbox`（canonical + vaultOutboxのatomic commit）へ
+    // 切り替わったため、stub対象もそれに合わせる（呼び出し側の引数はrecordType等が
+    // 増えるが、このstub自体は件数・成否だけを模すため、シグネチャは変えずそのまま使える）。
+    const oldPut = db.putMemoryObjectWithOutbox;
     const oldWrite = vault.writeMemoryObjectMarkdown;
     const oldConversationWrite = vault.writeConversationMarkdown;
     vault.writeConversationMarkdown = async () => {};
@@ -508,7 +512,7 @@ test("Capture Debug: observes IndexedDB success/failure and Vault success/held/f
     try {
       for (const mode of ["success", "held", "failed", "deferred", "idb-failed"]) {
         captureDebug.clearCaptureDebug();
-        db.putMemoryObject = async () => { if (mode === "idb-failed") throw new Error("test IDB failure"); };
+        db.putMemoryObjectWithOutbox = async () => { if (mode === "idb-failed") throw new Error("test IDB failure"); };
         vault.writeMemoryObjectMarkdown = async () => {
           if (mode === "held") { const e = new Error("test hold"); e.name = "VaultRecordNeedsResyncError"; throw e; }
           if (mode === "failed") throw new Error("test Vault failure");
@@ -520,10 +524,10 @@ test("Capture Debug: observes IndexedDB success/failure and Vault success/held/f
         const memory = (entry.memories as Json[])[0];
         assert.equal(memory.indexedDB, mode === "idb-failed" ? "failed" : "success");
         assert.equal((entry.totals as Json).saved, mode === "idb-failed" ? 0 : 1);
-        assert.equal(memory.vault, mode === "deferred" ? "deferred: no connected vault" : mode === "held" ? "held" : mode === "failed" ? "failed (write or sync bookkeeping)" : "success");
+        assert.equal(memory.vault, mode === "idb-failed" ? "not-attempted: canonical commit failed" : mode === "deferred" ? "deferred: no connected vault" : mode === "held" ? "held" : mode === "failed" ? "failed (write or sync bookkeeping)" : "success");
         assert.equal(saved.failedMemoryIds.length, mode === "idb-failed" ? 1 : 0);
       }
-    } finally { db.putMemoryObject = oldPut; vault.writeMemoryObjectMarkdown = oldWrite; vault.writeConversationMarkdown = oldConversationWrite; }
+    } finally { db.putMemoryObjectWithOutbox = oldPut; vault.writeMemoryObjectMarkdown = oldWrite; vault.writeConversationMarkdown = oldConversationWrite; }
   });
 });
 
@@ -575,14 +579,15 @@ test("cross-turn regression: [3,4] produces two original Evidence quotes and per
     const encodedUsers = firstReq.userContent.split("=== USER'S ACTUAL STATEMENTS ===\n")[1].split("\n=== END USER'S ACTUAL STATEMENTS ===")[0];
     assert.deepEqual(JSON.parse(encodedUsers), messages.map((content, index) => ({ index, content })));
     const db = stubs["./db"] as Record<string, unknown>;
-    const oldPut = db.putMemoryObject;
+    // 新保存基盤 Phase 3-9：上のstubと同じ理由でstub対象を`putMemoryObjectWithOutbox`へ変更。
+    const oldPut = db.putMemoryObjectWithOutbox;
     const saved: unknown[] = [];
-    db.putMemoryObject = async (m: unknown) => { saved.push(m); };
+    db.putMemoryObjectWithOutbox = async (m: unknown) => { saved.push(m); };
     try {
       const persist = (captureClient as unknown as { persistCapture: (h: null, c: unknown, m: unknown[]) => Promise<unknown> }).persistCapture;
       await persist(null, out.conversation, out.memoryObjects);
       assert.deepEqual((saved[0] as Json).evidenceQuotes, messages.slice(3));
-    } finally { db.putMemoryObject = oldPut; }
+    } finally { db.putMemoryObjectWithOutbox = oldPut; }
     const entry = debugEntry(await captureDebug.getCaptureDebugText());
     const server = entry.server as { userMessages: string[]; attempts: Array<{ validation: Json[] }>; finalized: Json[] };
     assert.deepEqual(server.userMessages, messages);
