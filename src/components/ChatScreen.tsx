@@ -43,6 +43,7 @@ import {
   getAllConversations,
   getAllMemoryObjects,
   getConversation,
+  getVaultIdentityRecord,
   loadApiKey,
   loadChatProvider,
   loadVaultHandle,
@@ -92,12 +93,17 @@ import { executeOrphanCleanup, planOrphanCleanup, type OrphanCleanupResult, type
 import {
   applyRecovery,
   createRecoveryApplyEnv,
-  planRecoveryApply,
   readRecoveryState,
   type RecoveryApplyResult,
   type RecoveryApplyPlan,
 } from "@/lib/vaultRecoveryApply";
 import { dbRecoveryJournalStore } from "@/lib/vaultRecoveryJournal";
+import {
+  runLegacyHeldCleanup,
+  planRecoveryApplyExcludingArchived,
+  collectRecoveryArchiveFiles,
+  type LegacyHeldCleanupResult,
+} from "@/lib/vaultRecoveryLegacyCleanup";
 import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
 import {
@@ -317,6 +323,23 @@ export type RecoveryUiStatus =
   | { kind: "interrupted" }
   | { kind: "executing" }
   | { kind: "done"; result: RecoveryApplyResult }
+  | { kind: "error"; message: string };
+
+/**
+ * Recovery最終整理フェーズ（`vaultRecoveryLegacyCleanup.ts`の`runLegacyHeldCleanup`）のUI状態。
+ * 「修復」ではなく「原本を保持したまま隔離する」設計——held recordのcurrent Vault/canonical/
+ * day-fileは一切書き換えず、実内容をRecovery Archiveへ安全に退避してからwarningの対象外にする。
+ * "done"は、cleanup自体の成功に加えて、その後のRecovery診断の再実行（archive除外込みの
+ * `planRecoveryApplyExcludingArchived`）まで成功した場合だけに進む。`finalHeldCount`は、この
+ * 再診断の結果そのもの——cleanup内部の集計ではなく、これがUIの真実（実機で表示される
+ * 「◯件は内容の確認が必要です」と同じ計算）。再診断自体が失敗した場合は"verify-failed"へ進み、
+ * 成功したかのような表示は一切しない。
+ */
+export type LegacyHeldCleanupUiStatus =
+  | { kind: "idle" }
+  | { kind: "executing" }
+  | { kind: "done"; result: LegacyHeldCleanupResult; finalHeldCount: number }
+  | { kind: "verify-failed" }
   | { kind: "error"; message: string };
 
 export type OrphanUiStatus =
@@ -608,6 +631,8 @@ export default function ChatScreen() {
    * 既存の他機能と同じ導線を使う。内部のclassification・journalの中身はUIには一切出さない。
    */
   const [recoveryStatus, setRecoveryStatus] = useState<RecoveryUiStatus>({ kind: "idle" });
+  /** Recovery最終整理フェーズ（「古い記録を整理する」）のUI状態。詳細は`LegacyHeldCleanupUiStatus`参照。 */
+  const [legacyHeldCleanupStatus, setLegacyHeldCleanupStatus] = useState<LegacyHeldCleanupUiStatus>({ kind: "idle" });
   /**
    * 統合表示の測定結果。`null`は「未測定」（測定済みで0件、とは別）。light-check・RegistryとIDBの差は
    * 起動時・保存先の接続／変更時・保存先関連の操作の実行後に測る。flushの測定は`vaultHoldMeasure`。
@@ -1335,6 +1360,7 @@ export default function ChatScreen() {
     // もう有効ではない（`applyRecovery`自体もworld不一致でconfirmation-expired/resumeOnly拒否に
     // なるが、UI側の古い表示自体も先に破棄し、新worldで古い「再確認して続ける」が残らないようにする）。
     setRecoveryStatus({ kind: "idle" });
+    setLegacyHeldCleanupStatus({ kind: "idle" });
     setVaultMeasure(null);
     setVaultHoldMeasure({ measured: false, count: 0 });
     setVaultStatusCheck({ kind: "idle" });
@@ -3345,7 +3371,9 @@ export default function ChatScreen() {
     const endTask = beginMemoryTask();
     setRecoveryStatus({ kind: "scanning" });
     try {
-      const applyPlan = await withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(vaultHandle)));
+      // Recovery最終整理フェーズ：Recovery Archiveへ退避済み（内容不変）のrecordを、通常の
+      // 「確認が必要」から除外した上でheldCountを数える（`planRecoveryApplyExcludingArchived`）。
+      const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
       if (generation !== vaultGenerationRef.current) {
         setRecoveryStatus({ kind: "idle" });
         return;
@@ -3358,6 +3386,56 @@ export default function ChatScreen() {
       }
       console.error("[Tsumugi] recovery apply dry-run failed", error);
       setRecoveryStatus({ kind: "error", message: "保存先の状態を確認できませんでした。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
+   * Recovery最終整理フェーズ：「古い記録を整理する」。`runLegacyHeldCleanup`自身が
+   * `runVaultWorldExclusive`（Recovery apply等と同じ排他区間）を取得するため、ここでは
+   * 追加のlockラップをしない（`applyRecovery`等の既存パターンとは異なる点——詳細は
+   * `vaultRecoveryLegacyCleanup.ts`のlock order解説を参照）。
+   *
+   * 「done」は、cleanup自体の成功「かつ」その後のRecovery診断の再実行（archive除外込みの
+   * `planRecoveryApplyExcludingArchived`）まで成功した場合だけに進む。この再診断の
+   * `heldCount`こそがUIの真実——cleanup内部の集計（`result.archived`等）は内訳の表示にしか
+   * 使わない。再診断自体が失敗した場合は成功したかのような表示を一切せず、"verify-failed"へ
+   * 進む（fail-safe）。
+   */
+  async function handleRunLegacyHeldCleanup() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setLegacyHeldCleanupStatus({ kind: "executing" });
+    let verifying = false;
+    try {
+      const vaultIdentity = await getVaultIdentityRecord();
+      const result = await runLegacyHeldCleanup({ root: vaultHandle, vaultIdentity: vaultIdentity ?? null });
+      if (generation !== vaultGenerationRef.current) return;
+      if ("notRun" in result) {
+        setLegacyHeldCleanupStatus({ kind: "error", message: result.notRun === "recovery-in-progress"
+          ? "復旧処理が進行中のため、整理できませんでした。"
+          : "他の操作が実行中のため、整理できませんでした。しばらくしてからもう一度お試しください。" });
+        return;
+      }
+      verifying = true;
+      // Keep the operation guard until remeasurement finishes; no second click or Vault switch.
+      const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
+      if (generation !== vaultGenerationRef.current) return;
+      setRecoveryStatus({ kind: "plan", applyPlan, generation });
+      setLegacyHeldCleanupStatus({ kind: "done", result, finalHeldCount: applyPlan.heldCount });
+    } catch (error) {
+      if (generation !== vaultGenerationRef.current) return;
+      if (handleStaleVaultTabError(error)) {
+        setLegacyHeldCleanupStatus({ kind: "idle" });
+        return;
+      }
+      setLegacyHeldCleanupStatus(verifying
+        ? { kind: "verify-failed" }
+        : { kind: "error", message: "整理できませんでした。元のデータは保持されています。" });
     } finally {
       endTask();
       vaultOperationLockRef.current = false;
@@ -3620,7 +3698,14 @@ export default function ChatScreen() {
     if (vaultBackend !== "opfs" || !vaultHandle) return;
     setExportDataFeedback({ kind: "busy", message: "エクスポートを準備しています…" });
     try {
-      const files = await collectAllMarkdownFiles(vaultHandle);
+      // Recovery Archive（`.tsumugi/recovery-archive/`）は通常のMarkdown export
+      // （`collectAllMarkdownFiles`）から意図的に除外される隠しフォルダの中にあるため、
+      // 別途明示的に収集してexportへ含める（Recovery最終整理フェーズ、原本保持の一環）。
+      const [markdownFiles, archiveFiles] = await Promise.all([
+        collectAllMarkdownFiles(vaultHandle),
+        collectRecoveryArchiveFiles(vaultHandle),
+      ]);
+      const files = [...markdownFiles, ...archiveFiles];
       if (files.length === 0) {
         setExportDataFeedback({ kind: "empty", message: "エクスポートするデータがありません。" });
         window.setTimeout(() => setExportDataFeedback(null), 4000);
@@ -5363,8 +5448,16 @@ export default function ChatScreen() {
             onRunOrphanDryRun={() => void handleRunOrphanDryRun()}
             onExecuteOrphanCleanup={() => void handleExecuteOrphanCleanup()}
             recoveryStatus={recoveryStatus}
-            onRunRecoveryDryRun={() => void handleRunRecoveryDryRun()}
+            onRunRecoveryDryRun={() => {
+              // ユーザーが明示的に「確認する」を押した場合は、前回の「整理しました」表示を消す
+              // （`handleRunLegacyHeldCleanup`内部からの自動再診断ではこれを呼ばないため、
+              // 完了直後のメッセージはそのまま見える）。
+              setLegacyHeldCleanupStatus({ kind: "idle" });
+              void handleRunRecoveryDryRun();
+            }}
             onExecuteRecoveryApply={() => void handleExecuteRecoveryApply()}
+            legacyHeldCleanupStatus={legacyHeldCleanupStatus}
+            onRunLegacyHeldCleanup={() => void handleRunLegacyHeldCleanup()}
             vaultHoldReasons={vaultHoldReasons}
           />
         </div>

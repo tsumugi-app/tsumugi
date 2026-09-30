@@ -42,6 +42,11 @@ import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, type Re
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
 import { withVaultSaveLock } from "./vaultSaveLock";
+// legacy writer（`vault.ts`の`enqueueVaultWrite`）と同じゲート。Recovery Apply自身は
+// `runVaultWorldExclusive`（Bootstrapとは別のlock）の下で動くため、`withVaultSaveLock`
+// だけではBootstrapとRecovery Applyの同時実行を防げない——journalが`in-progress`の間は
+// ここで明示的に拒否し、Registry/History/index/MarkdownをRecoveryと同時に書かない。
+import { assertNoPendingRecovery } from "./vaultRecoveryJournal";
 
 export interface SaveFoundationBootstrapEnv {
   root: FileSystemDirectoryHandle;
@@ -68,6 +73,11 @@ export interface SaveFoundationBootstrapResult {
 
 export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv): Promise<SaveFoundationBootstrapResult> {
   return withVaultSaveLock(async () => {
+    // 1. Recovery journalが`in-progress`の間は何もしない（1byteも読み書きの判断をしない前に
+    //    ここで止める）。呼び出し元（`productionBootstrap.ts`）は他の例外と同様にcatchし、
+    //    次回startupでのretryへ委ねる（req 6の「bootstrap失敗でアプリを止めない」を継承）。
+    await assertNoPendingRecovery();
+
     // 2. Vault identity確認。
     // 3. 必要ならlegacy adoption/resume（`ensureVaultIdentityForCurrentWorld`自身が
     //    empty/legacy/identified/indeterminateの分類・safe-to-adopt判定・

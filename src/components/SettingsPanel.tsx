@@ -9,6 +9,7 @@ import type {
   VaultConnectFeedback,
   VaultLightCheckStatus,
   LegacyCleanupUiStatus,
+  LegacyHeldCleanupUiStatus,
   LocalOnlyUiStatus,
   OrphanUiStatus,
   RecoveryUiStatus,
@@ -71,6 +72,8 @@ export default function SettingsPanel({
   recoveryStatus,
   onRunRecoveryDryRun,
   onExecuteRecoveryApply,
+  legacyHeldCleanupStatus,
+  onRunLegacyHeldCleanup,
   vaultHoldReasons,
 }: {
   chatProvider: SupportedChatProvider;
@@ -143,6 +146,13 @@ export default function SettingsPanel({
   recoveryStatus: RecoveryUiStatus;
   onRunRecoveryDryRun: () => void;
   onExecuteRecoveryApply: () => void;
+  /**
+   * Recovery最終整理フェーズ「古い記録を整理する」。`recoveryStatus.applyPlan.heldCount > 0`の
+   * 間だけボタンを表示する。押すと`runLegacyHeldCleanup`を実行し、完了後は呼び出し元が
+   * Recovery診断を自動的に再実行する（このcomponentからは何もしない。結果表示だけ）。
+   */
+  legacyHeldCleanupStatus: LegacyHeldCleanupUiStatus;
+  onRunLegacyHeldCleanup: () => void;
   /**
    * 実機不具合対応（HOLD表示整理）：Tsumugi自身のVault書き込みが保留されている
    * 原因別件数。null＝HOLD無し。light-check（`vaultLightCheckStatus`）とは
@@ -1342,6 +1352,77 @@ export default function SettingsPanel({
                   ) : (
                     <span>確認が必要な記録はありません。</span>
                   )}
+                  {/*
+                    Recovery最終整理フェーズ：「確認が必要」が残っている間だけ「古い記録を整理する」を
+                    出す。押した後の実行中・完了・エラー表示は、下の独立したブロックが
+                    `legacyHeldCleanupStatus`（このrecoveryStatus.applyPlanとは別state）で描く——
+                    完了後は呼び出し元がRecovery診断を再実行し、このrecoveryStatus.applyPlan自体が
+                    最新化される（固定件数をここに書かない）。
+                  */}
+                  {recoveryStatus.applyPlan.heldCount > 0 && legacyHeldCleanupStatus.kind !== "executing" && (
+                    <button
+                      onClick={onRunLegacyHeldCleanup}
+                      disabled={vaultActionsDisabled}
+                      className="self-start rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300"
+                    >
+                      古い記録を整理する
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {legacyHeldCleanupStatus.kind === "executing" && (
+                <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  古い記録を整理しています…
+                </div>
+              )}
+
+              {legacyHeldCleanupStatus.kind === "done" && (
+                <div className="flex flex-col gap-1 rounded-xl bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                  {(() => {
+                    const { result: r, finalHeldCount } = legacyHeldCleanupStatus;
+                    const handled = r.repaired + r.archived;
+                    return (
+                      <>
+                        <span>
+                          {finalHeldCount === 0
+                            ? "古い記録を整理しました。元のデータはRecovery Archiveに保存されています。"
+                            : handled > 0
+                              ? `${handled}件を整理しました。まだ${finalHeldCount}件の確認が必要です。`
+                              : `整理できる古い記録はありませんでした。まだ${finalHeldCount}件の確認が必要です。`}
+                        </span>
+                        {r.failed > 0 && (
+                          <span className="text-red-600 dark:text-red-400">{r.failed}件は今回処理できませんでした（次回の整理で再試行できます）。</span>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {legacyHeldCleanupStatus.kind === "verify-failed" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  <span>整理結果を確認できませんでした。元のデータは保持されています。</span>
+                  <button
+                    onClick={onRunLegacyHeldCleanup}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300"
+                  >
+                    もう一度確認する
+                  </button>
+                </div>
+              )}
+
+              {legacyHeldCleanupStatus.kind === "error" && (
+                <div className="flex items-center justify-between gap-4 rounded-xl bg-red-50/60 px-3 py-2 text-xs text-red-600 dark:bg-red-950/20 dark:text-red-400">
+                  <span>{legacyHeldCleanupStatus.message}</span>
+                  <button
+                    onClick={onRunLegacyHeldCleanup}
+                    disabled={vaultActionsDisabled}
+                    className="shrink-0 rounded-full border border-red-400/60 px-3 py-1 text-xs text-red-600 transition hover:bg-red-900/5 disabled:opacity-50 dark:border-red-500/60 dark:text-red-400"
+                  >
+                    もう一度整理する
+                  </button>
                 </div>
               )}
 
