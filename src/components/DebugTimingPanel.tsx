@@ -7,6 +7,7 @@
  * 目視・コピーできるようにするためのもの。原因調査が終わり次第、このファイルと
  * ChatScreen.tsxからの呼び出しごと削除すること。
  */
+import { getRecoveryArchiveDiagnostics } from "@/lib/vaultRecoveryArchiveDebug";
 import CaptureDebugPanel from "./CaptureDebugPanel";
 import { useEffect, useState } from "react";
 import { clearTimingLog, getTimingLog, type TimingLogEntry } from "@/lib/debugTimingLog";
@@ -105,6 +106,14 @@ export default function DebugTimingPanel() {
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4, flexWrap: "wrap" }}>
         <button onClick={handleCopy} style={{ border: "1px solid #0f0", padding: "2px 6px" }}>
           全てコピー
+        </button>
+        <button onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(JSON.stringify(getRecoveryArchiveDiagnostics(), null, 2));
+            setFeedback("Recovery Archive Debugをコピーしました");
+          } catch { setFeedback("コピーに失敗しました"); }
+        }} style={{ border: "1px solid #0f0", padding: "2px 6px" }}>
+          Recovery Archive Debugをコピー
         </button>
         <button onClick={handleClear} style={{ border: "1px solid #0f0", padding: "2px 6px" }}>
           クリア

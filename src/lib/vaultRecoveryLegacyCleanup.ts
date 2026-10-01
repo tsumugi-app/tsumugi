@@ -1,3 +1,4 @@
+import { logRecoveryArchiveDiagnostic } from "./vaultRecoveryArchiveDebug";
 /** Archive-only cleanup. Current records and management files remain read-only.
  * world exclusive → save lock → pending Recovery gate → verified snapshots.
  */
@@ -46,13 +47,22 @@ function isNotFoundError(error: unknown): boolean {
 
 async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
   const segments = path.split("/");
+  let operation = "resolve-directory";
   try {
     let dir = root;
     for (const name of segments.slice(0, -1)) dir = await dir.getDirectoryHandle(name, { create: false });
+    operation = "getFileHandle";
     const fileHandle = await dir.getFileHandle(segments[segments.length - 1], { create: false });
+    operation = "getFile";
     const file = await fileHandle.getFile();
+    operation = "text";
     return { state: "ok", text: await file.text() };
   } catch (error) {
+    // Preserve the existing reader result; distinguish read-vs-resolution failure
+    // in diagnostics only. No new absence/identity policy in this commit.
+    logRecoveryArchiveDiagnostic({ stage: "identity-read", archivePath: path, filesystemOperation: operation,
+      reason: isNotFoundError(error) && (operation === "getFileHandle" || operation === "resolve-directory")
+        ? "vault-identity-missing" : "vault-identity-read-error" }, error);
     return isNotFoundError(error) ? { state: "absent" } : { state: "error" };
   }
 }
@@ -109,10 +119,27 @@ function canonicalContentFor(local: Conversation | MemoryObject | Source): strin
 }
 
 async function actualIdentityMatches(env: LegacyCleanupEnv): Promise<boolean> {
-  if (!env.vaultIdentity?.vaultId) return false;
+  if (!env.vaultIdentity?.vaultId) {
+    logRecoveryArchiveDiagnostic({ stage: "identity", identityStatus: "canonical-missing", reason: "canonical-identity-missing" });
+    return false;
+  }
   const read = await readTextAt(env.root, ".tsumugi/vault-identity.json");
-  if (read.state !== "ok") return false;
-  try { return JSON.parse(read.text).vaultId === env.vaultIdentity.vaultId; } catch { return false; }
+  if (read.state !== "ok") {
+    logRecoveryArchiveDiagnostic({ stage: "identity", identityStatus: "unconfirmed", expectedWorldIdentity: env.vaultIdentity.vaultId });
+    return false;
+  }
+  try {
+    // Keep the original comparison, including its failure behavior.
+    const actual = JSON.parse(read.text).vaultId;
+    const matches = actual === env.vaultIdentity.vaultId;
+    logRecoveryArchiveDiagnostic({ stage: "identity", identityStatus: matches ? "matched" : "mismatch",
+      expectedWorldIdentity: env.vaultIdentity.vaultId, actualWorldIdentity: typeof actual === "string" ? actual : undefined,
+      reason: matches ? "world-identity-matched" : "world-identity-mismatch" });
+    return matches;
+  } catch (error) {
+    logRecoveryArchiveDiagnostic({ stage: "identity", identityStatus: "unconfirmed", reason: "vault-identity-parse-error", expectedWorldIdentity: env.vaultIdentity.vaultId }, error);
+    return false;
+  }
 }
 
 async function freshLocalSnapshot(): Promise<RecoveryLocalSnapshot> {
@@ -234,7 +261,10 @@ export async function excludeArchivedFromRecoveryPlan(env: LegacyCleanupEnv, pla
     const counts: RecoveryPlan["counts"] = { ...EMPTY_RECOVERY_PLAN_COUNTS };
     records.forEach((r) => counts[r.classification]++);
     return { ...plan, records, counts };
-  } catch { return plan; }
+  } catch (error) {
+    logRecoveryArchiveDiagnostic({ stage: "warning-exclusion", reason: "unconfirmed-retain-all" }, error);
+    return plan;
+  }
 }
 
 /**
@@ -255,7 +285,10 @@ export async function excludeArchivedFromApplyPlan(env: LegacyCleanupEnv, plan: 
       held.push(h);
     }
     return { ...plan, held, heldCount: held.length };
-  } catch { return plan; }
+  } catch (error) {
+    logRecoveryArchiveDiagnostic({ stage: "warning-exclusion", reason: "unconfirmed-retain-all" }, error);
+    return plan;
+  }
 }
 
 /**
@@ -264,9 +297,25 @@ export async function excludeArchivedFromApplyPlan(env: LegacyCleanupEnv, plan: 
  * recordが「確認が必要」から正しく外れる。
  */
 export async function planRecoveryApplyExcludingArchived(applyEnv: RecoveryApplyEnv): Promise<RecoveryApplyPlan> {
-  const raw = await planRecoveryApply(applyEnv);
-  const vaultIdentity = await getVaultIdentityRecord();
-  return excludeArchivedFromApplyPlan({ root: applyEnv.root, vaultIdentity: vaultIdentity ?? null }, raw);
+  logRecoveryArchiveDiagnostic({ stage: "diagnosis-start" });
+  let stage = "recovery-plan";
+  try {
+    const raw = await planRecoveryApply(applyEnv);
+    stage = "canonical-identity-read";
+    const vaultIdentity = await getVaultIdentityRecord();
+    const env = { root: applyEnv.root, vaultIdentity: vaultIdentity ?? null };
+    // Observational preflight for "確認する". Discard the result: it must NOT
+    // short-circuit or authorize warning exclusion, cleanup, or identity creation.
+    try { await actualIdentityMatches(env); }
+    catch (error) { logRecoveryArchiveDiagnostic({ stage: "identity", identityStatus: "unconfirmed" }, error); }
+    stage = "warning-exclusion";
+    const result = await excludeArchivedFromApplyPlan(env, raw);
+    logRecoveryArchiveDiagnostic({ stage: "diagnosis-complete", reason: "read-only-complete" });
+    return result;
+  } catch (error) {
+    logRecoveryArchiveDiagnostic({ stage }, error);
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,11 +354,14 @@ export type LegacyHeldCleanupRunResult = LegacyHeldCleanupResult | { notRun: "re
  * 呼び出し元（UI）は追加のlockラップを必要としない。
  */
 export async function runLegacyHeldCleanup(env: LegacyCleanupEnv): Promise<LegacyHeldCleanupRunResult> {
+  logRecoveryArchiveDiagnostic({ stage: "journal-precheck" });
   if (await isRecoveryBlockingNormalWrites()) return { notRun: "recovery-in-progress" }; // 早期return（待機コスト削減。安全性の根拠ではない）。
+  logRecoveryArchiveDiagnostic({ stage: "world-lock-wait" });
   const locked = await runVaultWorldExclusive(() =>
     withVaultSaveLock(async (): Promise<LegacyHeldCleanupResult | { notRun: "recovery-in-progress" }> => {
       // ここが安全性の根拠：lock取得後に必ず再確認する（lock取得前の確認だけでは、
       // lock待機中に別タブ・別操作がRecoveryを開始した場合を見逃す）。
+      logRecoveryArchiveDiagnostic({ stage: "journal-post-lock" });
       if (await isRecoveryBlockingNormalWrites()) return { notRun: "recovery-in-progress" };
       return runLegacyHeldCleanupImpl(env);
     })
@@ -320,7 +372,9 @@ export async function runLegacyHeldCleanup(env: LegacyCleanupEnv): Promise<Legac
 
 async function runLegacyHeldCleanupImpl(env: LegacyCleanupEnv): Promise<LegacyHeldCleanupResult> {
   if (!(await actualIdentityMatches(env))) throw new Error("vault-identity-unconfirmed");
+  logRecoveryArchiveDiagnostic({ stage: "canonical-snapshot" });
   const snapshot = await freshLocalSnapshot();
+  logRecoveryArchiveDiagnostic({ stage: "recovery-scan" });
   const plan = await buildVaultRecoveryPlan(env.root, snapshot);
 
   const details: LegacyHeldResolution[] = [];
@@ -337,9 +391,12 @@ async function runLegacyHeldCleanupImpl(env: LegacyCleanupEnv): Promise<LegacyHe
       continue;
     }
     try {
+      logRecoveryArchiveDiagnostic({ stage: "archive-record", recordType: r.recordType, recordId: r.recordId, classification: r.classification });
       const result = await archiveHeldRecord(env, r, local);
+      logRecoveryArchiveDiagnostic({ stage: "archive-record-result", recordType: r.recordType, recordId: r.recordId, classification: r.classification, reason: "reason" in result ? result.reason : result.outcome });
       details.push({ recordType: r.recordType, recordId: r.recordId, classification: r.classification, result });
     } catch (error) {
+      logRecoveryArchiveDiagnostic({ stage: "archive-record-error", recordType: r.recordType, recordId: r.recordId, classification: r.classification }, error);
       // 1件の予期しない失敗（page kill・一時I/Oエラー等）で他recordの処理を止めない。
       // このrecordの現在のVault/canonical自体は一切変更していないため、次回再試行できる。
       details.push({

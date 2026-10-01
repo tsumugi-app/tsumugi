@@ -1,3 +1,4 @@
+import { logRecoveryArchiveDiagnostic } from "./vaultRecoveryArchiveDebug";
 /** Append-only recovery snapshots. Current Markdown/metadata/IndexedDB are never written.
  * Caller holds world exclusive → save lock. File System Access has no exclusive-create
  * primitive: absence is checked immediately before each creation; cooperative writers
@@ -54,14 +55,19 @@ async function readText(root: FileSystemDirectoryHandle, path: string): Promise<
 export async function readAllPathsForArchive(root: FileSystemDirectoryHandle, paths: string[]): Promise<RecoveryArchiveReadPathsResult> {
   const contents: Record<string, string> = Object.create(null);
   const hashes: Record<string, string> = Object.create(null);
+  let currentPath: string | undefined;
   try {
     for (const path of paths) {
+      currentPath = path;
       // Every observed path must still be readable; disappearance is not an empty snapshot.
       contents[path] = await readText(root, path);
       hashes[path] = hashVaultText(contents[path]);
     }
     return { ok: true, contents, hashes };
-  } catch { return { ok: false, reason: "path-unconfirmed" }; }
+  } catch (error) {
+    logRecoveryArchiveDiagnostic({ stage: "raw-path-read", archivePath: currentPath, filesystemOperation: "resolve/getFile/text", reason: "path-unconfirmed" }, error);
+    return { ok: false, reason: "path-unconfirmed" };
+  }
 }
 function newArchiveId(): string { return `${Date.now().toString(36)}-${crypto.randomUUID()}`; }
 function safeName(s: string): string { return s.replace(/[^a-zA-Z0-9._-]/g, "_"); }
@@ -107,18 +113,38 @@ async function createNewText(root: FileSystemDirectoryHandle, path: string, text
   throw new Error("archive-destination-exists");
 }
 export async function writeRecoveryArchiveEntry(env: RecoveryArchiveWriteEnv, input: Omit<RecoveryArchiveEntry, "version" | "archiveId" | "createdAt">): Promise<WriteRecoveryArchiveResult> {
+  let stage = "archive-prepare";
+  let archivePath: string | undefined;
+  const trace = (next: string, path?: string) => {
+    stage = next; archivePath = path;
+    logRecoveryArchiveDiagnostic({ stage, archivePath, recordType: input.recordType, recordId: input.recordId, classification: input.classification, filesystemOperation: next });
+  };
   try {
+    trace(stage);
     const entry: RecoveryArchiveEntry = { ...input, version: 1, archiveId: newArchiveId(), createdAt: (env.now ?? (() => new Date().toISOString()))() };
     const text = JSON.stringify(entry); parseArchiveEntry(text);
     const name = entryFileName(entry), temp = `${ARCHIVE_DIR}/.tmp-${name}`, final = `${ARCHIVE_DIR}/${name}`;
     if (await resolveFile(env.root, temp) || await resolveFile(env.root, final)) return { ok: false, reason: "archive-id-collision" };
+    trace("temp-write", temp);
     await createNewText(env.root, temp, text);
-    if (await readText(env.root, temp) !== text) return { ok: false, reason: "temp-verify-failed" };
+    trace("temp-readback", temp);
+    if (await readText(env.root, temp) !== text) {
+      logRecoveryArchiveDiagnostic({ stage, archivePath, reason: "temp-verify-failed" });
+      return { ok: false, reason: "temp-verify-failed" };
+    }
+    trace("final-write", final);
     await createNewText(env.root, final, text);
-    if (await readText(env.root, final) !== text) return { ok: false, reason: "final-verify-failed" };
+    trace("final-readback", final);
+    if (await readText(env.root, final) !== text) {
+      logRecoveryArchiveDiagnostic({ stage, archivePath, reason: "final-verify-failed" });
+      return { ok: false, reason: "final-verify-failed" };
+    }
     // Leave temp for interrupted-write forensic recovery. It is never a resolution entry.
     return { ok: true, entry };
-  } catch { return { ok: false, reason: "archive-write-or-verify-failed" }; }
+  } catch (error) {
+    logRecoveryArchiveDiagnostic({ stage, archivePath, recordType: input.recordType, recordId: input.recordId, classification: input.classification, filesystemOperation: stage, reason: "archive-write-or-verify-failed" }, error);
+    return { ok: false, reason: "archive-write-or-verify-failed" };
+  }
 }
 async function archiveDirectory(root: FileSystemDirectoryHandle): Promise<FileSystemDirectoryHandle | null> {
   try { let dir = root; for (const part of ARCHIVE_DIR.split("/")) dir = await dir.getDirectoryHandle(part, { create: false }); return dir; }

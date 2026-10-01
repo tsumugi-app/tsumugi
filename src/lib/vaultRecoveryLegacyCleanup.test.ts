@@ -1021,3 +1021,162 @@ test("Review: same timestamp archives preserve all versions and reuse matching s
   assert.equal(vault.writeCount,writes);assert.equal(archivePaths.length,2);assert.equal(await held(vault),0);
   vault.put(file,raw);assert.equal(await held(vault),0);
 });
+
+const archiveDebug = require(path.join(OUT, "lib/vaultRecoveryArchiveDebug.js")) as typeof import("./vaultRecoveryArchiveDebug");
+async function batchFixture() {
+  await resetAll();
+  const vault = new FakeVault(); seedVaultIdentity(vault); await dbMod.putVaultIdentityRecord(identity());
+  for (let i = 0; i < 13; i++) {
+    const c = conversation(`batch-${i.toString().padStart(2, "0")}`);
+    await dbMod.putConversation(c);
+    vault.put(`Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`, markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "legacy unique original", timestamp: T }] }));
+  }
+  return vault;
+}
+
+test("iPhone A/C/D/J: 13 records, frozen clock, no archive self-interference or current data writes", async t => {
+  const vault = await batchFixture();
+  const before = currentFiles(vault), local = await dbMod.getAllConversations();
+  t.mock.method(Date, "now", () => 123456789);
+  assert.equal(await held(vault), 13);
+  const result = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
+  assert.equal(result.archived, 13); assert.equal(result.failed, 0); assert.equal(await held(vault), 0);
+  assert.equal(finalArchivePaths(vault).length, 13);
+  assert.equal(new Set(vault.writes).size, 26);
+  assert.deepEqual(currentFiles(vault), before); assert.deepEqual(await dbMod.getAllConversations(), local);
+});
+
+test("iPhone B/I: 13 Memory records share whole raw day-file including Vault-only member and unknown fields", async () => {
+  await resetAll(); const vault = new FakeVault(); seedVaultIdentity(vault); await dbMod.putVaultIdentityRecord(identity());
+  const originals: MemoryObject[] = [];
+  for (let i = 0; i < 13; i++) {
+    const m = memory(`shared-${i}`, "2026-10-10"); await dbMod.putMemoryObject(m);
+    originals.push({ ...m, content: `legacy unique ${i}` });
+  }
+  originals.push(memory("vault-only-unique", "2026-10-10"));
+  const raw = originals.map(m => markdownMod.memoryObjectToMarkdown(m).replace("---\n", "---\nunknownLegacyField: keep-me\n")).join("\n<!-- tsumugi:entry -->\n\n");
+  const file = `Memories/${vaultMod.dayFileNameFor(T)}`; vault.put(file, raw);
+  const before = currentFiles(vault), local = await dbMod.getAllMemoryObjects();
+  const result = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
+  assert.equal(result.archived, 13);
+  for (const e of await archiveMod.listRecoveryArchiveEntries(vault.root())) assert.equal(e.rawFileContents[file], raw);
+  assert.deepEqual(currentFiles(vault), before); assert.deepEqual(await dbMod.getAllMemoryObjects(), local);
+  const filtered = await cleanupMod.excludeArchivedFromRecoveryPlan(makeEnv(vault), await cleanupMod.readCurrentRecoveryPlanForCleanup(vault.root()));
+  assert.equal(filtered.records.filter(r => r.indexedDBExists).length, 0);
+});
+
+test("iPhone E: five successful archives then persistent temp failure; retry reuses five originals", async () => {
+  const vault = await batchFixture();
+  vault.beforeClose = () => { if (finalArchivePaths(vault).length >= 5) throw new DOMException("write denied", "NotAllowedError"); };
+  const first = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
+  assert.equal(first.archived, 5); assert.equal(first.failed, 8); assert.equal(await held(vault), 8);
+  const saved = new Map(finalArchivePaths(vault).map(p => [p, vault.get(p)]));
+  const oldWrites = vault.writeCount; vault.beforeClose = undefined;
+  const second = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
+  assert.equal(second.archived, 13); assert.equal(vault.writeCount - oldWrites, 16);
+  for (const [p, raw] of saved) assert.equal(vault.get(p), raw);
+  assert.equal(finalArchivePaths(vault).length, 13); assert.equal(await held(vault), 0);
+});
+
+test("iPhone F/G: external current-data change during archive is not excluded by fresh diagnosis", async () => {
+  const { vault, file, raw } = await reviewFixture("external-during-archive");
+  const changed = raw.replace("unique Vault original", "externally changed unique original");
+  vault.beforeClose = p => { if (!p.includes("/.tmp-")) vault.put(file, changed); };
+  await cleanupMod.runLegacyHeldCleanup(makeEnv(vault));
+  assert.equal(await held(vault), 1); assert.equal(vault.get(file), changed);
+  assert.equal((await archiveMod.listRecoveryArchiveEntries(vault.root()))[0].rawFileContents[file], raw);
+});
+
+for (const kind of ["canonical-missing", "missing", "different", "read-error", "parse-error"] as const) {
+  test(`iPhone pre-loop failure diagnostics: identity ${kind}, zero archive writes`, async () => {
+    const vault = await batchFixture(); const env = makeEnv(vault);
+    if (kind === "canonical-missing") env.vaultIdentity = null;
+    if (kind === "missing") vault.delete(".tsumugi/vault-identity.json");
+    if (kind === "different") vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "different" }));
+    if (kind === "read-error") vault.onRead = (p, text) => { if (p.endsWith("vault-identity.json")) throw new DOMException("provider read failed", "NotFoundError"); return text; };
+    if (kind === "parse-error") vault.put(".tsumugi/vault-identity.json", '{"privateContent":"never-log-this"');
+    archiveDebug.clearRecoveryArchiveDiagnostics();
+    await assert.rejects(cleanupMod.runLegacyHeldCleanup(env), /vault-identity-unconfirmed/);
+    assert.equal(vault.writeCount, 0); assert.equal(await held(vault), 13);
+    const logs = archiveDebug.getRecoveryArchiveDiagnostics();
+    const reasons = { "canonical-missing": "canonical-identity-missing", missing: "vault-identity-missing", different: "world-identity-mismatch", "read-error": "vault-identity-read-error", "parse-error": "vault-identity-parse-error" };
+    assert.ok(logs.some(e => e.reason === reasons[kind]));
+    assert.ok(!JSON.stringify(logs).includes("never-log-this"));
+  });
+}
+
+test("iPhone H: write diagnostic retains filesystem stage/error without raw Memory contents", async () => {
+  const { vault } = await reviewFixture("write-diagnostic"); archiveDebug.clearRecoveryArchiveDiagnostics();
+  vault.beforeClose = () => { throw new DOMException("provider write denied", "NotAllowedError"); };
+  const result = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
+  assert.equal(result.failed, 1); assert.equal(await held(vault), 1);
+  const logs = archiveDebug.getRecoveryArchiveDiagnostics();
+  assert.ok(logs.some(e => e.stage === "temp-write" && e.errorName === "NotAllowedError" && e.archivePath?.includes("/.tmp-")));
+  assert.ok(!JSON.stringify(logs).includes("unique Vault original"));
+});
+
+
+test("iPhone read-only diagnosis exposes missing identity without another cleanup attempt", async () => {
+  const vault = await batchFixture(); vault.delete(".tsumugi/vault-identity.json");
+  archiveDebug.clearRecoveryArchiveDiagnostics();
+  const plan = await cleanupMod.planRecoveryApplyExcludingArchived(applyEnvFor(vault));
+  assert.equal(plan.heldCount, 13); assert.equal(vault.writeCount, 0);
+  assert.ok(archiveDebug.getRecoveryArchiveDiagnostics().some(e => e.reason === "vault-identity-missing"));
+});
+
+test("Diagnostics: healthy identity is visible and read-only diagnosis does not create archives or alter canonical", async () => {
+  const vault = await batchFixture();
+  const files = [...vault.files].map(([p, f]) => [p, f.content, f.mtime]);
+  const local = await dbMod.getAllConversations();
+  archiveDebug.clearRecoveryArchiveDiagnostics();
+  const plan = await cleanupMod.planRecoveryApplyExcludingArchived(applyEnvFor(vault));
+  const logs = archiveDebug.getRecoveryArchiveDiagnostics();
+  const id = logs.find(e => e.identityStatus === "matched");
+  assert.ok(id); assert.equal(id.expectedWorldIdentity, id.actualWorldIdentity);
+  assert.notEqual(id.expectedWorldIdentity, VAULT_ID);
+  assert.ok(logs.some(e => e.stage === "diagnosis-complete"));
+  assert.equal(plan.heldCount, 13); assert.equal(vault.writeCount, 0);
+  assert.deepEqual([...vault.files].map(([p, f]) => [p, f.content, f.mtime]), files);
+  assert.deepEqual(await dbMod.getAllConversations(), local);
+});
+
+test("Diagnostics: observation failure must not short-circuit existing warning exclusion", async () => {
+  const { vault } = await reviewFixture("observation-not-a-gate");
+  await cleanupMod.runLegacyHeldCleanup(makeEnv(vault));
+  let reads = 0;
+  vault.onRead = (p, text) => {
+    // The preflight is inconclusive, but existing exclusion can independently
+    // verify the same identity on its own fresh read. Preserve that decision.
+    if (p.endsWith("vault-identity.json") && ++reads === 1) throw new DOMException("transient", "SecurityError");
+    return text;
+  };
+  assert.equal((await cleanupMod.planRecoveryApplyExcludingArchived(applyEnvFor(vault))).heldCount, 0);
+  assert.ok(reads >= 2);
+});
+
+test("Diagnostics: error/reason/extra-field payloads never expose body or secrets", () => {
+  archiveDebug.clearRecoveryArchiveDiagnostics();
+  const secret = 'private body and API_KEY=secret-123';
+  for (const error of [new Error(secret), new TypeError(secret), new SyntaxError(secret), new DOMException(secret, "SecurityError"), secret]) {
+    archiveDebug.logRecoveryArchiveDiagnostic({ stage: "privacy-test", reason: secret,
+      expectedWorldIdentity: secret, actualWorldIdentity: secret,
+      ...({ canonicalRaw: secret, rawFileContents: secret, errorMessage: secret } as Record<string, string>),
+    }, error);
+  }
+  const logs = archiveDebug.getRecoveryArchiveDiagnostics();
+  assert.ok(!JSON.stringify(logs).includes(secret));
+  assert.ok(!JSON.stringify(logs).includes("canonicalRaw"));
+  assert.ok(logs.every(e => e.reason === "unrecognized-reason"));
+  assert.ok(logs.every(e => e.expectedWorldIdentity === e.actualWorldIdentity));
+  for (let i = 0; i < 310; i++) archiveDebug.logRecoveryArchiveDiagnostic({ stage: "bounded" });
+  assert.equal(archiveDebug.getRecoveryArchiveDiagnostics().length, 300);
+});
+
+test("Diagnostics: copy UI is debug-only and does not run cleanup", () => {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const source = fs.readFileSync(path.join(process.cwd(), "src/components/DebugTimingPanel.tsx"), "utf8");
+  assert.ok(source.includes('get("debugLog") === "1"'));
+  assert.ok(source.indexOf('if (!enabled) return null') < source.indexOf('Recovery Archive Debugをコピー'));
+  assert.ok(source.includes('navigator.clipboard.writeText(JSON.stringify(getRecoveryArchiveDiagnostics(), null, 2))'));
+  assert.ok(!source.includes('runLegacyHeldCleanup'));
+});
