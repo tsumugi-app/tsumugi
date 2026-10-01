@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { decodeTime } from "ulid";
 import {
   isHistoryDayIndexV2,
   readConversationById,
@@ -13,12 +14,14 @@ import {
 import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
-import { jstDateOf, jstDateOfUlid, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
+import { JST_TIME_ZONE, jstDateOf, jstDateOfUlid, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
 import {
   conversationEntryKindLabel,
   conversationEntryKindOf,
   CONVERSATION_ENTRY_KIND_LABEL,
+  type ConversationEntryKind,
 } from "@/lib/conversationEntryKind";
+import { buildReflectionMap, fallbackConversationTitle } from "@/lib/historyConversationCard";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -45,6 +48,60 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
 function personaModeLabel(persona: Persona): string {
   return conversationEntryKindLabel(persona);
 }
+
+/**
+ * Conversation History（STEP 3）：entry kind（日記／会話）を一瞬で識別するための、
+ * 控えめな視覚区別（card左端の細いborderと、ラベル文字色だけ）。既存のstone基調の
+ * デザインを壊さないよう、card全面やbadgeの塗りつぶしはしない。新しい色トークンは
+ * 追加せず、Tailwindの既存パレット（rose/sky）を直接使う最小限の追加にとどめる。
+ */
+const ENTRY_KIND_ACCENT: Record<ConversationEntryKind, { text: string; borderLeft: string }> = {
+  diary: {
+    text: "text-rose-600 dark:text-rose-400",
+    borderLeft: "border-l-rose-400 dark:border-l-rose-500",
+  },
+  conversation: {
+    text: "text-sky-600 dark:text-sky-400",
+    borderLeft: "border-l-sky-400 dark:border-l-sky-500",
+  },
+};
+
+/**
+ * 任意の時刻（ISO文字列・epoch ms）から、Asia/Tokyo基準の時刻（HH:MM）だけを取り出す。
+ * `jstDateOf`（日付のみ）の時刻版。Conversation card表示用（STEP 3）。
+ * 不正な入力の場合はnull（fail-soft。例外は投げない）。
+ */
+function jstTimeOf(instant: string | number): string | null {
+  const date = new Date(instant);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: JST_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
+  const hour = get("hour");
+  const minute = get("minute");
+  if (!hour || !minute) return null;
+  return `${hour}:${minute}`;
+}
+
+/**
+ * ULID（`conversation.id`）の生成時刻からJST時刻を近似する（`jstDateOfUlid`と同じ
+ * 考え方）。History Index v2のConversation行は`startedAt`を持たないため、本体を
+ * 読まずにConversation card上へ時刻を表示するために使う。decode失敗時はnull。
+ */
+function jstTimeOfUlid(id: string): string | null {
+  try {
+    return jstTimeOf(decodeTime(id));
+  } catch {
+    return null;
+  }
+}
+
+// fallbackConversationTitle・buildReflectionMap（要件4/7）は、`node --test`で検証できる
+// よう`src/lib/historyConversationCard.ts`（JSX/DOM非依存の純粋関数）へ分離した。
 
 const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
 
@@ -240,6 +297,24 @@ export default function HistoryPanel({
   const lastKnownTodayRef = useRef(todayKey());
   const [selectedMemory, setSelectedMemory] = useState<MemoryObject | null>(null);
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
+  /**
+   * Conversation History（STEP 3、要件10）：Conversation detail内の「会話全文を見る」。
+   * trueの間だけraw Conversation（既存のturns＋HistoryTurnBubble表示、Layer 3）を見せる。
+   * `selectedConversation`が変わる・クリアされる全箇所で、既存のfalseへ一緒にリセットする
+   * （詳細は各setSelectedConversation呼び出し箇所のコメント参照）。
+   */
+  const [rawConversationView, setRawConversationView] = useState(false);
+  /**
+   * Conversation History（STEP 3、要件3/5/7）：選択中の日のConversation card・detailへ
+   * 表示するための、本体（title・persona・turns）とReflection（conversationId紐付け）。
+   * HistoryDayIndexV2.modeはcanonical sourceにしない（要件5）——ここで読み終えた
+   * 本体のpersonaから`conversationEntryKindOf`で都度導出する。読み込みは選択中の日の
+   * 行数分だけに限定され（Vault全体のscanはしない）、READ ONLY（書き込みは一切しない）。
+   */
+  const [conversationFullById, setConversationFullById] = useState<Map<string, Conversation>>(new Map());
+  const [reflectionByConversationId, setReflectionByConversationId] = useState<Map<string, MemoryObject>>(new Map());
+  /** 上記2つの本体読み込みが進行中かどうか（card側のskeleton表示切り替え用）。 */
+  const [enrichingDay, setEnrichingDay] = useState(false);
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
   /**
@@ -286,6 +361,7 @@ export default function HistoryPanel({
     setDetailUnavailable(false);
     setSelectedConversation(null);
     setSelectedMemory(null);
+    setRawConversationView(false);
   }, [refreshToken]);
 
   // race対策：月Index読み込み・日付詳細読み込み・詳細（Conversation/Memory本体）読み込み
@@ -297,6 +373,8 @@ export default function HistoryPanel({
   const monthRequestRef = useRef(0);
   const dayRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
+  /** Conversation History（STEP 3）：title/Reflection enrichment効果専用のcancellationトークン。 */
+  const enrichRequestRef = useRef(0);
   // 同一History表示セッション（このコンポーネントがマウントされている間）だけの
   // 短期メモリキャッシュ。History Index・Vaultデータそのものを置き換えるものではなく、
   // 「A→B→A」のように同じ日を行き来した際にVault I/Oを省略するためだけの一時キャッシュ。
@@ -369,6 +447,7 @@ export default function HistoryPanel({
       setSelectedDay(todayKey());
       setSelectedMemory(null);
       setSelectedConversation(null);
+      setRawConversationView(false);
       setDetailUnavailable(false);
       setMonthIndex(null);
       setPrevMonthIndex(null);
@@ -687,7 +766,10 @@ export default function HistoryPanel({
 
         const conversationRowsNext = perBucket
           .flatMap((r) => r.conversations)
-          .filter((row) => logicalDateOfConversationRow(row) === logicalDay);
+          .filter((row) => logicalDateOfConversationRow(row) === logicalDay)
+          // Conversation History（STEP 3）：card一覧を時系列順にする（idのULIDは
+          // 生成時刻で辞書順ソート可能。既存のmemoryRowsNextのcreatedAtソートと同じ考え方）。
+          .sort((a, b) => a.id.localeCompare(b.id));
         const memoryRowsNext = perBucket
           .flatMap((r) => r.memories)
           .filter((row) => logicalDateOfMemoryRow(row) === logicalDay)
@@ -708,13 +790,88 @@ export default function HistoryPanel({
   }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, monthLoading, refreshToken]);
 
   /**
+   * Conversation History（STEP 3）：選択中の日のConversation card・detailに必要な、
+   * title・persona・Reflectionを読み込む（READ ONLY。Vault/IndexedDBへの書き込みは
+   * 一切行わない）。`conversationRows`/`memoryRows`が確定した直後に走る。
+   *
+   * 読み込み範囲は「選択中の日に実在する行数分」だけに限定する（Vault全体のscanは
+   * しない）。v1 fallback由来の行は`row.full`に本体が既に入っているため追加readは
+   * 発生しない（即座にseedする）。v2高速パス由来の行（本来`本体read 0回`）だけ、
+   * この効果で個別に1回ずつ読む——History一覧カードにtitleとReflection previewを
+   * 表示するというSTEP 3の要件上、この追加readは避けられない（詳細は完了報告参照）。
+   *
+   * Reflectionは`conversationId`で対応するConversationへ紐付ける。同一conversationIdに
+   * 複数のReflectionが存在する場合は`buildReflectionMap`（最新を採用）で1件に決定する。
+   *
+   * entry kindは常にこの効果で読み終えた本体の`persona`から`conversationEntryKindOf`で
+   * 導出する（要件5：HistoryDayIndexV2.modeをcanonical sourceにしない）。本体を読む前の
+   * 短い間だけ、card側は`row.modeLabel`（Index由来、要request5のcanonical sourceでは
+   * ない一時的な控えめな代替）を表示する——詳細はConversationCardコンポーネント参照。
+   */
+  useEffect(() => {
+    const requestId = ++enrichRequestRef.current;
+    if (!vaultHandle) {
+      setConversationFullById(new Map());
+      setReflectionByConversationId(new Map());
+      setEnrichingDay(false);
+      return;
+    }
+
+    const seededConversations = new Map(
+      conversationRows
+        .filter((row): row is ConversationRow & { full: Conversation } => !!row.full)
+        .map((row) => [row.id, row.full])
+    );
+    setConversationFullById(seededConversations);
+
+    const reflectionRows = memoryRows.filter((row) => row.origin === "reflection");
+    const seededReflections = reflectionRows
+      .filter((row): row is MemoryRow & { full: MemoryObject } => !!row.full)
+      .map((row) => row.full);
+
+    const conversationsToFetch = conversationRows.filter((row) => !row.full);
+    const reflectionsToFetch = reflectionRows.filter((row) => !row.full);
+
+    if (conversationsToFetch.length === 0 && reflectionsToFetch.length === 0) {
+      setReflectionByConversationId(buildReflectionMap(seededReflections));
+      setEnrichingDay(false);
+      return;
+    }
+
+    setEnrichingDay(true);
+    const handle = vaultHandle;
+    (async () => {
+      const [fetchedConversations, fetchedReflections] = await Promise.all([
+        Promise.all(conversationsToFetch.map((row) => readConversationById(handle, row.id, row.bucketDay))),
+        Promise.all(reflectionsToFetch.map((row) => readReflectionById(handle, row.id, row.bucketDay))),
+      ]);
+      if (enrichRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
+
+      const conversationMap = new Map(seededConversations);
+      conversationsToFetch.forEach((row, index) => {
+        const full = fetchedConversations[index];
+        if (full) conversationMap.set(row.id, full);
+      });
+      setConversationFullById(conversationMap);
+
+      const allReflections = [...seededReflections, ...fetchedReflections.filter((m): m is MemoryObject => m !== null)];
+      setReflectionByConversationId(buildReflectionMap(allReflections));
+      setEnrichingDay(false);
+    })();
+  }, [vaultHandle, conversationRows, memoryRows]);
+
+  /**
    * 一覧行タップ時のオンデマンド詳細読み込み。`full`が既に設定済み（v1 fallbackで
    * 本体を読み終えている）ならその場で使い、追加のreadは発生させない。未設定
    * （v2の日、Vault本体read 0回で構築した行）の場合だけ、その1件分のMarkdownを読む。
    */
   async function openConversationRow(row: ConversationRow) {
-    if (row.full) {
-      setSelectedConversation(row.full);
+    // Conversation History（STEP 3）：card表示用に既に読み終えている本体
+    // （`conversationFullById`、要件5のcanonical source）があればそれを使う。
+    setRawConversationView(false);
+    const enriched = conversationFullById.get(row.id) ?? row.full;
+    if (enriched) {
+      setSelectedConversation(enriched);
       return;
     }
     if (!vaultHandle || !selectedDay) return;
@@ -794,11 +951,19 @@ export default function HistoryPanel({
    * そのまま受け取るだけ）。idで重複排除するため、Vault側読み込みが追いついた後に
    * 二重表示にはならない。
    */
+  /**
+   * Conversation History（STEP 3、要件11）：Reflection（`origin === "reflection"`）は
+   * もうこの「記憶」一覧の要素として表示しない——Conversation card／detail側へ
+   * `reflectionByConversationId`経由で紐付けて表示する（上記enrichment効果参照）。
+   * ここでは通常Memoryだけに絞り込む。
+   */
+  const normalMemoryRows = useMemo(() => memoryRows.filter((row) => row.origin !== "reflection"), [memoryRows]);
+
   const displayedMemoryRows = useMemo(() => {
     if (selectedDay !== todayKey() || sessionCapturedMemories.length === 0) {
-      return memoryRows;
+      return normalMemoryRows;
     }
-    const seenIds = new Set(memoryRows.map((row) => row.id));
+    const seenIds = new Set(normalMemoryRows.map((row) => row.id));
     const todaysSessionRows: MemoryRow[] = sessionCapturedMemories
       // JST日付モデル Phase 1修正：`memory.date`のLogical Date（JST）で判定する
       // （以前はUTCベースの`slice(0, 10)`で、JST 0:00〜8:59台に保存された今回
@@ -820,9 +985,9 @@ export default function HistoryPanel({
         bucketDay: memory.date.slice(0, 10),
         full: memory,
       }));
-    if (todaysSessionRows.length === 0) return memoryRows;
-    return [...memoryRows, ...todaysSessionRows].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  }, [memoryRows, selectedDay, sessionCapturedMemories]);
+    if (todaysSessionRows.length === 0) return normalMemoryRows;
+    return [...normalMemoryRows, ...todaysSessionRows].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }, [normalMemoryRows, selectedDay, sessionCapturedMemories]);
 
   const hasSessionRecordToday = useMemo(
     () => sessionCapturedMemories.some((memory) => jstDateOf(memory.date) === todayKey()),
@@ -869,11 +1034,25 @@ export default function HistoryPanel({
   // （`full`が設定済みの）Conversationからだけ作る（追加のVault読み込みは行わない。
   // v2の日で由来会話がまだ詳細表示されていない場合は、この一覧に無いため表示を省略
   // する——UIの完全再現ではなく「その日の記録を確認できる」ことを優先する方針）。
-  const conversationById = new Map(
-    conversationRows
+  // Conversation History（STEP 3）：`conversationFullById`（enrichment効果、要件5の
+  // canonical source）を優先し、まだそこに無い行だけ`row.full`（v1 fallback由来）で補う。
+  const conversationById = new Map<string, Conversation>([
+    ...conversationRows
       .filter((row): row is ConversationRow & { full: Conversation } => !!row.full)
-      .map((row) => [row.id, row.full])
-  );
+      .map((row): [string, Conversation] => [row.id, row.full]),
+    ...conversationFullById,
+  ]);
+
+  // Conversation History（STEP 3）：Conversation detail表示用の派生値。entry kindは
+  // 必ず`selectedConversation.persona`（canonical）から導出する（要件5）。titleは
+  // 無ければ表示専用fallback（`fallbackConversationTitle`、canonicalへは保存しない）。
+  const selectedConversationEntryKind = selectedConversation ? conversationEntryKindOf(selectedConversation.persona) : null;
+  const selectedConversationTitle = selectedConversation
+    ? selectedConversation.title?.trim() || fallbackConversationTitle(selectedConversation)
+    : null;
+  const selectedConversationReflection = selectedConversation
+    ? reflectionByConversationId.get(selectedConversation.id)
+    : undefined;
 
   const monthGrid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
 
@@ -911,6 +1090,7 @@ export default function HistoryPanel({
     setSelectedDay(null);
     setSelectedMemory(null);
     setSelectedConversation(null);
+    setRawConversationView(false);
     setDetailUnavailable(false);
   }
 
@@ -918,6 +1098,7 @@ export default function HistoryPanel({
     setSelectedDay(day);
     setSelectedMemory(null);
     setSelectedConversation(null);
+    setRawConversationView(false);
     setDetailUnavailable(false);
     // 前の日付の表示が一瞬でも残らないよう、ここで即座に更新する（実際の
     // requestId発行・skipDayFetchRefの確定は、直後に走るreset effect
@@ -1044,11 +1225,14 @@ export default function HistoryPanel({
                     <p>この記録は現在開けません。</p>
                   </div>
                 </div>
-              ) : selectedConversation ? (
+              ) : selectedConversation && rawConversationView ? (
+                // Conversation History（STEP 3、要件10）：raw Conversation（Layer 3）。
+                // 既存のturns＋HistoryTurnBubble表示をそのまま再利用し、新しいレンダラーは
+                // 作らない。「戻る」はConversation detailへ戻る（一覧へは戻らない）。
                 <div className="flex flex-col gap-3">
                   <button
                     type="button"
-                    onClick={() => setSelectedConversation(null)}
+                    onClick={() => setRawConversationView(false)}
                     className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
                   >
                     戻る
@@ -1062,6 +1246,55 @@ export default function HistoryPanel({
                       <HistoryTurnBubble key={index} turn={turn} />
                     ))}
                   </div>
+                </div>
+              ) : selectedConversation ? (
+                // Conversation History（STEP 3、要件9）：Conversation detail。
+                // entry kind → title → 日付/時刻 → Reflection（主役）→ raw Conversationへの
+                // 導線、という順番。raw Conversationは最初から全面表示しない。
+                <div className="flex flex-col gap-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedConversation(null);
+                      setRawConversationView(false);
+                    }}
+                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    戻る
+                  </button>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-2 text-xs">
+                      {selectedConversationEntryKind && (
+                        <span className={`font-medium ${ENTRY_KIND_ACCENT[selectedConversationEntryKind].text}`}>
+                          {CONVERSATION_ENTRY_KIND_LABEL[selectedConversationEntryKind]}
+                        </span>
+                      )}
+                      <span className="text-stone-400 dark:text-stone-500">
+                        {jstDateOf(selectedConversation.startedAt) ?? selectedConversation.startedAt.slice(0, 10)}
+                        {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
+                      </span>
+                    </div>
+                    <p className="text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
+                  </div>
+                  <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
+                    <p className="text-xs text-stone-400 dark:text-stone-500">振り返り</p>
+                    {selectedConversationReflection ? (
+                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
+                        {selectedConversationReflection.content}
+                      </p>
+                    ) : (
+                      // 要件8：legacy/自然離脱Conversationでは正常に起こるため、強いエラー
+                      // 表示にしない（静かなfallback）。
+                      <p className="text-sm text-stone-400 dark:text-stone-500">この会話にはまだ振り返りがありません。</p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setRawConversationView(true)}
+                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    会話全文を見る
+                  </button>
                 </div>
               ) : selectedMemory ? (
                 <div className="flex flex-col gap-3">
@@ -1119,17 +1352,14 @@ export default function HistoryPanel({
                     <div className="flex flex-col gap-2">
                       <p className="text-xs text-stone-400 dark:text-stone-500">会話</p>
                       {conversationRows.map((row) => (
-                        <button
+                        <ConversationCard
                           key={row.id}
-                          type="button"
+                          row={row}
+                          full={conversationFullById.get(row.id)}
+                          reflection={reflectionByConversationId.get(row.id)}
+                          loading={enrichingDay && !conversationFullById.has(row.id)}
                           onClick={() => void openConversationRow(row)}
-                          className="flex items-center justify-between gap-4 rounded-2xl border border-stone-300/70 px-4 py-3 text-left text-sm text-stone-700 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-300 dark:hover:border-stone-400 dark:hover:bg-stone-900"
-                        >
-                          <span>{row.modeLabel}</span>
-                          <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">
-                            {row.turnCount}件のメッセージ
-                          </span>
-                        </button>
+                        />
                       ))}
                     </div>
                   )}
@@ -1166,6 +1396,61 @@ export default function HistoryPanel({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Conversation History（STEP 3）のConversation card。本体（`full`）が読み終わるまでは
+ * 控えめなskeleton表示にし、entry kind（色付きラベル）・title・Reflection previewは
+ * 読み終わった本体からだけ組み立てる——`row`（History Index v2由来の軽量情報）の
+ * `modeLabel`はcanonical sourceとして使わず（要件5）、`full`が無い間の控えめな
+ * 一時的fallbackとしてのみ使う。時刻はConversation.startedAt（`full`があれば）、
+ * 無ければULID生成時刻から、追加readなしで即座に表示する。
+ */
+function ConversationCard({
+  row,
+  full,
+  reflection,
+  loading,
+  onClick,
+}: {
+  row: ConversationRow;
+  full: Conversation | undefined;
+  reflection: MemoryObject | undefined;
+  loading: boolean;
+  onClick: () => void;
+}) {
+  const time = (full ? jstTimeOf(full.startedAt) : null) ?? jstTimeOfUlid(row.id);
+  const entryKind = full ? conversationEntryKindOf(full.persona) : null;
+  const accent = entryKind ? ENTRY_KIND_ACCENT[entryKind] : null;
+  // title欠損時のfallbackは表示専用（canonicalなConversation.titleへは一切保存しない。要件4）。
+  const displayTitle = full ? full.title?.trim() || fallbackConversationTitle(full) : null;
+  const reflectionPreview = reflection?.summary?.trim();
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex flex-col gap-1.5 rounded-2xl border border-l-[3px] px-4 py-3 text-left transition hover:border-stone-500 hover:bg-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900 ${
+        accent
+          ? `border-stone-300/70 dark:border-stone-700/70 ${accent.borderLeft}`
+          : "border-stone-300/70 border-l-stone-300 dark:border-stone-700/70 dark:border-l-stone-600"
+      }`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className={`text-[11px] font-medium ${accent ? accent.text : "text-stone-400 dark:text-stone-500"}`}>
+          {entryKind ? CONVERSATION_ENTRY_KIND_LABEL[entryKind] : loading ? "…" : row.modeLabel}
+        </span>
+        <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">{time ?? ""}</span>
+      </div>
+      <p className="truncate text-sm text-stone-800 dark:text-stone-100">
+        {displayTitle ?? (loading ? "読み込んでいます…" : "詳細を読み込めませんでした")}
+      </p>
+      {reflectionPreview && (
+        <p className="line-clamp-2 text-xs leading-relaxed text-stone-500 dark:text-stone-400">{reflectionPreview}</p>
+      )}
+      <span className="text-[11px] text-stone-400 dark:text-stone-500">{row.turnCount}件のメッセージ</span>
+    </button>
   );
 }
 
