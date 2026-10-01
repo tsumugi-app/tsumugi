@@ -1,5 +1,6 @@
 "use client";
 
+import { logRecoveryArchiveDiagnostic } from "@/lib/vaultRecoveryArchiveDebug";
 import { requestFullWipe } from "@/lib/dataWipe";
 import { getJstTodayDateString } from "@/lib/jstDate";
 import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
@@ -11,6 +12,7 @@ import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationD
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
+import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
   applyVaultLightCheckCandidates,
@@ -562,6 +564,14 @@ export default function ChatScreen() {
    */
   const [launchTreeSignals, setLaunchTreeSignals] = useState<TreeSignals | null>(null);
   const [persona, setPersona] = useState<Persona>("companion");
+  /**
+   * Entry Type / Persona / Memory Type分離（2026-10-01）：ユーザーが実際に押した入口
+   * （「日記」／「会話」）をそのまま保持するstate。`persona`とは別に管理し、互いから
+   * 逆算しない。入口button・`handleSwitchPersona`・「過去からの問いかけ」が、確定時点の
+   * 値を明示的にここへ渡す。まだ何も確定していない（entry未確認のplaceholder
+   * Conversationを表示中の）間はundefined。
+   */
+  const [entryType, setEntryType] = useState<ConversationEntryKind | undefined>(undefined);
   const [entryConfirmed, setEntryConfirmed] = useState(false);
   const [conversation, setConversation] = useState<Conversation>(() => createConversation("companion"));
   /**
@@ -1345,7 +1355,10 @@ export default function ChatScreen() {
    * 端末設定・UI設定は対象に含めない（意図的に触れない）。
    */
   function resetMemoryWorldState() {
-    const freshConversation = createConversation(persona);
+    // Entry Type / Persona分離（2026-10-01）：Vault切替時も、ユーザーが既に確定している
+    // entryType（state）をそのまま引き継ぐ（personaと同じ扱い。entryConfirmed自体は
+    // ここでは変更しないため、entry画面へは戻らない）。
+    const freshConversation = createConversation(persona, entryType);
     setConversation(freshConversation);
     latestConversationRef.current = freshConversation;
     setMemoryObjects([]);
@@ -1826,7 +1839,11 @@ export default function ChatScreen() {
       !current.endedAt &&
       Date.parse(current.createdAt) <= Date.parse(baselineEstablishedAt);
     if (isUnusedPreBaselineConversation) {
-      const refreshed = createConversation(current.persona);
+      // Entry Type / Persona分離（2026-10-01）：作り直す対象は未使用（0 turns）の
+      // placeholderのため、current.entryType（undefinedの可能性もある）をそのまま
+      // 引き継ぐ（stateから逆算しない。current自体が既に確定済みの値を持っていれば
+      // それを保つ）。
+      const refreshed = createConversation(current.persona, current.entryType);
       setConversation(refreshed);
       latestConversationRef.current = refreshed;
     }
@@ -3431,6 +3448,7 @@ export default function ChatScreen() {
     setLegacyHeldCleanupStatus({ kind: "executing" });
     let verifying = false;
     try {
+      logRecoveryArchiveDiagnostic({ stage: "ui-identity-read" });
       const vaultIdentity = await getVaultIdentityRecord();
       const result = await runLegacyHeldCleanup({ root: vaultHandle, vaultIdentity: vaultIdentity ?? null });
       if (generation !== vaultGenerationRef.current) return;
@@ -3441,12 +3459,14 @@ export default function ChatScreen() {
         return;
       }
       verifying = true;
+      logRecoveryArchiveDiagnostic({ stage: "fresh-apply-plan" });
       // Keep the operation guard until remeasurement finishes; no second click or Vault switch.
       const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
       if (generation !== vaultGenerationRef.current) return;
       setRecoveryStatus({ kind: "plan", applyPlan, generation });
       setLegacyHeldCleanupStatus({ kind: "done", result, finalHeldCount: applyPlan.heldCount });
     } catch (error) {
+      logRecoveryArchiveDiagnostic({ stage: verifying ? "ui-verification-error" : "ui-cleanup-error" }, error);
       if (generation !== vaultGenerationRef.current) return;
       if (handleStaleVaultTabError(error)) {
         setLegacyHeldCleanupStatus({ kind: "idle" });
@@ -4259,15 +4279,18 @@ export default function ChatScreen() {
    * Conversationへ切り替えるだけ）。handleSend()の「終了済みConversationへは
    * 追記せず新規作成する」分岐と全く同じリセット処理を再利用する。
    */
-  function handleSwitchPersona(nextPersona: Persona) {
+  function handleSwitchPersona(nextPersona: Persona, nextEntryType: ConversationEntryKind) {
     // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
     if (isVaultSwitchingRef.current || crossTabStale) return;
     void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
-    const newConversation = createConversation(nextPersona);
+    // Entry Type / Persona分離（2026-10-01）：呼び出し元（下記の「日記」「会話」button）
+    // が確定時点で知っている値をそのまま渡す（personaから逆算しない）。
+    const newConversation = createConversation(nextPersona, nextEntryType);
     setConversation(newConversation);
     latestConversationRef.current = newConversation;
     setPersona(nextPersona);
+    setEntryType(nextEntryType);
     setMemoryObjects([]);
     setEndedConversationMemories(null);
     setReflectionStatus("idle");
@@ -4290,9 +4313,13 @@ export default function ChatScreen() {
     if (isVaultSwitchingRef.current || crossTabStale) return;
     void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
+    // Entry Type / Persona分離（2026-10-01）：トップ画面（entry未確定）へ戻るため、
+    // この時点のConversationはmount時のplaceholderと同じ扱い——entryTypeは
+    // undefinedのまま（ユーザーが次に日記／会話のどちらを押すかはまだ分からない）。
     const newConversation = createConversation(persona);
     setConversation(newConversation);
     latestConversationRef.current = newConversation;
+    setEntryType(undefined);
     setMemoryObjects([]);
     setEndedConversationMemories(null);
     setReflectionStatus("idle");
@@ -4313,11 +4340,15 @@ export default function ChatScreen() {
    * 読む必要はない（`input`自体がもうChatScreenには存在しない。ChatInputが送信成功後に
    * 自分のローカルstateをクリアする）。
    */
-  async function handleSend(overrideText?: string, overridePersona?: Persona) {
+  async function handleSend(overrideText?: string, overridePersona?: Persona, overrideEntryType?: ConversationEntryKind) {
     const text = (overrideText ?? "").trim();
     // Vault境界の安全性：切替処理中・stale判定中は新規の送信を開始させない。
     if (!text || busy || isVaultSwitchingRef.current || crossTabStale) return;
     const activePersona = overridePersona ?? persona;
+    // Entry Type / Persona分離（2026-10-01）：overridePersonaと同じ理由
+    // （「過去からの問いかけ」はsetEntryType()直後、再レンダーを挟まずこの関数を呼ぶため、
+    // closure変数のentryTypeはまだ更新前の値のままになりうる）でoverrideEntryTypeを使う。
+    const activeEntryType = overrideEntryType ?? entryType;
     const endTask = beginMemoryTask();
 
     setBusy(true);
@@ -4336,7 +4367,7 @@ export default function ChatScreen() {
     if (baseConversation.endedAt) {
       void trackMemoryTask(runConversationBoundary(baseConversation));
 
-      baseConversation = createConversation(activePersona);
+      baseConversation = createConversation(activePersona, activeEntryType);
       setConversation(baseConversation);
       latestConversationRef.current = baseConversation;
       setMemoryObjects([]);
@@ -4680,11 +4711,15 @@ export default function ChatScreen() {
     };
     // promptedMemoryIdは「この会話がどのMemoryをきっかけに始まったか」の追跡用
     // （Vault Markdownへは書き出さない実行時・IndexedDBの補助情報）。
-    // personaもここで明示的に上書きする。captureConversation()はconversation.personaを
-    // 参照するため（トップレベルのpersona stateとは別）、両方を揃えておく必要がある。
+    // persona・entryTypeもここで明示的に上書きする。captureConversation()は
+    // conversation.persona/entryTypeを参照するため（トップレベルのpersona/entryType
+    // stateとは別）、両方を揃えておく必要がある。Entry Type / Persona分離
+    // （2026-10-01）：entryTypeはtopPrompt.entryType（topPrompt.ts側で
+    // conversationEntryTypeOfにより解決済み。personaから逆算しない）をそのまま使う。
     const updated: Conversation = {
       ...appendTurn(conversation, questionTurn),
       persona: topPrompt.persona,
+      entryType: topPrompt.entryType,
       promptedMemoryId: topPrompt.memory.id,
     };
     setConversation(updated);
@@ -4692,9 +4727,10 @@ export default function ChatScreen() {
 
     setEntryConfirmed(true);
     setPersona(topPrompt.persona);
+    setEntryType(topPrompt.entryType);
     setTopPrompt(null);
     setTopPromptInput("");
-    void handleSend(text, topPrompt.persona);
+    void handleSend(text, topPrompt.persona, topPrompt.entryType);
   }
 
   const showPersonaSelector = conversation.turns.length === 0;
@@ -4991,11 +5027,28 @@ export default function ChatScreen() {
               として従来どおり残している（会話境界を大きく作り直さないため）。その会話中の
               継続選択（下記、promptedMemoryId起点の入口）も、この2本立てと同じ
               persona mapping（日記／会話）へ後日揃えた。
+
+              Entry Type / Persona分離（2026-10-01）：ここがConversation Entry Typeの
+              唯一の確定地点であり、button自身が「日記=diary」「会話=conversation」を
+              文字どおり知っている。以前はここでpersona stateを更新するだけで、
+              mount時に作られたplaceholder Conversation（persona="companion"のまま）を
+              そのまま使い続けていたため、「会話」を押して最初の1通を送った場合でも、
+              保存されるConversation.personaが"companion"のまま（＝AI応答はanalystとして
+              振る舞うのに、保存record・History表示だけ日記のまま）になるバグがあった
+              （handleSendの「baseConversation.endedAtが無ければ新規作成しない」分岐が、
+              このplaceholderを「既に使用中のConversation」として扱っていたため）。
+              ここで明示的に新しいConversationを作り直す（persona・entryTypeを確定時点の
+              値で直接渡す。setPersona後のstateから逆算しない）ことで、この根本原因を
+              解消する。
             */}
             <div className="flex flex-wrap justify-center gap-3">
               <button
                 onClick={() => {
+                  const fresh = createConversation("companion", "diary");
+                  setConversation(fresh);
+                  latestConversationRef.current = fresh;
                   setPersona("companion");
+                  setEntryType("diary");
                   setEntryConfirmed(true);
                 }}
                 className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
@@ -5004,7 +5057,11 @@ export default function ChatScreen() {
               </button>
               <button
                 onClick={() => {
+                  const fresh = createConversation("analyst", "conversation");
+                  setConversation(fresh);
+                  latestConversationRef.current = fresh;
                   setPersona("analyst");
+                  setEntryType("conversation");
                   setEntryConfirmed(true);
                 }}
                 className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
@@ -5221,13 +5278,13 @@ export default function ChatScreen() {
             <p className="text-sm text-stone-500 dark:text-stone-400">今日は、どう話そう？</p>
             <div className="flex flex-wrap justify-center gap-3">
               <button
-                onClick={() => handleSwitchPersona("companion")}
+                onClick={() => handleSwitchPersona("companion", "diary")}
                 className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
               >
                 日記
               </button>
               <button
-                onClick={() => handleSwitchPersona("analyst")}
+                onClick={() => handleSwitchPersona("analyst", "conversation")}
                 className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
               >
                 会話

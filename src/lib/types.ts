@@ -114,6 +114,22 @@ export interface ConversationTurn {
 export interface Conversation extends Identifiable, Timestamped {
   id: ID;
   persona: Persona;
+  /**
+   * ユーザーがどの入口（「日記」／「会話」）からこのConversationを開始したかという、
+   * ユーザー操作によって確定する事実（2026-10-01、Entry Type / Persona / Memory Type
+   * 分離整理）。AIが推測するものではなく、入口buttonのhandlerが確定時点の値を
+   * そのまま渡す。`persona`（AIの振る舞い）とは別概念——現状は
+   * `diary→companion`/`conversation→analyst`という対応だが、これは「現在の既定の
+   * 組み合わせ」であり「Entry Typeの定義」ではない。将来、同じentryTypeに異なる
+   * personaが対応する組み合わせもありうる。値域は`conversationEntryKind.ts`の
+   * `ConversationEntryKind`と同じ（型の循環import（`conversationEntryKind.ts`は
+   * `Persona`をこのファイルから取るため）を避けるため、ここでは独立したリテラル型と
+   * して定義する）。既存Conversationとの後方互換のためoptional——無いことは不正な
+   * 状態ではなく正常なlegacy状態であり、その場合は`conversationEntryTypeOf()`
+   * （conversationEntryKind.ts）がpersonaからlegacy fallbackとして推定する
+   * （新規Conversationのcanonical classificationにはこのfallbackを使わない）。
+   */
+  entryType?: "diary" | "conversation";
   startedAt: ISODateString;
   endedAt?: ISODateString;
   turns: ConversationTurn[];

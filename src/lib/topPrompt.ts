@@ -36,6 +36,7 @@ import {
   validateGeneratedRevisitPrompt,
 } from "./revisitPromptSafety";
 import { withVaultWorldRead } from "./vaultWorldLock";
+import { conversationEntryTypeOf, type ConversationEntryKind } from "./conversationEntryKind";
 import type { MemoryObject, Persona } from "./types";
 
 export interface TopPrompt {
@@ -43,6 +44,13 @@ export interface TopPrompt {
   question: string;
   /** 元Memoryが属していたConversationのpersona。取得できない場合はcompanion。 */
   persona: Persona;
+  /**
+   * 元Memoryが属していたConversationのEntry Type（2026-10-01追加、Entry Type / Persona
+   * 分離整理）。`conversationEntryTypeOf`（entryType優先・legacy personaはfallback）で
+   * 解決する。取得できない場合は`resolveOriginalPersona`のcompanion fallbackと対応する
+   * diaryにする。personaとは別に扱い、互いから逆算しない。
+   */
+  entryType: ConversationEntryKind;
 }
 
 /**
@@ -80,6 +88,20 @@ async function resolveOriginalPersona(memory: MemoryObject): Promise<Persona> {
   if (!memory.conversationId) return "companion";
   const sourceConversation = await getConversation(memory.conversationId);
   return sourceConversation?.persona ?? "companion";
+}
+
+/**
+ * 元Memoryが属していたConversationのEntry Type（persona/Memory Typeとは別概念、
+ * 2026-10-01整理）を引き継ぐ（優先）。conversationIdが無い・該当Conversationが
+ * 見つからない場合はdiaryにfallbackする（`resolveOriginalPersona`のcompanion
+ * fallbackと対応する既定値）。`conversationEntryTypeOf`がConversation.entryType
+ * （あれば）／legacy personaフォールバックを内部で解決するため、ここでは
+ * MemoryObject.types等には一切触れない。
+ */
+async function resolveOriginalEntryType(memory: MemoryObject): Promise<ConversationEntryKind> {
+  if (!memory.conversationId) return "diary";
+  const sourceConversation = await getConversation(memory.conversationId);
+  return sourceConversation ? conversationEntryTypeOf(sourceConversation) : "diary";
 }
 
 /**
@@ -163,12 +185,13 @@ async function generateTopPromptImpl(): Promise<TopPrompt | undefined> {
     if (!isSafeRevisitPromptText(memory.revisitPrompt)) return undefined;
 
     const persona = await resolveOriginalPersona(memory);
+    const entryType = await resolveOriginalEntryType(memory);
 
     // 実際にユーザーへ表示することが確定した時点でのみ「表示済み」として記録する。
     const lastPromptedIds = await loadLastPromptedMemoryIds();
     await saveLastPromptedMemoryIds([...lastPromptedIds, memory.id]);
 
-    return { memory, question: memory.revisitPrompt, persona };
+    return { memory, question: memory.revisitPrompt, persona, entryType };
   } catch (error) {
     console.error("Failed to generate top prompt", error);
     return undefined;

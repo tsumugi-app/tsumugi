@@ -100,6 +100,7 @@ export function conversationToMarkdown(conversation: Conversation): string {
     id: conversation.id,
     tsumugi: true,
     persona: conversation.persona,
+    entryType: conversation.entryType,
     status: conversation.status,
     title: conversation.title,
     startedAt: conversation.startedAt,
@@ -528,6 +529,12 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const createdAt = asString(frontmatter.createdAt) ?? startedAt;
   const updatedAt = asString(frontmatter.updatedAt) ?? createdAt;
   const persona = (asString(frontmatter.persona) ?? "companion") as Persona;
+  // Entry Type / Persona分離（2026-10-01）：frontmatterの値が"diary"/"conversation"の
+  // どちらでもない場合（legacy Markdown・不正値）はundefinedにする（fail-soft。
+  // personaのようにデフォルト値へ丸めない——無い場合はConversationEntryKind.ts側の
+  // legacy fallback（persona由来）が正しく働くようにするため）。
+  const rawEntryType = asString(frontmatter.entryType);
+  const entryType = rawEntryType === "diary" || rawEntryType === "conversation" ? rawEntryType : undefined;
   const status = (asString(frontmatter.status) ?? "captured") as Conversation["status"];
   const source = (asString(frontmatter.source) ?? "import") as MemorySource;
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
@@ -536,6 +543,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   return {
     id,
     persona,
+    entryType,
     startedAt,
     endedAt: asString(frontmatter.endedAt),
     turns: parseTranscript(body, startedAt, turnTimes),

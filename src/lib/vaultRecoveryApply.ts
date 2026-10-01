@@ -30,7 +30,7 @@
  * 無いことを確認する）。
  */
 import type { Conversation, MemoryObject, Source } from "./types";
-import { conversationEntryKindOf } from "./conversationEntryKind";
+import { conversationEntryTypeOf } from "./conversationEntryKind";
 import {
   buildVaultRecoveryPlan,
   parseRecoveryMemoryMarkdown,
@@ -406,7 +406,7 @@ async function inspectHistoryRows(env: RecoveryApplyEnv, op: RecoveryJournalOp, 
     if (!v2) return Array.isArray(entry.conversationIds) && entry.conversationIds.includes(member.id) ? SATISFIED : conflict("history-v1-day");
     const row = list("conversations")?.find((r) => isObj(r) && r.id === member.id);
     if (!row) return NEEDED;
-    return rowEquals(row, { id: c.id, mode: conversationEntryKindOf(c.persona), turnCount: c.turns.length }) ? SATISFIED : conflict("history-row-differs");
+    return rowEquals(row, { id: c.id, mode: conversationEntryTypeOf(c), turnCount: c.turns.length }) ? SATISFIED : conflict("history-row-differs");
   }
   if (op.recordType === "reflection") {
     const m = ctx.records[0] as MemoryObject;
@@ -886,7 +886,7 @@ async function execStep(env: RecoveryApplyEnv, journal: RecoveryJournal, op: Rec
       async () => {
         if (op.recordType === "conversation") {
           const c = ctx.records[0] as Conversation;
-          await env.runWrite(() => prim.updateHistoryIndex(env.root, { kind: "conversation", id: c.id, day: h.day, mode: conversationEntryKindOf(c.persona), turnCount: c.turns.length }));
+          await env.runWrite(() => prim.updateHistoryIndex(env.root, { kind: "conversation", id: c.id, day: h.day, mode: conversationEntryTypeOf(c), turnCount: c.turns.length }));
         } else if (op.recordType === "reflection") {
           const m = ctx.records[0] as MemoryObject;
           await env.runWrite(() => prim.updateHistoryIndex(env.root, { kind: "reflection", id: m.id, day: h.day, preview: truncateHistoryPreview(m.summary), createdAt: m.createdAt }));

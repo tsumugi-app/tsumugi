@@ -11,5 +11,5 @@
     "plugins": []
   },
   "include": [],
-  "files": ["src/lib/conversationEntryKind.test.ts", "src/lib/conversationEntryKind.ts"]
+  "files": ["src/lib/conversationEntryKind.test.ts", "src/lib/conversationEntryKind.ts", "src/lib/markdown.ts"]
 }

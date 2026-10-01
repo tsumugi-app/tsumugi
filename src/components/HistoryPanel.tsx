@@ -12,12 +12,12 @@ import {
   upgradeHistoryDayToV2,
 } from "@/lib/vault";
 import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
-import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
+import type { Conversation, ConversationTurn, MemoryObject, MemoryType } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
 import { JST_TIME_ZONE, jstDateOf, jstDateOfUlid, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
 import {
-  conversationEntryKindLabel,
-  conversationEntryKindOf,
+  conversationEntryTypeOf,
+  conversationEntryTypeLabel,
   CONVERSATION_ENTRY_KIND_LABEL,
   type ConversationEntryKind,
 } from "@/lib/conversationEntryKind";
@@ -35,34 +35,33 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
   insight: "気づき",
 };
 
-/**
- * History上のConversation表示名は「日記」「会話」の2つだけに正規化する
- * （persona==="companion"のみ「日記」、coach/analystを含むそれ以外は一律「会話」）。
- * 現在のチャットUI自体が「日記」「会話」の2択（ChatScreen.tsx参照）であり、旧
- * 「探究」「相談・創造」という名称はHistory上には一切表示しない。Conversation本体の
- * `persona`フィールド自体は変更しない（表示レイヤーでの正規化のみ）。
- * 変換規則そのものは`conversationEntryKind.ts`（Conversationの入口種別の唯一の実装）に
- * 集約されている——ここは表示用ラベルへの薄いエイリアス。
- * `src/lib/vault.ts`のHistory Index v2書き込み時の正規化ルールと同一。
- */
-function personaModeLabel(persona: Persona): string {
-  return conversationEntryKindLabel(persona);
-}
+// History上のConversation表示名（「日記」／「会話」）は`conversationEntryTypeLabel`
+// （`conversationEntryKind.ts`、Conversation全体を受け取りentryType優先・legacy
+// personaはfallback、要件8）を直接使う。以前ここにあった`personaModeLabel`
+// （persona単体からの変換）は、2026-10-01のEntry Type / Persona分離により、
+// 新規Conversationのcanonical classificationとして不正確になったため削除した。
 
 /**
- * Conversation History（STEP 3）：entry kind（日記／会話）を一瞬で識別するための、
- * 控えめな視覚区別（card左端の細いborderと、ラベル文字色だけ）。既存のstone基調の
- * デザインを壊さないよう、card全面やbadgeの塗りつぶしはしない。新しい色トークンは
- * 追加せず、Tailwindの既存パレット（rose/sky）を直接使う最小限の追加にとどめる。
+ * Conversation History（STEP 3、2026-10-01 STEP 3Bで色調整）：entry kind（日記／会話）を
+ * 一瞬で識別するための、控えめな視覚区別（card左端の細いborderと、ラベル文字色だけ）。
+ * 既存のstone基調のデザインを壊さないよう、card全面やbadgeの塗りつぶしはしない。
+ * 新しい色トークンは追加せず、Tailwindの既存パレットを使う最小限の追加にとどめる。
+ *
+ * 実機（Production）での確認を受け、当初のrose/sky（彩度が高くTsumugiの落ち着いた
+ * UIから浮いて見えた）から、よりmutedな色へ変更した：
+ * - diary：暖色（amber、dusty brown寄り）。opacityを下げて彩度を抑える。
+ * - conversation：寒色（slate、muted blue-gray）。同じくopacityを下げる。
+ * 色だけでなくopacityも使い、「色を見れば違いは分かるが、色そのものが最初に
+ * 目に入らない」程度に抑える。card全面着色・原色は引き続き使わない。
  */
 const ENTRY_KIND_ACCENT: Record<ConversationEntryKind, { text: string; borderLeft: string }> = {
   diary: {
-    text: "text-rose-600 dark:text-rose-400",
-    borderLeft: "border-l-rose-400 dark:border-l-rose-500",
+    text: "text-amber-800/80 dark:text-amber-200/70",
+    borderLeft: "border-l-amber-700/40 dark:border-l-amber-400/30",
   },
   conversation: {
-    text: "text-sky-600 dark:text-sky-400",
-    borderLeft: "border-l-sky-400 dark:border-l-sky-500",
+    text: "text-slate-600/80 dark:text-slate-300/70",
+    borderLeft: "border-l-slate-500/40 dark:border-l-slate-400/30",
   },
 };
 
@@ -686,7 +685,7 @@ export default function HistoryPanel({
 
       const conversations: ConversationRow[] = conversationsFull.map((c) => ({
         id: c.id,
-        modeLabel: personaModeLabel(c.persona),
+        modeLabel: conversationEntryTypeLabel(c),
         turnCount: c.turns.length,
         full: c,
         bucketDay,
@@ -722,7 +721,7 @@ export default function HistoryPanel({
         const v2Entry: HistoryDayIndexV2 = {
           conversations: conversationsFull.map((c) => ({
             id: c.id,
-            mode: conversationEntryKindOf(c.persona),
+            mode: conversationEntryTypeOf(c),
             turnCount: c.turns.length,
           })),
           normalMemories: normalMemoriesFull.map((m) => ({
@@ -1066,7 +1065,7 @@ export default function HistoryPanel({
   // Conversation History（STEP 3）：Conversation detail表示用の派生値。entry kindは
   // 必ず`selectedConversation.persona`（canonical）から導出する（要件5）。titleは
   // 無ければ表示専用fallback（`fallbackConversationTitle`、canonicalへは保存しない）。
-  const selectedConversationEntryKind = selectedConversation ? conversationEntryKindOf(selectedConversation.persona) : null;
+  const selectedConversationEntryKind = selectedConversation ? conversationEntryTypeOf(selectedConversation) : null;
   const selectedConversationTitle = selectedConversation
     ? selectedConversation.title?.trim() || fallbackConversationTitle(selectedConversation)
     : null;
@@ -1259,7 +1258,7 @@ export default function HistoryPanel({
                   </button>
                   <p className="text-xs text-stone-400 dark:text-stone-500">
                     {jstDateOf(selectedConversation.startedAt) ?? selectedConversation.startedAt.slice(0, 10)}・
-                    {personaModeLabel(selectedConversation.persona)}
+                    {conversationEntryTypeLabel(selectedConversation)}
                   </p>
                   <div className="flex flex-col gap-3">
                     {selectedConversation.turns.map((turn, index) => (
@@ -1268,9 +1267,12 @@ export default function HistoryPanel({
                   </div>
                 </div>
               ) : selectedConversation ? (
-                // Conversation History（STEP 3、要件9）：Conversation detail。
-                // entry kind → title → 日付/時刻 → Reflection（主役）→ raw Conversationへの
-                // 導線、という順番。raw Conversationは最初から全面表示しない。
+                // Conversation History（STEP 3B、要件9/16/18）：Conversation detail。
+                // entry kind → title → 日付/時刻 → title+Reflectionを1つの記録として
+                // → raw Conversationへの導線、という順番。raw Conversationは最初から
+                // 全面表示しない。「振り返り」のような独立section labelは置かない。
+                // ReflectionがないConversationは、titleだけで完結した記録として扱う
+                // （「振り返りがありません」のような強い表示はしない。要件19）。
                 <div className="flex flex-col gap-4">
                   <button
                     type="button"
@@ -1282,7 +1284,7 @@ export default function HistoryPanel({
                   >
                     戻る
                   </button>
-                  <div className="flex flex-col gap-1">
+                  <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-2 text-xs">
                       {selectedConversationEntryKind && (
                         <span className={`font-medium ${ENTRY_KIND_ACCENT[selectedConversationEntryKind].text}`}>
@@ -1295,17 +1297,10 @@ export default function HistoryPanel({
                       </span>
                     </div>
                     <p className="text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
-                  </div>
-                  <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
-                    <p className="text-xs text-stone-400 dark:text-stone-500">振り返り</p>
-                    {selectedConversationReflection ? (
+                    {selectedConversationReflection && (
                       <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
                         {selectedConversationReflection.content}
                       </p>
-                    ) : (
-                      // 要件8：legacy/自然離脱Conversationでは正常に起こるため、強いエラー
-                      // 表示にしない（静かなfallback）。
-                      <p className="text-sm text-stone-400 dark:text-stone-500">この会話にはまだ振り返りがありません。</p>
                     )}
                   </div>
                   <button
@@ -1359,7 +1354,7 @@ export default function HistoryPanel({
                       return (
                         <p className="border-t border-black/5 pt-3 text-xs text-stone-400 dark:border-white/10 dark:text-stone-500">
                           由来：{jstDateOf(origin.startedAt) ?? origin.startedAt.slice(0, 10)}の
-                          {personaModeLabel(origin.persona)}の会話
+                          {conversationEntryTypeLabel(origin)}の会話
                         </p>
                       );
                     })()}
@@ -1441,7 +1436,7 @@ function ConversationCard({
   onClick: () => void;
 }) {
   const time = (full ? jstTimeOf(full.startedAt) : null) ?? jstTimeOfUlid(row.id);
-  const entryKind = full ? conversationEntryKindOf(full.persona) : null;
+  const entryKind = full ? conversationEntryTypeOf(full) : null;
   const accent = entryKind ? ENTRY_KIND_ACCENT[entryKind] : null;
   // title欠損時のfallbackは表示専用（canonicalなConversation.titleへは一切保存しない。要件4）。
   const displayTitle = full ? full.title?.trim() || fallbackConversationTitle(full) : null;
@@ -1463,13 +1458,18 @@ function ConversationCard({
         </span>
         <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">{time ?? ""}</span>
       </div>
+      {/*
+        title + Reflection一体化（STEP 3B 要件16/17）：titleを見出し、Reflection previewを
+        その本文として、1つの過去の記録として読めるようにする。「Reflection」「振り返り」
+        のようなラベルは付けない。titleとpreviewの間に罫線・背景差等の強い区切りも作らない
+        （gapだけの最小限の行間）。
+      */}
       <p className="truncate text-sm text-stone-800 dark:text-stone-100">
         {displayTitle ?? (loading ? "読み込んでいます…" : "詳細を読み込めませんでした")}
       </p>
       {reflectionPreview && (
         <p className="line-clamp-2 text-xs leading-relaxed text-stone-500 dark:text-stone-400">{reflectionPreview}</p>
       )}
-      <span className="text-[11px] text-stone-400 dark:text-stone-500">{row.turnCount}件のメッセージ</span>
     </button>
   );
 }

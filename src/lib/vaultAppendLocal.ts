@@ -75,7 +75,7 @@ import {
 } from "./vault";
 import type { VaultSyncKind } from "./vault";
 import type { Conversation, MemoryObject, Source } from "./types";
-import { conversationEntryKindLabel } from "./conversationEntryKind";
+import { conversationEntryTypeLabel } from "./conversationEntryKind";
 
 // ---------------------------------------------------------------------------
 // 型
@@ -148,7 +148,7 @@ function conversationRecord(conversation: Conversation): LocalOnlyRecord {
   const turns = conversation.turns.slice(0, MAX_PREVIEW_TURNS);
   const lines = turns.map((turn) => `${turn.role === "user" ? "あなた" : "AI"}：${clip(turn.content)}`);
   if (conversation.turns.length > turns.length) lines.push(`…ほか ${conversation.turns.length - turns.length}件のやり取り`);
-  const mode = conversationEntryKindLabel(conversation.persona);
+  const mode = conversationEntryTypeLabel(conversation);
   return {
     key: vaultSyncKeyFor("conversation", conversation.id),
     kind: "conversation",

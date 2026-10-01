@@ -11,6 +11,7 @@ import { ulid } from "ulid";
 import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObjectWithOutbox } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
 import { isReflectionSummary, writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
+import type { ConversationEntryKind } from "./conversationEntryKind";
 import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "./retrieval";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
@@ -39,11 +40,20 @@ function nowISO(): string {
   return new Date().toISOString();
 }
 
-export function createConversation(persona: Persona): Conversation {
+/**
+ * Entry Type / Persona / Memory Type分離（2026-10-01）：`entryType`は呼び出し元
+ * （入口buttonのhandler）が確定時点で知っている値をそのまま渡すoptional引数。
+ * personaから逆算しない（禁止パターン：`setPersona(x)`した直後のstateを読んで
+ * entryTypeを推測すること）。省略した場合（entry未確定のplaceholder Conversation等）は
+ * `entryType: undefined`のまま作られ、History側は`conversationEntryTypeOf`の
+ * legacy fallback（persona由来）で扱う。
+ */
+export function createConversation(persona: Persona, entryType?: ConversationEntryKind): Conversation {
   const timestamp = nowISO();
   return {
     id: ulid(),
     persona,
+    entryType,
     startedAt: timestamp,
     turns: [],
     status: "active",
