@@ -20,6 +20,7 @@
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
 import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, putVaultOutboxEntry } from "./db";
+import { conversationEntryKindOf } from "./conversationEntryKind";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
 import type { Conversation, MemoryObject, Source } from "./types";
@@ -252,7 +253,7 @@ async function decideAndProjectHistory(env: ProjectionEnv, canonical: Conversati
   if (monthRead.state === "error") throw new ProjectionConflictError("history-unreadable");
   const metaRead = await readJsonAt(env.root, HISTORY_META_PATH);
   if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
-  const mode = canonical.persona === "companion" ? "diary" : "conversation";
+  const mode = conversationEntryKindOf(canonical.persona);
   try {
     await vaultProjectionPrimitives.updateHistoryIndex(env.root, { kind: "conversation", id: canonical.id, day, mode, turnCount: canonical.turns.length });
   } catch (error) {
@@ -287,7 +288,7 @@ async function finalVerify(env: ProjectionEnv, canonical: Conversation, path: st
   const days = isObj(historyRead.value.days) ? historyRead.value.days : {};
   const dayEntry = days[day];
   const row = isObj(dayEntry) && Array.isArray(dayEntry.conversations) ? dayEntry.conversations.find((r) => isObj(r) && r.id === canonical.id) : undefined;
-  const expectedMode = canonical.persona === "companion" ? "diary" : "conversation";
+  const expectedMode = conversationEntryKindOf(canonical.persona);
   if (!isObj(row) || row.mode !== expectedMode || row.turnCount !== canonical.turns.length) return { ok: false, reason: "verify-history-mismatch" };
 
   return { ok: true };

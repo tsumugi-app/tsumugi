@@ -14,6 +14,11 @@ import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/li
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
 import { jstDateOf, jstDateOfUlid, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
+import {
+  conversationEntryKindLabel,
+  conversationEntryKindOf,
+  CONVERSATION_ENTRY_KIND_LABEL,
+} from "@/lib/conversationEntryKind";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -33,10 +38,12 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
  * 現在のチャットUI自体が「日記」「会話」の2択（ChatScreen.tsx参照）であり、旧
  * 「探究」「相談・創造」という名称はHistory上には一切表示しない。Conversation本体の
  * `persona`フィールド自体は変更しない（表示レイヤーでの正規化のみ）。
+ * 変換規則そのものは`conversationEntryKind.ts`（Conversationの入口種別の唯一の実装）に
+ * 集約されている——ここは表示用ラベルへの薄いエイリアス。
  * `src/lib/vault.ts`のHistory Index v2書き込み時の正規化ルールと同一。
  */
 function personaModeLabel(persona: Persona): string {
-  return persona === "companion" ? "日記" : "会話";
+  return conversationEntryKindLabel(persona);
 }
 
 const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
@@ -548,7 +555,7 @@ export default function HistoryPanel({
         // v2：Vault本体read 0回で一覧を構築する。
         const conversations: ConversationRow[] = dayEntry.conversations.map((c) => ({
           id: c.id,
-          modeLabel: c.mode === "diary" ? "日記" : "会話",
+          modeLabel: CONVERSATION_ENTRY_KIND_LABEL[c.mode],
           turnCount: c.turnCount,
           bucketDay,
         }));
@@ -635,7 +642,7 @@ export default function HistoryPanel({
         const v2Entry: HistoryDayIndexV2 = {
           conversations: conversationsFull.map((c) => ({
             id: c.id,
-            mode: c.persona === "companion" ? "diary" : "conversation",
+            mode: conversationEntryKindOf(c.persona),
             turnCount: c.turns.length,
           })),
           normalMemories: normalMemoriesFull.map((m) => ({

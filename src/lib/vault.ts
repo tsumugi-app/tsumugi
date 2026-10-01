@@ -38,6 +38,7 @@ import {
   saveSourceAndMarkSynced,
   setVaultSyncState,
 } from "./db";
+import { conversationEntryKindOf } from "./conversationEntryKind";
 import { logTimingEvent } from "./debugTimingLog";
 import type { Conversation, MemoryObject, MemorySource, MemoryType, Source } from "./types";
 import {
@@ -1885,7 +1886,8 @@ async function writeConversationMarkdownImpl(
   // 本体・Index更新の両方が自然に再試行される（詳細はupdateHistoryIndexのコメント参照）。
   // modeはpersona!=="companion"を一律"conversation"へ正規化する（coach/analyst問わず、
   // History上は「日記」「会話」の2つにしか表示しない、という表示名正規化）。
-  const mode: HistoryConversationMode = conversation.persona === "companion" ? "diary" : "conversation";
+  // 変換規則そのものは`conversationEntryKind.ts`（Conversationの入口種別の唯一の実装）に集約。
+  const mode: HistoryConversationMode = conversationEntryKindOf(conversation.persona);
   await updateHistoryIndex(root, {
     kind: "conversation",
     id: conversation.id,
@@ -6007,7 +6009,7 @@ async function updateHistoryIndexForSingleRecord(
 ): Promise<void> {
   if (kind === "conversation") {
     const conversation = parsed as Conversation;
-    const mode: HistoryConversationMode = conversation.persona === "companion" ? "diary" : "conversation";
+    const mode: HistoryConversationMode = conversationEntryKindOf(conversation.persona);
     await updateHistoryIndex(root, {
       kind: "conversation",
       id: conversation.id,
