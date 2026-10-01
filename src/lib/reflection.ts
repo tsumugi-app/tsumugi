@@ -16,10 +16,16 @@ import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 
 const AI_PROVIDER = "gemini";
 
+export interface SessionReflection {
+  /** Conversation History一覧の識別用タイトル（Conversation.titleへ保存する）。Reflection本文の要約ではない。 */
+  title: string;
+  reflection: string;
+}
+
 export async function generateSessionReflection(
   persona: Persona,
   sourceMemoryObject: MemoryObject
-): Promise<string> {
+): Promise<SessionReflection> {
   const apiKey = await loadApiKey();
   const res = await fetch("/api/reflect", {
     method: "POST",
@@ -37,8 +43,8 @@ export async function generateSessionReflection(
   if (!res.ok) {
     throw new Error(`reflect request failed with status ${res.status}`);
   }
-  const data = (await res.json()) as { reflection: string };
-  return data.reflection;
+  const data = (await res.json()) as SessionReflection;
+  return data;
 }
 
 export function createInsightMemoryObject(

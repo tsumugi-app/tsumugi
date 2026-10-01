@@ -1,4 +1,5 @@
 import type { Persona } from "@/lib/types";
+import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 
 export const runtime = "nodejs";
@@ -63,12 +64,46 @@ OK例：
 - 「〜だったのかもしれません」「〜の表れ」「〜を求めている」のような、
   ユーザーの心理をAIが推測して意味づけする表現は使わない
 - 会話の中でユーザー自身が明確に語った感情や気づきは、そのまま日記の内容として扱ってよい
-- 会話から明確な気づきが生まれていない場合は、無理に「今日の気づき」を作らない`;
+- 会話から明確な気づきが生まれていない場合は、無理に「今日の気づき」を作らない
+
+titleについて（Conversation Historyの一覧に表示する短い識別名。reflection本文とは別の役割。
+後から人間が読み返すのはreflectionの方であり、titleは一覧で見分けるためだけに使う）：
+- 与えられた材料（要約・内容・キーワード）から、このConversationの中心的な話題が一目で
+  分かる、短いタイトルにする（目安10〜20文字程度の語句。文章にしなくてよい）
+- 後から一覧に並んだときに、このConversationだと見分けられることを優先する
+- 「〜についての会話」「〜の日記」のような機械的な接尾辞を毎回付けない
+- 「日記」「会話」という入口の種別そのものをtitle本文に含めない（それは一覧の別の場所に
+  既に表示されるため、titleに重複させない）
+- 過度に文学的な表現・比喩・キャッチコピーのような言い回しにしない
+- 「〜への葛藤」「〜の不安」のような、心理を分析・診断するようなタイトルにしない
+- reflection本文と同じgrounding原則に従い、材料に無い意味・感情・評価を追加しない
+- 話題が1つだけの短い材料であれば、その話題をそのまま短く言い表せばよい（無理に凝らない）`;
 
 const PERSONA_TONE: Record<Persona, string> = {
   companion: "温かく、寄り添うような文体で書いてください。",
   coach: "落ち着いて、次への手がかりを静かに感じさせるような文体で書いてください。",
   analyst: "冷静に、事実を丁寧に見つめるような文体で書いてください。",
+};
+
+/**
+ * title専用の追加LLM callは行わない。既存のReflection生成（1回のgenerateStructured
+ * call）に、SYSTEM_PROMPT末尾のtitleルールと合わせてtitleも同時に出力させる。
+ */
+const REFLECT_SCHEMA: AISchema = {
+  type: "object",
+  properties: {
+    title: {
+      type: "string",
+      description:
+        "Conversation Historyの一覧で識別するための短いタイトル（10〜20文字程度の語句。" +
+        "Reflection本文の要約ではなく、話題が分かる短い識別名）",
+    },
+    reflection: {
+      type: "string",
+      description: "SYSTEM_PROMPTの指示に従った、その日の振り返り本文",
+    },
+  },
+  required: ["title", "reflection"],
 };
 
 /**
@@ -117,13 +152,14 @@ export async function POST(request: Request) {
   let response: { text: string };
   const geminiCallStart = Date.now();
   try {
-    response = await provider.generateText({
+    response = await provider.generateStructured({
       model: resolveModel(providerName),
       apiKey,
       systemInstruction,
       userContent: record,
       maxOutputTokens: 1200,
       providerOptions: { gemini: { thinkingBudget: 256 } },
+      schema: REFLECT_SCHEMA,
     });
   } catch (error) {
     console.error("[Tsumugi Reflect] generateContent failed:", error);
@@ -134,13 +170,29 @@ export async function POST(request: Request) {
   }
   const geminiCallEnd = Date.now();
 
-  const reflection = response.text?.trim();
-  if (!reflection) {
+  const text = response.text;
+  if (!text) {
     return Response.json({ error: "AI did not return a reflection." }, { status: 502 });
   }
 
+  let parsed: { title?: unknown; reflection?: unknown };
+  try {
+    parsed = JSON.parse(text) as { title?: unknown; reflection?: unknown };
+  } catch {
+    return Response.json({ error: "Failed to parse AI response as JSON." }, { status: 502 });
+  }
+
+  const reflection = typeof parsed.reflection === "string" ? parsed.reflection.trim() : "";
+  const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
+  if (!reflection) {
+    return Response.json({ error: "AI did not return a reflection." }, { status: 502 });
+  }
+  if (!title) {
+    return Response.json({ error: "AI did not return a title." }, { status: 502 });
+  }
+
   return Response.json(
-    { reflection },
+    { title, reflection },
     { headers: { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) } }
   );
 }

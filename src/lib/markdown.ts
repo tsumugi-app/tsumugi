@@ -101,6 +101,7 @@ export function conversationToMarkdown(conversation: Conversation): string {
     tsumugi: true,
     persona: conversation.persona,
     status: conversation.status,
+    title: conversation.title,
     startedAt: conversation.startedAt,
     endedAt: conversation.endedAt,
     memoryObjectIds: conversation.memoryObjectIds.length > 0 ? conversation.memoryObjectIds : undefined,
@@ -540,6 +541,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
     turns: parseTranscript(body, startedAt, turnTimes),
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
+    title: asString(frontmatter.title),
     createdAt,
     updatedAt,
     metadata: {

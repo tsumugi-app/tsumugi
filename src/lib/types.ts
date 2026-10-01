@@ -120,6 +120,14 @@ export interface Conversation extends Identifiable, Timestamped {
   status: "active" | "captured" | "archived";
   memoryObjectIds: ID[];
   /**
+   * 後からConversation Historyの一覧で識別するための短いタイトル（Conversation History
+   * Layer 1）。`generateSessionReflection`がReflection本文と同じ1回のLLM callで生成する
+   * （title専用の追加callは行わない）。既存Conversationとの後方互換性のためoptional——
+   * titleが無いことは不正な状態ではなく、正常なlegacy状態として扱う。Memory titleでも
+   * Topic名でもなく、Conversation本体に閉じた表示用の値。
+   */
+  title?: string;
+  /**
    * Beta「過去からの問いかけ」。この会話が、どのMemoryをきっかけに始まったかの追跡用。
    * 通常のConversationでは常にundefined。Vault Markdownへは書き出さない
    * （実行時・IndexedDBの補助情報にとどめ、既存のfrontmatterスキーマは変更しない）。

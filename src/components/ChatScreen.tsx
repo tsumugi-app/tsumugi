@@ -22,6 +22,7 @@ import {
   ensureVaultSkeleton,
   flushPendingToVault,
   getVaultBackend,
+  isReflectionSummary,
   isVaultSupported,
   performVaultLightCheckDiscovery,
   pickVaultDirectory,
@@ -4072,6 +4073,21 @@ export default function ChatScreen() {
         return;
       }
 
+      // Reflection冪等性ガード（STEP 2-B、最小実装）：データ層にidempotency guardが
+      // 無いため、このConversationに既にReflection（insight MemoryObject）が存在する場合は
+      // 新しいLLM callも新しい保存も行わず、既存のReflectionをそのまま表示するだけにする
+      // （勝手な上書き・再生成はしない）。conversationIdを基準にした既存データモデルへの
+      // 最小限の確認のみで、新しい保存基盤・schemaは追加しない。
+      const existingReflection = (await withVaultWorldRead(() => getAllMemoryObjects())).find(
+        (memoryObject) => isReflectionSummary(memoryObject) && memoryObject.conversationId === conversation.id
+      );
+      if (existingReflection) {
+        setReflectionText(existingReflection.content);
+        setSessionCapturedMemories(latestMemoryObjects);
+        setReflectionStatus("done");
+        return;
+      }
+
       setReflectionStatus("generating");
       try {
         // 振り返り（/api/reflect）はMemoryObjectを1件受け取る既存の設計のため、
@@ -4084,10 +4100,13 @@ export default function ChatScreen() {
           keywords: [...new Set(latestMemoryObjects.flatMap((memory) => memory.keywords))],
         };
 
-        const text = await generateSessionReflection(persona, reflectionSource);
+        // STEP 2-B：title専用の追加LLM callは行わない。同じgenerateSessionReflection
+        // call（/api/reflectの1回のgenerateStructured call）がtitle/reflectionを同時に返す。
+        const { title, reflection: text } = await generateSessionReflection(persona, reflectionSource);
         const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
         const endedConversation: Conversation = {
           ...conversation,
+          title,
           endedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
           memoryObjectIds: [...conversation.memoryObjectIds, insightMemory.id],
