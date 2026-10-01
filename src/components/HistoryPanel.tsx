@@ -305,16 +305,19 @@ export default function HistoryPanel({
    */
   const [rawConversationView, setRawConversationView] = useState(false);
   /**
-   * Conversation History（STEP 3、要件3/5/7）：選択中の日のConversation card・detailへ
-   * 表示するための、本体（title・persona・turns）とReflection（conversationId紐付け）。
-   * HistoryDayIndexV2.modeはcanonical sourceにしない（要件5）——ここで読み終えた
-   * 本体のpersonaから`conversationEntryKindOf`で都度導出する。読み込みは選択中の日の
-   * 行数分だけに限定され（Vault全体のscanはしない）、READ ONLY（書き込みは一切しない）。
+   * Conversation History（STEP 3、要件3/5/7、2026-10-01修正）：選択中の日のConversation
+   * card・detailへ表示するための、本体（title・persona・turns）とReflectionの、
+   * オンデマンド読み込み結果だけを持つ生state。`id`で一度読み終えた
+   * （成功／失敗問わず）行はキーとして記録され、二重読み込み・無限retryを防ぐ
+   * （失敗時は値をnullとして記録し、「未試行」とは区別する）。ここには`effect`からしか
+   * 書き込まない（常に非同期read結果の反映としてのみ`setState`する——早期returnでの
+   * 同期的な`setState`はしない。react-hooks/set-state-in-effect対応）。
+   * 実際にcard/detailが参照する値（canonical source、要件5）は、下記の
+   * `conversationFullById`/`reflectionByConversationId`（このstateとHistory Index v2の
+   * 軽量行から導出するderived value）であり、この生state自体を直接は参照しない。
    */
-  const [conversationFullById, setConversationFullById] = useState<Map<string, Conversation>>(new Map());
-  const [reflectionByConversationId, setReflectionByConversationId] = useState<Map<string, MemoryObject>>(new Map());
-  /** 上記2つの本体読み込みが進行中かどうか（card側のskeleton表示切り替え用）。 */
-  const [enrichingDay, setEnrichingDay] = useState(false);
+  const [fetchedConversationById, setFetchedConversationById] = useState<Map<string, Conversation | null>>(new Map());
+  const [fetchedReflectionById, setFetchedReflectionById] = useState<Map<string, MemoryObject | null>>(new Map());
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
   /**
@@ -373,8 +376,6 @@ export default function HistoryPanel({
   const monthRequestRef = useRef(0);
   const dayRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
-  /** Conversation History（STEP 3）：title/Reflection enrichment効果専用のcancellationトークン。 */
-  const enrichRequestRef = useRef(0);
   // 同一History表示セッション（このコンポーネントがマウントされている間）だけの
   // 短期メモリキャッシュ。History Index・Vaultデータそのものを置き換えるものではなく、
   // 「A→B→A」のように同じ日を行き来した際にVault I/Oを省略するためだけの一時キャッシュ。
@@ -789,76 +790,95 @@ export default function HistoryPanel({
     })();
   }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, monthLoading, refreshToken]);
 
+  // Conversation History（STEP 3）：v1 fallback由来の行は`row.full`に本体が既に
+  // 入っているため、追加readなしで即座に使える（seed）。純粋な導出値（setStateしない）。
+  const seededConversations = useMemo(
+    () =>
+      new Map(
+        conversationRows
+          .filter((row): row is ConversationRow & { full: Conversation } => !!row.full)
+          .map((row) => [row.id, row.full])
+      ),
+    [conversationRows]
+  );
+  const seededReflections = useMemo(
+    () =>
+      memoryRows
+        .filter((row): row is MemoryRow & { full: MemoryObject } => row.origin === "reflection" && !!row.full)
+        .map((row) => row.full),
+    [memoryRows]
+  );
+
+  /**
+   * Conversation History（STEP 3、要件5）：card・detailが実際に参照するcanonical
+   * source。`seeded*`（v1 fallback、読み込み済み）と`fetched*`（下のeffectがオンデマンドで
+   * 読んだv2高速パス由来の行、READ ONLY）を合成するだけの純粋な導出値——`useMemo`で
+   * 計算し、この合成自体のための`setState`は発生しない（2026-10-01修正、
+   * react-hooks/set-state-in-effect対応）。HistoryDayIndexV2.modeは参照しない。
+   */
+  const conversationFullById = useMemo(() => {
+    if (fetchedConversationById.size === 0) return seededConversations;
+    const merged = new Map(seededConversations);
+    for (const [id, value] of fetchedConversationById) {
+      if (value) merged.set(id, value);
+    }
+    return merged;
+  }, [seededConversations, fetchedConversationById]);
+
+  const reflectionByConversationId = useMemo(() => {
+    const fetchedOnly = [...fetchedReflectionById.values()].filter((m): m is MemoryObject => m !== null);
+    return buildReflectionMap([...seededReflections, ...fetchedOnly]);
+  }, [seededReflections, fetchedReflectionById]);
+
   /**
    * Conversation History（STEP 3）：選択中の日のConversation card・detailに必要な、
    * title・persona・Reflectionを読み込む（READ ONLY。Vault/IndexedDBへの書き込みは
-   * 一切行わない）。`conversationRows`/`memoryRows`が確定した直後に走る。
+   * 一切行わない）。読み込み範囲は「選択中の日に実在する、まだ未読のv2高速パス由来の
+   * 行数分」だけに限定する（Vault全体のscanはしない）——History一覧カードにtitleと
+   * Reflection previewを表示するというSTEP 3の要件上、この追加readは避けられない
+   * （詳細は完了報告参照）。
    *
-   * 読み込み範囲は「選択中の日に実在する行数分」だけに限定する（Vault全体のscanは
-   * しない）。v1 fallback由来の行は`row.full`に本体が既に入っているため追加readは
-   * 発生しない（即座にseedする）。v2高速パス由来の行（本来`本体read 0回`）だけ、
-   * この効果で個別に1回ずつ読む——History一覧カードにtitleとReflection previewを
-   * 表示するというSTEP 3の要件上、この追加readは避けられない（詳細は完了報告参照）。
-   *
-   * Reflectionは`conversationId`で対応するConversationへ紐付ける。同一conversationIdに
-   * 複数のReflectionが存在する場合は`buildReflectionMap`（最新を採用）で1件に決定する。
-   *
-   * entry kindは常にこの効果で読み終えた本体の`persona`から`conversationEntryKindOf`で
-   * 導出する（要件5：HistoryDayIndexV2.modeをcanonical sourceにしない）。本体を読む前の
-   * 短い間だけ、card側は`row.modeLabel`（Index由来、要request5のcanonical sourceでは
-   * ない一時的な控えめな代替）を表示する——詳細はConversationCardコンポーネント参照。
+   * 2026-10-01修正（react-hooks/set-state-in-effect対応）：このeffect本体は非同期read
+   * 結果の反映（`setFetchedConversationById`/`setFetchedReflectionById`、常に
+   * Promise解決後のみ）だけを担当し、同期的な早期returnでの`setState`は一切行わない
+   * （「何も読む必要が無い」場合は、ただ`return`するだけで良い——`conversationFullById`/
+   * `reflectionByConversationId`は上のderived値が常に正しい状態を表すため、この効果が
+   * 何もしなくても表示は壊れない）。`id`ごとに一度読んだ行（成功／失敗問わず、失敗時は
+   * `null`を記録）は`fetched*ById`のキーとして残るため、同じ行を無限に再読込しない。
+   * 書き込み結果はrecord idで一意なため（day/選択には依存しない）、日付切替後に遅れて
+   * 届いても古い表示へ混入する心配が無く、cancellationトークンは不要。
    */
   useEffect(() => {
-    const requestId = ++enrichRequestRef.current;
-    if (!vaultHandle) {
-      setConversationFullById(new Map());
-      setReflectionByConversationId(new Map());
-      setEnrichingDay(false);
-      return;
-    }
-
-    const seededConversations = new Map(
-      conversationRows
-        .filter((row): row is ConversationRow & { full: Conversation } => !!row.full)
-        .map((row) => [row.id, row.full])
+    if (!vaultHandle) return;
+    const conversationsToFetch = conversationRows.filter((row) => !row.full && !fetchedConversationById.has(row.id));
+    const reflectionsToFetch = memoryRows.filter(
+      (row) => row.origin === "reflection" && !row.full && !fetchedReflectionById.has(row.id)
     );
-    setConversationFullById(seededConversations);
+    if (conversationsToFetch.length === 0 && reflectionsToFetch.length === 0) return;
 
-    const reflectionRows = memoryRows.filter((row) => row.origin === "reflection");
-    const seededReflections = reflectionRows
-      .filter((row): row is MemoryRow & { full: MemoryObject } => !!row.full)
-      .map((row) => row.full);
-
-    const conversationsToFetch = conversationRows.filter((row) => !row.full);
-    const reflectionsToFetch = reflectionRows.filter((row) => !row.full);
-
-    if (conversationsToFetch.length === 0 && reflectionsToFetch.length === 0) {
-      setReflectionByConversationId(buildReflectionMap(seededReflections));
-      setEnrichingDay(false);
-      return;
-    }
-
-    setEnrichingDay(true);
     const handle = vaultHandle;
     (async () => {
       const [fetchedConversations, fetchedReflections] = await Promise.all([
         Promise.all(conversationsToFetch.map((row) => readConversationById(handle, row.id, row.bucketDay))),
         Promise.all(reflectionsToFetch.map((row) => readReflectionById(handle, row.id, row.bucketDay))),
       ]);
-      if (enrichRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
 
-      const conversationMap = new Map(seededConversations);
-      conversationsToFetch.forEach((row, index) => {
-        const full = fetchedConversations[index];
-        if (full) conversationMap.set(row.id, full);
-      });
-      setConversationFullById(conversationMap);
-
-      const allReflections = [...seededReflections, ...fetchedReflections.filter((m): m is MemoryObject => m !== null)];
-      setReflectionByConversationId(buildReflectionMap(allReflections));
-      setEnrichingDay(false);
+      if (conversationsToFetch.length > 0) {
+        setFetchedConversationById((prev) => {
+          const next = new Map(prev);
+          conversationsToFetch.forEach((row, index) => next.set(row.id, fetchedConversations[index]));
+          return next;
+        });
+      }
+      if (reflectionsToFetch.length > 0) {
+        setFetchedReflectionById((prev) => {
+          const next = new Map(prev);
+          reflectionsToFetch.forEach((row, index) => next.set(row.id, fetchedReflections[index]));
+          return next;
+        });
+      }
     })();
-  }, [vaultHandle, conversationRows, memoryRows]);
+  }, [vaultHandle, conversationRows, memoryRows, fetchedConversationById, fetchedReflectionById]);
 
   /**
    * 一覧行タップ時のオンデマンド詳細読み込み。`full`が既に設定済み（v1 fallbackで
@@ -1357,7 +1377,7 @@ export default function HistoryPanel({
                           row={row}
                           full={conversationFullById.get(row.id)}
                           reflection={reflectionByConversationId.get(row.id)}
-                          loading={enrichingDay && !conversationFullById.has(row.id)}
+                          loading={!row.full && !fetchedConversationById.has(row.id)}
                           onClick={() => void openConversationRow(row)}
                         />
                       ))}
