@@ -387,6 +387,9 @@ const STARTUP_CONNECT_LIMIT = 3;
  * 閉じた等で、status==="active"のまま残ったもの）をまとめて処理する上限。
  * STARTUP_CONNECT_LIMITと同じ考え方（AI呼び出し回数のクォータ保護）。
  */
+/** 会話終了時のCapture結果の区別（表示専用）。"empty"のみが「正常に完了し、保存対象が0件」。 */
+type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed";
+
 const STARTUP_CAPTURE_LIMIT = 3;
 
 /**
@@ -579,6 +582,10 @@ export default function ChatScreen() {
    * memoryObjectsと同じタイミングでnullへリセットする。
    */
   const [endedConversationMemories, setEndedConversationMemories] = useState<MemoryObject[] | null>(null);
+  // 「この会話を終える」結果カードで、「正常に0件」と「失敗／全drop」を区別するための結果
+  // （endedConversationMemoriesが空のときだけ表示に使う。runConversationBoundaryが直前に記録する）。
+  const [endedCaptureOutcome, setEndedCaptureOutcome] = useState<BoundaryCaptureOutcome>("empty");
+  const boundaryOutcomeRef = useRef<BoundaryCaptureOutcome>("empty");
   /** handleEndConversation実行中、ボタンの連打を防ぐためだけの表示用フラグ。 */
   const [endingConversation, setEndingConversation] = useState(false);
   /**
@@ -1503,6 +1510,7 @@ export default function ChatScreen() {
     awaitVaultSync: boolean = true
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
+      boundaryOutcomeRef.current = "empty";
       connectConversationBoundary(Promise.resolve([]), priority);
       return [];
     }
@@ -1517,7 +1525,7 @@ export default function ChatScreen() {
       // 境界Captureは会話ごとに1回だけなので、このConversation自身からの
       // 既存Memory（existingMemoryObjects）は常に空でよい（前のターンでのCaptureが
       // 無いため、このConversation発の既存Memoryはまだ存在しない）。
-      const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects } = await captureConversation(
+      const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects, outcome: captureOutcome } = await captureConversation(
         target,
         []
       );
@@ -1562,6 +1570,15 @@ export default function ChatScreen() {
         });
       }
 
+      // 結果の区別（表示専用）：保存失敗＞全drop＞正常0件／保存済み。全dropは「記憶なし」と偽らない。
+      boundaryOutcomeRef.current =
+        conversationFailed || failedMemoryIds.length > 0
+          ? "persist-failed"
+          : captureOutcome.kind === "all-dropped"
+            ? "all-dropped"
+            : captureOutcome.kind === "empty"
+              ? "empty"
+              : "saved";
       if (conversationFailed || failedMemoryIds.length > 0) {
         console.error("Partial capture failure", { conversationFailed, failedMemoryIds });
         setCaptureStatus("partial");
@@ -1576,6 +1593,7 @@ export default function ChatScreen() {
     } catch (error) {
       if (handleStaleVaultTabError(error)) return [];
       console.error("Failed to capture memory at conversation boundary", error);
+      boundaryOutcomeRef.current = "failed";
       setCaptureStatus("error");
       connectConversationBoundary(Promise.resolve([]), priority);
       return [];
@@ -4195,6 +4213,7 @@ export default function ChatScreen() {
       // Capture成功時に書き戻したstatus/memoryObjectIds等も含めて反映する。
       setConversation(latestConversationRef.current);
 
+      setEndedCaptureOutcome(boundaryOutcomeRef.current);
       setEndedConversationMemories(latestMemoryObjects);
       // HistoryPanel「今日」即時マージ対応（handleEndSessionと同じ思想）：Vault/History
       // Indexへの反映（上のrunConversationBoundaryはawaitVaultSync=falseで、Vault反映は
@@ -5151,7 +5170,15 @@ export default function ChatScreen() {
                 </button>
               </>
             ) : (
-              <p className="text-stone-500 dark:text-stone-400">今回は新しく記憶したことはありませんでした。</p>
+              <p className="text-stone-500 dark:text-stone-400">
+                {endedCaptureOutcome === "all-dropped"
+                  ? "記憶の候補は見つかりましたが、発言との照合を通らず保存できませんでした。会話は保存されています。次回起動時に再確認する対象として残しています。"
+                  : endedCaptureOutcome === "failed"
+                    ? "記憶の保存に失敗しました。会話は保存されています。次回起動時にもう一度試します。"
+                    : endedCaptureOutcome === "persist-failed"
+                      ? "記憶を端末へ保存できませんでした。会話は保存されています。"
+                      : "今回は新しく記憶したことはありませんでした。"}
+              </p>
             )}
           </div>
         )}

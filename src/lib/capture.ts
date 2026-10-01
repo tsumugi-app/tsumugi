@@ -109,6 +109,30 @@ interface ExtractedMemory {
   evidenceQuotes?: unknown;
 }
 
+/** /api/captureが返す、Evidence Boundaryの件数（内容は含まない）。 */
+interface CaptureDiagnostics {
+  proposed: number;
+  accepted: number;
+  dropped: number;
+}
+
+/**
+ * 1回のCaptureの結果の区別。「Captureが正常に完了した」ことと「保存対象があった」ことを混同しない
+ * （Capture API・parse等の失敗は、この値ではなく例外として呼び出し元へ伝わる）。
+ * - saved：候補が1件以上採用された（一部だけdropされた場合も含む。dropped>0はpartialDropで別途分かる）
+ * - empty：AIが候補を1件も提案しなかった（正常に完了し、保存対象が0件）
+ * - all-dropped：AIは候補を提案したが、Evidence Boundary等のvalidationで全件dropされた。
+ *   「正常に処理済み」とはみなさない（Conversation.statusをcapturedにしない＝再Capture可能なまま残す）
+ */
+export type CaptureOutcomeKind = "saved" | "empty" | "all-dropped";
+export interface CaptureOutcome {
+  kind: CaptureOutcomeKind;
+  proposed: number;
+  dropped: number;
+  /** 一部の候補だけがvalidationでdropされたか（kind==="saved"のときだけ意味を持つ）。 */
+  partialDrop: boolean;
+}
+
 /** 根拠quoteの保存上限（保存サイズの抑制のみ。検証は件数によらず全件行う）。 */
 const EVIDENCE_QUOTES_STORE_MAX = 12;
 const EVIDENCE_QUOTE_STORE_MAX_CHARS = 200;
@@ -320,7 +344,7 @@ async function extractMemories(
   existingMemoryObjects: MemoryObject[],
   relatedMemoryObjects: MemoryObject[],
   debugId?: string
-): Promise<ExtractedMemory[]> {
+): Promise<{ memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics }> {
   const apiKey = await loadApiKey();
   const toRef = (memory: MemoryObject) => ({
     id: memory.id,
@@ -358,15 +382,22 @@ async function extractMemories(
   logEvidenceBoundaryHeader(res);
   logPersonMentionsHeader(res);
   logTopicEventsHeader(res);
-  const data = (await res.json()) as { memories: ExtractedMemory[]; captureDebug?: CaptureDebugServer };
+  const data = (await res.json()) as { memories: ExtractedMemory[]; diagnostics?: Partial<CaptureDiagnostics>; captureDebug?: CaptureDebugServer };
   observeCapture(debugId, e => { e.server = data.captureDebug; e.phase = "api-response"; });
-  return data.memories ?? [];
+  const d = data.diagnostics;
+  const diagnostics =
+    d && typeof d.proposed === "number" && typeof d.accepted === "number"
+      ? { proposed: d.proposed, accepted: d.accepted, dropped: typeof d.dropped === "number" ? d.dropped : 0 }
+      : undefined;
+  return { memories: data.memories ?? [], diagnostics };
 }
 
 export interface CaptureResult {
   conversation: Conversation;
   /** 今回のCaptureで新規作成 or 更新されたMemoryのみ（既存Memoryのうち触れられなかったものは含まない）。 */
   memoryObjects: MemoryObject[];
+  /** 正常0件／候補が全dropされた、を区別するための結果（呼び出し元UIの表示・statusの判断用）。 */
+  outcome: CaptureOutcome;
 }
 
 /**
@@ -406,7 +437,7 @@ async function captureConversationImpl(
   debugId?: string
 ): Promise<CaptureResult> {
   const relatedMemoryObjects = await findRelatedMemoriesFromOtherConversations(conversation, existingMemoryObjects);
-  const extracted = await extractMemories(
+  const { memories: extracted, diagnostics } = await extractMemories(
     conversation.persona,
     conversation.turns,
     existingMemoryObjects,
@@ -666,9 +697,24 @@ async function captureConversationImpl(
   // 品質の観測用（件数のみ。会話・quote内容は含めない）
   if (topicProposed > 0) logTimingEvent("Capture topicEvents", { proposed: topicProposed, accepted: topicAccepted });
 
+  // 正常0件と「候補は出たがvalidationで全drop」の区別。後者は「正常に処理済み」とみなさず、
+  // Conversation.statusをcapturedにしない（activeのまま＝次回起動時のキャッチアップ／次の境界で
+  // 再Captureできる。会話本文は原記録として保存済み）。/api/captureのdiagnosticsが無い応答
+  // （古い応答・モック）では、従来どおり件数だけで判断する（全dropは検出できないためcaptured）。
+  const proposed = diagnostics?.proposed ?? extracted.length;
+  const dropped = diagnostics?.dropped ?? 0;
+  const allDropped = extracted.length === 0 && proposed > 0;
+  const outcome: CaptureOutcome = {
+    kind: allDropped ? "all-dropped" : extracted.length > 0 ? "saved" : "empty",
+    proposed,
+    dropped,
+    partialDrop: extracted.length > 0 && dropped > 0,
+  };
+  logTimingEvent("Capture outcome", { kind: outcome.kind, proposed, dropped });
+
   const updatedConversation: Conversation = {
     ...conversation,
-    status: "captured",
+    status: allDropped ? conversation.status : "captured",
     memoryObjectIds:
       newlyCreatedIds.length === 0
         ? conversation.memoryObjectIds
@@ -677,7 +723,7 @@ async function captureConversationImpl(
   };
 
   bindCaptureDebug(debugId, updatedConversation, memoryObjects);
-  return { conversation: updatedConversation, memoryObjects };
+  return { conversation: updatedConversation, memoryObjects, outcome };
 }
 
 export interface PersistCaptureResult {

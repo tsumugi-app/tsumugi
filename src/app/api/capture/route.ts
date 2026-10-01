@@ -79,6 +79,24 @@ Memory候補の粒度（重要）:
   会話の中に明確に異なるテーマが複数存在する場合は、それぞれ別のMemory候補として扱う。
 - 判断基準は「テーマ・対象が明確に別物かどうか」であり、話題が変わるたびに機械的に分けることでは
   ない。迷う場合はまとめすぎるより分けすぎる方を避け、自然な単位を優先する。
+- 長い会話で1つのMemoryにまとめる場合でも、Userが明示した具体的な事実（購入額・購入方法、
+  所有・手放した経緯、出来事の時期、関係の相手についての見立て等）・評価・迷い・不確実性
+  （「〜かもしれない」「分からない」）を、一般化・省略せずcontentへ残す。会話の後半で述べられた
+  内容も落とさない。不確実性は、断定へ強めることも、省いて消すこともしない（Userの言い方の強さのまま）。
+  金額・価格・年数・数量などの数値は、Userが述べたとおりの数字（例：「20万くらいで中古で買った」→「約20万円で中古購入」）でcontentに必ず残す。
+  特に「相手はそれを望んでいない可能性もある」「自分の判断が正しかったのかわからない」のような、
+  Userが自分の判断や相手の意向について述べた迷い・見立ては、Userが明示した重要な内容として、
+  1文として独立してcontentに残す（「関係を修復したい」などの他の内容にまとめて消さない）。
+
+抽出前の確認（Assistantの解釈は対象外）:
+- 会話全体、特に終盤も確認し、Userが明示した重要な事実・所有・経験や出来事・好み・感情・
+  評価・意図・不確実性・状態変化・User自身が明示した因果を取りこぼさない。
+- 対象のスペック・属性だけでなく、その対象とUserとの関係を示す明示発言を重視する。
+  「TYOは所有する喜びがある」「なぜか売れない」は重要なMemory候補として検討する。
+  「なぜか」は原因不明のまま保持する。「愛着が強いから売れない」「希少性が所有欲を満たしている」
+  のように、Userが言っていない理由・心理・動機・人格を追加しない。
+- この点検は新しい意味を推論するためではない。contentの各主張をUser発言へ戻して確認し、
+  Assistantにしかない解釈は採用しない。不確実性と発言の強さを保つ。
 
 既存Memoryとの対応付け:
 - このConversationから既に生成済みのMemoryが「既存Memory」として提示される場合がある。
@@ -1058,7 +1076,18 @@ ${JSON.stringify(invalidCandidates)}
     } else {
       headers["X-Tsumugi-Topic-Events"] = "enabled=0";
     }
-    return Response.json({ ...parsed, memories: finalizedMemories, ...(captureDebug === true ? { captureDebug: { userMessages, attempts: debugAttempts, selectedAttempt: retryRecovered ? 2 : 1, finalized: finalizedMemories } } : {}) }, { headers });
+    // Capture結果の区別用（件数のみ。会話・quote・Memory本文は含めない）。クライアントは
+    // 「正常に0件」「候補は出たがvalidationで全drop」「一部drop」を、この値で区別する
+    // （キーが無い古い応答・モックでは、memoriesの件数だけで従来どおり扱う）。
+    const diagnostics = {
+      proposed: memoriesRaw.length,
+      accepted: memories.length,
+      dropped: evidenceDroppedCount,
+      dropReasons: evidenceDropReasons,
+      retryAttempted: retryAttempted,
+      retryRecovered: retryRecovered,
+    };
+    return Response.json({ ...parsed, memories: finalizedMemories, diagnostics, ...(captureDebug === true ? { captureDebug: { userMessages, attempts: debugAttempts, selectedAttempt: retryRecovered ? 2 : 1, finalized: finalizedMemories } } : {}) }, { headers });
   } catch {
     return captureError("Failed to parse AI response as JSON.");
   }

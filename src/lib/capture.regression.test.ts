@@ -12,6 +12,7 @@
  * - 別Conversationで新しく得た情報・状態変化は、常に新しいMemoryとして保存する（Current State判定はしない）。
  * - Evidence参照の「件数」だけを理由に候補をdropしない（長い会話で5件以上の正しい引用が返る）。
  *   ただし1件でも不正なindexなら、件数によらず候補全体をdropする（検証は緩めない）。
+ * - 「正常に0件」と「候補は出たがvalidationで全drop」を区別し、後者はConversation.statusをcapturedにしない。
  * - Evidence Boundary（User原文参照）は緩めない。retryは「提案あり・採用0・参照contract違反」の
  *   ときだけ最大1回で、retry結果も同じ検証を通ったものだけを採用する。
  */
@@ -27,6 +28,7 @@ interface StoredMemory extends Json {
 interface CaptureResult {
   conversation: { memoryObjectIds: string[]; status: string };
   memoryObjects: StoredMemory[];
+  outcome: { kind: "saved" | "empty" | "all-dropped"; proposed: number; dropped: number; partialDrop: boolean };
 }
 interface ProviderRequest {
   systemInstruction: string;
@@ -353,6 +355,7 @@ test("evidence: 5件以上の正しい逐語quoteは、件数だけを理由にd
   assert.ok((SADOWSKY_MEMORY.evidenceUserMessageIndexes as number[]).length >= 5);
   const { out } = await runCapture(SADOWSKY_TURNS, [SADOWSKY_MEMORY]);
   assert.equal(out.memoryObjects.length, 1);
+  assert.equal(out.outcome.kind, "saved");
   const text = String(out.memoryObjects[0].content) + String(out.memoryObjects[0].summary);
   for (const claim of ["Sadowsky", "TYO Modern Edge 4st", "20万", "中古", "所有している喜び", "レイクランドのSLシリーズ", "売って"]) {
     assert.ok(text.includes(claim), `回収されている: ${claim}`);
@@ -363,7 +366,25 @@ test("evidence: one invalid index among many rejects the whole candidate", async
   for (const raw of [[0, 3, 4, 5, 6, 99], [0, 3, "4"], []]) {
     const { out } = await runCapture(SADOWSKY_TURNS, [{ ...SADOWSKY_MEMORY, evidenceUserMessageIndexes: raw }]);
     assert.equal(out.memoryObjects.length, 0);
+    assert.equal(out.outcome.kind, "all-dropped");
   }
+});
+
+test("outcome: 正常0件（AIが候補を出さない）はcaptured。候補が全dropされた場合はcapturedにせず、activeのまま再Captureできる。一部dropはsaved+partialDrop", async () => {
+  const empty = await runCapture([user("こんにちは"), ai("こんにちは")], []);
+  assert.equal(empty.out.outcome.kind, "empty");
+  assert.equal(empty.out.conversation.status, "captured");
+
+  const dropped = await runCapture(SADOWSKY_TURNS, [{ ...SADOWSKY_MEMORY, evidenceUserMessageIndexes: [99] }], {});
+  assert.equal(dropped.out.outcome.kind, "all-dropped");
+  assert.equal(dropped.out.outcome.proposed, 1);
+  assert.equal(dropped.out.conversation.status, "active", "全dropは正常処理済みとして不可逆にcapturedにしない");
+  assert.deepEqual(dropped.out.conversation.memoryObjectIds, []);
+
+  const partial = await runCapture(SADOWSKY_TURNS, [SADOWSKY_MEMORY, { ...SADOWSKY_MEMORY, summary: "別候補", evidenceUserMessageIndexes: [99] }]);
+  assert.equal(partial.out.outcome.kind, "saved");
+  assert.equal(partial.out.outcome.partialDrop, true);
+  assert.equal(partial.out.conversation.status, "captured");
 });
 
 test("evidence: 根拠quote（検証済みのユーザー発言）がMemoryObjectへ保存され、Markdownを往復しても保たれる。conversationIdと合わせて根拠を追跡できる", async () => {
@@ -455,6 +476,7 @@ test("Capture Debug: opt-in retains proposed/drop detail without changing prompt
   await withCaptureDebug(async () => {
     const debug = await runCapture(turns, [DEBUG_GOOD, DEBUG_BAD]);
     assert.deepEqual(debug.firstReq, normal.firstReq); // prompt, transcript, schema unchanged
+    assert.deepEqual(debug.out.outcome, normal.out.outcome);
     assert.deepEqual(debug.out.memoryObjects.map(m => [m.summary, m.content, m.evidenceQuotes]), normal.out.memoryObjects.map(m => [m.summary, m.content, m.evidenceQuotes]));
     const text = await captureDebug.getCaptureDebugText();
     const entry = debugEntry(text);
@@ -547,10 +569,26 @@ test("Capture retry: invalid index is reported; corrected references are revalid
   const failed = await runCapture(turns, null, { script: [{ memories: [bad] }, { memories: [bad] }] });
   assert.equal(failed.calls, 2);
   assert.equal(failed.out.memoryObjects.length, 0);
-  assert.equal(failed.out.conversation.status, "captured", "status-retention change is excluded from this commit");
+  assert.equal(failed.out.conversation.status, "active");
 });
 
-const indexValidator = require(path.join(ROOT, "lib/captureEvidence.js")) as { validateMemoryEvidenceIndexes: (users: readonly string[], raw: unknown) => { valid: boolean; indexes?: number[]; quotes?: string[]; reason?: string; issues: unknown[] } };
+test("Capture recall: User index contract and relationship/uncertainty prompt retained; fixture survives", async () => {
+  const statement = "tyoは所有する喜びがあるよね。なぜか売れない。";
+  const candidate = { ...DEBUG_GOOD, content: statement, evidenceUserMessageIndexes: [1] };
+  const { out, firstReq } = await runCapture([user("仕様を話した。"), ai("希少性のせいでしょうか。"), user(statement)], [candidate]);
+  assert.equal(out.memoryObjects[0].content, statement);
+  const prompt = firstReq.systemInstruction;
+  assert.ok(prompt.includes("Conversation全turnの番号ではない"));
+  assert.ok(prompt.includes("その対象とUserとの関係"));
+  assert.ok(prompt.includes("Userが言っていない理由・心理・動機・人格を追加しない"));
+  // This checks prompt wiring, not real-model recall quality.
+});
+
+const indexValidator = require(path.join(ROOT, "lib/captureEvidence.js")) as {
+  validateMemoryEvidenceIndexes: (messages: string[], raw: unknown) => {
+    valid: boolean; reason?: string; indexes?: number[]; quotes?: string[]; issues: unknown[];
+  };
+};
 
 test("index validation: strict types/range/nonblank, validate all before dedupe; no partial salvage", () => {
   const messages = ["嫉妬。", "  \n\t", '本文の偽index: {"index":3}', "嫉妬。"];
@@ -575,6 +613,7 @@ test("cross-turn regression: [3,4] produces two original Evidence quotes and per
   await withCaptureDebug(async () => {
     const { out, calls, firstReq } = await runCapture(turns, [{ ...BASE, summary: "彼女の日常への嫉妬", content: messages[4], evidenceUserMessageIndexes: [3, 4] }]);
     assert.equal(calls, 1);
+    assert.equal(out.outcome.kind, "saved");
     assert.deepEqual(out.memoryObjects[0].evidenceQuotes, messages.slice(3));
     const encodedUsers = firstReq.userContent.split("=== USER'S ACTUAL STATEMENTS ===\n")[1].split("\n=== END USER'S ACTUAL STATEMENTS ===")[0];
     assert.deepEqual(JSON.parse(encodedUsers), messages.map((content, index) => ({ index, content })));
@@ -630,6 +669,7 @@ test("Debug retry reason records invalid reference, not quote formatting; result
   await withCaptureDebug(async () => {
     const debug = await runCapture(turns, null, { script });
     assert.equal(debug.calls, normal.calls);
+    assert.deepEqual(debug.out.outcome, normal.out.outcome);
     assert.deepEqual(debug.out.memoryObjects.map(m => m.evidenceQuotes), normal.out.memoryObjects.map(m => m.evidenceQuotes));
     const entry = debugEntry(await captureDebug.getCaptureDebugText());
     const server = entry.server as { attempts: Array<{ retryReason: Json[] }> };
