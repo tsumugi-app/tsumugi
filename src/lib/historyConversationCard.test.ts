@@ -7,6 +7,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { buildReflectionMap, fallbackConversationTitle } from "./historyConversationCard";
 import type { Conversation, MemoryObject } from "./types";
 
@@ -118,4 +120,87 @@ test("buildReflectionMap: 異なるconversationIdはそれぞれ独立して保�
 test("buildReflectionMap: 空配列ではクラッシュせず空のMapを返す", () => {
   const map = buildReflectionMap([]);
   assert.equal(map.size, 0);
+});
+
+// ===========================================================================
+// History一覧からの「独立した振り返り」排除と、Conversation詳細への同一Reflection
+// 紐付け（2026-10-02、要件3：filterコードの存在だけでなく、実際のデータ経路を確認する）
+// ===========================================================================
+
+test("Reflectionは一覧（記憶）行としては除外され、同じReflectionがconversationIdでdetailへ紐付く", () => {
+  // HistoryPanel.tsxのMemoryRow（id/origin/...）と同じ形の、その日の一覧行を模す。
+  const normalRow = { id: "MEM-1", origin: "normal" as const };
+  const reflectionRow = { id: "REF-1", origin: "reflection" as const };
+  const dayRows = [normalRow, reflectionRow];
+
+  // HistoryPanel.tsxの`normalMemoryRows`と全く同じ述語（row.origin !== "reflection"）。
+  const listRows = dayRows.filter((row) => row.origin !== "reflection");
+  assert.deepEqual(listRows.map((r) => r.id), ["MEM-1"], "「記憶」一覧にはReflectionが独立項目として出てこない");
+
+  // 同じ日に実在する、まさにそのReflectionの本体（MemoryObject）。
+  const theReflection = reflection({ id: "REF-1", conversationId: "CONV-1", content: "今日は散歩した", summary: "今日は散歩した", keywords: ["散歩"] });
+  const map = buildReflectionMap([theReflection]);
+  const linked = map.get("CONV-1");
+  assert.equal(linked?.id, "REF-1", "一覧から除外したのと同じidのReflectionがdetail用mapに入る");
+  assert.equal(linked, theReflection, "参照そのものが同一（複製・再生成していない）");
+  assert.equal(linked?.content, "今日は散歩した", "detailへ渡る内容は既存のReflection本文そのまま");
+  assert.deepEqual(linked?.keywords, ["散歩"], "既存keywordsもそのまま渡る（新規生成していない）");
+});
+
+test("normal MemoryはReflection除外の影響を受けず、一覧にそのまま残る", () => {
+  const rows = [
+    { id: "MEM-1", origin: "normal" as const },
+    { id: "MEM-2", origin: "normal" as const },
+    { id: "REF-1", origin: "reflection" as const },
+  ];
+  const listRows = rows.filter((row) => row.origin !== "reflection");
+  assert.deepEqual(listRows.map((r) => r.id), ["MEM-1", "MEM-2"]);
+});
+
+// ===========================================================================
+// HistoryPanel.tsx構造確認（2026-10-02）：一覧はtitleのみ、detailはtitle→Reflection→
+// keywords→会話全文、色はエンジ〜茶の同系統。ソースを直接確認する
+// （vaultRecoveryLegacyCleanup.test.tsの既存パターンと同じ手法）。
+// ===========================================================================
+
+const HISTORY_PANEL_SOURCE = fs.readFileSync(
+  path.join(process.cwd(), "src/components/HistoryPanel.tsx"),
+  "utf8"
+);
+
+test("HistoryPanel.tsx: Conversation card（一覧）はReflection previewを表示しない", () => {
+  const begin = HISTORY_PANEL_SOURCE.indexOf("function ConversationCard(");
+  const body = HISTORY_PANEL_SOURCE.slice(begin, HISTORY_PANEL_SOURCE.indexOf("function HistoryTurnBubble(", begin));
+  assert.ok(!body.includes("reflection:"), "ConversationCardはもうreflection propを受け取らない");
+  assert.ok(!body.includes("reflectionPreview"), "一覧側にReflection preview変数が残っていない");
+  assert.ok(body.includes("displayTitle"), "一覧にはtitleは引き続き表示する");
+  assert.ok(body.includes('entryKind ? CONVERSATION_ENTRY_KIND_LABEL[entryKind]'), "一覧には会話/日記のラベルも引き続き表示する");
+});
+
+test("HistoryPanel.tsx: Conversation detailはtitle→Reflection本文→keywords→会話全文、の順で、独立した「振り返り」ラベルを持たない", () => {
+  const begin = HISTORY_PANEL_SOURCE.indexOf("selectedConversationTitle}</p>");
+  const end = HISTORY_PANEL_SOURCE.indexOf("会話全文を見る", begin);
+  const detailBlock = HISTORY_PANEL_SOURCE.slice(begin, end);
+  assert.ok(detailBlock.includes("selectedConversationReflection.content"), "Reflection本文（既存の内容）がtitleの直後に続く");
+  assert.ok(detailBlock.includes("selectedConversationReflection.keywords"), "既存keywordsがReflection本文の下に表示される");
+  assert.ok(
+    detailBlock.indexOf("selectedConversationReflection.content") < detailBlock.indexOf("selectedConversationReflection.keywords"),
+    "Reflection本文→keywordsの順になっている"
+  );
+  assert.ok(!detailBlock.includes(">振り返り<"), "「振り返り」という独立section labelは表示しない");
+});
+
+test("HistoryPanel.tsx: entry kindの色はエンジ〜茶の同系統（rose/amber）で、赤×青のような対比ではない", () => {
+  const begin = HISTORY_PANEL_SOURCE.indexOf("const ENTRY_KIND_ACCENT");
+  const block = HISTORY_PANEL_SOURCE.slice(begin, HISTORY_PANEL_SOURCE.indexOf("};", begin));
+  assert.ok(block.includes("rose"), "会話＝エンジ系（rose系統）");
+  assert.ok(block.includes("amber"), "日記＝薄めの茶系（amber系統）");
+  assert.ok(!block.includes("slate"), "以前の寒色（slate）は使わない");
+  assert.ok(!block.includes("sky"), "赤と対比する青系は使わない");
+  assert.ok(!block.includes("blue"), "赤と対比する青系は使わない");
+});
+
+test("HistoryPanel.tsx: 一覧外のUI配色（背景・既存の警告表示）は変更していない", () => {
+  assert.ok(HISTORY_PANEL_SOURCE.includes("bg-[var(--background)]"), "背景は既存のCSS変数のまま");
+  assert.ok(HISTORY_PANEL_SOURCE.includes("bg-amber-50/60"), "既存の「開けません」警告色は変更していない");
 });
