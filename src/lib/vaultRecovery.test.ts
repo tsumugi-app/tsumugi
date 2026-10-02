@@ -155,13 +155,22 @@ test("day-file partial parse failure does not silently drop bad member", async (
   const p = await plan(new ReadOnlyVault({ "day.md": text }), local([], [memory()]));
   assert.equal(p.records[0].classification, "unreadable / indeterminate"); assert.equal(p.records[0].vaultMarkdownExists, null);
 });
-test("hidden moved Markdown is scanned; Source and Reflection supported", async () => {
+test("moved Markdown in an unconventional (but visible) folder is scanned; Source and Reflection supported", async () => {
   const m = memory(); m.metadata.source = "system-generated";
   const s: Source = { id: "s1", title: "素材", content: "本文", sourceType: "text", createdAt: T, updatedAt: T };
   const snapshot = local([], [m]); snapshot.sources.push(s);
-  const p = await plan(new ReadOnlyVault({ ".moved/r.md": memoryObjectToMarkdown(m), "Elsewhere/s.md": sourceToMarkdown(s) }), snapshot);
+  const p = await plan(new ReadOnlyVault({ "Moved/r.md": memoryObjectToMarkdown(m), "Elsewhere/s.md": sourceToMarkdown(s) }), snapshot);
   assert.ok(p.records.every(r => r.classification === "equivalent-existing"));
   assert.equal(p.records[0].recordType, "reflection");
+});
+test("scan boundary: hidden directories (dot-prefixed, e.g. .tsumugi-archive) are excluded from recursive Markdown discovery", async () => {
+  const c = conversation();
+  // Moved under a hidden directory instead of a visible one (cf. the previous test): this is
+  // the new, intentional boundary — hidden areas are no longer treated as evidence of existence.
+  const p = await plan(new ReadOnlyVault({ ".moved/c.md": conversationToMarkdown(c) }), local([c]));
+  assert.equal(p.records[0].classification, "local-only-safe");
+  assert.deepEqual(p.records[0].vaultPaths, []);
+  assert.equal(p.issues.length, 0);
 });
 test("native snapshot uses only readonly stores and closes connection", async () => {
   const fixture = { conversations: [conversation()], memoryObjects: [memory()], sources: [], vaultSyncState: { "conversation:c1": T } };
@@ -226,11 +235,76 @@ test("WebKit-style DOMException without Error inheritance retains NotFound disti
   assert.equal((await readRecoveryJson(denied, "missing.json", () => true)).status, "read-error");
 });
 
-test("archived Markdown is not ignored when proving record absence", async () => {
+test("Markdown in a visible non-canonical folder is not ignored when proving record absence", async () => {
+  // Moved out of `.tsumugi/` (now excluded as a hidden boundary, see the scan-boundary test
+  // above) into a visible non-canonical folder: the safety property under test — Recovery must
+  // not falsely classify a record "local-only-safe" when a copy already exists somewhere in the
+  // Vault — still holds for any *visible* location.
   const c = conversation();
-  const p = await plan(new ReadOnlyVault({ ".tsumugi/archive/c.md": conversationToMarkdown(c) }), local([c]));
+  const p = await plan(new ReadOnlyVault({ "Archive/c.md": conversationToMarkdown(c) }), local([c]));
   assert.equal(p.records[0].classification, "equivalent-existing");
-  assert.deepEqual(p.records[0].vaultPaths, [".tsumugi/archive/c.md"]);
+  assert.deepEqual(p.records[0].vaultPaths, ["Archive/c.md"]);
+});
+
+// ---------------------------------------------------------------------------
+// Scan boundary fix (2026-10-02): hidden directories are excluded from recursive
+// Markdown discovery, and Markdown without `tsumugi: true` frontmatter is treated
+// as not Tsumugi-owned (skipped) instead of a parse/shape issue. Neither change
+// touches HELD_REASON, RecoveryClassification, global issue broadcast, duplicate/
+// multiple-memory-files logic, or the known-path `.tsumugi/*` metadata reads
+// (`inspect()`), which are independent of this walk.
+// ---------------------------------------------------------------------------
+
+test("plain non-Tsumugi Markdown (no frontmatter) is skipped, not an issue", async () => {
+  const p = await plan(new ReadOnlyVault({ "test.md": "# hello" }), local());
+  assert.equal(p.issues.length, 0);
+  assert.equal(p.records.length, 0);
+});
+
+test("Markdown with frontmatter but tsumugi !== true is skipped, not an issue", async () => {
+  for (const text of ["---\nsomeField: value\n---\nnot ours", "---\ntsumugi: false\n---\nnot ours either"]) {
+    const p = await plan(new ReadOnlyVault({ "note.md": text }), local());
+    assert.equal(p.issues.length, 0, text);
+    assert.equal(p.records.length, 0, text);
+  }
+});
+
+test("legacy-format Markdown archived under .tsumugi-archive is excluded from the scan entirely", async () => {
+  const p = await plan(new ReadOnlyVault({
+    ".tsumugi-archive/legacy-cleanup/files/Memories/2026-07-27-tx6wqr.md": "this is not even close to a valid Tsumugi day-file",
+  }), local());
+  assert.equal(p.issues.length, 0);
+  assert.equal(p.records.length, 0);
+});
+
+test("Tsumugi-owned Markdown that is broken (tsumugi: true but unparseable) is still an issue", async () => {
+  const p = await plan(new ReadOnlyVault({ "broken.md": "---\ntsumugi: true\n---\nno id, no recognizable section" }), local());
+  assert.equal(p.issues.length, 1);
+  assert.equal(p.issues[0].error, "markdown-parse-or-shape-failure");
+});
+
+test("normal Tsumugi Markdown is still recognized when a foreign Markdown coexists in the same Vault", async () => {
+  const c = conversation();
+  const p = await plan(new ReadOnlyVault({ "Conversations/a.md": conversationToMarkdown(c), "test.md": "# hello, this is my own note" }), local([c]));
+  assert.equal(p.issues.length, 0);
+  assert.equal(p.records.length, 1);
+  assert.equal(p.records[0].classification, "equivalent-existing");
+});
+
+test("excluding .tsumugi-archive from the walk does not affect the existing .tsumugi/* known-path metadata reads", async () => {
+  const c = conversation(), path = "Conversations/a.md", text = conversationToMarkdown(c), bucket = vaultRegistryBucketOf(c.id);
+  const v = new ReadOnlyVault({
+    [path]: text,
+    ".tsumugi/registry-meta.json": JSON.stringify(baselineMeta),
+    [`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`]: JSON.stringify({ schemaVersion: 1, bucket, records: { [c.id]: path }, files: {
+      [path]: { recordType: "conversation", mtime: 1, size: text.length, contentHash: hashVaultText(text), memberIds: [c.id], status: "ok" } } }),
+    ".tsumugi-archive/legacy-cleanup/files/Memories/junk.md": "garbage, not a Tsumugi Markdown at all",
+  });
+  const p = await plan(v, local([c]));
+  assert.equal(p.baseline.status, "established");
+  assert.equal(p.records[0].classification, "equivalent-existing");
+  assert.equal(p.records[0].registry.entryExists, true);
+  assert.equal(p.issues.length, 0);
 });
 
 const { openExistingRecoveryDatabase, parseRecoveryMemoryMarkdown } = require("./vaultRecovery") as typeof import("./vaultRecovery");

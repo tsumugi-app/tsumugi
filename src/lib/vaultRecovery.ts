@@ -1,12 +1,19 @@
 /** Phase 1: observation only. No apply, DB initialization, persistent journal or repair.
  * Caller must hold the existing exclusive vault-world lock and validate the tab epoch.
- * All Markdown (including moved/hidden/archive folders) is scanned.
- * Unknown/malformed Markdown conservatively prevents a proof of absence.
+ * All Markdown owned by Tsumugi (moved/archive folders included, hidden directories
+ * excluded — see HIDDEN_PREFIX) is scanned. Markdown that is not Tsumugi-owned
+ * (no `tsumugi: true` frontmatter) is skipped, not treated as an issue.
+ * Unknown/malformed Tsumugi-owned Markdown conservatively prevents a proof of absence.
  */
 import type { Conversation, MemoryObject, Source } from "./types";
 import { parseConversationMarkdown, parseFrontmatter, parseMemoryObjectMarkdown, parseSourceMarkdown } from "./markdown";
 import { conversationsSemanticEqual, memoryObjectsSemanticEqual, sourcesSemanticEqual,
   isReflectionSummary, dayFileRegistryKey, vaultRegistryBucketOf, fileNameFor, dayFileNameFor } from "./vault";
+
+/** 他の全走査系関数（vault.ts/vaultLegacyCleanup.ts等）と共通の規約：`.`で始まる
+ *  ディレクトリ・ファイルは隠し領域（`.tsumugi`本体・`.tsumugi-archive`等）として
+ *  recursive walkの対象外にする。 */
+const HIDDEN_PREFIX = ".";
 
 export type RecoveryClassification = "local-only-safe" | "equivalent-existing" | "conflict" |
   "memory-dayfile-merge-required" | "vault-only" | "unreadable / indeterminate";
@@ -244,6 +251,14 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
     try {
       for await (const [name, handle] of dir.entries()) {
         signal?.throwIfAborted();
+        // 隠しディレクトリ・ファイル（`.tsumugi-archive`等）は、他の全走査系関数
+        // （vault.ts/vaultLegacyCleanup.ts等）と同じ既存規約（HIDDEN_PREFIX = "."）に
+        // 従い、recursive Markdown discoveryの対象外にする。`.tsumugi`自体もこの
+        // walkには含めない——known metadata（registry-meta.json・shard・history等）は
+        // 既にこの関数の冒頭で`inspect()`により個別pathを明示的に読んでおり、この
+        // walkとは独立しているため、除外しても既存のRecovery metadata読み取りには
+        // 一切影響しない。
+        if (name.startsWith(HIDDEN_PREFIX)) continue;
         const path = prefix ? `${prefix}/${name}` : name;
         if (allPaths.has(path)) { issues.push({ path, status: "invalid", error: "duplicate-path" }); continue; }
         allPaths.add(path);
@@ -260,7 +275,14 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
           const fileRecords: Observed[] = [];
           for (const block of blocks) {
             const parsed = parseFrontmatter(block);
-            if (!parsed || parsed.frontmatter.tsumugi !== true || typeof parsed.frontmatter.id !== "string") throw new Error("unrecognized-markdown");
+            // Tsumugi所有物かどうかの判定（frontmatterが無い、またはtsumugi!==true）は
+            // 「不正」ではなく「対象外」——Obsidian等、Tsumugiが生成していない任意の
+            // Markdownがこの位置に存在してもissue化せず、単にこのblockを無視する
+            // （所有権が確認できないrecordとして無視するだけで、他recordには一切
+            // 影響しない）。tsumugi:trueを宣言した後のid不正等は、従来通りTsumugi
+            // 所有recordの破損としてissue化する（下のthrowはそのまま維持）。
+            if (!parsed || parsed.frontmatter.tsumugi !== true) continue;
+            if (typeof parsed.frontmatter.id !== "string") throw new Error("unrecognized-markdown");
             const { frontmatter: fm, body } = parsed;
             for (const field of ["links", "profile", "person", "topicEvents"]) {
               if (fm[field] !== undefined && (typeof fm[field] !== "string" || !Array.isArray(JSON.parse(fm[field] as string)))) throw new Error("invalid-encoded-field");

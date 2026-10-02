@@ -404,13 +404,28 @@ test("H: memory-dayfile-merge-required（day-fileはあるがmemberが無い）�
 });
 
 test("I: unreadable/indeterminate（読み込み不能ファイルがある）は変更しない", async () => {
+  // 2026-10-02 scan boundary修正：frontmatterが無い/tsumugi!==trueの非Tsumugi
+  // Markdownはもはや「読み込み不能」扱いにならない（黙ってskipされ、他recordには
+  // 影響しない）。この回帰が検証したい「Tsumugi所有のrecordが本当に読み込み不能な
+  // 場合は、従来通り保守的に全体を変更しない」という性質は、tsumugi: trueを
+  // 宣言した上で壊れているfixtureでのみ再現できる。
   const db = new FakeDb(); const vault = new FakeVault();
   db.conversations.set("c1", conversation("c1"));
-  vault.put("broken.md", "not a valid tsumugi markdown at all, no frontmatter");
+  vault.put("broken.md", "---\ntsumugi: true\n---\nno id, no recognizable section");
   const result = await applyOnce(db, vault);
   assert.equal(result.status, "nothing-to-do");
   assert.equal(result.recovered, 0);
   assert.ok(result.held >= 1);
+});
+
+test("I2: scan boundary修正の回帰——非Tsumugi Markdown（frontmatter無し）が1件Vault内にあっても、他recordのApplyは正常に完了する", async () => {
+  const db = new FakeDb(); const vault = new FakeVault();
+  db.conversations.set("c1", conversation("c1"));
+  vault.put("test.md", "# hello, this is my own note, not Tsumugi's");
+  const result = await applyOnce(db, vault);
+  assert.equal(result.status, "completed");
+  assert.equal(result.recovered, 1);
+  assert.equal(result.held, 0);
 });
 
 // ===========================================================================
