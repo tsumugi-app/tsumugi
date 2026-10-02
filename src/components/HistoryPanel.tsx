@@ -42,27 +42,26 @@ const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
 // 新規Conversationのcanonical classificationとして不正確になったため削除した。
 
 /**
- * Conversation History（STEP 3、2026-10-02 色調整）：entry kind（日記／会話）を
+ * Conversation History（STEP 3、2026-10-01 STEP 3Bで色調整）：entry kind（日記／会話）を
  * 一瞬で識別するための、控えめな視覚区別（card左端の細いborderと、ラベル文字色だけ）。
  * 既存のstone基調のデザインを壊さないよう、card全面やbadgeの塗りつぶしはしない。
  * 新しい色トークンは追加せず、Tailwindの既存パレットを使う最小限の追加にとどめる。
  *
- * 2026-10-02：以前のamber（日記）/slate（会話）は「暖色と寒色の対比」になっており、
- * 赤・青のような強い対比に見えるとの指摘を受け、同じ赤〜茶の系統へ揃えた：
- * - conversation（会話）：落ち着いたエンジ系（rose系の深いshadeをopacityで抑える）。
- * - diary（日記）：薄めの茶系（amber系の浅いshadeをopacityで抑える）。
- * 両方とも暖色・同系統でまとめ、濃淡（エンジ＝濃い／茶＝薄い）だけで区別する。
+ * 実機（Production）での確認を受け、当初のrose/sky（彩度が高くTsumugiの落ち着いた
+ * UIから浮いて見えた）から、よりmutedな色へ変更した：
+ * - diary：暖色（amber、dusty brown寄り）。opacityを下げて彩度を抑える。
+ * - conversation：寒色（slate、muted blue-gray）。同じくopacityを下げる。
  * 色だけでなくopacityも使い、「色を見れば違いは分かるが、色そのものが最初に
  * 目に入らない」程度に抑える。card全面着色・原色は引き続き使わない。
  */
 const ENTRY_KIND_ACCENT: Record<ConversationEntryKind, { text: string; borderLeft: string }> = {
   diary: {
-    text: "text-amber-700/60 dark:text-amber-300/55",
-    borderLeft: "border-l-amber-500/35 dark:border-l-amber-400/25",
+    text: "text-amber-800/80 dark:text-amber-200/70",
+    borderLeft: "border-l-amber-700/40 dark:border-l-amber-400/30",
   },
   conversation: {
-    text: "text-rose-900/70 dark:text-rose-300/60",
-    borderLeft: "border-l-rose-900/40 dark:border-l-rose-400/30",
+    text: "text-slate-600/80 dark:text-slate-300/70",
+    borderLeft: "border-l-slate-500/40 dark:border-l-slate-400/30",
   },
 };
 
@@ -1299,27 +1298,9 @@ export default function HistoryPanel({
                     </div>
                     <p className="text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
                     {selectedConversationReflection && (
-                      <>
-                        <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
-                          {selectedConversationReflection.content}
-                        </p>
-                        {/*
-                          キーワードは新しく生成せず、既存のReflection（MemoryObject）が
-                          既に持っているkeywordsをそのまま表示するだけ（要件4）。
-                        */}
-                        {selectedConversationReflection.keywords.length > 0 && (
-                          <div className="flex flex-wrap gap-2 pt-1">
-                            {selectedConversationReflection.keywords.map((keyword) => (
-                              <span
-                                key={keyword}
-                                className="rounded-full border border-stone-300/60 px-3 py-1 text-xs text-stone-500 dark:border-stone-600/60 dark:text-stone-400"
-                              >
-                                {keyword}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </>
+                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
+                        {selectedConversationReflection.content}
+                      </p>
                     )}
                   </div>
                   <button
@@ -1390,6 +1371,7 @@ export default function HistoryPanel({
                           key={row.id}
                           row={row}
                           full={conversationFullById.get(row.id)}
+                          reflection={reflectionByConversationId.get(row.id)}
                           loading={!row.full && !fetchedConversationById.has(row.id)}
                           onClick={() => void openConversationRow(row)}
                         />
@@ -1443,11 +1425,13 @@ export default function HistoryPanel({
 function ConversationCard({
   row,
   full,
+  reflection,
   loading,
   onClick,
 }: {
   row: ConversationRow;
   full: Conversation | undefined;
+  reflection: MemoryObject | undefined;
   loading: boolean;
   onClick: () => void;
 }) {
@@ -1456,6 +1440,7 @@ function ConversationCard({
   const accent = entryKind ? ENTRY_KIND_ACCENT[entryKind] : null;
   // title欠損時のfallbackは表示専用（canonicalなConversation.titleへは一切保存しない。要件4）。
   const displayTitle = full ? full.title?.trim() || fallbackConversationTitle(full) : null;
+  const reflectionPreview = reflection?.summary?.trim();
 
   return (
     <button
@@ -1474,13 +1459,17 @@ function ConversationCard({
         <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">{time ?? ""}</span>
       </div>
       {/*
-        2026-10-02：一覧（card）はentry kind＋titleだけにする。Reflection previewは
-        一覧には出さない（詳細タップ後だけで読む、という仕様）。「Reflection」
-        「振り返り」のようなラベルもここでは不要（titleの1行だけで完結する）。
+        title + Reflection一体化（STEP 3B 要件16/17）：titleを見出し、Reflection previewを
+        その本文として、1つの過去の記録として読めるようにする。「Reflection」「振り返り」
+        のようなラベルは付けない。titleとpreviewの間に罫線・背景差等の強い区切りも作らない
+        （gapだけの最小限の行間）。
       */}
       <p className="truncate text-sm text-stone-800 dark:text-stone-100">
         {displayTitle ?? (loading ? "読み込んでいます…" : "詳細を読み込めませんでした")}
       </p>
+      {reflectionPreview && (
+        <p className="line-clamp-2 text-xs leading-relaxed text-stone-500 dark:text-stone-400">{reflectionPreview}</p>
+      )}
     </button>
   );
 }
