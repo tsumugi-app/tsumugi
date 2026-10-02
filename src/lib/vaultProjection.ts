@@ -549,7 +549,10 @@ async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObjec
   }
 
   const sortedMembers = [...mergedMembers].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const finalContent = serializeMemoryDayFile(sortedMembers);
+  // No-op must describe the bytes on disk, not a hypothetical serialization.
+  const finalContent = verdict === "no-op" && read.state === "ok"
+    ? read.text
+    : serializeMemoryDayFile(sortedMembers);
 
   if (verdict !== "no-op") {
     const { dir, fileName } = await dirAndFileNameFor(env.root, path, true);

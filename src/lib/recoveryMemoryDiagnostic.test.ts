@@ -143,3 +143,42 @@ test("busy lock does not open DB or read Vault", async () => {
   const locks = { request: async (_n: string, _o: unknown, cb: (lock: null) => Promise<unknown>) => cb(null) } as unknown as LockManager;
   assert.deepEqual(await runHeldMemoryDiagnostic(f.plan, f.root, () => true, factory, locks), { status: "unavailable" }); assert.equal(f.reads(), 0); assert.equal(f.writes(), 0);
 });
+
+const { compareDiagnosticLinks } = require("./recoveryMemoryDiagnostic") as typeof import("./recoveryMemoryDiagnostic");
+const edge = (id: string, sourceId = "SECRET-ID-30", targetId = "SECRET-ID-0"): import("./types").Link => ({
+  id, sourceId, targetId, axis: "theme", reason: "SECRET-LINK", contrast: false, strength: 0.8, createdBy: "ai-inference", createdAt: T,
+});
+for (const [name, a, b] of [
+  ["same-set-order-only", [edge("A"), edge("B")], [edge("B"), edge("A")]],
+  ["canonical-strict-superset", [edge("A"), edge("B")], [edge("A")]],
+  ["vault-strict-superset", [edge("A")], [edge("A"), edge("B")]],
+  ["both-have-unique-links", [edge("A")], [edge("B")]],
+  ["same-link-id-content-difference", [edge("A")], [{ ...edge("A"), strength: 0.2 }]],
+  ["same-order-and-content", [edge("A")], [edge("A")]],
+] as const) test(`Link classification: ${name}`, () => {
+  assert.equal(compareDiagnosticLinks([...a], [...b]).category, name);
+});
+test("duplicate Link identity is indeterminate, not a false superset", () => {
+  assert.throws(() => compareDiagnosticLinks([edge("A"), edge("A")], []));
+});
+for (const scenario of ["matching", "different", "missing", "reverse"] as const) test(`Link counterpart ${scenario}, anonymous readonly integration`, async () => {
+  const f = fixture();
+  const link = scenario === "reverse" ? edge("SECRET-LINK-ID", "SECRET-ID-0", "SECRET-ID-30")
+    : edge("SECRET-LINK-ID", "SECRET-ID-30", scenario === "missing" ? "ABSENT" : "SECRET-ID-0");
+  const stored = parseMemoryDayFile(f.files.get(f.path)!);
+  stored[30].links = [link]; // Vault-only Link.
+  if (scenario !== "missing") {
+    const counterpart = scenario === "different" ? { ...link, reason: "OTHER-SECRET" } : link;
+    f.local.memories[0].links = [counterpart]; stored[0].links = [counterpart];
+  }
+  f.plan.snapshot = clone(f.local);
+  f.files.set(f.path, serializeMemoryDayFile(stored));
+  const before = JSON.stringify([...f.files]), localBefore = JSON.stringify(f.local);
+  const r = await f.run(); assert.equal(r.status, "complete"); if (r.status !== "complete") return;
+  assert.equal(r.links.categories["vault-strict-superset"], 1);
+  const key = scenario === "missing" ? "indeterminate" : scenario === "different" ? "no-matching-link" : "counterpart-memory-has-matching-link";
+  assert.equal(r.links.canonicalCounterpart[key], 1);
+  assert.equal(r.links.storageEvidence.indeterminate, 5);
+  assert.ok(!JSON.stringify(r).includes("SECRET")); assert.ok(!JSON.stringify(r).includes(T));
+  assert.equal(JSON.stringify([...f.files]), before); assert.equal(JSON.stringify(f.local), localBefore); assert.equal(f.writes(), 0);
+});

@@ -62,3 +62,18 @@ Run `npm run test:recovery-memory-diagnostic` and existing Recovery suites.
 Tests trap Vault mutators and non-readonly transactions, test the browser runner with
 existing-only DB readers, and compare pre/post storage. Fake tests do not prove browser
 or provider correctness; no real-user storage is used by the tests.
+
+## Link-only extension
+
+The same five conflict Memories receive exact JSON Link comparison (the production
+comparison contract). Categories are exclusive; same-link-id-content-difference takes
+precedence over unique edges. Duplicate IDs abort rather than guessing set membership.
+`same-order-and-content` also counts conflicts whose links are unchanged.
+`canonicalCounterpart` observes the other endpoint in the existing canonical snapshot
+only (not a statement about its Vault copy). Counts are per one-sided Link occurrence
+across the five Memories, not distinct global edges. Both source and target direction
+are supported; missing/ambiguous endpoints are indeterminate. Matching requires the
+entire Link to match, not merely its ID. No extra scan/projection is invoked.
+Outbox/ledger timestamps cannot prove a Link payload's authority; storageEvidence is
+therefore indeterminate for all five. No additional outbox access is performed.
+This probe and the no-op hash prevention fix neither implement nor invoke batch repair.

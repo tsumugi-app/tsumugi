@@ -2,7 +2,7 @@
  * Imports production pure comparisons/serialization only; no db.ts helpers.
  * Output is a closed counts-only schema. Never return/log exceptions or input values.
  */
-import type { MemoryObject } from "./types";
+import type { Link, MemoryObject } from "./types";
 import type { RecoveryApplyPlan } from "./vaultRecoveryApply";
 import { openExistingRecoveryDatabase, readRecoveryLocalSnapshot, parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual, type RecoveryLocalSnapshot } from "./vaultRecovery";
 import { readRecoveryControl } from "./vaultRecoverySession";
@@ -17,8 +17,44 @@ export const MEMORY_DIAGNOSTIC_MISMATCH = "現在のRecovery状態と診断対�
 export type MemoryDiagnosticResult = { status: "mismatch" | "unavailable" } | {
   status: "complete";
   registry: { heldMemoryCount: number; dayFileCount: number; statusMismatch: number; rawHashMismatch: number; reserializeOnlyMatch: number; memberIdsMismatch: number };
+  links: LinkDiagnostic;
   conflicts: { count: number; "updatedAt-only": number; "timestamp-only": number; "metadata-only": number; "substantive-data-difference": number; fields: Record<string, number> };
 };
+type LinkCategory = "same-set-order-only" | "canonical-strict-superset" | "vault-strict-superset" | "both-have-unique-links" | "same-link-id-content-difference" | "same-order-and-content";
+interface LinkDiagnostic {
+  categories: Record<LinkCategory, number>;
+  // Counts are per one-sided Link occurrence in the five target Memories.
+  canonicalCounterpart: { "counterpart-memory-has-matching-link": number; "no-matching-link": number; indeterminate: number };
+  storageEvidence: { "canonical-consistent": number; "vault-consistent": number; indeterminate: number };
+}
+/** Exact JSON equality, as used by the production Memory links comparison.
+ * ID aligns edges; never compare reason/strength loosely or infer chronological authority. */
+export function compareDiagnosticLinks(a: Link[], b: Link[]): { category: LinkCategory; exclusive: Link[] } {
+  for (const links of [a, b]) {
+    requireMatch(Array.isArray(links) && links.every(l => obj(l) && typeof l.id === "string" && l.id.length > 0 && typeof l.sourceId === "string" && typeof l.targetId === "string"));
+    requireMatch(new Set(links.map(l => l.id)).size === links.length);
+  }
+  const am = new Map(a.map(l => [l.id, l])), bm = new Map(b.map(l => [l.id, l]));
+  const ax = a.filter(l => !bm.has(l.id)), bx = b.filter(l => !am.has(l.id));
+  const changed = a.some(l => bm.has(l.id) && !same(l, bm.get(l.id)));
+  const category: LinkCategory = changed ? "same-link-id-content-difference"
+    : ax.length && bx.length ? "both-have-unique-links"
+    : ax.length ? "canonical-strict-superset" : bx.length ? "vault-strict-superset"
+    : same(a, b) ? "same-order-and-content" : "same-set-order-only";
+  return { category, exclusive: [...ax, ...bx] };
+}
+function inspectCounterparts(id: string, links: Link[], memories: MemoryObject[], counts: LinkDiagnostic["canonicalCounterpart"]) {
+  for (const link of links) {
+    const other = link.sourceId === id && link.targetId !== id ? link.targetId
+      : link.targetId === id && link.sourceId !== id ? link.sourceId : null;
+    const matches = other === null ? [] : memories.filter(m => m.id === other);
+    if (matches.length !== 1 || !Array.isArray(matches[0].links)) { counts.indeterminate++; continue; }
+    const edges = matches[0].links.filter(l => l.id === link.id);
+    if (edges.length > 1) counts.indeterminate++;
+    else if (edges.length === 1 && same(edges[0], link)) counts["counterpart-memory-has-matching-link"]++;
+    else counts["no-matching-link"]++;
+  }
+}
 class Mismatch extends Error {}
 const requireMatch = (v: unknown) => { if (!v) throw new Mismatch(); };
 
@@ -80,7 +116,13 @@ export async function inspectHeldMemories(plan: RecoveryApplyPlan, root: FileSys
       return reads.get(path)!;
     };
     const result: Extract<MemoryDiagnosticResult, { status: "complete" }> = {
-      status: "complete", registry: { heldMemoryCount: 30, dayFileCount: 0, statusMismatch: 0, rawHashMismatch: 0, reserializeOnlyMatch: 0, memberIdsMismatch: 0 },
+      status: "complete", links: {
+        categories: { "same-set-order-only": 0, "canonical-strict-superset": 0, "vault-strict-superset": 0, "both-have-unique-links": 0, "same-link-id-content-difference": 0, "same-order-and-content": 0 },
+        canonicalCounterpart: { "counterpart-memory-has-matching-link": 0, "no-matching-link": 0, indeterminate: 0 },
+        // Ledger/outbox timestamps do not attest to a particular links payload.
+        // Do not label either side authoritative from updatedAt alone; no outbox read needed.
+        storageEvidence: { "canonical-consistent": 0, "vault-consistent": 0, indeterminate: 5 },
+      }, registry: { heldMemoryCount: 30, dayFileCount: 0, statusMismatch: 0, rawHashMismatch: 0, reserializeOnlyMatch: 0, memberIdsMismatch: 0 },
       conflicts: { count: 5, "updatedAt-only": 0, "timestamp-only": 0, "metadata-only": 0, "substantive-data-difference": 0, fields: {} },
     };
     const seen = new Set<string>();
@@ -98,6 +140,9 @@ export async function inspectHeldMemories(plan: RecoveryApplyPlan, root: FileSys
       const fields = memoryDifferenceFields(canonical[0], matches[0]);
       if (h.reason === "conflict") {
         requireMatch(fields.length > 0);
+        const linkDiff = compareDiagnosticLinks(canonical[0].links, matches[0].links);
+        result.links.categories[linkDiff.category]++;
+        inspectCounterparts(h.recordId, linkDiff.exclusive, local.memories, result.links.canonicalCounterpart);
         const category = fields.length === 1 && fields[0] === "updatedAt" ? "updatedAt-only"
           : fields.every(f => ["date", "createdAt", "updatedAt", "eventTime", "eventTimePrecision"].includes(f)) ? "timestamp-only"
           : fields.every(f => f.startsWith("metadata.")) ? "metadata-only" : "substantive-data-difference";

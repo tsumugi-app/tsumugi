@@ -1382,3 +1382,30 @@ test("reconcilePendingVaultOutbox: Conversation/Memory/Reflection/Sourceが混�
   // heldになったsourceの外部データは一切変更されていない。
   assert.ok(vault.get(sourcePath(sHeld))?.includes("外部で食い違う内容"));
 });
+
+test("no-op Registry uses untouched raw day-file hash, preserving all member metadata", async () => {
+  const vault = new FakeVault(); seedVaultIdentityFile(vault);
+  const day = "2026-04-29", a = memory("raw-noop-a", day), b = memory("raw-noop-b", day);
+  const entry = await seedMemoryCanonical(a);
+  const path = memoryDayPath(day);
+  const serialized = markdownMod.serializeMemoryDayFile([a, b]);
+  const raw = serialized + "\n\n";
+  vault.put(path, raw);
+  const members = markdownMod.parseMemoryDayFile(raw);
+  assert.notEqual(raw, markdownMod.serializeMemoryDayFile(members));
+  const hashes = Object.fromEntries(members.map(m => [m.id, vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(m))]));
+  const key = vaultMod.dayFileRegistryKey(day);
+  vault.put(memoryShardPathFor(day), JSON.stringify({ schemaVersion: 1, records: { [key]: path }, files: {
+    [path]: { recordType: "memory-day", contentHash: vaultMod.hashVaultText(serialized), memberIds: members.map(m => m.id), memberHashes: hashes, status: "ok" },
+  } }));
+  // Any Markdown write would fail: a passing reconcile proves the no-op branch.
+  vault.writeShouldFail.add(path);
+  const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(result.status, "done");
+  assert.equal(vault.get(path), raw);
+  const after = JSON.parse(vault.get(memoryShardPathFor(day))!).files[path];
+  assert.equal(after.contentHash, vaultMod.hashVaultText(raw));
+  assert.notEqual(after.contentHash, vaultMod.hashVaultText(serialized));
+  assert.deepEqual(after.memberIds, members.map(m => m.id));
+  assert.deepEqual(after.memberHashes, hashes);
+});
