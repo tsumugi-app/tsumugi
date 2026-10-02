@@ -87,7 +87,8 @@ test("fallbackConversationTitle: 空白だけのUser発言は無視して次のU
 });
 
 // ===========================================================================
-// buildReflectionMap（要件7：複数Reflection時の決定的選択ルール＝最新を採用）
+// buildReflectionMap（要件7、2026-10-02改訂：複数Reflection時は「内容が充実している
+// 方」を優先し、最後にcreatedAt降順＝最新で決める。単純な「最新を採用」ではない）
 // ===========================================================================
 
 test("buildReflectionMap: 1件だけの場合はそのままconversationIdへ紐付く", () => {
@@ -95,12 +96,55 @@ test("buildReflectionMap: 1件だけの場合はそのままconversationIdへ紐
   assert.equal(map.get("CONV-1")?.id, "REF-1");
 });
 
-test("buildReflectionMap: 同一conversationIdに複数ある場合は最新（createdAt降順）を採用する", () => {
+test("buildReflectionMap: keywords・本文の長さが同程度なら新しい方（createdAt降順）を採用する", () => {
   const older = reflection({ id: "REF-OLD", createdAt: "2026-09-20T10:00:00.000Z", content: "古い振り返り", summary: "古い振り返り" });
-  const newer = reflection({ id: "REF-NEW", createdAt: "2026-09-25T10:00:00.000Z", content: "新しい振り返り", summary: "新しい振り返り" });
+  const newer = reflection({ id: "REF-NEW", createdAt: "2026-09-25T10:00:00.000Z", content: "新しい振り返りです", summary: "新しい振り返りです" });
   const map = buildReflectionMap([older, newer]);
   assert.equal(map.size, 1, "削除・統合はしないが、1 conversationIdにつき採用するのは1件だけ");
   assert.equal(map.get("CONV-1")?.id, "REF-NEW");
+});
+
+test("buildReflectionMap: 実機バグの再現ケース——古いが内容豊富なReflectionを、新しいが劣化した複製（keywords無し・タイトルのように短い）より優先する", () => {
+  // STEP 2-Bの冪等性ガード導入前のlegacyデータを想定：同じ会話に対し、内容の濃い
+  // Reflection（keywordsあり・本文が長い）が先に作られ、後から短く情報の薄い
+  // 複製が作られてしまったケース。「最新を採用」だとこの劣化複製が選ばれてしまい、
+  // 実機で報告された「本文がタイトルのように短く、keywordsが出ない」症状と一致する。
+  const rich = reflection({
+    id: "REF-RICH",
+    createdAt: "2026-09-20T10:00:00.000Z",
+    content: "今日は公園で子どもと遊んだ後、近所のパン屋に寄って好きなクロワッサンを買って帰った。",
+    summary: "今日は公園で子どもと遊んだ後、近所のパン屋に寄って好きなクロワッサンを買って帰った。",
+    keywords: ["公園", "パン屋"],
+  });
+  const degenerate = reflection({
+    id: "REF-THIN",
+    createdAt: "2026-09-25T10:00:00.000Z",
+    content: "公園でのこと",
+    summary: "公園でのこと",
+    keywords: [],
+  });
+  const map = buildReflectionMap([rich, degenerate]);
+  assert.equal(map.get("CONV-1")?.id, "REF-RICH", "新しくても劣化した複製ではなく、内容の濃い既存Reflectionを選ぶ");
+  assert.deepEqual(map.get("CONV-1")?.keywords, ["公園", "パン屋"], "選ばれたReflectionのkeywordsがそのまま使われる");
+});
+
+test("buildReflectionMap: keywordsの有無が異なれば、本文の長さに関わらずkeywordsがある方を優先する", () => {
+  const withKeywords = reflection({
+    id: "REF-KW",
+    createdAt: "2026-09-20T10:00:00.000Z",
+    content: "短い本文",
+    summary: "短い本文",
+    keywords: ["散歩"],
+  });
+  const withoutKeywords = reflection({
+    id: "REF-NOKW",
+    createdAt: "2026-09-25T10:00:00.000Z",
+    content: "こちらのほうが本文は長いけれどkeywordsが無い振り返り",
+    summary: "こちらのほうが本文は長いけれどkeywordsが無い振り返り",
+    keywords: [],
+  });
+  const map = buildReflectionMap([withKeywords, withoutKeywords]);
+  assert.equal(map.get("CONV-1")?.id, "REF-KW", "本文の長さより、keywordsの有無を優先する");
 });
 
 test("buildReflectionMap: conversationIdが無いReflectionは無視する（クラッシュしない）", () => {
