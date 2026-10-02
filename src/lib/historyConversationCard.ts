@@ -20,33 +20,15 @@ export function fallbackConversationTitle(conversation: Conversation): string {
 
 /**
  * 同一conversationIdに複数のReflectionが存在するlegacy/異常ケースのための、
- * 決定的な選択ルール（要件7、2026-10-02改訂）：内容が充実している方（keywordsを
- * 持つ・本文が長い）を優先し、最後にcreatedAt降順（最新）で決める。
- * 単純な「最新を採用」ではない理由：STEP 2-Bで冪等性ガード（conversationIdに既存の
- * Reflectionがあれば新規生成しない）を導入する以前のlegacyデータでは、同じ会話に
- * 対して複数回Reflectionが生成され得た。その場合、後から作られた方が必ずしも
- * 内容豊富とは限らない（例：短い/キーワード無しの劣化した複製が、内容の充実した
- * 古いReflectionより後に作られているケース）。これを「最新だから正しい」と仮定して
- * 選ぶと、ユーザーが実際に読んでいた内容の濃いReflectionではなく、タイトルのように
- * 短くkeywordsも無い方が表示されてしまう。
+ * 決定的な選択ルール（要件7）：最新（createdAt降順）を採用する。
  * 削除・統合は一切行わない——選択されなかった方もVault/IndexedDB上にはそのまま残る。
  */
 export function buildReflectionMap(reflections: MemoryObject[]): Map<string, MemoryObject> {
+  const sorted = [...reflections].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const map = new Map<string, MemoryObject>();
-  for (const reflection of reflections) {
+  for (const reflection of sorted) {
     if (!reflection.conversationId) continue;
-    const current = map.get(reflection.conversationId);
-    if (!current || isRicherReflection(reflection, current)) {
-      map.set(reflection.conversationId, reflection);
-    }
+    if (!map.has(reflection.conversationId)) map.set(reflection.conversationId, reflection);
   }
   return map;
-}
-
-function isRicherReflection(candidate: MemoryObject, current: MemoryObject): boolean {
-  const candidateHasKeywords = candidate.keywords.length > 0;
-  const currentHasKeywords = current.keywords.length > 0;
-  if (candidateHasKeywords !== currentHasKeywords) return candidateHasKeywords;
-  if (candidate.content.length !== current.content.length) return candidate.content.length > current.content.length;
-  return candidate.createdAt.localeCompare(current.createdAt) > 0;
 }
