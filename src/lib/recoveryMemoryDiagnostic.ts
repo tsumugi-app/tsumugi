@@ -102,11 +102,19 @@ function strictMembers(raw: string): MemoryObject[] {
 export async function inspectHeldMemories(plan: RecoveryApplyPlan, root: FileSystemDirectoryHandle,
   snapshot: () => Promise<RecoveryLocalSnapshot>, stillCurrent: () => boolean): Promise<MemoryDiagnosticResult> {
   try {
-    const registryHeld = plan.held.filter(h => h.recordType === "memory" && h.reason === "registry-entry-differs");
-    const conflictHeld = plan.held.filter(h => h.recordType === "memory" && h.reason === "conflict");
-    requireMatch(plan.heldCount === 35 && plan.held.length === 35 && registryHeld.length === 30 && conflictHeld.length === 5);
+    // Capture primitive target tuples before the first await; never retain mutable
+    // held objects as the authority for the diagnostic run.
+    const targetSignature = () => JSON.stringify({ count: plan.heldCount,
+      targets: plan.held.map(h => [h.recordId, h.reason, h.recordType]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+      scanCompleted: plan.plan.scanCompleted, issues: plan.plan.issues,
+    });
+    const initialTargets = targetSignature();
+    const held = plan.held.map(h => ({ ...h }));
+    const registryHeld = held.filter(h => h.recordType === "memory" && h.reason === "registry-entry-differs");
+    const conflictHeld = held.filter(h => h.recordType === "memory" && h.reason === "conflict");
+    requireMatch(plan.heldCount === 10 && plan.held.length === 10 && registryHeld.length === 5 && conflictHeld.length === 5);
     requireMatch(plan.plan.scanCompleted && plan.plan.issues.length === 0 && stillCurrent());
-    requireMatch(new Set(plan.held.map(h => h.recordId)).size === 35);
+    requireMatch(new Set(plan.held.map(h => h.recordId)).size === 10);
     const local = await snapshot();
     // Refuse stale canonical/ledger snapshots, including changes outside the target set.
     requireMatch(same(local, plan.snapshot));
@@ -122,7 +130,7 @@ export async function inspectHeldMemories(plan: RecoveryApplyPlan, root: FileSys
         // Ledger/outbox timestamps do not attest to a particular links payload.
         // Do not label either side authoritative from updatedAt alone; no outbox read needed.
         storageEvidence: { "canonical-consistent": 0, "vault-consistent": 0, indeterminate: 5 },
-      }, registry: { heldMemoryCount: 30, dayFileCount: 0, statusMismatch: 0, rawHashMismatch: 0, reserializeOnlyMatch: 0, memberIdsMismatch: 0 },
+      }, registry: { heldMemoryCount: 5, dayFileCount: 0, statusMismatch: 0, rawHashMismatch: 0, reserializeOnlyMatch: 0, memberIdsMismatch: 0 },
       conflicts: { count: 5, "updatedAt-only": 0, "timestamp-only": 0, "metadata-only": 0, "substantive-data-difference": 0, fields: {} },
     };
     const seen = new Set<string>();
@@ -177,6 +185,7 @@ export async function inspectHeldMemories(plan: RecoveryApplyPlan, root: FileSys
     // External editors do not honor Web Locks. Re-read every observed file and canonical.
     for (const [path, raw] of reads) requireMatch(await readText(root, path) === raw);
     requireMatch(same(await snapshot(), local) && stillCurrent());
+    requireMatch(targetSignature() === initialTargets && plan.plan.scanCompleted && plan.plan.issues.length === 0);
     return result;
   } catch (error) { return { status: error instanceof Mismatch ? "mismatch" : "unavailable" }; }
 }

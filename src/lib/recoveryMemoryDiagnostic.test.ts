@@ -16,12 +16,12 @@ function memory(i: number): MemoryObject {
     createdAt: T, updatedAt: T, metadata: { id: "SECRET-META", source: "ai-capture", schemaVersion: "0.1", createdAt: T, updatedAt: T } } as MemoryObject;
 }
 function fixture(mode = "status") {
-  const local: RecoveryLocalSnapshot = { conversations: [], memories: Array.from({ length: 35 }, (_, i) => memory(i)), sources: [], sync: {} };
+  const local: RecoveryLocalSnapshot = { conversations: [], memories: Array.from({ length: 10 }, (_, i) => memory(i)), sources: [], sync: {} };
   const stored = clone(local.memories);
-  for (let i = 30; i < 35; i++) stored[i].updatedAt = "2026-09-19T00:00:00.000Z";
-  if (mode === "content") stored[30].content = "OTHER-SECRET";
-  if (mode === "metadata") { stored[30] = clone(local.memories[30]); stored[30].metadata.confidence = 0.1; }
-  if (mode === "timestamps") stored[30].createdAt = "2026-09-18T00:00:00.000Z";
+  for (let i = 5; i < 10; i++) stored[i].updatedAt = "2026-09-19T00:00:00.000Z";
+  if (mode === "content") stored[5].content = "OTHER-SECRET";
+  if (mode === "metadata") { stored[5] = clone(local.memories[5]); stored[5].metadata.confidence = 0.1; }
+  if (mode === "timestamps") stored[5].createdAt = "2026-09-18T00:00:00.000Z";
   const path = "Memories/SECRET-PATH.md", key = dayFileRegistryKey(T.slice(0, 10));
   const shardPath = `.tsumugi/registry/${vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`;
   const raw = serializeMemoryDayFile(stored) + (mode === "reserialize" ? "\n\n" : "");
@@ -42,17 +42,17 @@ function fixture(mode = "status") {
       } };
     },
   } as unknown as FileSystemDirectoryHandle);
-  const records = local.memories.map((m, i) => ({ recordId: m.id, recordType: "memory", indexedDBExists: true, vaultPaths: [path], registryKey: key, classification: i < 30 ? "equivalent-existing" : "conflict" }));
-  const plan = { heldCount: 35, held: local.memories.map((m, i) => ({ recordId: m.id, recordType: "memory", reason: i < 30 ? "registry-entry-differs" : "conflict" })),
+  const records = local.memories.map((m, i) => ({ recordId: m.id, recordType: "memory", indexedDBExists: true, vaultPaths: [path], registryKey: key, classification: i < 5 ? "equivalent-existing" : "conflict" }));
+  const plan = { heldCount: 10, held: local.memories.map((m, i) => ({ recordId: m.id, recordType: "memory", reason: i < 5 ? "registry-entry-differs" : "conflict" })),
     snapshot: clone(local), plan: { scanCompleted: true, issues: [], records }, confirmed: { world: { activeVaultEpoch: 1, committedVaultEpoch: 1, registryGenerationEpoch: 0, journalVersion: "current", backend: "file-system-access" } } } as unknown as RecoveryApplyPlan;
   return { local, plan, files, root: dir(), path, shardPath, forbid, reads: () => reads, writes: () => writes,
     run: () => inspectHeldMemories(plan, dir(), async () => clone(local), () => true) };
 }
 for (const [mode, field] of [["status", "statusMismatch"], ["hash", "rawHashMismatch"], ["reserialize", "reserializeOnlyMatch"], ["members", "memberIdsMismatch"]] as const) {
-  test(`${mode}: production raw/parser/serializer, 30 members share one day entry`, async () => {
+  test(`${mode}: production raw/parser/serializer, 5 members share one day entry`, async () => {
     const f = fixture(mode), before = [...f.files]; const result = await f.run();
     assert.equal(result.status, "complete"); if (result.status !== "complete") return;
-    assert.equal(result.registry[field], 1); assert.equal(result.registry.dayFileCount, 1); assert.equal(result.registry.heldMemoryCount, 30);
+    assert.equal(result.registry[field], 1); assert.equal(result.registry.dayFileCount, 1); assert.equal(result.registry.heldMemoryCount, 5);
     assert.deepEqual([...f.files], before); assert.equal(f.writes(), 0);
   });
 }
@@ -65,7 +65,7 @@ test("closed output never contains individual values, including IO errors", asyn
   for (const v of ["SECRET", T, f.path, "recordId", "conversationId"]) assert.ok(!text.includes(v));
   f.files.clear(); text = JSON.stringify(await f.run()); assert.equal(text, '{"status":"unavailable"}');
 });
-test("wrong counts stop before any IO", async () => { const f = fixture(); f.plan.heldCount = 34; assert.deepEqual(await f.run(), { status: "mismatch" }); assert.equal(f.reads(), 0); });
+test("wrong counts stop before any IO", async () => { const f = fixture(); f.plan.heldCount = 9; assert.deepEqual(await f.run(), { status: "mismatch" }); assert.equal(f.reads(), 0); });
 test("wrong reason or duplicate targets rejected", async () => { const f = fixture(); f.plan.held[0].reason = "other"; assert.deepEqual(await f.run(), { status: "mismatch" }); });
 test("changed canonical or current UI rejected", async () => {
   const f = fixture(); f.local.memories[0].summary = "CHANGED"; assert.deepEqual(await f.run(), { status: "mismatch" });
@@ -145,7 +145,7 @@ test("busy lock does not open DB or read Vault", async () => {
 });
 
 const { compareDiagnosticLinks } = require("./recoveryMemoryDiagnostic") as typeof import("./recoveryMemoryDiagnostic");
-const edge = (id: string, sourceId = "SECRET-ID-30", targetId = "SECRET-ID-0"): import("./types").Link => ({
+const edge = (id: string, sourceId = "SECRET-ID-5", targetId = "SECRET-ID-0"): import("./types").Link => ({
   id, sourceId, targetId, axis: "theme", reason: "SECRET-LINK", contrast: false, strength: 0.8, createdBy: "ai-inference", createdAt: T,
 });
 for (const [name, a, b] of [
@@ -163,10 +163,10 @@ test("duplicate Link identity is indeterminate, not a false superset", () => {
 });
 for (const scenario of ["matching", "different", "missing", "reverse"] as const) test(`Link counterpart ${scenario}, anonymous readonly integration`, async () => {
   const f = fixture();
-  const link = scenario === "reverse" ? edge("SECRET-LINK-ID", "SECRET-ID-0", "SECRET-ID-30")
-    : edge("SECRET-LINK-ID", "SECRET-ID-30", scenario === "missing" ? "ABSENT" : "SECRET-ID-0");
+  const link = scenario === "reverse" ? edge("SECRET-LINK-ID", "SECRET-ID-0", "SECRET-ID-5")
+    : edge("SECRET-LINK-ID", "SECRET-ID-5", scenario === "missing" ? "ABSENT" : "SECRET-ID-0");
   const stored = parseMemoryDayFile(f.files.get(f.path)!);
-  stored[30].links = [link]; // Vault-only Link.
+  stored[5].links = [link]; // Vault-only Link.
   if (scenario !== "missing") {
     const counterpart = scenario === "different" ? { ...link, reason: "OTHER-SECRET" } : link;
     f.local.memories[0].links = [counterpart]; stored[0].links = [counterpart];
@@ -181,4 +181,24 @@ for (const scenario of ["matching", "different", "missing", "reverse"] as const)
   assert.equal(r.links.storageEvidence.indeterminate, 5);
   assert.ok(!JSON.stringify(r).includes("SECRET")); assert.ok(!JSON.stringify(r).includes(T));
   assert.equal(JSON.stringify([...f.files]), before); assert.equal(JSON.stringify(f.local), localBefore); assert.equal(f.writes(), 0);
+});
+
+for (const change of ["id", "reason", "type", "issues"] as const) test(`mid-read target ${change} change aborts`, async () => {
+  const f = fixture(); let reads = 0;
+  const result = await inspectHeldMemories(f.plan, f.root, async () => {
+    if (++reads === 2) {
+      if (change === "id") f.plan.held[0].recordId = "REPLACED-SECRET";
+      if (change === "reason") f.plan.held[0].reason = "other";
+      if (change === "type") f.plan.held[0].recordType = "conversation";
+      if (change === "issues") f.plan.plan.issues.push("unexpected" as never);
+    }
+    return clone(f.local);
+  }, () => true);
+  assert.deepEqual(result, { status: "mismatch" }); assert.equal(f.writes(), 0);
+});
+for (const change of ["type", "issues"] as const) test(`initial ${change} fails closed`, async () => {
+  const f = fixture();
+  if (change === "type") f.plan.held[0].recordType = "conversation";
+  else f.plan.plan.issues.push("unexpected" as never);
+  assert.deepEqual(await f.run(), { status: "mismatch" }); assert.equal(f.reads(), 0);
 });

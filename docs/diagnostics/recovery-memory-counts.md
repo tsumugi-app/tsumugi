@@ -5,12 +5,12 @@ This is observation only, not a Recovery fix. No deployment is included.
 ## Entry point
 
 On a build containing this change, `?debugLog=1` → Settings → Recovery:
-use an existing completed Apply Plan, then press **35件を読み取り専用で診断** once.
+use an existing completed Apply Plan, then press **10件を読み取り専用で診断** once.
 If no Plan exists, the existing **確認する** produces the read-only Plan; the diagnostic
 button itself never invokes a scan, Apply, cleanup, resync or migration.
 Do not press recovery/cleanup buttons. Close other Tsumugi tabs and external editors.
 
-Only exactly 35 held records (30 memory registry-entry-differs and 5 memory conflict)
+Only exactly 10 held records (5 memory registry-entry-differs and 5 memory conflict)
 are accepted. Additional held reasons/types, incomplete scans, changed canonical/ledger,
 changed world, replaced UI Plan, unreadable files or changed target classifications stop
 without partial output. Busy/missing Web Locks also stop, without waiting.
@@ -77,3 +77,6 @@ entire Link to match, not merely its ID. No extra scan/projection is invoked.
 Outbox/ledger timestamps cannot prove a Link payload's authority; storageEvidence is
 therefore indeterminate for all five. No additional outbox access is performed.
 This probe and the no-op hash prevention fix neither implement nor invoke batch repair.
+
+Target ID/reason/type tuples are copied before IO and compared again after all reads.
+Changes to that set, scan completeness or issues abort without partial output.

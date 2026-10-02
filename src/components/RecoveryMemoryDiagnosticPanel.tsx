@@ -23,7 +23,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
   return <section>
     <p>[D] Memory Recovery診断 — READ ONLY・件数のみ</p>
     <p>他のTsumugiタブと外部エディタを閉じてください。整理・復旧は実行しません。</p>
-    <button disabled={disabled || busy || !!output} onClick={() => void inspect()}>35件を読み取り専用で診断</button>
+    <button disabled={disabled || busy || !!output} onClick={() => void inspect()}>10件を読み取り専用で診断</button>
     {busy && <p>診断中…</p>}
     {result?.status === "mismatch" && <p>{MEMORY_DIAGNOSTIC_MISMATCH}</p>}
     {result?.status === "unavailable" && <p>読み取りまたは排他確認ができないため中止しました。</p>}
