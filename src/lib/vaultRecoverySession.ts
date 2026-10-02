@@ -22,7 +22,7 @@ function assertNotWiping(env: RecoveryEnvironment) {
 function isEpoch(raw: unknown): raw is string {
   return typeof raw === "string" && Number.isSafeInteger(Number(raw)) && Number(raw) >= 0 && String(Number(raw)) === raw;
 }
-async function readControl(db: IDBDatabase): Promise<unknown[]> {
+export async function readRecoveryControl(db: IDBDatabase): Promise<unknown[]> {
   if (!db.objectStoreNames.contains("settings")) throw new Error("world-unconfirmed");
   const tx = db.transaction(["settings"], "readonly");
   const done = new Promise<void>((resolve, reject) => {
@@ -68,7 +68,7 @@ export async function runRecoveryDiagnostic(env: RecoveryEnvironment, signal: Ab
     let versionChanged = false;
     db.onversionchange = () => { versionChanged = true; db.close(); };
     try {
-      const before = await readControl(db);
+      const before = await readRecoveryControl(db);
       signal.throwIfAborted();
       const root = await restoreVaultHandleReadOnly(env);
       signal.throwIfAborted();
@@ -76,7 +76,7 @@ export async function runRecoveryDiagnostic(env: RecoveryEnvironment, signal: Ab
       const plan = await buildVaultRecoveryPlan(root, snapshot, signal);
       signal.throwIfAborted();
       assertNotWiping(env);
-      if (versionChanged || JSON.stringify(before) !== JSON.stringify(await readControl(db))) throw new Error("world-changed");
+      if (versionChanged || JSON.stringify(before) !== JSON.stringify(await readRecoveryControl(db))) throw new Error("world-changed");
       return plan;
     } finally { db.close(); }
   });

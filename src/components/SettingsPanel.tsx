@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
 import type {
   DataActionFeedback,
   RestoreCandidate,
@@ -1317,6 +1318,10 @@ export default function SettingsPanel({
                   {recoveryStatus.kind === "scanning" ? "確認中…" : "確認する"}
                 </button>
               </div>
+
+              {showAdvancedVaultTools && recoveryStatus.kind === "plan" && (
+                <RecoveryMemoryDiagnosticPanel key={recoveryStatus.applyPlan.plan.completedAt} plan={recoveryStatus.applyPlan} root={vaultHandle} disabled={vaultActionsDisabled} />
+              )}
 
               {recoveryStatus.kind === "interrupted" && (
                 <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">

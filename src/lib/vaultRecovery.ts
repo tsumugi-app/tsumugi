@@ -185,7 +185,7 @@ export function parseRecoveryMemoryMarkdown(raw: string): MemoryObject | null {
 
 interface Observed { type: RecordType; data: Data; path: string; day: string }
 const recordDate = (type: RecordType, data: Data) => type === "conversation" ? (data as Conversation).startedAt : type === "source" ? data.createdAt : (data as MemoryObject).date;
-function equal(type: RecordType, a: Data, b: Data): boolean {
+export function recoveryRecordsSemanticEqual(type: RecordType, a: Data, b: Data): boolean {
   if (type === "conversation") return conversationsSemanticEqual(a as Conversation, b as Conversation);
   if (type === "source") return sourcesSemanticEqual(a as Source, b as Source);
   // Existing semantic equality deliberately omits some round-trip fields. Observe these too;
@@ -334,7 +334,7 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
     const reasons: string[] = [];
     let semanticEqual: boolean | null = null;
     if (inLocal && matches.length === 1 && matches[0].type === type) {
-      try { semanticEqual = equal(type, data, matches[0].data); } catch { reasons.push("invalid-local-record"); }
+      try { semanticEqual = recoveryRecordsSemanticEqual(type, data, matches[0].data); } catch { reasons.push("invalid-local-record"); }
     }
     if (!scanCompleted) reasons.push("vault-scan-incomplete");
     if (issues.length) reasons.push("strict-read-or-parse-failure");

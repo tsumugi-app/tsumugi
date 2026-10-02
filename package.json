@@ -16,7 +16,8 @@
     "test:conversation-entry-kind": "tsc -p tsconfig.conversation-entry-kind.json && node --test .test-out/lib/conversationEntryKind.test.js",
     "test:reflect": "tsc -p tsconfig.reflect.json && node --test .test-out/lib/reflection.test.js",
     "test:history-conversation-card": "tsc -p tsconfig.history-conversation-card.json && node --test .test-out/lib/historyConversationCard.test.js",
-    "test:save-foundation": "tsc -p tsconfig.save-foundation.json && node --test .test-out/lib/db.foundation.test.js .test-out/lib/vaultOutbox.test.js .test-out/lib/recordAdapter.test.js .test-out/lib/vaultProjection.test.js .test-out/lib/vaultIdentityAdoption.test.js .test-out/lib/vaultProductionMigration.test.js .test-out/lib/storagePersistence.test.js .test-out/lib/saveFoundationBootstrap.test.js .test-out/lib/productionBootstrap.test.js .test-out/lib/productionWiring.test.js .test-out/lib/productionMemoryWiring.test.js .test-out/lib/vaultRecoveryLegacyCleanup.test.js"
+    "test:save-foundation": "tsc -p tsconfig.save-foundation.json && node --test .test-out/lib/db.foundation.test.js .test-out/lib/vaultOutbox.test.js .test-out/lib/recordAdapter.test.js .test-out/lib/vaultProjection.test.js .test-out/lib/vaultIdentityAdoption.test.js .test-out/lib/vaultProductionMigration.test.js .test-out/lib/storagePersistence.test.js .test-out/lib/saveFoundationBootstrap.test.js .test-out/lib/productionBootstrap.test.js .test-out/lib/productionWiring.test.js .test-out/lib/productionMemoryWiring.test.js .test-out/lib/vaultRecoveryLegacyCleanup.test.js",
+    "test:recovery-memory-diagnostic": "tsc -p tsconfig.recovery-memory-diagnostic.json && node --test .test-out/lib/recoveryMemoryDiagnostic.test.js"
   },
   "dependencies": {
     "@google/genai": "^2.13.0",

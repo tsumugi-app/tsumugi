@@ -1,0 +1,161 @@
+/** One-shot observation of an EXISTING Apply Plan. Never builds/scans/applies a plan.
+ * Imports production pure comparisons/serialization only; no db.ts helpers.
+ * Output is a closed counts-only schema. Never return/log exceptions or input values.
+ */
+import type { MemoryObject } from "./types";
+import type { RecoveryApplyPlan } from "./vaultRecoveryApply";
+import { openExistingRecoveryDatabase, readRecoveryLocalSnapshot, parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual, type RecoveryLocalSnapshot } from "./vaultRecovery";
+import { readRecoveryControl } from "./vaultRecoverySession";
+import { hashVaultText, vaultRegistryBucketOf, dayFileRegistryKey } from "./vault";
+import { parseMemoryDayFile, serializeMemoryDayFile, inferSourceType } from "./markdown";
+
+type Obj = Record<string, unknown>;
+const obj = (v: unknown): v is Obj => !!v && typeof v === "object" && !Array.isArray(v);
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every(x => b.includes(x));
+export const MEMORY_DIAGNOSTIC_MISMATCH = "現在のRecovery状態と診断対象が一致しない";
+export type MemoryDiagnosticResult = { status: "mismatch" | "unavailable" } | {
+  status: "complete";
+  registry: { heldMemoryCount: number; dayFileCount: number; statusMismatch: number; rawHashMismatch: number; reserializeOnlyMatch: number; memberIdsMismatch: number };
+  conflicts: { count: number; "updatedAt-only": number; "timestamp-only": number; "metadata-only": number; "substantive-data-difference": number; fields: Record<string, number> };
+};
+class Mismatch extends Error {}
+const requireMatch = (v: unknown) => { if (!v) throw new Mismatch(); };
+
+/** Same fields/normalizations as production semantic comparison. Production comparator
+ * is the oracle below: disagreement aborts, never silently reports a different contract. */
+export function memoryDifferenceFields(a: MemoryObject, b: MemoryObject): string[] {
+  const project = (m: MemoryObject): Obj => ({
+    id: m.id, date: m.date.slice(0, 10), types: m.types, content: m.content, summary: m.summary,
+    keywords: m.keywords, conversationId: m.conversationId ?? null, links: m.links,
+    eventTime: m.eventTime ?? null, eventTimePrecision: m.eventTimePrecision ?? null,
+    createdAt: m.createdAt, updatedAt: m.updatedAt,
+    "metadata.source": m.metadata.source,
+    "metadata.sourceType": m.metadata.sourceType ?? inferSourceType(m.metadata.source),
+    "metadata.sourceDetail": m.metadata.sourceDetail ?? null,
+    "metadata.aiProvider": m.metadata.aiProvider ?? null,
+    "metadata.confidence": m.metadata.confidence ?? null,
+    "metadata.schemaVersion": m.metadata.schemaVersion,
+    topicId: m.topicId ?? null, profileClaims: m.profileClaims ?? [],
+    personMentions: m.personMentions ?? [], topicEvents: m.topicEvents ?? [], evidenceQuotes: m.evidenceQuotes ?? [],
+  });
+  const x = project(a), y = project(b);
+  const fields = Object.keys(x).filter(k => !same(x[k], y[k]));
+  requireMatch((fields.length === 0) === recoveryRecordsSemanticEqual("memory", a, b));
+  return fields;
+}
+
+/** Only getters are reachable on this capability. create:false at every level. */
+async function readText(root: FileSystemDirectoryHandle, path: string): Promise<string> {
+  const parts = path.split("/");
+  requireMatch(parts.length > 1 && parts.every(p => p && p !== "." && p !== ".." && !p.includes("\\")));
+  let dir = root;
+  for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create: false });
+  return (await (await dir.getFileHandle(parts.at(-1)!, { create: false })).getFile()).text();
+}
+function strictMembers(raw: string): MemoryObject[] {
+  const blocks = raw.split("\n<!-- tsumugi:entry -->\n\n").map(s => s.trim()).filter(Boolean);
+  const members = blocks.map(parseRecoveryMemoryMarkdown);
+  requireMatch(members.length && members.every(Boolean));
+  const result = members as MemoryObject[];
+  requireMatch(new Set(result.map(m => m.id)).size === result.length);
+  return result;
+}
+
+/** Testable read-only core. snapshot() must read existing canonical data, not initialize it. */
+export async function inspectHeldMemories(plan: RecoveryApplyPlan, root: FileSystemDirectoryHandle,
+  snapshot: () => Promise<RecoveryLocalSnapshot>, stillCurrent: () => boolean): Promise<MemoryDiagnosticResult> {
+  try {
+    const registryHeld = plan.held.filter(h => h.recordType === "memory" && h.reason === "registry-entry-differs");
+    const conflictHeld = plan.held.filter(h => h.recordType === "memory" && h.reason === "conflict");
+    requireMatch(plan.heldCount === 35 && plan.held.length === 35 && registryHeld.length === 30 && conflictHeld.length === 5);
+    requireMatch(plan.plan.scanCompleted && plan.plan.issues.length === 0 && stillCurrent());
+    requireMatch(new Set(plan.held.map(h => h.recordId)).size === 35);
+    const local = await snapshot();
+    // Refuse stale canonical/ledger snapshots, including changes outside the target set.
+    requireMatch(same(local, plan.snapshot));
+    const reads = new Map<string, string>();
+    const read = async (path: string) => {
+      if (!reads.has(path)) reads.set(path, await readText(root, path));
+      return reads.get(path)!;
+    };
+    const result: Extract<MemoryDiagnosticResult, { status: "complete" }> = {
+      status: "complete", registry: { heldMemoryCount: 30, dayFileCount: 0, statusMismatch: 0, rawHashMismatch: 0, reserializeOnlyMatch: 0, memberIdsMismatch: 0 },
+      conflicts: { count: 5, "updatedAt-only": 0, "timestamp-only": 0, "metadata-only": 0, "substantive-data-difference": 0, fields: {} },
+    };
+    const seen = new Set<string>();
+    for (const h of [...registryHeld, ...conflictHeld]) {
+      const records = plan.plan.records.filter(r => r.recordType === "memory" && r.recordId === h.recordId);
+      requireMatch(records.length === 1);
+      const r = records[0];
+      requireMatch(r.indexedDBExists && r.vaultPaths.length === 1);
+      requireMatch(r.classification === (h.reason === "conflict" ? "conflict" : "equivalent-existing"));
+      const canonical = local.memories.filter(m => m.id === h.recordId);
+      requireMatch(canonical.length === 1);
+      const path = r.vaultPaths[0], raw = await read(path), members = strictMembers(raw);
+      const matches = members.filter(m => m.id === h.recordId);
+      requireMatch(matches.length === 1);
+      const fields = memoryDifferenceFields(canonical[0], matches[0]);
+      if (h.reason === "conflict") {
+        requireMatch(fields.length > 0);
+        const category = fields.length === 1 && fields[0] === "updatedAt" ? "updatedAt-only"
+          : fields.every(f => ["date", "createdAt", "updatedAt", "eventTime", "eventTimePrecision"].includes(f)) ? "timestamp-only"
+          : fields.every(f => f.startsWith("metadata.")) ? "metadata-only" : "substantive-data-difference";
+        result.conflicts[category]++;
+        for (const field of fields) result.conflicts.fields[field] = (result.conflicts.fields[field] ?? 0) + 1;
+        continue;
+      }
+      requireMatch(fields.length === 0);
+      const key = dayFileRegistryKey(canonical[0].date.slice(0, 10));
+      requireMatch(r.registryKey === key && members.every(m => dayFileRegistryKey(m.date.slice(0, 10)) === key));
+      const shard: unknown = JSON.parse(await read(`.tsumugi/registry/${vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`));
+      requireMatch(obj(shard) && obj(shard.records) && obj(shard.files));
+      const s = shard as { records: Obj; files: Obj };
+      requireMatch(s.records[key] === path && obj(s.files[path]));
+      const entry = s.files[path] as Obj;
+      requireMatch(typeof entry.contentHash === "string" && typeof entry.status === "string" && Array.isArray(entry.memberIds) && entry.memberIds.every(x => typeof x === "string"));
+      const statusMismatch = entry.status !== "ok";
+      const rawMismatch = entry.contentHash !== hashVaultText(raw);
+      const memberMismatch = !sameSet(entry.memberIds as string[], members.map(m => m.id));
+      requireMatch(statusMismatch || rawMismatch || memberMismatch);
+      if (seen.has(path)) continue;
+      seen.add(path);
+      result.registry.dayFileCount++;
+      result.registry.statusMismatch += Number(statusMismatch);
+      result.registry.rawHashMismatch += Number(rawMismatch);
+      result.registry.memberIdsMismatch += Number(memberMismatch);
+      // EXACT production Projection pipeline: ordinary parser, createdAt sort, serializer.
+      const projected = parseMemoryDayFile(raw).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      requireMatch(sameSet(projected.map(m => m.id), members.map(m => m.id)));
+      result.registry.reserializeOnlyMatch += Number(rawMismatch && entry.contentHash === hashVaultText(serializeMemoryDayFile(projected)));
+    }
+    // External editors do not honor Web Locks. Re-read every observed file and canonical.
+    for (const [path, raw] of reads) requireMatch(await readText(root, path) === raw);
+    requireMatch(same(await snapshot(), local) && stillCurrent());
+    return result;
+  } catch (error) { return { status: error instanceof Mismatch ? "mismatch" : "unavailable" }; }
+}
+
+/** Existing handles only. No picker, permission request, OPFS root creation or getDB(). */
+export async function runHeldMemoryDiagnostic(plan: RecoveryApplyPlan, root: FileSystemDirectoryHandle,
+  stillCurrent: () => boolean, factory: IDBFactory = indexedDB,
+  locks: Pick<LockManager, "request"> = navigator.locks): Promise<MemoryDiagnosticResult> {
+  try {
+    if (!locks?.request) return { status: "unavailable" };
+    return await locks.request("tsumugi-vault-world", { mode: "exclusive", ifAvailable: true }, async lock => {
+      if (!lock) return { status: "unavailable" };
+      const db = await openExistingRecoveryDatabase(factory);
+      let changed = false;
+      db.onversionchange = () => { changed = true; db.close(); };
+      try {
+        const before = await readRecoveryControl(db);
+        const world = plan.confirmed.world;
+        requireMatch(Number(before[0] ?? 0) === world.activeVaultEpoch && Number(before[1]) === world.committedVaultEpoch &&
+          before[2] === "1" && world.journalVersion === "current" && Number(before[3] ?? 0) === world.registryGenerationEpoch);
+        const result = await inspectHeldMemories(plan, root, () => readRecoveryLocalSnapshot(factory), () => !changed && stillCurrent());
+        requireMatch(!changed && same(before, await readRecoveryControl(db)) && stillCurrent());
+        return result;
+      } finally { db.close(); }
+    });
+  } catch (error) { return { status: error instanceof Mismatch ? "mismatch" : "unavailable" }; }
+}
