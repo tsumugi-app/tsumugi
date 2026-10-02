@@ -745,12 +745,6 @@ export default function ChatScreen() {
   const startupRecoveryCheckRanRef = useRef(false);
   /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
   const startupSaveFoundationBootstrapRanRef = useRef(false);
-  /**
-   * Legacy Recovery自動整理（借り物端末対応）：起動のたびに「古い記録を整理する」
-   * （`runLegacyHeldCleanupFlow`）を1回だけ自動的に試みるためのガード。他のstartup
-   * effectと同じ「ページ読み込みごとに1回」パターン（Vault切替では再設定しない）。
-   */
-  const startupLegacyHeldCleanupRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
@@ -2280,50 +2274,6 @@ export default function ChatScreen() {
     );
   }, [vaultStatus, vaultHandle]);
 
-  /**
-   * Legacy Recovery自動整理（借り物端末対応）：起動のたびに一度だけ、「古い記録を整理する」
-   * （`runLegacyHeldCleanupFlow`、上の手動buttonハンドラと完全に同じ実装）を自動的に試みる。
-   *
-   * 背景：Legacy Recoveryが保留している記録（conflict／memory-dayfile-merge-required／
-   * unreadable・indeterminate）は、`runLegacyHeldCleanup`自身がarchive-first（append-only
-   * snapshotを作り、検証してから）で安全に整理できる場合にだけ実際にarchiveする——これは
-   * 既存のVault identity確認・fresh診断・temp→final write＋read-back検証という、Settings画面
-   * から手動で「古い記録を整理する」を押した場合と全く同じ安全条件を内部で課す（この effect
-   * 自体は一切新しい判断を追加しない）。借り物iPhone等、利用者にSettings操作やDebugパネル
-   * 操作を一切要求できない環境でも、安全に整理できる状態であれば起動するだけでRecovery
-   * warning（Settings上のheldCount）が解消されるようにする。
-   *
-   * 安全に整理できない状態（Vault identity不一致／不明、archive失敗、読み取り不能等）では
-   * `runLegacyHeldCleanup`内部の既存の安全条件がそのまま働き、何も書き込まずheldのまま
-   * 残る——この effect は「安全性の判断」を一切行わず、既存の安全な実装をただ起動時に
-   * 呼ぶだけ（新しいRecoveryロジックは追加しない）。
-   *
-   * 他のstartup effectと同じ「ページ読み込みごとに1回」パターン（Vault切替では再実行しない）。
-   * `vaultOperationLockRef`を取得することで、ほぼ同時に走りうる他のVault操作
-   * （Save Foundation Bootstrap等）と直列化する（`runLegacyHeldCleanup`自身のworld
-   * exclusive lockとは別の、UI層の排他）。取得できなければ（既に他の操作が進行中）
-   * 今回は何もしない——次回起動時にもう一度自動的に試みられる。
-   */
-  useEffect(() => {
-    if (vaultStatus !== "connected" || !vaultHandle || startupLegacyHeldCleanupRanRef.current) return;
-    startupLegacyHeldCleanupRanRef.current = true;
-    const handle = vaultHandle;
-    void trackMemoryTask(
-      (async () => {
-        if (isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
-        vaultOperationLockRef.current = true;
-        try {
-          await runLegacyHeldCleanupFlow(handle);
-        } catch (error) {
-          if (handleStaleVaultTabError(error)) return;
-          console.error("[Tsumugi] automatic legacy held cleanup failed to start (app continues; next startup will retry)", error);
-        } finally {
-          vaultOperationLockRef.current = false;
-        }
-      })()
-    );
-  }, [vaultStatus, vaultHandle]);
-
   useEffect(() => {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversation.turns.length, streamingText]);
@@ -3479,33 +3429,28 @@ export default function ChatScreen() {
   }
 
   /**
-   * Recovery最終整理フェーズ（archive→再診断）の実体。「古い記録を整理する」button
-   * （手動、`handleRunLegacyHeldCleanup`）と、起動時の自動実行（`startupLegacyHeldCleanupRanRef`の
-   * effect、借り物端末でユーザー操作を要求しないための自動化）の両方から呼ぶ、唯一の実装。
-   * 手動・自動でロジックを一切分岐させない——「自動実行は手動実行と同じ安全性を持つ」ことの
-   * 根拠は、両方が全く同じコードを通ることそのものにある。
-   *
-   * `runLegacyHeldCleanup`自身が`runVaultWorldExclusive`（Recovery apply等と同じ排他区間）を
-   * 取得するため、ここでは追加のlockラップをしない（`applyRecovery`等の既存パターンとは
-   * 異なる点——詳細は`vaultRecoveryLegacyCleanup.ts`のlock order解説を参照）。
+   * Recovery最終整理フェーズ：「古い記録を整理する」。`runLegacyHeldCleanup`自身が
+   * `runVaultWorldExclusive`（Recovery apply等と同じ排他区間）を取得するため、ここでは
+   * 追加のlockラップをしない（`applyRecovery`等の既存パターンとは異なる点——詳細は
+   * `vaultRecoveryLegacyCleanup.ts`のlock order解説を参照）。
    *
    * 「done」は、cleanup自体の成功「かつ」その後のRecovery診断の再実行（archive除外込みの
    * `planRecoveryApplyExcludingArchived`）まで成功した場合だけに進む。この再診断の
    * `heldCount`こそがUIの真実——cleanup内部の集計（`result.archived`等）は内訳の表示にしか
    * 使わない。再診断自体が失敗した場合は成功したかのような表示を一切せず、"verify-failed"へ
    * 進む（fail-safe）。
-   *
-   * 呼び出し元が`vaultOperationLockRef`の取得・解放を担当する（この関数自体は一切触れない）。
    */
-  async function runLegacyHeldCleanupFlow(handle: FileSystemDirectoryHandle): Promise<void> {
+  async function handleRunLegacyHeldCleanup() {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
     const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
     const endTask = beginMemoryTask();
     setLegacyHeldCleanupStatus({ kind: "executing" });
     let verifying = false;
     try {
       logRecoveryArchiveDiagnostic({ stage: "ui-identity-read" });
       const vaultIdentity = await getVaultIdentityRecord();
-      const result = await runLegacyHeldCleanup({ root: handle, vaultIdentity: vaultIdentity ?? null });
+      const result = await runLegacyHeldCleanup({ root: vaultHandle, vaultIdentity: vaultIdentity ?? null });
       if (generation !== vaultGenerationRef.current) return;
       if ("notRun" in result) {
         setLegacyHeldCleanupStatus({ kind: "error", message: result.notRun === "recovery-in-progress"
@@ -3516,7 +3461,7 @@ export default function ChatScreen() {
       verifying = true;
       logRecoveryArchiveDiagnostic({ stage: "fresh-apply-plan" });
       // Keep the operation guard until remeasurement finishes; no second click or Vault switch.
-      const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(handle)));
+      const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
       if (generation !== vaultGenerationRef.current) return;
       setRecoveryStatus({ kind: "plan", applyPlan, generation });
       setLegacyHeldCleanupStatus({ kind: "done", result, finalHeldCount: applyPlan.heldCount });
@@ -3532,16 +3477,6 @@ export default function ChatScreen() {
         : { kind: "error", message: "整理できませんでした。元のデータは保持されています。" });
     } finally {
       endTask();
-    }
-  }
-
-  /** 「古い記録を整理する」button（手動）。ロジック本体は`runLegacyHeldCleanupFlow`参照。 */
-  async function handleRunLegacyHeldCleanup() {
-    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
-    vaultOperationLockRef.current = true;
-    try {
-      await runLegacyHeldCleanupFlow(vaultHandle);
-    } finally {
       vaultOperationLockRef.current = false;
     }
   }

@@ -1000,22 +1000,13 @@ test("Review: Safari without createWritable uses existing Worker writer only for
 test("Review: production UI retains operation guard until verification, uses actual heldCount, resets world state",()=>{
   const fs=require("node:fs") as typeof import("node:fs");
   const source=fs.readFileSync(path.join(process.cwd(),"src/components/ChatScreen.tsx"),"utf8");
-  // 自動startup対応（借り物端末）でcleanup本体は`runLegacyHeldCleanupFlow`へ共通化された
-  // （手動buttonと自動startupの両方がこれを呼ぶ。ロジック自体は一切変えていないため、
-  // ここで検証する順序性はそのまま`runLegacyHeldCleanupFlow`の本体に対して確認する）。
-  const flowBegin=source.indexOf("async function runLegacyHeldCleanupFlow(");
-  const flowBody=source.slice(flowBegin,source.indexOf("async function handleRunLegacyHeldCleanup()",flowBegin));
-  assert.ok(flowBody.indexOf('await runLegacyHeldCleanup')<flowBody.indexOf('planRecoveryApplyExcludingArchived'));
-  assert.ok(flowBody.indexOf('planRecoveryApplyExcludingArchived')<flowBody.indexOf('kind: "done"'));
-  assert.ok(flowBody.indexOf('finalHeldCount: applyPlan.heldCount')<flowBody.indexOf('endTask()'));
-  assert.ok(flowBody.includes('verifying\n        ? { kind: "verify-failed" }'));
-  assert.ok(flowBody.includes('generation !== vaultGenerationRef.current'));
-  // 手動button（`handleRunLegacyHeldCleanup`）は、`vaultOperationLockRef`の取得・解放を
-  // `runLegacyHeldCleanupFlow`の呼び出しの前後に維持したまま委譲する。
-  const handlerBegin=source.indexOf("async function handleRunLegacyHeldCleanup()");
-  const handlerBody=source.slice(handlerBegin,source.indexOf("async function handleExecuteRecoveryApply()",handlerBegin));
-  assert.ok(handlerBody.indexOf('vaultOperationLockRef.current = true')<handlerBody.indexOf('await runLegacyHeldCleanupFlow'));
-  assert.ok(handlerBody.indexOf('await runLegacyHeldCleanupFlow')<handlerBody.indexOf('vaultOperationLockRef.current = false'));
+  const begin=source.indexOf("async function handleRunLegacyHeldCleanup()");
+  const body=source.slice(begin,source.indexOf("async function handleExecuteRecoveryApply()",begin));
+  assert.ok(body.indexOf('vaultOperationLockRef.current = true')<body.indexOf('await runLegacyHeldCleanup'));
+  assert.ok(body.indexOf('planRecoveryApplyExcludingArchived')<body.indexOf('kind: "done"'));
+  assert.ok(body.indexOf('finalHeldCount: applyPlan.heldCount')<body.indexOf('vaultOperationLockRef.current = false'));
+  assert.ok(body.includes('verifying\n        ? { kind: "verify-failed" }'));
+  assert.ok(body.includes('generation !== vaultGenerationRef.current'));
   const reset=source.slice(source.indexOf('function resetMemoryWorldState()'),source.indexOf('function resetMemoryWorldState()')+3500);
   assert.ok(reset.includes('setLegacyHeldCleanupStatus({ kind: "idle" })'));
 });
@@ -1188,96 +1179,4 @@ test("Diagnostics: copy UI is debug-only and does not run cleanup", () => {
   assert.ok(source.indexOf('if (!enabled) return null') < source.indexOf('Recovery Archive Debugをコピー'));
   assert.ok(source.includes('navigator.clipboard.writeText(JSON.stringify(getRecoveryArchiveDiagnostics(), null, 2))'));
   assert.ok(!source.includes('runLegacyHeldCleanup'));
-});
-
-// ===========================================================================
-// Automatic startup cleanup（借り物端末対応）：「古い記録を整理する」をユーザー操作
-// 無しで起動のたびに自動的に試みるようChatScreen.tsxへ配線した（`runLegacyHeldCleanupFlow`、
-// 中身は`runLegacyHeldCleanup`/`planRecoveryApplyExcludingArchived`をそのまま呼ぶだけ）。
-// ここではその配線が前提とする、下記の性質をもう一度明示的に確認する：
-// - 事前の「確認する」（dry-run）無しでいきなり呼んでも安全に完結すること
-// - 2回連続で呼んでも（＝2回起動相当）二重archiveしないこと
-// - 1回目が書き込み途中で中断しても、2回目（＝次回起動相当）が安全に再開し、
-//   既存canonical data・既存Archiveを一切壊さないこと
-// 実際のarchive/cleanupロジック自体（identity確認・temp→final write・read-back検証等）は
-// 上記の既存testがすでに広く確認済みであり、ここでは変更していない。
-// ===========================================================================
-
-test("iPhone K: automatic startup（事前のdry-runなし）だけでsafeなlegacy batchが解消し、Recovery warningが再表示されない", async () => {
-  const vault = await batchFixture();
-  assert.equal(await held(vault), 13, "起動前：13件がwarning対象");
-  // 「確認する」（dry-run）を一度も呼ばずに、起動時の自動実行が呼ぶのと全く同じ関数を直接呼ぶ。
-  const result = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
-  assert.equal(result.archived, 13); assert.equal(result.failed, 0);
-  assert.equal(await held(vault), 0, "1回目の自動実行だけでwarningが解消する");
-  // warningが「解消されたまま」であること（再度diagnosticを読んでも再表示されない）。
-  assert.equal(await held(vault), 0, "再度確認してもwarningは再表示されない");
-});
-
-test("iPhone L: 2回連続のautomatic startup（2回起動相当）でも二重archiveしない", async () => {
-  const vault = await batchFixture();
-  const first = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
-  assert.equal(first.archived, 13);
-  const archivesAfterFirst = finalArchivePaths(vault).slice().sort();
-  const writesAfterFirst = vault.writeCount;
-  // 2回目の起動（同じ関数を、同じ安全条件のまま、もう一度最初から呼ぶだけ）。held判定とは
-  // 独立に、runLegacyHeldCleanup自身は今回もconflict等の13件を再診断・再処理する——
-  // ただしそれぞれ`matchingArchive`が既存archiveを見つけるため、1byteも新規に書き込まず、
-  // 結果はarchived13件・failed0件のまま「安定」する（これが二重archiveしないことの意味）。
-  const second = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
-  assert.equal(second.archived, 13); assert.equal(second.failed, 0);
-  assert.equal(vault.writeCount, writesAfterFirst, "2回目は1byteも書き込まない");
-  assert.deepEqual(finalArchivePaths(vault).slice().sort(), archivesAfterFirst, "archiveは重複作成されない（既存archiveIdをそのまま再利用する）");
-  for (const { recordId, result } of second.details) {
-    assert.equal(result.outcome, "archived", `record ${recordId} should reuse the existing verified archive`);
-  }
-  assert.equal(await held(vault), 0, "warningは2回目以降も再表示されない");
-});
-
-test("iPhone M: 1回目のautomatic startupがarchive書き込み途中で中断しても、2回目（次回起動相当）が安全に再開し、canonical data・既存Archiveを失わない", async () => {
-  const vault = await batchFixture();
-  const local = await dbMod.getAllConversations();
-  const before = currentFiles(vault);
-  // 1回目：5件archiveした時点で中断（iPhone Eと同じ障害注入。ここでは「次回起動での
-  // 自動再開」という文脈を明示するために独立したtestとして持つ）。
-  vault.beforeClose = () => { if (finalArchivePaths(vault).length >= 5) throw new DOMException("app closed mid-write", "NotAllowedError"); };
-  const first = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
-  assert.equal(first.archived, 5); assert.equal(first.failed, 8);
-  assert.equal(await held(vault), 8, "中断後も8件はwarning対象のまま（データは失われていない）");
-  const archivedAfterFirst = new Map(finalArchivePaths(vault).map((p) => [p, vault.get(p)]));
-  // アプリが閉じて再度開かれた想定：中断要因を取り除き、次回起動の自動実行として
-  // もう一度同じ関数を呼ぶ（特別な「再開」フラグ等は無く、runLegacyHeldCleanupは
-  // 常に実体を再確認してから進む）。
-  vault.beforeClose = undefined;
-  const second = await assertResultIsSummary(await cleanupMod.runLegacyHeldCleanup(makeEnv(vault)));
-  assert.equal(second.archived, 13, "残り8件も含めて全件archiveされる");
-  assert.equal(await held(vault), 0, "次回起動でwarningが解消する");
-  for (const [p, raw] of archivedAfterFirst) assert.equal(vault.get(p), raw, "1回目で確定したarchiveは書き換わらない");
-  assert.equal(finalArchivePaths(vault).length, 13);
-  // 現在のVault・canonical dataは中断・再開を通じて一切変更されていない。
-  assert.deepEqual(currentFiles(vault), before);
-  assert.deepEqual(await dbMod.getAllConversations(), local);
-});
-
-test("iPhone N: identity不一致のVaultでは自動startupを2回試みても何も書き込まず、warningは解消されない（安全側）", async () => {
-  const vault = await batchFixture();
-  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "different-vault" }));
-  for (let i = 0; i < 2; i++) {
-    await assert.rejects(cleanupMod.runLegacyHeldCleanup(makeEnv(vault)), /vault-identity-unconfirmed/);
-  }
-  assert.equal(vault.writeCount, 0, "identity不一致の間は1byteも書き込まない");
-  assert.equal(await held(vault), 13, "安全に確認できない間はwarningを消さない（偽の解消をしない）");
-});
-
-test("ChatScreen.tsx: automatic startup cleanupは手動buttonと同じ実装を呼び、Debugフラグに依存しない", () => {
-  const fs = require("node:fs") as typeof import("node:fs");
-  const source = fs.readFileSync(path.join(process.cwd(), "src/components/ChatScreen.tsx"), "utf8");
-  assert.ok(source.includes("startupLegacyHeldCleanupRanRef"), "起動時に1回だけ実行するガードが存在する");
-  assert.ok(source.includes("runLegacyHeldCleanupFlow"), "手動buttonと共通の実装を使っている");
-  // 自動実行のeffect自体の定義ブロックを抜き出し、その中にdebugLog依存が無いことを確認する
-  // （借り物端末では`?debugLog=1`を開かせない、という絶対条件の直接的な裏付け）。
-  const guardIndex = source.indexOf("startupLegacyHeldCleanupRanRef.current) return;");
-  assert.ok(guardIndex > 0);
-  const effectBlock = source.slice(guardIndex, source.indexOf("}, [vaultStatus, vaultHandle]);", guardIndex));
-  assert.ok(!effectBlock.includes("debugLog"), "自動cleanupはdebugLogフラグに一切依存しない");
 });
