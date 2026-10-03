@@ -12,7 +12,7 @@
     "test:recovery-apply": "tsc -p tsconfig.recovery.json && node --test .test-out/lib/vaultRecoveryApply.test.js",
     "test:write-gate": "tsc -p tsconfig.write-gate.json && node --test .test-out/lib/vaultWriteGate.test.js",
     "test:lock-order": "tsc -p tsconfig.lock-order.json && node --test .test-out/lib/vaultLockOrder.test.js",
-    "test:recovery-ui-text": "tsc -p tsconfig.recovery-ui-text.json && node --test .test-out/lib/vaultRecoveryUiText.test.js",
+    "test:recovery-ui-text": "tsc -p tsconfig.recovery-ui-text.json && node --test .test-out/lib/vaultRecoveryUiText.test.js .test-out/lib/vaultRecoveryUserView.test.js",
     "test:conversation-entry-kind": "tsc -p tsconfig.conversation-entry-kind.json && node --test .test-out/lib/conversationEntryKind.test.js",
     "test:reflect": "tsc -p tsconfig.reflect.json && node --test .test-out/lib/reflection.test.js",
     "test:history-conversation-card": "tsc -p tsconfig.history-conversation-card.json && node --test .test-out/lib/historyConversationCard.test.js",

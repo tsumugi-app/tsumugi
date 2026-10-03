@@ -11,5 +11,5 @@
     "plugins": []
   },
   "include": [],
-  "files": ["src/lib/vaultRecoveryUiText.test.ts", "src/lib/vaultRecoveryUiText.ts"]
+  "files": ["src/lib/vaultRecoveryUiText.test.ts", "src/lib/vaultRecoveryUiText.ts", "src/lib/vaultRecoveryUserView.test.ts", "src/lib/vaultRecoveryUserView.ts"]
 }

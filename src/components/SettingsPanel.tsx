@@ -20,6 +20,10 @@ import type {
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
 import { recoveryDoneMessage, recoveryHeadingText } from "@/lib/vaultRecoveryUiText";
+import {
+  RECOVERY_ATTENTION_TEXT, RECOVERY_INCOMPLETE_TEXT, RECOVERY_REPAIRING_TEXT, RECOVERY_REPAIR_BUTTON,
+  recoveryAllowsLatest, type RecoveryUserView,
+} from "@/lib/vaultRecoveryUserView";
 import type { VaultStatusView } from "@/lib/vaultStatus";
 
 /**
@@ -71,6 +75,8 @@ export default function SettingsPanel({
   onRunOrphanDryRun,
   onExecuteOrphanCleanup,
   recoveryStatus,
+  recoveryUserView,
+  onUserRepair,
   onRunRecoveryDryRun,
   onExecuteRecoveryApply,
   legacyHeldCleanupStatus,
@@ -145,6 +151,9 @@ export default function SettingsPanel({
    * （起動時に自動検出される。「再確認して続ける」は`onExecuteRecoveryApply`をそのまま呼ぶ）。
    */
   recoveryStatus: RecoveryUiStatus;
+  /** 通常ユーザー向けのRecovery表示（正常なら何も出さない）。導出は`deriveRecoveryUserView`。 */
+  recoveryUserView: RecoveryUserView;
+  onUserRepair: () => void;
   onRunRecoveryDryRun: () => void;
   onExecuteRecoveryApply: () => void;
   /**
@@ -419,7 +428,7 @@ export default function SettingsPanel({
                 </span>
               )}
 
-              {vaultStatusView.kind === "latest" && <span>✓ 最新の状態です</span>}
+              {vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView) && <span>✓ 最新の状態です</span>}
 
               {vaultStatusView.kind === "maybe" && (
                 <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 dark:bg-amber-950/20">
@@ -1287,12 +1296,37 @@ export default function SettingsPanel({
           )}
 
           {/*
+            Recovery（通常ユーザー向け）。正常時は何も出さない（上の「✓ 最新の状態です」だけ）。異常を検出したときだけ
+            「保存先に確認が必要な記録があります」と「修復する」を出す。診断・修復前チェック・件数・cleanup等の
+            詳細は、下の`?debugLog=1`（`showAdvancedVaultTools`）の開発者向けUIにだけある。
+          */}
+          {vaultStatus === "connected" && vaultHandle && (recoveryUserView.kind === "attention" || recoveryUserView.kind === "repairing") && (
+            <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <div className="flex flex-col gap-0.5">
+                <span>{recoveryUserView.kind === "repairing" ? RECOVERY_REPAIRING_TEXT : RECOVERY_ATTENTION_TEXT}</span>
+                {recoveryUserView.kind === "attention" && recoveryUserView.incomplete && (
+                  <span className="text-xs text-red-600 dark:text-red-400">{RECOVERY_INCOMPLETE_TEXT}</span>
+                )}
+              </div>
+              {recoveryUserView.kind === "attention" && (
+                <button
+                  onClick={onUserRepair}
+                  disabled={vaultActionsDisabled}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300"
+                >
+                  {RECOVERY_REPAIR_BUTTON}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/*
             Vault Recovery Apply（Phase 2初期版）。「安全性を証明できた旧記録」だけを保存先へ復旧する。
             内部のclassification・journalの中身はここには出さない（件数と、対象の日付・種別の要約だけ）。
             通常ユーザー向け機能のため、`showAdvancedVaultTools`（`?debugLog=1`限定の開発者向け詳細）の
             外に置く——中に入れると通常アクセスでは一切表示されなくなる（実機で発覚・修正）。
           */}
-          {vaultStatus === "connected" && vaultHandle && (
+          {showAdvancedVaultTools && vaultStatus === "connected" && vaultHandle && (
             <div className="flex flex-col gap-2 border-t border-black/5 pt-4 dark:border-white/10">
               <div className="flex items-center justify-between gap-4">
                 <div className="flex flex-col gap-0.5">

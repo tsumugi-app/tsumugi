@@ -431,6 +431,24 @@ export async function runExplicitRepairPreflight(root: FileSystemDirectoryHandle
 }
 
 /**
+ * The user-facing "修復する" for this repair. Same code, same guards as the explicit debug entry, without the debugLog gate:
+ * a NEW repair runs only when the READ ONLY pre-repair check (every guard) passes; an in-progress narrow repair is resumed
+ * with its own journaled verification. Holds the world lock like the repair. Never reports success unless the repair completed.
+ */
+export type UserRepairResult = { status: "repaired" | "not-repairable" | "incomplete" | "unavailable" };
+export async function runNarrowRepairForUser(root: FileSystemDirectoryHandle, confirmed: RecoveryApplyPlan | null, options: { apply?: RecoveryApplyEnv } = {}): Promise<UserRepairResult> {
+  const locked = await runVaultWorldExclusive(async (): Promise<UserRepairResult> => {
+    const env = createProductionNarrowRepairEnv(root, options.apply);
+    const journal = await readRecoveryJournal(env.apply.store);
+    const resuming = journal.kind === "journal" && journal.journal.status === "in-progress" && !!journal.journal.narrowMemoryRepair;
+    if (!resuming && !(await runNarrowRepairPreflight(env, confirmed)).allPass) return { status: "not-repairable" };
+    const result = await executeNarrowMemoryRepair(env, resuming ? null : confirmed);
+    return { status: result.status === "complete" ? "repaired" : "incomplete" };
+  });
+  return locked.timedOut || !locked.result ? { status: "unavailable" } : locked.result;
+}
+
+/**
  * READ ONLY diagnostic of the held Memories. The Recovery screen shows an archive-excluded plan, so the
  * raw plan (nothing excluded) is rebuilt from the current state here. Nothing is written, no plan state
  * is replaced, and no archive entry is touched.

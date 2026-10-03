@@ -2584,3 +2584,39 @@ test("sourceType 6b: canonical changing before the compare-and-set stops without
   assert.equal(r.status, "held"); assert.equal((await repairDb.getMemoryObject("c-0"))!.metadata.sourceType, "manual", "the concurrent value is kept");
   assert.equal((await repairDb.readMemoryRepairStorage("c-0")).outbox!.status === "done", false);
 });
+
+// ---------------------------------------------------------------------------
+// User-facing "修復する" (no debugLog gate; a new repair needs the all-PASS pre-repair check)
+// ---------------------------------------------------------------------------
+const userView = (require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView")).deriveRecoveryUserView;
+const detect = async (w: Wired) => { const p = await w.confirmedNow(); return p.heldCount > 0 || p.recoverableCount > 0 ? { kind: "plan", applyPlan: p } : { kind: "clean" }; };
+const userRepair = (w: Wired, confirmed: import("./vaultRecoveryApply").RecoveryApplyPlan | null) => withProductionGlobals(() => narrow.runNarrowRepairForUser(w.root, confirmed, { apply: w.apply }));
+test("User repair: anomaly shown -> 修復する -> repaired -> re-detection is clean -> Recovery display gone", async () => {
+  const w = await wiredFixture();
+  assert.equal(userView(await detect(w)).kind, "attention");
+  assert.deepEqual(await userRepair(w, w.confirmed), { status: "repaired" });
+  const after = await detect(w); assert.equal(after.kind, "clean"); assert.deepEqual(userView(after), { kind: "none" });
+  assert.equal((await applyMod.planRecoveryApply(w.apply)).heldCount, 0);
+});
+test("User repair: a failed pre-repair check changes nothing and keeps the anomaly display (never 'latest')", async () => {
+  const w = await wiredFixture();
+  const key = vaultMod.dayFileRegistryKey("2026-09-22"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, file = `Memories/${vaultMod.dayFileNameFor("2026-09-22")}`;
+  const shard = readShard(w.vault.get(sp)!); (shard.files[file].memberHashes as Record<string, string>)["r-0"] = "deadbeef"; w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  const confirmed = await w.confirmedNow(), before = await fullState(w);
+  assert.deepEqual(await userRepair(w, confirmed), { status: "not-repairable" });
+  assert.equal(await fullState(w), before, "no journal, nothing written");
+  const status = await detect(w); const view = userView(status, { incomplete: true });
+  assert.equal(view.kind, "attention"); assert.equal(view.kind === "attention" && view.incomplete, true);
+});
+test("User repair: an interrupted narrow repair is resumed to completion (state kept, then clean)", async () => {
+  const w = await wiredFixture(), env = wiredEnv(w), commit = env.commit; let once = true;
+  env.commit = async (...args) => { await commit(...args); if (once && !args[3]) { once = false; throw new Error("page kill after canonical"); } };
+  assert.equal((await narrow.executeNarrowMemoryRepair(env, w.confirmed)).status, "held");
+  assert.equal(userView({ kind: "interrupted" }).kind, "attention");
+  assert.deepEqual(await userRepair(w, null), { status: "repaired" });
+  assert.equal((await detect(w)).kind, "clean");
+});
+test("User repair: nothing to do is not repairable (no plan) and writes nothing", async () => {
+  const w = await wiredFixture(); const before = await fullState(w);
+  assert.deepEqual(await userRepair(w, null), { status: "not-repairable" }); assert.equal(await fullState(w), before);
+});
