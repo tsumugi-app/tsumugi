@@ -1,5 +1,5 @@
 "use client";
-import { runExplicitMemoryRepair, runRawHeldMemoryDiagnostic, type NarrowRepairResult } from "../lib/memoryNarrowRepair";
+import { runExplicitMemoryRepair, runExplicitRepairPreflight, runRawHeldMemoryDiagnostic, type NarrowRepairResult, type PreflightReport } from "../lib/memoryNarrowRepair";
 import { useEffect, useRef, useState } from "react";
 import type { RecoveryApplyPlan } from "../lib/vaultRecoveryApply";
 import { MEMORY_DIAGNOSTIC_MISMATCH, type MemoryDiagnosticResult } from "../lib/recoveryMemoryDiagnostic";
@@ -9,6 +9,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
   plan: RecoveryApplyPlan | null; root: FileSystemDirectoryHandle; disabled: boolean;
 }) {
   const [repair, setRepair] = useState<NarrowRepairResult | null>(null);
+  const [preflight, setPreflight] = useState<PreflightReport | { unavailable: string } | null>(null);
   const repairRunning = useRef(false);
   const current = useRef({ active: false });
   const used = useRef(false);
@@ -22,6 +23,13 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
     // The screen's plan excludes archived records; the diagnostic rebuilds the raw plan (read only).
     const { diagnostic, rawHeld } = await runRawHeldMemoryDiagnostic(root, () => token.active);
     if (token.active) { setOutput({ result: diagnostic, rawHeld }); setBusy(false); }
+  }
+  async function checkBeforeRepair() {
+    if (disabled || busy || repairRunning.current) return;
+    repairRunning.current = true; setBusy(true); setPreflight(null);
+    try { setPreflight(await runExplicitRepairPreflight(root, plan)); }
+    catch { setPreflight({ unavailable: "unexpected-error" }); }
+    finally { repairRunning.current = false; setBusy(false); }
   }
   async function repairExplicitly() {
     if (disabled || busy || repairRunning.current) return;
@@ -37,6 +45,14 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
     <button disabled={disabled || busy || !!output} onClick={() => void inspect()}>現在状態から再構築して読み取り専用で診断</button>
     {output?.rawHeld != null && <p>診断対象（archive除外前）: {output.rawHeld}件</p>}
     <div>
+      <p>修復前チェック（READ ONLY）: 修復と同じ全条件を現在の実データで最後まで評価します。何も変更しません。</p>
+      <button disabled={disabled || busy} onClick={() => void checkBeforeRepair()}>修復前チェック（READ ONLY）</button>
+      {preflight && "unavailable" in preflight && <p>実行できませんでした（{preflight.unavailable}）。</p>}
+      {preflight && "entries" in preflight && <div>
+        <p>{preflight.allPass ? "修復前チェック：全条件PASS" : "修復前チェック：未達の条件があります"}</p>
+        <p>総check数 {preflight.total} / PASS {preflight.pass} / FAIL {preflight.fail} / SKIP {preflight.skip}</p>
+        {preflight.entries.filter(e => e.status !== "PASS").length > 0 && <pre>{preflight.entries.filter(e => e.status !== "PASS").map(e => [`${e.status} ${e.code}`, e.recordType && `  recordType: ${e.recordType}`, e.memoryId && `  memoryId: ${e.memoryId}`, e.expected && `  expected: ${e.expected}`, e.actual && `  actual: ${e.actual}`, e.reason && `  reason: ${e.reason}`].filter(Boolean).join("\n")).join("\n")}</pre>}
+      </div>}
       <p>以下はREAD ONLY診断とは別の、明示実行する限定修復です。全条件を再検証してから変更します。</p>
       <button disabled={disabled || busy || repair?.status === "complete"} onClick={() => void repairExplicitly()}>
         {plan ? "検証済み10件を修復" : "限定修復を再検証して再開"}

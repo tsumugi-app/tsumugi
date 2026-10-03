@@ -6,6 +6,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import Module from "node:module";
 
@@ -2388,4 +2389,81 @@ test("Wired negative F: read issues -> stops before journal", async () => {
   const w = await wiredFixture(); w.vault.put("broken.md", "---\ntsumugi: true\n---\nno id, no recognizable section");
   const confirmed = await w.confirmedNow(), before = await w.snapshot(), r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
   assert.equal(r.status, "held"); assert.equal(await w.snapshot(), before);
+});
+
+// ---------------------------------------------------------------------------
+// READ ONLY pre-repair check (dry-run)
+// ---------------------------------------------------------------------------
+const fullState = async (w: Wired) => JSON.stringify({ base: await w.snapshot(), identity: await repairDb.getVaultIdentityRecord(), epoch: await repairDb.getActiveVaultEpoch(),
+  committed: await repairDb.getCommittedVaultEpoch(), archive: archiveEntries(w.vault), ledger: await Promise.all([0,1,2,3,4].map(i => repairDb.getVaultSyncState(`memory:c-${i}`))) });
+const dry = (w: Wired, confirmed: import("./vaultRecoveryApply").RecoveryApplyPlan | null = w.confirmed) => narrow.runNarrowRepairPreflight(wiredEnv(w), confirmed);
+const failsOf = (r: import("./memoryNarrowRepair").PreflightReport) => r.entries.filter(e => e.status === "FAIL");
+test("Preflight: Production-simulated 10 records -> every guard PASS, no SKIP, zero mutation, and the repair still completes afterwards", async () => {
+  const w = await wiredFixture(); const before = await fullState(w);
+  const report = await dry(w);
+  assert.deepEqual(failsOf(report), []); assert.equal(report.fail, 0); assert.equal(report.skip, 0); assert.equal(report.allPass, true);
+  assert.equal(report.total, report.pass);
+  const passed = new Set(report.entries.filter(e => e.status === "PASS").map(e => e.code));
+  for (const code of narrow.PREFLIGHT_GUARD_CODES) assert.ok(passed.has(code), `guard not evaluated as PASS: ${code}`);
+  assert.equal(await fullState(w), before, "persistent mutation = 0");
+  if (process.env.SHOW_GUARDS) console.log(`PREFLIGHT total=${report.total} pass=${report.pass} fail=${report.fail} skip=${report.skip}`);
+  // the production entry (debugLog + world lock) gives the same answer and also mutates nothing
+  const viaEntry = await withProductionGlobals(() => narrow.runExplicitRepairPreflight(w.root, w.confirmed, { apply: w.apply }));
+  assert.ok("entries" in viaEntry && viaEntry.allPass); assert.equal(await fullState(w), before);
+  assert.deepEqual(await withProductionGlobals(() => narrow.runExplicitMemoryRepair(w.root, w.confirmed, { apply: w.apply })), { status: "complete", held: 0, issues: 0 });
+});
+test("Preflight: debugLog off -> unavailable, nothing evaluated", async () => {
+  const w = await wiredFixture(); const r = await narrow.runExplicitRepairPreflight(w.root, w.confirmed, { apply: w.apply });
+  assert.deepEqual(r, { unavailable: "debug-log-not-enabled" });
+});
+test("Preflight: identity/world mismatch -> the matching guard FAILs, the other guards are still evaluated, zero mutation", async () => {
+  const w = await wiredFixture(); await repairDb.bumpActiveVaultEpoch(await repairDb.getActiveVaultEpoch());
+  const confirmed = await w.confirmedNow(), before = await fullState(w), report = await dry(w, confirmed);
+  assert.deepEqual(failsOf(report).map(e => e.code), ["vault-world-epoch-not-committed"]);
+  assert.ok(report.entries.some(e => e.code === "registry-memberhash-differs" && e.status === "PASS"), "later guards were still evaluated");
+  assert.equal(await fullState(w), before);
+});
+test("Preflight: Registry condition mismatch -> Registry guard FAILs, zero mutation", async () => {
+  const w = await wiredFixture(); const key = vaultMod.dayFileRegistryKey("2026-09-22"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, file = `Memories/${vaultMod.dayFileNameFor("2026-09-22")}`;
+  const shard = readShard(w.vault.get(sp)!); (shard.files[file].memberHashes as Record<string, string>)["r-0"] = "deadbeef"; w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  const confirmed = await w.confirmedNow(), before = await fullState(w), report = await dry(w, confirmed);
+  assert.ok(failsOf(report).some(e => e.code === "registry-memberhash-differs" && e.memoryId === "r-0"), JSON.stringify(failsOf(report)));
+  assert.equal(await fullState(w), before);
+});
+test("Preflight: Link condition mismatch -> Link guard FAILs, zero mutation", async () => {
+  const w = await wiredFixture(); const c = (await repairDb.getMemoryObject("c-0"))!; await repairDb.putMemoryObject({ ...c, updatedAt: "2030-01-01T00:00:00.000Z" });
+  const confirmed = await w.confirmedNow(), before = await fullState(w), report = await dry(w, confirmed);
+  assert.ok(failsOf(report).some(e => e.code === "link-vault-updatedat-not-newer" && e.memoryId === "c-0"), JSON.stringify(failsOf(report)));
+  assert.equal(await fullState(w), before);
+});
+test("Preflight: several abnormalities at once -> all of them are reported in one run", async () => {
+  const w = await wiredFixture();
+  await repairDb.bumpActiveVaultEpoch(await repairDb.getActiveVaultEpoch());
+  const key = vaultMod.dayFileRegistryKey("2026-09-22"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, file = `Memories/${vaultMod.dayFileNameFor("2026-09-22")}`;
+  const shard = readShard(w.vault.get(sp)!); (shard.files[file].memberHashes as Record<string, string>)["r-0"] = "deadbeef"; w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  const c = (await repairDb.getMemoryObject("c-0"))!; await repairDb.putMemoryObject({ ...c, updatedAt: "2030-01-01T00:00:00.000Z" });
+  const confirmed = await w.confirmedNow(), before = await fullState(w), report = await dry(w, confirmed);
+  const codes = new Set(failsOf(report).map(e => e.code));
+  for (const code of ["vault-world-epoch-not-committed", "registry-memberhash-differs", "link-vault-updatedat-not-newer"]) assert.ok(codes.has(code), `${code} missing from ${[...codes].join(",")}`);
+  assert.equal(await fullState(w), before);
+});
+test("Preflight: a guard that cannot be evaluated safely is SKIP (never PASS), with the prerequisite reason", async () => {
+  const w = await wiredFixture(); { const all = await repairDb.getAllMemoryObjects(); await repairDb.clearMemoryData(); for (const m of all) if (m.id !== "p-0") await repairDb.putMemoryObject(m); }
+  const confirmed = await w.confirmedNow(), before = await fullState(w), report = await dry(w, confirmed);
+  assert.ok(failsOf(report).some(e => e.code === "link-counterpart-not-unique"), JSON.stringify(failsOf(report)));
+  const skips = report.entries.filter(e => e.status === "SKIP");
+  assert.ok(skips.some(e => e.code === "record-evaluation-incomplete" && e.reason === "prerequisite failed (remaining guards of this record could not be evaluated safely)"));
+  for (const code of ["post-journal-payload-validation", "post-journal-verify-inputs", "post-journal-registry-shards-match-planned-before"]) assert.ok(skips.some(e => e.code === code && e.reason === "prerequisite failed"), code);
+  assert.equal(report.allPass, false); assert.equal(report.total, report.pass + report.fail + report.skip);
+  assert.equal(await fullState(w), before);
+});
+test("Preflight: no confirmed plan, and an in-progress journal (a resume would run instead), are FAILs", async () => {
+  const w = await wiredFixture(); assert.ok(failsOf(await dry(w, null)).some(e => e.code === "no-confirmed-plan"));
+  await repairDb.writeRecoveryJournalRaw(JSON.stringify({ version: 1, operationId: "x", status: "in-progress", createdAt: T, updatedAt: T, world: await w.apply.readWorld(), baselineAtStart: { status: "unset", value: null }, managedBefore: {}, ops: [], held: [], result: null, unresolvedMetadata: false }));
+  const before = await fullState(w); assert.ok(failsOf(await dry(w)).some(e => e.code === "recovery-journal-allows-new-run")); assert.equal(await fullState(w), before);
+});
+test("Preflight: UI shows the pre-repair check and the all-pass message; it is wired to the READ ONLY entry only", () => {
+  const ui = fs.readFileSync("src/components/RecoveryMemoryDiagnosticPanel.tsx", "utf8");
+  for (const text of ["修復前チェック（READ ONLY）", "修復前チェック：全条件PASS", "総check数"]) assert.ok(ui.includes(text), text);
+  assert.equal(ui.match(/await runExplicitRepairPreflight\(/g)?.length, 1);
 });

@@ -16,13 +16,29 @@ const eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 export type NarrowRepairFailureInfo = { phase: string; code: string; recordType?: string; memoryId?: string; expected?: string; actual?: string };
 type FailureDetail = { recordType?: string; memoryId?: string; expected?: string; actual?: string };
 export class NarrowRepairFailure extends Error {
-  constructor(public code: string, public detail: FailureDetail = {}) { super(code); }
+  constructor(public code: string, public detail: FailureDetail = {}, public recorded = false) { super(code); }
 }
-function fail(code: string, detail: FailureDetail = {}): never { throw new NarrowRepairFailure(code, detail); }
+/** One evaluated guard of the READ ONLY pre-repair check (dry-run). */
+export type PreflightEntry = { code: string; status: "PASS" | "FAIL" | "SKIP"; recordType?: string; memoryId?: string; expected?: string; actual?: string; reason?: string };
+/** Non-null only while the READ ONLY dry-run evaluates the guards: guards are recorded instead of stopping at the first failure. */
+let collector: PreflightEntry[] | null = null;
+function fail(code: string, detail: FailureDetail = {}): never {
+  if (collector) collector.push({ code, status: "FAIL", ...detail });
+  throw new NarrowRepairFailure(code, detail, collector !== null);
+}
 let checkTrace: ((entry: { code: string; pass: boolean; detail: FailureDetail }) => void) | null = null;
 /** Test/diagnostic seam: observe every guard evaluation (code, expected/actual, pass/fail). Never persisted. */
 export function __setNarrowRepairCheckTrace(trace: typeof checkTrace): void { checkTrace = trace; }
-function check(value: unknown, code: string, detail: FailureDetail = {}): asserts value { checkTrace?.({ code, pass: !!value, detail }); if (!value) fail(code, detail); }
+function check(value: unknown, code: string, detail: FailureDetail = {}): asserts value {
+  checkTrace?.({ code, pass: !!value, detail });
+  if (collector) { collector.push(value ? { code, status: "PASS", recordType: detail.recordType, memoryId: detail.memoryId, expected: detail.expected, actual: "condition satisfied" } : { code, status: "FAIL", ...detail }); return; }
+  if (!value) fail(code, detail);
+}
+/** Dry-run only: a record whose evaluation stopped on an earlier FAIL (e.g. missing data) is reported as SKIP, never as PASS. */
+function skipRecord(_error: unknown, detail: FailureDetail): void {
+  if (!collector) return;
+  collector.push({ code: "record-evaluation-incomplete", status: "SKIP", ...detail, reason: "prerequisite failed (remaining guards of this record could not be evaluated safely)" });
+}
 function insist(value: unknown): asserts value { if (!value) throw new NarrowRepairFailure("repair-precondition-changed"); }
 const heldSummary = (p: RecoveryApplyPlan) => {
   const counts = new Map<string, number>();
@@ -95,10 +111,13 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
   const diagnostic = await inspectHeldMemories(plan, env.apply.root, env.apply.readLocalSnapshot, () => true);
   check(diagnostic.status === "complete", "held-diagnostic-not-complete", { expected: "complete", actual: diagnostic.status });
   check(diagnostic.registry.dayFileCount === 3, "registry-day-file-count-mismatch", { expected: "3 day-files", actual: `${diagnostic.registry.dayFileCount} day-files` });
-  const payload: Payload = { version: 2, storage: [], storageTime: env.apply.now(), allowedFields: { registry: ["contentHash"], canonical: ["links", "updatedAt"] }, identity: await env.identity(), targets: targets(plan), immutable: [], files: [], markdown: [], changes: [], counterparts: [] };
+  let identity = "";
+  try { identity = await env.identity(); } catch (error) { if (!collector) throw error; skipRecord(error, { expected: "identity and world guards", actual: "identity()/world guards stopped" }); }
+  const payload: Payload = { version: 2, storage: [], storageTime: env.apply.now(), allowedFields: { registry: ["contentHash"], canonical: ["links", "updatedAt"] }, identity, targets: targets(plan), immutable: [], files: [], markdown: [], changes: [], counterparts: [] };
   const shards = new Map<string, { before: string; value: { records: Record<string, string>; files: Record<string, Record<string, unknown>> } }>();
   const days = new Map<string, MemoryObject[]>();
   for (const held of plan.held) {
+   try {
     const r = plan.plan.records.find(r => r.recordType === "memory" && r.recordId === held.recordId)!;
     const target = { recordType: held.recordType, memoryId: held.recordId };
     check(r && r.vaultPaths.length === 1, "recovery-vault-path-not-unique", { ...target, expected: "exactly 1 Vault path", actual: `${r ? r.vaultPaths.length : "no-plan-record"} paths` });
@@ -153,7 +172,9 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
       check(original.contentHash !== rawHash && original.contentHash === reserialized, "registry-contenthash-pattern-unexpected", { ...target, expected: "contentHash != raw hash and == re-serialized hash", actual: original.contentHash === rawHash ? "equals-raw-hash" : original.contentHash === reserialized ? "unexpected" : "equals-neither" });
       entry.contentHash = rawHash;
     }
+   } catch (error) { if (!collector) throw error; skipRecord(error, { recordType: held.recordType, memoryId: held.recordId }); }
   }
+  try {
   for (const [path, s] of shards) payload.files.push({ path, before: s.before, after: serializeVaultRegistryShard(s.value), beforeHash: hashVaultText(s.before), afterHash: hashVaultText(serializeVaultRegistryShard(s.value)) });
   check(payload.changes.length === 5, "link-target-count-mismatch", { expected: "5 Link targets", actual: `${payload.changes.length}` });
   // Shared day-files are permitted only when every local differing member is one
@@ -165,6 +186,7 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
   const protectedPaths = new Set([".tsumugi/registry-meta.json", ".tsumugi/registry-index.json", ".tsumugi/index.json", ".tsumugi/history-meta.json"]);
   for (const ms of days.values()) for (const m of ms) protectedPaths.add(`.tsumugi/history/${m.date.slice(0,7)}.json`);
   for (const path of protectedPaths) payload.immutable.push({ path, raw: await readOptional(env,path) });
+  } catch (error) { if (!collector) throw error; skipRecord(error, { expected: "payload-wide guards", actual: "evaluation stopped" }); }
   return { plan, payload };
 }
 
@@ -327,6 +349,67 @@ export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, c
   if (typeof window === "undefined" || new URLSearchParams(window.location.search).get("debugLog") !== "1") return { status: "unavailable", failure: { phase: "start", code: "debug-log-not-enabled" } };
   const locked = await runVaultWorldExclusive(() => executeNarrowMemoryRepair(createProductionNarrowRepairEnv(root, options.apply), confirmed));
   return locked.timedOut ? { status: "unavailable", failure: { phase: "start", code: "world-lock-timed-out" } } : locked.result ?? { status: "unavailable", failure: { phase: "start", code: "no-result" } };
+}
+
+// ---------------------------------------------------------------------------
+// READ ONLY pre-repair check (dry-run): evaluates every prepare guard against the current real data, with the
+// production wiring, without stopping at the first failure. It never writes (no journal, canonical, Outbox,
+// ledger, Registry, Markdown, archive, identity or epoch change) and shares `prepare`/`validatePayload`/`verifyInputs` with the repair.
+// ---------------------------------------------------------------------------
+export const PREFLIGHT_GUARD_CODES = [
+  "recovery-journal-allows-new-run", "no-confirmed-plan",
+  "world-changed-since-confirmed-plan", "held-targets-differ-from-confirmed-plan", "plan-has-recoverable-ops", "held-diagnostic-not-complete", "registry-day-file-count-mismatch",
+  "vault-identity-unpaired", "vault-identity-mismatch", "vault-world-epoch-invalid", "vault-world-epoch-not-committed",
+  "recovery-vault-path-not-unique", "memory-missing-in-vault-or-canonical", "actual-path-differs-from-normal-projection-path-canonical", "actual-path-differs-from-normal-projection-path-vault", "registry-path-mismatch",
+  "link-differing-fields-not-only-links-updatedat", "link-not-vault-strict-superset", "link-updatedat-invalid", "link-vault-updatedat-not-newer", "link-createdat-invalid-or-after-updatedat",
+  "link-counterpart-not-unique", "link-counterpart-link-differs", "link-restored-memory-not-byte-equal-to-vault", "link-target-count-mismatch",
+  "registry-target-not-semantically-equivalent", "registry-shard-not-in-canonical-format", "registry-entry-missing", "registry-entry-status-or-type", "registry-entry-mtime-or-size-differs",
+  "registry-memberids-differ", "registry-memberhashes-keys-differ", "registry-memberhash-differs", "registry-contenthash-pattern-unexpected", "dayfile-member-not-equivalent-to-canonical",
+  "post-journal-payload-validation", "post-journal-verify-inputs", "post-journal-registry-shards-match-planned-before",
+] as const;
+export type PreflightReport = { total: number; pass: number; fail: number; skip: number; allPass: boolean; entries: PreflightEntry[] };
+
+export async function runNarrowRepairPreflight(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan | null): Promise<PreflightReport> {
+  const entries: PreflightEntry[] = [];
+  collector = entries;
+  try {
+    try {
+      const journal = await readRecoveryJournal(env.apply.store);
+      const state = journal.kind === "journal" ? `${journal.journal.status}${journal.journal.narrowMemoryRepair ? " (narrow repair)" : ""}` : journal.kind;
+      entries.push({ code: "recovery-journal-allows-new-run", status: journal.kind === "none" || (journal.kind === "journal" && journal.journal.status !== "in-progress") ? "PASS" : "FAIL",
+        expected: "no journal, or a completed/abandoned one (an in-progress journal would be resumed instead)", actual: state });
+    } catch { entries.push({ code: "recovery-journal-allows-new-run", status: "FAIL", expected: "readable journal store", actual: "journal read failed" }); }
+    if (!confirmed) entries.push({ code: "no-confirmed-plan", status: "FAIL", expected: "confirmed plan", actual: "none" });
+    else {
+      entries.push({ code: "no-confirmed-plan", status: "PASS", expected: "confirmed plan", actual: "condition satisfied" });
+      let prepared: Awaited<ReturnType<typeof prepare>> | null = null;
+      try { prepared = await prepare(env, confirmed); }
+      catch (error) { const info = describeFailure(error, "prepare"); if (!(error instanceof NarrowRepairFailure && error.recorded)) entries.push({ code: info.code, status: "FAIL", expected: info.expected, actual: info.actual }); }
+      const stopped = entries.some(e => e.status === "FAIL");
+      collector = null; // the post-journal simulation below uses the repair's own throwing guards
+      if (prepared && !stopped) {
+        const journalLike = { world: prepared.plan.confirmed.world } as RecoveryJournal;
+        const run = async (code: string, fn: () => Promise<void> | void, expected: string) => {
+          try { await fn(); entries.push({ code, status: "PASS", expected, actual: "condition satisfied" }); }
+          catch (error) { const info = describeFailure(error, "post-journal"); entries.push({ code, status: "FAIL", expected, actual: `${info.code}${info.actual ? ` (${info.actual})` : ""}` }); }
+        };
+        await run("post-journal-payload-validation", () => validatePayload(prepared!.payload), "journaled payload is internally consistent");
+        await run("post-journal-verify-inputs", () => verifyInputs(env, journalLike, prepared!.payload), "world, identity, Markdown, plan, canonical and storage still match what would be journaled");
+        await run("post-journal-registry-shards-match-planned-before", async () => { for (const f of prepared!.payload.files) insist((await env.read(f.path)).raw === f.before); }, "each Registry shard is currently exactly the planned before text");
+      }
+    }
+    const seen = new Set(entries.map(e => e.code)), stopped = entries.some(e => e.status === "FAIL" || e.status === "SKIP");
+    for (const code of PREFLIGHT_GUARD_CODES) if (!seen.has(code)) entries.push({ code, status: "SKIP", reason: stopped ? "prerequisite failed" : "not evaluated: no record to which it applies" });
+    const count = (st: PreflightEntry["status"]) => entries.filter(e => e.status === st).length;
+    return { total: entries.length, pass: count("PASS"), fail: count("FAIL"), skip: count("SKIP"), allPass: count("FAIL") === 0 && count("SKIP") === 0, entries };
+  } finally { collector = null; }
+}
+
+/** UI entry of the READ ONLY pre-repair check: debugLog=1 only, world lock held like the repair, nothing written. */
+export async function runExplicitRepairPreflight(root: FileSystemDirectoryHandle, confirmed: RecoveryApplyPlan | null, options: { apply?: RecoveryApplyEnv } = {}): Promise<PreflightReport | { unavailable: string }> {
+  if (typeof window === "undefined" || new URLSearchParams(window.location.search).get("debugLog") !== "1") return { unavailable: "debug-log-not-enabled" };
+  const locked = await runVaultWorldExclusive(() => runNarrowRepairPreflight(createProductionNarrowRepairEnv(root, options.apply), confirmed));
+  return locked.timedOut || !locked.result ? { unavailable: "world-lock-timed-out" } : locked.result;
 }
 
 /**
