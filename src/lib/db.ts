@@ -1132,6 +1132,27 @@ export async function markVaultWorldJournalMigrated(): Promise<void> {
  */
 const VAULT_RECOVERY_JOURNAL_KEY = "vaultRecoveryJournal";
 
+/**
+ * Recovery背景検査の「検査済み」記録（Vaultごと）。値は`{ build, clean }`のJSON文字列1つ。`build`はアプリのビルド識別子
+ * （新しいバージョンになったら1回だけ再検査する）、`clean`は検査結果（正常か）。plan本体や件数は保存しない。
+ */
+export interface RecoveryCheckMarker { build: string; clean: boolean }
+const recoveryCheckKey = (vaultId: string) => `recoveryCheck:${vaultId}`;
+export async function getRecoveryCheckMarker(vaultId: string): Promise<RecoveryCheckMarker | undefined> {
+  const db = await getDB();
+  const raw = await db.get("settings", recoveryCheckKey(vaultId));
+  if (typeof raw !== "string") return undefined;
+  try {
+    const value: unknown = JSON.parse(raw);
+    return value && typeof value === "object" && typeof (value as RecoveryCheckMarker).build === "string" && typeof (value as RecoveryCheckMarker).clean === "boolean"
+      ? { build: (value as RecoveryCheckMarker).build, clean: (value as RecoveryCheckMarker).clean } : undefined;
+  } catch { return undefined; }
+}
+export async function setRecoveryCheckMarker(vaultId: string, marker: RecoveryCheckMarker): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", JSON.stringify({ build: marker.build, clean: marker.clean }), recoveryCheckKey(vaultId));
+}
+
 export async function readRecoveryJournalRaw(): Promise<string | undefined> {
   const db = await getDB();
   const raw = await db.get("settings", VAULT_RECOVERY_JOURNAL_KEY);

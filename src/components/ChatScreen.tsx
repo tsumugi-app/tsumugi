@@ -112,6 +112,7 @@ import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
 import { deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
 import { runNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
+import { productionRecoveryBackgroundDeps, recordRecoveryCheck, recoveryStatusFromCheck, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import {
   VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
   applyVaultStatusCleanup,
@@ -327,6 +328,8 @@ export type RecoveryUiStatus =
   | { kind: "scanning" }
   /** 自動検出済みで、確認が必要な記録も復旧できる記録も無い（通常ユーザー向け表示では何も出さない）。 */
   | { kind: "clean" }
+  /** 過去の背景検査で異常が確定している（再起動後。planは「修復する」を押したときに作り直す）。 */
+  | { kind: "known-issue" }
   | { kind: "plan"; applyPlan: RecoveryApplyPlan; generation: number }
   | { kind: "interrupted" }
   | { kind: "executing" }
@@ -748,7 +751,7 @@ export default function ChatScreen() {
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
   const startupRecoveryCheckRanRef = useRef(false);
-  /** 通常ユーザー向けRecovery表示：Settingsを最初に開いたときに、読み取りだけの検出を1回行う（保存先ごと）。 */
+  /** Recovery背景検査（読み取りだけ）。ビルド × Vaultごとに未検査の場合だけ1回。Settingsを開くこととは無関係。 */
   const recoveryDetectionRanRef = useRef(false);
   const [recoveryDetectionFailed, setRecoveryDetectionFailed] = useState(false);
   /** 直前の「修復する」が完了しなかった（異常表示を維持し、最新状態と誤表示しない）。 */
@@ -2134,11 +2137,14 @@ export default function ChatScreen() {
     if (vaultStatus !== "connected" || !vaultHandle || startupSaveFoundationBootstrapRanRef.current) return;
     startupSaveFoundationBootstrapRanRef.current = true;
     void trackMemoryTask(
-      withVaultWorldRead(() => runProductionBootstrapOnce(vaultHandle)).catch((error) => {
-        if (!handleStaleVaultTabError(error)) {
-          console.error("[Tsumugi] Save Foundation Bootstrap failed to start (app continues; next startup will retry)", error);
-        }
-      })
+      withVaultWorldRead(() => runProductionBootstrapOnce(vaultHandle))
+        .catch((error) => {
+          if (!handleStaleVaultTabError(error)) {
+            console.error("[Tsumugi] Save Foundation Bootstrap failed to start (app continues; next startup will retry)", error);
+          }
+        })
+        // 通常のstartup（Outbox reconciliation等）が落ち着いた後に、Recoveryの背景検査を（未検査の場合だけ）1回行う。
+        .then(() => startRecoveryBackgroundCheck(vaultHandle))
     );
   }, [vaultStatus, vaultHandle]);
 
@@ -2286,35 +2292,6 @@ export default function ChatScreen() {
       })()
     );
   }, [vaultStatus, vaultHandle]);
-
-  /**
-   * 通常ユーザー向けRecovery表示のための自動検出（読み取りだけ。何も書き込まない）。Settingsを最初に開いた
-   * ときに1回だけ、「確認する」と同じplan（archive除外込み）を作る。異常が無ければ"clean"、あれば"plan"
-   * （通常UIは「保存先に確認が必要な記録があります」＋「修復する」を出す）。操作中なら次回に回す。
-   * 検出できなかった場合は、何も断定しない（最新状態とも異常とも表示しない）。
-   */
-  useEffect(() => {
-    if (!settingsOpen || vaultStatus !== "connected" || !vaultHandle || recoveryDetectionRanRef.current) return;
-    if (vaultOperationLockRef.current || isVaultSwitchingRef.current || crossTabStale) return;
-    recoveryDetectionRanRef.current = true;
-    const generation = vaultGenerationRef.current;
-    void trackMemoryTask(
-      (async () => {
-        try {
-          const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
-          if (generation !== vaultGenerationRef.current) return;
-          const next: RecoveryUiStatus = applyPlan.heldCount > 0 || applyPlan.recoverableCount > 0 ? { kind: "plan", applyPlan, generation } : { kind: "clean" };
-          setRecoveryStatus((current) => (current.kind === "idle" ? next : current));
-        } catch (error) {
-          recoveryDetectionRanRef.current = false;
-          if (handleStaleVaultTabError(error)) return;
-          console.error("[Tsumugi] recovery detection failed", error);
-          setRecoveryDetectionFailed(true);
-        }
-      })()
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settingsOpen, vaultStatus, vaultHandle, crossTabStale]);
 
   useEffect(() => {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -3524,13 +3501,48 @@ export default function ChatScreen() {
   }
 
   /**
+   * Recoveryの背景検査。保存先が使え、startupが落ち着いた後に、ビルド × Vault identityごとに未検査の場合だけ、
+   * 既存のRecovery plan（READ ONLY）を1回作る。結果は「異常が確定したときだけ」通常UIに現れる
+   * （検査中の表示は無い。検査できなかった場合は「最新」とも「異常」とも断定しない）。
+   * 操作中は少し待って再試行する。同じビルド・同じVaultでは、再起動しても再scanしない。
+   */
+  async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle) {
+    if (recoveryDetectionRanRef.current) return;
+    recoveryDetectionRanRef.current = true;
+    const generation = vaultGenerationRef.current;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await new Promise((resolve) => window.setTimeout(resolve, attempt === 0 ? 3000 : 20000));
+      if (generation !== vaultGenerationRef.current) return;
+      if (!vaultOperationLockRef.current && !isVaultSwitchingRef.current) break;
+      if (attempt === 3) { recoveryDetectionRanRef.current = false; return; }
+    }
+    try {
+      const result = await runBackgroundRecoveryCheck(
+        productionRecoveryBackgroundDeps(() => withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(handle))))
+      );
+      if (generation !== vaultGenerationRef.current) return;
+      const checked = recoveryStatusFromCheck(result);
+      if (!checked) { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
+      setRecoveryDetectionFailed(false);
+      const next: RecoveryUiStatus = checked.kind === "plan" ? { kind: "plan", applyPlan: checked.applyPlan, generation } : checked;
+      // 中断journalの検出（起動時）や実行中の状態は上書きしない。
+      setRecoveryStatus((current) => (current.kind === "idle" ? next : current));
+    } catch (error) {
+      recoveryDetectionRanRef.current = false;
+      if (handleStaleVaultTabError(error)) return;
+      console.error("[Tsumugi] recovery background check failed", error);
+      setRecoveryDetectionFailed(true);
+    }
+  }
+
+  /**
    * 通常ユーザー向けの「修復する」。復旧できる記録があれば既存の「復旧する」（applyRecovery）、無ければ保留中の記録の
    * 限定修復（全ての安全条件を読み取りで確認してから実行。確認できなければ何も変更しない）。完了しても
    * 「最新」とは断定せず、必ず現在の状態を再検出し、異常が残っていれば異常表示を維持する。
    */
   async function handleUserRepair() {
     if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
-    const plan = recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan : null;
+    let plan = recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan : null;
     const wasInterrupted = recoveryStatus.kind === "interrupted";
     setUserRepairIncomplete(false);
     if (plan && plan.recoverableCount > 0) {
@@ -3542,6 +3554,24 @@ export default function ChatScreen() {
     const endTask = beginMemoryTask();
     setRecoveryStatus({ kind: "executing" });
     try {
+      if (!plan && !wasInterrupted) {
+        // 再起動後など、planを持っていない場合（過去の検査で異常が確定していた）：このクリックで現在の状態を確認し直す。
+        plan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
+        if (generation !== vaultGenerationRef.current) return;
+        if (plan.heldCount === 0 && plan.recoverableCount === 0) {
+          await recordRecoveryCheck(true);
+          setRecoveryStatus({ kind: "clean" });
+          return;
+        }
+        if (plan.recoverableCount > 0) {
+          // 復旧できる記録がある：通常の「復旧する」（applyRecovery）へ。このhandlerのlockを先に解放する。
+          setRecoveryStatus({ kind: "plan", applyPlan: plan, generation });
+          vaultOperationLockRef.current = false;
+          endTask();
+          await handleExecuteRecoveryApply();
+          return;
+        }
+      }
       const result = await runNarrowRepairForUser(vaultHandle, plan);
       if (generation !== vaultGenerationRef.current) return;
       if (wasInterrupted && result.status === "not-repairable") {
@@ -3555,6 +3585,7 @@ export default function ChatScreen() {
       if (generation !== vaultGenerationRef.current) return;
       const anomalies = applyPlan.heldCount > 0 || applyPlan.recoverableCount > 0;
       setRecoveryStatus(anomalies ? { kind: "plan", applyPlan, generation } : { kind: "clean" });
+      await recordRecoveryCheck(!anomalies); // 再検査の結果（正常が確認できた場合だけ「正常」と記録する）
       setUserRepairIncomplete(result.status !== "repaired" || anomalies);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
@@ -3618,6 +3649,7 @@ export default function ChatScreen() {
         return;
       }
       setRecoveryStatus({ kind: "done", result });
+      if (result.held === 0 && result.failed === 0) void recordRecoveryCheck(true).catch(() => undefined);
       if (recoveryDoneLooksLikeSuccess(result)) {
         // 管理情報が変わった：light-checkの保存済み結果を破棄して再計測する（排他ロック解放後に実行する）。
         vaultLightCheckDiscoveryRef.current = null;

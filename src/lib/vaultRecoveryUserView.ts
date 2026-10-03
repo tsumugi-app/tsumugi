@@ -20,15 +20,18 @@ export interface RecoveryStatusLike {
 export type RecoveryUserView =
   /** まだ検出が済んでいない。「最新の状態です」と言ってはいけない。 */
   | { kind: "pending" }
-  /** 検出済みで異常なし（または検出自体を行えなかった）。Recoveryの表示は無い。 */
+  /** 検出済みで異常なし。Recoveryの表示は無い。 */
   | { kind: "none" }
+  /** 検査できず健全性を判定できなかった。何も表示せず、「最新」とも断定しない。 */
+  | { kind: "unknown" }
   | { kind: "attention"; incomplete: boolean }
   | { kind: "repairing" };
 
 export function deriveRecoveryUserView(status: RecoveryStatusLike, options: { incomplete?: boolean; detectionFailed?: boolean } = {}): RecoveryUserView {
   switch (status.kind) {
     case "executing": return { kind: "repairing" };
-    case "interrupted": return { kind: "attention", incomplete: !!options.incomplete };
+    case "interrupted":
+    case "known-issue": return { kind: "attention", incomplete: !!options.incomplete };
     case "error": return { kind: "attention", incomplete: true };
     case "plan": {
       const plan = status.applyPlan;
@@ -39,7 +42,7 @@ export function deriveRecoveryUserView(status: RecoveryStatusLike, options: { in
       return result && (result.held > 0 || result.failed > 0) ? { kind: "attention", incomplete: !!options.incomplete } : { kind: "none" };
     }
     case "clean": return { kind: "none" };
-    default: return options.detectionFailed ? { kind: "none" } : { kind: "pending" };
+    default: return options.detectionFailed ? { kind: "unknown" } : { kind: "pending" };
   }
 }
 

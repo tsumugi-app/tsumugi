@@ -17,10 +17,12 @@ test("A: 正常（検出済み・held 0・recoverable 0）→ Recovery表示な�
 });
 test("未検出・検出中は「最新」と断定しない（検出できなかった場合だけ、何も断定せず通す）", () => {
   for (const kind of ["idle", "scanning"]) { const view = deriveRecoveryUserView({ kind }); assert.equal(view.kind, "pending"); assert.equal(recoveryAllowsLatest(view), false); }
-  assert.equal(recoveryAllowsLatest(deriveRecoveryUserView({ kind: "idle" }, { detectionFailed: true })), true);
+  // 検査できなかった場合：何も表示せず、「最新」とも断定しない（意味不明な確認UIも出さない）
+  const failed = deriveRecoveryUserView({ kind: "idle" }, { detectionFailed: true });
+  assert.deepEqual(failed, { kind: "unknown" }); assert.equal(recoveryAllowsLatest(failed), false);
 });
 test("B: Recovery対象あり（held>0 / recoverable>0 / 中断）→ 異常表示と修復導線、「最新」は出さない", () => {
-  for (const status of [plan(5), plan(0, 3), plan(10, 2), { kind: "interrupted" }]) {
+  for (const status of [plan(5), plan(0, 3), plan(10, 2), { kind: "interrupted" }, { kind: "known-issue" }]) {
     const view = deriveRecoveryUserView(status); assert.equal(view.kind, "attention"); assert.equal(recoveryAllowsLatest(view), false);
   }
   assert.equal(RECOVERY_ATTENTION_TEXT, "保存先に確認が必要な記録があります"); assert.equal(RECOVERY_REPAIR_BUTTON, "修復する");
@@ -56,13 +58,25 @@ test("「✓ 最新の状態です」はRecoveryの異常・未検出の間は�
   const settings = fs.readFileSync("src/components/SettingsPanel.tsx", "utf8");
   assert.ok(settings.includes('vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView)'));
 });
-test("ユーザー向け「修復する」は全ての安全確認を通す入口だけを使い、自動実行（検出）は読み取りだけ", () => {
+test("Settingsを開くこととRecovery検査は結びつかない。背景検査はstartup後に、読み取りの検査だけを行う", () => {
+  const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
+  const start = chat.indexOf("async function startRecoveryBackgroundCheck("), end = chat.indexOf("async function handleUserRepair()");
+  const check = chat.slice(start, end);
+  assert.ok(start > 0 && end > start);
+  assert.ok(!/settingsOpen/.test(check) && !/settingsOpen[^\n]*recoveryDetection|recoveryDetection[^\n]*settingsOpen/.test(chat), "no Settings-open trigger");
+  assert.ok(check.includes("runBackgroundRecoveryCheck(") && !/applyRecovery\(|runNarrowRepairForUser|runLegacyHeldCleanup|executeNarrow/.test(check), "the background check never repairs or cleans up");
+  assert.ok(/runProductionBootstrapOnce\(vaultHandle\)[\s\S]*\.then\(\(\) => startRecoveryBackgroundCheck\(vaultHandle\)\)/.test(chat), "started after the normal startup (bootstrap) settles");
+});
+test("ユーザー向け「修復する」は全ての安全確認を通す入口だけを使う", () => {
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
   const handler = chat.slice(chat.indexOf("async function handleUserRepair()"), chat.indexOf("async function handleExecuteRecoveryApply()"));
-  assert.ok(handler.includes("runNarrowRepairForUser(") && handler.includes("handleExecuteRecoveryApply()") && handler.includes("planRecoveryApplyExcludingArchived"));
-  const detect = chat.slice(chat.indexOf("recoveryDetectionRanRef.current = true;"), chat.indexOf("recoveryDetectionRanRef.current = false;\n          if (handleStaleVaultTabError"));
-  assert.ok(detect.includes("planRecoveryApplyExcludingArchived") && !/applyRecovery\(|runNarrowRepairForUser|runLegacyHeldCleanup|executeNarrow/.test(detect), "automatic detection never repairs or cleans up");
+  assert.ok(handler.includes("runNarrowRepairForUser(") && handler.includes("handleExecuteRecoveryApply()") && handler.includes("planRecoveryApplyExcludingArchived") && handler.includes("recordRecoveryCheck("));
   const narrow = strip(fs.readFileSync("src/lib/memoryNarrowRepair.ts", "utf8"));
-  const user = narrow.slice(narrow.indexOf("export async function runNarrowRepairForUser"), narrow.indexOf("READ ONLY diagnostic of the held Memories") > 0 ? narrow.length : narrow.length);
+  const user = narrow.slice(narrow.indexOf("export async function runNarrowRepairForUser"));
   assert.ok(user.includes("runNarrowRepairPreflight(env, confirmed)).allPass") && user.includes("executeNarrowMemoryRepair(env"), "a new repair needs the all-PASS pre-repair check");
+});
+test("検査に失敗しても、通常UIに手動確認の導線（古い記録の確認 / 確認する）を出さない", () => {
+  const settings = fs.readFileSync("src/components/SettingsPanel.tsx", "utf8");
+  const user = strip(settings.slice(settings.indexOf("Recovery（通常ユーザー向け）"), settings.indexOf('{showAdvancedVaultTools && vaultStatus === "connected" && vaultHandle && (')));
+  for (const text of ["古い記録", "確認する", "確認してください"]) assert.ok(!user.includes(text), text);
 });
