@@ -13,11 +13,14 @@
  */
 "use client";
 
+import { withVaultSaveLock } from "./vaultSaveLock";
+import { assertNoPendingRecovery } from "./vaultRecoveryJournal";
+import { reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry } from "./vaultProjection";
 import { ulid } from "ulid";
-import { getAllMemoryObjects, loadApiKey, putMemoryObject } from "./db";
-import { writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
+import { getAllMemoryObjects, getMemoryObject, loadApiKey, addMemoryLinkDurably, getVaultIdentityRecord, getVaultOutboxEntry } from "./db";
+import { type VaultWritePriority } from "./vault";
 import { retrieveRelevantMemoriesImpl } from "./retrieval";
-import { withVaultWorldRead } from "./vaultWorldLock";
+import { IncompleteVaultWorldError, StaleVaultTabError, withVaultWorldRead } from "./vaultWorldLock";
 import { markMemoryConnected, releaseMemoryConnectClaim, tryClaimMemoryForConnect } from "./connectState";
 import type { Link, LinkAxis, MemoryObject } from "./types";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
@@ -89,8 +92,11 @@ export async function connectMemory(
 async function connectMemoryImpl(
   vaultHandle: FileSystemDirectoryHandle | null,
   newMemory: MemoryObject,
-  priority: VaultWritePriority = "interactive"
+  _priority: VaultWritePriority = "interactive"
 ): Promise<void> {
+  // Projection now uses the serialized durable outbox path; keep the public
+  // priority parameter compatible with existing callers.
+  void _priority;
   const claimed = await tryClaimMemoryForConnect(newMemory.id);
   if (!claimed) return;
 
@@ -128,7 +134,7 @@ async function connectMemoryImpl(
     const allMemories = await getAllMemoryObjects();
     const byId = new Map(allMemories.map((memory) => [memory.id, memory]));
     const now = new Date().toISOString();
-    let updatedNewMemory = newMemory;
+    const changedIds = new Set<string>();
 
     for (const judgment of accepted) {
       const target = byId.get(judgment.candidateId);
@@ -137,7 +143,7 @@ async function connectMemoryImpl(
 
       const link: Link = {
         id: ulid(),
-        sourceId: updatedNewMemory.id,
+        sourceId: newMemory.id,
         targetId: target.id,
         axis: judgment.axis,
         reason: judgment.reason,
@@ -147,29 +153,34 @@ async function connectMemoryImpl(
         createdAt: now,
       };
 
-      updatedNewMemory = {
-        ...updatedNewMemory,
-        links: [...updatedNewMemory.links, link],
-        updatedAt: now,
-      };
+      await withVaultSaveLock(async () => {
+        await assertNoPendingRecovery();
+        const updated = await addMemoryLinkDurably(link);
+        for (const memory of updated) changedIds.add(memory.id);
+      });
+    }
 
-      // 記憶単体からその接続関係を即座に読めるよう（DATA_MODEL.md §5）、
-      // targetの側にも同じLinkを持たせ、どちらの記憶からも辿れるようにする。
-      const updatedTarget: MemoryObject = {
-        ...target,
-        links: [...target.links, link],
-        updatedAt: now,
-      };
-      if (vaultHandle) {
-        await writeMemoryObjectMarkdown(vaultHandle, updatedTarget, priority);
+    // Every accepted Link is durable before projection starts. A projection failure
+    // leaves the outbox for bootstrap; it must not rerun the AI and duplicate Links.
+    if (vaultHandle) for (const id of changedIds) {
+      try {
+        await withVaultSaveLock(async () => {
+          await assertNoPendingRecovery();
+          const current = await getMemoryObject(id);
+          if (!current) return;
+          const kind = current.metadata.source === "system-generated" ? "reflection" : "memory";
+          const entry = await getVaultOutboxEntry(`${kind}:${id}`);
+          if (!entry) throw new Error("connect-outbox-missing");
+          const env = { root: vaultHandle, vaultIdentity: await getVaultIdentityRecord() ?? null };
+          if (entry.recordType === "reflection") await reconcileReflectionOutboxEntry(env, entry);
+          else await reconcileMemoryOutboxEntry(env, entry);
+        });
+      } catch (error) {
+        if (error instanceof StaleVaultTabError || error instanceof IncompleteVaultWorldError) throw error;
+        console.warn("[Tsumugi] Connect projection deferred; durable outbox retained.");
       }
-      await putMemoryObject(updatedTarget);
     }
 
-    if (vaultHandle) {
-      await writeMemoryObjectMarkdown(vaultHandle, updatedNewMemory, priority);
-    }
-    await putMemoryObject(updatedNewMemory);
     await markMemoryConnected(newMemory.id);
   } catch (error) {
     // 失敗時はクレームを解放し、次回のキャッチアップ等で再試行できるようにする。

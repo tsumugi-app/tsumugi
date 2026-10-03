@@ -1409,3 +1409,20 @@ test("no-op Registry uses untouched raw day-file hash, preserving all member met
   assert.deepEqual(after.memberIds, members.map(m => m.id));
   assert.deepEqual(after.memberHashes, hashes);
 });
+
+test("Restored Vault Link version survives done outbox startup reconciliation without Markdown write", async () => {
+  const vault = new FakeVault(); seedVaultIdentityFile(vault);
+  const day = "2026-04-30", before = memory("restored-link-memory", day), other = memory("restored-link-other", day);
+  const link: import("./types").Link = { id:"restore-edge", sourceId:before.id, targetId:other.id, axis:"theme", reason:"reason", strength:0.8, contrast:false, createdBy:"ai-inference", createdAt:"2026-05-01T00:00:00.000Z" };
+  other.links = [link];
+  const after = { ...before, links:[link], updatedAt:link.createdAt };
+  const entry = await seedMemoryCanonical(after);
+  assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault),entry)).status,"done");
+  await dbMod.putMemoryObject(before); await dbMod.putMemoryObject(other);
+  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,false);
+  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,true);
+  const path = memoryDayPath(day), raw = vault.get(path); vault.writeShouldFail.add(path);
+  const done = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault),done)).status,"done");
+  assert.equal(vault.get(path),raw); assert.deepEqual((await dbMod.getMemoryObject(before.id))!.links,[link]);
+});

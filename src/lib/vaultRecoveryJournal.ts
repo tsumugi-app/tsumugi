@@ -82,6 +82,8 @@ export interface RecoveryJournalWorld {
 export type RecoveryJournalStatus = "in-progress" | "completed" | "abandoned";
 
 export interface RecoveryJournal {
+  /** Explicit debug-only narrow repair; never resume through generic Apply. */
+  narrowMemoryRepair?: unknown;
   version: typeof RECOVERY_JOURNAL_VERSION;
   operationId: string;
   status: RecoveryJournalStatus;

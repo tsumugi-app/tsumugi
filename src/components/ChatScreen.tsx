@@ -53,6 +53,7 @@ import {
   putConversation,
   putConversationWithOutbox,
   putMemoryObject,
+  updateMemoryRevisitPrompt,
   saveChatProvider,
   saveSource,
   saveVaultHandle,
@@ -1438,9 +1439,9 @@ export default function ChatScreen() {
           try {
             const revisitPrompt = await generateRevisitPrompt(memory);
             if (!revisitPrompt) return;
-            const memoryWithPrompt: MemoryObject = { ...memory, revisitPrompt };
-            // Vault境界の安全性（H4対応）：IndexedDBへの書き込みをロック＋epoch確認で包む。
-            await withVaultWorldRead(() => putMemoryObject(memoryWithPrompt));
+            // Vault境界の安全性（H4対応）：最新recordへのfield更新をロック＋epoch確認で包む。
+            const memoryWithPrompt = await withVaultWorldRead(() => updateMemoryRevisitPrompt(memory.id, revisitPrompt));
+            if (!memoryWithPrompt) return;
             // 保険（generation check）：待ちきれずVault切替が確定した後に完了した場合、
             // 既にIndexedDBへは保存済み（旧Vaultへの安全策はpending task待ちが担う）だが、
             // 新しいMemory Worldの画面へ古いMemoryObjectを書き戻さない。

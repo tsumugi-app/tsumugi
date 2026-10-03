@@ -308,3 +308,48 @@ test("Phase3-2 J（データ層側）：Assistant turn追加前にIndexedDBを�
   assert.ok(latest);
   assert.ok(latest!.updatedAt > original.updatedAt, "古いclosure snapshotより新しい値が読み直しで得られる＝古いsnapshotで上書きする経路を回避できる");
 });
+
+const testLink = (id: string, a: string, b: string): import("./types").Link => ({ id, sourceId: a, targetId: b, axis: "theme", reason: "reason", strength: 0.8, contrast: false, createdBy: "ai-inference", createdAt: "2026-01-02T00:00:00.000Z" });
+for (const caller of ["revisitPrompt", "topPrompt"]) test(`${caller}: atomic auxiliary patch retains latest links/version`, async () => {
+  const m = memory(`patch-${caller}`); m.links = [testLink("l",m.id,"other")]; m.updatedAt = "2026-01-02T00:00:00.000Z";
+  await dbMod.putMemoryObject(m);
+  const latest = await dbMod.updateMemoryRevisitPrompt(m.id,"question");
+  assert.deepEqual(latest, { ...m, revisitPrompt: "question" });
+  assert.deepEqual(await dbMod.getMemoryObject(m.id), latest);
+});
+test("auxiliary patch never recreates deleted Memory", async () => { assert.equal(await dbMod.updateMemoryRevisitPrompt("absent-patch","question"), undefined); });
+test("Connect latest endpoints + outbox atomic success", async () => {
+  const a = memory("connect-a"), b = memory("connect-b"); a.revisitPrompt = "keep";
+  await dbMod.putMemoryObject(a); await dbMod.putMemoryObject(b);
+  const link = testLink("atomic-link",a.id,b.id);
+  const result = await dbMod.addMemoryLinkDurably(link);
+  assert.equal(result.length,2);
+  for (const m of result) { assert.deepEqual(m.links,[link]); assert.equal((await dbMod.getVaultOutboxEntry(`memory:${m.id}`))!.recordUpdatedAt,m.updatedAt); }
+  assert.equal(result[0].revisitPrompt,"keep");
+});
+test("Connect outbox failure rolls back BOTH endpoint Memories", async () => {
+  const a = memory("connect-fail-a"), b = memory("connect-fail-b"); await dbMod.putMemoryObject(a); await dbMod.putMemoryObject(b);
+  fakeIdbMod.__failNextPutOn("tsumugi","vaultOutbox");
+  await assert.rejects(dbMod.addMemoryLinkDurably(testLink("fail-link",a.id,b.id)));
+  assert.deepEqual(await dbMod.getMemoryObject(a.id),a); assert.deepEqual(await dbMod.getMemoryObject(b.id),b);
+});
+test("Connect missing endpoint never recreates it or changes the survivor", async () => {
+  const a = memory("connect-survivor"); await dbMod.putMemoryObject(a);
+  assert.deepEqual(await dbMod.addMemoryLinkDurably(testLink("missing-link",a.id,"absent")),[]);
+  assert.deepEqual(await dbMod.getMemoryObject(a.id),a); assert.equal(await dbMod.getMemoryObject("absent"),undefined);
+});
+test("Link repair canonical + pending outbox atomicity and field scope", async () => {
+  const before = memory("repair-db"), other = memory("repair-other"), link = testLink("repair-link",before.id,other.id);
+  other.links = [link]; const after = { ...before, links:[link], updatedAt:link.createdAt };
+  await dbMod.putMemoryObject(before); await dbMod.putMemoryObject(other);
+  fakeIdbMod.__failNextPutOn("tsumugi","vaultOutbox");
+  await assert.rejects(dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,false));
+  assert.deepEqual(await dbMod.getMemoryObject(before.id),before);
+  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,false);
+  assert.deepEqual(await dbMod.getMemoryObject(before.id),after);
+  assert.equal((await dbMod.getVaultOutboxEntry(`memory:${before.id}`))!.status,"pending");
+  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,true);
+  assert.equal((await dbMod.getVaultOutboxEntry(`memory:${before.id}`))!.status,"done");
+  assert.equal(await dbMod.getVaultSyncState(`memory:${before.id}`),after.updatedAt);
+  await assert.rejects(dbMod.commitMemoryLinkRestoration([{before,after:{...after,content:"changed"}}],[other],T,false));
+});

@@ -117,7 +117,7 @@ test("UI mount only exposes explicit diagnostic; no normal action invoked", () =
   const ui = fs.readFileSync("src/components/RecoveryMemoryDiagnosticPanel.tsx", "utf8");
   for (const token of ["cleanup(", "applyRecovery(", "planRecoveryApply(", "console.", "navigator.clipboard"]) assert.ok(!ui.includes(token));
   const main = fs.readFileSync("src/components/SettingsPanel.tsx", "utf8");
-  assert.ok(main.includes('showAdvancedVaultTools && recoveryStatus.kind === "plan"'));
+  assert.ok(main.includes('showAdvancedVaultTools && (recoveryStatus.kind === "plan"'));
 });
 
 test("all production compared fields accounted for; excluded fields remain excluded", () => {
@@ -201,4 +201,15 @@ for (const change of ["type", "issues"] as const) test(`initial ${change} fails 
   if (change === "type") f.plan.held[0].recordType = "conversation";
   else f.plan.plan.issues.push("unexpected" as never);
   assert.deepEqual(await f.run(), { status: "mismatch" }); assert.equal(f.reads(), 0);
+});
+
+test("narrow repair is wired only to an explicit debug button, never diagnostic/startup/projection", () => {
+  const ui = fs.readFileSync("src/components/RecoveryMemoryDiagnosticPanel.tsx", "utf8");
+  assert.match(ui, /onClick=\{\(\) => void repairExplicitly\(\)\}/);
+  assert.match(ui, /検証済み10件を修復/);
+  assert.equal(ui.match(/await runExplicitMemoryRepair\(/g)?.length, 1);
+  for (const path of ["src/lib/recoveryMemoryDiagnostic.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts", "src/components/ChatScreen.tsx"]) {
+    assert.doesNotMatch(fs.readFileSync(path, "utf8"), /runExplicitMemoryRepair|executeNarrowMemoryRepair/);
+  }
+  assert.match(fs.readFileSync("src/lib/memoryNarrowRepair.ts", "utf8"), /get\("debugLog"\) !== "1"/);
 });

@@ -8,7 +8,7 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
 import { isWipePending, WipeInProgressError } from "./wipeState";
-import type { Conversation, MemoryObject, Source } from "./types";
+import type { Conversation, MemoryObject, Source, Link } from "./types";
 import type { AIProviderName } from "./ai/types";
 import { type VaultOutboxEntry, vaultOutboxIdFor, buildOutboxEntryForUpdate } from "./vaultOutbox";
 import { type VaultIdentityRecord, VAULT_IDENTITY_RECORD_ID } from "./vaultIdentity";
@@ -1263,4 +1263,90 @@ export async function getConnectStateRecords(): Promise<Record<string, ConnectSt
     if (value) result[key] = value;
   }
   return result;
+}
+
+/** Auxiliary updates must never replace a Memory snapshot captured before an API call. */
+export async function updateMemoryRevisitPrompt(id: string, prompt: string): Promise<MemoryObject | undefined> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects"], "readwrite");
+  let result: MemoryObject | undefined;
+  try {
+    const current = await tx.objectStore("memoryObjects").get(id);
+    if (current) {
+      result = current.revisitPrompt ? current : { ...current, revisitPrompt: prompt };
+      if (!current.revisitPrompt) await tx.objectStore("memoryObjects").put(result);
+    }
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return result;
+}
+
+/** Both endpoints and their outboxes commit atomically; no stale whole-record writes. */
+export async function addMemoryLinkDurably(link: Link): Promise<MemoryObject[]> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "vaultOutbox"], "readwrite");
+  const result: MemoryObject[] = [];
+  try {
+    const memories = tx.objectStore("memoryObjects"), outbox = tx.objectStore("vaultOutbox");
+    const a = await memories.get(link.sourceId), b = await memories.get(link.targetId);
+    // Revalidate pair existence after the AI call, including partial-retry cases.
+    // Do not create a second edge for an already connected pair in either direction.
+    if (a && b && a.id !== b.id && [a, b].every(m => !m.links.some(l =>
+      l.sourceId === a.id && l.targetId === b.id || l.sourceId === b.id && l.targetId === a.id))) {
+      for (const current of [a, b]) {
+        const sameId = current.links.filter(l => l.id === link.id);
+        if (sameId.length > 1 || sameId.some(l => JSON.stringify(l) !== JSON.stringify(link))) throw new Error("link-conflict");
+        if (sameId.length) { result.push(current); continue; }
+        const clock = Date.parse(current.updatedAt), now = Date.parse(link.createdAt);
+        if (!Number.isFinite(clock) || !Number.isFinite(now)) throw new Error("link-time-invalid");
+        const updated = { ...current, links: [...current.links, link], updatedAt: new Date(Math.max(clock + 1, now)).toISOString() };
+        const type = current.metadata.source === "system-generated" ? "reflection" : "memory";
+        const old = await outbox.get(vaultOutboxIdFor(type, current.id));
+        await memories.put(updated);
+        await outbox.put(buildOutboxEntryForUpdate(old, type, current.id, updated.updatedAt, link.createdAt));
+        result.push(updated);
+      }
+    }
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return result;
+}
+
+/** Narrow repair CAS. Caller holds exclusive world lock and a durable Recovery journal.
+ * This is never called by bootstrap/projection. Both before and after are exact snapshots.
+ */
+export async function commitMemoryLinkRestoration(
+  changes: { before: MemoryObject; after: MemoryObject }[],
+  counterparts: MemoryObject[], now: string, finalize: boolean
+): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "vaultOutbox", "vaultSyncState"], "readwrite");
+  try {
+    const memories = tx.objectStore("memoryObjects"), outbox = tx.objectStore("vaultOutbox");
+    const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    for (const c of counterparts) {
+      const expected = changes.find(x => x.before.id === c.id);
+      const actual = await memories.get(c.id);
+      if (!equal(actual, c) && !(expected && equal(actual, expected.after))) throw new Error("counterpart-changed");
+    }
+    for (const { before, after } of changes) {
+      if (!equal({ ...before, links: after.links, updatedAt: after.updatedAt }, after)) throw new Error("repair-field-scope");
+      const current = await memories.get(before.id);
+      if (!equal(current, after) && (finalize || !equal(current, before))) throw new Error("canonical-changed");
+      const id = vaultOutboxIdFor("memory", before.id);
+      const existing = await outbox.get(id);
+      if (existing && existing.recordUpdatedAt !== before.updatedAt && existing.recordUpdatedAt !== after.updatedAt) throw new Error("outbox-changed");
+      if (!finalize) {
+        await memories.put(after);
+        // Force pending even when an old entry happens to share this timestamp.
+        await outbox.put(buildOutboxEntryForUpdate(undefined, "memory", after.id, after.updatedAt, now));
+      } else {
+        if (!existing || existing.recordUpdatedAt !== after.updatedAt) throw new Error("repair-outbox-missing");
+        await outbox.put({ ...existing, status: "done", heldReason: null,
+          steps: { markdown: "done", registry: "done", index: "done", history: "done", ledger: "done" }, updatedAt: now });
+        await tx.objectStore("vaultSyncState").put(after.updatedAt, `memory:${after.id}`);
+      }
+    }
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
 }

@@ -24,6 +24,8 @@
     "src/lib/productionWiring.test.ts",
     "src/lib/productionMemoryWiring.test.ts",
     "src/lib/vaultRecoveryLegacyCleanup.test.ts",
+    "src/lib/connect.test.ts",
+    "src/lib/connect.ts",
     "src/lib/db.ts",
     "src/lib/vaultOutbox.ts",
     "src/lib/vaultIdentity.ts",

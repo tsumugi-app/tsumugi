@@ -1319,8 +1319,8 @@ export default function SettingsPanel({
                 </button>
               </div>
 
-              {showAdvancedVaultTools && recoveryStatus.kind === "plan" && (
-                <RecoveryMemoryDiagnosticPanel key={recoveryStatus.applyPlan.plan.completedAt} plan={recoveryStatus.applyPlan} root={vaultHandle} disabled={vaultActionsDisabled} />
+              {showAdvancedVaultTools && (recoveryStatus.kind === "plan" || recoveryStatus.kind === "interrupted") && (
+                <RecoveryMemoryDiagnosticPanel key={recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan.plan.completedAt : "interrupted"} plan={recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan : null} root={vaultHandle} disabled={vaultActionsDisabled} />
               )}
 
               {recoveryStatus.kind === "interrupted" && (

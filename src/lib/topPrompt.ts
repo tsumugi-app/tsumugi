@@ -23,7 +23,7 @@ import {
   getConversation,
   loadApiKey,
   loadLastPromptedMemoryIds,
-  putMemoryObject,
+  updateMemoryRevisitPrompt,
   saveLastPromptedMemoryIds,
 } from "./db";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
@@ -177,8 +177,9 @@ async function generateTopPromptImpl(): Promise<TopPrompt | undefined> {
     if (selection.needsGeneration) {
       const revisitPrompt = await generateRevisitPrompt(memory);
       if (!revisitPrompt) return undefined;
-      memory = { ...memory, revisitPrompt };
-      await putMemoryObject(memory);
+      const latest = await updateMemoryRevisitPrompt(memory.id, revisitPrompt);
+      if (!latest) return undefined;
+      memory = latest;
     }
     // Time Safety：表示・Conversation送信に使う文字列を確定する直前の最終確認
     // （selectRevisitCandidate・生成後検証を通っているはずだが、保険として必ず確認する）。

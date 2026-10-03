@@ -1701,3 +1701,186 @@ test("M3d: single-member（Reflection）の従来のsafe repairは、multi-membe
   assert.equal(result.status, "completed");
   assert.equal(result.recovered, 1);
 });
+
+// Explicit narrow repair uses the actual production Plan/parser/verifiers above.
+const narrow = require("./memoryNarrowRepair") as typeof import("./memoryNarrowRepair");
+async function narrowFixture() {
+  const db = new FakeDb(), vault = new FakeVault();
+  const next = "2026-09-21T09:00:00.000Z";
+  for (let i = 0; i < 5; i++) {
+    const link: import("./types").Link = { id: `link-${i}`, sourceId: `c-${i}`, targetId: `p-${i}`, axis: "theme", reason: "reason", strength: 0.8, contrast: false, createdBy: "ai-inference", createdAt: next };
+    db.memories.set(`r-${i}`, memory(`r-${i}`, { date: `2026-09-${22 + i % 3}T09:00:00.000Z` }));
+    db.memories.set(`c-${i}`, memory(`c-${i}`, { links: [link], updatedAt: next }));
+    db.memories.set(`p-${i}`, memory(`p-${i}`, { date: "2026-09-25T09:00:00.000Z", links: [link], updatedAt: next }));
+  }
+  for (const m of db.memories.values()) m.date = m.date.slice(0, 10);
+  const initial = await applyOnce(db, vault); assert.equal(initial.status, "completed");
+  db.journal = undefined;
+  // Seed a fully current History fixture from the actual persisted parser output.
+  const hp = ".tsumugi/history/2026-09.json", history = JSON.parse(vault.get(hp)!);
+  for (const [path, file] of vault.files) if (path.startsWith("Memories/")) {
+    const members = markdownMod.parseMemoryDayFile(file.content);
+    const day = members[0].date.slice(0,10);
+    for (const m of members) db.memories.set(m.id, clone(m));
+    const rk = vaultMod.dayFileRegistryKey(day), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(rk).toString(16).padStart(2,"0")}.json`;
+    const shard = JSON.parse(vault.get(sp)!);
+    shard.files[path].memberHashes = Object.fromEntries(members.map(m => [m.id, vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(m))]));
+    vault.put(sp,JSON.stringify(shard));
+    history.days[day].normalMemories = members.map(m => ({ id:m.id, types:m.types, preview:vaultMod.truncateHistoryPreview(m.summary), createdAt:m.createdAt, date:m.date }));
+  }
+  vault.put(hp,JSON.stringify(history));
+  for (let i = 0; i < 5; i++) db.memories.set(`c-${i}`, { ...db.memories.get(`c-${i}`)!, links: [], updatedAt: T });
+  for (let day = 22; day <= 24; day++) {
+    const date = `2026-09-${day}`, file = `Memories/${vaultMod.dayFileNameFor(date)}`;
+    vault.put(file, vault.get(file)! + "\n\n");
+    const key = vaultMod.dayFileRegistryKey(date), bucket = vaultMod.vaultRegistryBucketOf(key);
+    const sp = `.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`;
+    const shard = JSON.parse(vault.get(sp)!); shard.files[file].mtime = vault.mtimeOf(file); shard.files[file].size = vault.get(file)!.length; shard.files[file].contentHash = vaultMod.hashVaultText(markdownMod.serializeMemoryDayFile(markdownMod.parseMemoryDayFile(vault.get(file)!).sort((a,b)=>a.createdAt.localeCompare(b.createdAt))));
+    vault.put(sp, JSON.stringify(shard));
+  }
+  const apply = makeEnv(db, vault);
+  const plan = await applyMod.planRecoveryApply(apply);
+  assert.equal(plan.heldCount, 10, JSON.stringify(plan.held)); assert.equal(plan.plan.issues.length, 0);
+  const env: import("./memoryNarrowRepair").NarrowRepairEnv = { apply,
+    identity: async () => "fixture-identity",
+    read: async p => { const f = vault.files.get(p); if (!f) throw new DOMException("absent", "NotFoundError"); return { raw: f.content, size: f.content.length, mtime: f.mtime }; },
+    write: async (p, text) => { vault.put(p, text); },
+    commit: async (changes, counterparts, _now, finalize) => {
+      for (const c of counterparts) assert.deepEqual(db.memories.get(c.id), c);
+      for (const c of changes) {
+        const current = db.memories.get(c.before.id);
+        assert.ok(JSON.stringify(current) === JSON.stringify(c.before) || JSON.stringify(current) === JSON.stringify(c.after));
+        db.memories.set(c.before.id, clone(c.after));
+        if (finalize) db.ledger.set(`memory:${c.after.id}`, c.after.updatedAt);
+      }
+    },
+  };
+  return { db, vault, env, plan };
+}
+test("Narrow: explicit 3 day / 5 Link repair, only permitted fields, held=0", async () => {
+  const f = await narrowFixture();
+  const before = new Map([...f.vault.files].map(([p,v]) => [p,v.content])); const local = clone(f.db.snapshot().memories);
+  const result = await narrow.executeNarrowMemoryRepair(f.env, f.plan);
+  assert.deepEqual(result, { status: "complete", held: 0, issues: 0 });
+  for (const [p, raw] of before) {
+    if (!p.startsWith(".tsumugi/registry/")) assert.equal(f.vault.get(p), raw);
+    else { const a = JSON.parse(raw), b = JSON.parse(f.vault.get(p)!); for (const path of Object.keys(a.files)) a.files[path].contentHash = b.files[path].contentHash; assert.deepEqual(a,b); }
+  }
+  for (const m of local) {
+    const after = f.db.memories.get(m.id)!;
+    if (!m.id.startsWith("c-")) assert.deepEqual(after, m, "Registry対象・counterpart canonicalは完全不変");
+    else assert.deepEqual({ ...after, links: m.links, updatedAt: m.updatedAt }, m);
+  }
+  assert.equal((await journalMod.readRecoveryJournal(f.env.apply.store)).kind, "journal");
+});
+for (const failure of ["identity", "world", "memberIds", "memberHashes", "raw", "mtime", "size", "counterpart", "counterpart-content", "content", "registry-content", "timestamp", "timestamp-invalid", "both-unique", "same-id", "issues"] as const) test(`Narrow preflight refuses ${failure}`, async () => {
+  const f = await narrowFixture();
+  if (failure === "identity") f.env.identity = async () => { throw new Error("identity"); };
+  else if (failure === "world") f.db.activeVaultEpoch++;
+  else if (["memberIds", "memberHashes", "mtime", "size"].includes(failure)) {
+    const p = f.plan.plan.records.find(r => r.recordId === "r-0")!;
+    const sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(p.registryKey).toString(16).padStart(2,"0")}.json`;
+    const shard = JSON.parse(f.vault.get(sp)!); const e = shard.files[p.vaultPaths[0]];
+    if (failure === "memberIds") e.memberIds = []; else if (failure === "memberHashes") e.memberHashes = {}; else e[failure]++;
+    f.vault.put(sp, JSON.stringify(shard));
+  } else if (failure === "raw") { const p = f.plan.plan.records.find(r => r.recordId === "r-0")!.vaultPaths[0]; f.vault.put(p, f.vault.get(p)! + "changed"); }
+  else if (failure === "counterpart") f.db.memories.delete("p-0");
+  else if (failure === "counterpart-content") f.db.memories.get("p-0")!.links[0].reason = "changed";
+  else if (failure === "content") f.db.memories.get("c-0")!.content = "changed";
+  else if (failure === "registry-content") f.db.memories.get("r-0")!.content = "changed";
+  else if (failure === "timestamp") f.db.memories.get("c-0")!.updatedAt = "2026-10-01T00:00:00.000Z";
+  else if (failure === "timestamp-invalid") f.db.memories.get("c-0")!.updatedAt = "invalid";
+  else if (failure === "both-unique") f.db.memories.get("c-0")!.links = [{ ...f.db.memories.get("p-0")!.links[0], id: "other" }];
+  else if (failure === "same-id") f.db.memories.get("c-0")!.links = [{ ...f.db.memories.get("p-0")!.links[0], reason: "changed" }];
+  else f.vault.put("Memories/broken.md", "---\ntsumugi: true\nid: broken\n---\ninvalid");
+  const before = JSON.stringify([...f.vault.files]), local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "held");
+  assert.equal(JSON.stringify([...f.vault.files]), before); assert.equal(JSON.stringify(f.db.snapshot()), local);
+});
+for (const stage of ["before", "after", "partial", "canonical", "finalize"] as const) test(`Narrow interruption ${stage}, explicit resume only`, async () => {
+  const f = await narrowFixture(), write = f.env.write, commit = f.env.commit; let once = true;
+  f.env.write = async (p, text) => {
+    if (once && ["before", "after", "partial"].includes(stage)) {
+      once = false;
+      if (stage === "after") await write(p,text);
+      if (stage === "partial") await write(p,"{");
+      throw new Error("kill");
+    }
+    await write(p,text);
+  };
+  f.env.commit = async (...args) => { await commit(...args); if (once && (stage === "canonical" && !args[3] || stage === "finalize" && args[3])) { once = false; throw new Error("kill"); } };
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "held");
+  assert.equal(await journalMod.isRecoveryBlockingNormalWrites(f.env.apply.store, async () => 0), true);
+  const generic = await applyMod.applyRecovery(f.env.apply);
+  assert.equal(generic.status, "unavailable");
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, null)).status, "complete");
+});
+
+test("Narrow failed restore keeps gate; neither snapshot refuses explicit resume", async () => {
+  const f = await narrowFixture(); let writes=0;
+  f.env.write = async (p) => { writes++; f.vault.put(p,"{"); throw new Error("write/restore unavailable"); };
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  assert.equal(await journalMod.isRecoveryBlockingNormalWrites(f.env.apply.store,async()=>0),true);
+  const attempted = writes;
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,null)).status,"held"); assert.equal(writes,attempted);
+});
+test("Narrow double invocation cannot reapply a completed repair", async () => {
+  const f = await narrowFixture(); assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"complete");
+  const before = JSON.stringify([...f.vault.files]), local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  assert.equal(JSON.stringify([...f.vault.files]),before); assert.equal(JSON.stringify(f.db.snapshot()),local);
+});
+test("Narrow journal persistence failure precedes every mutation", async () => {
+  const f = await narrowFixture(); f.db.journalWriteShouldFail=true;
+  const before = JSON.stringify([...f.vault.files]), local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  assert.equal(JSON.stringify([...f.vault.files]),before); assert.equal(JSON.stringify(f.db.snapshot()),local);
+});
+
+test("Narrow journal read-back failure stops before storage mutations", async () => {
+  const f = await narrowFixture();
+  f.env.apply.store = { read: async () => undefined, write: async text => { f.db.journal = text; } };
+  const files = JSON.stringify([...f.vault.files]), local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "held");
+  assert.equal(JSON.stringify([...f.vault.files]), files);
+  assert.equal(JSON.stringify(f.db.snapshot()), local);
+});
+test("Narrow changed target set after confirmation refuses all writes", async () => {
+  const f = await narrowFixture();
+  f.plan.held[0].recordId = "different-confirmed-id";
+  const files = JSON.stringify([...f.vault.files]), local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "held");
+  assert.equal(JSON.stringify([...f.vault.files]), files);
+  assert.equal(JSON.stringify(f.db.snapshot()), local);
+  assert.equal(f.db.journal, undefined);
+});
+test("Narrow interrupted journal cannot resume in a different world", async () => {
+  const f = await narrowFixture(), commit = f.env.commit;
+  f.env.commit = async () => { throw new Error("interrupt"); };
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "held");
+  f.env.commit = commit; f.db.activeVaultEpoch++;
+  const files = JSON.stringify([...f.vault.files]), local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, null)).status, "held");
+  assert.equal(JSON.stringify([...f.vault.files]), files);
+  assert.equal(JSON.stringify(f.db.snapshot()), local);
+  assert.equal(JSON.parse(f.db.journal!).status, "in-progress");
+});
+
+for (const scenario of ["duplicate-counterpart", "missing-matching-link"] as const) test(`Narrow Link validation rejects ${scenario}`, async () => {
+  const f = await narrowFixture();
+  const before = f.db.memories.get("c-0")!;
+  const after = { ...before, links: f.db.memories.get("p-0")!.links, updatedAt: "2026-09-21T09:00:00.000Z" };
+  const pool = f.db.snapshot().memories;
+  if (scenario === "duplicate-counterpart") pool.push(clone(f.db.memories.get("p-0")!));
+  else pool.find(m => m.id === "p-0")!.links = [];
+  assert.throws(() => narrow.validateLinkRestoration(before,after,pool));
+});
+test("Narrow rechecks raw files after journal read-back before any repair write", async () => {
+  const f = await narrowFixture(), store = f.env.apply.store;
+  const path = f.plan.plan.records.find(r => r.recordId === "r-0")!.vaultPaths[0];
+  f.env.apply.store = { read: store.read, write: async text => { await store.write(text); f.vault.put(path, f.vault.get(path)! + "\n"); } };
+  let writes = 0; f.env.write = async () => { writes++; };
+  const local = JSON.stringify(f.db.snapshot());
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  assert.equal(writes,0); assert.equal(JSON.stringify(f.db.snapshot()),local);
+});

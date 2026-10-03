@@ -1541,6 +1541,9 @@ export async function applyRecovery(env: RecoveryApplyEnv, confirmed?: RecoveryC
   //   `confirmation-expired`で止める（journalには一切触れない）。
   // - 別worldの古いjournalを明示的に破棄して新規Applyへ進んでよいのは、呼び出し元が新しく確認した
   //   `confirmed`（Dry Runをやり直した結果）を持っている場合だけ。
+  if (existing.kind === "journal" && existing.journal.narrowMemoryRepair && existing.journal.status === "in-progress") {
+    return { status: "unavailable", ...EMPTY_RESULT, resumed: false, reason: "use-explicit-memory-repair" };
+  }
   const hasMatchingJournal = existing.kind === "journal" && existing.journal.status === "in-progress" && sameWorld(world, existing.journal.world);
   const hasStaleJournal = existing.kind === "journal" && existing.journal.status === "in-progress" && !sameWorld(world, existing.journal.world);
 
