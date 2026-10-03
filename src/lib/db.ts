@@ -9,6 +9,7 @@ import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
 import { isWipePending, WipeInProgressError } from "./wipeState";
 import type { Conversation, MemoryObject, Source, Link } from "./types";
+import { inferSourceType } from "./markdown";
 import type { AIProviderName } from "./ai/types";
 import { type VaultOutboxEntry, vaultOutboxIdFor, buildOutboxEntryForUpdate } from "./vaultOutbox";
 import { type VaultIdentityRecord, VAULT_IDENTITY_RECORD_ID } from "./vaultIdentity";
@@ -1372,6 +1373,16 @@ export async function markMemoryProjectionSynced(recordType: "memory" | "reflect
 /** Narrow repair CAS. Caller holds exclusive world lock and a durable Recovery journal.
  * This is never called by bootstrap/projection. Both before and after are exact snapshots.
  */
+/** Allowed difference between canonical `before` and `after`: `links` and `updatedAt`, and, only when `before` has no
+ * `metadata.sourceType`, the parser's own inferred value (`inferSourceType`, the normal Vault -> canonical rule). */
+export function memoryRepairScopeOk(before: MemoryObject, after: MemoryObject): boolean {
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const base = { ...before, links: after.links, updatedAt: after.updatedAt };
+  if (same(base, after)) return true;
+  return before.metadata.sourceType === undefined && after.metadata.sourceType === inferSourceType(before.metadata.source)
+    && same({ ...base, metadata: { ...before.metadata, sourceType: after.metadata.sourceType } }, after);
+}
+
 export async function commitMemoryLinkRestoration(
   changes: { before: MemoryObject; after: MemoryObject }[],
   counterparts: MemoryObject[], now: string, finalize: boolean, expectations: MemoryRepairExpectation[]
@@ -1388,7 +1399,7 @@ export async function commitMemoryLinkRestoration(
     }
     if (expectations.length !== changes.length) throw new Error("repair-storage-missing");
     for (const { before, after } of changes) {
-      if (!equal({ ...before, links: after.links, updatedAt: after.updatedAt }, after)) throw new Error("repair-field-scope");
+      if (!memoryRepairScopeOk(before, after)) throw new Error("repair-field-scope");
       const current = await memories.get(before.id);
       if (!equal(current, after) && (finalize || !equal(current, before))) throw new Error("canonical-changed");
       const id = vaultOutboxIdFor("memory", before.id);

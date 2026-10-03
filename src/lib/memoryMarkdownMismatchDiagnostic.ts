@@ -13,7 +13,7 @@ import { memoryObjectToMarkdown } from "./markdown";
 import { memoryDifferenceFields } from "./recoveryMemoryDiagnostic";
 import { parseRecoveryMemoryMarkdown } from "./vaultRecovery";
 import { planRecoveryApply, type RecoveryApplyEnv } from "./vaultRecoveryApply";
-import { createProductionNarrowRepairEnv } from "./memoryNarrowRepair";
+import { createProductionNarrowRepairEnv, restoredMemoryFor } from "./memoryNarrowRepair";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 
 const ENTRY_SEPARATOR = "\n<!-- tsumugi:entry -->\n\n";
@@ -60,7 +60,7 @@ const SHAPE_FIELDS: [string, (m: MemoryObject) => unknown][] = [
 
 /** Pure core: compares one Memory given its canonical form and the raw Vault member block. */
 export function diagnoseMemoryMarkdown(before: MemoryObject, vault: MemoryObject, rawBlock: string, location: MemoryMarkdownDiagnostic["dayFile"]): MemoryMarkdownDiagnostic {
-  const after: MemoryObject = { ...before, links: vault.links, updatedAt: vault.updatedAt };
+  const after: MemoryObject = restoredMemoryFor(before, vault); // exactly what the repair would write
   const D = memoryObjectToMarkdown(after), E = memoryObjectToMarkdown(vault), R = rawBlock;
   const d = splitMarkdown(D), e = splitMarkdown(E), keyDifferences: KeyDiff[] = [];
   for (const key of new Set([...d.front.keys(), ...e.front.keys()])) {

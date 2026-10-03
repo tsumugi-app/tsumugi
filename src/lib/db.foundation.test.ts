@@ -354,3 +354,15 @@ test("Link repair canonical + pending outbox atomicity and field scope", async (
   assert.equal(await dbMod.getVaultSyncState(`memory:${before.id}`),after.updatedAt);
   await assert.rejects(dbMod.commitMemoryLinkRestoration([{before,after:{...after,content:"changed"}}],[other],T,false,expected));
 });
+
+test("memoryRepairScopeOk: links/updatedAt, plus metadata.sourceType only when absent and equal to inferSourceType(source)", () => {
+  const base = memory("scope-1"); const { sourceType: _omit, ...metadata } = base.metadata as unknown as Record<string, unknown>; void _omit;
+  const legacy = { ...base, metadata } as unknown as MemoryObject;
+  const links = { ...legacy, links: [testLink("scope-l", "scope-1", "scope-2")], updatedAt: "2026-02-09T00:00:00.000Z" };
+  assert.equal(dbMod.memoryRepairScopeOk(legacy, links), true);
+  assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, metadata: { ...legacy.metadata, sourceType: "chat" } } as MemoryObject), true, "source ai-capture -> chat");
+  assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, metadata: { ...legacy.metadata, sourceType: "manual" } } as MemoryObject), false, "not the inferred value");
+  assert.equal(dbMod.memoryRepairScopeOk({ ...legacy, metadata: { ...legacy.metadata, sourceType: "manual" } } as MemoryObject, { ...links, metadata: { ...legacy.metadata, sourceType: "chat" } } as MemoryObject), false, "an explicit value is never overwritten");
+  assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, metadata: { ...legacy.metadata, sourceType: "chat", confidence: 0.1 } } as MemoryObject), false, "no other metadata");
+  assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, summary: "x" }), false);
+});

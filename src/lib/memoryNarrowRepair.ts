@@ -3,7 +3,7 @@ import type { MemoryObject } from "./types";
 import { compareDiagnosticLinks, memoryDifferenceFields, inspectHeldMemories, runHeldMemoryDiagnostic, type MemoryDiagnosticResult } from "./recoveryMemoryDiagnostic";
 import { createRecoveryApplyEnv, planRecoveryApply, type RecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
 import { parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual } from "./vaultRecovery";
-import { parseMemoryDayFile, serializeMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
+import { parseMemoryDayFile, serializeMemoryDayFile, memoryObjectToMarkdown, inferSourceType } from "./markdown";
 import { hashVaultText, serializeVaultRegistryShard, vaultRegistryBucketOf, vaultRecoveryPrimitives, runRecoveryVaultWrite } from "./vault";
 import { readRecoveryJournal, saveRecoveryJournal, type RecoveryJournal } from "./vaultRecoveryJournal";
 import { commitMemoryLinkRestoration, getVaultIdentityRecord, readMemoryRepairStorage, memoryRepairExpectation, type MemoryRepairExpectation } from "./db";
@@ -76,6 +76,21 @@ function parseAll(raw: string): MemoryObject[] {
   insist(new Set(result.map(m => m.id)).size === result.length);
   return result;
 }
+/**
+ * The canonical Memory the Link repair produces: the Vault's `links` and `updatedAt`, plus the normal
+ * Vault -> canonical `metadata.sourceType` normalization. A canonical written before `sourceType` existed has none;
+ * the Markdown parser (and so every normal restore, e.g. `mergeMemoryObjectForApply`) supplies `inferSourceType(source)`.
+ * The value is never invented here: it is taken from the Vault member, and only when canonical has none and the
+ * Vault value is exactly what `inferSourceType` (the shared parser rule) yields. Nothing else is touched.
+ */
+export function restoredMemoryFor(before: MemoryObject, vault: MemoryObject): MemoryObject {
+  const after: MemoryObject = { ...before, links: vault.links, updatedAt: vault.updatedAt };
+  if (before.metadata.sourceType === undefined && vault.metadata.sourceType === inferSourceType(before.metadata.source)) {
+    return { ...after, metadata: { ...before.metadata, sourceType: vault.metadata.sourceType } };
+  }
+  return after;
+}
+
 export function validateLinkRestoration(before: MemoryObject, vault: MemoryObject, all: MemoryObject[]): MemoryObject[] {
   const d = { recordType: "memory", memoryId: before.id };
   const fields = memoryDifferenceFields(before, vault).sort();
@@ -140,7 +155,10 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
     check(r.registryKey && registryPath === path, "registry-path-mismatch", { ...target, expected: path, actual: registryPath ?? "absent" });
     if (held.reason === "conflict") {
       payload.counterparts.push(...validateLinkRestoration(before, vault, plan.snapshot.memories));
-      const after = { ...before, links: vault.links, updatedAt: vault.updatedAt };
+      // sourceType: unchanged unless canonical has none (then it must be exactly the parser's inferred value).
+      check(before.metadata.sourceType !== undefined || vault.metadata.sourceType === inferSourceType(before.metadata.source), "link-sourcetype-restoration-allowed",
+        { ...target, expected: `canonical sourceType set, or Vault sourceType == inferSourceType(${before.metadata.source})`, actual: `canonical sourceType undefined, Vault sourceType ${String(vault.metadata.sourceType)}` });
+      const after = restoredMemoryFor(before, vault);
       check(memoryObjectToMarkdown(after) === memoryObjectToMarkdown(vault), "link-restored-memory-not-byte-equal-to-vault", { ...target, expected: "restored Markdown == Vault Markdown", actual: "differs" });
       payload.changes.push({ before, after });
       const storage = await env.readStorage(before.id);
@@ -218,9 +236,9 @@ function validatePayload(p: Payload) {
     const storage = p.storage.find(e => e.id === c.before.id);
     insist(storage && eq(storage, memoryRepairExpectation(c.before, c.after, storage.before, p.storageTime)));
     insist(p.markdown.some(m => m.path === memoryDayFilePath(c.after) && parseAll(m.raw).some(v => v.id === c.after.id)));
-    insist(eq({ ...c.before, links: c.after.links, updatedAt: c.after.updatedAt }, c.after));
     const matches = vault.filter(m => m.id === c.before.id);
-    insist(matches.length === 1 && recoveryRecordsSemanticEqual("memory",c.after,matches[0]));
+    insist(matches.length === 1 && eq(restoredMemoryFor(c.before, matches[0]), c.after)); // links/updatedAt (+ the normal sourceType normalization) only
+    insist(recoveryRecordsSemanticEqual("memory",c.after,matches[0]));
     insist(memoryObjectToMarkdown(c.after) === memoryObjectToMarkdown(matches[0]));
   }
 }
@@ -362,7 +380,7 @@ export const PREFLIGHT_GUARD_CODES = [
   "vault-identity-unpaired", "vault-identity-mismatch", "vault-world-epoch-invalid", "vault-world-epoch-not-committed",
   "recovery-vault-path-not-unique", "memory-missing-in-vault-or-canonical", "actual-path-differs-from-normal-projection-path-canonical", "actual-path-differs-from-normal-projection-path-vault", "registry-path-mismatch",
   "link-differing-fields-not-only-links-updatedat", "link-not-vault-strict-superset", "link-updatedat-invalid", "link-vault-updatedat-not-newer", "link-createdat-invalid-or-after-updatedat",
-  "link-counterpart-not-unique", "link-counterpart-link-differs", "link-restored-memory-not-byte-equal-to-vault", "link-target-count-mismatch",
+  "link-counterpart-not-unique", "link-counterpart-link-differs", "link-sourcetype-restoration-allowed", "link-restored-memory-not-byte-equal-to-vault", "link-target-count-mismatch",
   "registry-target-not-semantically-equivalent", "registry-shard-not-in-canonical-format", "registry-entry-missing", "registry-entry-status-or-type", "registry-entry-mtime-or-size-differs",
   "registry-memberids-differ", "registry-memberhashes-keys-differ", "registry-memberhash-differs", "registry-contenthash-pattern-unexpected", "dayfile-member-not-equivalent-to-canonical",
   "post-journal-payload-validation", "post-journal-verify-inputs", "post-journal-registry-shards-match-planned-before",

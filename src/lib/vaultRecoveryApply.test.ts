@@ -2485,29 +2485,15 @@ async function runMismatchDiag(w: Wired) {
   const r = await mismatchDiag.runMarkdownMismatchDiagnostic(w.apply, async p => { const f = w.vault.files.get(p)!; return { raw: f.content }; });
   assert.ok("memories" in r); return r as Extract<typeof r, { memories: unknown[] }>;
 }
-test("Mismatch diagnostic: a legacy canonical Memory without metadata.sourceType reproduces the one-record FAIL (semantic identical, serializer-normalised only)", async () => {
-  const w = await wiredFixture();
-  const c0 = (await repairDb.getMemoryObject("c-0"))!; const { sourceType: _omit, ...metadata } = c0.metadata; void _omit; await repairDb.putMemoryObject({ ...c0, metadata });
-  editMemberBlock(w, "c-0", b => b.replace("sourceType: chat\n", ""));
-  const confirmed = await w.confirmedNow(), before = await fullState(w);
-  const report = await dry(w, confirmed);
-  assert.deepEqual(failsOf(report).map(e => `${e.code}:${e.memoryId}`), ["link-restored-memory-not-byte-equal-to-vault:c-0"], "same symptom as Production: exactly one record fails this guard, the other four pass");
-  const diag = await runMismatchDiag(w);
-  const bad = diag.memories.find(m => m.memoryId === "c-0")!, good = diag.memories.filter(m => m.memoryId !== "c-0");
-  assert.equal(bad.verdict, "semantically identical, serialization differs"); assert.deepEqual(bad.semanticDifferenceFields, []);
-  assert.deepEqual(bad.keyDifferences, [{ key: "sourceType", kind: "only-in-E", e: "chat" }]);
-  assert.equal(bad.rawEqualsD, true, "the raw Vault bytes equal the restored canonical's serialization"); assert.equal(bad.rawEqualsE, false); assert.equal(bad.dEqualsE, false);
-  assert.deepEqual(bad.shape["metadata.sourceType"], { canonical: "undefined", vault: "string" });
-  assert.equal(good.length, 4); for (const m of good) { assert.equal(m.dEqualsE, true); assert.equal(m.verdict, "D==E (guard passes)"); }
-  assert.equal(await fullState(w), before, "persistent mutation = 0");
-});
 test("Mismatch diagnostic: eventTime/eventTimePrecision stored as null in canonical is another serializer-only difference", async () => {
   const w = await wiredFixture();
   const c1 = (await repairDb.getMemoryObject("c-1"))!; await repairDb.putMemoryObject({ ...c1, eventTime: null as unknown as undefined, eventTimePrecision: null as unknown as undefined });
   const confirmed = await w.confirmedNow(), before = await fullState(w), diag = await runMismatchDiag(w);
   const bad = diag.memories.find(m => m.memoryId === "c-1")!;
   assert.equal(bad.dEqualsE, false); assert.deepEqual(bad.semanticDifferenceFields, []); assert.ok(bad.keyDifferences.some(k => k.key === "eventTime"), JSON.stringify(bad.keyDifferences));
-  assert.equal(bad.verdict, "semantically identical, serialization differs"); assert.ok(confirmed); assert.equal(await fullState(w), before);
+  assert.equal(bad.verdict, "semantically identical, serialization differs"); assert.equal(await fullState(w), before);
+  // eventTime/eventTimePrecision are deliberately NOT generalised: the guard still stops this Memory.
+  assert.deepEqual(failsOf(await dry(w, confirmed)).map(e => `${e.code}:${e.memoryId}`), ["link-restored-memory-not-byte-equal-to-vault:c-1"]);
 });
 test("Mismatch diagnostic: reports lengths/offsets/char codes, never user text, for non-enum keys", () => {
   const T0 = "2026-09-01T09:00:00.000Z";
@@ -2521,4 +2507,80 @@ test("Mismatch diagnostic: UI entry is READ ONLY wiring only (debugLog gate, no 
   const src = fs.readFileSync("src/lib/memoryMarkdownMismatchDiagnostic.ts", "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   for (const token of ["saveRecoveryJournal", "commitMemoryLinkRestoration", "putMemoryObject", "setVaultSyncState", "writeFileInDir", "runRecoveryVaultWrite", "env.write(", "removeEntry", "createWritable"]) assert.ok(!src.includes(token), token);
   assert.ok(src.includes('get("debugLog") !== "1"'));
+});
+
+// ---------------------------------------------------------------------------
+// Conditional metadata.sourceType normalization (the normal Vault -> canonical rule, shared via inferSourceType)
+// ---------------------------------------------------------------------------
+/** The Vault member carries `sourceType: <value>` (as the failing Production Memory does) and its Registry entry is kept consistent. */
+function setVaultSourceType(w: Wired, id: string, value: string) {
+  editMemberBlock(w, id, b => b.replace("source: ai-capture\n", `source: ai-capture\nsourceType: ${value}\n`));
+  const file = [...w.vault.files.keys()].find(p => p.startsWith("Memories/") && w.vault.get(p)!.includes(`id: ${id}\n`))!;
+  for (const [sp, f] of shardFiles(w.vault)) {
+    const shard = readShard(f); let touched = false;
+    for (const [path, entry] of Object.entries(shard.files)) if (path === file) { entry.mtime = w.vault.mtimeOf(file); entry.size = w.vault.get(file)!.length; entry.contentHash = vaultMod.hashVaultText(w.vault.get(file)!); touched = true; }
+    if (touched) w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  }
+}
+async function dropSourceType(id: string, set?: string) {
+  const m = (await repairDb.getMemoryObject(id))!, { sourceType: _omit, ...metadata } = m.metadata; void _omit;
+  await repairDb.putMemoryObject({ ...m, metadata: set ? { ...metadata, sourceType: set as never } : metadata });
+}
+const productionRepair = (w: Wired, confirmed: import("./vaultRecoveryApply").RecoveryApplyPlan) => withProductionGlobals(() => narrow.runExplicitMemoryRepair(w.root, confirmed, { apply: w.apply }));
+test("sourceType 1: Production shape (canonical none, Vault chat, ai-capture) -> preflight all PASS, repair completes, canonical gets chat, Vault bytes unchanged, D==E, 0 after startup", async () => {
+  const w = await wiredFixture(); await dropSourceType("c-0"); setVaultSourceType(w, "c-0", "chat");
+  const canonicalBefore = new Map((await repairDb.getAllMemoryObjects()).map(m => [m.id, m]));
+  const confirmed = await w.confirmedNow(), before = await fullState(w);
+  const diag = await runMismatchDiag(w); const d0 = diag.memories.find(m => m.memoryId === "c-0")!;
+  assert.equal(d0.verdict, "D==E (guard passes)"); assert.equal(d0.rawEqualsE, true); assert.equal(d0.rawEqualsD, true); assert.deepEqual(d0.shape["metadata.sourceType"], { canonical: "undefined", vault: "string" });
+  const report = await dry(w, confirmed); assert.deepEqual(failsOf(report), []); assert.equal(report.skip, 0); assert.equal(report.allPass, true);
+  assert.ok(report.entries.some(e => e.code === "link-sourcetype-restoration-allowed" && e.memoryId === "c-0" && e.status === "PASS"));
+  assert.equal(await fullState(w), before, "preflight mutates nothing");
+  const markdown = new Map([...w.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content]));
+  for (const p of markdown.keys()) w.vault.writeShouldFail.add(p);
+  assert.deepEqual(await productionRepair(w, confirmed), { status: "complete", held: 0, issues: 0 });
+  const c0 = (await repairDb.getMemoryObject("c-0"))!, b0 = canonicalBefore.get("c-0")!;
+  assert.equal(c0.metadata.sourceType, "chat");
+  assert.deepEqual({ ...c0, links: b0.links, updatedAt: b0.updatedAt, metadata: b0.metadata }, b0, "only links/updatedAt/metadata.sourceType changed");
+  assert.deepEqual({ ...c0.metadata, sourceType: undefined }, { ...b0.metadata, sourceType: undefined });
+  for (const m of await repairDb.getAllMemoryObjects()) if (m.id !== "c-0" && /^c-\d$/.test(m.id)) assert.deepEqual(m.metadata, canonicalBefore.get(m.id)!.metadata, "canonical sourceType already chat: unchanged");
+  assert.deepEqual(new Map([...w.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content])), markdown, "Vault Markdown byte-identical");
+  assert.equal(markdownMod.memoryObjectToMarkdown(c0), markdownMod.memoryObjectToMarkdown(markdownMod.parseMemoryDayFile(w.vault.get([...markdown.keys()].find(p => w.vault.get(p)!.includes("id: c-0\n"))!)!).find(m => m.id === "c-0")!), "D == E");
+  assert.equal((await projection.reconcileDoneVaultOutboxIntegrity(w.projectionEnv)).processed, 5);
+  const raw = await applyMod.planRecoveryApply(w.apply); assert.equal(raw.heldCount, 0); assert.equal(raw.plan.issues.length, 0); assert.equal(raw.ops.length, 0);
+  assert.deepEqual(new Map([...w.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content])), markdown, "still byte-identical after startup reconciliation (projection no-op)");
+});
+test("sourceType 3: canonical none but the Vault value is not inferSourceType(source) -> FAIL before any write", async () => {
+  const w = await wiredFixture(); await dropSourceType("c-0"); setVaultSourceType(w, "c-0", "manual");
+  const confirmed = await w.confirmedNow(), before = await fullState(w), report = await dry(w, confirmed);
+  assert.ok(failsOf(report).some(e => e.code === "link-sourcetype-restoration-allowed" && e.memoryId === "c-0"), JSON.stringify(failsOf(report)));
+  const r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
+  assert.equal(r.status, "held"); assert.equal(r.failure?.phase, "prepare"); assert.equal(await fullState(w), before, "nothing written, no journal");
+});
+test("sourceType 4: canonical has another explicit value -> never overwritten, repair stops before any write", async () => {
+  const w = await wiredFixture(); await dropSourceType("c-0", "manual");
+  const confirmed = await w.confirmedNow(), before = await fullState(w), r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
+  assert.equal(r.failure?.code, "link-differing-fields-not-only-links-updatedat"); assert.equal(await fullState(w), before);
+  assert.equal((await repairDb.getMemoryObject("c-0"))!.metadata.sourceType, "manual");
+});
+test("sourceType 5: any other semantic difference alongside the missing sourceType still stops", async () => {
+  const w = await wiredFixture(); await dropSourceType("c-0"); const c0 = (await repairDb.getMemoryObject("c-0"))!; await repairDb.putMemoryObject({ ...c0, summary: "also different" });
+  const confirmed = await w.confirmedNow(), before = await fullState(w), r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
+  assert.equal(r.failure?.code, "link-differing-fields-not-only-links-updatedat"); assert.equal(await fullState(w), before);
+});
+test("sourceType 6a: interruption after the canonical step keeps the normalized state and resumes to completion", async () => {
+  const w = await wiredFixture(); await dropSourceType("c-0"); const confirmed = await w.confirmedNow(), env = wiredEnv(w), commit = env.commit; let once = true;
+  env.commit = async (...args) => { await commit(...args); if (once && !args[3]) { once = false; throw new Error("page kill after canonical"); } };
+  assert.equal((await narrow.executeNarrowMemoryRepair(env, confirmed)).status, "held");
+  assert.equal((await repairDb.getMemoryObject("c-0"))!.metadata.sourceType, "chat"); assert.equal((await repairDb.readMemoryRepairStorage("c-0")).outbox!.status, "pending");
+  env.commit = commit;
+  assert.deepEqual(await narrow.executeNarrowMemoryRepair(env, null), { status: "complete", held: 0, issues: 0 });
+  const st = await repairDb.readMemoryRepairStorage("c-0"), m = (await repairDb.getMemoryObject("c-0"))!; assert.equal(st.ledger, m.updatedAt); assert.equal(st.outbox!.status, "done");
+});
+test("sourceType 6b: canonical changing before the compare-and-set stops without overwriting it", async () => {
+  const w = await wiredFixture(); await dropSourceType("c-0"); const confirmed = await w.confirmedNow(), env = wiredEnv(w), commit = env.commit;
+  env.commit = async (...args) => { if (!args[3]) await dropSourceType("c-0", "manual"); return commit(...args); };
+  const r = await narrow.executeNarrowMemoryRepair(env, confirmed);
+  assert.equal(r.status, "held"); assert.equal((await repairDb.getMemoryObject("c-0"))!.metadata.sourceType, "manual", "the concurrent value is kept");
+  assert.equal((await repairDb.readMemoryRepairStorage("c-0")).outbox!.status === "done", false);
 });
