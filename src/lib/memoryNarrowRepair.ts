@@ -19,7 +19,10 @@ export class NarrowRepairFailure extends Error {
   constructor(public code: string, public detail: FailureDetail = {}) { super(code); }
 }
 function fail(code: string, detail: FailureDetail = {}): never { throw new NarrowRepairFailure(code, detail); }
-function check(value: unknown, code: string, detail: FailureDetail = {}): asserts value { if (!value) fail(code, detail); }
+let checkTrace: ((entry: { code: string; pass: boolean; detail: FailureDetail }) => void) | null = null;
+/** Test/diagnostic seam: observe every guard evaluation (code, expected/actual, pass/fail). Never persisted. */
+export function __setNarrowRepairCheckTrace(trace: typeof checkTrace): void { checkTrace = trace; }
+function check(value: unknown, code: string, detail: FailureDetail = {}): asserts value { checkTrace?.({ code, pass: !!value, detail }); if (!value) fail(code, detail); }
 function insist(value: unknown): asserts value { if (!value) throw new NarrowRepairFailure("repair-precondition-changed"); }
 const heldSummary = (p: RecoveryApplyPlan) => {
   const counts = new Map<string, number>();
@@ -282,26 +285,47 @@ export async function executeNarrowMemoryRepair(env: NarrowRepairEnv, confirmed:
   } catch (error) { return { status: "held", failure: describeFailure(error, phase) }; }
 }
 
-export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, confirmed: RecoveryApplyPlan | null): Promise<NarrowRepairResult> {
+const validEpoch = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+
+/**
+ * The production dependency wiring, shared by the UI entry and by the integration tests.
+ * `apply` defaults to the production Recovery env. Tests replace ONLY its `readLocalSnapshot`/`readRecord`
+ * (the fake IndexedDB has no IDBFactory.databases()); every other dependency is the production one.
+ */
+export function createProductionNarrowRepairEnv(root: FileSystemDirectoryHandle, apply: RecoveryApplyEnv = createRecoveryApplyEnv(root)): NarrowRepairEnv {
+  const read = async (path: string) => {
+    const parts = path.split("/"); insist(parts.every(p => p && p !== "." && p !== ".." && !p.includes("\\")));
+    let dir = root;
+    for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create: false });
+    const file = await (await dir.getFileHandle(parts.at(-1)!, { create: false })).getFile();
+    return { raw: await file.text(), mtime: file.lastModified, size: file.size };
+  };
+  return {
+    apply, read, commit: commitMemoryLinkRestoration, readStorage: readMemoryRepairStorage,
+    // VaultIdentityRecord.activeVaultEpoch is never populated by production code (always null), so it cannot be an
+    // invariant. The maintained invariants are: IndexedDB vaultId == vault-identity.json vaultId, and the world's
+    // active epoch is a valid epoch that equals the committed epoch (a switch/commit is not half-done).
+    identity: async () => {
+      const id = await getVaultIdentityRecord(); const disk = JSON.parse((await read(".tsumugi/vault-identity.json")).raw);
+      check(id?.vaultId, "vault-identity-unpaired", { expected: "paired vaultId in IndexedDB", actual: "absent" });
+      check(disk.vaultId === id.vaultId, "vault-identity-mismatch", { expected: "IndexedDB vaultId == vault-identity.json", actual: "differs" });
+      const world = await apply.readWorld();
+      check(validEpoch(world.activeVaultEpoch) && validEpoch(world.committedVaultEpoch), "vault-world-epoch-invalid", { expected: "valid active and committed epochs", actual: `active=${String(world.activeVaultEpoch)} committed=${String(world.committedVaultEpoch)}` });
+      check(world.committedVaultEpoch === world.activeVaultEpoch, "vault-world-epoch-not-committed", { expected: "committed epoch == active epoch", actual: `active=${world.activeVaultEpoch} committed=${world.committedVaultEpoch}` });
+      return id.vaultId;
+    },
+    excludeArchived: async (p) => excludeArchivedFromApplyPlan({ root, vaultIdentity: (await getVaultIdentityRecord()) ?? null }, p),
+    write: (path, raw) => runRecoveryVaultWrite(async () => {
+      insist(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(path));
+      const dir = await (await root.getDirectoryHandle(".tsumugi", { create: false })).getDirectoryHandle("registry", { create: false });
+      await vaultRecoveryPrimitives.writeFileInDir(dir, path.split("/").at(-1)!, raw, "explicit memory repair");
+    }),
+  };
+}
+
+export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, confirmed: RecoveryApplyPlan | null, options: { apply?: RecoveryApplyEnv } = {}): Promise<NarrowRepairResult> {
   if (typeof window === "undefined" || new URLSearchParams(window.location.search).get("debugLog") !== "1") return { status: "unavailable", failure: { phase: "start", code: "debug-log-not-enabled" } };
-  const locked = await runVaultWorldExclusive(async () => {
-    const read = async (path: string) => {
-      const parts = path.split("/"); insist(parts.every(p => p && p !== "." && p !== ".." && !p.includes("\\")));
-      let dir = root;
-      for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create: false });
-      const file = await (await dir.getFileHandle(parts.at(-1)!, { create: false })).getFile();
-      return { raw: await file.text(), mtime: file.lastModified, size: file.size };
-    };
-    return executeNarrowMemoryRepair({ apply: createRecoveryApplyEnv(root), read, commit: commitMemoryLinkRestoration, readStorage: readMemoryRepairStorage,
-      identity: async () => { const id = await getVaultIdentityRecord(); const disk = JSON.parse((await read(".tsumugi/vault-identity.json")).raw); check(id?.vaultId, "vault-identity-unpaired", { expected: "paired vaultId in IndexedDB", actual: "absent" }); check(disk.vaultId === id.vaultId, "vault-identity-mismatch", { expected: "IndexedDB vaultId == vault-identity.json", actual: "differs" }); check(id.activeVaultEpoch === (await createRecoveryApplyEnv(root).readWorld()).activeVaultEpoch, "vault-identity-epoch-mismatch", { expected: "identity epoch == active epoch", actual: "differs" }); return id.vaultId; },
-      excludeArchived: async (p) => excludeArchivedFromApplyPlan({ root, vaultIdentity: (await getVaultIdentityRecord()) ?? null }, p),
-      write: (path, raw) => runRecoveryVaultWrite(async () => {
-        insist(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(path));
-        const dir = await (await root.getDirectoryHandle(".tsumugi", { create: false })).getDirectoryHandle("registry", { create: false });
-        await vaultRecoveryPrimitives.writeFileInDir(dir, path.split("/").at(-1)!, raw, "explicit memory repair");
-      }),
-    }, confirmed);
-  });
+  const locked = await runVaultWorldExclusive(() => executeNarrowMemoryRepair(createProductionNarrowRepairEnv(root, options.apply), confirmed));
   return locked.timedOut ? { status: "unavailable", failure: { phase: "start", code: "world-lock-timed-out" } } : locked.result ?? { status: "unavailable", failure: { phase: "start", code: "no-result" } };
 }
 

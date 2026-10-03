@@ -2173,7 +2173,7 @@ async function archivedFixture(registryDays = 3) {
   const nav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   Object.defineProperty(globalThis, "navigator", { value: { locks: new FifoLocks() }, configurable: true, writable: true });
   const worldLock = require("./vaultWorldLock") as typeof import("./vaultWorldLock");
-  await repairDb.markVaultEpochCommitted(0); await repairDb.markVaultWorldJournalMigrated(); worldLock.setTabVaultEpoch(0);
+  const currentEpoch = await repairDb.getActiveVaultEpoch(); await repairDb.markVaultEpochCommitted(currentEpoch); await repairDb.markVaultWorldJournalMigrated(); worldLock.setTabVaultEpoch(currentEpoch);
   let cleanup: Awaited<ReturnType<typeof f.legacy.runLegacyHeldCleanup>>;
   try { cleanup = await f.legacy.runLegacyHeldCleanup({ root: f.vault.root(), vaultIdentity: f.identity, now: () => T }); }
   finally { if (nav) Object.defineProperty(globalThis, "navigator", nav); else delete (globalThis as { navigator?: unknown }).navigator; }
@@ -2252,4 +2252,140 @@ test("Archive diagnostics: screen plan = 5, read-only diagnostic uses the raw pl
   assert.equal(rawHeld, 10); assert.equal(diagnostic.status, "complete");
   if (diagnostic.status === "complete") { assert.equal(diagnostic.registry.heldMemoryCount, 5); assert.equal(diagnostic.conflicts.count, 5); assert.equal(diagnostic.registry.dayFileCount, 3); }
   assert.equal(JSON.stringify([...f.vault.files]), files); assert.equal(JSON.stringify(await f.env.apply.readLocalSnapshot()), local); assert.equal(f.db.journal, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Production-wired integration: the production env (createProductionNarrowRepairEnv/runExplicitMemoryRepair),
+// real db.ts over the fake IndexedDB (real readWorld/identity/Outbox/ledger/journal store), real archive exclusion.
+// The ONLY replaced dependency is apply.readLocalSnapshot/readRecord (the fake IndexedDB has no IDBFactory.databases()).
+// ---------------------------------------------------------------------------
+class WiredLocks {
+  private tails = new Map<string, Promise<void>>();
+  async request<R>(name: string, a: unknown, b?: (l: { name: string } | null) => Promise<R>): Promise<R> {
+    const cb = (typeof a === "function" ? a : b) as (l: { name: string } | null) => Promise<R>;
+    const turn = this.tails.get(name) ?? Promise.resolve(); let release!: () => void;
+    this.tails.set(name, new Promise<void>(r => { release = r; })); await turn;
+    try { return await cb({ name }); } finally { release(); }
+  }
+}
+async function withProductionGlobals<R>(fn: () => Promise<R>): Promise<R> {
+  const g = globalThis as unknown as Record<string, unknown>;
+  const saved = { navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator"), window: Object.getOwnPropertyDescriptor(globalThis, "window") };
+  Object.defineProperty(globalThis, "navigator", { value: { locks: new WiredLocks() }, configurable: true, writable: true });
+  Object.defineProperty(globalThis, "window", { value: { location: { search: "?debugLog=1" } }, configurable: true, writable: true });
+  try { return await fn(); }
+  finally { for (const k of ["navigator", "window"] as const) { if (saved[k]) Object.defineProperty(globalThis, k, saved[k]!); else delete g[k]; } }
+}
+async function wiredFixture() {
+  const f = await archivedFixture();
+  const worldLock = require("./vaultWorldLock") as typeof import("./vaultWorldLock");
+  let epoch = await repairDb.getActiveVaultEpoch(); while (epoch < 2) epoch = await repairDb.bumpActiveVaultEpoch(epoch);
+  await repairDb.markVaultEpochCommitted(epoch); worldLock.setTabVaultEpoch(epoch); // the fake IndexedDB is shared by the whole file: commit whatever the active epoch is now
+  // Production shape: the identity record's activeVaultEpoch has never been populated.
+  await repairDb.putVaultIdentityRecord({ id: "current", vaultId: "fixture-identity", activeVaultEpoch: null, registryGeneration: null, pairedAt: T, pendingCandidateVaultId: null, updatedAt: T });
+  // The fake IndexedDB is shared by the whole file: start every scenario with an abandoned (inert) journal.
+  await repairDb.writeRecoveryJournalRaw(JSON.stringify({ version: 1, operationId: "test-reset", status: "abandoned", createdAt: T, updatedAt: T,
+    world: { activeVaultEpoch: 0, committedVaultEpoch: 0, registryGenerationEpoch: 0, journalVersion: "current", backend: null },
+    baselineAtStart: { status: "unset", value: null }, managedBefore: {}, ops: [], held: [], result: null, unresolvedMetadata: false }));
+  const root = f.vault.root();
+  const apply = { ...applyMod.createRecoveryApplyEnv(root), readLocalSnapshot: f.env.apply.readLocalSnapshot, readRecord: f.env.apply.readRecord };
+  const confirmedNow = async () => {
+    const raw = await applyMod.planRecoveryApply(apply);
+    return f.legacy.excludeArchivedFromApplyPlan({ root, vaultIdentity: (await repairDb.getVaultIdentityRecord()) ?? null, now: () => T }, raw);
+  };
+  const snapshot = async () => JSON.stringify({ files: [...f.vault.files], memories: await repairDb.getAllMemoryObjects(),
+    storage: await Promise.all([0,1,2,3,4].map(i => repairDb.readMemoryRepairStorage(`c-${i}`))), journal: await repairDb.readRecoveryJournalRaw() });
+  return { ...f, root, apply, confirmed: await confirmedNow(), confirmedNow, snapshot };
+}
+type Wired = Awaited<ReturnType<typeof wiredFixture>>;
+const wiredEnv = (w: Wired) => narrow.createProductionNarrowRepairEnv(w.root, w.apply);
+
+test("Wired: production-shaped state (raw 10, excluded 5, identity epoch null, world epoch number)", async () => {
+  const w = await wiredFixture();
+  assert.equal((await repairDb.getVaultIdentityRecord())!.activeVaultEpoch, null);
+  assert.ok((await repairDb.getActiveVaultEpoch()) >= 2);
+  const world = await w.apply.readWorld(); assert.equal(world.committedVaultEpoch, world.activeVaultEpoch);
+  assert.equal((await applyMod.planRecoveryApply(w.apply)).heldCount, 10); assert.equal(w.confirmed.heldCount, 5);
+});
+test("Wired: EVERY prepare guard passes with production dependencies (guard table)", async () => {
+  const w = await wiredFixture(); const trace: { code: string; pass: boolean; detail: Record<string, string | undefined> }[] = [];
+  narrow.__setNarrowRepairCheckTrace(e => trace.push(e));
+  const before = await w.snapshot();
+  try {
+    const result = await withProductionGlobals(() => narrow.runExplicitMemoryRepair(w.root, w.confirmed, { apply: w.apply }));
+    assert.deepEqual(result, { status: "complete", held: 0, issues: 0 });
+  } finally { narrow.__setNarrowRepairCheckTrace(null); }
+  assert.notEqual(await w.snapshot(), before);
+  const failed = trace.filter(t => !t.pass); assert.deepEqual(failed, [], JSON.stringify(failed));
+  const codes = new Set(trace.map(t => t.code));
+  for (const code of ["world-changed-since-confirmed-plan", "held-targets-differ-from-confirmed-plan", "plan-has-recoverable-ops", "held-diagnostic-not-complete", "registry-day-file-count-mismatch",
+    "recovery-vault-path-not-unique", "memory-missing-in-vault-or-canonical", "actual-path-differs-from-normal-projection-path-canonical", "actual-path-differs-from-normal-projection-path-vault", "registry-path-mismatch",
+    "link-differing-fields-not-only-links-updatedat", "link-not-vault-strict-superset", "link-updatedat-invalid", "link-vault-updatedat-not-newer", "link-createdat-invalid-or-after-updatedat", "link-counterpart-not-unique", "link-counterpart-link-differs",
+    "link-restored-memory-not-byte-equal-to-vault", "registry-target-not-semantically-equivalent", "registry-shard-not-in-canonical-format", "registry-entry-missing", "registry-entry-status-or-type", "registry-entry-mtime-or-size-differs",
+    "registry-memberids-differ", "registry-memberhashes-keys-differ", "registry-memberhash-differs", "registry-contenthash-pattern-unexpected", "link-target-count-mismatch", "dayfile-member-not-equivalent-to-canonical",
+    "vault-identity-unpaired", "vault-identity-mismatch", "vault-world-epoch-invalid", "vault-world-epoch-not-committed"]) assert.ok(codes.has(code), `guard never evaluated: ${code}`);
+  if (process.env.SHOW_GUARDS) { const seen = new Set<string>(); for (const t of trace) { if (seen.has(t.code)) continue; seen.add(t.code); console.log(`GUARD ${t.pass ? "PASS" : "FAIL"} ${t.code} | expected: ${t.detail.expected ?? "-"} | actual: ${t.detail.actual ?? "-"}`); } }
+});
+test("Wired: full Production-simulated run 10 -> 0, then startup/done-Outbox reconciliation keeps 0", async () => {
+  const w = await wiredFixture();
+  const markdown = new Map([...w.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content]));
+  const archiveBefore = archiveEntries(w.vault), shardsBefore = new Map(shardFiles(w.vault)), others = new Map([...w.vault.files].filter(([p]) => !p.startsWith(".tsumugi/registry/")).map(([p, v]) => [p, v.content]));
+  const canonicalBefore = new Map((await repairDb.getAllMemoryObjects()).map(m => [m.id, m]));
+  for (const p of markdown.keys()) w.vault.writeShouldFail.add(p);
+  const result = await withProductionGlobals(() => narrow.runExplicitMemoryRepair(w.root, w.confirmed, { apply: w.apply }));
+  assert.deepEqual(result, { status: "complete", held: 0, issues: 0 });
+  assert.equal((await applyMod.planRecoveryApply(w.apply)).heldCount, 0);
+  assert.equal((await projection.reconcileDoneVaultOutboxIntegrity(w.projectionEnv)).processed, 5);
+  const rawFinal = await applyMod.planRecoveryApply(w.apply);
+  assert.equal(rawFinal.heldCount, 0); assert.equal(rawFinal.plan.issues.length, 0); assert.equal(rawFinal.ops.length, 0);
+  assert.deepEqual(new Map([...w.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content])), markdown, "Memory Markdown byte-identical, no duplicates");
+  assert.deepEqual(archiveEntries(w.vault), archiveBefore, "archive byte-identical");
+  assert.deepEqual(new Map([...w.vault.files].filter(([p]) => !p.startsWith(".tsumugi/registry/")).map(([p, v]) => [p, v.content])), others, "only Registry shards changed in the Vault");
+  const changedShards = shardFiles(w.vault).filter(([p, c]) => shardsBefore.get(p) !== c); assert.equal(changedShards.length, 3, "exactly the 3 intended Registry shards");
+  for (const m of await repairDb.getAllMemoryObjects()) {
+    const before = canonicalBefore.get(m.id)!;
+    if (/^c-\d$/.test(m.id)) {
+      assert.deepEqual({ ...m, links: before.links, updatedAt: before.updatedAt }, before, "only links/updatedAt change"); assert.equal(m.links.length, 1);
+      const st = await repairDb.readMemoryRepairStorage(m.id); assert.equal(st.ledger, m.updatedAt); assert.equal(st.outbox!.status, "done"); assert.equal(st.outbox!.recordUpdatedAt, m.updatedAt);
+      const other = (await repairDb.getMemoryObject(m.links[0].sourceId === m.id ? m.links[0].targetId : m.links[0].sourceId))!; assert.ok(other.links.some(l => l.id === m.links[0].id), "counterpart link consistent");
+    } else assert.deepEqual(m, before, "other Memories are untouched");
+  }
+  assert.equal(JSON.parse((await repairDb.readRecoveryJournalRaw())!).status, "completed");
+});
+for (const [name, code] of [["A: vaultId mismatch", "vault-identity-mismatch"], ["B: committed != active epoch", "vault-world-epoch-not-committed"]] as const) {
+  test(`Wired negative ${name} -> stops before journal`, async () => {
+    const w = await wiredFixture();
+    if (code === "vault-identity-mismatch") await repairDb.putVaultIdentityRecord({ ...(await repairDb.getVaultIdentityRecord())!, vaultId: "someone-else" });
+    else await repairDb.bumpActiveVaultEpoch(await repairDb.getActiveVaultEpoch());
+    const confirmed = await w.confirmedNow(), before = await w.snapshot();
+    const r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
+    assert.equal(r.status, "held"); assert.equal(r.failure?.code, code, JSON.stringify(r.failure)); assert.equal(r.failure?.phase, "prepare");
+    assert.equal(await w.snapshot(), before, "no journal, no write");
+  });
+}
+test("Wired negative C: the world changes after the journal (before any repair write) -> held at the existing safe point", async () => {
+  const w = await wiredFixture(), env = wiredEnv(w), identity = env.identity; let calls = 0;
+  env.identity = async () => { if (++calls === 2) await repairDb.bumpActiveVaultEpoch(await repairDb.getActiveVaultEpoch()); return identity(); };
+  const files = JSON.stringify([...w.vault.files]), canonical = JSON.stringify(await repairDb.getAllMemoryObjects()), journalBefore = await repairDb.readRecoveryJournalRaw();
+  const r = await narrow.executeNarrowMemoryRepair(env, w.confirmed);
+  assert.equal(r.failure?.code, "vault-world-epoch-not-committed"); assert.equal(r.failure?.phase, "post-journal");
+  assert.equal(r.status, "held"); assert.equal(JSON.stringify([...w.vault.files]), files, "Vault unchanged"); assert.equal(JSON.stringify(await repairDb.getAllMemoryObjects()), canonical, "canonical unchanged");
+  assert.notEqual(await repairDb.readRecoveryJournalRaw(), journalBefore); assert.equal(JSON.parse((await repairDb.readRecoveryJournalRaw())!).status, "in-progress");
+});
+test("Wired negative D: the archive-excluded view changed after confirmation -> stops before journal", async () => {
+  const w = await wiredFixture(); const c = (await repairDb.getMemoryObject("c-0"))!; await repairDb.putMemoryObject({ ...c, summary: "changed after archive" });
+  const before = await w.snapshot(), r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), w.confirmed);
+  assert.equal(r.failure?.code, "held-targets-differ-from-confirmed-plan"); assert.equal(await w.snapshot(), before);
+});
+test("Wired negative E: raw 5+5 broken (even with a matching confirmed view) -> stops before journal", async () => {
+  const w = await wiredFixture();
+  const key = vaultMod.dayFileRegistryKey("2026-09-24"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, file = `Memories/${vaultMod.dayFileNameFor("2026-09-24")}`;
+  const shard = readShard(w.vault.get(sp)!); shard.files[file].contentHash = vaultMod.hashVaultText(w.vault.get(file)!); w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  const confirmed = await w.confirmedNow(), before = await w.snapshot(), r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
+  assert.equal(r.failure?.code, "held-diagnostic-not-complete"); assert.equal(await w.snapshot(), before);
+});
+test("Wired negative F: read issues -> stops before journal", async () => {
+  const w = await wiredFixture(); w.vault.put("broken.md", "---\ntsumugi: true\n---\nno id, no recognizable section");
+  const confirmed = await w.confirmedNow(), before = await w.snapshot(), r = await narrow.executeNarrowMemoryRepair(wiredEnv(w), confirmed);
+  assert.equal(r.status, "held"); assert.equal(await w.snapshot(), before);
 });
