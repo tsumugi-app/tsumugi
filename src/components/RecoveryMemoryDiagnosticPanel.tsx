@@ -26,7 +26,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
     if (disabled || busy || repairRunning.current) return;
     repairRunning.current = true; setBusy(true);
     try { setRepair(await runExplicitMemoryRepair(root, plan)); }
-    catch { setRepair({ status: "held" }); }
+    catch { setRepair({ status: "held", failure: { phase: "start", code: "unexpected-error" } }); }
     finally { repairRunning.current = false; setBusy(false); }
   }
   const result = output?.plan === plan ? output.result : null;
@@ -40,6 +40,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
         {plan ? "検証済み10件を修復" : "限定修復を再検証して再開"}
       </button>
       {repair && <p>{repair.status === "complete" ? `修復後 held: ${repair.held} / issues: ${repair.issues}` : "修復を完了できませんでした。変更前後の記録を保持して保留しています。"}</p>}
+      {repair?.failure && <pre>{[`phase: ${repair.failure.phase}`, `code: ${repair.failure.code}`, repair.failure.recordType && `recordType: ${repair.failure.recordType}`, repair.failure.memoryId && `memoryId: ${repair.failure.memoryId}`, repair.failure.expected && `expected: ${repair.failure.expected}`, repair.failure.actual && `actual: ${repair.failure.actual}`].filter(Boolean).join("\n")}</pre>}
     </div>
     {busy && <p>確認・処理中…</p>}
     {result?.status === "mismatch" && <p>{MEMORY_DIAGNOSTIC_MISMATCH}</p>}

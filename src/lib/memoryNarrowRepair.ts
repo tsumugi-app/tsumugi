@@ -11,11 +11,32 @@ import { memoryDayFilePath } from "./vaultProjection";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 
 const eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-function insist(value: unknown): asserts value { if (!value) throw new Error("repair-precondition-changed"); }
+/** Diagnostic-only failure description. Closed vocabulary: codes, IDs, and classification values (never record content). */
+export type NarrowRepairFailureInfo = { phase: string; code: string; recordType?: string; memoryId?: string; expected?: string; actual?: string };
+type FailureDetail = { recordType?: string; memoryId?: string; expected?: string; actual?: string };
+export class NarrowRepairFailure extends Error {
+  constructor(public code: string, public detail: FailureDetail = {}) { super(code); }
+}
+function fail(code: string, detail: FailureDetail = {}): never { throw new NarrowRepairFailure(code, detail); }
+function check(value: unknown, code: string, detail: FailureDetail = {}): asserts value { if (!value) fail(code, detail); }
+function insist(value: unknown): asserts value { if (!value) throw new NarrowRepairFailure("repair-precondition-changed"); }
+const heldSummary = (p: RecoveryApplyPlan) => {
+  const counts = new Map<string, number>();
+  for (const h of p.held) { const k = `${h.recordType}/${h.reason}`; counts.set(k, (counts.get(k) ?? 0) + 1); }
+  return `held=${p.heldCount} issues=${p.plan.issues.length} scanCompleted=${p.plan.scanCompleted} ${[...counts].sort().map(([k, n]) => `${k}:${n}`).join(",")}`;
+};
+const relation = (value: string | undefined | null, before: string, after: string) =>
+  value === undefined || value === null ? "absent" : value === before ? "equals-before-updatedAt" : value === after ? "equals-after-updatedAt" : "other-value";
+/** Converts any thrown value into a safe diagnostic (error messages are used only when they are plain codes). */
+function describeFailure(error: unknown, phase: string): NarrowRepairFailureInfo {
+  if (error instanceof NarrowRepairFailure) return { phase, code: error.code, ...error.detail };
+  const message = error instanceof Error ? error.message : "";
+  return { phase, code: /^[a-z0-9-]{1,60}$/.test(message) ? message : "unexpected-error", actual: error instanceof Error ? error.name : typeof error };
+}
 type FileChange = { path: string; before: string; after: string; beforeHash: string; afterHash: string };
 type Payload = { version: 2; storage: MemoryRepairExpectation[]; storageTime: string; allowedFields: { registry: ["contentHash"]; canonical: ["links", "updatedAt"] }; identity: string; targets: string[]; immutable: { path: string; raw: string | null }[]; files: FileChange[]; markdown: { path: string; raw: string; mtime: number; size: number }[];
   changes: { before: MemoryObject; after: MemoryObject }[]; counterparts: MemoryObject[] };
-export type NarrowRepairResult = { status: "complete" | "held" | "unavailable"; held?: number; issues?: number };
+export type NarrowRepairResult = { status: "complete" | "held" | "unavailable"; held?: number; issues?: number; failure?: NarrowRepairFailureInfo };
 export interface NarrowRepairEnv {
   apply: RecoveryApplyEnv;
   identity(): Promise<string>;
@@ -34,20 +55,24 @@ function parseAll(raw: string): MemoryObject[] {
   return result;
 }
 export function validateLinkRestoration(before: MemoryObject, vault: MemoryObject, all: MemoryObject[]): MemoryObject[] {
-  insist(eq(memoryDifferenceFields(before, vault).sort(), ["links", "updatedAt"]));
+  const d = { recordType: "memory", memoryId: before.id };
+  const fields = memoryDifferenceFields(before, vault).sort();
+  check(eq(fields, ["links", "updatedAt"]), "link-differing-fields-not-only-links-updatedat", { ...d, expected: "links,updatedAt", actual: fields.join(",") || "none" });
   const diff = compareDiagnosticLinks(before.links, vault.links);
-  insist(diff.category === "vault-strict-superset");
+  check(diff.category === "vault-strict-superset", "link-not-vault-strict-superset", { ...d, expected: "vault-strict-superset", actual: diff.category });
   const a = Date.parse(before.updatedAt), b = Date.parse(vault.updatedAt);
-  insist(Number.isFinite(a) && Number.isFinite(b) && b > a);
+  check(Number.isFinite(a) && Number.isFinite(b), "link-updatedat-invalid", { ...d, expected: "valid timestamps", actual: `canonical:${Number.isFinite(a) ? "valid" : "invalid"} vault:${Number.isFinite(b) ? "valid" : "invalid"}` });
+  check(b > a, "link-vault-updatedat-not-newer", { ...d, expected: "vault updatedAt > canonical updatedAt", actual: b === a ? "equal" : "vault-older" });
   const counterparts: MemoryObject[] = [];
   for (const link of diff.exclusive) {
-    insist(Number.isFinite(Date.parse(link.createdAt)) && Date.parse(link.createdAt) <= b);
+    const created = Date.parse(link.createdAt);
+    check(Number.isFinite(created) && created <= b, "link-createdat-invalid-or-after-updatedat", { ...d, expected: "valid and <= vault updatedAt", actual: Number.isFinite(created) ? "later-than-vault-updatedAt" : "invalid" });
     const other = link.sourceId === before.id && link.targetId !== before.id ? link.targetId
       : link.targetId === before.id && link.sourceId !== before.id ? link.sourceId : null;
     const candidates = all.filter(m => m.id === other);
-    insist(candidates.length === 1);
+    check(candidates.length === 1, "link-counterpart-not-unique", { ...d, expected: "exactly 1 counterpart memory", actual: `${other === null ? "link-not-attached-to-memory" : candidates.length}` });
     const matches = candidates[0].links.filter(l => l.id === link.id);
-    insist(matches.length === 1 && eq(matches[0], link));
+    check(matches.length === 1 && eq(matches[0], link), "link-counterpart-link-differs", { ...d, expected: "counterpart has identical link", actual: matches.length === 0 ? "counterpart-has-no-matching-link" : matches.length > 1 ? "duplicate-link-ids" : "link-content-differs" });
     counterparts.push(candidates[0]);
   }
   return counterparts;
@@ -55,16 +80,19 @@ export function validateLinkRestoration(before: MemoryObject, vault: MemoryObjec
 
 async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Promise<{ plan: RecoveryApplyPlan; payload: Payload }> {
   const plan = await planRecoveryApply(env.apply);
-  insist(eq(plan.confirmed.world, confirmed.confirmed.world) && eq(targets(plan), targets(confirmed)));
-  insist(plan.ops.length === 0);
+  check(eq(plan.confirmed.world, confirmed.confirmed.world), "world-changed-since-confirmed-plan", { expected: "same world as the confirmed plan", actual: "world differs" });
+  check(eq(targets(plan), targets(confirmed)), "held-targets-differ-from-confirmed-plan", { expected: heldSummary(confirmed), actual: heldSummary(plan) });
+  check(plan.ops.length === 0, "plan-has-recoverable-ops", { expected: "0 ops", actual: `${plan.ops.length} ops` });
   const diagnostic = await inspectHeldMemories(plan, env.apply.root, env.apply.readLocalSnapshot, () => true);
-  insist(diagnostic.status === "complete" && diagnostic.registry.dayFileCount === 3);
+  check(diagnostic.status === "complete", "held-diagnostic-not-complete", { expected: "complete", actual: diagnostic.status });
+  check(diagnostic.registry.dayFileCount === 3, "registry-day-file-count-mismatch", { expected: "3 day-files", actual: `${diagnostic.registry.dayFileCount} day-files` });
   const payload: Payload = { version: 2, storage: [], storageTime: env.apply.now(), allowedFields: { registry: ["contentHash"], canonical: ["links", "updatedAt"] }, identity: await env.identity(), targets: targets(plan), immutable: [], files: [], markdown: [], changes: [], counterparts: [] };
   const shards = new Map<string, { before: string; value: { records: Record<string, string>; files: Record<string, Record<string, unknown>> } }>();
   const days = new Map<string, MemoryObject[]>();
   for (const held of plan.held) {
     const r = plan.plan.records.find(r => r.recordType === "memory" && r.recordId === held.recordId)!;
-    insist(r && r.vaultPaths.length === 1);
+    const target = { recordType: held.recordType, memoryId: held.recordId };
+    check(r && r.vaultPaths.length === 1, "recovery-vault-path-not-unique", { ...target, expected: "exactly 1 Vault path", actual: `${r ? r.vaultPaths.length : "no-plan-record"} paths` });
     const path = r.vaultPaths[0];
     if (!days.has(path)) {
       const file = await env.read(path);
@@ -72,46 +100,58 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
     }
     const vault = days.get(path)!.find(m => m.id === held.recordId);
     const before = plan.snapshot.memories.find(m => m.id === held.recordId);
-    insist(vault && before);
-    insist(path === memoryDayFilePath(before) && path === memoryDayFilePath(vault));
+    check(vault && before, "memory-missing-in-vault-or-canonical", { ...target, expected: "present in Vault day-file and canonical", actual: `${vault ? "vault:present" : "vault:missing"} ${before ? "canonical:present" : "canonical:missing"}` });
+    check(path === memoryDayFilePath(before), "actual-path-differs-from-normal-projection-path-canonical", { ...target, expected: memoryDayFilePath(before), actual: path });
+    check(path === memoryDayFilePath(vault), "actual-path-differs-from-normal-projection-path-vault", { ...target, expected: memoryDayFilePath(vault), actual: path });
     const registryPathOf = async (key: string) => {
       const shardRaw = (await env.read(`.tsumugi/registry/${vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`)).raw;
       return (JSON.parse(shardRaw) as { records?: Record<string, string> }).records?.[key];
     };
     // Registry must already point at the actual path (checked, never rewritten) for every target.
-    insist(r.registryKey && await registryPathOf(r.registryKey) === path);
+    const registryPath = r.registryKey ? await registryPathOf(r.registryKey) : undefined;
+    check(r.registryKey && registryPath === path, "registry-path-mismatch", { ...target, expected: path, actual: registryPath ?? "absent" });
     if (held.reason === "conflict") {
       payload.counterparts.push(...validateLinkRestoration(before, vault, plan.snapshot.memories));
       const after = { ...before, links: vault.links, updatedAt: vault.updatedAt };
-      insist(memoryObjectToMarkdown(after) === memoryObjectToMarkdown(vault));
+      check(memoryObjectToMarkdown(after) === memoryObjectToMarkdown(vault), "link-restored-memory-not-byte-equal-to-vault", { ...target, expected: "restored Markdown == Vault Markdown", actual: "differs" });
       payload.changes.push({ before, after });
-      payload.storage.push(memoryRepairExpectation(before, after, await env.readStorage(before.id), payload.storageTime));
+      const storage = await env.readStorage(before.id);
+      try { payload.storage.push(memoryRepairExpectation(before, after, storage, payload.storageTime)); }
+      catch (error) {
+        const code = error instanceof Error ? error.message : "repair-storage-invalid";
+        const ob = storage.outbox;
+        fail(code, { ...target, expected: code === "repair-ledger-changed" ? "ledger absent, or equals canonical before.updatedAt, or equals Vault updatedAt" : "outbox absent, or recordUpdatedAt equals before/after updatedAt",
+          actual: code === "repair-ledger-changed" ? `ledger ${relation(storage.ledger, before.updatedAt, after.updatedAt)}` : `outbox ${ob ? `${ob.status} recordUpdatedAt:${relation(ob.recordUpdatedAt, before.updatedAt, after.updatedAt)} idMatches:${ob.id === `memory:${before.id}`}` : "absent"}` });
+      }
     } else {
-      insist(recoveryRecordsSemanticEqual("memory", before, vault));
+      check(recoveryRecordsSemanticEqual("memory", before, vault), "registry-target-not-semantically-equivalent", { ...target, expected: "canonical == Vault member", actual: `differs in: ${memoryDifferenceFields(before, vault).join(",") || "unknown"}` });
       const shardPath = `.tsumugi/registry/${vaultRegistryBucketOf(r.registryKey).toString(16).padStart(2, "0")}.json`;
-      if (!shards.has(shardPath)) { const { raw } = await env.read(shardPath); const value = JSON.parse(raw); insist(serializeVaultRegistryShard(value) === raw); shards.set(shardPath, { before: raw, value }); }
+      if (!shards.has(shardPath)) { const { raw } = await env.read(shardPath); const value = JSON.parse(raw); check(serializeVaultRegistryShard(value) === raw, "registry-shard-not-in-canonical-format", { ...target, expected: "shard bytes == normal writer serialization", actual: "differs" }); shards.set(shardPath, { before: raw, value }); }
       const shard = shards.get(shardPath)!;
-      insist(shard.value.records[r.registryKey] === path);
+      check(shard.value.records[r.registryKey] === path, "registry-path-mismatch", { ...target, expected: path, actual: shard.value.records[r.registryKey] ?? "absent" });
       const entry = shard.value.files[path], file = payload.markdown.find(x => x.path === path)!;
       const members = days.get(path)!;
-      insist(entry && entry.status === "ok" && entry.recordType === "memory-day" && entry.mtime === file.mtime && entry.size === file.size);
-      insist(eq([...(entry.memberIds as string[])].sort(), members.map(m => m.id).sort()));
-      insist(eq(Object.keys(entry.memberHashes as object).sort(), members.map(m => m.id).sort()));
-      for (const m of members) insist((entry.memberHashes as Record<string, string>)[m.id] === hashVaultText(memoryObjectToMarkdown(m)));
+      check(entry, "registry-entry-missing", { ...target, expected: "entry for day-file path", actual: "absent" });
+      check(entry.status === "ok" && entry.recordType === "memory-day", "registry-entry-status-or-type", { ...target, expected: "status=ok recordType=memory-day", actual: `status=${String(entry.status)} recordType=${String(entry.recordType)}` });
+      check(entry.mtime === file.mtime && entry.size === file.size, "registry-entry-mtime-or-size-differs", { ...target, expected: "entry mtime/size == file", actual: `mtime:${entry.mtime === file.mtime ? "equal" : "differs"} size:${entry.size === file.size ? "equal" : "differs"}` });
+      check(eq([...(entry.memberIds as string[])].sort(), members.map(m => m.id).sort()), "registry-memberids-differ", { ...target, expected: `${members.length} members of the day-file`, actual: `${(entry.memberIds as string[]).length} memberIds` });
+      check(eq(Object.keys(entry.memberHashes as object).sort(), members.map(m => m.id).sort()), "registry-memberhashes-keys-differ", { ...target, expected: `${members.length} memberHashes keys`, actual: `${Object.keys(entry.memberHashes as object).length} keys` });
+      for (const m of members) check((entry.memberHashes as Record<string, string>)[m.id] === hashVaultText(memoryObjectToMarkdown(m)), "registry-memberhash-differs", { ...target, memoryId: m.id, expected: "hash of the member's Markdown", actual: "differs" });
       const rawHash = hashVaultText(file.raw);
       // Repeated held members in one day share one entry; validate against original.
       const original = JSON.parse(shard.before).files[path];
-      insist(original.contentHash !== rawHash && original.contentHash === hashVaultText(serializeMemoryDayFile(parseMemoryDayFile(file.raw).sort((a,b) => a.createdAt.localeCompare(b.createdAt)))));
+      const reserialized = hashVaultText(serializeMemoryDayFile(parseMemoryDayFile(file.raw).sort((a,b) => a.createdAt.localeCompare(b.createdAt))));
+      check(original.contentHash !== rawHash && original.contentHash === reserialized, "registry-contenthash-pattern-unexpected", { ...target, expected: "contentHash != raw hash and == re-serialized hash", actual: original.contentHash === rawHash ? "equals-raw-hash" : original.contentHash === reserialized ? "unexpected" : "equals-neither" });
       entry.contentHash = rawHash;
     }
   }
   for (const [path, s] of shards) payload.files.push({ path, before: s.before, after: serializeVaultRegistryShard(s.value), beforeHash: hashVaultText(s.before), afterHash: hashVaultText(serializeVaultRegistryShard(s.value)) });
-  insist(payload.changes.length === 5);
+  check(payload.changes.length === 5, "link-target-count-mismatch", { expected: "5 Link targets", actual: `${payload.changes.length}` });
   // Shared day-files are permitted only when every local differing member is one
   // of the validated Link restorations. Unknown members are preserved verbatim.
   for (const members of days.values()) for (const m of members) {
     const local = plan.snapshot.memories.find(x => x.id === m.id);
-    if (local) insist(recoveryRecordsSemanticEqual("memory", payload.changes.find(x => x.before.id === m.id)?.after ?? local, m));
+    if (local) check(recoveryRecordsSemanticEqual("memory", payload.changes.find(x => x.before.id === m.id)?.after ?? local, m), "dayfile-member-not-equivalent-to-canonical", { recordType: "memory", memoryId: m.id, expected: "canonical (or restored) == Vault member", actual: "differs" });
   }
   const protectedPaths = new Set([".tsumugi/registry-meta.json", ".tsumugi/registry-index.json", ".tsumugi/index.json", ".tsumugi/history-meta.json"]);
   for (const ms of days.values()) for (const m of ms) protectedPaths.add(`.tsumugi/history/${m.date.slice(0,7)}.json`);
@@ -180,20 +220,26 @@ async function verifyInputs(env: NarrowRepairEnv, journal: RecoveryJournal, p: P
 /** Internal runner requires exclusive world ownership; production wrapper below is the only UI entry. */
 export async function executeNarrowMemoryRepair(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan | null): Promise<NarrowRepairResult> {
   let journal: RecoveryJournal;
+  // Diagnostic only: names the stage that stopped the run (kept in the return value, never persisted).
+  let phase = "journal-read";
   try {
     const previous = await readRecoveryJournal(env.apply.store);
-    if (previous.kind === "unreadable") return { status: "held" };
+    if (previous.kind === "unreadable") return { status: "held", failure: { phase, code: "recovery-journal-unreadable" } };
     if (previous.kind === "journal" && previous.journal.status === "in-progress") {
-      insist(previous.journal.narrowMemoryRepair);
+      check(previous.journal.narrowMemoryRepair, "other-recovery-journal-in-progress", { expected: "narrow repair journal", actual: "in-progress journal without narrow repair" });
       journal = previous.journal;
+      phase = "resume";
     } else {
-      insist(confirmed);
+      check(confirmed, "no-confirmed-plan", { expected: "confirmed plan", actual: "none" });
+      phase = "prepare";
       const prepared = await prepare(env, confirmed);
+      phase = "journal-save";
       const now = env.apply.now();
       journal = { version: 1, operationId: env.apply.newId(), status: "in-progress", createdAt: now, updatedAt: now,
         world: prepared.plan.confirmed.world, baselineAtStart: { status: prepared.plan.plan.baseline.status, value: null }, managedBefore: {},
         ops: [], held: [], result: null, unresolvedMetadata: false, narrowMemoryRepair: prepared.payload };
       await saveRecoveryJournal(env.apply.store, journal);
+      phase = "post-journal";
     }
     // Runtime validation below also prevents malformed payloads from reaching writes.
     const p = journal.narrowMemoryRepair as Payload;
@@ -227,11 +273,11 @@ export async function executeNarrowMemoryRepair(env: NarrowRepairEnv, confirmed:
     journal.result = { recovered: 10, held: 0, failed: 0 };
     await saveRecoveryJournal(env.apply.store, journal);
     return { status: "complete", held: 0, issues: 0 };
-  } catch { return { status: "held" }; }
+  } catch (error) { return { status: "held", failure: describeFailure(error, phase) }; }
 }
 
 export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, confirmed: RecoveryApplyPlan | null): Promise<NarrowRepairResult> {
-  if (typeof window === "undefined" || new URLSearchParams(window.location.search).get("debugLog") !== "1") return { status: "unavailable" };
+  if (typeof window === "undefined" || new URLSearchParams(window.location.search).get("debugLog") !== "1") return { status: "unavailable", failure: { phase: "start", code: "debug-log-not-enabled" } };
   const locked = await runVaultWorldExclusive(async () => {
     const read = async (path: string) => {
       const parts = path.split("/"); insist(parts.every(p => p && p !== "." && p !== ".." && !p.includes("\\")));
@@ -241,7 +287,7 @@ export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, c
       return { raw: await file.text(), mtime: file.lastModified, size: file.size };
     };
     return executeNarrowMemoryRepair({ apply: createRecoveryApplyEnv(root), read, commit: commitMemoryLinkRestoration, readStorage: readMemoryRepairStorage,
-      identity: async () => { const id = await getVaultIdentityRecord(); const disk = JSON.parse((await read(".tsumugi/vault-identity.json")).raw); insist(id?.vaultId && disk.vaultId === id.vaultId && id.activeVaultEpoch === (await createRecoveryApplyEnv(root).readWorld()).activeVaultEpoch); return id.vaultId; },
+      identity: async () => { const id = await getVaultIdentityRecord(); const disk = JSON.parse((await read(".tsumugi/vault-identity.json")).raw); check(id?.vaultId, "vault-identity-unpaired", { expected: "paired vaultId in IndexedDB", actual: "absent" }); check(disk.vaultId === id.vaultId, "vault-identity-mismatch", { expected: "IndexedDB vaultId == vault-identity.json", actual: "differs" }); check(id.activeVaultEpoch === (await createRecoveryApplyEnv(root).readWorld()).activeVaultEpoch, "vault-identity-epoch-mismatch", { expected: "identity epoch == active epoch", actual: "differs" }); return id.vaultId; },
       write: (path, raw) => runRecoveryVaultWrite(async () => {
         insist(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(path));
         const dir = await (await root.getDirectoryHandle(".tsumugi", { create: false })).getDirectoryHandle("registry", { create: false });
@@ -249,5 +295,5 @@ export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, c
       }),
     }, confirmed);
   });
-  return locked.timedOut ? { status: "unavailable" } : locked.result ?? { status: "unavailable" };
+  return locked.timedOut ? { status: "unavailable", failure: { phase: "start", code: "world-lock-timed-out" } } : locked.result ?? { status: "unavailable", failure: { phase: "start", code: "no-result" } };
 }

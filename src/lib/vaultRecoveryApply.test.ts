@@ -1713,12 +1713,12 @@ test("M3d: single-member（Reflection）の従来のsafe repairは、multi-membe
 // Explicit narrow repair uses the actual production Plan/parser/verifiers above.
 const repairDb = require("./db") as typeof import("./db");
 const narrow = require("./memoryNarrowRepair") as typeof import("./memoryNarrowRepair");
-async function narrowFixture() {
+async function narrowFixture(registryDays = 3) {
   const db = new FakeDb(), vault = new FakeVault();
   const next = "2026-09-21T09:00:00.000Z";
   for (let i = 0; i < 5; i++) {
     const link: import("./types").Link = { id: `link-${i}`, sourceId: `c-${i}`, targetId: `p-${i}`, axis: "theme", reason: "reason", strength: 0.8, contrast: false, createdBy: "ai-inference", createdAt: next };
-    db.memories.set(`r-${i}`, memory(`r-${i}`, { date: `2026-09-${22 + i % 3}T09:00:00.000Z` }));
+    db.memories.set(`r-${i}`, memory(`r-${i}`, { date: `2026-09-${22 + i % registryDays}T09:00:00.000Z` }));
     db.memories.set(`c-${i}`, memory(`c-${i}`, { links: [link], updatedAt: next }));
     db.memories.set(`p-${i}`, memory(`p-${i}`, { date: "2026-09-25T09:00:00.000Z", links: [link], updatedAt: next }));
   }
@@ -1739,7 +1739,7 @@ async function narrowFixture() {
   }
   vault.put(hp,JSON.stringify(history));
   for (let i = 0; i < 5; i++) db.memories.set(`c-${i}`, { ...db.memories.get(`c-${i}`)!, links: [], updatedAt: T });
-  for (let day = 22; day <= 24; day++) {
+  for (let day = 22; day < 22 + registryDays; day++) {
     const date = `2026-09-${day}`, file = `Memories/${vaultMod.dayFileNameFor(date)}`;
     vault.put(file, vault.get(file)! + "\n\n");
     const key = vaultMod.dayFileRegistryKey(date), bucket = vaultMod.vaultRegistryBucketOf(key);
@@ -1899,8 +1899,8 @@ test("Narrow rechecks raw files after journal read-back before any repair write"
 });
 
 
-async function productionNarrowFixture() {
-  const f = await narrowFixture();
+async function productionNarrowFixture(registryDays = 3) {
+  const f = await narrowFixture(registryDays);
   await repairDb.clearMemoryData();
   for (const entry of [...await repairDb.getPendingVaultOutboxEntries(), ...await repairDb.getDoneVaultOutboxEntries()]) await repairDb.deleteVaultOutboxEntry(entry.id);
   for (const m of f.db.memories.values()) await repairDb.putMemoryObject(m);
@@ -2087,4 +2087,66 @@ test("M1-registry: an actually inconsistent Registry path for a Link target is a
   const files = JSON.stringify([...f.vault.files]), local = await f.env.apply.readLocalSnapshot();
   assert.equal((await narrow.executeNarrowMemoryRepair(f.env, await applyMod.planRecoveryApply(f.env.apply))).status, "held");
   assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files); assert.deepEqual(await f.env.apply.readLocalSnapshot(), local);
+});
+
+// ---------------------------------------------------------------------------
+// Diagnostics: a stop before the journal reports exactly which guard stopped it (return value only).
+// ---------------------------------------------------------------------------
+async function expectStopsWith(f: Awaited<ReturnType<typeof productionNarrowFixture>>, code: string, memoryId?: string, plan = f.plan) {
+  const files = JSON.stringify([...f.vault.files]), local = await f.env.apply.readLocalSnapshot();
+  const storage = await Promise.all([0,1,2,3,4].map(i => repairDb.readMemoryRepairStorage(`c-${i}`)));
+  const result = await narrow.executeNarrowMemoryRepair(f.env, plan);
+  assert.equal(result.status, "held"); assert.equal(result.failure?.code, code, JSON.stringify(result.failure));
+  assert.equal(result.failure?.phase, "prepare"); if (memoryId) assert.equal(result.failure?.memoryId, memoryId);
+  assert.ok(result.failure?.expected !== undefined && result.failure?.actual !== undefined, "expected/actual are reported");
+  assert.equal(f.db.journal, undefined, "no journal"); assert.equal(JSON.stringify([...f.vault.files]), files, "Vault (Registry/Markdown) unchanged");
+  assert.deepEqual(await f.env.apply.readLocalSnapshot(), local, "canonical unchanged");
+  assert.deepEqual(await Promise.all([0,1,2,3,4].map(i => repairDb.readMemoryRepairStorage(`c-${i}`))), storage, "Outbox and ledger unchanged");
+  return result;
+}
+test("Diagnostics: storage (ledger) mismatch", async () => {
+  const f = await productionNarrowFixture(); await repairDb.setVaultSyncState("memory:c-0", "2030-01-01");
+  const r = await expectStopsWith(f, "repair-ledger-changed", "c-0"); assert.match(r.failure!.actual!, /ledger other-value/);
+});
+test("Diagnostics: storage (outbox) mismatch", async () => {
+  const f = await productionNarrowFixture(); const e = (await repairDb.getVaultOutboxEntry("memory:c-0"))!; await repairDb.putVaultOutboxEntry({ ...e, recordUpdatedAt: "2030-01-01" });
+  const r = await expectStopsWith(f, "repair-outbox-changed", "c-0"); assert.match(r.failure!.actual!, /recordUpdatedAt:other-value/);
+});
+test("Diagnostics: Registry path mismatch", async () => {
+  const f = await productionNarrowFixture(); const m = (await repairDb.getMemoryObject("c-0"))!, key = vaultMod.dayFileRegistryKey(m.date.slice(0, 10));
+  const sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, read = f.env.read;
+  f.env.read = async p => { const r = await read(p); if (p !== sp) return r; const shard = readShard(r.raw); shard.records[key] = "Memories/elsewhere.md"; return { ...r, raw: vaultMod.serializeVaultRegistryShard(shard) }; };
+  const r = await expectStopsWith(f, "registry-path-mismatch", "c-0"); assert.equal(r.failure!.actual, "Memories/elsewhere.md");
+});
+test("Diagnostics: actual path differs from the normal projection path", async () => {
+  const f = await productionNarrowFixture(); for (let i = 0; i < 5; i++) await repairDb.deleteVaultOutboxEntry(`memory:c-${i}`);
+  const m = (await repairDb.getMemoryObject("c-0"))!, old = projection.memoryDayFilePath(m), moved = "Memories/relocated.md";
+  f.vault.files.set(moved, f.vault.files.get(old)!); f.vault.files.delete(old);
+  for (const [p, file] of [...f.vault.files]) if (p.startsWith(".tsumugi/") && file.content.includes(old)) f.vault.put(p, file.content.split(old).join(moved));
+  f.plan = await applyMod.planRecoveryApply(f.env.apply);
+  const r = await expectStopsWith(f, "actual-path-differs-from-normal-projection-path-canonical"); assert.equal(r.failure!.expected, old); assert.equal(r.failure!.actual, moved);
+});
+test("Diagnostics: timestamp validation failure", async () => {
+  const f = await productionNarrowFixture(); const m = (await repairDb.getMemoryObject("c-0"))!;
+  await repairDb.putMemoryObject({ ...m, updatedAt: "2030-01-01T00:00:00.000Z" });
+  f.plan = await applyMod.planRecoveryApply(f.env.apply);
+  await expectStopsWith(f, "link-vault-updatedat-not-newer", "c-0");
+});
+test("Diagnostics: registry day-file count mismatch", async () => {
+  const f = await productionNarrowFixture(2); assert.equal(f.plan.heldCount, 10);
+  const r = await expectStopsWith(f, "registry-day-file-count-mismatch"); assert.equal(r.failure!.expected, "3 day-files"); assert.equal(r.failure!.actual, "2 day-files");
+});
+test("Diagnostics: plan changed since the confirmed plan reports both held summaries", async () => {
+  const f = await productionNarrowFixture(); const stale = clone(f.plan); stale.held = stale.held.filter(h => h.reason === "conflict"); stale.heldCount = 5;
+  const r = await expectStopsWith(f, "held-targets-differ-from-confirmed-plan", undefined, stale);
+  assert.match(r.failure!.expected!, /held=5/); assert.match(r.failure!.actual!, /held=10/); assert.match(r.failure!.actual!, /registry-entry-differs:5/);
+});
+test("Diagnostics: no confirmed plan, and failure details never include record content", async () => {
+  const f = await productionNarrowFixture(); const r = await narrow.executeNarrowMemoryRepair(f.env, null);
+  assert.equal(r.failure?.code, "no-confirmed-plan"); assert.equal(f.db.journal, undefined);
+  assert.ok(!JSON.stringify(r).includes("内容"));
+});
+test("Diagnostics: success path is unchanged and reports no failure", async () => {
+  const f = await productionNarrowFixture(); const r = await narrow.executeNarrowMemoryRepair(f.env, f.plan);
+  assert.deepEqual(r, { status: "complete", held: 0, issues: 0 });
 });
