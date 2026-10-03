@@ -15,6 +15,14 @@ const origResolve = (Module as unknown as { _resolveFilename: (request: string, 
   return origResolve.call(this, request.startsWith("@/") ? path.join(OUT, request.slice(2)) : request, ...rest);
 };
 
+// Exercise real db.ts transactions in the narrow repair integration fixtures.
+const loader = Module as unknown as { _load: (request: string, parent?: unknown, main?: boolean) => unknown };
+const previousLoad = loader._load;
+loader._load = function(request, parent, main) {
+  if (request === "idb") return require("./fakeIdb");
+  return previousLoad.call(this, request, parent, main);
+};
+
 type Conversation = import("./types").Conversation;
 type MemoryObject = import("./types").MemoryObject;
 type Source = import("./types").Source;
@@ -1046,7 +1054,7 @@ test("R: 未完了journalがある間、通常のflushPendingToVault相当のwri
   await db.journalStore().write(JSON.stringify(journal));
   const blocked = await journalMod.isRecoveryBlockingNormalWrites(db.journalStore(), async () => db.activeVaultEpoch);
   assert.equal(blocked, true);
-  await assert.rejects(journalMod.assertNoPendingRecovery(), journalMod.VaultRecoveryPendingError);
+  await assert.rejects(journalMod.assertNoPendingRecovery(db.journalStore(), async () => db.activeVaultEpoch), journalMod.VaultRecoveryPendingError);
 });
 
 test("R2: Recovery自身の書き込み（runRecoveryVaultWrite経由）は、未完了journach中でも通常どおり進む", async () => {
@@ -1703,6 +1711,7 @@ test("M3d: single-member（Reflection）の従来のsafe repairは、multi-membe
 });
 
 // Explicit narrow repair uses the actual production Plan/parser/verifiers above.
+const repairDb = require("./db") as typeof import("./db");
 const narrow = require("./memoryNarrowRepair") as typeof import("./memoryNarrowRepair");
 async function narrowFixture() {
   const db = new FakeDb(), vault = new FakeVault();
@@ -1741,21 +1750,25 @@ async function narrowFixture() {
   const apply = makeEnv(db, vault);
   const plan = await applyMod.planRecoveryApply(apply);
   assert.equal(plan.heldCount, 10, JSON.stringify(plan.held)); assert.equal(plan.plan.issues.length, 0);
+  const outboxes = new Map<string, import("./vaultOutbox").VaultOutboxEntry>();
   const env: import("./memoryNarrowRepair").NarrowRepairEnv = { apply,
+    readStorage: async id => ({ outbox: outboxes.get(id) ?? null, ledger: db.ledger.get(`memory:${id}`) ?? null }),
     identity: async () => "fixture-identity",
     read: async p => { const f = vault.files.get(p); if (!f) throw new DOMException("absent", "NotFoundError"); return { raw: f.content, size: f.content.length, mtime: f.mtime }; },
     write: async (p, text) => { vault.put(p, text); },
-    commit: async (changes, counterparts, _now, finalize) => {
+    commit: async (changes, counterparts, _now, finalize, expectations) => {
       for (const c of counterparts) assert.deepEqual(db.memories.get(c.id), c);
       for (const c of changes) {
         const current = db.memories.get(c.before.id);
         assert.ok(JSON.stringify(current) === JSON.stringify(c.before) || JSON.stringify(current) === JSON.stringify(c.after));
         db.memories.set(c.before.id, clone(c.after));
+        const expected = expectations.find(e => e.id === c.before.id)!;
+        outboxes.set(c.before.id, clone((finalize ? expected.after : expected.intermediate).outbox!));
         if (finalize) db.ledger.set(`memory:${c.after.id}`, c.after.updatedAt);
       }
     },
   };
-  return { db, vault, env, plan };
+  return { db, vault, env, plan, outboxes };
 }
 test("Narrow: explicit 3 day / 5 Link repair, only permitted fields, held=0", async () => {
   const f = await narrowFixture();
@@ -1883,4 +1896,111 @@ test("Narrow rechecks raw files after journal read-back before any repair write"
   const local = JSON.stringify(f.db.snapshot());
   assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
   assert.equal(writes,0); assert.equal(JSON.stringify(f.db.snapshot()),local);
+});
+
+
+async function productionNarrowFixture() {
+  const f = await narrowFixture();
+  await repairDb.clearMemoryData();
+  for (const entry of [...await repairDb.getPendingVaultOutboxEntries(), ...await repairDb.getDoneVaultOutboxEntries()]) await repairDb.deleteVaultOutboxEntry(entry.id);
+  for (const m of f.db.memories.values()) await repairDb.putMemoryObject(m);
+  for (const [key,value] of f.db.ledger) await repairDb.setVaultSyncState(key,value);
+  for (let i=0;i<5;i++) {
+    const m=f.db.memories.get(`c-${i}`)!;
+    await repairDb.setVaultSyncState(`memory:${m.id}`,m.updatedAt);
+    await repairDb.putMemoryObjectWithOutbox(m,"memory",T);
+  }
+  f.env.apply.readLocalSnapshot = async () => {
+    const memories = await repairDb.getAllMemoryObjects();
+    const sync: Record<string,string> = {};
+    for (const m of memories) { const value=await repairDb.getVaultSyncState(`memory:${m.id}`); if(value!==undefined) sync[`memory:${m.id}`]=value; }
+    return { conversations:[],sources:[],memories,sync };
+  };
+  f.env.apply.readRecord = async (_type,id) => repairDb.getMemoryObject(id);
+  f.env.apply.readLedger = repairDb.getVaultSyncState;
+  f.env.readStorage = repairDb.readMemoryRepairStorage;
+  f.env.commit = repairDb.commitMemoryLinkRestoration;
+  f.plan = await applyMod.planRecoveryApply(f.env.apply);
+  const identity: import("./vaultIdentity").VaultIdentityRecord = {id:"current",vaultId:"fixture-identity",activeVaultEpoch:0,registryGeneration:"gen",pairedAt:T,pendingCandidateVaultId:null,updatedAt:T};
+  f.vault.put(".tsumugi/vault-identity.json",JSON.stringify({vaultId:identity.vaultId,createdAt:T}));
+  return {...f, projectionEnv:{root:f.vault.root(),vaultIdentity:identity,now:()=>T}};
+}
+const projection = require("./vaultProjection") as typeof import("./vaultProjection");
+test("H1/H2 integration: real canonical/outbox/ledger transactions, 10 held -> repair -> done startup -> 0 held; no Markdown writes",async()=>{
+  const f=await productionNarrowFixture();
+  assert.equal(f.plan.heldCount,10);
+  const markdown=new Map([...f.vault.files].filter(([p])=>p.startsWith("Memories/")).map(([p,v])=>[p,v.content]));
+  for(const p of markdown.keys()) f.vault.writeShouldFail.add(p);
+  assert.deepEqual(await narrow.executeNarrowMemoryRepair(f.env,f.plan),{status:"complete",held:0,issues:0});
+  for(let i=0;i<5;i++) {
+    const m=(await repairDb.getMemoryObject(`c-${i}`))!, state=await repairDb.readMemoryRepairStorage(m.id);
+    assert.equal(state.ledger,m.updatedAt); assert.equal(state.outbox!.recordUpdatedAt,m.updatedAt); assert.equal(state.outbox!.status,"done");
+  }
+  const result=await projection.reconcileDoneVaultOutboxIntegrity(f.projectionEnv);
+  assert.equal(result.processed,5);
+  for(const e of await repairDb.getDoneVaultOutboxEntries()) assert.equal(e.status,"done");
+  const final=await applyMod.planRecoveryApply(f.env.apply);
+  assert.equal(final.heldCount,0,JSON.stringify(final.held)); assert.equal(final.plan.issues.length,0); assert.equal(final.ops.length,0);
+  assert.deepEqual(new Map([...f.vault.files].filter(([p])=>p.startsWith("Memories/")).map(([p,v])=>[p,v.content])),markdown);
+});
+test("H1 real transaction intermediate resumes; finalize ledger failure rolls back Outbox done",async()=>{
+  const f=await productionNarrowFixture(), commit=f.env.commit;
+  let once=true;
+  f.env.commit=async(...args)=>{await commit(...args);if(once&&!args[3]) {once=false;throw new Error("page kill after canonical");}};
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  const mid=await repairDb.readMemoryRepairStorage("c-0");
+  assert.equal(mid.ledger,T); assert.equal(mid.outbox!.status,"pending");
+  const fake=require("./fakeIdb") as typeof import("./fakeIdb");
+  // Fail the ledger write of the FINALIZE transaction only (the preceding canonical/outbox step must still run).
+  f.env.commit=async(...args)=>{ if(args[3]) fake.__failNextPutOn("tsumugi","vaultSyncState"); return commit(...args); };
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,null)).status,"held");
+  assert.deepEqual(await repairDb.readMemoryRepairStorage("c-0"),mid);
+  assert.equal(JSON.parse(f.db.journal!).status,"in-progress");
+  f.env.commit=commit;
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,null)).status,"complete");
+});
+for(const invalid of ["ledger","outbox"] as const) test(`H1 rejects unrelated ${invalid} BEFORE journal/Registry/canonical writes`,async()=>{
+  const f=await productionNarrowFixture();
+  if(invalid==="ledger") await repairDb.setVaultSyncState("memory:c-0","2030-01-01");
+  else {const e=(await repairDb.getVaultOutboxEntry("memory:c-0"))!;await repairDb.putVaultOutboxEntry({...e,recordUpdatedAt:"2030-01-01"});}
+  const files=JSON.stringify([...f.vault.files]),snapshot=await f.env.apply.readLocalSnapshot(),state=await repairDb.readMemoryRepairStorage("c-0");
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  assert.equal(f.db.journal,undefined);assert.equal(JSON.stringify([...f.vault.files]),files);
+  assert.deepEqual(await f.env.apply.readLocalSnapshot(),snapshot);assert.deepEqual(await repairDb.readMemoryRepairStorage("c-0"),state);
+});
+test("H1 rejects neither storage state on resume without changing data",async()=>{
+  const f=await productionNarrowFixture(),commit=f.env.commit;
+  f.env.commit=async(...a)=>{await commit(...a);throw new Error("stop");};
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  await repairDb.setVaultSyncState("memory:c-0","2030-01-01");
+  f.env.commit=commit;const before=await f.env.apply.readLocalSnapshot();
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,null)).status,"held");
+  assert.deepEqual(await f.env.apply.readLocalSnapshot(),before);
+  assert.equal(JSON.parse(f.db.journal!).status,"in-progress");
+});
+test("H2 relocated day-file stops before write; creates no repair done Outbox for startup",async()=>{
+  const f=await productionNarrowFixture();
+  // This legacy state has no Outbox yet. Repair must not introduce a done task
+  // that would direct startup to a second path.
+  for(let i=0;i<5;i++)await repairDb.deleteVaultOutboxEntry(`memory:c-${i}`);
+  const m=(await repairDb.getMemoryObject("c-0"))!,old=projection.memoryDayFilePath(m),moved="Memories/relocated.md";
+  f.vault.files.set(moved,f.vault.files.get(old)!);f.vault.files.delete(old);
+  for(const [p,file] of [...f.vault.files]) if(p.startsWith(".tsumugi/")&&file.content.includes(old)) f.vault.put(p,file.content.split(old).join(moved));
+  f.plan=await applyMod.planRecoveryApply(f.env.apply);assert.equal(f.plan.heldCount,10);assert.equal(f.plan.plan.issues.length,0);
+  const files=JSON.stringify([...f.vault.files]),local=await f.env.apply.readLocalSnapshot();
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env,f.plan)).status,"held");
+  assert.equal(f.db.journal,undefined);assert.equal(JSON.stringify([...f.vault.files]),files);assert.deepEqual(await f.env.apply.readLocalSnapshot(),local);
+  assert.equal((await projection.reconcileDoneVaultOutboxIntegrity(f.projectionEnv)).processed,0);
+  assert.equal(f.vault.get(old),undefined);assert.equal(JSON.stringify([...f.vault.files]),files);
+});
+
+test("H2: Recoveryが使うexpected pathと通常projectionのpathは同じhelper（memoryDayFilePath）から得る",()=>{
+  const fs=require("node:fs") as typeof import("node:fs");
+  const strip=(t:string)=>t.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm,"");
+  const repair=strip(fs.readFileSync("src/lib/memoryNarrowRepair.ts","utf8")), proj=strip(fs.readFileSync("src/lib/vaultProjection.ts","utf8"));
+  assert.ok(/import \{ memoryDayFilePath \} from "\.\/vaultProjection"/.test(repair));
+  assert.ok(!repair.includes("dayFileNameFor(")&&!repair.includes("`Memories/"),"Recovery側にpathルールをコピーしていない");
+  assert.ok(proj.includes("const path = memoryDayFilePath(canonical);"),"通常projectionの書き込みpathも同じhelper");
+  const m=memory("h2-helper");
+  assert.equal(projection.memoryDayFilePath(m),`Memories/${vaultMod.dayFileNameFor(m.date)}`);
 });

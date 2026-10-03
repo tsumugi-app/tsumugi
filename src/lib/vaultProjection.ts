@@ -19,7 +19,7 @@
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
-import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, putVaultOutboxEntry } from "./db";
+import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, putVaultOutboxEntry, putMemoryProjectionOutcome } from "./db";
 import { conversationEntryTypeOf } from "./conversationEntryKind";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
@@ -304,7 +304,8 @@ function emptySteps(): Record<ProjectionStepName, ProjectionStepState> {
 
 async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionStepName, ProjectionStepState>, status: "done" | "pending" | "held", reason: string | null, now: string): Promise<void> {
   const attempt = status === "done" ? entry.attempt : { count: entry.attempt.count + 1, lastError: reason, lastAttemptAt: now };
-  await putVaultOutboxEntry({ ...entry, steps, status, heldReason: status === "held" ? reason : null, attempt, updatedAt: now });
+  const persist = entry.recordType === "memory" || entry.recordType === "reflection" ? putMemoryProjectionOutcome : putVaultOutboxEntry;
+  await persist({ ...entry, steps, status, heldReason: status === "held" ? reason : null, attempt, updatedAt: now });
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +497,7 @@ export function isMemoryLegitimateSuccessor(onDisk: MemoryObject, canonical: Mem
 // req 2〜4：member単位の判定とsafe merge
 // ---------------------------------------------------------------------------
 
-const memoryDayFilePath = (m: MemoryObject) => `Memories/${dayFileNameFor(m.date)}`;
+export const memoryDayFilePath = (m: MemoryObject) => `Memories/${dayFileNameFor(m.date)}`;
 
 export type MemoryMemberVerdictKind = "create" | "append" | "no-op" | "update";
 

@@ -1419,8 +1419,9 @@ test("Restored Vault Link version survives done outbox startup reconciliation wi
   const entry = await seedMemoryCanonical(after);
   assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault),entry)).status,"done");
   await dbMod.putMemoryObject(before); await dbMod.putMemoryObject(other);
-  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,false);
-  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,true);
+  const expected = [dbMod.memoryRepairExpectation(before,after,await dbMod.readMemoryRepairStorage(before.id),T)];
+  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,false,expected);
+  await dbMod.commitMemoryLinkRestoration([{before,after}],[other],T,true,expected);
   const path = memoryDayPath(day), raw = vault.get(path); vault.writeShouldFail.add(path);
   const done = (await dbMod.getVaultOutboxEntry(entry.id))!;
   assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault),done)).status,"done");

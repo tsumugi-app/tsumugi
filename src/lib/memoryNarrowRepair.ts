@@ -6,13 +6,14 @@ import { parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual } from "./vau
 import { parseMemoryDayFile, serializeMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
 import { hashVaultText, vaultRegistryBucketOf, vaultRecoveryPrimitives, runRecoveryVaultWrite } from "./vault";
 import { readRecoveryJournal, saveRecoveryJournal, type RecoveryJournal } from "./vaultRecoveryJournal";
-import { commitMemoryLinkRestoration, getVaultIdentityRecord } from "./db";
+import { commitMemoryLinkRestoration, getVaultIdentityRecord, readMemoryRepairStorage, memoryRepairExpectation, type MemoryRepairExpectation } from "./db";
+import { memoryDayFilePath } from "./vaultProjection";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 
 const eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 function insist(value: unknown): asserts value { if (!value) throw new Error("repair-precondition-changed"); }
 type FileChange = { path: string; before: string; after: string; beforeHash: string; afterHash: string };
-type Payload = { version: 1; allowedFields: { registry: ["contentHash"]; canonical: ["links", "updatedAt"] }; identity: string; targets: string[]; immutable: { path: string; raw: string | null }[]; files: FileChange[]; markdown: { path: string; raw: string; mtime: number; size: number }[];
+type Payload = { version: 2; storage: MemoryRepairExpectation[]; storageTime: string; allowedFields: { registry: ["contentHash"]; canonical: ["links", "updatedAt"] }; identity: string; targets: string[]; immutable: { path: string; raw: string | null }[]; files: FileChange[]; markdown: { path: string; raw: string; mtime: number; size: number }[];
   changes: { before: MemoryObject; after: MemoryObject }[]; counterparts: MemoryObject[] };
 export type NarrowRepairResult = { status: "complete" | "held" | "unavailable"; held?: number; issues?: number };
 export interface NarrowRepairEnv {
@@ -21,6 +22,7 @@ export interface NarrowRepairEnv {
   read(path: string): Promise<{ raw: string; mtime: number; size: number }>;
   write(path: string, raw: string): Promise<void>;
   commit: typeof commitMemoryLinkRestoration;
+  readStorage: typeof readMemoryRepairStorage;
 }
 const targets = (p: RecoveryApplyPlan) => p.held.map(h => JSON.stringify([h.recordType, h.recordId, h.reason])).sort();
 function parseAll(raw: string): MemoryObject[] {
@@ -57,7 +59,7 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
   insist(plan.ops.length === 0);
   const diagnostic = await inspectHeldMemories(plan, env.apply.root, env.apply.readLocalSnapshot, () => true);
   insist(diagnostic.status === "complete" && diagnostic.registry.dayFileCount === 3);
-  const payload: Payload = { version: 1, allowedFields: { registry: ["contentHash"], canonical: ["links", "updatedAt"] }, identity: await env.identity(), targets: targets(plan), immutable: [], files: [], markdown: [], changes: [], counterparts: [] };
+  const payload: Payload = { version: 2, storage: [], storageTime: env.apply.now(), allowedFields: { registry: ["contentHash"], canonical: ["links", "updatedAt"] }, identity: await env.identity(), targets: targets(plan), immutable: [], files: [], markdown: [], changes: [], counterparts: [] };
   const shards = new Map<string, { before: string; value: { records: Record<string, string>; files: Record<string, Record<string, unknown>> } }>();
   const days = new Map<string, MemoryObject[]>();
   for (const held of plan.held) {
@@ -71,11 +73,13 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
     const vault = days.get(path)!.find(m => m.id === held.recordId);
     const before = plan.snapshot.memories.find(m => m.id === held.recordId);
     insist(vault && before);
+    insist(path === memoryDayFilePath(before) && path === memoryDayFilePath(vault));
     if (held.reason === "conflict") {
       payload.counterparts.push(...validateLinkRestoration(before, vault, plan.snapshot.memories));
       const after = { ...before, links: vault.links, updatedAt: vault.updatedAt };
       insist(memoryObjectToMarkdown(after) === memoryObjectToMarkdown(vault));
       payload.changes.push({ before, after });
+      payload.storage.push(memoryRepairExpectation(before, after, await env.readStorage(before.id), payload.storageTime));
     } else {
       insist(recoveryRecordsSemanticEqual("memory", before, vault));
       const shardPath = `.tsumugi/registry/${vaultRegistryBucketOf(r.registryKey).toString(16).padStart(2, "0")}.json`;
@@ -115,9 +119,10 @@ async function readOptional(env: NarrowRepairEnv, path: string): Promise<string 
 }
 function validatePayload(p: Payload) {
   insist(eq(p.allowedFields, { registry: ["contentHash"], canonical: ["links", "updatedAt"] }));
-  insist(p.version === 1 && p.changes.length === 5 && new Set(p.changes.map(c => c.before.id)).size === 5);
+  insist(p.version === 2 && p.changes.length === 5 && new Set(p.changes.map(c => c.before.id)).size === 5);
   insist(new Set(p.files.map(f => f.path)).size === p.files.length);
   insist(new Set(p.markdown.map(f => f.path)).size === p.markdown.length);
+  insist(p.storage.length === p.changes.length);
   let changed = 0;
   for (const f of p.files) {
     insist(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(f.path));
@@ -132,6 +137,9 @@ function validatePayload(p: Payload) {
   insist(changed === 3);
   const vault = p.markdown.flatMap(m => parseAll(m.raw));
   for (const c of p.changes) {
+    const storage = p.storage.find(e => e.id === c.before.id);
+    insist(storage && eq(storage, memoryRepairExpectation(c.before, c.after, storage.before, p.storageTime)));
+    insist(p.markdown.some(m => m.path === memoryDayFilePath(c.after) && parseAll(m.raw).some(v => v.id === c.after.id)));
     insist(eq({ ...c.before, links: c.after.links, updatedAt: c.after.updatedAt }, c.after));
     const matches = vault.filter(m => m.id === c.before.id);
     insist(matches.length === 1 && recoveryRecordsSemanticEqual("memory",c.after,matches[0]));
@@ -146,11 +154,18 @@ async function verifyInputs(env: NarrowRepairEnv, journal: RecoveryJournal, p: P
   for (const f of p.immutable) insist(await readOptional(env,f.path) === f.raw);
   const currentPlan = await planRecoveryApply(env.apply);
   insist(currentPlan.plan.scanCompleted && currentPlan.plan.issues.length === 0);
-  insist(targets(currentPlan).every(t => p.targets.includes(t)));
+  // Only journal-approved ledger transitions may appear as a temporary held reason.
+  insist(currentPlan.held.every(h => p.targets.includes(JSON.stringify([h.recordType, h.recordId, h.reason])) ||
+    h.recordType === "memory" && h.reason === "ledger-differs" && p.changes.some(c => c.before.id === h.recordId)));
+  insist(currentPlan.ops.every(op => op.members.every(m => p.changes.some(c => c.before.id === m.id)) &&
+    Object.entries(op.steps).every(([step, state]) => state === "not-needed" || step === "ledger")));
   const local = await env.apply.readLocalSnapshot();
   for (const c of p.changes) {
     const current = local.memories.find(m => m.id === c.before.id);
-    insist(eq(current, c.before) || eq(current, c.after));
+    const expected = p.storage.find(e => e.id === c.before.id)!;
+    const storage = await env.readStorage(c.before.id);
+    insist(eq(current, c.before) && eq(storage, expected.before) ||
+      eq(current, c.after) && (eq(storage, expected.intermediate) || eq(storage, expected.after)));
     validateLinkRestoration(c.before, c.after, local.memories);
   }
 }
@@ -175,7 +190,7 @@ export async function executeNarrowMemoryRepair(env: NarrowRepairEnv, confirmed:
     }
     // Runtime validation below also prevents malformed payloads from reaching writes.
     const p = journal.narrowMemoryRepair as Payload;
-    insist(p?.version === 1 && p.changes.length === 5 && p.files.length > 0 && p.markdown.length > 0);
+    insist(p?.version === 2 && p.changes.length === 5 && p.files.length > 0 && p.markdown.length > 0);
     await verifyInputs(env, journal, p);
     for (const file of p.files) {
       const current = (await env.read(file.path)).raw;
@@ -194,16 +209,10 @@ export async function executeNarrowMemoryRepair(env: NarrowRepairEnv, confirmed:
       }
     }
     await verifyInputs(env, journal, p);
-    await env.commit(p.changes, p.counterparts, journal.createdAt, false);
+    await env.commit(p.changes, p.counterparts, p.storageTime, false, p.storage);
     await verifyInputs(env, journal, p);
-    // Plan validation does not apply anything. Ledger can be pending at this point;
-    // only our five missing ledger repairs may remain as safe ops, never other ops.
-    let plan = await planRecoveryApply(env.apply);
-    insist(plan.plan.issues.length === 0 && plan.heldCount === 0);
-    insist(plan.ops.every(op => op.members.every(m => p.changes.some(c => c.before.id === m.id)) &&
-      Object.entries(op.steps).every(([step, state]) => state === "not-needed" || step === "ledger")));
-    await env.commit(p.changes, p.counterparts, journal.createdAt, true);
-    plan = await planRecoveryApply(env.apply);
+    await env.commit(p.changes, p.counterparts, p.storageTime, true, p.storage);
+    const plan = await planRecoveryApply(env.apply);
     insist(plan.plan.issues.length === 0 && plan.heldCount === 0 && plan.ops.length === 0);
     await verifyInputs(env, journal, p);
     for (const file of p.files) insist((await env.read(file.path)).raw === file.after);
@@ -224,7 +233,7 @@ export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, c
       const file = await (await dir.getFileHandle(parts.at(-1)!, { create: false })).getFile();
       return { raw: await file.text(), mtime: file.lastModified, size: file.size };
     };
-    return executeNarrowMemoryRepair({ apply: createRecoveryApplyEnv(root), read, commit: commitMemoryLinkRestoration,
+    return executeNarrowMemoryRepair({ apply: createRecoveryApplyEnv(root), read, commit: commitMemoryLinkRestoration, readStorage: readMemoryRepairStorage,
       identity: async () => { const id = await getVaultIdentityRecord(); const disk = JSON.parse((await read(".tsumugi/vault-identity.json")).raw); insist(id?.vaultId && disk.vaultId === id.vaultId && id.activeVaultEpoch === (await createRecoveryApplyEnv(root).readWorld()).activeVaultEpoch); return id.vaultId; },
       write: (path, raw) => runRecoveryVaultWrite(async () => {
         insist(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(path));

@@ -17,7 +17,7 @@ import { withVaultSaveLock } from "./vaultSaveLock";
 import { assertNoPendingRecovery } from "./vaultRecoveryJournal";
 import { reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry } from "./vaultProjection";
 import { ulid } from "ulid";
-import { getAllMemoryObjects, getMemoryObject, loadApiKey, addMemoryLinkDurably, getVaultIdentityRecord, getVaultOutboxEntry } from "./db";
+import { getAllMemoryObjects, getMemoryObject, loadApiKey, addMemoryLinkDurably, getVaultIdentityRecord, getVaultOutboxEntry, markMemoryProjectionSynced } from "./db";
 import { type VaultWritePriority } from "./vault";
 import { retrieveRelevantMemoriesImpl } from "./retrieval";
 import { IncompleteVaultWorldError, StaleVaultTabError, withVaultWorldRead } from "./vaultWorldLock";
@@ -172,8 +172,10 @@ async function connectMemoryImpl(
           const entry = await getVaultOutboxEntry(`${kind}:${id}`);
           if (!entry) throw new Error("connect-outbox-missing");
           const env = { root: vaultHandle, vaultIdentity: await getVaultIdentityRecord() ?? null };
-          if (entry.recordType === "reflection") await reconcileReflectionOutboxEntry(env, entry);
-          else await reconcileMemoryOutboxEntry(env, entry);
+          const result = entry.recordType === "reflection"
+            ? await reconcileReflectionOutboxEntry(env, entry)
+            : await reconcileMemoryOutboxEntry(env, entry);
+          if (result.status === "done") await markMemoryProjectionSynced(kind, id, current.updatedAt);
         });
       } catch (error) {
         if (error instanceof StaleVaultTabError || error instanceof IncompleteVaultWorldError) throw error;

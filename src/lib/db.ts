@@ -1312,12 +1312,69 @@ export async function addMemoryLinkDurably(link: Link): Promise<MemoryObject[]> 
   return result;
 }
 
+/** Exact journalled storage states. null means a proven absent entry.
+ * Comparisons are JSON-based, so every state is built with the same key order (outbox, ledger). */
+export type MemoryRepairStorage = { ledger: string | null; outbox: VaultOutboxEntry | null };
+export type MemoryRepairExpectation = {
+  id: string; before: MemoryRepairStorage; intermediate: MemoryRepairStorage; after: MemoryRepairStorage;
+};
+export async function readMemoryRepairStorage(id: string): Promise<MemoryRepairStorage> {
+  const db = await getDB();
+  const tx = db.transaction(["vaultOutbox", "vaultSyncState"], "readonly");
+  const outbox = await tx.objectStore("vaultOutbox").get(vaultOutboxIdFor("memory", id));
+  const ledger = await tx.objectStore("vaultSyncState").get(`memory:${id}`);
+  await tx.done;
+  return { outbox: outbox ?? null, ledger: ledger ?? null };
+}
+export function memoryRepairExpectation(before: MemoryObject, after: MemoryObject, storage: MemoryRepairStorage, now: string): MemoryRepairExpectation {
+  if (storage.ledger !== null && storage.ledger !== before.updatedAt && storage.ledger !== after.updatedAt) throw new Error("repair-ledger-changed");
+  const old = storage.outbox;
+  if (old && (old.id !== vaultOutboxIdFor("memory", before.id) || old.recordId !== before.id || old.recordType !== "memory" ||
+    old.recordUpdatedAt !== before.updatedAt && old.recordUpdatedAt !== after.updatedAt)) throw new Error("repair-outbox-changed");
+  const pending = buildOutboxEntryForUpdate(undefined, "memory", after.id, after.updatedAt, now);
+  const done: VaultOutboxEntry = { ...pending, status: "done", heldReason: null,
+    steps: { markdown: "done", registry: "done", index: "done", history: "done", ledger: "done" } };
+  return { id: before.id, before: storage, intermediate: { outbox: pending, ledger: storage.ledger }, after: { outbox: done, ledger: after.updatedAt } };
+}
+
+/** Do not let an older in-flight Memory projection erase a newer pending task. */
+export async function putMemoryProjectionOutcome(entry: VaultOutboxEntry): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "vaultOutbox"], "readwrite");
+  try {
+    const current = await tx.objectStore("memoryObjects").get(entry.recordId);
+    const existing = await tx.objectStore("vaultOutbox").get(entry.id);
+    if ((!current || current.updatedAt === entry.recordUpdatedAt) &&
+      (!existing || existing.recordUpdatedAt === entry.recordUpdatedAt)) await tx.objectStore("vaultOutbox").put(entry);
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+}
+
+/** Connect's verified projection may mark only that exact canonical/outbox version synced.
+ * Reflection uses the existing memory ledger key, just like writeMemoryObjectMarkdown.
+ */
+export async function markMemoryProjectionSynced(recordType: "memory" | "reflection", id: string, version: string): Promise<boolean> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "vaultOutbox", "vaultSyncState"], "readwrite");
+  let marked = false;
+  try {
+    const current = await tx.objectStore("memoryObjects").get(id);
+    const outbox = await tx.objectStore("vaultOutbox").get(vaultOutboxIdFor(recordType, id));
+    if (current?.updatedAt === version && outbox?.recordUpdatedAt === version && outbox.status === "done") {
+      await tx.objectStore("vaultSyncState").put(version, `memory:${id}`);
+      marked = true;
+    }
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return marked;
+}
+
 /** Narrow repair CAS. Caller holds exclusive world lock and a durable Recovery journal.
  * This is never called by bootstrap/projection. Both before and after are exact snapshots.
  */
 export async function commitMemoryLinkRestoration(
   changes: { before: MemoryObject; after: MemoryObject }[],
-  counterparts: MemoryObject[], now: string, finalize: boolean
+  counterparts: MemoryObject[], now: string, finalize: boolean, expectations: MemoryRepairExpectation[]
 ): Promise<void> {
   const db = await getDB();
   const tx = db.transaction(["memoryObjects", "vaultOutbox", "vaultSyncState"], "readwrite");
@@ -1329,22 +1386,26 @@ export async function commitMemoryLinkRestoration(
       const actual = await memories.get(c.id);
       if (!equal(actual, c) && !(expected && equal(actual, expected.after))) throw new Error("counterpart-changed");
     }
+    if (expectations.length !== changes.length) throw new Error("repair-storage-missing");
     for (const { before, after } of changes) {
       if (!equal({ ...before, links: after.links, updatedAt: after.updatedAt }, after)) throw new Error("repair-field-scope");
       const current = await memories.get(before.id);
       if (!equal(current, after) && (finalize || !equal(current, before))) throw new Error("canonical-changed");
       const id = vaultOutboxIdFor("memory", before.id);
-      const existing = await outbox.get(id);
-      if (existing && existing.recordUpdatedAt !== before.updatedAt && existing.recordUpdatedAt !== after.updatedAt) throw new Error("outbox-changed");
+      const expected = expectations.find(e => e.id === before.id);
+      if (!expected || !equal(expected, memoryRepairExpectation(before, after, expected.before, now))) throw new Error("repair-storage-invalid");
+      const storage: MemoryRepairStorage = { outbox: await outbox.get(id) ?? null, ledger: await tx.objectStore("vaultSyncState").get(`memory:${before.id}`) ?? null };
+      const isBefore = equal(current, before) && equal(storage, expected.before);
+      const isIntermediate = equal(current, after) && equal(storage, expected.intermediate);
+      const isAfter = equal(current, after) && equal(storage, expected.after);
+      if (!(isAfter || isIntermediate || !finalize && isBefore)) throw new Error("repair-storage-changed");
+      if (isAfter) continue;
       if (!finalize) {
         await memories.put(after);
-        // Force pending even when an old entry happens to share this timestamp.
-        await outbox.put(buildOutboxEntryForUpdate(undefined, "memory", after.id, after.updatedAt, now));
+        await outbox.put(expected.intermediate.outbox!);
       } else {
-        if (!existing || existing.recordUpdatedAt !== after.updatedAt) throw new Error("repair-outbox-missing");
-        await outbox.put({ ...existing, status: "done", heldReason: null,
-          steps: { markdown: "done", registry: "done", index: "done", history: "done", ledger: "done" }, updatedAt: now });
-        await tx.objectStore("vaultSyncState").put(after.updatedAt, `memory:${after.id}`);
+        await outbox.put(expected.after.outbox!);
+        await tx.objectStore("vaultSyncState").put(expected.after.ledger!, `memory:${after.id}`);
       }
     }
   } catch (error) { await abortAndSettleTransaction(tx, error); }

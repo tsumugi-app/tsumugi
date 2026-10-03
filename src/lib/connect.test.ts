@@ -30,7 +30,11 @@ const rec: {
   released: string[];
   claim: boolean;
   onJudge: (() => Promise<void>) | null;
-} = { judgments: [], candidates: [], vaultWrites: [], vaultError: null, connected: [], released: [], claim: true, onJudge: null };
+  /** Real projection persists `done` through the version-guarded outcome writer; mimic that. */
+  markDone: boolean;
+  /** Runs inside the (stubbed) projection of the given record, before it reports its outcome. */
+  onProject: ((id: string) => Promise<void>) | null;
+} = { judgments: [], candidates: [], vaultWrites: [], vaultError: null, connected: [], released: [], claim: true, onJudge: null, markDone: false, onProject: null };
 
 class StaleVaultTabError extends Error {}
 class IncompleteVaultWorldError extends Error {}
@@ -50,7 +54,9 @@ const stubs: Record<string, unknown> = {
       const memory = (await dbRef!.getMemoryObject(entry.recordId))!;
       const canonicalAtWrite = await dbRef!.getMemoryObject(memory.id);
       rec.vaultWrites.push({ id: memory.id, links: memory.links.length, updatedAt: memory.updatedAt, canonicalAtWrite });
+      if (rec.onProject) await rec.onProject(memory.id);
       if (rec.vaultError) throw rec.vaultError;
+      if (rec.markDone) await dbRef!.putMemoryProjectionOutcome({ ...(entry as never as import("./vaultOutbox").VaultOutboxEntry), status: "done", heldReason: null });
       return { status: "done" };
     },
   },
@@ -93,7 +99,7 @@ const existingLink = (id: string, sourceId: string, targetId: string): Link => (
 function setup(judgments: Json[], candidateIds: string[]) {
   rec.judgments = judgments;
   rec.candidates = candidateIds.map((id) => ({ id, date: T0, summary: `要約-${id}`, keywords: ["k"] }));
-  rec.vaultWrites = []; rec.vaultError = null; rec.connected = []; rec.released = []; rec.claim = true; rec.onJudge = null;
+  rec.vaultWrites = []; rec.vaultError = null; rec.connected = []; rec.released = []; rec.claim = true; rec.onJudge = null; rec.markDone = false; rec.onProject = null;
 }
 (globalThis as unknown as { fetch: unknown }).fetch = async () => {
   if (rec.onJudge) await rec.onJudge();
@@ -235,6 +241,60 @@ test("Connect advances timestamps even when the source clock is ahead", async ()
   const updated = await dbMod.addMemoryLinkDurably(link);
   assert.equal(updated[0].updatedAt, "2099-01-01T00:00:00.001Z");
   assert.equal(updated[1].updatedAt, "2099-02-01T00:00:00.001Z");
+});
+
+// ---------------------------------------------------------------------------
+// M1：projection/read-back成功後だけ、そのversionをsynced（同期台帳）として記録する
+// ---------------------------------------------------------------------------
+
+test("M1: projection成功→Outbox done→両endpointの台帳がcanonical.updatedAtと一致する", async () => {
+  await dbMod.putMemoryObjectWithOutbox(memory("m1-new-a"));
+  await dbMod.putMemoryObjectWithOutbox(memory("m1-target-a"));
+  setup([judgment("m1-target-a")], ["m1-target-a"]);
+  rec.markDone = true;
+  await connectMod.connectMemory(VAULT, memory("m1-new-a"));
+  for (const id of ["m1-new-a", "m1-target-a"]) {
+    const stored = (await dbMod.getMemoryObject(id))!;
+    assert.equal(stored.links.length, 1);
+    const outbox = (await dbMod.getVaultOutboxEntry(`memory:${id}`))!;
+    assert.equal(outbox.status, "done"); assert.equal(outbox.recordUpdatedAt, stored.updatedAt);
+    assert.equal(await dbMod.getVaultSyncState(`memory:${id}`), stored.updatedAt, "台帳＝canonical version");
+  }
+});
+
+test("M1: projection失敗時は台帳を進めない（Outboxもpendingのまま）", async () => {
+  await dbMod.putMemoryObjectWithOutbox(memory("m1-new-b"));
+  await dbMod.putMemoryObjectWithOutbox(memory("m1-target-b"));
+  setup([judgment("m1-target-b")], ["m1-target-b"]);
+  rec.markDone = true; rec.vaultError = new Error("vault write failed");
+  await connectMod.connectMemory(VAULT, memory("m1-new-b"));
+  for (const id of ["m1-new-b", "m1-target-b"]) {
+    assert.equal(await dbMod.getVaultSyncState(`memory:${id}`), undefined);
+    assert.equal((await dbMod.getVaultOutboxEntry(`memory:${id}`))!.status, "pending");
+  }
+});
+
+test("M1: projection中にcanonicalが新versionへ更新されたら、古いversionで新canonicalをsynced扱いしない", async () => {
+  await dbMod.putMemoryObjectWithOutbox(memory("m1-new-c"));
+  await dbMod.putMemoryObjectWithOutbox(memory("m1-target-c"));
+  setup([judgment("m1-target-c")], ["m1-target-c"]);
+  rec.markDone = true;
+  const newer = "2030-01-01T00:00:00.000Z";
+  rec.onProject = async (id) => {
+    if (id !== "m1-new-c") return;
+    const cur = (await dbMod.getMemoryObject(id))!;
+    await dbMod.putMemoryObjectWithOutbox({ ...cur, summary: "projection中の更新", updatedAt: newer });
+  };
+  await connectMod.connectMemory(VAULT, memory("m1-new-c"));
+  const source = (await dbMod.getMemoryObject("m1-new-c"))!;
+  assert.equal(source.updatedAt, newer);
+  assert.notEqual(await dbMod.getVaultSyncState("memory:m1-new-c"), source.updatedAt, "新versionをsyncedにしない");
+  assert.equal(await dbMod.getVaultSyncState("memory:m1-new-c"), undefined);
+  const outbox = (await dbMod.getVaultOutboxEntry("memory:m1-new-c"))!;
+  assert.equal(outbox.recordUpdatedAt, newer); assert.equal(outbox.status, "pending", "新versionのpending taskを古い結果で消さない");
+  // 影響を受けない側のendpointは通常どおりsynced。
+  const target = (await dbMod.getMemoryObject("m1-target-c"))!;
+  assert.equal(await dbMod.getVaultSyncState("memory:m1-target-c"), target.updatedAt);
 });
 
 // ---------------------------------------------------------------------------
