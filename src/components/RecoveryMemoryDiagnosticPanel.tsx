@@ -2,6 +2,7 @@
 import { runExplicitMemoryRepair, runExplicitRepairPreflight, runRawHeldMemoryDiagnostic, type NarrowRepairResult, type PreflightReport } from "../lib/memoryNarrowRepair";
 import { useEffect, useRef, useState } from "react";
 import type { RecoveryApplyPlan } from "../lib/vaultRecoveryApply";
+import { runExplicitMarkdownMismatchDiagnostic, type MarkdownMismatchReport } from "../lib/memoryMarkdownMismatchDiagnostic";
 import { MEMORY_DIAGNOSTIC_MISMATCH, type MemoryDiagnosticResult } from "../lib/recoveryMemoryDiagnostic";
 
 /** Debug-only, existing Plan only. Mount has no IO. A run can be requested once per mount. */
@@ -9,6 +10,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
   plan: RecoveryApplyPlan | null; root: FileSystemDirectoryHandle; disabled: boolean;
 }) {
   const [repair, setRepair] = useState<NarrowRepairResult | null>(null);
+  const [mismatch, setMismatch] = useState<MarkdownMismatchReport | null>(null);
   const [preflight, setPreflight] = useState<PreflightReport | { unavailable: string } | null>(null);
   const repairRunning = useRef(false);
   const current = useRef({ active: false });
@@ -29,6 +31,13 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
     repairRunning.current = true; setBusy(true); setPreflight(null);
     try { setPreflight(await runExplicitRepairPreflight(root, plan)); }
     catch { setPreflight({ unavailable: "unexpected-error" }); }
+    finally { repairRunning.current = false; setBusy(false); }
+  }
+  async function diagnoseMarkdown() {
+    if (disabled || busy || repairRunning.current) return;
+    repairRunning.current = true; setBusy(true); setMismatch(null);
+    try { setMismatch(await runExplicitMarkdownMismatchDiagnostic(root)); }
+    catch { setMismatch({ unavailable: "unexpected-error" }); }
     finally { repairRunning.current = false; setBusy(false); }
   }
   async function repairExplicitly() {
@@ -53,6 +62,8 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
         <p>総check数 {preflight.total} / PASS {preflight.pass} / FAIL {preflight.fail} / SKIP {preflight.skip}</p>
         {preflight.entries.filter(e => e.status !== "PASS").length > 0 && <pre>{preflight.entries.filter(e => e.status !== "PASS").map(e => [`${e.status} ${e.code}`, e.recordType && `  recordType: ${e.recordType}`, e.memoryId && `  memoryId: ${e.memoryId}`, e.expected && `  expected: ${e.expected}`, e.actual && `  actual: ${e.actual}`, e.reason && `  reason: ${e.reason}`].filter(Boolean).join("\n")).join("\n")}</pre>}
       </div>}
+      <button disabled={disabled || busy} onClick={() => void diagnoseMarkdown()}>Markdown差分診断（READ ONLY）</button>
+      {mismatch && <pre>{JSON.stringify(mismatch, null, 2)}</pre>}
       <p>以下はREAD ONLY診断とは別の、明示実行する限定修復です。全条件を再検証してから変更します。</p>
       <button disabled={disabled || busy || repair?.status === "complete"} onClick={() => void repairExplicitly()}>
         {plan ? "検証済み10件を修復" : "限定修復を再検証して再開"}

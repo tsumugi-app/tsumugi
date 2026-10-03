@@ -2161,6 +2161,10 @@ test("Diagnostics: success path is unchanged and reports no failure", async () =
 const archiveEntries = (v: { files: Map<string, { content: string }> }) => [...v.files].filter(([p]) => p.startsWith(".tsumugi/recovery-archive/")).map(([p, f]) => [p, f.content] as const);
 async function archivedFixture(registryDays = 3) {
   const f = await productionNarrowFixture(registryDays);
+  // the fake IndexedDB is shared by the whole file: a leftover in-progress journal would block the real cleanup
+  await repairDb.writeRecoveryJournalRaw(JSON.stringify({ version: 1, operationId: "test-reset", status: "abandoned", createdAt: T, updatedAt: T,
+    world: { activeVaultEpoch: 0, committedVaultEpoch: 0, registryGenerationEpoch: 0, journalVersion: "current", backend: null },
+    baselineAtStart: { status: "unset", value: null }, managedBefore: {}, ops: [], held: [], result: null, unresolvedMetadata: false }));
   // The real cleanup takes the world lock (FIFO fake, one queue per lock name) and needs the H4 epoch records.
   class FifoLocks {
     private tails = new Map<string, Promise<void>>();
@@ -2466,4 +2470,55 @@ test("Preflight: UI shows the pre-repair check and the all-pass message; it is w
   const ui = fs.readFileSync("src/components/RecoveryMemoryDiagnosticPanel.tsx", "utf8");
   for (const text of ["修復前チェック（READ ONLY）", "修復前チェック：全条件PASS", "総check数"]) assert.ok(ui.includes(text), text);
   assert.equal(ui.match(/await runExplicitRepairPreflight\(/g)?.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// READ ONLY Markdown mismatch diagnostic (guard link-restored-memory-not-byte-equal-to-vault)
+// ---------------------------------------------------------------------------
+const mismatchDiag = require("./memoryMarkdownMismatchDiagnostic") as typeof import("./memoryMarkdownMismatchDiagnostic");
+function editMemberBlock(w: Wired, id: string, edit: (block: string) => string) {
+  const file = [...w.vault.files.keys()].find(p => p.startsWith("Memories/") && w.vault.get(p)!.includes(`id: ${id}\n`))!, text = w.vault.get(file)!;
+  const start = text.indexOf(`id: ${id}\n`), sep = text.indexOf("\n<!-- tsumugi:entry -->", start), end = sep < 0 ? text.length : sep;
+  w.vault.put(file, text.slice(0, start) + edit(text.slice(start, end)) + text.slice(end));
+}
+async function runMismatchDiag(w: Wired) {
+  const r = await mismatchDiag.runMarkdownMismatchDiagnostic(w.apply, async p => { const f = w.vault.files.get(p)!; return { raw: f.content }; });
+  assert.ok("memories" in r); return r as Extract<typeof r, { memories: unknown[] }>;
+}
+test("Mismatch diagnostic: a legacy canonical Memory without metadata.sourceType reproduces the one-record FAIL (semantic identical, serializer-normalised only)", async () => {
+  const w = await wiredFixture();
+  const c0 = (await repairDb.getMemoryObject("c-0"))!; const { sourceType: _omit, ...metadata } = c0.metadata; void _omit; await repairDb.putMemoryObject({ ...c0, metadata });
+  editMemberBlock(w, "c-0", b => b.replace("sourceType: chat\n", ""));
+  const confirmed = await w.confirmedNow(), before = await fullState(w);
+  const report = await dry(w, confirmed);
+  assert.deepEqual(failsOf(report).map(e => `${e.code}:${e.memoryId}`), ["link-restored-memory-not-byte-equal-to-vault:c-0"], "same symptom as Production: exactly one record fails this guard, the other four pass");
+  const diag = await runMismatchDiag(w);
+  const bad = diag.memories.find(m => m.memoryId === "c-0")!, good = diag.memories.filter(m => m.memoryId !== "c-0");
+  assert.equal(bad.verdict, "semantically identical, serialization differs"); assert.deepEqual(bad.semanticDifferenceFields, []);
+  assert.deepEqual(bad.keyDifferences, [{ key: "sourceType", kind: "only-in-E", e: "chat" }]);
+  assert.equal(bad.rawEqualsD, true, "the raw Vault bytes equal the restored canonical's serialization"); assert.equal(bad.rawEqualsE, false); assert.equal(bad.dEqualsE, false);
+  assert.deepEqual(bad.shape["metadata.sourceType"], { canonical: "undefined", vault: "string" });
+  assert.equal(good.length, 4); for (const m of good) { assert.equal(m.dEqualsE, true); assert.equal(m.verdict, "D==E (guard passes)"); }
+  assert.equal(await fullState(w), before, "persistent mutation = 0");
+});
+test("Mismatch diagnostic: eventTime/eventTimePrecision stored as null in canonical is another serializer-only difference", async () => {
+  const w = await wiredFixture();
+  const c1 = (await repairDb.getMemoryObject("c-1"))!; await repairDb.putMemoryObject({ ...c1, eventTime: null as unknown as undefined, eventTimePrecision: null as unknown as undefined });
+  const confirmed = await w.confirmedNow(), before = await fullState(w), diag = await runMismatchDiag(w);
+  const bad = diag.memories.find(m => m.memoryId === "c-1")!;
+  assert.equal(bad.dEqualsE, false); assert.deepEqual(bad.semanticDifferenceFields, []); assert.ok(bad.keyDifferences.some(k => k.key === "eventTime"), JSON.stringify(bad.keyDifferences));
+  assert.equal(bad.verdict, "semantically identical, serialization differs"); assert.ok(confirmed); assert.equal(await fullState(w), before);
+});
+test("Mismatch diagnostic: reports lengths/offsets/char codes, never user text, for non-enum keys", () => {
+  const T0 = "2026-09-01T09:00:00.000Z";
+  const base = { id: "Z", date: "2026-09-01T00:00:00.000Z", content: "SECRET-BODY", summary: "SECRET-SUMMARY", types: ["event"], keywords: ["SECRET-KW"], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], createdAt: T0, updatedAt: T0, metadata: { id: "m", source: "ai-capture", schemaVersion: "0.1", createdAt: T0, updatedAt: T0 } } as MemoryObject;
+  const vault = { ...base, summary: "SECRET-SUMMAry" } as MemoryObject, raw = markdownMod.memoryObjectToMarkdown(vault);
+  const d = mismatchDiag.diagnoseMemoryMarkdown(base, vault, raw, { path: "p", memberIndex: 0, memberCount: 1 });
+  const text = JSON.stringify(d); assert.ok(!text.includes("SECRET")); assert.equal(d.verdict, "semantic difference");
+  assert.ok(d.keyDifferences.some(k => k.key === "summary" && k.kind === "value-differs" && k.diff && k.diff.firstDiffAt !== null));
+});
+test("Mismatch diagnostic: UI entry is READ ONLY wiring only (debugLog gate, no write APIs)", () => {
+  const src = fs.readFileSync("src/lib/memoryMarkdownMismatchDiagnostic.ts", "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+  for (const token of ["saveRecoveryJournal", "commitMemoryLinkRestoration", "putMemoryObject", "setVaultSyncState", "writeFileInDir", "runRecoveryVaultWrite", "env.write(", "removeEntry", "createWritable"]) assert.ok(!src.includes(token), token);
+  assert.ok(src.includes('get("debugLog") !== "1"'));
 });
