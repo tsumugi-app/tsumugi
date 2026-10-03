@@ -4,7 +4,7 @@ import { compareDiagnosticLinks, memoryDifferenceFields, inspectHeldMemories } f
 import { createRecoveryApplyEnv, planRecoveryApply, type RecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
 import { parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual } from "./vaultRecovery";
 import { parseMemoryDayFile, serializeMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
-import { hashVaultText, vaultRegistryBucketOf, vaultRecoveryPrimitives, runRecoveryVaultWrite } from "./vault";
+import { hashVaultText, serializeVaultRegistryShard, vaultRegistryBucketOf, vaultRecoveryPrimitives, runRecoveryVaultWrite } from "./vault";
 import { readRecoveryJournal, saveRecoveryJournal, type RecoveryJournal } from "./vaultRecoveryJournal";
 import { commitMemoryLinkRestoration, getVaultIdentityRecord, readMemoryRepairStorage, memoryRepairExpectation, type MemoryRepairExpectation } from "./db";
 import { memoryDayFilePath } from "./vaultProjection";
@@ -74,6 +74,12 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
     const before = plan.snapshot.memories.find(m => m.id === held.recordId);
     insist(vault && before);
     insist(path === memoryDayFilePath(before) && path === memoryDayFilePath(vault));
+    const registryPathOf = async (key: string) => {
+      const shardRaw = (await env.read(`.tsumugi/registry/${vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`)).raw;
+      return (JSON.parse(shardRaw) as { records?: Record<string, string> }).records?.[key];
+    };
+    // Registry must already point at the actual path (checked, never rewritten) for every target.
+    insist(r.registryKey && await registryPathOf(r.registryKey) === path);
     if (held.reason === "conflict") {
       payload.counterparts.push(...validateLinkRestoration(before, vault, plan.snapshot.memories));
       const after = { ...before, links: vault.links, updatedAt: vault.updatedAt };
@@ -83,7 +89,7 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
     } else {
       insist(recoveryRecordsSemanticEqual("memory", before, vault));
       const shardPath = `.tsumugi/registry/${vaultRegistryBucketOf(r.registryKey).toString(16).padStart(2, "0")}.json`;
-      if (!shards.has(shardPath)) { const { raw } = await env.read(shardPath); shards.set(shardPath, { before: raw, value: JSON.parse(raw) }); }
+      if (!shards.has(shardPath)) { const { raw } = await env.read(shardPath); const value = JSON.parse(raw); insist(serializeVaultRegistryShard(value) === raw); shards.set(shardPath, { before: raw, value }); }
       const shard = shards.get(shardPath)!;
       insist(shard.value.records[r.registryKey] === path);
       const entry = shard.value.files[path], file = payload.markdown.find(x => x.path === path)!;
@@ -99,7 +105,7 @@ async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Prom
       entry.contentHash = rawHash;
     }
   }
-  for (const [path, s] of shards) payload.files.push({ path, before: s.before, after: JSON.stringify(s.value), beforeHash: hashVaultText(s.before), afterHash: hashVaultText(JSON.stringify(s.value)) });
+  for (const [path, s] of shards) payload.files.push({ path, before: s.before, after: serializeVaultRegistryShard(s.value), beforeHash: hashVaultText(s.before), afterHash: hashVaultText(serializeVaultRegistryShard(s.value)) });
   insist(payload.changes.length === 5);
   // Shared day-files are permitted only when every local differing member is one
   // of the validated Link restorations. Unknown members are preserved verbatim.
@@ -133,6 +139,7 @@ function validatePayload(p: Payload) {
       expected.files[path].contentHash = hashVaultText(raw.raw); changed++;
     }
     insist(eq(expected, after));
+    insist(f.before === serializeVaultRegistryShard(before) && f.after === serializeVaultRegistryShard(after));
   }
   insist(changed === 3);
   const vault = p.markdown.flatMap(m => parseAll(m.raw));

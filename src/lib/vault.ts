@@ -3225,10 +3225,15 @@ export function isRecordNewerThanBaseline(recordCreatedAt: string, baselineEstab
  * `withVaultRegistryLock`で全体を包んだ上で「読み込み→計算→書き込み」の一部として呼ぶ
  * （History Indexの`updateHistoryIndex`と同じ構成）。
  */
+/** The one serialization contract for Registry shard files (normal writer and narrow repair share it). */
+export function serializeVaultRegistryShard(shard: unknown): string {
+  return JSON.stringify(shard, null, 2);
+}
+
 async function writeVaultRegistryShard(root: FileSystemDirectoryHandle, bucket: number, shard: VaultRegistryShard): Promise<void> {
   const tsumugiDir = await root.getDirectoryHandle(".tsumugi", { create: true });
   const registryDir = await tsumugiDir.getDirectoryHandle("registry", { create: true });
-  await writeFileInDir(registryDir, vaultRegistryBucketFileName(bucket), JSON.stringify(shard, null, 2), "registry shard write");
+  await writeFileInDir(registryDir, vaultRegistryBucketFileName(bucket), serializeVaultRegistryShard(shard), "registry shard write");
 }
 
 async function writeVaultRegistryMeta(root: FileSystemDirectoryHandle, meta: VaultRegistryMeta): Promise<void> {

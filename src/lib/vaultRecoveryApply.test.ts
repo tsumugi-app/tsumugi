@@ -1734,7 +1734,7 @@ async function narrowFixture() {
     const rk = vaultMod.dayFileRegistryKey(day), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(rk).toString(16).padStart(2,"0")}.json`;
     const shard = JSON.parse(vault.get(sp)!);
     shard.files[path].memberHashes = Object.fromEntries(members.map(m => [m.id, vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(m))]));
-    vault.put(sp,JSON.stringify(shard));
+    vault.put(sp,vaultMod.serializeVaultRegistryShard(shard));
     history.days[day].normalMemories = members.map(m => ({ id:m.id, types:m.types, preview:vaultMod.truncateHistoryPreview(m.summary), createdAt:m.createdAt, date:m.date }));
   }
   vault.put(hp,JSON.stringify(history));
@@ -1745,7 +1745,7 @@ async function narrowFixture() {
     const key = vaultMod.dayFileRegistryKey(date), bucket = vaultMod.vaultRegistryBucketOf(key);
     const sp = `.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`;
     const shard = JSON.parse(vault.get(sp)!); shard.files[file].mtime = vault.mtimeOf(file); shard.files[file].size = vault.get(file)!.length; shard.files[file].contentHash = vaultMod.hashVaultText(markdownMod.serializeMemoryDayFile(markdownMod.parseMemoryDayFile(vault.get(file)!).sort((a,b)=>a.createdAt.localeCompare(b.createdAt))));
-    vault.put(sp, JSON.stringify(shard));
+    vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
   }
   const apply = makeEnv(db, vault);
   const plan = await applyMod.planRecoveryApply(apply);
@@ -1795,7 +1795,7 @@ for (const failure of ["identity", "world", "memberIds", "memberHashes", "raw", 
     const sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(p.registryKey).toString(16).padStart(2,"0")}.json`;
     const shard = JSON.parse(f.vault.get(sp)!); const e = shard.files[p.vaultPaths[0]];
     if (failure === "memberIds") e.memberIds = []; else if (failure === "memberHashes") e.memberHashes = {}; else e[failure]++;
-    f.vault.put(sp, JSON.stringify(shard));
+    f.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
   } else if (failure === "raw") { const p = f.plan.plan.records.find(r => r.recordId === "r-0")!.vaultPaths[0]; f.vault.put(p, f.vault.get(p)! + "changed"); }
   else if (failure === "counterpart") f.db.memories.delete("p-0");
   else if (failure === "counterpart-content") f.db.memories.get("p-0")!.links[0].reason = "changed";
@@ -2003,4 +2003,88 @@ test("H2: Recoveryが使うexpected pathと通常projectionのpathは同じhelpe
   assert.ok(proj.includes("const path = memoryDayFilePath(canonical);"),"通常projectionの書き込みpathも同じhelper");
   const m=memory("h2-helper");
   assert.equal(projection.memoryDayFilePath(m),`Memories/${vaultMod.dayFileNameFor(m.date)}`);
+});
+
+// ---------------------------------------------------------------------------
+// MEDIUM-1: Registry path of Link targets is verified (never rewritten) before any write.
+// MEDIUM-3: Registry shards keep the single serialization contract of the normal writer.
+// ---------------------------------------------------------------------------
+const shardFiles = (v: { files: Map<string, { content: string }> }) => [...v.files].filter(([p]) => p.startsWith(".tsumugi/registry/")).map(([p, f]) => [p, f.content] as const);
+const readShard = (c: string) => JSON.parse(c) as { records: Record<string, string>; files: Record<string, Record<string, unknown>> };
+async function expectNoWrite(f: Awaited<ReturnType<typeof productionNarrowFixture>>) {
+  assert.equal(f.plan.heldCount, 10, "the plan itself is unchanged: only the new preflight can stop the repair"); assert.equal(f.plan.plan.issues.length, 0);
+  const files = JSON.stringify([...f.vault.files]), local = await f.env.apply.readLocalSnapshot();
+  const storage = await Promise.all([0,1,2,3,4].map(i => repairDb.readMemoryRepairStorage(`c-${i}`)));
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "held");
+  assert.equal(f.db.journal, undefined, "stopped before the journal was created");
+  assert.equal(JSON.stringify([...f.vault.files]), files, "Registry and Markdown are byte-identical");
+  assert.deepEqual(await f.env.apply.readLocalSnapshot(), local);
+  assert.deepEqual(await Promise.all([0,1,2,3,4].map(i => repairDb.readMemoryRepairStorage(`c-${i}`))), storage, "Outbox and ledger unchanged");
+  return files;
+}
+test("M1-registry: Link target whose Registry path equals the actual path is repaired", async () => {
+  const f = await productionNarrowFixture();
+  for (let i = 0; i < 5; i++) {
+    const m = (await repairDb.getMemoryObject(`c-${i}`))!, key = vaultMod.dayFileRegistryKey(m.date.slice(0, 10));
+    const sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`;
+    assert.equal(readShard(f.vault.get(sp)!).records[key], projection.memoryDayFilePath(m));
+  }
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "complete");
+});
+test("M1-registry: Link target Registry path mismatch (seen only by the repair's own read) stops before journal; nothing changes; startup creates no duplicate Markdown", async () => {
+  // The Plan scan sees a consistent Vault; only the repair preflight's Registry read is altered, so this
+  // isolates the new Link-target check (the Plan-level reason counts cannot be what stops the repair).
+  const f = await productionNarrowFixture();
+  const m = (await repairDb.getMemoryObject("c-0"))!, key = vaultMod.dayFileRegistryKey(m.date.slice(0, 10));
+  const sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`;
+  const read = f.env.read;
+  f.env.read = async p => { const r = await read(p); if (p !== sp) return r; const shard = readShard(r.raw); shard.records[key] = "Memories/elsewhere.md"; return { ...r, raw: vaultMod.serializeVaultRegistryShard(shard) }; };
+  const files = await expectNoWrite(f);
+  assert.equal(readShard(f.vault.get(sp)!).records[key], projection.memoryDayFilePath(m), "Registry path is never rewritten");
+  const memoriesBefore = [...f.vault.files.keys()].filter(p => p.startsWith("Memories/")).sort();
+  await projection.reconcileDoneVaultOutboxIntegrity(f.projectionEnv);
+  assert.deepEqual([...f.vault.files.keys()].filter(p => p.startsWith("Memories/")).sort(), memoriesBefore, "no duplicate Markdown");
+  assert.equal(JSON.stringify([...f.vault.files]), files);
+});
+test("M3: shards written by the normal writer use the shared serializer, and repair keeps exactly that format", async () => {
+  const f = await productionNarrowFixture();
+  const writer = new FakeVault(); // the normal Registry writer
+  await vaultMod.vaultRecoveryPrimitives.upsertVaultRegistryRecord(writer.root(), { registryKey: "k1", path: "Memories/a.md", recordType: "memory-day", mtime: 1, size: 2, contentHash: "h", memberIds: ["x"], memberHashes: { x: "y" } });
+  for (const [, content] of shardFiles(writer)) assert.equal(content, vaultMod.serializeVaultRegistryShard(JSON.parse(content)));
+  const before = new Map(shardFiles(f.vault));
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, f.plan)).status, "complete");
+  let changedEntries = 0;
+  for (const [p, content] of shardFiles(f.vault)) {
+    const prev = before.get(p)!;
+    assert.equal(content, vaultMod.serializeVaultRegistryShard(JSON.parse(content)), "same bytes the normal writer would produce");
+    assert.ok(content.includes("\n  "), "not compacted");
+    if (content === prev) continue;
+    const a = readShard(prev), b = readShard(content);
+    assert.deepEqual(b.records, a.records); assert.deepEqual(Object.keys(b.files), Object.keys(a.files));
+    for (const file of Object.keys(a.files)) {
+      if (JSON.stringify(a.files[file]) === JSON.stringify(b.files[file])) continue; // untouched entries are identical
+      changedEntries++;
+      assert.deepEqual({ ...b.files[file], contentHash: 0 }, { ...a.files[file], contentHash: 0 }, "only contentHash differs");
+      assert.equal(b.files[file].contentHash, vaultMod.hashVaultText(f.vault.get(file)!));
+    }
+    assert.deepEqual(Object.keys(b), Object.keys(a));
+  }
+  assert.equal(changedEntries, 3);
+});
+test("M3: a shard that is not in the writer's canonical format is never reformatted (stops before any write)", async () => {
+  const f = await productionNarrowFixture();
+  const [sp, content] = shardFiles(f.vault)[0];
+  f.vault.put(sp, JSON.stringify(JSON.parse(content)));
+  f.plan = await applyMod.planRecoveryApply(f.env.apply);
+  await expectNoWrite(f);
+});
+test("M1-registry: an actually inconsistent Registry path for a Link target is also never repaired", async () => {
+  const f = await productionNarrowFixture();
+  const m = (await repairDb.getMemoryObject("c-0"))!, key = vaultMod.dayFileRegistryKey(m.date.slice(0, 10));
+  const sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`;
+  const shard = readShard(f.vault.get(sp)!); shard.records[key] = "Memories/elsewhere.md";
+  f.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  const files = JSON.stringify([...f.vault.files]), local = await f.env.apply.readLocalSnapshot();
+  assert.equal((await narrow.executeNarrowMemoryRepair(f.env, await applyMod.planRecoveryApply(f.env.apply))).status, "held");
+  assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files); assert.deepEqual(await f.env.apply.readLocalSnapshot(), local);
 });
