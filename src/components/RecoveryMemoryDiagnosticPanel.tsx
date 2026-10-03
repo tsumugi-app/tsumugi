@@ -1,8 +1,8 @@
 "use client";
-import { runExplicitMemoryRepair, type NarrowRepairResult } from "../lib/memoryNarrowRepair";
+import { runExplicitMemoryRepair, runRawHeldMemoryDiagnostic, type NarrowRepairResult } from "../lib/memoryNarrowRepair";
 import { useEffect, useRef, useState } from "react";
 import type { RecoveryApplyPlan } from "../lib/vaultRecoveryApply";
-import { runHeldMemoryDiagnostic, MEMORY_DIAGNOSTIC_MISMATCH, type MemoryDiagnosticResult } from "../lib/recoveryMemoryDiagnostic";
+import { MEMORY_DIAGNOSTIC_MISMATCH, type MemoryDiagnosticResult } from "../lib/recoveryMemoryDiagnostic";
 
 /** Debug-only, existing Plan only. Mount has no IO. A run can be requested once per mount. */
 export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: {
@@ -13,14 +13,15 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
   const current = useRef({ active: false });
   const used = useRef(false);
   const [busy, setBusy] = useState(false);
-  const [output, setOutput] = useState<{ plan: RecoveryApplyPlan; result: MemoryDiagnosticResult } | null>(null);
+  const [output, setOutput] = useState<{ result: MemoryDiagnosticResult; rawHeld: number | null } | null>(null);
   useEffect(() => { const token = { active: true }; current.current = token; return () => { token.active = false; }; }, [plan, root]);
   async function inspect() {
-    if (!plan || disabled || used.current) return;
+    if (disabled || used.current) return;
     used.current = true; setBusy(true);
     const token = current.current;
-    const result = await runHeldMemoryDiagnostic(plan, root, () => token.active);
-    if (token.active) { setOutput({ plan, result }); setBusy(false); }
+    // The screen's plan excludes archived records; the diagnostic rebuilds the raw plan (read only).
+    const { diagnostic, rawHeld } = await runRawHeldMemoryDiagnostic(root, () => token.active);
+    if (token.active) { setOutput({ result: diagnostic, rawHeld }); setBusy(false); }
   }
   async function repairExplicitly() {
     if (disabled || busy || repairRunning.current) return;
@@ -29,11 +30,12 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled }: 
     catch { setRepair({ status: "held", failure: { phase: "start", code: "unexpected-error" } }); }
     finally { repairRunning.current = false; setBusy(false); }
   }
-  const result = output?.plan === plan ? output.result : null;
+  const result = output?.result ?? null;
   return <section>
     <p>[D] Memory Recovery診断 — READ ONLY・件数のみ</p>
     <p>他のTsumugiタブと外部エディタを閉じてください。診断ボタンはデータを変更しません。</p>
-    <button disabled={!plan || disabled || busy || !!output} onClick={() => void inspect()}>10件を読み取り専用で診断</button>
+    <button disabled={disabled || busy || !!output} onClick={() => void inspect()}>現在状態から再構築して読み取り専用で診断</button>
+    {output?.rawHeld != null && <p>診断対象（archive除外前）: {output.rawHeld}件</p>}
     <div>
       <p>以下はREAD ONLY診断とは別の、明示実行する限定修復です。全条件を再検証してから変更します。</p>
       <button disabled={disabled || busy || repair?.status === "complete"} onClick={() => void repairExplicitly()}>

@@ -1752,6 +1752,7 @@ async function narrowFixture(registryDays = 3) {
   assert.equal(plan.heldCount, 10, JSON.stringify(plan.held)); assert.equal(plan.plan.issues.length, 0);
   const outboxes = new Map<string, import("./vaultOutbox").VaultOutboxEntry>();
   const env: import("./memoryNarrowRepair").NarrowRepairEnv = { apply,
+    excludeArchived: async p => p,
     readStorage: async id => ({ outbox: outboxes.get(id) ?? null, ledger: db.ledger.get(`memory:${id}`) ?? null }),
     identity: async () => "fixture-identity",
     read: async p => { const f = vault.files.get(p); if (!f) throw new DOMException("absent", "NotFoundError"); return { raw: f.content, size: f.content.length, mtime: f.mtime }; },
@@ -1923,7 +1924,9 @@ async function productionNarrowFixture(registryDays = 3) {
   f.plan = await applyMod.planRecoveryApply(f.env.apply);
   const identity: import("./vaultIdentity").VaultIdentityRecord = {id:"current",vaultId:"fixture-identity",activeVaultEpoch:0,registryGeneration:"gen",pairedAt:T,pendingCandidateVaultId:null,updatedAt:T};
   f.vault.put(".tsumugi/vault-identity.json",JSON.stringify({vaultId:identity.vaultId,createdAt:T}));
-  return {...f, projectionEnv:{root:f.vault.root(),vaultIdentity:identity,now:()=>T}};
+  const legacy = require("./vaultRecoveryLegacyCleanup") as typeof import("./vaultRecoveryLegacyCleanup");
+  f.env.excludeArchived = p => legacy.excludeArchivedFromApplyPlan({ root: f.vault.root(), vaultIdentity: identity, now: () => T }, p);
+  return {...f, identity, legacy, projectionEnv:{root:f.vault.root(),vaultIdentity:identity,now:()=>T}};
 }
 const projection = require("./vaultProjection") as typeof import("./vaultProjection");
 test("H1/H2 integration: real canonical/outbox/ledger transactions, 10 held -> repair -> done startup -> 0 held; no Markdown writes",async()=>{
@@ -2149,4 +2152,104 @@ test("Diagnostics: no confirmed plan, and failure details never include record c
 test("Diagnostics: success path is unchanged and reports no failure", async () => {
   const f = await productionNarrowFixture(); const r = await narrow.executeNarrowMemoryRepair(f.env, f.plan);
   assert.deepEqual(r, { status: "complete", held: 0, issues: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Archive-excluded confirmed plan (what the screen shows) vs raw actual plan (what repair verifies/uses).
+// ---------------------------------------------------------------------------
+const archiveEntries = (v: { files: Map<string, { content: string }> }) => [...v.files].filter(([p]) => p.startsWith(".tsumugi/recovery-archive/")).map(([p, f]) => [p, f.content] as const);
+async function archivedFixture(registryDays = 3) {
+  const f = await productionNarrowFixture(registryDays);
+  // The real cleanup takes the world lock (FIFO fake, one queue per lock name) and needs the H4 epoch records.
+  class FifoLocks {
+    private tails = new Map<string, Promise<void>>();
+    async request<R>(name: string, a: unknown, b?: (l: { name: string } | null) => Promise<R>): Promise<R> {
+      const cb = (typeof a === "function" ? a : b) as (l: { name: string } | null) => Promise<R>;
+      const turn = this.tails.get(name) ?? Promise.resolve(); let release!: () => void;
+      this.tails.set(name, new Promise<void>(r => { release = r; })); await turn;
+      try { return await cb({ name }); } finally { release(); }
+    }
+  }
+  const nav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { value: { locks: new FifoLocks() }, configurable: true, writable: true });
+  const worldLock = require("./vaultWorldLock") as typeof import("./vaultWorldLock");
+  await repairDb.markVaultEpochCommitted(0); await repairDb.markVaultWorldJournalMigrated(); worldLock.setTabVaultEpoch(0);
+  let cleanup: Awaited<ReturnType<typeof f.legacy.runLegacyHeldCleanup>>;
+  try { cleanup = await f.legacy.runLegacyHeldCleanup({ root: f.vault.root(), vaultIdentity: f.identity, now: () => T }); }
+  finally { if (nav) Object.defineProperty(globalThis, "navigator", nav); else delete (globalThis as { navigator?: unknown }).navigator; }
+  assert.ok(!("notRun" in cleanup)); if ("notRun" in cleanup) throw new Error("cleanup did not run");
+  assert.equal(cleanup.archived, 5, "only the 5 Link conflicts are archived (registry-entry-differs is not archive-eligible)");
+  const raw = await applyMod.planRecoveryApply(f.env.apply);
+  const excluded = await f.legacy.excludeArchivedFromApplyPlan({ root: f.vault.root(), vaultIdentity: f.identity, now: () => T }, raw);
+  return { ...f, raw, excluded };
+}
+test("Archive: raw plan 10, archive-excluded plan 5 (registry-entry-differs only); archive is only a pre-repair copy", async () => {
+  const f = await archivedFixture();
+  assert.equal(f.raw.heldCount, 10); assert.equal(f.excluded.heldCount, 5);
+  assert.deepEqual([...new Set(f.excluded.held.map(h => h.reason))], ["registry-entry-differs"]);
+  assert.equal(f.raw.held.filter(h => h.reason === "conflict").length, 5);
+});
+test("Archive: confirmed=excluded(5) is checked against the SAME view of the current state; repair runs on raw 10 and completes", async () => {
+  const f = await archivedFixture();
+  const archiveBefore = archiveEntries(f.vault), memories = new Map([...f.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content]));
+  for (const p of memories.keys()) f.vault.writeShouldFail.add(p);
+  assert.deepEqual(await narrow.executeNarrowMemoryRepair(f.env, f.excluded), { status: "complete", held: 0, issues: 0 });
+  const rawAfter = await applyMod.planRecoveryApply(f.env.apply);
+  assert.equal(rawAfter.heldCount, 0); assert.equal(rawAfter.plan.issues.length, 0);
+  assert.equal((await projection.reconcileDoneVaultOutboxIntegrity(f.projectionEnv)).processed, 5);
+  const rawFinal = await applyMod.planRecoveryApply(f.env.apply);
+  assert.equal(rawFinal.heldCount, 0); assert.equal(rawFinal.plan.issues.length, 0); assert.equal(rawFinal.ops.length, 0);
+  assert.deepEqual(new Map([...f.vault.files].filter(([p]) => p.startsWith("Memories/")).map(([p, v]) => [p, v.content])), memories, "Memory Markdown byte-identical, no duplicate");
+  assert.deepEqual(archiveEntries(f.vault), archiveBefore, "archive entries are never changed");
+});
+test("Archive negative A: an unrelated held record appeared after confirmation -> stops before journal", async () => {
+  const f = await archivedFixture();
+  const p = (await repairDb.getMemoryObject("p-0"))!; await repairDb.putMemoryObject({ ...p, summary: "unrelated change" });
+  const files = JSON.stringify([...f.vault.files]);
+  const r = await narrow.executeNarrowMemoryRepair(f.env, f.excluded);
+  assert.equal(r.failure?.code, "held-targets-differ-from-confirmed-plan"); assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files);
+});
+test("Archive negative B: archive no longer matches the current state -> confirmed != current excluded -> stops before journal", async () => {
+  const f = await archivedFixture();
+  const c = (await repairDb.getMemoryObject("c-0"))!; await repairDb.putMemoryObject({ ...c, summary: "changed after archive" });
+  const files = JSON.stringify([...f.vault.files]);
+  const r = await narrow.executeNarrowMemoryRepair(f.env, f.excluded);
+  assert.equal(r.failure?.code, "held-targets-differ-from-confirmed-plan"); assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files);
+});
+test("Archive negative C: raw plan is no longer 5+5 (even with a matching confirmed view) -> repair forbidden", async () => {
+  const f = await archivedFixture();
+  const key = vaultMod.dayFileRegistryKey("2026-09-24"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`;
+  const file = `Memories/${vaultMod.dayFileNameFor("2026-09-24")}`, shard = readShard(f.vault.get(sp)!);
+  shard.files[file].contentHash = vaultMod.hashVaultText(f.vault.get(file)!); f.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
+  const raw = await applyMod.planRecoveryApply(f.env.apply), excluded = await f.legacy.excludeArchivedFromApplyPlan({ root: f.vault.root(), vaultIdentity: f.identity, now: () => T }, raw);
+  assert.notEqual(raw.heldCount, 10);
+  const files = JSON.stringify([...f.vault.files]), r = await narrow.executeNarrowMemoryRepair(f.env, excluded);
+  assert.equal(r.status, "held"); assert.equal(r.failure?.code, "held-diagnostic-not-complete"); assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files);
+});
+test("Archive negative D: read issues (issues > 0) -> repair forbidden", async () => {
+  const f = await archivedFixture();
+  f.vault.put("broken.md", "---\ntsumugi: true\n---\nno id, no recognizable section");
+  const raw = await applyMod.planRecoveryApply(f.env.apply), excluded = await f.legacy.excludeArchivedFromApplyPlan({ root: f.vault.root(), vaultIdentity: f.identity, now: () => T }, raw);
+  assert.ok(raw.plan.issues.length > 0 || raw.heldCount !== 10);
+  const files = JSON.stringify([...f.vault.files]), r = await narrow.executeNarrowMemoryRepair(f.env, excluded);
+  assert.equal(r.status, "held"); assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files);
+});
+test("Archive negative E: an unreadable archive entry fails safe (not excluded -> confirmed differs) before journal", async () => {
+  const f = await archivedFixture();
+  const [entryPath] = archiveEntries(f.vault).find(([p]) => p.endsWith(".json") && !p.split("/").pop()!.startsWith(".tmp-")) ?? [undefined]; assert.ok(entryPath);
+  f.vault.put(entryPath!, "{ not json");
+  const files = JSON.stringify([...f.vault.files]), r = await narrow.executeNarrowMemoryRepair(f.env, f.excluded);
+  assert.equal(r.status, "held"); assert.equal(f.db.journal, undefined); assert.equal(JSON.stringify([...f.vault.files]), files);
+});
+test("Archive diagnostics: screen plan = 5, read-only diagnostic uses the raw plan = 10 (registry 5 / conflict 5), zero mutation", async () => {
+  const f = await archivedFixture(); assert.equal(f.excluded.heldCount, 5);
+  const files = JSON.stringify([...f.vault.files]), local = JSON.stringify(await f.env.apply.readLocalSnapshot());
+  const inspect = require("./recoveryMemoryDiagnostic") as typeof import("./recoveryMemoryDiagnostic");
+  const { diagnostic, rawHeld } = await narrow.runRawHeldMemoryDiagnostic(f.vault.root(), () => true, {
+    plan: () => applyMod.planRecoveryApply(f.env.apply),
+    diagnose: (plan, root, still) => inspect.inspectHeldMemories(plan, root, f.env.apply.readLocalSnapshot, still),
+  });
+  assert.equal(rawHeld, 10); assert.equal(diagnostic.status, "complete");
+  if (diagnostic.status === "complete") { assert.equal(diagnostic.registry.heldMemoryCount, 5); assert.equal(diagnostic.conflicts.count, 5); assert.equal(diagnostic.registry.dayFileCount, 3); }
+  assert.equal(JSON.stringify([...f.vault.files]), files); assert.equal(JSON.stringify(await f.env.apply.readLocalSnapshot()), local); assert.equal(f.db.journal, undefined);
 });

@@ -1,6 +1,6 @@
 /** Explicit debug button ONLY. No startup, projection or diagnostic imports this runner. */
 import type { MemoryObject } from "./types";
-import { compareDiagnosticLinks, memoryDifferenceFields, inspectHeldMemories } from "./recoveryMemoryDiagnostic";
+import { compareDiagnosticLinks, memoryDifferenceFields, inspectHeldMemories, runHeldMemoryDiagnostic, type MemoryDiagnosticResult } from "./recoveryMemoryDiagnostic";
 import { createRecoveryApplyEnv, planRecoveryApply, type RecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
 import { parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual } from "./vaultRecovery";
 import { parseMemoryDayFile, serializeMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
@@ -9,6 +9,7 @@ import { readRecoveryJournal, saveRecoveryJournal, type RecoveryJournal } from "
 import { commitMemoryLinkRestoration, getVaultIdentityRecord, readMemoryRepairStorage, memoryRepairExpectation, type MemoryRepairExpectation } from "./db";
 import { memoryDayFilePath } from "./vaultProjection";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
+import { excludeArchivedFromApplyPlan } from "./vaultRecoveryLegacyCleanup";
 
 const eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 /** Diagnostic-only failure description. Closed vocabulary: codes, IDs, and classification values (never record content). */
@@ -44,6 +45,8 @@ export interface NarrowRepairEnv {
   write(path: string, raw: string): Promise<void>;
   commit: typeof commitMemoryLinkRestoration;
   readStorage: typeof readMemoryRepairStorage;
+  /** The same archive exclusion the normal Recovery "確認する" applies (`excludeArchivedFromApplyPlan`). */
+  excludeArchived(plan: RecoveryApplyPlan): Promise<RecoveryApplyPlan>;
 }
 const targets = (p: RecoveryApplyPlan) => p.held.map(h => JSON.stringify([h.recordType, h.recordId, h.reason])).sort();
 function parseAll(raw: string): MemoryObject[] {
@@ -81,7 +84,10 @@ export function validateLinkRestoration(before: MemoryObject, vault: MemoryObjec
 async function prepare(env: NarrowRepairEnv, confirmed: RecoveryApplyPlan): Promise<{ plan: RecoveryApplyPlan; payload: Payload }> {
   const plan = await planRecoveryApply(env.apply);
   check(eq(plan.confirmed.world, confirmed.confirmed.world), "world-changed-since-confirmed-plan", { expected: "same world as the confirmed plan", actual: "world differs" });
-  check(eq(targets(plan), targets(confirmed)), "held-targets-differ-from-confirmed-plan", { expected: heldSummary(confirmed), actual: heldSummary(plan) });
+  // The confirmed plan is the archive-excluded view the user saw. Compare it with the SAME view of the
+  // current state; the repair itself keeps working on the raw plan (archive never counts as resolved).
+  const currentView = await env.excludeArchived(plan);
+  check(eq(targets(currentView), targets(confirmed)), "held-targets-differ-from-confirmed-plan", { expected: heldSummary(confirmed), actual: `${heldSummary(currentView)} (raw: ${heldSummary(plan)})` });
   check(plan.ops.length === 0, "plan-has-recoverable-ops", { expected: "0 ops", actual: `${plan.ops.length} ops` });
   const diagnostic = await inspectHeldMemories(plan, env.apply.root, env.apply.readLocalSnapshot, () => true);
   check(diagnostic.status === "complete", "held-diagnostic-not-complete", { expected: "complete", actual: diagnostic.status });
@@ -288,6 +294,7 @@ export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, c
     };
     return executeNarrowMemoryRepair({ apply: createRecoveryApplyEnv(root), read, commit: commitMemoryLinkRestoration, readStorage: readMemoryRepairStorage,
       identity: async () => { const id = await getVaultIdentityRecord(); const disk = JSON.parse((await read(".tsumugi/vault-identity.json")).raw); check(id?.vaultId, "vault-identity-unpaired", { expected: "paired vaultId in IndexedDB", actual: "absent" }); check(disk.vaultId === id.vaultId, "vault-identity-mismatch", { expected: "IndexedDB vaultId == vault-identity.json", actual: "differs" }); check(id.activeVaultEpoch === (await createRecoveryApplyEnv(root).readWorld()).activeVaultEpoch, "vault-identity-epoch-mismatch", { expected: "identity epoch == active epoch", actual: "differs" }); return id.vaultId; },
+      excludeArchived: async (p) => excludeArchivedFromApplyPlan({ root, vaultIdentity: (await getVaultIdentityRecord()) ?? null }, p),
       write: (path, raw) => runRecoveryVaultWrite(async () => {
         insist(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(path));
         const dir = await (await root.getDirectoryHandle(".tsumugi", { create: false })).getDirectoryHandle("registry", { create: false });
@@ -296,4 +303,17 @@ export async function runExplicitMemoryRepair(root: FileSystemDirectoryHandle, c
     }, confirmed);
   });
   return locked.timedOut ? { status: "unavailable", failure: { phase: "start", code: "world-lock-timed-out" } } : locked.result ?? { status: "unavailable", failure: { phase: "start", code: "no-result" } };
+}
+
+/**
+ * READ ONLY diagnostic of the held Memories. The Recovery screen shows an archive-excluded plan, so the
+ * raw plan (nothing excluded) is rebuilt from the current state here. Nothing is written, no plan state
+ * is replaced, and no archive entry is touched.
+ */
+export async function runRawHeldMemoryDiagnostic(root: FileSystemDirectoryHandle, stillCurrent: () => boolean,
+  deps: { plan(): Promise<RecoveryApplyPlan>; diagnose: typeof runHeldMemoryDiagnostic } = { plan: () => planRecoveryApply(createRecoveryApplyEnv(root)), diagnose: runHeldMemoryDiagnostic }
+): Promise<{ diagnostic: MemoryDiagnosticResult; rawHeld: number | null }> {
+  let raw: RecoveryApplyPlan;
+  try { raw = await deps.plan(); } catch { return { diagnostic: { status: "unavailable" }, rawHeld: null }; }
+  return { diagnostic: await deps.diagnose(raw, root, stillCurrent), rawHeld: raw.heldCount };
 }
