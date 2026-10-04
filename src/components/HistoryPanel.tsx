@@ -7,6 +7,7 @@ import {
   readConversationById,
   readHistoryMonthIndex,
   readMemoriesForDay,
+  lookupVaultRegistryRecord,
   readReflectionById,
   truncateHistoryPreview,
   upgradeHistoryDayToV2,
@@ -21,7 +22,7 @@ import {
   CONVERSATION_ENTRY_KIND_LABEL,
   type ConversationEntryKind,
 } from "@/lib/conversationEntryKind";
-import { buildReflectionMap, fallbackConversationTitle } from "@/lib/historyConversationCard";
+import { buildReflectionMap, fallbackConversationTitle, resolvePrimaryReflection, selectConversationReflection } from "@/lib/historyConversationCard";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -317,6 +318,11 @@ export default function HistoryPanel({
    */
   const [fetchedConversationById, setFetchedConversationById] = useState<Map<string, Conversation | null>>(new Map());
   const [fetchedReflectionById, setFetchedReflectionById] = useState<Map<string, MemoryObject | null>>(new Map());
+  /**
+   * Conversation History v1：詳細を開いたConversationの、primary relation（`Conversation.memoryObjectIds`→Reflection）で
+   * 解決した結果（解決できなかった場合はnull。キーが無い間は解決中）。READ ONLY。`effect`の非同期読み取り結果からだけ更新する。
+   */
+  const [primaryReflectionByConversationId, setPrimaryReflectionByConversationId] = useState<Map<string, MemoryObject | null>>(new Map());
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
   /**
@@ -879,6 +885,21 @@ export default function HistoryPanel({
     })();
   }, [vaultHandle, conversationRows, memoryRows, fetchedConversationById, fetchedReflectionById]);
 
+  useEffect(() => {
+    if (!vaultHandle || !selectedConversation) return;
+    const conversation = selectedConversation;
+    if (primaryReflectionByConversationId.has(conversation.id)) return;
+    const handle = vaultHandle;
+    void (async () => {
+      const found = await resolvePrimaryReflection(conversation, {
+        hasRegistryEntry: async (id) => (await lookupVaultRegistryRecord(handle, id)).entry !== undefined,
+        // Registry entryがあるIDだけが渡される。entryがある場合、`readReflectionById`は日付のヒントを使わない。
+        readById: (id) => readReflectionById(handle, id, ""),
+      });
+      setPrimaryReflectionByConversationId((prev) => new Map(prev).set(conversation.id, found));
+    })();
+  }, [vaultHandle, selectedConversation, primaryReflectionByConversationId]);
+
   /**
    * 一覧行タップ時のオンデマンド詳細読み込み。`full`が既に設定済み（v1 fallbackで
    * 本体を読み終えている）ならその場で使い、追加のreadは発生させない。未設定
@@ -1069,8 +1090,13 @@ export default function HistoryPanel({
   const selectedConversationTitle = selectedConversation
     ? selectedConversation.title?.trim() || fallbackConversationTitle(selectedConversation)
     : null;
+  // primary（`memoryObjectIds`→Reflection）で解決できなかった場合だけ、既存の`conversationId`関連付けを使う。
   const selectedConversationReflection = selectedConversation
-    ? reflectionByConversationId.get(selectedConversation.id)
+    ? selectConversationReflection(
+        selectedConversation,
+        primaryReflectionByConversationId.get(selectedConversation.id),
+        reflectionByConversationId.get(selectedConversation.id)
+      )
     : undefined;
 
   const monthGrid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
@@ -1298,9 +1324,22 @@ export default function HistoryPanel({
                     </div>
                     <p className="text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
                     {selectedConversationReflection && (
-                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
-                        {selectedConversationReflection.content}
-                      </p>
+                      <>
+                        <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
+                          {selectedConversationReflection.content}
+                        </p>
+                        {/* キーワードは新しく生成せず、Reflection（MemoryObject）が既に持つkeywordsをそのまま表示する。 */}
+                        {selectedConversationReflection.keywords.length > 0 && (
+                          <div className="flex flex-col gap-1.5 pt-1">
+                            <p className="text-xs text-stone-400 dark:text-stone-500">キーワード</p>
+                            <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-stone-600 dark:text-stone-300">
+                              {selectedConversationReflection.keywords.map((keyword) => (
+                                <span key={keyword}>{keyword}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                   <button
@@ -1371,7 +1410,6 @@ export default function HistoryPanel({
                           key={row.id}
                           row={row}
                           full={conversationFullById.get(row.id)}
-                          reflection={reflectionByConversationId.get(row.id)}
                           loading={!row.full && !fetchedConversationById.has(row.id)}
                           onClick={() => void openConversationRow(row)}
                         />
@@ -1425,13 +1463,11 @@ export default function HistoryPanel({
 function ConversationCard({
   row,
   full,
-  reflection,
   loading,
   onClick,
 }: {
   row: ConversationRow;
   full: Conversation | undefined;
-  reflection: MemoryObject | undefined;
   loading: boolean;
   onClick: () => void;
 }) {
@@ -1440,7 +1476,6 @@ function ConversationCard({
   const accent = entryKind ? ENTRY_KIND_ACCENT[entryKind] : null;
   // title欠損時のfallbackは表示専用（canonicalなConversation.titleへは一切保存しない。要件4）。
   const displayTitle = full ? full.title?.trim() || fallbackConversationTitle(full) : null;
-  const reflectionPreview = reflection?.summary?.trim();
 
   return (
     <button
@@ -1459,17 +1494,12 @@ function ConversationCard({
         <span className="shrink-0 text-[11px] text-stone-400 dark:text-stone-500">{time ?? ""}</span>
       </div>
       {/*
-        title + Reflection一体化（STEP 3B 要件16/17）：titleを見出し、Reflection previewを
-        その本文として、1つの過去の記録として読めるようにする。「Reflection」「振り返り」
-        のようなラベルは付けない。titleとpreviewの間に罫線・背景差等の強い区切りも作らない
-        （gapだけの最小限の行間）。
+        Conversation History v1：一覧は entry kind ＋ title だけ。Reflectionのpreviewは出さない
+        （Reflectionは詳細を開いたときにだけ読む、Conversationの付属情報）。
       */}
       <p className="truncate text-sm text-stone-800 dark:text-stone-100">
         {displayTitle ?? (loading ? "読み込んでいます…" : "詳細を読み込めませんでした")}
       </p>
-      {reflectionPreview && (
-        <p className="line-clamp-2 text-xs leading-relaxed text-stone-500 dark:text-stone-400">{reflectionPreview}</p>
-      )}
     </button>
   );
 }
