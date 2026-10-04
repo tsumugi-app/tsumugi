@@ -302,7 +302,21 @@ function emptySteps(): Record<ProjectionStepName, ProjectionStepState> {
   return { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "not-needed" };
 }
 
+/**
+ * READ ONLY診断（Projection dry-run）専用の出力フック。診断が渡した「そのentryオブジェクト」に限り、outboxを
+ * IndexedDBへ書く代わりに結果をsinkへ渡す。それ以外のentry（実際のreconcile）は従来どおり永続化する
+ * （診断中に通常の保存が走っても、その結果は失われない）。productionのreconcile経路は何も変わらない。
+ */
+export interface ProjectionDryRunOutcome { steps: Record<ProjectionStepName, ProjectionStepState>; status: "done" | "pending" | "held"; reason: string | null }
+const dryRunSinks = new WeakMap<object, (outcome: ProjectionDryRunOutcome) => void>();
+export function registerProjectionDryRun(entry: VaultOutboxEntry, sink: (outcome: ProjectionDryRunOutcome) => void): () => void {
+  dryRunSinks.set(entry, sink);
+  return () => { dryRunSinks.delete(entry); };
+}
+
 async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionStepName, ProjectionStepState>, status: "done" | "pending" | "held", reason: string | null, now: string): Promise<void> {
+  const dryRunSink = dryRunSinks.get(entry);
+  if (dryRunSink) { dryRunSink({ steps: { ...steps }, status, reason }); return; }
   const attempt = status === "done" ? entry.attempt : { count: entry.attempt.count + 1, lastError: reason, lastAttemptAt: now };
   const persist = entry.recordType === "memory" || entry.recordType === "reflection" ? putMemoryProjectionOutcome : putVaultOutboxEntry;
   await persist({ ...entry, steps, status, heldReason: status === "held" ? reason : null, attempt, updatedAt: now });

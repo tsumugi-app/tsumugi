@@ -129,7 +129,7 @@ export type LegacyVaultAdoptionResult =
   | { kind: "insufficient-evidence"; reason: string };
 
 /** Conversation 1件の、Vault側実体との突き合わせ。「一致」「不一致（conflict）」「不明（読めない）」「Vault側に無い」を返す。 */
-async function evaluateConversationEvidence(root: FileSystemDirectoryHandle, c: Conversation): Promise<"match" | "conflict" | "unreadable" | "absent"> {
+export async function evaluateConversationEvidence(root: FileSystemDirectoryHandle, c: Conversation): Promise<"match" | "conflict" | "unreadable" | "absent"> {
   const path = `Conversations/${fileNameFor(c.id, c.startedAt)}`;
   const read = await readTextAt(root, path);
   if (read.state === "error") return "unreadable";
@@ -151,7 +151,7 @@ async function evaluateConversationEvidence(root: FileSystemDirectoryHandle, c: 
   return "conflict";
 }
 
-async function evaluateSourceEvidence(root: FileSystemDirectoryHandle, s: Source): Promise<"match" | "conflict" | "unreadable" | "absent"> {
+export async function evaluateSourceEvidence(root: FileSystemDirectoryHandle, s: Source): Promise<"match" | "conflict" | "unreadable" | "absent"> {
   const path = `Sources/${fileNameFor(s.id, s.createdAt)}`;
   const read = await readTextAt(root, path);
   if (read.state === "error") return "unreadable";
@@ -166,7 +166,7 @@ async function evaluateSourceEvidence(root: FileSystemDirectoryHandle, s: Source
 }
 
 /** Reflection（1 record = 1 file）の証拠評価。normal Memory（day-file）はこの関数の対象外（下のday-file評価を使う）。 */
-async function evaluateReflectionEvidence(root: FileSystemDirectoryHandle, m: MemoryObject): Promise<"match" | "conflict" | "unreadable" | "absent"> {
+export async function evaluateReflectionEvidence(root: FileSystemDirectoryHandle, m: MemoryObject): Promise<"match" | "conflict" | "unreadable" | "absent"> {
   const path = `Memories/${fileNameFor(m.id, m.date)}`;
   const read = await readTextAt(root, path);
   if (read.state === "error") return "unreadable";
@@ -175,7 +175,7 @@ async function evaluateReflectionEvidence(root: FileSystemDirectoryHandle, m: Me
 }
 
 /** normal Memory（day-fileに複数memberが同居）の証拠評価。day-file自体が読めるか・該当memberの行が矛盾していないかだけを見る（day-file全体の同一性は要求しない——他のmemberは既知でなくてよい）。 */
-async function evaluateMemoryDayEvidence(root: FileSystemDirectoryHandle, m: MemoryObject): Promise<"match" | "conflict" | "unreadable" | "absent"> {
+export async function evaluateMemoryDayEvidence(root: FileSystemDirectoryHandle, m: MemoryObject): Promise<"match" | "conflict" | "unreadable" | "absent"> {
   const path = `Memories/${dayFileNameFor(m.date)}`;
   const read = await readTextAt(root, path);
   if (read.state === "error") return "unreadable";

@@ -2874,3 +2874,144 @@ test("Classifier: production wiring (locks, raw plan) writes nothing — canonic
   const src = fs.readFileSync("src/lib/recoveryClassifierDiagnostic.ts", "utf8") + fs.readFileSync("src/lib/recoveryClassifier.ts", "utf8");
   assert.ok(!/\.put\(|\.add\(|\.delete\(|create: true|createWritable|removeEntry|ensureVaultIdentity|establishNewIdentity|writeLedger|setVaultSyncState|markVault/.test(src.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "")));
 });
+
+// ===========================================================================
+// Projection dry-run（READ ONLY・shadow Vault）
+// ===========================================================================
+const dryMod = require("./projectionDryRun") as typeof import("./projectionDryRun");
+const projMod = require("./vaultProjection") as typeof import("./vaultProjection");
+const DRY_NOW = "2026-09-27T00:00:00.000Z";
+const uid = () => Math.random().toString(36).slice(2, 10);
+async function seedCanonical(db: FakeDb) {
+  for (const c of db.conversations.values()) await repairDb.putConversation(c);
+  for (const m of db.memories.values()) await repairDb.putMemoryObject(m);
+  for (const s of db.sources.values()) await repairDb.saveSource(s);
+}
+const dryDeps = (db: FakeDb, vault: FakeVault) => ({
+  readSnapshot: async () => { const s = db.snapshot(); return { conversations: s.conversations, memories: s.memories, sources: s.sources }; },
+  planEnv: (root: FileSystemDirectoryHandle) => ({ ...makeEnv(db, vault), root }), now: () => DRY_NOW,
+});
+async function dryRun(db: FakeDb, vault: FakeVault) {
+  await seedCanonical(db);
+  const raw = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  const before = JSON.stringify([...vault.files]) + vault.writeCount + JSON.stringify(db.snapshot()) + String(db.journal);
+  const outboxKeys = [...db.conversations.keys()].map((i) => `conversation:${i}`).concat([...db.memories.keys()].flatMap((i) => [`memory:${i}`, `reflection:${i}`]), [...db.sources.keys()].map((i) => `source:${i}`));
+  const outboxBefore = JSON.stringify(await Promise.all(outboxKeys.map((k) => repairDb.getVaultOutboxEntry(k))));
+  const idbBefore = JSON.stringify([await repairDb.getAllConversations(), await repairDb.getAllMemoryObjects(), await repairDb.getAllSources()]);
+  const out = await dryMod.runProjectionDryRunWithShadow(vault.root(), raw, dryDeps(db, vault));
+  assert.equal(JSON.stringify([...vault.files]) + vault.writeCount + JSON.stringify(db.snapshot()) + String(db.journal), before, "dry-run leaves the Vault / FakeDb / journal untouched");
+  assert.equal(JSON.stringify([await repairDb.getAllConversations(), await repairDb.getAllMemoryObjects(), await repairDb.getAllSources()]), idbBefore, "canonical untouched");
+  assert.equal(JSON.stringify(await Promise.all(outboxKeys.map((k) => repairDb.getVaultOutboxEntry(k)))), outboxBefore, "no outbox written by the dry-run");
+  assert.equal(out.report.safety.canonicalUnchanged, true);
+  return { raw, ...out };
+}
+/** The production reconcile, really executed (what the bootstrap would do) — for equivalence checks. */
+async function realReconcile(db: FakeDb, vault: FakeVault) {
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "dry-run-identity" }));
+  const env = { root: vault.root(), now: () => DRY_NOW, vaultIdentity: { id: "current", vaultId: "dry-run-identity", activeVaultEpoch: null, registryGeneration: null, pairedAt: DRY_NOW, pendingCandidateVaultId: null, updatedAt: DRY_NOW } } as unknown as import("./vaultProjection").ProjectionEnv;
+  const status: Record<string, string> = {};
+  for (const c of db.conversations.values()) status[c.id] = (await projMod.reconcileConversationOutboxEntry(env, await repairDb.putConversationWithOutbox(c, DRY_NOW))).status;
+  for (const m of db.memories.values()) { const refl = m.metadata.source === "system-generated"; status[m.id] = (await (refl ? projMod.reconcileReflectionOutboxEntry : projMod.reconcileMemoryOutboxEntry)(env, await repairDb.putMemoryObjectWithOutbox(m, refl ? "reflection" : "memory", DRY_NOW))).status; }
+  for (const s of db.sources.values()) status[s.id] = (await projMod.reconcileSourceOutboxEntry(env, await repairDb.putSourceWithOutbox(s, DRY_NOW))).status;
+  return status;
+}
+function expectShadowEqualsReal(shadow: import("./shadowVault").ShadowVault, vault: FakeVault, before: Map<string, string>) {
+  const changed = new Set<string>();
+  for (const [p, f] of vault.files) if (p !== ".tsumugi/vault-identity.json" && before.get(p) !== f.content) changed.add(p);
+  for (const w of shadow.writes) changed.add(w.path);
+  // The fake Vault counts characters / uses its own clock for size / mtime; real files use bytes. Everything else must be identical.
+  const norm = (p: string, c: string | undefined) => (p.startsWith(".tsumugi/registry/") ? c?.replace(/\s*"(mtime|size)": \d+,?/g, "") : p === ".tsumugi/history-meta.json" ? c?.replace(/"updatedAt": "[^"]*"/, "") : c);
+  for (const p of changed) assert.equal(norm(p, shadow.overlay.get(p)?.content ?? before.get(p)), norm(p, vault.get(p)), `dry-run content equals the real projection for ${p}`);
+}
+const filesOf = (v: FakeVault) => new Map([...v.files].map(([p, f]) => [p, f.content] as const));
+const mdWithoutTurnTimes = (c: Conversation) => markdownMod.conversationToMarkdown(c).replace(/^turnTimes:.*\n/m, "");
+
+test("DryRun A: old Markdown without turnTimes -> identity divergent (timestampOnly), Recovery semantic equal, dry-run == real projection (conflict, History not reached)", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const id = `a-${uid()}`;
+  const c = conversation(id, { turns: [{ role: "user", content: "一", timestamp: T }, { role: "ai", content: "二", timestamp: "2026-09-20T09:05:00.000Z" }] });
+  db.conversations.set(id, c); vault.put(convPath(c), mdWithoutTurnTimes(c));
+  const parsed = markdownMod.parseConversationMarkdown(vault.get(convPath(c))!)!;
+  assert.equal(recoveryMod.recoveryRecordsSemanticEqual("conversation", c, parsed), true, "Recovery: semantically equal");
+  const { report, results, shadow } = await dryRun(db, vault);
+  assert.equal(report.divergent.byType.conversation, 1); assert.equal(report.divergent.conversation.timestampOnly, 1);
+  assert.equal(results[0].verdict, "conflict"); assert.equal(results[0].markdown, "conflict"); assert.equal(results[0].history, "notReached");
+  assert.equal(shadow.writes.length, 0); assert.equal(report.divergentPreservation.preservedBothSides, 1); assert.equal(report.divergentPreservation.wouldOverwriteVault.total, 0);
+  const before = filesOf(vault), real = await realReconcile(db, vault);
+  assert.equal(real[id], "held"); expectShadowEqualsReal(shadow, vault, before);
+});
+const recoveryMod = require("./vaultRecovery") as typeof import("./vaultRecovery");
+
+test("DryRun B/D: true role/content conflict -> conflict, never overwritten, History not reached", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const id = `b-${uid()}`;
+  const c = conversation(id); db.conversations.set(id, c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "全く別", timestamp: T }] }));
+  const { report, results, shadow } = await dryRun(db, vault);
+  assert.deepEqual([results[0].verdict, results[0].markdown, results[0].registry, results[0].index, results[0].history], ["conflict", "conflict", "notReached", "notReached", "notReached"]);
+  assert.equal(report.divergent.conversation.roleContent, 1); assert.equal(shadow.writes.length, 0);
+  const before = filesOf(vault), real = await realReconcile(db, vault); assert.equal(real[id], "held"); expectShadowEqualsReal(shadow, vault, before);
+});
+
+test("DryRun C: only the History row differs -> History wouldUpdate, expected raw held 0, equals the real projection", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const id = `c-${uid()}`;
+  const c = conversation(id); db.conversations.set(id, c); await repairDb.putConversation(c);
+  // a consistent Vault first (what a healthy bootstrap leaves behind), then tamper the History row
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "dry-run-identity" }));
+  const env = { root: vault.root(), now: () => DRY_NOW, vaultIdentity: { vaultId: "dry-run-identity" } } as unknown as import("./vaultProjection").ProjectionEnv;
+  assert.equal((await projMod.reconcileConversationOutboxEntry(env, await repairDb.putConversationWithOutbox(c, DRY_NOW))).status, "done");
+  vault.files.delete(".tsumugi/vault-identity.json");
+  const hp = `.tsumugi/history/${c.startedAt.slice(0, 7)}.json`; const hist = JSON.parse(vault.get(hp)!);
+  hist.days[c.startedAt.slice(0, 10)].conversations[0].turnCount = 99; vault.put(hp, JSON.stringify(hist));
+  const { raw, report, results, shadow } = await dryRun(db, vault);
+  assert.ok(raw.held.some((h) => h.recordId === id && h.reason === "history-row-differs"), "starts as history-row-differs");
+  assert.deepEqual([results[0].markdown, results[0].history, results[0].verdict], ["noOp", "wouldUpdate", "update"]);
+  assert.equal(report.historyHeld.total, 1); assert.equal(report.historyPrediction.wouldBecomeCorrect, 1); assert.equal(report.historyPrediction.expectedRawHeldAfterBootstrap, 0);
+  assert.equal(report.historyPrediction.shadowFidelity, "ok");
+  const before = filesOf(vault); vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "dry-run-identity" })); before.set(".tsumugi/vault-identity.json", vault.get(".tsumugi/vault-identity.json")!);
+  assert.equal((await projMod.reconcileConversationOutboxEntry(env, await repairDb.putConversationWithOutbox(c, DRY_NOW))).status, "done");
+  expectShadowEqualsReal(shadow, vault, before);
+});
+
+test("DryRun E: Vault-only frontmatter (title) that a canonical rewrite would drop is detected by field name", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const id = `e-${uid()}`;
+  const c = conversation(id); db.conversations.set(id, c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown({ ...c, title: "Vaultだけにある題" }));
+  const { report, results, shadow } = await dryRun(db, vault);
+  assert.equal(results[0].markdown, "wouldRewrite"); assert.equal(results[0].rewriteReason, "frontmatterDifference");
+  assert.equal(report.metadataLoss.potentialVaultOnlyMetadataLoss, 1); assert.deepEqual(report.metadataLoss.potentialLossFields, { title: 1 });
+  assert.ok(!JSON.stringify(report).includes("Vaultだけにある題"), "values are never reported");
+  const before = filesOf(vault), real = await realReconcile(db, vault); assert.equal(real[id], "done"); expectShadowEqualsReal(shadow, vault, before);
+});
+
+test("DryRun F: Memory / Reflection / Source projections equal the production reconcile (create, no-op, conflict)", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const k = uid();
+  const m = memory(`m-${k}`, { date: "2026-09-20T00:00:00.000Z" }); db.memories.set(m.id, m);                         // canonical only -> create
+  const r = reflection(`r-${k}`); db.memories.set(r.id, r);                      // Reflection, Vault identical -> no-op markdown
+  vault.put(`Memories/${vaultMod.fileNameFor(r.id, r.date)}`, markdownMod.memoryObjectToMarkdown(r));
+  const s = source(`s-${k}`); db.sources.set(s.id, s);                           // Source with different content -> conflict
+  vault.put(`Sources/${vaultMod.fileNameFor(s.id, s.createdAt)}`, markdownMod.sourceToMarkdown({ ...s, content: "別の本文" }));
+  const { results, shadow, report } = await dryRun(db, vault);
+  const by = Object.fromEntries(results.map((x) => [x.id, x]));
+  assert.equal(by[m.id].markdown, "wouldCreate"); assert.equal(by[r.id].markdown, "noOp"); assert.equal(by[s.id].markdown, "conflict");
+  assert.equal(report.projection.outbox.wouldCreate, 2); assert.equal(report.projection.outbox.other, 1, "the conflicting Source gets no outbox (migration holds it)");
+  const before = filesOf(vault), real = await realReconcile(db, vault);
+  const asStatus = (v: string) => (v === "noOp" || v === "update" ? "done" : v === "conflict" ? "held" : "pending");
+  for (const x of results) assert.equal(asStatus(x.verdict), real[x.id], `dry-run verdict equals the production reconcile status for ${x.type}`);
+  assert.equal(real[s.id], "held"); assert.equal(real[r.id], "done"); expectShadowEqualsReal(shadow, vault, before);
+});
+
+test("DryRun H: Phase 1 is never assumed where it would not apply (user-selectable / held preview)", () => {
+  const diag = require("./recoveryClassifierDiagnostic") as typeof import("./recoveryClassifierDiagnostic");
+  const preview = (phase1Preview: string) => ({ storageCapability: "x", phase1Preview }) as unknown as import("./vaultIdentityAdoption").VaultIdentityPreview;
+  assert.equal(diag.phase1DryRunApplicable(preview("would-establish:origin-bound-shared-ids")), true);
+  assert.equal(diag.phase1DryRunApplicable(preview("held:conversation-content-conflict:x")), false, "FSA: the strict rule still holds");
+  assert.equal(diag.phase1DryRunApplicable(preview("unrelated:no-common-record-matched")), false);
+  assert.equal(diag.phase1DryRunApplicable(null), false);
+});
+
+test("DryRun G: the shadow layer and the dry-run never reach a real write API (static) and the hook only intercepts the diagnostic's own entries", () => {
+  const strip = (t: string) => t.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+  const src = strip(fs.readFileSync("src/lib/shadowVault.ts", "utf8")) + strip(fs.readFileSync("src/lib/projectionDryRun.ts", "utf8"));
+  assert.ok(!/create: true|removeEntry\(|\.put\(|db\.add\(|db\.delete\(|putVaultOutboxEntry|putMemoryProjectionOutcome|setVaultSyncState|ensureVaultIdentity|establishNewIdentity/.test(src.replace(/async removeEntry\(\)/, "")));
+  const proj = fs.readFileSync("src/lib/vaultProjection.ts", "utf8");
+  assert.ok(proj.includes("dryRunSinks.get(entry)") && proj.includes("new WeakMap"), "only the entry objects registered by the diagnostic are intercepted");
+});

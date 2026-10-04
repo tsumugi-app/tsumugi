@@ -12,6 +12,8 @@
 import { planRecoveryApply, createRecoveryApplyEnv } from "./vaultRecoveryApply";
 import { classifyRawHeld, readVaultTextFrom, type ClassifierReport } from "./recoveryClassifier";
 import { previewVaultIdentityAdoption, type VaultIdentityPreview } from "./vaultIdentityAdoption";
+import { formatDryRun, runProjectionDryRun, type DryRunReport } from "./projectionDryRun";
+import { loadCanonicalSnapshot } from "./vaultIdentityAdoption";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import { withVaultSaveLock } from "./vaultSaveLock";
 
@@ -21,8 +23,13 @@ export type ClassifierDiagnosticResult =
       status: "complete";
       report: Omit<ClassifierReport, "records">;
       identity: VaultIdentityPreview | null;
+      dryRun: DryRunReport | { unavailable: string };
       safety: { diagnosticWrites: 0; locksSupported: boolean; concurrentVaultWriteRisk: boolean; concurrentCanonicalWriteRisk: true };
     };
+
+/** Phase 1の規則でidentityが確立される（または既に確立済み）と予測できる場合だけ、dry-runの前提が成り立つ。 */
+export const phase1DryRunApplicable = (identity: VaultIdentityPreview | null): boolean =>
+  !!identity && /^(would-establish|would-pair|already-paired)/.test(identity.phase1Preview);
 
 const locksSupported = () => typeof navigator !== "undefined" && !!navigator.locks?.request;
 
@@ -34,7 +41,12 @@ export async function runClassifierDiagnostic(root: FileSystemDirectoryHandle): 
       void records;
       let identity: VaultIdentityPreview | null = null;
       try { identity = await previewVaultIdentityAdoption({ root }); } catch { identity = null; }
-      return { status: "complete", report, identity,
+      // Phase 1を有効化した場合にbootstrap / Projectionが何をしようとするかの予測（実Vault・実IndexedDBへは読み取りのみ）。
+      let dryRun: DryRunReport | { unavailable: string };
+      if (!phase1DryRunApplicable(identity)) dryRun = { unavailable: "phase1-would-not-establish-identity (dry-run assumption does not apply)" };
+      else try { dryRun = await runProjectionDryRun(root, raw, { readSnapshot: loadCanonicalSnapshot, planEnv: (r) => createRecoveryApplyEnv(r) }); }
+      catch (error) { dryRun = { unavailable: error instanceof Error && error.name ? error.name : "unexpected-error" }; }
+      return { status: "complete", report, identity, dryRun,
         safety: { diagnosticWrites: 0, locksSupported: locksSupported(), concurrentVaultWriteRisk: !locksSupported(), concurrentCanonicalWriteRisk: true } };
     }));
   } catch (error) {
@@ -68,6 +80,7 @@ export function formatClassifierDiagnostic(r: Extract<ClassifierDiagnosticResult
       `  commonRecordIds: ${id.commonRecordIds ?? "n/a"}${id.divergentRecords != null ? ` (divergent ${id.divergentRecords})` : ""}`,
       `  currentAdoptionResult: ${id.adoption}`, `  phase1PreviewResult: ${id.phase1Preview}`,
     ] : ["  unavailable"]),
+    ...("unavailable" in r.dryRun ? [`DRY RUN: unavailable (${r.dryRun.unavailable})`] : [formatDryRun(r.dryRun)]),
     "SAFETY",
     `  diagnosticWrites: ${r.safety.diagnosticWrites}`,
     `  concurrentVaultWriteRisk: ${r.safety.concurrentVaultWriteRisk}`, `  concurrentCanonicalWriteRisk: ${r.safety.concurrentCanonicalWriteRisk} (close other tabs before running)`,

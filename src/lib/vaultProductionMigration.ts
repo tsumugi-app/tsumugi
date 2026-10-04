@@ -124,7 +124,7 @@ export interface ConversationClassification {
  * （Projection Engineは実行のたびに必ず実体を検証するため、baseline等の判断材料に
  * 頼らず安全に収束できる。Phase 3-3のtest群で既に確認済み）。
  */
-async function classifyConversation(root: FileSystemDirectoryHandle, canonical: Conversation): Promise<ConversationClassification> {
+export async function classifyConversation(root: FileSystemDirectoryHandle, canonical: Conversation): Promise<ConversationClassification> {
   const path = `Conversations/${fileNameFor(canonical.id, canonical.startedAt)}`;
   const read = await readTextAt(root, path);
   if (read.state === "error") return { kind: "unreadable", recordId: canonical.id, reason: "markdown-unreadable" };
@@ -193,7 +193,7 @@ export interface MemoryVaultOnlyMember {
  * そのまま再利用する（Conversationの`isLegitimatePredecessor`と同じく、
  * 二重実装しない）。
  */
-async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: string, canonicalMembers: MemoryObject[]): Promise<MemoryMemberClassification[]> {
+export async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: string, canonicalMembers: MemoryObject[]): Promise<MemoryMemberClassification[]> {
   const path = `Memories/${dayFileNameFor(day)}`;
   const read = await readTextAt(root, path);
   if (read.state === "error") {
@@ -284,7 +284,7 @@ interface SingleFileMigrationConfig<T extends { id: string }> {
   isLegitimateSuccessor: ((onDisk: T, canonical: T) => boolean) | null;
 }
 
-async function classifySingleFileRecord<T extends { id: string }>(
+export async function classifySingleFileRecord<T extends { id: string }>(
   root: FileSystemDirectoryHandle,
   canonical: T,
   config: SingleFileMigrationConfig<T>
@@ -339,14 +339,14 @@ function parseSourceMarkdownSafe(text: string): Source | null {
   }
 }
 
-const reflectionMigrationConfig: SingleFileMigrationConfig<MemoryObject> = {
+export const reflectionMigrationConfig: SingleFileMigrationConfig<MemoryObject> = {
   pathFor: (r) => `Memories/${fileNameFor(r.id, r.date)}`,
   toMarkdown: memoryObjectToMarkdown,
   parseMarkdown: parseMemoryObjectMarkdownSafe,
   isLegitimateSuccessor: isMemoryLegitimateSuccessor,
 };
 
-const sourceMigrationConfig: SingleFileMigrationConfig<Source> = {
+export const sourceMigrationConfig: SingleFileMigrationConfig<Source> = {
   pathFor: (s) => `Sources/${fileNameFor(s.id, s.createdAt)}`,
   toMarkdown: sourceToMarkdown,
   parseMarkdown: parseSourceMarkdownSafe,
