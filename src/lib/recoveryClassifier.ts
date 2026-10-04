@@ -26,7 +26,7 @@ import { parseConversationMarkdown, parseSourceMarkdown, inferSourceType } from 
 export type ClassifierLevel = "L0" | "L1" | "L2" | "L3" | "L4" | "L5";
 export type ClassifierRecordType = "conversation" | "memory" | "reflection" | "source";
 export type ClassifierRepairSafety = "AUTO" | "HOLD";
-export type L5Kind = "unreadable" | "malformed";
+export type L5Kind = "unreadable" | "malformed" | "scanIncomplete" | "other";
 
 export interface ClassifiedRecord {
   recordType: string;
@@ -49,14 +49,42 @@ export interface ClassifierSummary {
   levels: {
     L0: number; L1: number; L2: number; L3: number;
     L4: { total: number; conversation: number; source: number; memory: number; reflection: number };
-    L5: { total: number; unreadable: number; malformed: number };
+    L5: { total: number; unreadable: number; malformed: number; scanIncomplete: number; other: number };
   };
   repair: { AUTO: number; HOLD: number };
   futureConflictCopyCandidates: number;
+  /** held分類の合計（L0〜L3 + L4 + L5）。 */
+  classificationTotal: number;
+  /** 分類の合計がraw planのheldCountと一致しない（取りこぼし／二重計上がある）。 */
+  classificationMismatch: boolean;
+  /** held reasonごとの件数（plan-levelの理由も含め、押し込まずにそのまま数える）。 */
+  byReason: Record<string, number>;
+}
+
+/** raw planの全体像。held分類とは別に、plan全体で何が起きているか。 */
+export interface PlanSection {
+  scanCompleted: boolean;
+  issues: number;
+  /** 復旧できる記録の操作（op）の数と、そのmember合計。 */
+  recoverableOps: number;
+  recoverableMembers: number;
+  held: number;
+  /** plan外（Recoveryは何もしない）のVault-only記録の数。 */
+  vaultOnly: number;
+}
+/** 片側のみの記録（件数のみ）。 */
+export interface OneSidedSection {
+  vaultOnly: { total: number; conversation: number; memory: number; reflection: number; source: number };
+  /** 安全にVaultへ復旧できるcanonicalのみの記録（create / create-dayのopのmember）。 */
+  canonicalOnlyRecoverable: { total: number; conversation: number; memory: number; reflection: number; source: number };
+  /** 上記以外の復旧対象（既存記録の不足している管理情報の補修等）。 */
+  otherRecoverable: number;
 }
 
 export interface ClassifierReport {
+  plan: PlanSection;
   summary: ClassifierSummary;
+  oneSided: OneSidedSection;
   records: ClassifiedRecord[];
 }
 
@@ -67,14 +95,17 @@ type Obj = Record<string, unknown>;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 /** held reasonのうち、記録本体ではなく派生情報（Registry / History / index / ledger）の差。 */
-const DERIVED_REASONS = new Set([
-  "registry-entry-differs", "index-differs", "history-row-differs", "ledger-differs",
-  "orphan-registry-key", "registry-identity-mismatch", "metadata-trace-without-confirmed-markdown",
-]);
-const UNREADABLE_REASONS = new Set([
-  "unreadable-or-indeterminate", "scan-incomplete", "record-unavailable", "path-unresolved", "markdown-unreadable", "vault-scan-incomplete",
-]);
+const DERIVED_EXACT = new Set(["orphan-registry-key", "registry-identity-mismatch", "metadata-trace-without-confirmed-markdown"]);
+const isDerivedReason = (reason: string) =>
+  DERIVED_EXACT.has(reason) || (/^(registry|index|history|ledger)-/.test(reason) && !/-(unreadable|malformed)$/.test(reason));
+/** 走査が完了していない（plan全体の理由）。個々の記録の中身は見ていない。 */
+const SCAN_REASONS = new Set(["scan-incomplete", "vault-scan-incomplete"]);
+const UNREADABLE_REASONS = new Set(["unreadable-or-indeterminate", "record-unavailable", "path-unresolved", "markdown-unreadable"]);
+const isUnreadableReason = (reason: string) => UNREADABLE_REASONS.has(reason) || /^(registry|index|history)-(unreadable)$/.test(reason);
 const MALFORMED_REASONS = new Set(["dayfile-unparseable", "strict-read-or-parse-failure", "invalid-local-record"]);
+const isMalformedReason = (reason: string) => MALFORMED_REASONS.has(reason) || /-malformed$/.test(reason);
+/** 記録の中身を比べて意味分類してよい理由。これ以外のplan-levelの理由（not-confirmed / path-collision等）は意味分類しない。 */
+const SEMANTIC_REASONS = new Set(["conflict", "memory-dayfile-merge-required", "markdown-changed", "target-exists-with-other-content"]);
 
 interface Verdict { level: ClassifierLevel; fields: string[]; l5Kind?: L5Kind }
 const v = (level: ClassifierLevel, fields: string[] = [], l5Kind?: L5Kind): Verdict => ({ level, fields, ...(l5Kind ? { l5Kind } : {}) });
@@ -234,10 +265,14 @@ function localOf(snapshot: RecoveryLocalSnapshot, type: string, id: string) {
 
 async function classifyOne(held: { recordType: string; recordId: string; reason: string }, rec: RecoveryRecord | undefined, snapshot: RecoveryLocalSnapshot, read: ReadVaultText): Promise<Verdict> {
   const { reason } = held;
-  if (UNREADABLE_REASONS.has(reason)) return malformedOrUnreadable(rec, "unreadable");
-  if (MALFORMED_REASONS.has(reason)) return v("L5", [], "malformed");
+  if (SCAN_REASONS.has(reason)) return v("L5", [], "scanIncomplete");
+  if (isUnreadableReason(reason)) return malformedOrUnreadable(rec, "unreadable");
+  if (isMalformedReason(reason)) return v("L5", [], "malformed");
+  // plan-levelの理由（not-confirmed / day-has-unresolved-member / path-collision / 未知の理由）は、
+  // 意味分類へ押し込まず、分類できなかったものとして残す。
+  if (!isDerivedReason(reason) && !SEMANTIC_REASONS.has(reason)) return v("L5", [reason], "other");
   if (!rec) return v("L5", [], "unreadable");
-  if (DERIVED_REASONS.has(reason) && rec.classification === "equivalent-existing") return v("L0", [reason]);
+  if (isDerivedReason(reason) && rec.classification === "equivalent-existing") return v("L0", [reason]);
 
   const type = rec.recordType;
   const local = localOf(snapshot, type === "reflection" ? "memory" : type, rec.recordId);
@@ -291,17 +326,48 @@ export async function classifyRawHeld(plan: RecoveryApplyPlan, read: ReadVaultTe
       heldReason: h.reason, differingFields: verdict.fields,
     });
   }
-  return { summary: summarize(records), records };
+  const summary = summarize(records, plan.heldCount, plan.held.length);
+  return { plan: planSection(plan), summary, oneSided: oneSidedSection(plan), records };
 }
 
-export function summarize(records: ClassifiedRecord[]): ClassifierSummary {
+const emptyByType = () => ({ total: 0, conversation: 0, memory: 0, reflection: 0, source: 0 });
+type ByType = ReturnType<typeof emptyByType>;
+const bump = (b: ByType, type: string) => { b.total += 1; if (type in b) (b as unknown as Record<string, number>)[type] += 1; };
+
+function planSection(plan: RecoveryApplyPlan): PlanSection {
+  return {
+    scanCompleted: plan.plan.scanCompleted, issues: plan.plan.issues.length,
+    recoverableOps: plan.ops.length, recoverableMembers: plan.recoverableCount,
+    held: plan.heldCount, vaultOnly: plan.plan.records.filter((r) => r.classification === "vault-only").length,
+  };
+}
+
+/**
+ * Vault-onlyはraw planではplan外（heldでもopでもない）。診断のためだけに、planが既に読んでいる
+ * 走査結果（`plan.plan.records`）から数える。Recovery本体の意味論は変えない。
+ */
+function oneSidedSection(plan: RecoveryApplyPlan): OneSidedSection {
+  const vaultOnly = emptyByType(), canonicalOnly = emptyByType();
+  for (const r of plan.plan.records) if (r.classification === "vault-only") bump(vaultOnly, r.recordType);
+  let createMembers = 0;
+  for (const op of plan.ops) {
+    if (op.kind !== "create" && op.kind !== "create-day") continue;
+    for (const m of op.members) { bump(canonicalOnly, op.recordType === "memory" && isReflectionId(plan, m.id) ? "reflection" : op.recordType); createMembers += 1; }
+  }
+  return { vaultOnly, canonicalOnlyRecoverable: canonicalOnly, otherRecoverable: Math.max(0, plan.recoverableCount - createMembers) };
+}
+const isReflectionId = (plan: RecoveryApplyPlan, id: string) => plan.plan.records.some((r) => r.recordId === id && r.recordType === "reflection");
+
+export function summarize(records: ClassifiedRecord[], heldCount: number = records.length, heldListLength: number = records.length): ClassifierSummary {
   const s: ClassifierSummary = {
-    rawHeldTotal: records.length,
-    levels: { L0: 0, L1: 0, L2: 0, L3: 0, L4: { total: 0, conversation: 0, source: 0, memory: 0, reflection: 0 }, L5: { total: 0, unreadable: 0, malformed: 0 } },
+    rawHeldTotal: heldCount,
+    levels: { L0: 0, L1: 0, L2: 0, L3: 0, L4: { total: 0, conversation: 0, source: 0, memory: 0, reflection: 0 }, L5: { total: 0, unreadable: 0, malformed: 0, scanIncomplete: 0, other: 0 } },
     repair: { AUTO: 0, HOLD: 0 }, futureConflictCopyCandidates: 0,
+    classificationTotal: 0, classificationMismatch: false, byReason: {},
   };
   for (const r of records) {
     s.repair[r.repairSafety] += 1;
+    s.byReason[r.heldReason] = (s.byReason[r.heldReason] ?? 0) + 1;
     if (r.futureConflictCopyCandidate) s.futureConflictCopyCandidates += 1;
     if (r.level === "L4") {
       s.levels.L4.total += 1;
@@ -309,9 +375,12 @@ export function summarize(records: ClassifiedRecord[]): ClassifierSummary {
       if (t in s.levels.L4) s.levels.L4[t] += 1;
     } else if (r.level === "L5") {
       s.levels.L5.total += 1;
-      s.levels.L5[r.l5Kind ?? "unreadable"] += 1;
+      s.levels.L5[r.l5Kind ?? "other"] += 1;
     } else s.levels[r.level] += 1;
   }
+  const l = s.levels;
+  s.classificationTotal = l.L0 + l.L1 + l.L2 + l.L3 + l.L4.total + l.L5.total;
+  s.classificationMismatch = s.classificationTotal !== heldCount || records.length !== heldListLength || heldListLength !== heldCount;
   return s;
 }
 

@@ -2829,3 +2829,48 @@ test("Classifier F7/F8: malformed Tsumugi file → L5 HOLD; unmanaged / hidden a
   const plain = new FakeVault(); plain.put("notes/user-note.md", "# my note\n"); plain.put(".tsumugi-archive/old.md", "---\ntsumugi: true\nid: z\n---\n# a\n");
   assert.equal((await classifyFixture(new FakeDb(), plain)).report.summary.rawHeldTotal, 0);
 });
+
+test("Classifier D/E/F: totals reconcile with raw plan; Vault-only is counted outside the plan; canonical-only recoverable is a separate axis", async () => {
+  const db = new FakeDb(), vault = new FakeVault();
+  const c = conversation("c-conf"); db.conversations.set(c.id, c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "別", timestamp: T }] }));
+  const vo = conversation("v-only", { startedAt: "2026-09-21T09:00:00.000Z" }); vault.put(convPath(vo), markdownMod.conversationToMarkdown(vo));
+  const vs = source("s-vault-only"); vault.put(`Sources/${vaultMod.fileNameFor(vs.id, vs.createdAt)}`, markdownMod.sourceToMarkdown(vs));
+  const co = conversation("c-only", { startedAt: "2026-09-22T09:00:00.000Z" }); db.conversations.set(co.id, co);
+  const { plan, report } = await classifyFixture(db, vault);
+  assert.equal(report.plan.held, plan.heldCount); assert.equal(report.summary.classificationTotal, plan.heldCount);
+  assert.equal(report.summary.classificationMismatch, false);
+  assert.equal(report.plan.vaultOnly, 2); assert.equal(plan.held.some((h) => h.recordId === "v-only"), false, "Vault-only is outside the raw plan");
+  assert.equal(report.oneSided.vaultOnly.total, 2); assert.equal(report.oneSided.vaultOnly.conversation, 1); assert.equal(report.oneSided.vaultOnly.source, 1);
+  assert.equal(report.plan.recoverableOps, plan.ops.length);
+  assert.equal(report.oneSided.canonicalOnlyRecoverable.total, 1); assert.equal(report.oneSided.canonicalOnlyRecoverable.conversation, 1);
+  assert.equal(report.oneSided.otherRecoverable, plan.recoverableCount - 1);
+  const forged = clsMod.summarize(report.records, plan.heldCount + 1, plan.held.length);
+  assert.equal(forged.classificationMismatch, true, "a missing record is reported, not hidden");
+});
+test("Classifier G: plan-level reasons are never forced into semantic L0-L4", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const c = conversation("c1"); db.conversations.set("c1", c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown(c));
+  const { report } = await classifyFixture(db, vault, (p) => {
+    for (const reason of ["not-confirmed", "day-has-unresolved-member", "path-collision", "scan-incomplete", "some-future-reason"]) p.held.push({ recordType: "conversation", recordId: "c1", reason });
+    p.heldCount = p.held.length;
+  });
+  const L5 = report.summary.levels.L5;
+  assert.equal(L5.scanIncomplete, 1); assert.equal(L5.other, 4);
+  assert.equal(report.summary.levels.L0 + report.summary.levels.L1 + report.summary.levels.L2 + report.summary.levels.L3 + report.summary.levels.L4.total, 0);
+  assert.equal(report.summary.classificationMismatch, false);
+});
+test("Classifier: production wiring (locks, raw plan) writes nothing — canonical, identity, Outbox/ledger, Markdown/Registry/History/index, archive, journal", async () => {
+  const w = await wiredFixture(); const diag = require("./recoveryClassifierDiagnostic") as typeof import("./recoveryClassifierDiagnostic");
+  const ledger = async () => JSON.stringify([await repairDb.getVaultSyncState("conversation:x"), await repairDb.getAllConversations(), await repairDb.getAllSources()]);
+  const before = [await w.snapshot(), JSON.stringify(await repairDb.getVaultIdentityRecord()), await ledger()];
+  const result = await withProductionGlobals(() => diag.runClassifierDiagnostic(w.root));
+  assert.deepEqual([await w.snapshot(), JSON.stringify(await repairDb.getVaultIdentityRecord()), await ledger()], before);
+  // The node harness has no raw IndexedDB factory, so the production snapshot read reports "unavailable" here; the lock chain still ran and wrote nothing.
+  if (result.status === "complete") {
+    assert.equal(result.report.summary.classificationMismatch, false); assert.equal(result.safety.diagnosticWrites, 0);
+    const text = diag.formatClassifierDiagnostic(result); assert.ok(text.includes("diagnosticWrites: 0") && text.includes("phase1PreviewResult"));
+  } else assert.ok(result.reason.length > 0);
+  const src = fs.readFileSync("src/lib/recoveryClassifierDiagnostic.ts", "utf8") + fs.readFileSync("src/lib/recoveryClassifier.ts", "utf8");
+  assert.ok(!/\.put\(|\.add\(|\.delete\(|create: true|createWritable|removeEntry|ensureVaultIdentity|establishNewIdentity|writeLedger|setVaultSyncState|markVault/.test(src.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "")));
+});

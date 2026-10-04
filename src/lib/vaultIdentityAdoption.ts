@@ -244,7 +244,20 @@ export interface VaultIdentityEnv {
    * （内容の食い違いはRecoveryの問題であり、世界の取り違えではない）。"user-selectable"（FSA）：従来どおり厳格。
    */
   storageCapability?: VaultStorageCapability;
+  /**
+   * origin-bound保存先での「共通IDがあれば内容が違ってもidentityを確立する」新規則（Phase 1）を使うか。
+   * 既定は`PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED`（今回の診断buildではfalse）。テストと、READ ONLY診断の
+   * 「新規則ならどうなるか」のpreviewだけが明示的にtrueを渡す。production startupは渡さない。
+   */
+  phase1OriginBoundAdoption?: boolean;
 }
+
+/**
+ * Phase 1の新規則（origin-bound + 共通ID >= 1 + 内容差 → identity確立）のproduction既定。
+ * 診断前に保存先の状態を変えないため、現時点のbuildではfalse（従来どおりconflictはheld）。
+ * 診断で状態を確認した後、別commitでtrueにする。
+ */
+export const PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED = false;
 
 export type VaultIdentityEnsureResult =
   | { kind: "identified"; vaultId: string }
@@ -374,7 +387,7 @@ export async function decideVaultIdentityAdoption(env: VaultIdentityEnv): Promis
       // あること自体が「同じ世界」の強い証拠であり（別のVaultを選ぶ手段が無い）、内容の食い違いはRecoveryの問題。
       // identityの確立は拒否しない（食い違ったrecordの処理は、Projection・Recoveryが従来どおり保持する）。
       // ユーザーが選んだフォルダ（FSA）では、フォルダの取り違えが実際に起きるため、従来どおりheld。
-      if ((env.storageCapability ?? getVaultStorageCapability()) === "origin-bound") {
+      if ((env.phase1OriginBoundAdoption ?? PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED) && (env.storageCapability ?? getVaultStorageCapability()) === "origin-bound") {
         return { action: "establish", candidate: preferredCandidate, why: "origin-bound-shared-ids" };
       }
       return { action: "done", result: { kind: "held", reason: evaluation.reason } };
@@ -417,8 +430,10 @@ export interface VaultIdentityPreview {
   indexedDbIdentity: "paired" | "absent";
   /** Vault側（`.tsumugi/vault-identity.json`）の状態。 */
   vaultIdentityFile: "present" | "absent" | "unreadable";
-  /** 今この状態で`ensureVaultIdentityForCurrentWorld`を実行した場合の結果（実行はしない）。 */
+  /** 今のproduction規則で`ensureVaultIdentityForCurrentWorld`を実行した場合の結果（実行はしない）。 */
   adoption: string;
+  /** Phase 1の新規則を有効にした場合の結果（実行はしない）。 */
+  phase1Preview: string;
   /** canonicalとVaultの両方に存在するrecord idの数。identityが確立済みなら計算しない（null）。 */
   commonRecordIds: number | null;
   /** そのうち内容が食い違っているrecordの数。 */
@@ -442,9 +457,11 @@ export async function previewVaultIdentityAdoption(env: VaultIdentityEnv): Promi
   const storageCapability = env.storageCapability ?? getVaultStorageCapability();
   const idb = await getVaultIdentityRecord();
   const file = await readJsonAt(env.root, VAULT_IDENTITY_PATH);
-  const decision = await decideVaultIdentityAdoption(env);
-  const adoption = decision.action === "done" ? (decision.result.kind === "identified" ? "already-paired" : "reason" in decision.result ? `${decision.result.kind}:${decision.result.reason}` : decision.result.kind)
+  const describe = (decision: VaultIdentityDecision) => decision.action === "done" ? (decision.result.kind === "identified" ? "already-paired" : "reason" in decision.result ? `${decision.result.kind}:${decision.result.reason}` : decision.result.kind)
     : decision.action === "pair-existing" ? "would-pair-existing-identity-file" : `would-establish:${decision.why}`;
+  const decision = await decideVaultIdentityAdoption(env);
+  const adoption = describe(decision);
+  const phase1Preview = describe(await decideVaultIdentityAdoption({ ...env, phase1OriginBoundAdoption: true }));
   let evidence: { common: number; divergent: number } | null = null;
   if (!(decision.action === "done" && decision.result.kind === "identified")) {
     try { evidence = await countSharedRecordEvidence(env.root, await loadCanonicalSnapshot()); } catch { evidence = null; }
@@ -452,6 +469,6 @@ export async function previewVaultIdentityAdoption(env: VaultIdentityEnv): Promi
   return {
     storageCapability, indexedDbIdentity: idb?.vaultId ? "paired" : "absent",
     vaultIdentityFile: file.state === "ok" ? "present" : file.state === "absent" ? "absent" : "unreadable",
-    adoption, commonRecordIds: evidence?.common ?? null, divergentRecords: evidence?.divergent ?? null,
+    adoption, phase1Preview, commonRecordIds: evidence?.common ?? null, divergentRecords: evidence?.divergent ?? null,
   };
 }

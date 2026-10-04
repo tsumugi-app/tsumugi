@@ -3,7 +3,7 @@ import { runExplicitMemoryRepair, runExplicitRepairPreflight, runRawHeldMemoryDi
 import { useEffect, useRef, useState } from "react";
 import type { RecoveryApplyPlan } from "../lib/vaultRecoveryApply";
 import { runExplicitMarkdownMismatchDiagnostic, type MarkdownMismatchReport } from "../lib/memoryMarkdownMismatchDiagnostic";
-import { runClassifierDiagnostic, type ClassifierDiagnosticResult } from "../lib/recoveryClassifierDiagnostic";
+import { formatClassifierDiagnostic, runClassifierDiagnostic, type ClassifierDiagnosticResult } from "../lib/recoveryClassifierDiagnostic";
 import { MEMORY_DIAGNOSTIC_MISMATCH, type MemoryDiagnosticResult } from "../lib/recoveryMemoryDiagnostic";
 
 /** Debug-only, existing Plan only. Mount has no IO. A run can be requested once per mount. */
@@ -32,7 +32,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled, cl
     if (disabled || busy || repairRunning.current) return;
     repairRunning.current = true; setBusy(true); setClassified(null);
     try { setClassified(await runClassifierDiagnostic(root)); }
-    catch { setClassified({ status: "unavailable" }); }
+    catch { setClassified({ status: "unavailable", reason: "unexpected-error" }); }
     finally { repairRunning.current = false; setBusy(false); }
   }
   async function checkBeforeRepair() {
@@ -65,23 +65,8 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled, cl
     <div>
       <p>Recovery分類（READ ONLY・件数のみ・本文なし）: rawなheld記録をL0〜L5に分類します。何も変更せず、identityも作成しません。</p>
       <button disabled={disabled || busy} onClick={() => void classifyHeld()}>Recovery分類（READ ONLY）</button>
-      {classified?.status === "unavailable" && <p>分類できませんでした（何も変更していません）。</p>}
-      {classified?.status === "complete" && <pre>{[
-        `raw held total: ${classified.summary.rawHeldTotal}${classified.scanCompleted ? "" : "（走査が不完全）"}`,
-        `L0 derived: ${classified.summary.levels.L0}`, `L1 representation: ${classified.summary.levels.L1}`,
-        `L2 one-sided: ${classified.summary.levels.L2}`, `L3 lossless-merge: ${classified.summary.levels.L3}`,
-        `L4 conflict: ${classified.summary.levels.L4.total} (conversation ${classified.summary.levels.L4.conversation} / source ${classified.summary.levels.L4.source} / memory ${classified.summary.levels.L4.memory} / reflection ${classified.summary.levels.L4.reflection})`,
-        `L5 unreadable/malformed: ${classified.summary.levels.L5.total} (unreadable ${classified.summary.levels.L5.unreadable} / malformed ${classified.summary.levels.L5.malformed})`,
-        `AUTO: ${classified.summary.repair.AUTO} / HOLD: ${classified.summary.repair.HOLD}`,
-        `future conflict-copy candidates (HOLD now): ${classified.summary.futureConflictCopyCandidates}`,
-        "--- identity ---",
-        ...(classified.identity ? [
-          `storage capability: ${classified.identity.storageCapability}`,
-          `vault identity: IndexedDB ${classified.identity.indexedDbIdentity} / Vault file ${classified.identity.vaultIdentityFile}`,
-          `common record ids: ${classified.identity.commonRecordIds ?? "n/a"}${classified.identity.divergentRecords != null ? ` (divergent ${classified.identity.divergentRecords})` : ""}`,
-          `adoption result: ${classified.identity.adoption}`,
-        ] : ["identity: unavailable"]),
-      ].join("\n")}</pre>}
+      {classified?.status === "unavailable" && <p>診断できませんでした（{classified.reason}）。何も変更していません。</p>}
+      {classified?.status === "complete" && <pre>{formatClassifierDiagnostic(classified)}</pre>}
       {!classifyOnly && <>
       <p>修復前チェック（READ ONLY）: 修復と同じ全条件を現在の実データで最後まで評価します。何も変更しません。</p>
       <button disabled={disabled || busy} onClick={() => void checkBeforeRepair()}>修復前チェック（READ ONLY）</button>
