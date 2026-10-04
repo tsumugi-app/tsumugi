@@ -4085,7 +4085,8 @@ function parseTsumugiResyncCandidate(text: string): VaultResyncParsedCandidate |
  * 「本当にsourceTypeが異なる」場合だけを不一致として検出する
  * （sourceType自体を比較対象から外すのではなく、判定基準をparserの実際の挙動に揃える）。
  */
-function normalizedSourceType(source: MemorySource, sourceType: string | undefined): string {
+/** Recoveryの意味比較が使うsourceType正規化（READ ONLY診断も同じものを使う）。 */
+export function normalizedSourceType(source: MemorySource, sourceType: string | undefined): string {
   return sourceType ?? inferSourceType(source);
 }
 

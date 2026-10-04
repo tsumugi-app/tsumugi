@@ -16,16 +16,16 @@ import { getVaultOutboxEntry } from "./db";
 import { vaultOutboxIdFor, buildOutboxEntryForUpdate, type VaultOutboxEntry } from "./vaultOutbox";
 import {
   reconcileConversationOutboxEntry, reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry, reconcileSourceOutboxEntry,
-  registerProjectionDryRun, type ProjectionDryRunOutcome, type ProjectionEnv, type ReconcileConversationResult,
+  registerProjectionDryRun, isMemorySame, isMemoryLegitimateSuccessor, type ProjectionDryRunOutcome, type ProjectionEnv, type ReconcileConversationResult,
 } from "./vaultProjection";
 import { classifyConversation, classifyMemoryDay, classifySingleFileRecord, reflectionMigrationConfig, sourceMigrationConfig } from "./vaultProductionMigration";
 import {
   evaluateConversationEvidence, evaluateMemoryDayEvidence, evaluateReflectionEvidence, evaluateSourceEvidence, loadCanonicalSnapshot,
 } from "./vaultIdentityAdoption";
-import { parseConversationMarkdown, parseFrontmatter, parseMemoryObjectMarkdown, parseMemoryDayFile } from "./markdown";
-import { isReflectionSummary } from "./vault";
+import { parseConversationMarkdown, parseFrontmatter, parseMemoryObjectMarkdown, parseMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
+import { isReflectionSummary, normalizedSourceType, dayFileNameFor } from "./vault";
 import { planRecoveryApply, type RecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
-import { recoveryRecordsSemanticEqual } from "./vaultRecovery";
+import { recoveryRecordsSemanticEqual, parseRecoveryMemoryMarkdown } from "./vaultRecovery";
 import { ShadowVault } from "./shadowVault";
 import type { VaultIdentityRecord } from "./vaultIdentity";
 
@@ -53,10 +53,30 @@ export interface RecordResult {
   history: "noOp" | "wouldUpdate" | "notReached";
   rewriteReason?: RewriteReason;
   lossFields: string[];
+  /** 止まった（または進まなかった）判定。どのproduction判定か（migration / projection / outbox）とそのreasonをそのまま残す。 */
+  stop?: { source: "migration" | "projection" | "outbox"; reason: string };
 }
 export type RewriteReason = "serializationOnly" | "missingTurnTimes" | "frontmatterDifference" | "semanticSuccessor" | "other";
 
+export interface HeldMemoryAnalysis {
+  total: number;
+  path: { projectionNoOp: number; projectionConflict: number; projectionNotReached: number; projectionUpdate: number; other: number };
+  /** `source:reason`（source = migration / projection / outbox）。productionが返したreasonをそのまま数える。 */
+  stopReasons: Record<string, number>;
+  classificationMismatch: boolean;
+  semantic: { recoverySemanticEqual: number; recoverySemanticDifferent: number; unknown: number };
+  fieldDifferences: Record<string, number>;
+  sourceType: { canonicalMissingVaultInferred: number; canonicalPresentDifferent: number; other: number };
+  sourceTypeNormalization: { wouldMatchAfterSourceTypeNormalization: number; wouldStillDiffer: number; unknown: number };
+  projectionComparison: { isMemorySame: number; legitimateSuccessor: number; neither: number; neitherButRecoverySemanticEqual: number; unknown: number };
+  dayFiles: { heldMemoryRecords: number; affectedDayFiles: number; allMembersParseable: number; partiallyParseable: number; unreadable: number };
+}
+export interface StopBreakdown { total: number; byType: ByType; byReason: Record<string, number> }
+
 export interface DryRunReport {
+  conflictBreakdown: StopBreakdown;
+  notReachedBreakdown: StopBreakdown;
+  memoryHeld: HeldMemoryAnalysis;
   divergent: { total: number; byType: ByType; conversation: { timestampOnly: number; roleContent: number; other: number }; reflection: { semanticEqualButIdentityDivergent: number; trueSemanticDifference: number } };
   historyHeld: { total: number; byType: ByType };
   overlap: { divergentAndHistoryHeld: number; divergentOnly: number; historyHeldOnly: number; byType: { divergentAndHistoryHeld: ByType; divergentOnly: ByType; historyHeldOnly: ByType } };
@@ -159,6 +179,108 @@ const layerOf = (path: string): "md" | "registry" | "index" | "history" | "other
 // 本体
 // ---------------------------------------------------------------------------
 
+const SEP = "\n<!-- tsumugi:entry -->\n\n"; // Recoveryのstrict day-file分割と同じ区切り
+const FIELD_OF_KEY: Record<string, string> = {
+  id: "id", types: "types", summary: "summary", createdAt: "createdAt", updatedAt: "updatedAt", links: "links", keywords: "keywords",
+  conversationId: "conversationId", sourceType: "metadata.sourceType", source: "source", sourceDetail: "sourceDetail", aiProvider: "aiProvider",
+  confidence: "confidence", schemaVersion: "schemaVersion", topicId: "topicId", profile: "profile", person: "person", topicEvents: "topicEvents", evidence: "evidence",
+};
+const FIELD_NAMES = ["id", "types", "summary", "content", "createdAt", "updatedAt", "links", "keywords", "conversationId", "metadata.sourceType", "source", "sourceDetail", "aiProvider", "confidence", "schemaVersion", "topicId", "profile", "person", "topicEvents", "evidence", "other"];
+
+/**
+ * History held（history-row-differs）のMemoryだけを追跡する。意味比較・直列化比較・正規化はすべて既存のproduction / Recoveryの関数
+ * （recoveryRecordsSemanticEqual / isMemorySame / isMemoryLegitimateSuccessor / normalizedSourceType / memoryObjectToMarkdown）を使う。値・本文・IDは出さない。
+ */
+async function analyzeHeldMemories(ids: string[], snapshot: Snapshot, resultOf: Map<string, RecordResult>, readReal: (p: string) => Promise<string | null>): Promise<HeldMemoryAnalysis> {
+  const a: HeldMemoryAnalysis = {
+    total: ids.length, path: { projectionNoOp: 0, projectionConflict: 0, projectionNotReached: 0, projectionUpdate: 0, other: 0 }, stopReasons: {}, classificationMismatch: false,
+    semantic: { recoverySemanticEqual: 0, recoverySemanticDifferent: 0, unknown: 0 }, fieldDifferences: Object.fromEntries(FIELD_NAMES.map((n) => [n, 0])),
+    sourceType: { canonicalMissingVaultInferred: 0, canonicalPresentDifferent: 0, other: 0 },
+    sourceTypeNormalization: { wouldMatchAfterSourceTypeNormalization: 0, wouldStillDiffer: 0, unknown: 0 },
+    projectionComparison: { isMemorySame: 0, legitimateSuccessor: 0, neither: 0, neitherButRecoverySemanticEqual: 0, unknown: 0 },
+    dayFiles: { heldMemoryRecords: ids.length, affectedDayFiles: 0, allMembersParseable: 0, partiallyParseable: 0, unreadable: 0 },
+  };
+  const memories = new Map(snapshot.memories.map((m) => [m.id, m]));
+  type Block = { text: string; strict: MemoryObject | null };
+  const dayCache = new Map<string, { raw: string | null; blocks: Block[]; lenient: MemoryObject[] }>();
+  const dayOf = async (path: string) => {
+    let d = dayCache.get(path);
+    if (!d) {
+      const raw = await readReal(path);
+      const blocks: Block[] = (raw ?? "").split(SEP).map((t) => t.trim()).filter(Boolean).map((text) => { let strict: MemoryObject | null = null; try { strict = parseRecoveryMemoryMarkdown(text); } catch { strict = null; } return { text, strict }; });
+      d = { raw, blocks, lenient: raw ? parseMemoryDayFile(raw) : [] };
+      dayCache.set(path, d);
+    }
+    return d;
+  };
+  for (const id of ids) {
+    const r = resultOf.get(id);
+    if (!r) a.path.other += 1;
+    else if (r.verdict === "noOp") a.path.projectionNoOp += 1;
+    else if (r.verdict === "conflict") a.path.projectionConflict += 1;
+    else if (r.verdict === "notReached") a.path.projectionNotReached += 1;
+    else if (r.verdict === "update") a.path.projectionUpdate += 1;
+    else a.path.other += 1;
+    const stopKey = r?.stop ? `${r.stop.source}:${r.stop.reason}` : r ? "none" : "not-evaluated";
+    a.stopReasons[stopKey] = (a.stopReasons[stopKey] ?? 0) + 1;
+
+    const m = memories.get(id);
+    if (!m) { a.semantic.unknown += 1; a.sourceTypeNormalization.unknown += 1; a.projectionComparison.unknown += 1; continue; }
+    const path = `Memories/${dayFileNameFor(m.date)}`;
+    const day = await dayOf(path);
+    const block = day.blocks.find((b) => b.strict?.id === id);
+    const lenient = day.lenient.find((x) => x.id === id);
+
+    if (!block?.strict) a.semantic.unknown += 1;
+    else if (recoveryRecordsSemanticEqual("memory", m, block.strict)) a.semantic.recoverySemanticEqual += 1;
+    else a.semantic.recoverySemanticDifferent += 1;
+
+    if (!lenient) { a.sourceTypeNormalization.unknown += 1; a.projectionComparison.unknown += 1; continue; }
+    const same = isMemorySame(lenient, m), succ = !same && isMemoryLegitimateSuccessor(lenient, m);
+    if (same) a.projectionComparison.isMemorySame += 1;
+    else if (succ) a.projectionComparison.legitimateSuccessor += 1;
+    else { a.projectionComparison.neither += 1; if (block?.strict && recoveryRecordsSemanticEqual("memory", m, block.strict)) a.projectionComparison.neitherButRecoverySemanticEqual += 1; }
+
+    // canonicalをproductionの直列化にかけた結果と、Vaultを読み直して再直列化した結果の、frontmatterのキー単位の差
+    const A = parseFrontmatter(memoryObjectToMarkdown(m)), B = parseFrontmatter(memoryObjectToMarkdown(lenient));
+    const fa = (A?.frontmatter ?? {}) as Fm, fb = (B?.frontmatter ?? {}) as Fm;
+    const differing = new Set<string>();
+    for (const k of new Set([...Object.keys(fa), ...Object.keys(fb)])) if (!same_(fa[k], fb[k])) differing.add(FIELD_OF_KEY[k] ?? "other");
+    if ((A?.body ?? "") !== (B?.body ?? "")) differing.add("content");
+    for (const f of differing) a.fieldDifferences[f] += 1;
+    if (differing.has("metadata.sourceType")) {
+      const rawFm = block ? ((parseFrontmatter(block.text)?.frontmatter ?? {}) as Fm) : {};
+      if (m.metadata.sourceType === undefined && lenient.metadata.sourceType !== undefined && rawFm.sourceType === undefined) a.sourceType.canonicalMissingVaultInferred += 1;
+      else if (m.metadata.sourceType !== undefined && m.metadata.sourceType !== lenient.metadata.sourceType) a.sourceType.canonicalPresentDifferent += 1;
+      else a.sourceType.other += 1;
+    }
+    const normalized: MemoryObject = { ...m, metadata: { ...m.metadata, sourceType: normalizedSourceType(m.metadata.source, m.metadata.sourceType) as MemoryObject["metadata"]["sourceType"] } };
+    if (memoryObjectToMarkdown(lenient) === memoryObjectToMarkdown(normalized)) a.sourceTypeNormalization.wouldMatchAfterSourceTypeNormalization += 1;
+    else a.sourceTypeNormalization.wouldStillDiffer += 1;
+  }
+  for (const d of dayCache.values()) {
+    a.dayFiles.affectedDayFiles += 1;
+    if (!d.raw || d.blocks.length === 0) a.dayFiles.unreadable += 1;
+    else if (d.blocks.every((b) => b.strict)) a.dayFiles.allMembersParseable += 1;
+    else a.dayFiles.partiallyParseable += 1;
+  }
+  const pathTotal = Object.values(a.path).reduce((x, y) => x + y, 0), stopTotal = Object.values(a.stopReasons).reduce((x, y) => x + y, 0);
+  a.classificationMismatch = pathTotal !== a.total || stopTotal !== a.total
+    || a.semantic.recoverySemanticEqual + a.semantic.recoverySemanticDifferent + a.semantic.unknown !== a.total;
+  return a;
+}
+const same_ = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+function stopBreakdown(results: RecordResult[], verdict: RecordResult["verdict"]): StopBreakdown {
+  const b: StopBreakdown = { total: 0, byType: byType(), byReason: {} };
+  for (const r of results) {
+    if (r.verdict !== verdict) continue;
+    b.total += 1; b.byType[r.type] += 1;
+    const key = r.stop ? `${r.stop.source}:${r.stop.reason}` : "unknown";
+    b.byReason[key] = (b.byReason[key] ?? 0) + 1;
+  }
+  return b;
+}
+
 interface Item { type: RT; id: string; record: Conversation | MemoryObject | Source }
 
 export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHandle, rawPlan: RecoveryApplyPlan, deps: DryRunDeps): Promise<{ report: DryRunReport; shadow: ShadowVault; results: RecordResult[]; divergent: DivergentRecord[] }> {
@@ -208,19 +330,20 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
     if (existing && existing.recordUpdatedAt === updatedAt) {
       if (existing.status === "pending") plans.push({ item, entry: existing, bucket: "existingPending" });
       else if (existing.status === "done") plans.push({ item, entry: existing, bucket: "existingDone" });
-      else unreached.push(notReached(item, "other")); // held：bootstrapは再実行しない
+      else unreached.push({ ...notReached(item, "other"), stop: { source: "outbox", reason: "existing-held-outbox" } }); // held：bootstrapは再実行しない
       continue;
     }
-    let kind: string;
+    let kind: string, why: string | undefined;
     try {
-      if (item.type === "conversation") kind = (await classifyConversation(root, item.record as Conversation)).kind;
-      else if (item.type === "memory") kind = (await classifyMemoryDay(root, (item.record as MemoryObject).date.slice(0, 10), [item.record as MemoryObject]))[0]?.kind ?? "unreadable";
-      else if (item.type === "reflection") kind = (await classifySingleFileRecord(root, item.record as MemoryObject, reflectionMigrationConfig)).kind;
-      else kind = (await classifySingleFileRecord(root, item.record as Source, sourceMigrationConfig)).kind;
-    } catch { kind = "unreadable"; }
+      const cls = item.type === "conversation" ? await classifyConversation(root, item.record as Conversation)
+        : item.type === "memory" ? (await classifyMemoryDay(root, (item.record as MemoryObject).date.slice(0, 10), [item.record as MemoryObject]))[0]
+        : item.type === "reflection" ? await classifySingleFileRecord(root, item.record as MemoryObject, reflectionMigrationConfig)
+        : await classifySingleFileRecord(root, item.record as Source, sourceMigrationConfig);
+      kind = cls?.kind ?? "unreadable"; why = (cls as { reason?: string } | undefined)?.reason;
+    } catch { kind = "other"; why = "classification-threw"; }
     if (eligible.has(kind)) plans.push({ item, entry: buildOutboxEntryForUpdate(existing, item.type, item.id, updatedAt, now), bucket: "wouldCreate" });
-    else if (kind === "conflict") unreached.push({ ...notReached(item, "other"), verdict: "conflict", markdown: "conflict" }); // migrationがconflictと判定：outboxは作られず、Projectionへ進まない（Vaultは書かれない）
-    else unreached.push(notReached(item, "other"));
+    else if (kind === "conflict") unreached.push({ ...notReached(item, "other"), verdict: "conflict", markdown: "conflict", stop: { source: "migration", reason: why ?? "migration-conflict" } }); // migrationがconflictと判定：outboxは作られず、Projectionへ進まない（Vaultは書かれない）
+    else unreached.push({ ...notReached(item, "other"), stop: { source: "migration", reason: kind === "unreadable-dayfile" ? "unreadable-dayfile" : `migration-ineligible:${kind}` } });
   }
   const order: Record<string, number> = { existingPending: 0, wouldCreate: 1, existingDone: 2 };
   plans.sort((a, b) => order[a.bucket] - order[b.bucket]);
@@ -248,6 +371,7 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
       index: done("index") ? (w("index").length ? "wouldUpdate" : "noOp") : "notReached",
       history: done("history") ? (w("history").length ? "wouldUpdate" : "noOp") : "notReached",
       lossFields: [],
+      ...(o && o.status !== "done" ? { stop: { source: "projection" as const, reason: o.reason ?? "unknown" } } : {}),
     };
     if (result.markdown === "wouldRewrite" && mdWrite?.before != null) {
       const a = analyzeRewrite(item.type, item.record, mdWrite.before, mdWrite.after);
@@ -316,7 +440,10 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
   const hh = { total: historyHeld.length, byType: byType() };
   for (const h of historyHeld) hh.byType[typeOfHeld(h.recordId)] += 1;
 
+  const heldMemoryIds = historyHeld.filter((h) => typeOfHeld(h.recordId) === "memory").map((h) => h.recordId);
   const report: DryRunReport = {
+    conflictBreakdown: stopBreakdown(results, "conflict"), notReachedBreakdown: stopBreakdown(results, "notReached"),
+    memoryHeld: await analyzeHeldMemories(heldMemoryIds, snapshot, resultOf, readReal),
     divergent: dv, historyHeld: hh, overlap, projection: p, rewriteReasons,
     metadataLoss: { potentialVaultOnlyMetadataLoss: lossRecords, potentialLossFields: lossFields },
     historyPrediction: { ...prediction, expectedRawHeldAfterBootstrap: trustworthy ? afterPlan!.heldCount : "unknown", afterByReason, shadowFidelity: fidelity },
@@ -358,10 +485,32 @@ export function formatDryRun(r: DryRunReport): string {
     `  expectedRawHeldAfterBootstrap: ${h.expectedRawHeldAfterBootstrap}`,
     `  expected held by reason after: ${Object.entries(h.afterByReason).map(([k, n]) => `${k} ${n}`).join(", ") || "-"}`,
     `  shadowFidelity (shadow plan == real plan before any simulated write): ${h.shadowFidelity}`,
+    ...formatBreakdowns(r),
     "DIVERGENT PRESERVATION",
     `  preservedBothSides: ${r.divergentPreservation.preservedBothSides}`,
     `  wouldOverwriteVault: ${r.divergentPreservation.wouldOverwriteVault.total} (semantic ${r.divergentPreservation.wouldOverwriteVault.semantic} / representation ${r.divergentPreservation.wouldOverwriteVault.representation})`,
     `  wouldOverwriteCanonical: ${r.divergentPreservation.wouldOverwriteCanonical} / unknown: ${r.divergentPreservation.unknown}`,
     `  simulatedWrites (memory only, never persisted): ${r.safety.simulatedWritesInMemoryOnly} / canonicalUnchanged: ${r.safety.canonicalUnchanged}`,
   ].join("\n");
+}
+
+const kv = (m: Record<string, number>) => Object.entries(m).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`).join(", ") || "-";
+function formatBreakdowns(r: DryRunReport): string[] {
+  const t = (b: ByType) => `Conversation ${b.conversation} / Memory ${b.memory} / Reflection ${b.reflection} / Source ${b.source}`;
+  const m = r.memoryHeld;
+  return [
+    "PROJECTION CONFLICT BREAKDOWN", `  total: ${r.conflictBreakdown.total}`, `  by type: ${t(r.conflictBreakdown.byType)}`, `  by reason (source:reason): ${kv(r.conflictBreakdown.byReason)}`,
+    "NOT REACHED BREAKDOWN", `  total: ${r.notReachedBreakdown.total}`, `  by type: ${t(r.notReachedBreakdown.byType)}`, `  by reason (source:reason): ${kv(r.notReachedBreakdown.byReason)}`,
+    "HISTORY MEMORY PROJECTION PATH", `  total: ${m.total}`,
+    `  projectionNoOp ${m.path.projectionNoOp} / projectionConflict ${m.path.projectionConflict} / projectionNotReached ${m.path.projectionNotReached} / projectionUpdate ${m.path.projectionUpdate} / other ${m.path.other}`,
+    `  STOP REASONS (source:reason): ${kv(m.stopReasons)}`, `  classificationMismatch: ${m.classificationMismatch}`,
+    "MEMORY SEMANTIC CHECK (Recovery)", `  recoverySemanticEqual ${m.semantic.recoverySemanticEqual} / recoverySemanticDifferent ${m.semantic.recoverySemanticDifferent} / unknown ${m.semantic.unknown}`,
+    "MEMORY FIELD DIFFERENCES (canonical vs Vault re-parsed + re-serialized; field names only)", `  ${kv(m.fieldDifferences)}`,
+    `  metadata.sourceType: canonicalMissingVaultInferred ${m.sourceType.canonicalMissingVaultInferred} / canonicalPresentDifferent ${m.sourceType.canonicalPresentDifferent} / other ${m.sourceType.other}`,
+    "SOURCE TYPE NORMALIZATION TEST (existing Recovery normalization)", `  wouldMatchAfterSourceTypeNormalization ${m.sourceTypeNormalization.wouldMatchAfterSourceTypeNormalization} / wouldStillDiffer ${m.sourceTypeNormalization.wouldStillDiffer} / unknown ${m.sourceTypeNormalization.unknown}`,
+    "PROJECTION COMPARISON", `  isMemorySame ${m.projectionComparison.isMemorySame} / legitimateSuccessor ${m.projectionComparison.legitimateSuccessor} / neither ${m.projectionComparison.neither} / unknown ${m.projectionComparison.unknown}`,
+    `  neitherButRecoverySemanticEqual: ${m.projectionComparison.neitherButRecoverySemanticEqual}`,
+    "MEMORY DAY FILES", `  heldMemoryRecords: ${m.dayFiles.heldMemoryRecords}`, `  affectedDayFiles: ${m.dayFiles.affectedDayFiles}`,
+    `  allMembersParseable ${m.dayFiles.allMembersParseable} / partiallyParseable ${m.dayFiles.partiallyParseable} / unreadable ${m.dayFiles.unreadable}`,
+  ];
 }

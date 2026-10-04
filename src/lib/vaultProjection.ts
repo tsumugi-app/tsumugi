@@ -485,7 +485,7 @@ function memoryEntryMarkdown(m: MemoryObject): string {
   return memoryObjectToMarkdown(m);
 }
 
-function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boolean {
+export function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boolean {
   return memoryEntryMarkdown(onDisk) === memoryEntryMarkdown(canonical);
 }
 

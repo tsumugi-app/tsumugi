@@ -2891,9 +2891,10 @@ const dryDeps = (db: FakeDb, vault: FakeVault) => ({
   readSnapshot: async () => { const s = db.snapshot(); return { conversations: s.conversations, memories: s.memories, sources: s.sources }; },
   planEnv: (root: FileSystemDirectoryHandle) => ({ ...makeEnv(db, vault), root }), now: () => DRY_NOW,
 });
-async function dryRun(db: FakeDb, vault: FakeVault) {
+async function dryRun(db: FakeDb, vault: FakeVault, mutate?: (plan: import("./vaultRecoveryApply").RecoveryApplyPlan) => void) {
   await seedCanonical(db);
   const raw = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  mutate?.(raw);
   const before = JSON.stringify([...vault.files]) + vault.writeCount + JSON.stringify(db.snapshot()) + String(db.journal);
   const outboxKeys = [...db.conversations.keys()].map((i) => `conversation:${i}`).concat([...db.memories.keys()].flatMap((i) => [`memory:${i}`, `reflection:${i}`]), [...db.sources.keys()].map((i) => `source:${i}`));
   const outboxBefore = JSON.stringify(await Promise.all(outboxKeys.map((k) => repairDb.getVaultOutboxEntry(k))));
@@ -3014,4 +3015,55 @@ test("DryRun G: the shadow layer and the dry-run never reach a real write API (s
   assert.ok(!/create: true|removeEntry\(|\.put\(|db\.add\(|db\.delete\(|putVaultOutboxEntry|putMemoryProjectionOutcome|setVaultSyncState|ensureVaultIdentity|establishNewIdentity/.test(src.replace(/async removeEntry\(\)/, "")));
   const proj = fs.readFileSync("src/lib/vaultProjection.ts", "utf8");
   assert.ok(proj.includes("dryRunSinks.get(entry)") && proj.includes("new WeakMap"), "only the entry objects registered by the diagnostic are intercepted");
+});
+
+const heldHistory = (...ids: string[]) => (plan: import("./vaultRecoveryApply").RecoveryApplyPlan) => { for (const id of ids) plan.held.push({ recordType: "memory", recordId: id, reason: "history-row-differs" }); plan.heldCount = plan.held.length; };
+const dayPath = (m: MemoryObject) => `Memories/${vaultMod.dayFileNameFor(m.date)}`;
+const withSourceType = (m: MemoryObject, over: Partial<MemoryObject> = {}) => memory(m.id, { ...over, metadata: { ...m.metadata, sourceType: "ai-capture" as never } });
+
+test("DryRun Memory-A: missing metadata.sourceType -> Recovery semantic equal, Projection 'neither', canonicalMissingVaultInferred, equal after existing normalization", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const m = memory(`ma-${uid()}`, { date: "2026-09-20T00:00:00.000Z" }); db.memories.set(m.id, m);
+  vault.put(dayPath(m), markdownMod.serializeMemoryDayFile([m]));
+  const { report } = await dryRun(db, vault, heldHistory(m.id)); const h = report.memoryHeld;
+  assert.equal(h.semantic.recoverySemanticEqual, 1); assert.equal(h.projectionComparison.neither, 1); assert.equal(h.projectionComparison.neitherButRecoverySemanticEqual, 1);
+  assert.equal(h.sourceType.canonicalMissingVaultInferred, 1); assert.equal(h.fieldDifferences["metadata.sourceType"], 1);
+  assert.equal(h.sourceTypeNormalization.wouldMatchAfterSourceTypeNormalization, 1);
+  assert.deepEqual([h.path.projectionConflict, h.stopReasons["migration:member-content-conflict"]], [1, 1]); assert.equal(h.classificationMismatch, false);
+  assert.equal(report.conflictBreakdown.byType.memory, 1);
+});
+test("DryRun Memory-B: a real content difference still differs after sourceType normalization", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const m = memory(`mb-${uid()}`, { date: "2026-09-20T00:00:00.000Z" }); db.memories.set(m.id, m);
+  vault.put(dayPath(m), markdownMod.serializeMemoryDayFile([{ ...m, content: "別の内容" }]));
+  const h = (await dryRun(db, vault, heldHistory(m.id))).report.memoryHeld;
+  assert.equal(h.semantic.recoverySemanticDifferent, 1); assert.equal(h.sourceTypeNormalization.wouldStillDiffer, 1); assert.equal(h.fieldDifferences.content, 1);
+  assert.ok(!JSON.stringify(h).includes("別の内容"), "no values in the report");
+});
+test("DryRun Memory-C: an updatedAt-only successor is a legitimateSuccessor (and Projection would update it)", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const base = memory(`mc-${uid()}`, { date: "2026-09-20T00:00:00.000Z" });
+  const m = withSourceType(base, { updatedAt: "2026-09-21T00:00:00.000Z" }); db.memories.set(m.id, m);
+  vault.put(dayPath(m), markdownMod.serializeMemoryDayFile([{ ...m, updatedAt: "2026-09-20T09:00:00.000Z" }]));
+  const { report, results } = await dryRun(db, vault, heldHistory(m.id));
+  assert.equal(report.memoryHeld.projectionComparison.legitimateSuccessor, 1); assert.equal(results[0].verdict, "update"); assert.equal(report.memoryHeld.path.projectionUpdate, 1);
+});
+test("DryRun Memory-D: an existing held outbox is reported as the reason a record is not reached", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const m = memory(`md-${uid()}`, { date: "2026-09-20T00:00:00.000Z" }); db.memories.set(m.id, m);
+  vault.put(dayPath(m), markdownMod.serializeMemoryDayFile([m]));
+  const entry = await repairDb.putMemoryObjectWithOutbox(m, "memory", DRY_NOW); await repairDb.putMemoryProjectionOutcome({ ...entry, status: "held", heldReason: "memory-member-conflict" });
+  const { report } = await dryRun(db, vault, heldHistory(m.id));
+  assert.equal(report.notReachedBreakdown.total, 1); assert.equal(report.notReachedBreakdown.byType.memory, 1); assert.equal(report.notReachedBreakdown.byReason["outbox:existing-held-outbox"], 1);
+  assert.equal(report.memoryHeld.path.projectionNotReached, 1); assert.equal(report.memoryHeld.stopReasons["outbox:existing-held-outbox"], 1);
+});
+test("DryRun Memory-E/G: day files are counted separately from records; totals reconcile", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const k = uid();
+  const d1 = ["a", "b", "c"].map((x) => memory(`me1${x}-${k}`, { date: "2026-09-20T00:00:00.000Z", createdAt: `2026-09-20T0${x === "a" ? 1 : x === "b" ? 2 : 3}:00:00.000Z` }));
+  const d2 = memory(`me2-${k}`, { date: "2026-09-21T00:00:00.000Z" });
+  for (const m of [...d1, d2]) db.memories.set(m.id, m);
+  vault.put(dayPath(d1[0]), markdownMod.serializeMemoryDayFile(d1));
+  vault.put(dayPath(d2), markdownMod.serializeMemoryDayFile([d2]) + "\n<!-- tsumugi:entry -->\n\n---\ntsumugi: true\n---\nno id here\n");
+  const { report } = await dryRun(db, vault, heldHistory(d1[0].id, d1[1].id, d2.id)); const f = report.memoryHeld.dayFiles;
+  assert.deepEqual([f.heldMemoryRecords, f.affectedDayFiles, f.allMembersParseable, f.partiallyParseable, f.unreadable], [3, 2, 1, 1, 0]);
+  const c = report.conflictBreakdown, n = report.notReachedBreakdown;
+  assert.equal(c.total, Object.values(c.byReason).reduce((x, y) => x + y, 0)); assert.equal(c.total, Object.values(c.byType).reduce((x, y) => x + y, 0));
+  assert.equal(n.total, Object.values(n.byReason).reduce((x, y) => x + y, 0)); assert.equal(report.memoryHeld.classificationMismatch, false);
+  assert.ok(report.projection.recordsEvaluated === report.projection.noOp + report.projection.update + report.projection.conflict + report.projection.notReached + report.projection.other, "per-record totals reconcile");
 });
