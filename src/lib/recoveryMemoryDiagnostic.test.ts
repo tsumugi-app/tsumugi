@@ -117,7 +117,8 @@ test("UI mount only exposes explicit diagnostic; no normal action invoked", () =
   const ui = fs.readFileSync("src/components/RecoveryMemoryDiagnosticPanel.tsx", "utf8");
   for (const token of ["cleanup(", "applyRecovery(", "planRecoveryApply(", "console.", "navigator.clipboard"]) assert.ok(!ui.includes(token));
   const main = fs.readFileSync("src/components/SettingsPanel.tsx", "utf8");
-  assert.ok(main.includes('showAdvancedVaultTools && (recoveryStatus.kind === "plan"'));
+  assert.ok(main.includes("showAdvancedVaultTools && (\n                <RecoveryMemoryDiagnosticPanel") && main.includes("classifyOnly="), "debug-only; the panel is also reachable (classify-only) when no plan is held");
+  assert.ok(ui.includes("runClassifierDiagnostic(root)") && !ui.includes("ensureVaultIdentity"), "the classifier button never creates identity");
 });
 
 test("all production compared fields accounted for; excluded fields remain excluded", () => {

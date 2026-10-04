@@ -2626,7 +2626,7 @@ test("User repair: nothing to do is not repairable (no plan) and writes nothing"
 // ---------------------------------------------------------------------------
 const bg = require("./recoveryBackgroundCheck") as typeof import("./recoveryBackgroundCheck");
 async function bgCheck(w: Wired, build: string, counter: { scans: number }, fail = false) {
-  return bg.runBackgroundRecoveryCheck(bg.productionRecoveryBackgroundDeps(async () => { counter.scans++; if (fail) throw new Error("scan failed"); return w.confirmedNow(); }, build));
+  return bg.runBackgroundRecoveryCheck(bg.productionRecoveryBackgroundDeps(async () => { counter.scans++; if (fail) throw new Error("scan failed"); return applyMod.planRecoveryApply(w.apply); }, build)); // the raw plan, never the archive-excluded one
 }
 const uiOf = (result: Awaited<ReturnType<typeof bgCheck>>) => { const st = bg.recoveryStatusFromCheck(result); return st ? userView(st) : userView({ kind: "idle" }, { detectionFailed: true }); };
 test("Background A/B: the same build and Vault scan once; a restart does not scan again (persisted)", async () => {
@@ -2654,8 +2654,40 @@ test("Background H: a failed or impossible check stores nothing, claims neither 
   const view = uiOf(failed); assert.deepEqual(view, { kind: "unknown" }); assert.equal(recoveryAllowsLatestFn(view), false);
   assert.equal(await repairDb.getRecoveryCheckMarker(vaultId), undefined, "nothing recorded");
   assert.equal((await bgCheck(w, build, n)).kind, "scanned", "retried and succeeded");
-  const id = (await repairDb.getVaultIdentityRecord())!; const noId = bg.runBackgroundRecoveryCheck({ ...bg.productionRecoveryBackgroundDeps(async () => w.confirmedNow(), build), vaultId: async () => null });
-  assert.equal((await noId).kind, "failed"); void id;
+});
+test("Phase 0: the check key does not depend on identity (world key); an unidentified world is still checked and recorded", async () => {
+  const w = await wiredFixture(), n = { scans: 0 }, build = `w-${Math.random()}`;
+  const id = (await repairDb.getVaultIdentityRecord())!;
+  try {
+    await repairDb.putVaultIdentityRecord({ ...id, vaultId: "" as string });
+    const key = await repairDb.getRecoveryCheckWorldKey();
+    assert.match(key, /^world:\d+$/, "no identity -> origin-bound world key");
+    const first = await bgCheck(w, build, n); assert.equal(first.kind, "scanned"); assert.equal(first.kind === "scanned" && first.clean, false);
+    assert.deepEqual(await repairDb.getRecoveryCheckMarker(key), { build, clean: false });
+    assert.equal((await bgCheck(w, build, n)).kind, "skipped"); assert.equal(n.scans, 1);
+  } finally { await repairDb.putVaultIdentityRecord(id); }
+  assert.equal(await repairDb.getRecoveryCheckWorldKey(), "fixture-identity", "identity present -> vaultId");
+});
+test("Phase 0: clean only from the RAW plan (archived records are never 'clean'; incomplete scan / ops / issues are not clean)", async () => {
+  const w = await wiredFixture(); const raw = await applyMod.planRecoveryApply(w.apply);
+  assert.equal(bg.isRecoveryClean(raw), false);
+  const done = await w.confirmedNow(); // archive-excluded view (5): must not be what decides clean
+  assert.ok(raw.heldCount > done.heldCount);
+  const base = { heldCount: 0, recoverableCount: 0, ops: [] as unknown[], plan: { scanCompleted: true, issues: [] as unknown[] } };
+  assert.equal(bg.isRecoveryClean(base), true);
+  assert.equal(bg.isRecoveryClean({ ...base, plan: { scanCompleted: false, issues: [] } }), false);
+  assert.equal(bg.isRecoveryClean({ ...base, plan: { scanCompleted: true, issues: [{}] } }), false);
+  assert.equal(bg.isRecoveryClean({ ...base, ops: [{}] }), false);
+  assert.equal(bg.isRecoveryClean({ ...base, heldCount: 1 }), false);
+});
+test("Phase 0: states — checking keeps a known issue visible; failed is never blank; texts", () => {
+  const uv = require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView");
+  assert.equal(uv.deriveRecoveryUserView({ kind: "idle" }, { checking: true }).kind, "checking");
+  assert.equal(uv.deriveRecoveryUserView({ kind: "known-issue" }, { checking: true }).kind, "attention");
+  assert.equal(uv.deriveRecoveryUserView({ kind: "idle" }, { detectionFailed: true }).kind, "unknown");
+  assert.ok(uv.RECOVERY_FAILED_TEXT.length > 0);
+  assert.equal(uv.RECOVERY_REPAIRING_TEXT, "保存先を修復しています…");
+  assert.equal(uv.RECOVERY_INCOMPLETE_TEXT, "一部の記録を安全に修復できませんでした。データは保持されています。");
 });
 const recoveryAllowsLatestFn = (require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView")).recoveryAllowsLatest;
 test("Background E: a healthy Vault shows only 'latest' (no Recovery UI)", async () => {
@@ -2696,4 +2728,104 @@ test("Background G: a repair that does not reach a clean re-detection keeps the 
 test("Background: build id and persistence details", () => {
   assert.equal(typeof bg.APP_BUILD_ID, "string");
   const next = fs.readFileSync("next.config.ts", "utf8"); assert.ok(next.includes("NEXT_PUBLIC_APP_BUILD") && next.includes("VERCEL_GIT_COMMIT_SHA"));
+});
+
+// ===========================================================================
+// Phase 2: Recovery Classifier（READ ONLY）
+// ===========================================================================
+const clsMod = require("./recoveryClassifier") as typeof import("./recoveryClassifier");
+async function classifyFixture(db: FakeDb, vault: FakeVault, mutate?: (plan: import("./vaultRecoveryApply").RecoveryApplyPlan) => void) {
+  const plan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  mutate?.(plan);
+  const before = JSON.stringify([...vault.files]) + JSON.stringify(db.snapshot()) + String(db.journal);
+  const report = await clsMod.classifyRawHeld(plan, clsMod.readVaultTextFrom(vault.root()));
+  assert.equal(JSON.stringify([...vault.files]) + JSON.stringify(db.snapshot()) + String(db.journal), before, "classifierは何も書かない");
+  assert.ok(!JSON.stringify(report).includes("テスト発言") && !JSON.stringify(report).includes("素材本文"), "本文を含まない");
+  return { plan, report };
+}
+const convPath = (c: Conversation) => `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
+
+test("Classifier F1: identical → held 0", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const c = conversation("c1"); db.conversations.set("c1", c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown(c));
+  const { report } = await classifyFixture(db, vault);
+  assert.equal(report.summary.rawHeldTotal, 0);
+});
+
+test("Classifier F2: derived-only difference (record equivalent) → L0 / AUTO", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const c = conversation("c1"); db.conversations.set("c1", c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown(c));
+  const { report } = await classifyFixture(db, vault, (p) => { p.held.push({ recordType: "conversation", recordId: "c1", reason: "history-row-differs" }); p.heldCount = 1; });
+  assert.equal(report.summary.levels.L0, 1);
+  assert.equal(report.summary.repair.AUTO, 1);
+});
+
+test("Classifier F3: representation-only (updatedAt only / Link order only) → L1 / AUTO", async () => {
+  const db = new FakeDb(), vault = new FakeVault();
+  const c = conversation("c1"); db.conversations.set("c1", c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown({ ...c, updatedAt: "2026-09-21T00:00:00.000Z" }));
+  const link = (id: string) => ({ id, sourceId: "m1", targetId: "m2", axis: "theme", reason: "r", contrast: false, strength: 0.5, createdBy: "auto-exact", createdAt: T }) as import("./types").Link;
+  const m = memory("m1", { links: [link("l1"), link("l2")] }); db.memories.set("m1", m);
+  vault.put(`Memories/${vaultMod.dayFileNameFor(m.date)}`, markdownMod.serializeMemoryDayFile([{ ...m, links: [link("l2"), link("l1")] }]));
+  const { report } = await classifyFixture(db, vault);
+  assert.equal(report.summary.rawHeldTotal, 2);
+  assert.equal(report.summary.levels.L1, 2, JSON.stringify(report.records));
+  assert.equal(report.summary.repair.HOLD, 0);
+});
+
+test("Classifier F4/F5: Vault-only and canonical-only records are not held", async () => {
+  const db = new FakeDb(), vault = new FakeVault();
+  const vo = conversation("v-only"); vault.put(convPath(vo), markdownMod.conversationToMarkdown(vo));
+  db.conversations.set("c-only", conversation("c-only"));
+  const { report } = await classifyFixture(db, vault);
+  assert.equal(report.summary.rawHeldTotal, 0);
+});
+
+test("Classifier L2: one side extends the other (conversation prefix) → L2 / AUTO", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const c = conversation("c1"); db.conversations.set("c1", c);
+  const longer = { ...c, turns: [...c.turns, { role: "ai" as const, content: "続き", timestamp: T }] };
+  vault.put(convPath(c), markdownMod.conversationToMarkdown(longer));
+  const { report } = await classifyFixture(db, vault);
+  assert.equal(report.records[0].level, "L2"); assert.equal(report.records[0].repairSafety, "AUTO");
+});
+
+test("Classifier L3: Memory links both-unique (lossless union) → L3 / AUTO; same link id with different content → L4", async () => {
+  const link = (id: string, reason = "r") => ({ id, sourceId: "m1", targetId: "m2", axis: "theme", reason, contrast: false, strength: 0.5, createdBy: "auto-exact", createdAt: T }) as import("./types").Link;
+  for (const [vaultLinks, expected] of [[[link("l2")], "L3"], [[link("l1", "別の理由")], "L4"]] as const) {
+    const db = new FakeDb(), vault = new FakeVault();
+    const m = memory("m1", { links: [link("l1")] }); db.memories.set("m1", m);
+    vault.put(`Memories/${vaultMod.dayFileNameFor(m.date)}`, markdownMod.serializeMemoryDayFile([{ ...m, links: [...vaultLinks] }]));
+    const { report } = await classifyFixture(db, vault);
+    assert.equal(report.records[0].level, expected, JSON.stringify(report.records));
+  }
+});
+
+test("Classifier F6a-d: true conflicts by type → L4 / HOLD (Conversation / Source flagged as future conflict-copy candidates)", async () => {
+  const db = new FakeDb(), vault = new FakeVault();
+  const c = conversation("c1"); db.conversations.set("c1", c);
+  vault.put(convPath(c), markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "全く別", timestamp: T }] }));
+  const s = source("s1"); db.sources.set("s1", s);
+  vault.put(`Sources/${vaultMod.fileNameFor("s1", s.createdAt)}`, markdownMod.sourceToMarkdown({ ...s, content: "別の本文" }));
+  const m = memory("m1"); db.memories.set("m1", m);
+  vault.put(`Memories/${vaultMod.dayFileNameFor(m.date)}`, markdownMod.serializeMemoryDayFile([{ ...m, content: "別の内容" }]));
+  const r = reflection("r1"); db.memories.set("r1", r);
+  vault.put(`Memories/${vaultMod.fileNameFor("r1", r.date)}`, markdownMod.memoryObjectToMarkdown({ ...r, summary: "別の要約" }));
+  const { report } = await classifyFixture(db, vault);
+  const L4 = report.summary.levels.L4;
+  assert.deepEqual([L4.conversation, L4.source, L4.memory, L4.reflection], [1, 1, 1, 1], JSON.stringify(report.records));
+  assert.equal(report.summary.repair.HOLD, 4);
+  assert.equal(report.summary.futureConflictCopyCandidates, 2);
+});
+
+test("Classifier F7/F8: malformed Tsumugi file → L5 HOLD; unmanaged / hidden archive files are outside the scan", async () => {
+  const db = new FakeDb(), vault = new FakeVault(); const c = conversation("c1"); db.conversations.set("c1", c);
+  vault.put("Conversations/broken.md", "---\ntsumugi: true\n---\nno id, no recognizable section");
+  vault.put("notes/user-note.md", "# my note\n");
+  vault.put(".tsumugi-archive/old.md", "---\ntsumugi: true\nid: c1\n---\n# archived copy\n");
+  const { report } = await classifyFixture(db, vault);
+  assert.ok(report.summary.rawHeldTotal >= 1);
+  assert.ok(report.records.every((r) => r.level === "L5" && r.repairSafety === "HOLD"), JSON.stringify(report.records));
+  assert.equal(report.summary.levels.L5.total, report.summary.rawHeldTotal);
+  const plain = new FakeVault(); plain.put("notes/user-note.md", "# my note\n"); plain.put(".tsumugi-archive/old.md", "---\ntsumugi: true\nid: z\n---\n# a\n");
+  assert.equal((await classifyFixture(new FakeDb(), plain)).report.summary.rawHeldTotal, 0);
 });

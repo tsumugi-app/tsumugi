@@ -239,9 +239,51 @@ test("Identity F: 共通IDの内容が食い違う → adoption禁止（held）"
   const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
   const differentContent = markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "全く別の内容", timestamp: T }] });
   vault.put(path, differentContent);
-  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault));
+  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault, { storageCapability: "user-selectable" }));
   assert.equal(result.kind, "held");
   assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined, "conflict時はidentityも書かない");
+});
+
+test("Identity F-FSA: user-selectable＋共通IDの内容が食い違う → held（従来どおり。previewも書かない）", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  const c = conversation("id-f-fsa-1");
+  await seedIdbConversation(c);
+  vault.put(`Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`, markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "別", timestamp: T }] }));
+  const env = makeEnv(vault, { storageCapability: "user-selectable" });
+  const preview = await adoptionMod.previewVaultIdentityAdoption(env);
+  assert.equal(preview.commonRecordIds, 1);
+  assert.equal(preview.divergentRecords, 1);
+  assert.match(preview.adoption, /^held/);
+  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined, "previewはidentityを作らない");
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(env)).kind, "held");
+});
+
+test("Identity F-OPFS: origin-bound＋共通IDあり＋内容が食い違う → identity確立（内容差はRecoveryの問題）", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  const c = conversation("id-f-opfs-1");
+  await seedIdbConversation(c);
+  const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
+  const differing = markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "別", timestamp: T }] });
+  vault.put(path, differing);
+  const env = makeEnv(vault, { storageCapability: "origin-bound" });
+  const preview = await adoptionMod.previewVaultIdentityAdoption(env);
+  assert.equal(preview.adoption, "would-establish:origin-bound-shared-ids");
+  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined, "previewはidentityを作らない");
+  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(env);
+  assert.equal(result.kind, "newly-paired");
+  assert.equal(vault.get(path), differing, "食い違ったVault側recordは変更されない");
+});
+
+test("Identity G-OPFS: origin-bound＋共通IDが無い → unrelated（HOLD。identityを作らない）", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  await seedIdbConversation(conversation("id-g-opfs-idb"));
+  vault.put("Conversations/vault-side-only.md", "---\nid: vault-side-only-id\ntsumugi: true\n---\n# 別の会話\n");
+  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault, { storageCapability: "origin-bound" }));
+  assert.equal(result.kind, "unrelated");
+  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined);
 });
 
 test("Identity G: 両側にデータがあるが共通IDが一件も無い → unrelated（adoption禁止）", async () => {

@@ -70,7 +70,7 @@ test("Settingsを開くこととRecovery検査は結びつかない。背景検�
 test("ユーザー向け「修復する」は全ての安全確認を通す入口だけを使う", () => {
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
   const handler = chat.slice(chat.indexOf("async function handleUserRepair()"), chat.indexOf("async function handleExecuteRecoveryApply()"));
-  assert.ok(handler.includes("runNarrowRepairForUser(") && handler.includes("handleExecuteRecoveryApply()") && handler.includes("planRecoveryApplyExcludingArchived") && handler.includes("recordRecoveryCheck("));
+  assert.ok(handler.includes("runNarrowRepairForUser(") && handler.includes("handleExecuteRecoveryApply()") && handler.includes("planRecoveryApply(") && !handler.includes("planRecoveryApplyExcludingArchived") && handler.includes("recordRecoveryCheck("));
   const narrow = strip(fs.readFileSync("src/lib/memoryNarrowRepair.ts", "utf8"));
   const user = narrow.slice(narrow.indexOf("export async function runNarrowRepairForUser"));
   assert.ok(user.includes("runNarrowRepairPreflight(env, confirmed)).allPass") && user.includes("executeNarrowMemoryRepair(env"), "a new repair needs the all-PASS pre-repair check");

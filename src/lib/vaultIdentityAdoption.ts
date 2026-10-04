@@ -21,7 +21,7 @@ import {
 import { VAULT_IDENTITY_RECORD_ID, emptyVaultIdentityRecord, type VaultIdentityRecord } from "./vaultIdentity";
 import type { Conversation, MemoryObject, Source } from "./types";
 import { conversationToMarkdown, parseConversationMarkdown, parseMemoryDayFile, sourceToMarkdown, parseSourceMarkdown } from "./markdown";
-import { fileNameFor, dayFileNameFor, isReflectionSummary, vaultProjectionPrimitives } from "./vault";
+import { fileNameFor, dayFileNameFor, getVaultStorageCapability, isReflectionSummary, vaultProjectionPrimitives, type VaultStorageCapability } from "./vault";
 
 // ---------------------------------------------------------------------------
 // 実体の読み込み（vaultProjection.tsと同じ考え方：ok/absent/errorを区別する。
@@ -238,6 +238,12 @@ export interface VaultIdentityEnv {
   now?: () => string;
   /** テスト・DI用。既定は`crypto.randomUUID()`。 */
   generateVaultId?: () => string;
+  /**
+   * 保存先の性質（端末名ではない）。既定は`getVaultStorageCapability()`。
+   * "origin-bound"（OPFS）：共通のrecord idが存在し内容だけが食い違う場合も、同じ世界の証拠としてidentityを確立できる
+   * （内容の食い違いはRecoveryの問題であり、世界の取り違えではない）。"user-selectable"（FSA）：従来どおり厳格。
+   */
+  storageCapability?: VaultStorageCapability;
 }
 
 export type VaultIdentityEnsureResult =
@@ -304,36 +310,38 @@ async function establishNewIdentity(env: VaultIdentityEnv, candidateVaultId: str
 }
 
 /**
- * 公開API（req 13）。「このIndexedDBは、今のVaultとどう向き合うべきか」を1回の呼び出しで
- * 確定させる。identity file・IndexedDB双方の現在状態（req 7のpartial identityを含む）を
- * 読んでから判断し、安全に書けると証明できた場合にのみ書き込む。
- *
- * 通常のもっとも多い経路（既に確立済みのVaultに、いつも通り接続する）では読み取りだけで
- * 完結し、何も書き込まない（`identified`）。
+ * identityの確立について「何をすべきか」だけを決める（読み取りのみ。何も書かない）。
+ * `ensureVaultIdentityForCurrentWorld`（実行）と`previewVaultIdentityAdoption`（READ ONLY診断）が同じ判断を共有する。
  */
-export async function ensureVaultIdentityForCurrentWorld(env: VaultIdentityEnv): Promise<VaultIdentityEnsureResult> {
+export type VaultIdentityDecision =
+  | { action: "done"; result: VaultIdentityEnsureResult }
+  | { action: "pair-existing"; vaultId: string }
+  /** `candidate`がnullなら、実行時に新しいvaultIdを発行する（IndexedDBに確定済みのidがあればそれを再利用）。 */
+  | { action: "establish"; candidate: string | null; why: "pending-resume" | "empty" | "safe-to-adopt" | "new-empty-vault" | "origin-bound-shared-ids" };
+
+export async function decideVaultIdentityAdoption(env: VaultIdentityEnv): Promise<VaultIdentityDecision> {
   const idbIdentity = await getVaultIdentityRecord();
   const vaultRead = await readJsonAt(env.root, VAULT_IDENTITY_PATH);
 
-  if (vaultRead.state === "error") return { kind: "unreadable", reason: "vault-identity-file-unreadable" };
+  if (vaultRead.state === "error") return { action: "done", result: { kind: "unreadable", reason: "vault-identity-file-unreadable" } };
 
   if (vaultRead.state === "ok") {
     const onDiskVaultId = vaultRead.value.vaultId;
-    if (typeof onDiskVaultId !== "string" || onDiskVaultId.length === 0) return { kind: "unreadable", reason: "vault-identity-malformed" };
-    if (idbIdentity?.vaultId === onDiskVaultId) return { kind: "identified", vaultId: onDiskVaultId }; // 通常の毎回の接続（no-op）
-    if (idbIdentity?.vaultId && idbIdentity.vaultId !== onDiskVaultId) return { kind: "held", reason: "identity-mismatch" }; // req M
+    if (typeof onDiskVaultId !== "string" || onDiskVaultId.length === 0) return { action: "done", result: { kind: "unreadable", reason: "vault-identity-malformed" } };
+    if (idbIdentity?.vaultId === onDiskVaultId) return { action: "done", result: { kind: "identified", vaultId: onDiskVaultId } }; // 通常の毎回の接続（no-op）
+    if (idbIdentity?.vaultId && idbIdentity.vaultId !== onDiskVaultId) return { action: "done", result: { kind: "held", reason: "identity-mismatch" } }; // req M
     if (idbIdentity?.pendingCandidateVaultId && idbIdentity.pendingCandidateVaultId !== onDiskVaultId) {
       // 前回試みていたcandidateとは別のidentityが既にVault側にある＝安全側で保留。
-      return { kind: "held", reason: "unexpected-existing-identity" };
+      return { action: "done", result: { kind: "held", reason: "unexpected-existing-identity" } };
     }
     // req A：Vault identityあり／IndexedDB未pair（またはpendingが同じID）→追いつく。
-    return pairToExistingVaultId(env, onDiskVaultId);
+    return { action: "pair-existing", vaultId: onDiskVaultId };
   }
 
   // vaultRead.state === "absent"
   if (idbIdentity?.pendingCandidateVaultId) {
     // req I/J：前回のadoption試行の続き。同じcandidateで再開する。
-    return establishNewIdentity(env, idbIdentity.pendingCandidateVaultId);
+    return { action: "establish", candidate: idbIdentity.pendingCandidateVaultId, why: "pending-resume" };
   }
 
   // req B：IndexedDBには確定済みvaultIdがあるのに、Vault側にidentity fileが無い。
@@ -344,34 +352,106 @@ export async function ensureVaultIdentityForCurrentWorld(env: VaultIdentityEnv):
   const preferredCandidate = idbIdentity?.vaultId ?? null;
 
   const classification = await classifyVault(env.root);
-  if (classification.kind === "indeterminate") return { kind: "unreadable", reason: classification.reason };
+  if (classification.kind === "indeterminate") return { action: "done", result: { kind: "unreadable", reason: classification.reason } };
   if (classification.kind === "identified") {
     // classifyVaultとreadJsonAtの間でVault側が変化した等、通常起こらないはずのraceだが、
     // 安全側でheldにする。
-    return { kind: "held", reason: "vault-identity-changed-during-check" };
+    return { action: "done", result: { kind: "held", reason: "vault-identity-changed-during-check" } };
   }
 
-  if (classification.kind === "empty") {
-    const candidate = preferredCandidate ?? newVaultId(env);
-    return establishNewIdentity(env, candidate);
-  }
+  if (classification.kind === "empty") return { action: "establish", candidate: preferredCandidate, why: "empty" };
 
   // classification.kind === "legacy"
   const snapshot = await loadCanonicalSnapshot();
   const evaluation = await evaluateLegacyVaultAdoption(env.root, snapshot);
   switch (evaluation.kind) {
     case "safe-to-adopt":
-    case "new-empty-vault": {
-      const candidate = preferredCandidate ?? newVaultId(env);
-      return establishNewIdentity(env, candidate);
-    }
+      return { action: "establish", candidate: preferredCandidate, why: "safe-to-adopt" };
+    case "new-empty-vault":
+      return { action: "establish", candidate: preferredCandidate, why: "new-empty-vault" };
     case "conflict":
-      return { kind: "held", reason: evaluation.reason };
+      // 共通のrecord idが存在し、内容だけが食い違っている。origin固定の保存先（OPFS）では、同じidが両側に
+      // あること自体が「同じ世界」の強い証拠であり（別のVaultを選ぶ手段が無い）、内容の食い違いはRecoveryの問題。
+      // identityの確立は拒否しない（食い違ったrecordの処理は、Projection・Recoveryが従来どおり保持する）。
+      // ユーザーが選んだフォルダ（FSA）では、フォルダの取り違えが実際に起きるため、従来どおりheld。
+      if ((env.storageCapability ?? getVaultStorageCapability()) === "origin-bound") {
+        return { action: "establish", candidate: preferredCandidate, why: "origin-bound-shared-ids" };
+      }
+      return { action: "done", result: { kind: "held", reason: evaluation.reason } };
     case "unrelated-vault":
-      return { kind: "unrelated", reason: evaluation.reason };
+      return { action: "done", result: { kind: "unrelated", reason: evaluation.reason } };
     case "unreadable":
-      return { kind: "unreadable", reason: evaluation.reason };
+      return { action: "done", result: { kind: "unreadable", reason: evaluation.reason } };
     case "insufficient-evidence":
-      return { kind: "held", reason: evaluation.reason };
+      return { action: "done", result: { kind: "held", reason: evaluation.reason } };
   }
+}
+
+/**
+ * 公開API（req 13）。「このIndexedDBは、今のVaultとどう向き合うべきか」を1回の呼び出しで
+ * 確定させる。identity file・IndexedDB双方の現在状態（req 7のpartial identityを含む）を
+ * 読んでから判断し、安全に書けると証明できた場合にのみ書き込む。
+ *
+ * 通常のもっとも多い経路（既に確立済みのVaultに、いつも通り接続する）では読み取りだけで
+ * 完結し、何も書き込まない（`identified`）。
+ */
+export async function ensureVaultIdentityForCurrentWorld(env: VaultIdentityEnv): Promise<VaultIdentityEnsureResult> {
+  const decision = await decideVaultIdentityAdoption(env);
+  switch (decision.action) {
+    case "done":
+      return decision.result;
+    case "pair-existing":
+      return pairToExistingVaultId(env, decision.vaultId);
+    case "establish":
+      return establishNewIdentity(env, decision.candidate ?? newVaultId(env));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// READ ONLY診断：identityの確立をシミュレートするだけ（何も書かない。identityを新規作成しない）
+// ---------------------------------------------------------------------------
+
+export interface VaultIdentityPreview {
+  storageCapability: VaultStorageCapability;
+  /** IndexedDB側のidentityの状態。 */
+  indexedDbIdentity: "paired" | "absent";
+  /** Vault側（`.tsumugi/vault-identity.json`）の状態。 */
+  vaultIdentityFile: "present" | "absent" | "unreadable";
+  /** 今この状態で`ensureVaultIdentityForCurrentWorld`を実行した場合の結果（実行はしない）。 */
+  adoption: string;
+  /** canonicalとVaultの両方に存在するrecord idの数。identityが確立済みなら計算しない（null）。 */
+  commonRecordIds: number | null;
+  /** そのうち内容が食い違っているrecordの数。 */
+  divergentRecords: number | null;
+}
+
+/** 共通のrecord idの数と、内容が食い違うrecordの数（読み取りのみ。「unreadable」は共通とは数えない）。 */
+export async function countSharedRecordEvidence(root: FileSystemDirectoryHandle, snapshot: CanonicalSnapshot): Promise<{ common: number; divergent: number }> {
+  let common = 0, divergent = 0;
+  const tally = (verdict: "match" | "conflict" | "unreadable" | "absent") => {
+    if (verdict === "match") common += 1;
+    else if (verdict === "conflict") { common += 1; divergent += 1; }
+  };
+  for (const c of snapshot.conversations) tally(await evaluateConversationEvidence(root, c));
+  for (const x of snapshot.sources) tally(await evaluateSourceEvidence(root, x));
+  for (const m of snapshot.memories) tally(isReflectionSummary(m) ? await evaluateReflectionEvidence(root, m) : await evaluateMemoryDayEvidence(root, m));
+  return { common, divergent };
+}
+
+export async function previewVaultIdentityAdoption(env: VaultIdentityEnv): Promise<VaultIdentityPreview> {
+  const storageCapability = env.storageCapability ?? getVaultStorageCapability();
+  const idb = await getVaultIdentityRecord();
+  const file = await readJsonAt(env.root, VAULT_IDENTITY_PATH);
+  const decision = await decideVaultIdentityAdoption(env);
+  const adoption = decision.action === "done" ? (decision.result.kind === "identified" ? "already-paired" : "reason" in decision.result ? `${decision.result.kind}:${decision.result.reason}` : decision.result.kind)
+    : decision.action === "pair-existing" ? "would-pair-existing-identity-file" : `would-establish:${decision.why}`;
+  let evidence: { common: number; divergent: number } | null = null;
+  if (!(decision.action === "done" && decision.result.kind === "identified")) {
+    try { evidence = await countSharedRecordEvidence(env.root, await loadCanonicalSnapshot()); } catch { evidence = null; }
+  }
+  return {
+    storageCapability, indexedDbIdentity: idb?.vaultId ? "paired" : "absent",
+    vaultIdentityFile: file.state === "ok" ? "present" : file.state === "absent" ? "absent" : "unreadable",
+    adoption, commonRecordIds: evidence?.common ?? null, divergentRecords: evidence?.divergent ?? null,
+  };
 }

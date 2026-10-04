@@ -164,6 +164,19 @@ export function getVaultBackend(): VaultBackend | null {
 }
 
 /**
+ * 保存先の「世界の決まり方」（storage capability）。端末名ではなく、保存先の性質で区別する。
+ * - "origin-bound"：このoriginに固定された保存先（OPFS）。ユーザーが別のVaultを選べない。IndexedDBとVaultは同じoriginの
+ *   同じ世界にあり、「別のフォルダを選んだ」という取り違えは構造的に起きない。
+ * - "user-selectable"：ユーザーが選んだフォルダ（File System Access）。別フォルダ・別Vaultを選べるため、世界の
+ *   取り違えが実際に起きる。
+ * バックエンドが分からない場合は、厳格な方（user-selectable）として扱う。
+ */
+export type VaultStorageCapability = "origin-bound" | "user-selectable";
+export function getVaultStorageCapability(): VaultStorageCapability {
+  return getVaultBackend() === "opfs" ? "origin-bound" : "user-selectable";
+}
+
+/**
  * OPFSは、`createWritable`があるか、Worker経路で書き込めることを確認できた場合だけ使える。
  * 書き込み方式を確認できなかった端末（例：Workerを作れない、`createSyncAccessHandle`が無い）では、
  * `connected`と表示してしまう偽陽性を避けるため、backendをnull（＝未対応）にする。

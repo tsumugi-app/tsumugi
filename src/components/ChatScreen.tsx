@@ -97,6 +97,7 @@ import { executeOrphanCleanup, planOrphanCleanup, type OrphanCleanupResult, type
 import {
   applyRecovery,
   createRecoveryApplyEnv,
+  planRecoveryApply,
   readRecoveryState,
   type RecoveryApplyResult,
   type RecoveryApplyPlan,
@@ -112,7 +113,7 @@ import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
 import { deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
 import { runNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
-import { productionRecoveryBackgroundDeps, recordRecoveryCheck, recoveryStatusFromCheck, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
+import { isRecoveryClean, productionRecoveryBackgroundDeps, recordRecoveryCheck, recoveryStatusFromCheck, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import {
   VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
   applyVaultStatusCleanup,
@@ -754,6 +755,7 @@ export default function ChatScreen() {
   /** Recovery背景検査（読み取りだけ）。ビルド × Vaultごとに未検査の場合だけ1回。Settingsを開くこととは無関係。 */
   const recoveryDetectionRanRef = useRef(false);
   const [recoveryDetectionFailed, setRecoveryDetectionFailed] = useState(false);
+  const [recoveryChecking, setRecoveryChecking] = useState(false);
   /** 直前の「修復する」が完了しなかった（異常表示を維持し、最新状態と誤表示しない）。 */
   const [userRepairIncomplete, setUserRepairIncomplete] = useState(false);
   /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
@@ -1396,6 +1398,7 @@ export default function ChatScreen() {
     setRecoveryStatus({ kind: "idle" });
     recoveryDetectionRanRef.current = false;
     setRecoveryDetectionFailed(false);
+    setRecoveryChecking(false);
     setUserRepairIncomplete(false);
     setLegacyHeldCleanupStatus({ kind: "idle" });
     setVaultMeasure(null);
@@ -3510,21 +3513,27 @@ export default function ChatScreen() {
     if (recoveryDetectionRanRef.current) return;
     recoveryDetectionRanRef.current = true;
     const generation = vaultGenerationRef.current;
+    // 検査は必ず終わる：待機・再試行は有限回で、尽きたら「failed」を表示する（空白のままにしない）。
+    let idle = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       await new Promise((resolve) => window.setTimeout(resolve, attempt === 0 ? 3000 : 20000));
       if (generation !== vaultGenerationRef.current) return;
-      if (!vaultOperationLockRef.current && !isVaultSwitchingRef.current) break;
-      if (attempt === 3) { recoveryDetectionRanRef.current = false; return; }
+      if (!vaultOperationLockRef.current && !isVaultSwitchingRef.current) { idle = true; break; }
     }
+    if (!idle) { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
+    // 既知の異常がある間は「検査中」で上書きしない（隠さない）。
+    setRecoveryChecking(true);
     try {
       const result = await runBackgroundRecoveryCheck(
-        productionRecoveryBackgroundDeps(() => withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(handle))))
+        // 正常かどうかは必ずrawなplanで決める（archive済みの記録も「解決済み」にはしない）。identityには依存しない。
+        productionRecoveryBackgroundDeps(() => withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(handle))))
       );
       if (generation !== vaultGenerationRef.current) return;
       const checked = recoveryStatusFromCheck(result);
       if (!checked) { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
       setRecoveryDetectionFailed(false);
       const next: RecoveryUiStatus = checked.kind === "plan" ? { kind: "plan", applyPlan: checked.applyPlan, generation } : checked;
+      if (checked.kind === "plan" && checked.applyPlan.recoverableCount > 0) setUserRepairIncomplete(false); // 修復できる記録が見つかれば、ボタンを再び出せる
       // 中断journalの検出（起動時）や実行中の状態は上書きしない。
       setRecoveryStatus((current) => (current.kind === "idle" ? next : current));
     } catch (error) {
@@ -3532,6 +3541,8 @@ export default function ChatScreen() {
       if (handleStaleVaultTabError(error)) return;
       console.error("[Tsumugi] recovery background check failed", error);
       setRecoveryDetectionFailed(true);
+    } finally {
+      if (generation === vaultGenerationRef.current) setRecoveryChecking(false);
     }
   }
 
@@ -3556,9 +3567,9 @@ export default function ChatScreen() {
     try {
       if (!plan && !wasInterrupted) {
         // 再起動後など、planを持っていない場合（過去の検査で異常が確定していた）：このクリックで現在の状態を確認し直す。
-        plan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
+        plan = await withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(vaultHandle)));
         if (generation !== vaultGenerationRef.current) return;
-        if (plan.heldCount === 0 && plan.recoverableCount === 0) {
+        if (isRecoveryClean(plan)) {
           await recordRecoveryCheck(true);
           setRecoveryStatus({ kind: "clean" });
           return;
@@ -3581,9 +3592,10 @@ export default function ChatScreen() {
         await handleExecuteRecoveryApply();
         return;
       }
-      const applyPlan = await withVaultWorldRead(() => planRecoveryApplyExcludingArchived(createRecoveryApplyEnv(vaultHandle)));
+      // 修復後の再検査もrawなplan。archiveへ退避しただけの記録は「解決済み」ではない。
+      const applyPlan = await withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(vaultHandle)));
       if (generation !== vaultGenerationRef.current) return;
-      const anomalies = applyPlan.heldCount > 0 || applyPlan.recoverableCount > 0;
+      const anomalies = !isRecoveryClean(applyPlan);
       setRecoveryStatus(anomalies ? { kind: "plan", applyPlan, generation } : { kind: "clean" });
       await recordRecoveryCheck(!anomalies); // 再検査の結果（正常が確認できた場合だけ「正常」と記録する）
       setUserRepairIncomplete(result.status !== "repaired" || anomalies);
@@ -5682,7 +5694,7 @@ export default function ChatScreen() {
               void handleRunRecoveryDryRun();
             }}
             onExecuteRecoveryApply={() => void handleExecuteRecoveryApply()}
-            recoveryUserView={deriveRecoveryUserView(recoveryStatus, { incomplete: userRepairIncomplete, detectionFailed: recoveryDetectionFailed })}
+            recoveryUserView={deriveRecoveryUserView(recoveryStatus, { incomplete: userRepairIncomplete, detectionFailed: recoveryDetectionFailed, checking: recoveryChecking })}
             onUserRepair={() => void handleUserRepair()}
             legacyHeldCleanupStatus={legacyHeldCleanupStatus}
             onRunLegacyHeldCleanup={() => void handleRunLegacyHeldCleanup()}

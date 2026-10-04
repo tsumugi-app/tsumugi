@@ -21,7 +21,7 @@ import type {
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
 import { recoveryDoneMessage, recoveryHeadingText } from "@/lib/vaultRecoveryUiText";
 import {
-  RECOVERY_ATTENTION_TEXT, RECOVERY_INCOMPLETE_TEXT, RECOVERY_REPAIRING_TEXT, RECOVERY_REPAIR_BUTTON,
+  RECOVERY_ATTENTION_TEXT, RECOVERY_CHECKING_TEXT, RECOVERY_FAILED_TEXT, RECOVERY_INCOMPLETE_TEXT, RECOVERY_REPAIRING_TEXT, RECOVERY_REPAIR_BUTTON,
   recoveryAllowsLatest, type RecoveryUserView,
 } from "@/lib/vaultRecoveryUserView";
 import type { VaultStatusView } from "@/lib/vaultStatus";
@@ -1300,15 +1300,15 @@ export default function SettingsPanel({
             「保存先に確認が必要な記録があります」と「修復する」を出す。診断・修復前チェック・件数・cleanup等の
             詳細は、下の`?debugLog=1`（`showAdvancedVaultTools`）の開発者向けUIにだけある。
           */}
-          {vaultStatus === "connected" && vaultHandle && (recoveryUserView.kind === "attention" || recoveryUserView.kind === "repairing") && (
+          {vaultStatus === "connected" && vaultHandle && (recoveryUserView.kind === "attention" || recoveryUserView.kind === "repairing" || recoveryUserView.kind === "checking" || recoveryUserView.kind === "unknown") && (
             <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               <div className="flex flex-col gap-0.5">
-                <span>{recoveryUserView.kind === "repairing" ? RECOVERY_REPAIRING_TEXT : RECOVERY_ATTENTION_TEXT}</span>
+                <span>{recoveryUserView.kind === "repairing" ? RECOVERY_REPAIRING_TEXT : recoveryUserView.kind === "checking" ? RECOVERY_CHECKING_TEXT : recoveryUserView.kind === "unknown" ? RECOVERY_FAILED_TEXT : RECOVERY_ATTENTION_TEXT}</span>
                 {recoveryUserView.kind === "attention" && recoveryUserView.incomplete && (
                   <span className="text-xs text-red-600 dark:text-red-400">{RECOVERY_INCOMPLETE_TEXT}</span>
                 )}
               </div>
-              {recoveryUserView.kind === "attention" && (
+              {recoveryUserView.kind === "attention" && !recoveryUserView.incomplete && (
                 <button
                   onClick={onUserRepair}
                   disabled={vaultActionsDisabled}
@@ -1353,8 +1353,8 @@ export default function SettingsPanel({
                 </button>
               </div>
 
-              {showAdvancedVaultTools && (recoveryStatus.kind === "plan" || recoveryStatus.kind === "interrupted") && (
-                <RecoveryMemoryDiagnosticPanel key={recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan.plan.completedAt : "interrupted"} plan={recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan : null} root={vaultHandle} disabled={vaultActionsDisabled} />
+              {showAdvancedVaultTools && (
+                <RecoveryMemoryDiagnosticPanel key={recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan.plan.completedAt : recoveryStatus.kind === "interrupted" ? "interrupted" : "classify-only"} plan={recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan : null} root={vaultHandle} disabled={vaultActionsDisabled} classifyOnly={recoveryStatus.kind !== "plan" && recoveryStatus.kind !== "interrupted"} />
               )}
 
               {recoveryStatus.kind === "interrupted" && (

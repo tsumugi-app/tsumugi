@@ -8,8 +8,10 @@
  */
 export const RECOVERY_ATTENTION_TEXT = "保存先に確認が必要な記録があります";
 export const RECOVERY_REPAIR_BUTTON = "修復する";
-export const RECOVERY_REPAIRING_TEXT = "修復しています…";
-export const RECOVERY_INCOMPLETE_TEXT = "修復を完了できませんでした。記録は変更されていないか、元の状態が保持されています。";
+export const RECOVERY_REPAIRING_TEXT = "保存先を修復しています…";
+export const RECOVERY_INCOMPLETE_TEXT = "一部の記録を安全に修復できませんでした。データは保持されています。";
+export const RECOVERY_CHECKING_TEXT = "保存先を確認しています…";
+export const RECOVERY_FAILED_TEXT = "保存先の状態を確認できませんでした。しばらくしてからもう一度お試しください。";
 
 /** `RecoveryUiStatus`（ChatScreen）の、この判定に必要な部分だけ。 */
 export interface RecoveryStatusLike {
@@ -18,16 +20,18 @@ export interface RecoveryStatusLike {
   result?: { held: number; failed: number };
 }
 export type RecoveryUserView =
-  /** まだ検出が済んでいない。「最新の状態です」と言ってはいけない。 */
+  /** まだ検出を始めていない（unknown）。「最新の状態です」と言ってはいけない。 */
   | { kind: "pending" }
+  /** 検査中（checking）。既知の異常があれば隠さず、attentionのまま。 */
+  | { kind: "checking" }
   /** 検出済みで異常なし。Recoveryの表示は無い。 */
   | { kind: "none" }
-  /** 検査できず健全性を判定できなかった。何も表示せず、「最新」とも断定しない。 */
+  /** 検査できず健全性を判定できなかった（failed）。空白のままにせず理由を示し、「最新」とは断定しない。 */
   | { kind: "unknown" }
   | { kind: "attention"; incomplete: boolean }
   | { kind: "repairing" };
 
-export function deriveRecoveryUserView(status: RecoveryStatusLike, options: { incomplete?: boolean; detectionFailed?: boolean } = {}): RecoveryUserView {
+export function deriveRecoveryUserView(status: RecoveryStatusLike, options: { incomplete?: boolean; detectionFailed?: boolean; checking?: boolean } = {}): RecoveryUserView {
   switch (status.kind) {
     case "executing": return { kind: "repairing" };
     case "interrupted":
@@ -42,7 +46,7 @@ export function deriveRecoveryUserView(status: RecoveryStatusLike, options: { in
       return result && (result.held > 0 || result.failed > 0) ? { kind: "attention", incomplete: !!options.incomplete } : { kind: "none" };
     }
     case "clean": return { kind: "none" };
-    default: return options.detectionFailed ? { kind: "unknown" } : { kind: "pending" };
+    default: return options.detectionFailed ? { kind: "unknown" } : options.checking ? { kind: "checking" } : { kind: "pending" };
   }
 }
 

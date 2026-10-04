@@ -1137,7 +1137,16 @@ const VAULT_RECOVERY_JOURNAL_KEY = "vaultRecoveryJournal";
  * （新しいバージョンになったら1回だけ再検査する）、`clean`は検査結果（正常か）。plan本体や件数は保存しない。
  */
 export interface RecoveryCheckMarker { build: string; clean: boolean }
-const recoveryCheckKey = (vaultId: string) => `recoveryCheck:${vaultId}`;
+const recoveryCheckKey = (worldKey: string) => `recoveryCheck:${worldKey}`;
+/**
+ * Recovery検査の記録の鍵。Vault identityがあれば`vaultId`、まだ無ければ（identityが保留の保存先でも検査できるよう）
+ * このorigin・このIndexedDBの世界を表す`world:<activeVaultEpoch>`。identityの有無・端末種別には依存しない。
+ */
+export async function getRecoveryCheckWorldKey(): Promise<string> {
+  const identity = await getVaultIdentityRecord();
+  if (identity?.vaultId) return identity.vaultId;
+  return `world:${await getActiveVaultEpoch()}`;
+}
 export async function getRecoveryCheckMarker(vaultId: string): Promise<RecoveryCheckMarker | undefined> {
   const db = await getDB();
   const raw = await db.get("settings", recoveryCheckKey(vaultId));
