@@ -81,3 +81,57 @@ export function selectConversationReflection(
   if (primary === undefined && (conversation.memoryObjectIds?.length ?? 0) > 0) return undefined; // primary解決中
   return fallback;
 }
+
+/**
+ * Historyの見出し（Conversation History v2）。AI生成のtitleは使わず、「自分が何を話し始めたか」をそのまま
+ * 目印にする：1) Conversationの最初の role === "user" の本文、2) 取得できない場合だけ既存の`Conversation.title`、
+ * 3) それも無ければ既存の最終fallback。保存データは書き換えない（長い場合の短縮は表示側のCSS line clampに任せる）。
+ */
+export function conversationHeading(conversation: Conversation): string {
+  const firstUser = conversation.turns.find((turn) => turn.role === "user" && typeof turn.content === "string" && turn.content.trim());
+  if (firstUser) return firstUser.content.trim();
+  const title = conversation.title?.trim();
+  if (title) return title;
+  return fallbackConversationTitle(conversation);
+}
+
+/** summaryとcontentが実質同じ（空白の違いだけ）なら、同じ文章を二重に表示しない。 */
+export function isEffectivelySameText(a: string, b: string): boolean {
+  const normalize = (text: string) => text.replace(/\s+/g, "");
+  return normalize(a) === normalize(b);
+}
+
+/**
+ * 「会話」Conversationの詳細に出す通常Memory。既存データだけを使う：
+ * - `Conversation.memoryObjectIds`のうち、通常Memory（Reflectionでないもの）。Captureが新規Memoryを作るとき
+ *   `date: conversation.startedAt`を付けるため（capture.ts）、そのMemoryは`startedAt`のUTC日付の日ファイル
+ *   （`Memories/YYYY-MM-DD.md`）にある。その日ファイルを`readDayMembers`（既存の`readMemoriesForDay`）で読み、IDで絞り込む。
+ *   Reflection（1レコード1ファイル、`isReflectionSummary`）は必ず除外する。`readReflectionById`は流用しない。
+ * - 別のConversationのMemory（`conversationId`が違う）は混ぜない。
+ * - `memoryObjectIds`から1件も解決できない旧データだけ、同じ日ファイルから`conversationId`が一致する通常Memoryで補う。
+ * - 「今日」のVault書き込み未完了分は、呼び出し側が渡す今回セッションのMemory（既にReact stateにあるもの）で補う。
+ * 読み取りのみ。新しい関連付け方式・永続化は無い。
+ */
+export async function resolveConversationMemories(
+  conversation: Conversation,
+  readDayMembers: (day: string) => Promise<MemoryObject[]>,
+  sessionMemories: MemoryObject[] = []
+): Promise<MemoryObject[]> {
+  let members: MemoryObject[] = [];
+  try {
+    members = await readDayMembers(conversation.startedAt.slice(0, 10));
+  } catch {
+    members = [];
+  }
+  const pool = new Map<string, MemoryObject>();
+  for (const memory of members) pool.set(memory.id, memory);
+  for (const memory of sessionMemories) if (!pool.has(memory.id)) pool.set(memory.id, memory);
+  const belongs = (memory: MemoryObject) => !isReflectionSummary(memory) && (!memory.conversationId || memory.conversationId === conversation.id);
+  const byIds: MemoryObject[] = [];
+  for (const id of conversation.memoryObjectIds ?? []) {
+    const memory = pool.get(id);
+    if (memory && belongs(memory) && !byIds.some((m) => m.id === id)) byIds.push(memory);
+  }
+  const chosen = byIds.length > 0 ? byIds : [...pool.values()].filter((memory) => !isReflectionSummary(memory) && memory.conversationId === conversation.id);
+  return chosen.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}

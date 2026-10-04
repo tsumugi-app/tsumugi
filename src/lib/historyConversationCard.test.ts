@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { buildReflectionMap, fallbackConversationTitle, resolvePrimaryReflection, selectConversationReflection, type ReflectionPrimaryReaders } from "./historyConversationCard";
+import { buildReflectionMap, conversationHeading, fallbackConversationTitle, isEffectivelySameText, resolveConversationMemories, resolvePrimaryReflection, selectConversationReflection, type ReflectionPrimaryReaders } from "./historyConversationCard";
 import type { Conversation, MemoryObject } from "./types";
 
 const T0 = "2026-09-25T10:00:00.000Z";
@@ -204,7 +204,7 @@ test("H/J: the list has no Reflection preview and Reflection is not a separate H
   const card = panel.slice(panel.indexOf("function ConversationCard("), panel.indexOf("function ConversationCard(") + 2500);
   assert.ok(!/reflection/i.test(card.replace(/\/\*[\s\S]*?\*\//g, "")), "ConversationCard has no Reflection prop, preview or markup");
   assert.ok(!panel.includes("reflection={reflectionByConversationId.get(row.id)}"));
-  assert.ok(panel.includes('memoryRows.filter((row) => row.origin !== "reflection")'), "Reflection rows are still excluded from the memory list");
+  assert.ok(!panel.includes("displayedMemoryRows") && !panel.includes("normalMemoryRows"), "no independent memory list is built any more");
 });
 test("I: 会話全文を見る keeps working (the raw conversation view is untouched)", () => {
   const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
@@ -215,4 +215,71 @@ test("I: 会話全文を見る keeps working (the raw conversation view is untou
 test("Scope: the change stays in History display; no save / Recovery / generation code is touched", () => {
   const src = fs.readFileSync("src/lib/historyConversationCard.ts", "utf8");
   assert.ok(!/putConversation|putMemoryObject|persistCapture|writeMemoryObjectMarkdown|createInsightMemoryObject|\.put\(/.test(src), "read-only, pure logic");
+});
+
+// ---------------------------------------------------------------------------
+// Conversation History v2：Conversation単位の1項目（見出し＝最初のユーザー発言、会話→通常Memory、日記→Reflection）
+// ---------------------------------------------------------------------------
+const TS = (n: number) => `2026-09-25T10:0${n}:00.000Z`;
+const userTurn = (content: string) => ({ role: "user" as const, content, timestamp: T0 });
+const aiTurn = (content: string) => ({ role: "ai" as const, content, timestamp: T0 });
+const mem = (id: string, over: Partial<MemoryObject> = {}): MemoryObject => ({ ...normalMemory(id), conversationId: "CONV-1", summary: `要約-${id}`, content: `内容-${id}`, keywords: [`k-${id}`], createdAt: TS(Number(id.replace(/\D/g, "")) % 9), ...over });
+/** Fake day-file reader; records which days were read. */
+const dayReader = (members: MemoryObject[]) => { const days: string[] = []; return { read: async (day: string) => { days.push(day); return members; }, days }; };
+
+test("F/G/H: heading = the first user message (not the AI title); falls back to the existing title, then the last fallback", () => {
+  const c = conversation({ title: "AIが付けたタイトル", turns: [userTurn("今日は洗車をした。洗車をしたらやはり少し気持ちがいい。"), aiTurn("いいですね")] });
+  assert.equal(conversationHeading(c), "今日は洗車をした。洗車をしたらやはり少し気持ちがいい。");
+  assert.equal(conversationHeading(conversation({ title: undefined, turns: [userTurn("  タイトル無しの発言  ")] })), "タイトル無しの発言", "B: no title, user message exists");
+  assert.notEqual(conversationHeading(c), c.title, "C: differs from the AI title");
+  assert.equal(conversationHeading(conversation({ turns: [aiTurn("先に話しかけたAI"), userTurn("最初のユーザー発言")] })), "最初のユーザー発言", "D: legacy order with the assistant first");
+  assert.equal(conversationHeading(conversation({ title: "保存済みタイトル", turns: [aiTurn("AIだけ")] })), "保存済みタイトル", "E: no user message -> the existing title");
+  assert.equal(conversationHeading(conversation({ title: undefined, turns: [] })), "タイトルなし", "last fallback");
+  const long = "あ".repeat(500); assert.equal(conversationHeading(conversation({ turns: [userTurn(long)] })), long, "stored text is never shortened (display clamps with CSS)");
+});
+test("I/J/K/L/M/N: a conversation's normal Memories come from memoryObjectIds; Reflections and other conversations' Memories are excluded", async () => {
+  const conv = conversation({ id: "CONV-1", memoryObjectIds: ["M1", "R1", "M2"] });
+  const r1 = asReflection({ id: "R1" });
+  const other = mem("M9", { conversationId: "CONV-OTHER" });
+  const day = dayReader([mem("M2"), mem("M1"), r1, other, mem("M3", { conversationId: "CONV-OTHER" })]);
+  const found = await resolveConversationMemories(conv, day.read);
+  assert.deepEqual(found.map((m) => m.id).sort(), ["M1", "M2"], "J: all of the conversation's normal Memories; K/N: the Reflection is excluded; M: other conversations' Memories are not mixed in");
+  assert.deepEqual(day.days, ["2026-09-25"], "the Memory day file is the one of Conversation.startedAt (Capture sets Memory.date = conversation.startedAt)");
+  assert.deepEqual((await resolveConversationMemories(conversation({ memoryObjectIds: ["M1"] }), dayReader([mem("M1")]).read)).map((m) => m.id), ["M1"], "I: one Memory");
+  assert.deepEqual(await resolveConversationMemories(conversation({ memoryObjectIds: [] }), dayReader([]).read), [], "L: zero Memories -> nothing");
+  // a Memory id that points to another conversation's Memory is rejected even if it is listed
+  assert.deepEqual(await resolveConversationMemories(conversation({ id: "CONV-1", memoryObjectIds: ["M9"] }), dayReader([other]).read), []);
+  // legacy: no usable ids -> the same day file's Memories with a matching conversationId
+  const legacy = await resolveConversationMemories(conversation({ id: "CONV-1", memoryObjectIds: [] }), dayReader([mem("M1"), other, r1]).read);
+  assert.deepEqual(legacy.map((m) => m.id), ["M1"]);
+  // today's not-yet-written Memory is supplied from the session state; a read failure does not break the detail
+  const failing = async () => { throw new Error("io"); };
+  assert.deepEqual((await resolveConversationMemories(conversation({ memoryObjectIds: ["M5"] }), failing, [mem("M5")])).map((m) => m.id), ["M5"]);
+});
+test("summary and content that are effectively the same are not shown twice", () => {
+  assert.equal(isEffectivelySameText("今日は  洗車をした", "今日は洗車をした"), true);
+  assert.equal(isEffectivelySameText("要約", "もっと長い内容"), false);
+});
+test("list: only Conversation cards (no independent Memory / Reflection section or card)", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  const list = panel.slice(panel.indexOf("conversationRows.length === 0 ? ("), panel.indexOf("function ConversationCard("));
+  assert.ok(list.includes("<ConversationCard") && !list.includes("MEMORY_TYPE_LABEL") && !list.includes("openMemoryRow") && !/>記憶</.test(list), "A/B/C/D/E: the day list renders ConversationCard only");
+  assert.ok(panel.includes("const displayTitle = full ? conversationHeading(full) : null;") && !panel.includes("full.title?.trim()"), "the card heading is the first user message");
+});
+test("detail: 日記 shows 振り返り (Reflection + keywords), 会話 shows 記憶 (normal Memories); 会話全文を見る is last for both", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  const start = panel.indexOf("selectedConversationTitle}</p>"), end = panel.indexOf("会話全文を見る", start);
+  const detail = panel.slice(start, end);
+  assert.ok(detail.indexOf("selectedConversationReflection") < detail.indexOf("selectedConversationMemories"), "Reflection block, then Memory block, then the raw-view button");
+  assert.ok(detail.includes(">振り返り<") && detail.includes("selectedConversationReflection.keywords") && detail.includes(">記憶<"), "O/P: 振り返り + keywords; I: 記憶");
+  assert.ok(panel.includes('selectedConversationEntryKind === "diary"') && panel.includes('selectedConversationEntryKind === "conversation"'), "N/Q: Reflection only for 日記, normal Memories only for 会話");
+  assert.ok(panel.includes("selectedConversationMemories && selectedConversationMemories.length > 0") && panel.includes("selectedConversationReflection && ("), "L/R: empty sections are not rendered");
+  assert.equal(panel.indexOf("会話全文を見る", end + 10), -1, "S: the raw-view button is the last element");
+});
+test("T: the helpers are read-only and the Reflection effect only runs for 日記", () => {
+  const lib = fs.readFileSync("src/lib/historyConversationCard.ts", "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+  assert.ok(!/putConversation|putMemoryObject|persistCapture|writeMemoryObjectMarkdown|createInsightMemoryObject|readReflectionById|\.put\(/.test(lib), "no writes; readReflectionById is not reused for normal Memories");
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  assert.ok(panel.includes('conversationEntryTypeOf(selectedConversation) !== "diary"') && panel.includes('conversationEntryTypeOf(selectedConversation) !== "conversation"'));
+  assert.ok(panel.includes("readMemoriesForDay(handle, day)"), "normal Memories use the existing day-file reader");
 });

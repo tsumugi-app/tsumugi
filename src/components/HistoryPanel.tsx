@@ -22,7 +22,7 @@ import {
   CONVERSATION_ENTRY_KIND_LABEL,
   type ConversationEntryKind,
 } from "@/lib/conversationEntryKind";
-import { buildReflectionMap, fallbackConversationTitle, resolvePrimaryReflection, selectConversationReflection } from "@/lib/historyConversationCard";
+import { buildReflectionMap, conversationHeading, isEffectivelySameText, resolveConversationMemories, resolvePrimaryReflection, selectConversationReflection } from "@/lib/historyConversationCard";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -323,6 +323,8 @@ export default function HistoryPanel({
    * 解決した結果（解決できなかった場合はnull。キーが無い間は解決中）。READ ONLY。`effect`の非同期読み取り結果からだけ更新する。
    */
   const [primaryReflectionByConversationId, setPrimaryReflectionByConversationId] = useState<Map<string, MemoryObject | null>>(new Map());
+  /** Conversation History v2：「会話」Conversationの詳細に出す通常Memory（`memoryObjectIds`から解決。READ ONLY）。 */
+  const [memoriesByConversationId, setMemoriesByConversationId] = useState<Map<string, MemoryObject[]>>(new Map());
 
   const [monthIndex, setMonthIndex] = useState<HistoryMonthIndex | null>(null);
   /**
@@ -886,7 +888,8 @@ export default function HistoryPanel({
   }, [vaultHandle, conversationRows, memoryRows, fetchedConversationById, fetchedReflectionById]);
 
   useEffect(() => {
-    if (!vaultHandle || !selectedConversation) return;
+    // Reflectionを出すのは「日記」だけ（「会話」には通常Memoryを出す）。
+    if (!vaultHandle || !selectedConversation || conversationEntryTypeOf(selectedConversation) !== "diary") return;
     const conversation = selectedConversation;
     if (primaryReflectionByConversationId.has(conversation.id)) return;
     const handle = vaultHandle;
@@ -899,6 +902,17 @@ export default function HistoryPanel({
       setPrimaryReflectionByConversationId((prev) => new Map(prev).set(conversation.id, found));
     })();
   }, [vaultHandle, selectedConversation, primaryReflectionByConversationId]);
+
+  useEffect(() => {
+    if (!vaultHandle || !selectedConversation || conversationEntryTypeOf(selectedConversation) !== "conversation") return;
+    const conversation = selectedConversation;
+    if (memoriesByConversationId.has(conversation.id)) return;
+    const handle = vaultHandle;
+    void (async () => {
+      const found = await resolveConversationMemories(conversation, (day) => readMemoriesForDay(handle, day), sessionCapturedMemories);
+      setMemoriesByConversationId((prev) => new Map(prev).set(conversation.id, found));
+    })();
+  }, [vaultHandle, selectedConversation, memoriesByConversationId, sessionCapturedMemories]);
 
   /**
    * 一覧行タップ時のオンデマンド詳細読み込み。`full`が既に設定済み（v1 fallbackで
@@ -983,52 +997,6 @@ export default function HistoryPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dayLoading, memoryRows]);
 
-  /**
-   * 「今日」だけの安全な例外的マージ：Vault write未完了でも、既にIndexedDBへ保存済み
-   * （＝ユーザー操作としては完了している）今回セッションのCapture結果を、選択日が
-   * 今日の場合にだけ描画時にマージする。IndexedDBへの新規アクセスは一切発生しない
-   * （sessionCapturedMemoriesは既にChatScreen.tsx側が保持しているReact stateを
-   * そのまま受け取るだけ）。idで重複排除するため、Vault側読み込みが追いついた後に
-   * 二重表示にはならない。
-   */
-  /**
-   * Conversation History（STEP 3、要件11）：Reflection（`origin === "reflection"`）は
-   * もうこの「記憶」一覧の要素として表示しない——Conversation card／detail側へ
-   * `reflectionByConversationId`経由で紐付けて表示する（上記enrichment効果参照）。
-   * ここでは通常Memoryだけに絞り込む。
-   */
-  const normalMemoryRows = useMemo(() => memoryRows.filter((row) => row.origin !== "reflection"), [memoryRows]);
-
-  const displayedMemoryRows = useMemo(() => {
-    if (selectedDay !== todayKey() || sessionCapturedMemories.length === 0) {
-      return normalMemoryRows;
-    }
-    const seenIds = new Set(normalMemoryRows.map((row) => row.id));
-    const todaysSessionRows: MemoryRow[] = sessionCapturedMemories
-      // JST日付モデル Phase 1修正：`memory.date`のLogical Date（JST）で判定する
-      // （以前はUTCベースの`slice(0, 10)`で、JST 0:00〜8:59台に保存された今回
-      // セッションのMemoryが「今日」の一覧から漏れることがあった）。
-      .filter((memory) => jstDateOf(memory.date) === selectedDay && !seenIds.has(memory.id))
-      .map((memory) => ({
-        id: memory.id,
-        types: memory.types,
-        preview: memory.summary,
-        createdAt: memory.createdAt,
-        date: memory.date,
-        origin: "normal" as const,
-        // sessionCapturedMemoriesはIndexedDB由来（まだVault writeが確定していない
-        // 可能性がある）のため、bucketDayはVault書き込み側と同じ規則
-        // （`memoryObject.date.slice(0, 10)`、Storage Bucket＝UTC）で計算する
-        // だけで、実際にそのファイルへ書き込み済みとは限らない（detail readには
-        // 使わない——このrowは常に`full`を持つため、openMemoryRowが`row.bucketDay`を
-        // 使う経路そのものに入らない）。
-        bucketDay: memory.date.slice(0, 10),
-        full: memory,
-      }));
-    if (todaysSessionRows.length === 0) return normalMemoryRows;
-    return [...normalMemoryRows, ...todaysSessionRows].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  }, [normalMemoryRows, selectedDay, sessionCapturedMemories]);
-
   const hasSessionRecordToday = useMemo(
     () => sessionCapturedMemories.some((memory) => jstDateOf(memory.date) === todayKey()),
     [sessionCapturedMemories]
@@ -1087,17 +1055,18 @@ export default function HistoryPanel({
   // 必ず`selectedConversation.persona`（canonical）から導出する（要件5）。titleは
   // 無ければ表示専用fallback（`fallbackConversationTitle`、canonicalへは保存しない）。
   const selectedConversationEntryKind = selectedConversation ? conversationEntryTypeOf(selectedConversation) : null;
-  const selectedConversationTitle = selectedConversation
-    ? selectedConversation.title?.trim() || fallbackConversationTitle(selectedConversation)
-    : null;
+  // Conversation History v2：見出しはAI生成titleではなく、最初のユーザー発言（取得できない場合だけ既存title）。
+  const selectedConversationTitle = selectedConversation ? conversationHeading(selectedConversation) : null;
   // primary（`memoryObjectIds`→Reflection）で解決できなかった場合だけ、既存の`conversationId`関連付けを使う。
-  const selectedConversationReflection = selectedConversation
+  const selectedConversationReflection = selectedConversation && selectedConversationEntryKind === "diary"
     ? selectConversationReflection(
         selectedConversation,
         primaryReflectionByConversationId.get(selectedConversation.id),
         reflectionByConversationId.get(selectedConversation.id)
       )
     : undefined;
+  const selectedConversationMemories =
+    selectedConversation && selectedConversationEntryKind === "conversation" ? memoriesByConversationId.get(selectedConversation.id) : undefined;
 
   const monthGrid = useMemo(() => buildMonthGrid(viewYear, viewMonth), [viewYear, viewMonth]);
 
@@ -1322,9 +1291,11 @@ export default function HistoryPanel({
                         {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
                       </span>
                     </div>
-                    <p className="text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
+                    <p className="whitespace-pre-wrap text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
+                    {/* 日記：Reflection（本文＋既存keywords）。通常Memoryは独立項目として出さない。 */}
                     {selectedConversationReflection && (
-                      <>
+                      <div className="flex flex-col gap-2 pt-2">
+                        <p className="text-xs text-stone-400 dark:text-stone-500">振り返り</p>
                         <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">
                           {selectedConversationReflection.content}
                         </p>
@@ -1339,7 +1310,28 @@ export default function HistoryPanel({
                             </div>
                           </div>
                         )}
-                      </>
+                      </div>
+                    )}
+                    {/* 会話：そのConversationから作られた通常Memory（summary・content・keywords。同じ文章は二重表示しない）。 */}
+                    {selectedConversationMemories && selectedConversationMemories.length > 0 && (
+                      <div className="flex flex-col gap-3 pt-2">
+                        <p className="text-xs text-stone-400 dark:text-stone-500">記憶</p>
+                        {selectedConversationMemories.map((memory) => (
+                          <div key={memory.id} className="flex flex-col gap-1.5">
+                            <p className="whitespace-pre-wrap text-sm text-stone-800 dark:text-stone-100">{memory.summary}</p>
+                            {!isEffectivelySameText(memory.summary, memory.content) && (
+                              <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">{memory.content}</p>
+                            )}
+                            {memory.keywords.length > 0 && (
+                              <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-stone-500 dark:text-stone-400">
+                                {memory.keywords.map((keyword) => (
+                                  <span key={keyword}>{keyword}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
                   <button
@@ -1398,7 +1390,7 @@ export default function HistoryPanel({
                       );
                     })()}
                 </div>
-              ) : conversationRows.length === 0 && displayedMemoryRows.length === 0 ? (
+              ) : conversationRows.length === 0 ? (
                 <p className="text-sm text-stone-400 dark:text-stone-500">この日の記録はありません。</p>
               ) : (
                 <div className="flex flex-col gap-4">
@@ -1413,32 +1405,6 @@ export default function HistoryPanel({
                           loading={!row.full && !fetchedConversationById.has(row.id)}
                           onClick={() => void openConversationRow(row)}
                         />
-                      ))}
-                    </div>
-                  )}
-
-                  {displayedMemoryRows.length > 0 && (
-                    <div className="flex flex-col gap-2">
-                      <p className="text-xs text-stone-400 dark:text-stone-500">記憶</p>
-                      {displayedMemoryRows.map((row) => (
-                        <button
-                          key={row.id}
-                          type="button"
-                          onClick={() => void openMemoryRow(row)}
-                          className="flex flex-col gap-1 rounded-2xl border border-stone-300/70 px-4 py-3 text-left transition hover:border-stone-500 hover:bg-stone-100 dark:border-stone-700/70 dark:hover:border-stone-400 dark:hover:bg-stone-900"
-                        >
-                          <span className="text-sm text-stone-700 dark:text-stone-300">{row.preview}</span>
-                          <span className="flex flex-wrap items-center gap-2 text-[11px] text-stone-400 dark:text-stone-500">
-                            {row.types.map((type) => (
-                              <span
-                                key={type}
-                                className="rounded-full border border-stone-300/60 px-2 py-0.5 dark:border-stone-600/60"
-                              >
-                                {MEMORY_TYPE_LABEL[type] ?? type}
-                              </span>
-                            ))}
-                          </span>
-                        </button>
                       ))}
                     </div>
                   )}
@@ -1474,8 +1440,8 @@ function ConversationCard({
   const time = (full ? jstTimeOf(full.startedAt) : null) ?? jstTimeOfUlid(row.id);
   const entryKind = full ? conversationEntryTypeOf(full) : null;
   const accent = entryKind ? ENTRY_KIND_ACCENT[entryKind] : null;
-  // title欠損時のfallbackは表示専用（canonicalなConversation.titleへは一切保存しない。要件4）。
-  const displayTitle = full ? full.title?.trim() || fallbackConversationTitle(full) : null;
+  // 見出しは最初のユーザー発言（Conversation History v2）。保存データは書き換えない。
+  const displayTitle = full ? conversationHeading(full) : null;
 
   return (
     <button
@@ -1497,7 +1463,7 @@ function ConversationCard({
         Conversation History v1：一覧は entry kind ＋ title だけ。Reflectionのpreviewは出さない
         （Reflectionは詳細を開いたときにだけ読む、Conversationの付属情報）。
       */}
-      <p className="truncate text-sm text-stone-800 dark:text-stone-100">
+      <p className="line-clamp-2 whitespace-pre-wrap break-words text-sm text-stone-800 dark:text-stone-100">
         {displayTitle ?? (loading ? "読み込んでいます…" : "詳細を読み込めませんでした")}
       </p>
     </button>
