@@ -36,7 +36,7 @@ import {
   sourceToMarkdown,
   parseSourceMarkdown,
 } from "./markdown";
-import { isLegitimatePredecessor, isMemoryLegitimateSuccessor } from "./vaultProjection";
+import { isLegitimatePredecessor, isMemoryLegitimateSuccessor, isMemorySame } from "./vaultProjection";
 import type { Conversation, MemoryObject, Source } from "./types";
 
 /**
@@ -213,7 +213,7 @@ export async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: st
   return canonicalMembers.map((canonical) => {
     const onDisk = onDiskById.get(canonical.id);
     if (!onDisk) return { kind: "idb-only" as const, recordId: canonical.id, day };
-    if (memoryObjectToMarkdown(onDisk) === memoryObjectToMarkdown(canonical)) return { kind: "both-same" as const, recordId: canonical.id, day };
+    if (isMemorySame(onDisk, canonical)) return { kind: "both-same" as const, recordId: canonical.id, day };
     if (isMemoryLegitimateSuccessor(onDisk, canonical)) return { kind: "legitimate-successor" as const, recordId: canonical.id, day };
     return { kind: "conflict" as const, recordId: canonical.id, day, reason: "member-content-conflict" };
   });

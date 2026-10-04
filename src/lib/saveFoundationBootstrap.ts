@@ -38,7 +38,7 @@
 import { getVaultIdentityRecord } from "./db";
 import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultIdentityEnsureResult } from "./vaultIdentityAdoption";
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
-import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
+import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
 import { withVaultSaveLock } from "./vaultSaveLock";
@@ -65,6 +65,8 @@ export interface SaveFoundationBootstrapResult {
    */
   migration: ProductionMigrationResult | null;
   reconcile: ReconcileAllRecordTypesResult | null;
+  /** 比較ルールが変わった後に1回だけ行う、過去のheld outboxの再評価。同じルールversionでは再実行されないためnull。 */
+  heldReevaluation: ReconcileAllRecordTypesResult | null;
   /** Phase 3-7.1：done outboxのintegrity検証結果（`reconcileDoneVaultOutboxIntegrity`）。 */
   integrity: ReconcileAllRecordTypesResult | null;
   /** req 9：最終rescan後の追加reconcile（1回だけ。無限loopにしない）。 */
@@ -88,7 +90,7 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     if (identity.kind !== "identified" && identity.kind !== "newly-paired") {
       // req 11：Recoveryへ残すもの（identity conflict／unrelated Vault／読めない
       // 状態）。ここでmigration/reconcileを一切実行しない——1byteも書かない。
-      return { identity, migration: null, reconcile: null, integrity: null, finalReconcile: null };
+      return { identity, migration: null, reconcile: null, heldReevaluation: null, integrity: null, finalReconcile: null };
     }
 
     const vaultIdentityRecord = await getVaultIdentityRecord();
@@ -103,6 +105,9 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     // 5. pending outboxのreconcile（Conversation/Memory/Reflection/Source全種別。
     //    1件のheld/conflictが他recordの処理を止めない。req 10）。
     const reconcile = await reconcilePendingVaultOutbox(projectionEnv);
+
+    // 5b. 比較ルールが変わった場合だけ、過去のルールでheldになったentryを1回再評価する（同じルールversionでは二度と行わない）。
+    const heldReevaluation = await reevaluateHeldOutboxOnce(projectionEnv);
 
     // Phase 3-7.1：done outboxのintegrity検証。「doneだから見ない」は禁止
     // （Phase 3-7.1 req 4）——`status`に関わらず、done entry全件についても
@@ -122,6 +127,6 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     const finalReconcile = await reconcilePendingVaultOutbox(projectionEnv);
 
     // 8. summary返却。
-    return { identity, migration, reconcile, integrity, finalReconcile };
+    return { identity, migration, reconcile, heldReevaluation, integrity, finalReconcile };
   });
 }

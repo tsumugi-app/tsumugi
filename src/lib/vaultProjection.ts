@@ -19,7 +19,7 @@
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
-import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, putVaultOutboxEntry, putMemoryProjectionOutcome } from "./db";
+import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, getHeldVaultOutboxEntries, getProjectionHeldReevaluationMarker, setProjectionHeldReevaluationMarker, putVaultOutboxEntry, putMemoryProjectionOutcome } from "./db";
 import { conversationEntryTypeOf } from "./conversationEntryKind";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
@@ -34,7 +34,7 @@ import {
   sourceToMarkdown,
   parseSourceMarkdown,
 } from "./markdown";
-import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, vaultProjectionPrimitives } from "./vault";
+import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives } from "./vault";
 
 // ---------------------------------------------------------------------------
 // path
@@ -481,8 +481,14 @@ async function withMemoryDayFileLock<T>(day: string, fn: () => Promise<T>): Prom
 // ため、安全側でconflictとして保留する（Conversationのturn内容保護と同じ考え方）。
 // ---------------------------------------------------------------------------
 
+/**
+ * Memoryの「同じ」「Registryのmember hash」「最終verify」の共通の比較基準（`isMemorySame` / migration / final verify / memberHashesが全てこれを使う）。
+ * 直列化は従来どおり厳密に比べるが、`metadata.sourceType`だけは、パーサがVault上で行う推定（未設定→`source`から推定）と
+ * 同じ`normalizedSourceType`で両側を揃えてから直列化する。canonicalの未設定とパーサの推定値の差を意味差として扱わないためで、
+ * 他の項目・明示されたsourceTypeの本当の差は従来どおり不一致になる。実際にVaultへ書くMarkdown（`memoryObjectToMarkdown`）は変えない。
+ */
 function memoryEntryMarkdown(m: MemoryObject): string {
-  return memoryObjectToMarkdown(m);
+  return memoryObjectToMarkdown({ ...m, metadata: { ...m.metadata, sourceType: normalizedSourceType(m.metadata.source, m.metadata.sourceType) as MemoryObject["metadata"]["sourceType"] } });
 }
 
 export function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boolean {
@@ -1238,6 +1244,29 @@ export async function reconcilePendingVaultOutbox(env: ProjectionEnv): Promise<R
  * 増えた場合は、rotating verification・Registry mtimeベースのdirty detection等への
  * 発展余地を残すに留め、今回は実装しない。
  */
+/**
+ * 比較ルールが変わったときに、「過去のルールではheldだった」entryを現在のルールで再評価する（既存の`reconcile*OutboxEntry`をそのまま使う。
+ * 競合は従来どおり上書きせず、再びheldになる）。
+ */
+export async function reconcileHeldVaultOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
+  return reconcileOutboxEntries(env, await getHeldVaultOutboxEntries());
+}
+
+/** held outboxの再評価を行う比較ルールのversion。Projectionの「同じ」の定義を変えたときだけ上げる。 */
+export const PROJECTION_HELD_RULE_VERSION = "memory-sourcetype-normalized-v1";
+
+/**
+ * 現在のルールversionでまだ再評価していなければ、heldを1回だけ再評価して記録する。
+ * 同じversionでは二度と行わない（真の競合のheldを毎起動で再試行しない）。再評価を最後まで終えた後にだけ記録するため、
+ * 途中で中断すれば次回また行う（reconcile自体が冪等）。
+ */
+export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: string = PROJECTION_HELD_RULE_VERSION): Promise<ReconcileAllRecordTypesResult | null> {
+  if (await getProjectionHeldReevaluationMarker(ruleVersion)) return null;
+  const result = await reconcileHeldVaultOutbox(env);
+  await setProjectionHeldReevaluationMarker(ruleVersion, (env.now ?? (() => new Date().toISOString()))());
+  return result;
+}
+
 export async function reconcileDoneVaultOutboxIntegrity(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
   return reconcileOutboxEntries(env, await getDoneVaultOutboxEntries());
 }

@@ -12,11 +12,11 @@
  * そのまま走らせて得る。
  */
 import type { Conversation, MemoryObject, Source } from "./types";
-import { getVaultOutboxEntry } from "./db";
+import { getVaultOutboxEntry, getProjectionHeldReevaluationMarker } from "./db";
 import { vaultOutboxIdFor, buildOutboxEntryForUpdate, type VaultOutboxEntry } from "./vaultOutbox";
 import {
   reconcileConversationOutboxEntry, reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry, reconcileSourceOutboxEntry,
-  registerProjectionDryRun, isMemorySame, isMemoryLegitimateSuccessor, type ProjectionDryRunOutcome, type ProjectionEnv, type ReconcileConversationResult,
+  registerProjectionDryRun, PROJECTION_HELD_RULE_VERSION, isMemorySame, isMemoryLegitimateSuccessor, type ProjectionDryRunOutcome, type ProjectionEnv, type ReconcileConversationResult,
 } from "./vaultProjection";
 import { classifyConversation, classifyMemoryDay, classifySingleFileRecord, reflectionMigrationConfig, sourceMigrationConfig } from "./vaultProductionMigration";
 import {
@@ -45,7 +45,7 @@ export interface DryRunDeps {
 export interface DivergentRecord { type: RT; id: string; detail: string }
 export interface RecordResult {
   type: RT; id: string;
-  bucket: "existingPending" | "existingDone" | "wouldCreate" | "other";
+  bucket: "existingPending" | "existingHeld" | "existingDone" | "wouldCreate" | "other";
   verdict: "noOp" | "update" | "conflict" | "notReached" | "other";
   markdown: "noOp" | "wouldCreate" | "wouldRewrite" | "conflict" | "notReached";
   registry: "noOp" | "wouldUpdate" | "notReached";
@@ -73,7 +73,19 @@ export interface HeldMemoryAnalysis {
 }
 export interface StopBreakdown { total: number; byType: ByType; byReason: Record<string, number> }
 
+export interface PostBootstrapPlan {
+  scanCompleted: boolean; issues: number; recoverableOps: number; recoverableMembers: number; held: number; vaultOnly: number;
+  heldByReason: Record<string, number>;
+  /** 復旧できる記録（op）の内訳：種別（create / create-day / repair）と、まだ必要なstep（markdown / index / history / registry / ledger）。 */
+  recoverableOpsByKind: Record<string, number>;
+  recoverableOpsByPendingStep: Record<string, number>;
+  /** このbootstrapを実際に実行した後のraw Recovery planが完全にcleanか（走査完了・読取問題0・held 0・op 0）。 */
+  wouldBeClean: boolean;
+}
+
 export interface DryRunReport {
+  heldReevaluation: { ruleVersion: string; alreadyDone: boolean };
+  postBootstrap: PostBootstrapPlan | { unavailable: true };
   conflictBreakdown: StopBreakdown;
   notReachedBreakdown: StopBreakdown;
   memoryHeld: HeldMemoryAnalysis;
@@ -86,7 +98,7 @@ export interface DryRunReport {
     registry: { noOp: number; wouldUpdate: number; notReached: number };
     index: { noOp: number; wouldUpdate: number; notReached: number };
     history: { noOp: number; wouldUpdate: number; notReached: number };
-    outbox: { wouldCreate: number; existingPending: number; existingDone: number; other: number };
+    outbox: { wouldCreate: number; existingPending: number; existingHeld: number; existingDone: number; other: number };
   };
   rewriteReasons: Record<RewriteReason, number>;
   metadataLoss: { potentialVaultOnlyMetadataLoss: number; potentialLossFields: Record<string, number> };
@@ -321,6 +333,7 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
 
   // 4) Outboxの状態とmigrationの適格性（bootstrapと同じ順序：migrationがoutboxを作る → pending → done）
   const eligible = new Set(["idb-only", "both-same", "legitimate-successor"]);
+  const heldReevaluationDone = !!(await getProjectionHeldReevaluationMarker(PROJECTION_HELD_RULE_VERSION));
   const plans: { item: Item; entry: VaultOutboxEntry; bucket: RecordResult["bucket"] }[] = [];
   const unreached: RecordResult[] = [];
   const notReached = (item: Item, bucket: RecordResult["bucket"]): RecordResult => ({ type: item.type, id: item.id, bucket, verdict: "notReached", markdown: "notReached", registry: "notReached", index: "notReached", history: "notReached", lossFields: [] });
@@ -330,7 +343,8 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
     if (existing && existing.recordUpdatedAt === updatedAt) {
       if (existing.status === "pending") plans.push({ item, entry: existing, bucket: "existingPending" });
       else if (existing.status === "done") plans.push({ item, entry: existing, bucket: "existingDone" });
-      else unreached.push({ ...notReached(item, "other"), stop: { source: "outbox", reason: "existing-held-outbox" } }); // held：bootstrapは再実行しない
+      else if (!heldReevaluationDone) plans.push({ item, entry: existing, bucket: "existingHeld" }); // 比較ルール変更後の1回限りの再評価（bootstrapと同じ）
+      else unreached.push({ ...notReached(item, "other"), stop: { source: "outbox", reason: "existing-held-outbox" } }); // 再評価済みのheldは再実行しない
       continue;
     }
     let kind: string, why: string | undefined;
@@ -345,7 +359,7 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
     else if (kind === "conflict") unreached.push({ ...notReached(item, "other"), verdict: "conflict", markdown: "conflict", stop: { source: "migration", reason: why ?? "migration-conflict" } }); // migrationがconflictと判定：outboxは作られず、Projectionへ進まない（Vaultは書かれない）
     else unreached.push({ ...notReached(item, "other"), stop: { source: "migration", reason: kind === "unreadable-dayfile" ? "unreadable-dayfile" : `migration-ineligible:${kind}` } });
   }
-  const order: Record<string, number> = { existingPending: 0, wouldCreate: 1, existingDone: 2 };
+  const order: Record<string, number> = { existingPending: 0, wouldCreate: 1, existingHeld: 2, existingDone: 3 }; // bootstrapの順序：migration → pending → held再評価 → done整合確認
   plans.sort((a, b) => order[a.bucket] - order[b.bucket]);
 
   // 5) 実際のreconcileを、shadowに対してそのまま実行する
@@ -389,7 +403,7 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
   const p = { recordsEvaluated: results.length, noOp: 0, update: 0, conflict: 0, notReached: 0, other: 0,
     markdown: { noOp: 0, wouldCreate: 0, wouldRewrite: 0, conflict: 0, notReached: 0 },
     registry: { noOp: 0, wouldUpdate: 0, notReached: 0 }, index: { noOp: 0, wouldUpdate: 0, notReached: 0 }, history: { noOp: 0, wouldUpdate: 0, notReached: 0 },
-    outbox: { wouldCreate: 0, existingPending: 0, existingDone: 0, other: 0 } };
+    outbox: { wouldCreate: 0, existingPending: 0, existingHeld: 0, existingDone: 0, other: 0 } };
   const rewriteReasons: Record<RewriteReason, number> = { serializationOnly: 0, missingTurnTimes: 0, frontmatterDifference: 0, semanticSuccessor: 0, other: 0 };
   const lossFields: Record<string, number> = {}; let lossRecords = 0;
   for (const r of results) {
@@ -441,7 +455,20 @@ export async function runProjectionDryRunWithShadow(root: FileSystemDirectoryHan
   for (const h of historyHeld) hh.byType[typeOfHeld(h.recordId)] += 1;
 
   const heldMemoryIds = historyHeld.filter((h) => typeOfHeld(h.recordId) === "memory").map((h) => h.recordId);
+  const postBootstrap: PostBootstrapPlan | { unavailable: true } = afterPlan ? (() => {
+    const heldByReason: Record<string, number> = {}, byKind: Record<string, number> = {}, byStep: Record<string, number> = {};
+    for (const h of afterPlan.held) heldByReason[h.reason] = (heldByReason[h.reason] ?? 0) + 1;
+    for (const op of afterPlan.ops) {
+      byKind[op.kind] = (byKind[op.kind] ?? 0) + 1;
+      for (const [step, state] of Object.entries(op.steps)) if (state === "pending") byStep[step] = (byStep[step] ?? 0) + 1;
+    }
+    const vaultOnly = afterPlan.plan.records.filter((x) => x.classification === "vault-only").length;
+    return { scanCompleted: afterPlan.plan.scanCompleted, issues: afterPlan.plan.issues.length, recoverableOps: afterPlan.ops.length, recoverableMembers: afterPlan.recoverableCount,
+      held: afterPlan.heldCount, vaultOnly, heldByReason, recoverableOpsByKind: byKind, recoverableOpsByPendingStep: byStep,
+      wouldBeClean: afterPlan.plan.scanCompleted && afterPlan.plan.issues.length === 0 && afterPlan.heldCount === 0 && afterPlan.ops.length === 0 };
+  })() : { unavailable: true };
   const report: DryRunReport = {
+    heldReevaluation: { ruleVersion: PROJECTION_HELD_RULE_VERSION, alreadyDone: heldReevaluationDone }, postBootstrap,
     conflictBreakdown: stopBreakdown(results, "conflict"), notReachedBreakdown: stopBreakdown(results, "notReached"),
     memoryHeld: await analyzeHeldMemories(heldMemoryIds, snapshot, resultOf, readReal),
     divergent: dv, historyHeld: hh, overlap, projection: p, rewriteReasons,
@@ -475,7 +502,7 @@ export function formatDryRun(r: DryRunReport): string {
     `  Registry: noOp ${p.registry.noOp} / wouldUpdate ${p.registry.wouldUpdate} / notReached ${p.registry.notReached}`,
     `  Index: noOp ${p.index.noOp} / wouldUpdate ${p.index.wouldUpdate} / notReached ${p.index.notReached}`,
     `  History: noOp ${p.history.noOp} / wouldUpdate ${p.history.wouldUpdate} / notReached ${p.history.notReached}`,
-    `  Outbox: wouldCreate ${p.outbox.wouldCreate} / existingPending ${p.outbox.existingPending} / existingDone ${p.outbox.existingDone} / other ${p.outbox.other}`,
+    `  Outbox: wouldCreate ${p.outbox.wouldCreate} / existingPending ${p.outbox.existingPending} / existingHeld(re-evaluated) ${p.outbox.existingHeld} / existingDone ${p.outbox.existingDone} / other ${p.outbox.other}`,
     "MARKDOWN REWRITE REASONS",
     `  serializationOnly ${r.rewriteReasons.serializationOnly} / missingTurnTimes ${r.rewriteReasons.missingTurnTimes} / frontmatterDifference ${r.rewriteReasons.frontmatterDifference} / semanticSuccessor ${r.rewriteReasons.semanticSuccessor} / other ${r.rewriteReasons.other}`,
     `  potentialVaultOnlyMetadataLoss: ${r.metadataLoss.potentialVaultOnlyMetadataLoss}`,
@@ -486,6 +513,7 @@ export function formatDryRun(r: DryRunReport): string {
     `  expected held by reason after: ${Object.entries(h.afterByReason).map(([k, n]) => `${k} ${n}`).join(", ") || "-"}`,
     `  shadowFidelity (shadow plan == real plan before any simulated write): ${h.shadowFidelity}`,
     ...formatBreakdowns(r),
+    ...formatPostBootstrap(r),
     "DIVERGENT PRESERVATION",
     `  preservedBothSides: ${r.divergentPreservation.preservedBothSides}`,
     `  wouldOverwriteVault: ${r.divergentPreservation.wouldOverwriteVault.total} (semantic ${r.divergentPreservation.wouldOverwriteVault.semantic} / representation ${r.divergentPreservation.wouldOverwriteVault.representation})`,
@@ -512,5 +540,17 @@ function formatBreakdowns(r: DryRunReport): string[] {
     `  neitherButRecoverySemanticEqual: ${m.projectionComparison.neitherButRecoverySemanticEqual}`,
     "MEMORY DAY FILES", `  heldMemoryRecords: ${m.dayFiles.heldMemoryRecords}`, `  affectedDayFiles: ${m.dayFiles.affectedDayFiles}`,
     `  allMembersParseable ${m.dayFiles.allMembersParseable} / partiallyParseable ${m.dayFiles.partiallyParseable} / unreadable ${m.dayFiles.unreadable}`,
+  ];
+}
+
+function formatPostBootstrap(r: DryRunReport): string[] {
+  const b = r.postBootstrap;
+  const head = `HELD OUTBOX RE-EVALUATION (rule ${r.heldReevaluation.ruleVersion}): ${r.heldReevaluation.alreadyDone ? "already done (not re-run)" : "would run once"}`;
+  if ("unavailable" in b) return [head, "POST-BOOTSTRAP RAW PLAN: unavailable"];
+  return [
+    head, "POST-BOOTSTRAP RAW PLAN (simulated bootstrap, raw plan, archive exclusion not applied)",
+    `  scanCompleted: ${b.scanCompleted}`, `  issues: ${b.issues}`, `  recoverableOps: ${b.recoverableOps} (members ${b.recoverableMembers})`, `  held: ${b.held}`, `  vaultOnly: ${b.vaultOnly}`,
+    `  held by reason: ${kv(b.heldByReason)}`, `  recoverableOps by kind: ${kv(b.recoverableOpsByKind)}`, `  recoverableOps by pending step: ${kv(b.recoverableOpsByPendingStep)}`,
+    `  wouldBeClean: ${b.wouldBeClean}`,
   ];
 }

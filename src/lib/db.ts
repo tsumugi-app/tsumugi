@@ -591,6 +591,27 @@ export async function getPendingVaultOutboxEntries(): Promise<VaultOutboxEntry[]
   return db.getAllFromIndex("vaultOutbox", "by-status", "pending");
 }
 
+/** held entryの一覧（`by-status`インデックス。bootstrapの「ルール変更後の1回限りの再評価」専用）。 */
+export async function getHeldVaultOutboxEntries(): Promise<VaultOutboxEntry[]> {
+  const db = await getDB();
+  return db.getAllFromIndex("vaultOutbox", "by-status", "held");
+}
+
+/**
+ * Projectionの比較ルールのversionごとに「held outboxを再評価済みか」を記録する（settingsの1キー。DB schema変更なし）。
+ * ルールが変わらない限り、heldは毎起動では再試行されない。
+ */
+const projectionHeldReevaluationKey = (ruleVersion: string) => `projectionHeldReevaluated:${ruleVersion}`;
+export async function getProjectionHeldReevaluationMarker(ruleVersion: string): Promise<string | undefined> {
+  const db = await getDB();
+  const raw = await db.get("settings", projectionHeldReevaluationKey(ruleVersion));
+  return typeof raw === "string" ? raw : undefined;
+}
+export async function setProjectionHeldReevaluationMarker(ruleVersion: string, at: string): Promise<void> {
+  const db = await getDB();
+  await db.put("settings", at, projectionHeldReevaluationKey(ruleVersion));
+}
+
 /**
  * Phase 3-7.1：`status:"done"`のentry一覧（done outbox integrity検証専用）。
  * `by-status`は同じ`status`フィールド上のindexのため、"pending"と同じくindexed
