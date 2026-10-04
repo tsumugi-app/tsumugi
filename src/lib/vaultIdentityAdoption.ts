@@ -254,10 +254,10 @@ export interface VaultIdentityEnv {
 
 /**
  * Phase 1の新規則（origin-bound + 共通ID >= 1 + 内容差 → identity確立）のproduction既定。
- * 診断前に保存先の状態を変えないため、現時点のbuildではfalse（従来どおりconflictはheld）。
- * 診断で状態を確認した後、別commitでtrueにする。
+ * 有効化済み（Android実機でdry-runにより、確立後のbootstrapがconflictを上書きせず、最終的なraw Recovery planがcleanになる
+ * ことを確認した後）。効くのはorigin-bound（OPFS）の保存先だけで、user-selectable（FSA）は従来どおり厳格。
  */
-export const PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED = false;
+export const PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED = true;
 
 export type VaultIdentityEnsureResult =
   | { kind: "identified"; vaultId: string }

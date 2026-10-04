@@ -3149,7 +3149,7 @@ test("Held B: stale held + now a legitimate successor goes through the existing 
 test("Held: bootstrap runs the one-time held pass right after the pending reconcile, and records the rule version", () => {
   const src = fs.readFileSync("src/lib/saveFoundationBootstrap.ts", "utf8");
   assert.ok(/reconcilePendingVaultOutbox\(projectionEnv\);[\s\S]*reevaluateHeldOutboxOnce\(projectionEnv\)[\s\S]*reconcileDoneVaultOutboxIntegrity/.test(src));
-  assert.ok(fs.readFileSync("src/lib/vaultIdentityAdoption.ts", "utf8").includes("PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED = false"), "Phase 1 stays OFF");
+  assert.ok(fs.readFileSync("src/lib/vaultIdentityAdoption.ts", "utf8").includes("PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED = true"), "Phase 1 is enabled (origin-bound only)");
 });
 
 test("End-to-end: sourceType-less Memory + wrong History row -> Projection passes (same, Registry, index, History, final verify) -> raw Recovery clean; dry-run predicts exactly that", async () => {
@@ -3178,6 +3178,37 @@ test("DryRun K2: a leftover ledger gap shows up in the post-bootstrap plan as a 
   const hp = `.tsumugi/history/${m.date.slice(0, 7)}.json`; const hist = JSON.parse(vault.get(hp)!); hist.days[m.date.slice(0, 10)].normalMemories[0].types = ["idea"]; vault.put(hp, JSON.stringify(hist)); // no ledger entry
   const post = (await dryRun(db, vault)).report.postBootstrap;
   assert.ok(!("unavailable" in post)); if (!("unavailable" in post)) { assert.equal(post.wouldBeClean, false); assert.equal(post.recoverableOps, 1); assert.equal(post.recoverableOpsByPendingStep.ledger, 1); assert.equal(post.held, 0); }
+});
+test("Phase 1 enabled end-to-end (Android-like): identity established -> migration / reconcile / held pass: timestampOnly Conversation untouched, sourceType-less Memory converges, raw Recovery has no Memory anomaly", async () => {
+  const adoption = require("./vaultIdentityAdoption") as typeof import("./vaultIdentityAdoption");
+  assert.equal(adoption.PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED, true);
+  const db = new FakeDb(), vault = new FakeVault();
+  const c = conversation(`p1c-${uid()}`, { startedAt: "2025-03-05T09:00:00.000Z", turns: [{ role: "user", content: "一", timestamp: "2025-03-05T09:00:00.000Z" }, { role: "ai", content: "二", timestamp: "2025-03-05T09:05:00.000Z" }] });
+  db.conversations.set(c.id, c); await repairDb.putConversation(c); vault.put(convPath(c), mdWithoutTurnTimes(c));
+  const m = mem0(); db.memories.set(m.id, m); await repairDb.putMemoryObject(m);
+  // legacy-like Memory state (sourceType unset), wrong History row, a stale held outbox from the old comparison rule, ledger present
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "temp" }));
+  const tempEnv = { root: vault.root(), now: () => DRY_NOW, vaultIdentity: { vaultId: "temp" } } as unknown as import("./vaultProjection").ProjectionEnv;
+  assert.equal((await projMod.reconcileMemoryOutboxEntry(tempEnv, await repairDb.putMemoryObjectWithOutbox(m, "memory", DRY_NOW))).status, "done");
+  vault.files.delete(".tsumugi/vault-identity.json"); db.ledger.set(`memory:${m.id}`, m.updatedAt);
+  const hp = `.tsumugi/history/${m.date.slice(0, 7)}.json`; const hist = JSON.parse(vault.get(hp)!); hist.days[m.date.slice(0, 10)].normalMemories[0].types = ["idea"]; vault.put(hp, JSON.stringify(hist));
+  const e0 = (await repairDb.getVaultOutboxEntry(`memory:${m.id}`))!; await repairDb.putMemoryProjectionOutcome({ ...e0, status: "held", heldReason: "memory-member-conflict" });
+  const convBefore = vault.get(convPath(c)), convCanonical = JSON.stringify(await repairDb.getConversation(c.id));
+
+  // startup: identity first (origin-bound, production default = Phase 1 enabled), then the existing bootstrap steps unchanged
+  const ensured = await adoption.ensureVaultIdentityForCurrentWorld({ root: vault.root(), now: () => DRY_NOW, storageCapability: "origin-bound" });
+  assert.equal(ensured.kind, "newly-paired");
+  const identity = await repairDb.getVaultIdentityRecord();
+  const env = { root: vault.root(), now: () => DRY_NOW, vaultIdentity: identity ?? null } as unknown as import("./vaultProjection").ProjectionEnv;
+  await migrationMod.runProductionBootstrapMigration({ root: vault.root(), now: () => DRY_NOW });
+  await projMod.reconcilePendingVaultOutbox(env); const held = await projMod.reevaluateHeldOutboxOnce(env, `p1-${uid()}`); await projMod.reconcileDoneVaultOutboxIntegrity(env); await projMod.reconcilePendingVaultOutbox(env);
+
+  assert.equal(vault.get(convPath(c)), convBefore, "D: the timestampOnly Conversation Markdown is not overwritten");
+  assert.equal(JSON.stringify(await repairDb.getConversation(c.id)), convCanonical, "D: canonical Conversation untouched");
+  assert.equal(await repairDb.getVaultOutboxEntry(`conversation:${c.id}`), undefined, "D: migration holds it (no outbox, no Projection)");
+  assert.ok(held && held.processed >= 1); assert.equal((await repairDb.getVaultOutboxEntry(`memory:${m.id}`))!.status, "done", "F: the stale held outbox was re-evaluated to done");
+  const plan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.ok(!plan.held.some((h) => h.recordId === m.id) && !plan.ops.some((op) => op.members.some((x) => x.id === m.id)), "G/E: the Memory has no remaining Recovery anomaly (History corrected, no held, no op)");
 });
 test("DryRun D2 (keep last): once the rule version is recorded, a held outbox is no longer re-run and is reported as existing-held-outbox", async () => {
   const db = new FakeDb(), vault = new FakeVault(); const m = mem0(); db.memories.set(m.id, m); vault.put(dayPath(m), markdownMod.serializeMemoryDayFile([m]));

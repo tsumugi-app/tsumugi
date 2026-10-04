@@ -436,27 +436,40 @@ test("Identity: registry-meta.json（baselineEstablishedAt）が一切無くて�
   assert.equal(result.kind, "newly-paired");
 });
 
-test("Identity Phase1-disabled (production default): origin-bound + common ID + conflict → held, nothing written, bootstrap stops", async () => {
-  assert.equal(adoptionMod.PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED, false);
+test("Identity Phase1 enabled (production default): origin-bound + common ID + conflict -> identity established; the divergent Vault record is not overwritten", async () => {
+  assert.equal(adoptionMod.PHASE1_ORIGIN_BOUND_ADOPTION_ENABLED, true);
   const vault = new FakeVault();
   await resetIdbIdentity();
-  const c = conversation("id-p1-off-1");
+  const c = conversation("id-p1-on-1");
   await seedIdbConversation(c);
   const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
   const differing = markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "別", timestamp: T }] });
   vault.put(path, differing);
-  const env = makeEnv(vault, { storageCapability: "origin-bound" }); // production passes no phase1 override
+  const env = makeEnv(vault, { storageCapability: "origin-bound" }); // production passes no phase1 override: the default is used
   const writesBefore = vault.writeCount;
   const preview = await adoptionMod.previewVaultIdentityAdoption(env);
-  assert.match(preview.adoption, /^held/, "current rule");
-  assert.equal(preview.phase1Preview, "would-establish:origin-bound-shared-ids", "Phase 1 rule previewed, not applied");
+  assert.equal(preview.adoption, "would-establish:origin-bound-shared-ids"); assert.equal(preview.phase1Preview, "would-establish:origin-bound-shared-ids");
   assert.equal(vault.writeCount, writesBefore, "preview writes nothing");
-  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(env)).kind, "held");
-  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined);
-  assert.equal(vault.get(path), differing);
-  assert.equal((await dbMod.getVaultIdentityRecord())?.vaultId ?? null, null, "IndexedDB identity untouched");
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(env)).kind, "newly-paired");
+  assert.equal(vault.get(path), differing, "the divergent Vault record is untouched by the adoption");
   const bootstrapSrc = fs.readFileSync("src/lib/saveFoundationBootstrap.ts", "utf8");
-  assert.ok(!bootstrapSrc.includes("phase1OriginBoundAdoption"), "production bootstrap never enables the Phase 1 rule");
+  assert.ok(!bootstrapSrc.includes("phase1OriginBoundAdoption"), "production bootstrap uses the default (no override)");
+});
+
+test("Identity Phase1 enabled: user-selectable (FSA) stays strict; origin-bound without a common ID still holds", async () => {
+  const fsa = new FakeVault();
+  await resetIdbIdentity();
+  const c = conversation("id-p1-on-fsa");
+  await seedIdbConversation(c);
+  fsa.put(`Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`, markdownMod.conversationToMarkdown({ ...c, turns: [{ role: "user", content: "別", timestamp: T }] }));
+  assert.match((await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(fsa, { storageCapability: "user-selectable" }))).kind, /^held/);
+  assert.equal(fsa.get(".tsumugi/vault-identity.json"), undefined);
+  const opfs = new FakeVault();
+  await resetIdbIdentity();
+  await seedIdbConversation(conversation("id-p1-on-nocommon"));
+  opfs.put("Conversations/other.md", "---\nid: other-id\ntsumugi: true\n---\n# 別\n");
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(opfs, { storageCapability: "origin-bound" }))).kind, "unrelated");
+  assert.equal(opfs.get(".tsumugi/vault-identity.json"), undefined);
 });
 
 test("Identity Phase1 preview: FSA (user-selectable) stays strict even with the new rule", async () => {
