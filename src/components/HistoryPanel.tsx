@@ -15,14 +15,14 @@ import {
 import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
-import { JST_TIME_ZONE, jstDateOf, jstDateOfUlid, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
+import { JST_TIME_ZONE, jstDateOf, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
 import {
   conversationEntryTypeOf,
   conversationEntryTypeLabel,
   CONVERSATION_ENTRY_KIND_LABEL,
   type ConversationEntryKind,
 } from "@/lib/conversationEntryKind";
-import { buildReflectionMap, conversationHeading, isEffectivelySameText, resolveConversationMemories, resolvePrimaryReflection, selectConversationReflection } from "@/lib/historyConversationCard";
+import { buildReflectionMap, conversationHeading, conversationLogicalDay, indexEntryHasConversationOnDay, isEffectivelySameText, resolveConversationMemories, resolvePrimaryReflection, selectConversationReflection } from "@/lib/historyConversationCard";
 
 /** MemoryType（英語の列挙値）をUI表示用の日本語ラベルへ変換する。既存のtypes.tsの語彙のみを使う。 */
 const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
@@ -211,8 +211,7 @@ interface MemoryRow {
  * 表示される」ことを優先する）。
  */
 function logicalDateOfConversationRow(row: ConversationRow): string {
-  const fromFull = row.full ? jstDateOf(row.full.startedAt) : null;
-  return fromFull ?? jstDateOfUlid(row.id) ?? row.bucketDay;
+  return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay);
 }
 
 /**
@@ -997,11 +996,6 @@ export default function HistoryPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dayLoading, memoryRows]);
 
-  const hasSessionRecordToday = useMemo(
-    () => sessionCapturedMemories.some((memory) => jstDateOf(memory.date) === todayKey()),
-    [sessionCapturedMemories]
-  );
-
   /**
    * カレンダーのマス目1日分（Logical Date）に記録があるかどうか（丸印の表示用）。
    * JST日付モデル Phase 1：Logical Date `day`自身のStorage Bucketに加え、前日の
@@ -1015,6 +1009,9 @@ export default function HistoryPanel({
    * Phase 1の制約——最終報告のリスク欄参照）。
    */
   function dayHasRecord(day: string): boolean {
+    // Conversation History v2：ドット ＝ その日にHistoryで表示するConversationが1件以上ある。
+    // 日付一覧がConversationの行を絞り込むのと同じ論理日の判定（`conversationLogicalDay`）を使い、
+    // 通常Memory・Reflectionだけを理由にはドットを付けない。
     const buckets = [day, previousDateKey(day)];
     for (const bucketDay of buckets) {
       const bucketMonth = monthKeyOfDateKey(bucketDay);
@@ -1024,18 +1021,9 @@ export default function HistoryPanel({
           : prevMonthIndex && prevMonthIndex.month === bucketMonth
             ? prevMonthIndex.days[bucketDay]
             : undefined;
-      if (!entry) continue;
-      if (isHistoryDayIndexV2(entry)) {
-        if (entry.conversations.some((c) => (jstDateOfUlid(c.id) ?? bucketDay) === day)) return true;
-        if (entry.normalMemories.some((m) => (jstDateOf(m.date ?? m.createdAt) ?? bucketDay) === day)) return true;
-        if (entry.reflections.some((r) => (jstDateOf(r.createdAt) ?? bucketDay) === day)) return true;
-      } else {
-        if (entry.conversationIds.some((id) => (jstDateOfUlid(id) ?? bucketDay) === day)) return true;
-        if (entry.reflectionIds.some((id) => (jstDateOfUlid(id) ?? bucketDay) === day)) return true;
-        if (entry.normalMemoryCount > 0 && bucketDay === day) return true; // 近似（上記コメント参照）
-      }
+      if (entry && indexEntryHasConversationOnDay(entry, bucketDay, day)) return true;
     }
-    return day === todayKey() && hasSessionRecordToday;
+    return false;
   }
 
   // Memoryの由来会話（日時・モード）を一言添えるための索引。既に本体を読み終えている
@@ -1140,7 +1128,7 @@ export default function HistoryPanel({
           カレンダー本体は一切スクロールせず、外枠の高さも履歴の長さに関わらず常に
           一定のため、カレンダー位置が画面内で動かない。
         */}
-        <div className="flex shrink-0 flex-col gap-5">
+        <div className="flex shrink-0 flex-col gap-2">
           <div className="flex items-center justify-between">
             <p className="text-lg text-stone-800 dark:text-stone-100">これまでの記憶</p>
             <button
@@ -1176,15 +1164,15 @@ export default function HistoryPanel({
                 </button>
               </div>
 
-              <div className="grid grid-cols-7 gap-1 text-center text-[11px] text-stone-400 dark:text-stone-500">
+              <div className="grid grid-cols-7 gap-1 text-center text-[11px] leading-3 text-stone-400 dark:text-stone-500">
                 {WEEKDAY_LABELS.map((label) => (
                   <span key={label}>{label}</span>
                 ))}
               </div>
 
-              <div className="flex flex-col gap-1">
+              <div className="flex flex-col gap-0">
                 {monthGrid.map((week, weekIndex) => (
-                  <div key={weekIndex} className="grid grid-cols-7 gap-1">
+                  <div key={weekIndex} className="grid grid-cols-7 gap-x-1 gap-y-0">
                     {week.map((day, dayIndex) => {
                       if (!day) {
                         return <div key={dayIndex} />;
@@ -1197,7 +1185,7 @@ export default function HistoryPanel({
                           key={day}
                           type="button"
                           onClick={() => selectDay(day)}
-                          className={`flex flex-col items-center gap-0.5 rounded-xl border px-1 py-1.5 text-xs transition ${
+                          className={`flex flex-col items-center gap-0.5 rounded-xl border px-1 py-1 text-xs transition ${
                             isSelected
                               ? "border-stone-800 bg-stone-800 text-stone-50 dark:border-stone-200 dark:bg-stone-200 dark:text-stone-900"
                               : "border-transparent text-stone-600 hover:bg-stone-900/5 dark:text-stone-300 dark:hover:bg-white/5"
@@ -1220,8 +1208,8 @@ export default function HistoryPanel({
         </div>
 
         {vaultHandle && selectedDay && (
-          <div className="mt-5 min-h-0 flex-1 overflow-y-auto">
-            <div className="flex flex-col gap-3 border-t border-black/5 pt-4 dark:border-white/10">
+          <div className="mt-3 min-h-0 flex-1 overflow-y-auto">
+            <div className="flex flex-col gap-3 border-t border-black/5 pt-3 dark:border-white/10">
               <p className="text-xs text-stone-400 dark:text-stone-500">{selectedDay}</p>
 
               {monthLoading || dayLoading || detailLoading ? (
@@ -1291,7 +1279,10 @@ export default function HistoryPanel({
                         {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
                       </span>
                     </div>
-                    <p className="whitespace-pre-wrap text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
+                    {/* 会話：最初のユーザー発言を見出しにする。日記では出さない（振り返りと内容が重複して見えるため）。 */}
+                    {selectedConversationEntryKind !== "diary" && (
+                      <p className="whitespace-pre-wrap text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
+                    )}
                     {/* 日記：Reflection（本文＋既存keywords）。通常Memoryは独立項目として出さない。 */}
                     {selectedConversationReflection && (
                       <div className="flex flex-col gap-2 pt-2">

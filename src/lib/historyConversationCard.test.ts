@@ -8,7 +8,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { buildReflectionMap, conversationHeading, fallbackConversationTitle, isEffectivelySameText, resolveConversationMemories, resolvePrimaryReflection, selectConversationReflection, type ReflectionPrimaryReaders } from "./historyConversationCard";
+import { ulid } from "ulid";
+import { buildReflectionMap, conversationHeading, conversationLogicalDay, fallbackConversationTitle, indexEntryHasConversationOnDay, isEffectivelySameText, resolveConversationMemories, resolvePrimaryReflection, selectConversationReflection, type ReflectionPrimaryReaders } from "./historyConversationCard";
 import type { Conversation, MemoryObject } from "./types";
 
 const T0 = "2026-09-25T10:00:00.000Z";
@@ -282,4 +283,76 @@ test("T: the helpers are read-only and the Reflection effect only runs for 日�
   const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
   assert.ok(panel.includes('conversationEntryTypeOf(selectedConversation) !== "diary"') && panel.includes('conversationEntryTypeOf(selectedConversation) !== "conversation"'));
   assert.ok(panel.includes("readMemoriesForDay(handle, day)"), "normal Memories use the existing day-file reader");
+});
+
+// ---------------------------------------------------------------------------
+// Conversation History v2.1：カレンダーのドット＝Conversation基準／日記詳細の見出し／カレンダーのコンパクト化
+// ---------------------------------------------------------------------------
+import type { HistoryDayIndex } from "./vault";
+const idAt = (iso: string) => ulid(Date.parse(iso));
+const v2Entry = (over: { conversations?: string[]; memories?: string[]; reflections?: string[] }): HistoryDayIndex => ({
+  conversations: (over.conversations ?? []).map((id) => ({ id, mode: "diary" as const, turnCount: 2 })),
+  normalMemories: (over.memories ?? []).map((date) => ({ id: `M-${date}`, types: ["event" as const], preview: "p", createdAt: date, date })),
+  reflections: (over.reflections ?? []).map((createdAt) => ({ id: `R-${createdAt}`, types: ["insight" as const], preview: "p", createdAt })),
+});
+const v1Entry = (over: { conversationIds?: string[]; normalMemoryCount?: number; reflectionIds?: string[] }): HistoryDayIndex => ({
+  conversationIds: over.conversationIds ?? [], normalMemoryCount: over.normalMemoryCount ?? 0, reflectionIds: over.reflectionIds ?? [],
+  memoryCount: (over.normalMemoryCount ?? 0) + (over.reflectionIds?.length ?? 0),
+});
+const DAY = "2026-09-25";
+const noonId = idAt("2026-09-25T03:00:00.000Z"); // JST 9/25 12:00
+
+test("dots A-E: only a Conversation makes the dot; Memory or Reflection alone never does", () => {
+  assert.equal(indexEntryHasConversationOnDay(v2Entry({ conversations: [noonId] }), DAY, DAY), true, "A");
+  assert.equal(indexEntryHasConversationOnDay(v2Entry({ memories: ["2026-09-25T00:00:00.000Z"] }), DAY, DAY), false, "B: Memory only");
+  assert.equal(indexEntryHasConversationOnDay(v2Entry({ reflections: ["2026-09-25T03:00:00.000Z"] }), DAY, DAY), false, "C: Reflection only");
+  assert.equal(indexEntryHasConversationOnDay(v2Entry({ conversations: [noonId], memories: ["2026-09-25T00:00:00.000Z"] }), DAY, DAY), true, "D");
+  assert.equal(indexEntryHasConversationOnDay(v2Entry({ conversations: [noonId], reflections: ["2026-09-25T03:00:00.000Z"] }), DAY, DAY), true, "E");
+});
+test("dots F: the real PC-Vault case — Conversations started JST 9/26 early morning (UTC 9/25) with UTC-9/25 Memories: no dot on 9/25, dot on 9/26", () => {
+  const early = ["2026-09-25T16:51:51.000Z", "2026-09-25T20:17:13.000Z", "2026-09-25T20:35:58.000Z"].map(idAt); // JST 9/26 01:51 / 05:17 / 05:35
+  const bucket925 = v2Entry({ conversations: early, memories: ["2026-09-25T00:00:00.000Z", "2026-09-25T00:00:00.000Z", "2026-09-25T00:00:00.000Z"] });
+  assert.equal(conversationLogicalDay(early[0], undefined, "2026-09-25"), "2026-09-26");
+  assert.equal(indexEntryHasConversationOnDay(bucket925, "2026-09-25", "2026-09-25"), false, "the Memories no longer create a 9/25 dot");
+  assert.equal(indexEntryHasConversationOnDay(bucket925, "2026-09-25", "2026-09-26"), true, "the Conversations' logical day (JST 9/26) has the dot");
+});
+test("dots G/H/I: v1 days use conversationIds only", () => {
+  assert.equal(indexEntryHasConversationOnDay(v1Entry({ normalMemoryCount: 3 }), DAY, DAY), false, "G");
+  assert.equal(indexEntryHasConversationOnDay(v1Entry({ reflectionIds: [idAt("2026-09-25T03:00:00.000Z")] }), DAY, DAY), false, "H");
+  assert.equal(indexEntryHasConversationOnDay(v1Entry({ conversationIds: [noonId] }), DAY, DAY), true, "I");
+});
+test("dot contract: the dot and the Conversation card list use the same logical-day helper (no separate date logic)", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  const dayHas = panel.slice(panel.indexOf("function dayHasRecord("), panel.indexOf("// Memoryの由来会話"));
+  assert.ok(dayHas.includes("indexEntryHasConversationOnDay(") && !/normalMemor|reflections|reflectionIds|hasSessionRecordToday/.test(dayHas.replace(/\/\/.*$/gm, "")), "the dot looks at Conversations only (no Memory / Reflection / today's session Memory)");
+  assert.ok(panel.includes("return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay);"), "the card list filters with the same helper");
+  assert.ok(!panel.includes("hasSessionRecordToday"));
+});
+test("J/O: list cards and 会話 detail keep the first user message as the heading; K: the 日記 detail has no big heading", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  assert.ok(panel.includes("const displayTitle = full ? conversationHeading(full) : null;"), "J: every list card (日記 and 会話) uses the first user message");
+  assert.ok(/selectedConversationEntryKind !== "diary" && \(\s*<p[^>]*>\{selectedConversationTitle\}<\/p>/.test(panel), "K/O: the detail heading is rendered only for non-diary (会話)");
+  assert.equal((panel.match(/\{selectedConversationTitle\}/g) ?? []).length, 1, "the heading is rendered in exactly one place");
+});
+test("L/M/N/P/Q: 日記 detail = 振り返り + keywords + 会話全文を見る (last); 会話 detail = 記憶 + 会話全文を見る (last)", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  const start = panel.indexOf("selectedConversationEntryKind !== \"diary\" &&"), end = panel.indexOf("会話全文を見る", start);
+  const detail = panel.slice(start, end);
+  assert.ok(detail.includes(">振り返り<") && detail.includes("selectedConversationReflection.keywords") && detail.includes(">記憶<") && detail.includes("memory.keywords"));
+  assert.ok(detail.indexOf("selectedConversationReflection &&") < detail.indexOf("selectedConversationMemories &&"));
+  assert.equal(panel.indexOf("会話全文を見る", end + 10), -1, "the raw-view button is last");
+});
+test("R/S: month navigation and day selection are unchanged", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  assert.ok(panel.includes("onClick={() => goToMonth(-1)}") && panel.includes("onClick={() => goToMonth(1)}") && panel.includes("onClick={() => selectDay(day)}"));
+  assert.ok(panel.includes("grid grid-cols-7"), "the 7-column layout is kept");
+});
+test("calendar is more compact vertically (spacing classes), without shrinking numbers or the month buttons", () => {
+  const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
+  assert.ok(panel.includes('<div className="flex shrink-0 flex-col gap-2">'), "section gap 20px -> 8px");
+  assert.ok(panel.includes("text-center text-[11px] leading-3"), "weekday row line-height 16px -> 12px");
+  assert.ok(panel.includes('<div className="flex flex-col gap-0">') && panel.includes("gap-x-1 gap-y-0"), "week row gap 4px -> 0");
+  assert.ok(panel.includes("rounded-xl border px-1 py-1 text-xs transition"), "day cell padding 6px -> 4px (same number size text-xs)");
+  assert.ok(panel.includes('mt-3 min-h-0 flex-1 overflow-y-auto') && panel.includes("border-t border-black/5 pt-3"), "space below the calendar 20px/16px -> 12px/12px");
+  assert.ok(panel.includes("px-3 py-1 text-xs text-stone-500") && panel.includes("前月") && panel.includes("翌月"), "前月/翌月 buttons keep their size");
 });

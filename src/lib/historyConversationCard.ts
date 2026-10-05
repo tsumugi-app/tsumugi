@@ -3,7 +3,8 @@
  * JSX/DOMに依存しない純粋なロジックだけを集めたモジュール（`HistoryPanel.tsx`から
  * 分離し、`node --test`で検証できるようにする）。
  */
-import { isReflectionSummary, truncateHistoryPreview } from "./vault";
+import { isHistoryDayIndexV2, isReflectionSummary, truncateHistoryPreview, type HistoryDayIndex } from "./vault";
+import { jstDateOf, jstDateOfUlid } from "./dateModel";
 import type { Conversation, MemoryObject } from "./types";
 
 /**
@@ -134,4 +135,25 @@ export async function resolveConversationMemories(
   }
   const chosen = byIds.length > 0 ? byIds : [...pool.values()].filter((memory) => !isReflectionSummary(memory) && memory.conversationId === conversation.id);
   return chosen.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/**
+ * Conversationの論理日（JST）。日付一覧（Conversationカード）とカレンダーのドットが同じ基準を使うための共有helper。
+ * 本体（`startedAt`）を読み終えていればそのJST日付、未読（History Indexの行だけ）ならULID（生成時刻）から、
+ * どちらも失敗した場合はStorage Bucketの日付へfail-softにfallbackする。
+ */
+export function conversationLogicalDay(id: string, startedAt: string | undefined, bucketDay: string): string {
+  const fromStartedAt = startedAt ? jstDateOf(startedAt) : null;
+  return fromStartedAt ?? jstDateOfUlid(id) ?? bucketDay;
+}
+
+/**
+ * カレンダーのドット（Conversation History v2）：その論理日に、Historyで表示するConversationが1件以上あるか。
+ * 通常Memory・Reflectionは理由にしない（Memoryの日付は日ファイルのUTC日付に切り詰められており、JST早朝に始めた
+ * Conversationとは論理日が1日ずれるため）。History Indexの行は本体を読む前なので、日付一覧が行を絞り込むときと同じ
+ * `conversationLogicalDay`（ULID基準）で判定する。v1の日も`conversationIds`だけを見る。
+ */
+export function indexEntryHasConversationOnDay(entry: HistoryDayIndex, bucketDay: string, day: string): boolean {
+  const ids = isHistoryDayIndexV2(entry) ? entry.conversations.map((c) => c.id) : entry.conversationIds;
+  return ids.some((id) => conversationLogicalDay(id, undefined, bucketDay) === day);
 }
