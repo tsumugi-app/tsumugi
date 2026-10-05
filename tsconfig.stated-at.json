@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/memoryStatedAt.test.ts",
+    "src/lib/markdown.ts",
+    "src/lib/vault.ts",
+    "src/lib/vaultOutbox.ts",
+    "src/lib/reflection.ts"
+  ]
+}

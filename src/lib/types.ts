@@ -381,6 +381,13 @@ export interface MemoryObject extends Identifiable, Timestamped {
   eventTime?: string;
   eventTimePrecision?: EventTimePrecision;
   /**
+   * Temporal Phase 1A。このMemoryの根拠となったユーザー発言の時刻（UTC ISO timestamp）。
+   * Storage Date（`date`）や出来事の時間（`eventTime`）とは別の概念。
+   * Phase 1Aでは保存・復元の土台のみで、Captureはまだ生成しない（Phase 1Bで有効化）。
+   * 追加のみのoptionalフィールド（IndexedDBバージョンアップ不要。未設定の既存Memoryは正常）。
+   */
+  statedAt?: string;
+  /**
    * Personal Profile v1。この記憶の元になった会話で、ユーザー自身が明示した「安定した前提」の候補
    * （追加のみ。Capture UPDATEでも既存のclaimは削除しない）。Profile候補が無い会話では未設定（キー自体を持たない）。
    * `eventTime`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・Vault migration不要）。

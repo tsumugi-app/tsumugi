@@ -58,6 +58,21 @@ function stringifySourceDetail(detail: Record<string, string> | undefined): stri
   return detail && Object.keys(detail).length > 0 ? JSON.stringify(detail) : undefined;
 }
 
+/**
+ * Temporal Phase 1A：`statedAt`用。UTC ISO timestamp（`...Z`）で、実在する日時のみ有効。
+ * serialize/parseの両方で同じ判定を使い、不正値は書かない・読まない（fail-closed）。
+ */
+const STATED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+function validStatedAt(value: unknown): string | undefined {
+  if (typeof value !== "string" || !STATED_AT_PATTERN.test(value)) return undefined;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return undefined;
+  // Compare at millisecond precision without accepting Date's calendar rollover.
+  const normalizedInput = value.replace(/(?:\.(\d{1,3}))?Z$/, (_, fraction: string | undefined) =>
+    `.${(fraction ?? "").padEnd(3, "0")}Z`);
+  return new Date(timestamp).toISOString() === normalizedInput ? value : undefined;
+}
+
 export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
   const datePart = memoryObject.date.slice(0, 10);
   const frontmatter = toFrontmatter({
@@ -70,6 +85,7 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     topicId: memoryObject.topicId,
     eventTime: memoryObject.eventTime,
     eventTimePrecision: memoryObject.eventTimePrecision,
+    statedAt: validStatedAt(memoryObject.statedAt),
     summary: memoryObject.summary,
     links: memoryObject.links.length > 0 ? JSON.stringify(memoryObject.links) : undefined,
     // Personal Profile v1：`links`と同じパターン（JSON文字列）。claimが無いMemoryには、キー自体を書かない。
@@ -433,6 +449,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
   const personMentions = parsePersonMentions(frontmatter.person);
   const topicEvents = parseTopicEvents(frontmatter.topicEvents);
   const evidenceQuotes = parseEvidenceQuotes(frontmatter.evidence);
+  const statedAt = validStatedAt(frontmatter.statedAt);
 
   return {
     id,
@@ -442,6 +459,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     topicId: asString(frontmatter.topicId),
     eventTime,
     eventTimePrecision,
+    ...(statedAt ? { statedAt } : {}),
     content,
     summary,
     keywords: asStringArray(frontmatter.keywords),
