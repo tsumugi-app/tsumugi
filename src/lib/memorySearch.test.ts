@@ -20,8 +20,8 @@ const fakeProvider = {
 };
 const stubs: Record<string, unknown> = {
   "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini", resolveRequestedProvider: () => undefined },
-  "./db": { getAllMemoryObjects: async () => [], getMemoryObject: async () => undefined },
-  "./vaultWorldLock": { withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn() },
+  "./db": { getAllMemoryObjects: async () => [], getAllConversations: async () => [], getMemoryObject: async () => undefined },
+  "./vaultWorldLock": { withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn(), getTabVaultEpoch: () => 1 },
 };
 const mod = Module as unknown as { _load: (request: string, parent?: { filename?: string }, isMain?: boolean) => unknown; _resolveFilename: (request: string, ...rest: unknown[]) => string };
 const origLoad = mod._load;
@@ -191,4 +191,108 @@ test("regression 10: normal Associative Recall (retrieval.ts) is untouched — s
   const src = require("node:fs").readFileSync(path.join(ROOT, "..", "src/lib/memorySearch.ts"), "utf8") as string;
   assert.ok(!/from "\.\/retrieval"/.test(src), "memorySearch does not reuse or touch the normal scoring");
   assert.equal(retrieval.DEFAULT_LIMIT, 3); assert.equal(retrieval.CONVERSATION_MIN_SCORE, 3); assert.equal(retrieval.REFLECTIVE_LIMIT, 6);
+});
+
+// ===========================================================================
+// P0診断（Conversation Debugger専用の観測。検索挙動・Chat promptには影響しない）
+// ===========================================================================
+const diag = require(path.join(ROOT, "lib/memorySearchDiagnostics.js")) as typeof import("./memorySearchDiagnostics");
+const debugLog = require(path.join(ROOT, "lib/conversationDebugLog.js")) as typeof import("./conversationDebugLog");
+type Conversation = import("./types").Conversation;
+
+function conv(id: string, turns: { role: "user" | "ai"; content: string; timestamp: string }[], startedAt = "2026-08-10T14:15:00.000Z"): Conversation {
+  return { id, persona: "companion", entryType: "diary", startedAt, turns, status: "captured", memoryObjectIds: [], createdAt: startedAt, updatedAt: startedAt, metadata: { id, schemaVersion: "0.1", source: "user", createdAt: startedAt, updatedAt: startedAt } } as unknown as Conversation;
+}
+const GOGANE_TEXT = "今日は友人のリュウと銭湯に行った。錦糸町にある黄金湯という銭湯。青じそのイベントを行なっており、色々なグッズが当たるキャンペーンをやっていた。無料でもらった青じそドリンクが個人的に美味しかった。";
+const Q = "黄金湯について何話したっけ？";
+
+test("P0 diag 1-2: built only for an explicit search; the extracted terms are recorded", () => {
+  assert.equal(diag.buildExplicitSearchDiagnostics(ALL, [], "黄金湯に行きたい"), null);
+  const d = diag.buildExplicitSearchDiagnostics(ALL, [], Q)!;
+  assert.equal(d.intentDetected, true); assert.deepEqual(d.terms, [{ text: "黄金湯", weak: false }]);
+  assert.deepEqual(diag.formatExplicitSearchDiagnostics(null), ["explicitSearch: intent=false (通常会話。診断なし)"]);
+});
+test("P0 diag 3-5: memory pool counts, candidate/selected counts, selected id/conversationId/source/types/matched field/score", () => {
+  const d = diag.buildExplicitSearchDiagnostics(ALL, [], Q, { excludeConversationId: C.conversationId })!;
+  assert.equal(d.memory.poolTotal, ALL.length); assert.equal(d.memory.afterCurrentConversationExclusion, ALL.length - 1); assert.equal(d.memory.excludedByCurrentConversation, 1);
+  assert.equal(d.memory.candidateCount, 1); assert.equal(d.memory.selectedCount, 1);
+  const s = d.memory.selected[0];
+  assert.equal(s.id, B.id); assert.equal(s.conversationId, B.conversationId); assert.equal(s.source, "user"); assert.deepEqual(s.types, ["diary"]);
+  assert.ok(s.matchedFields.includes("keyword")); assert.deepEqual(s.matchedTerms, ["黄金湯"]); assert.ok(s.score > 0);
+  const c = d.memory.termFieldCounts[0];
+  assert.equal(c.inAllMemories.keywordExact, 1); assert.equal(c.inAllMemories.summary, 1); assert.equal(c.inAllMemories.content, 1); assert.equal(c.inAllMemories.evidence, 1);
+  assert.deepEqual(d.memory.keywordHitMemories.map((m) => m.id), [B.id]);
+  // the keyword-hit Memory being excluded as the current conversation is visible
+  const ex = diag.buildExplicitSearchDiagnostics(ALL, [], Q, { excludeConversationId: B.conversationId })!;
+  assert.equal(ex.memory.selectedCount, 0); assert.equal(ex.memory.keywordHitMemories[0].excludedAsCurrent, true);
+  assert.equal(ex.memory.termFieldCounts[0].inAllMemories.keywordExact, 1); assert.equal(ex.memory.termFieldCounts[0].inPool.keywordExact, 0);
+  // the selected ids equal the real payload's ids
+  assert.deepEqual(d.memory.selected.map((x) => x.id), ms.buildExplicitSearchContext(ALL, Q, { excludeConversationId: C.conversationId })!.results.map((x) => x.id));
+});
+test("P0 diag 6 + hint: user-turn matches in IndexedDB conversations are counted (id, timestamp, short snippet); cases A / B / C / D", () => {
+  const today = conv("CONV-AUG10", [{ role: "user", content: GOGANE_TEXT, timestamp: "2026-08-10T14:15:00.000Z" }, { role: "ai", content: "黄金湯、いいですね", timestamp: "2026-08-10T14:16:00.000Z" }]);
+  const other = conv("CONV-OTHER", [{ role: "user", content: "仕事の話", timestamp: "2026-08-11T01:00:00.000Z" }, { role: "ai", content: "黄金湯の話は出ていない", timestamp: "2026-08-11T01:01:00.000Z" }]);
+  // B: Conversation has it, Memory side has none
+  const b = diag.buildExplicitSearchDiagnostics([E, F], [today, other], Q)!;
+  assert.equal(b.conversation.total, 2); assert.equal(b.conversation.matchedCount, 1);
+  assert.equal(b.conversation.matches[0].conversationId, "CONV-AUG10"); assert.equal(b.conversation.matches[0].turns[0].timestamp, "2026-08-10T14:15:00.000Z");
+  assert.ok(b.conversation.matches[0].turns[0].snippet.includes("黄金湯") && b.conversation.matches[0].turns[0].snippet.length <= 45, "short snippet only, never the full text");
+  assert.equal(b.conversation.matches[0].memoriesInIndexedDb, 0); assert.equal(b.memory.selectedCount, 0); assert.ok(b.hint.startsWith("B"));
+  assert.equal(b.conversation.perTerm[0].conversations, 1, "AI turns are never matched");
+  // A: nowhere
+  assert.ok(diag.buildExplicitSearchDiagnostics([E, F], [other], Q)!.hint.startsWith("A"));
+  // C: Memory has the word (keyword) but excluded -> selected 0
+  assert.ok(diag.buildExplicitSearchDiagnostics(ALL, [], Q, { excludeConversationId: B.conversationId })!.hint.startsWith("C"));
+  // D: selected > 0
+  assert.ok(diag.buildExplicitSearchDiagnostics(ALL, [today], Q)!.hint.startsWith("D"));
+  // the Memory / Reflection belonging to the matched conversation are reported
+  const bm = mem({ summary: "黄金湯へ行った", content: "黄金湯に行った", keywords: ["黄金湯"], conversationId: "CONV-AUG10" });
+  const refl = { ...mem({ summary: "r", content: "友人のリュウさんと黄金湯を訪れ", keywords: ["黄金湯"], conversationId: "CONV-AUG10" }), metadata: { id: "x", schemaVersion: "0.1", source: "system-generated", createdAt: "", updatedAt: "" } } as unknown as MemoryObject;
+  const full = diag.buildExplicitSearchDiagnostics([bm, refl], [today], Q)!;
+  assert.equal(full.conversation.matches[0].memoriesInIndexedDb, 1); assert.equal(full.conversation.matches[0].reflectionInIndexedDb, true);
+});
+test("P0 diag 7-9: the diagnostics never change the search result or the Chat payload (inputs untouched, results identical, no new payload field)", async () => {
+  const today = conv("CONV-AUG10", [{ role: "user", content: GOGANE_TEXT, timestamp: "2026-08-10T14:15:00.000Z" }]);
+  const memsBefore = JSON.stringify(ALL); const convBefore = JSON.stringify([today]);
+  const payloadBefore = JSON.stringify(ms.buildExplicitSearchContext(ALL, Q, { excludeConversationId: "NEW" }));
+  diag.buildExplicitSearchDiagnostics(ALL, [today], Q, { excludeConversationId: "NEW" });
+  assert.equal(JSON.stringify(ALL), memsBefore); assert.equal(JSON.stringify([today]), convBefore);
+  assert.equal(JSON.stringify(ms.buildExplicitSearchContext(ALL, Q, { excludeConversationId: "NEW" })), payloadBefore, "payload identical after running diagnostics");
+  // the conversation matches are not part of the search payload
+  const payload = ms.buildExplicitSearchContext([E, F], Q)!;
+  assert.equal(payload.results.length, 0, "a Conversation-only hit does not become a search result");
+  assert.ok(!JSON.stringify(payload).includes("CONV-AUG10"));
+  // ordinary conversation: no diagnostics, search behaviour unchanged
+  assert.equal(ms.buildExplicitSearchContext(ALL, "黄金湯に行きたい"), null);
+  // the Chat prompt is built only from the explicitSearch payload: identical with and without the diagnostics having run
+  const ctx = ms.buildExplicitSearchContext(ALL, Q)!;
+  const si1 = await callChat({ persona: "companion", turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx });
+  diag.buildExplicitSearchDiagnostics(ALL, [today], Q);
+  const si2 = await callChat({ persona: "companion", turns: [turn(Q)], retrievedMemories: [], explicitSearch: ms.buildExplicitSearchContext(ALL, Q)! });
+  assert.equal(si1, si2);
+  assert.ok(!si1.includes("hint:") && !si1.includes("conversationMatch") && !si1.includes("memoryTermCounts"), "no diagnostics text in the Chat prompt");
+});
+test("P0 diag: logConversationDebug writes the diagnostics only with ?debugLog=1 and only for an explicit search; Memory/Conversation bodies are not dumped", async () => {
+  const today = conv("CONV-AUG10", [{ role: "user", content: GOGANE_TEXT, timestamp: "2026-08-10T14:15:00.000Z" }]);
+  const store = new Map<string, string>();
+  const g = globalThis as unknown as { window?: unknown };
+  const run = async (search: string, text: string) => {
+    store.clear();
+    g.window = { location: { search }, localStorage: { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v), removeItem: (k: string) => void store.delete(k) } };
+    (stubs["./db"] as { getAllMemoryObjects: () => Promise<MemoryObject[]>; getAllConversations: () => Promise<Conversation[]> }).getAllMemoryObjects = async () => ALL;
+    (stubs["./db"] as { getAllConversations: () => Promise<Conversation[]> }).getAllConversations = async () => [today];
+    const origLog = console.log; console.log = () => {};
+    try { await debugLog.logConversationDebug({ persona: "companion", turns: [{ role: "user", content: text, timestamp: "2026-10-07T00:00:00.000Z" }], retrievedMemories: [], latestUserMessage: text, vaultBackend: null, vaultStatus: "connected", excludeConversationId: "NEW" }); } finally { console.log = origLog; }
+    const raw = store.get("tsumugi:conversationDebugLog:v1");
+    return raw ? (JSON.parse(raw) as { text: string }[])[0]?.text ?? "" : "";
+  };
+  try {
+    assert.equal(await run("", Q), "", "no ?debugLog=1 -> nothing is written");
+    const normal = await run("?debugLog=1", "黄金湯に行きたい");
+    assert.ok(normal.includes("explicitSearch: intent=false")); assert.ok(!normal.includes("conversationMatch"));
+    const explicit = await run("?debugLog=1", Q);
+    for (const needle of ["explicitSearch: intent=true", "terms: 黄金湯", "memory.poolTotal(IndexedDB memoryObjects): 6", "candidateCount: 1 selectedCount: 1", `selected[0] id=${B.id}`, "conversation.total(IndexedDB conversations): 1 matchedByUserTurn=1", "conversationMatch id=CONV-AUG10", "userTurn ts=2026-08-10T14:15:00.000Z", "hint: D?"]) assert.ok(explicit.includes(needle), needle);
+    assert.ok(!explicit.includes(GOGANE_TEXT), "the full user turn is never dumped");
+    assert.ok(!explicit.includes("昨日は黄金湯に行った"), "Memory content is never dumped");
+  } finally { g.window = undefined; }
 });

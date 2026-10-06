@@ -14,6 +14,8 @@
   "files": [
     "src/lib/memorySearch.test.ts",
     "src/lib/memorySearch.ts",
+    "src/lib/memorySearchDiagnostics.ts",
+    "src/lib/conversationDebugLog.ts",
     "src/lib/retrieval.ts",
     "src/app/api/chat/route.ts"
   ]

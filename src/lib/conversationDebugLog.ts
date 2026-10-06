@@ -46,7 +46,8 @@
  */
 "use client";
 
-import { getAllMemoryObjects } from "./db";
+import { getAllConversations, getAllMemoryObjects } from "./db";
+import { buildExplicitSearchDiagnostics, formatExplicitSearchDiagnostics } from "./memorySearchDiagnostics";
 import {
   CONVERSATION_MIN_SCORE,
   CONVERSATION_RECENT_TURNS_WINDOW,
@@ -337,6 +338,17 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
         ];
       }
 
+      // Explicit Memory Search P0診断（観測専用）。Explicit Searchが発火する発言のときだけ、IndexedDBの状態と
+      // 検索のcandidate/selectedを記録する。同じ検索関数を読み取り専用で再実行するだけで、検索結果・Chat promptには影響しない。
+      // Conversation（user turn）の照合は診断専用で、検索にもChat回答にも使わない。失敗してもログ本体は出す。
+      let explicitSearchLines: string[] = [];
+      try {
+        const diagnostics = buildExplicitSearchDiagnostics(allMemories, await getAllConversations(), latestUserMessage, { excludeConversationId });
+        explicitSearchLines = formatExplicitSearchDiagnostics(diagnostics);
+      } catch (diagnosticsError) {
+        explicitSearchLines = [`explicitSearch: diagnostics failed (${diagnosticsError instanceof Error ? diagnosticsError.message : "unknown"})`];
+      }
+
       const lines = [
         "[ConversationDebug]",
         `device/environment: ${roughDeviceLabel()} (userAgent="${typeof navigator !== "undefined" ? navigator.userAgent : "unknown"}")`,
@@ -357,6 +369,7 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
             `  [${i}] id=${r.id} score=${r.score ?? "n/a"} source=${r.source}${r.isOriginMemory ? " origin=true" : ""} summary="${r.summary}"${r.linkReason ? ` linkReason="${r.linkReason}"` : ""}`
         ),
         ...conversationRetrievalLines,
+        ...explicitSearchLines,
         `finalContextSummary: retrievedMemoriesSectionPresent=${retrievedMemories.length > 0} charLenOfSummaries=${retrieved.reduce((sum, r) => sum + r.summary.length, 0)}`,
         `generationConfig(mirrored from route.ts constants, not the actual server-reported value): thinkingBudget=${mirrorThinkingBudget(trimmed)} maxOutputTokens=${MIRROR_MAX_OUTPUT_TOKENS} enableWebSearch=${needsWebSearch(trimmed)}`,
       ];
