@@ -34,6 +34,7 @@ import {
   sourceToMarkdown,
   parseSourceMarkdown,
 } from "./markdown";
+import { validStatedAt } from "./markdown";
 import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives } from "./vault";
 
 // ---------------------------------------------------------------------------
@@ -496,6 +497,25 @@ export function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boo
 }
 
 /**
+ * Temporal Phase 1A.5：「statedAtだけが欠落している」Vault member（canonicalをVaultへ再投影してよいsafe successor）。
+ * 旧build（statedAtを知らないparser）が日ファイルを読み直して書くと、同じ日の全memberからstatedAtが落ちる。それを、
+ * 新しいbuildのProjectionが、他の何も壊さずに復元できるようにする。
+ *
+ * 条件（全て満たす場合だけtrue）：
+ * - canonicalにvalidなstatedAtがある（日時のvalidationはPhase 1Aのserializer/parserと同じ`validStatedAt`を使う）
+ * - Vault memberにvalidなstatedAtが無い
+ * - canonicalからstatedAtだけを除いた直列化（`memoryEntryMarkdown`）が、Vault memberの直列化と**完全一致**する
+ *   ——content・summary・keywords・evidenceQuotes・eventTime・topicId・person/profile/topic・createdAt・updatedAt等、
+ *   Markdownに書かれる他の項目が1つでも違えば成立しない（statedAtを比較から単純に除外するのとは違う）。
+ * 逆方向（canonicalに無く、Vaultにある）と、両側に別の値がある場合は成立しない。
+ */
+export function isMemoryStatedAtOnlyMissing(onDisk: MemoryObject, canonical: MemoryObject): boolean {
+  if (validStatedAt(canonical.statedAt) === undefined) return false;
+  if (validStatedAt(onDisk.statedAt) !== undefined) return false;
+  return memoryEntryMarkdown(onDisk) === memoryEntryMarkdown({ ...canonical, statedAt: undefined });
+}
+
+/**
  * Phase 3-6のmigration（vaultProductionMigration.ts）もこの判定を共有する（二重実装しない）。
  *
  * `date`は日付部分（`YYYY-MM-DD`）だけをMarkdown frontmatterへ書く
@@ -507,6 +527,13 @@ export function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boo
  */
 export function isMemoryLegitimateSuccessor(onDisk: MemoryObject, canonical: MemoryObject): boolean {
   if (onDisk.id !== canonical.id) return false;
+  // Temporal Phase 1A.5：Vault側にあるstatedAt（Memory.statedAt）を、canonicalが同じ値で持っていない限り、successorとして
+  // 上書きして消さない（canonicalにstatedAtが無い／別の値の場合）。updatedAtが新しくても同じ。Vaultの方が情報が多い可能性があるため、
+  // conflict / HOLD（安全側）に残す。statedAtを持つMemoryがまだ無い間は、この条件は常に偽で挙動は変わらない。
+  const vaultStatedAt = validStatedAt(onDisk.statedAt);
+  if (vaultStatedAt !== undefined && validStatedAt(canonical.statedAt) !== vaultStatedAt) return false;
+  // Temporal Phase 1A.5：statedAtだけが欠落したVault memberは、canonicalから再投影できる安全なsuccessor（下記）。
+  if (isMemoryStatedAtOnlyMissing(onDisk, canonical)) return true;
   if (onDisk.date.slice(0, 10) !== canonical.date.slice(0, 10)) return false;
   if (onDisk.createdAt !== canonical.createdAt) return false;
   if (onDisk.content !== canonical.content) return false;

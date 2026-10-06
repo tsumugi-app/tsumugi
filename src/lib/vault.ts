@@ -53,6 +53,7 @@ import {
   parseSourceMarkdown,
   serializeMemoryDayFile,
   sourceToMarkdown,
+  validStatedAt,
 } from "./markdown";
 import { runVaultWorldExclusive } from "./vaultWorldLock";
 import { withVaultSaveLock } from "./vaultSaveLock";
@@ -5990,10 +5991,18 @@ function mergeConversationForApply(f: Conversation, l: Conversation): Conversati
  * container自体の識別で既にday不一致は別経路で処理されているため、通常この
  * gateは発火しない防御的なものになる）。
  */
-function mergeMemoryObjectForApply(f: MemoryObject, l: MemoryObject): MemoryObject | null {
+export function mergeMemoryObjectForApply(f: MemoryObject, l: MemoryObject): MemoryObject | null {
   if (f.date.slice(0, 10) !== l.date.slice(0, 10)) return null;
+  // Temporal Phase 1A.5：statedAt（ユーザーがその情報を述べた時刻）は、Vaultの行が無いだけでは消さない。
+  // - Vaultにだけある：そのまま取り込む（`...f`）。IDBにだけある：IDB側を保持する（外部編集・旧buildで行が無くなっただけ）。
+  // - 両側にvalidな別の値がある：どちらかへ寄せず、conflict（null）にする（既存のdate不一致と同じ扱い）。
+  const vaultStatedAt = validStatedAt(f.statedAt);
+  const localStatedAt = validStatedAt(l.statedAt);
+  if (vaultStatedAt !== undefined && localStatedAt !== undefined && vaultStatedAt !== localStatedAt) return null;
+  const statedAt = vaultStatedAt ?? localStatedAt;
   return {
     ...f,
+    ...(statedAt !== undefined ? { statedAt } : {}),
     date: l.date,
     themeIds: l.themeIds,
     personIds: l.personIds,

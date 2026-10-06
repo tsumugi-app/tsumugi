@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:stated-at": "tsc -p tsconfig.stated-at.json && node --test .test-out/lib/memoryStatedAt.test.js",
+    "test:stated-at-projection": "tsc -p tsconfig.stated-at-projection.json && node --test .test-out/lib/memoryStatedAtProjection.test.js",
     "test:capture": "tsc -p tsconfig.test.json && node --test .test-out/lib/capture.regression.test.js",
     "test:recovery-diagnostic": "tsc -p tsconfig.recovery-diagnostic.json && node --test .test-out/lib/vaultRecovery.test.js",
     "test:recovery-apply": "tsc -p tsconfig.recovery.json && node --test .test-out/lib/vaultRecoveryApply.test.js",

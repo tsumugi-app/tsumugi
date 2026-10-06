@@ -63,7 +63,7 @@ function stringifySourceDetail(detail: Record<string, string> | undefined): stri
  * serialize/parseの両方で同じ判定を使い、不正値は書かない・読まない（fail-closed）。
  */
 const STATED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
-function validStatedAt(value: unknown): string | undefined {
+export function validStatedAt(value: unknown): string | undefined {
   if (typeof value !== "string" || !STATED_AT_PATTERN.test(value)) return undefined;
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return undefined;
