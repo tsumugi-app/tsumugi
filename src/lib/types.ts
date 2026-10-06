@@ -412,7 +412,7 @@ export interface MemoryObject extends Identifiable, Timestamped {
    * この記憶の根拠になった、ユーザー自身の発言からの逐語quote（Capture Evidence Boundaryを
    * 通過したもの）。「どのConversation（`conversationId`）の、どのユーザー発言を根拠に生成されたか」を
    * 後から追跡するための付随情報（追加のみ。Capture UPDATEでは既存quoteを残したまま足す）。
-   * 検索・Retrieval・生成には使わない。無いMemory（従来のMemory含む）は未設定（キー自体を持たない）。
+   * 通常のRetrieval・生成には使わない（Explicit Memory Search＝memorySearch.tsの検索対象とChatへ渡す逐語抜粋には使う）。無いMemory（従来のMemory含む）は未設定（キー自体を持たない）。
    * `topicEvents`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・Vault migration不要）。
    */
   evidenceQuotes?: string[];

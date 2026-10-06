@@ -6,6 +6,7 @@ import { getJstTodayDateString } from "@/lib/jstDate";
 import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
 import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
 import { computePersonViews, PERSON_VIEW_CONTEXT_LIMIT, type PersonView } from "@/lib/person";
+import { buildExplicitSearchContext, type ExplicitSearchContext } from "@/lib/memorySearch";
 import { computeTopicTimelines, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { appendGenerationDebugEntry, createGenerationId, debugLogEnabled as generationDebugLogEnabled } from "@/lib/generationDebugLog";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
@@ -4590,8 +4591,16 @@ export default function ChatScreen() {
       // ローカルの純粋関数。失敗しても会話送信をブロックしない）。
       let personViewContext: PersonView[] | null = null;
       let topicTimelineContext: TopicTimeline[] | null = null;
+      // Explicit Memory Search Phase 1：ユーザーが保存済みの過去を明示的に探す発言のときだけ、保存済みMemory全体を検索する
+      // （通常のAssociative Recall＝上のretrievedMemoriesは変更しない。追加のIDB読み込み・API呼び出しは無い）。
+      let explicitSearchContext: ExplicitSearchContext | null = null;
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
+        try {
+          explicitSearchContext = buildExplicitSearchContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
+        } catch (searchError) {
+          console.error("Failed to run explicit memory search", searchError);
+        }
         topicContext = buildTopicContinuityPayload(allMemoriesForTopicContinuity, text);
         try {
           const recentUserTexts = updated.turns.filter((turn) => turn.role === "user").slice(-3).map((turn) => turn.content).reverse();
@@ -4684,6 +4693,7 @@ export default function ChatScreen() {
           ...(profileContext ? { profile: profileContext } : {}),
           ...(personViewContext ? { personView: personViewContext } : {}),
           ...(topicTimelineContext ? { topicTimeline: topicTimelineContext } : {}),
+          ...(explicitSearchContext ? { explicitSearch: explicitSearchContext } : {}),
           ...(generationId ? { debugGenerationId: generationId } : {}),
         }),
       });

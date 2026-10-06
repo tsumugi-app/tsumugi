@@ -7,6 +7,7 @@ import { needsWebSearch } from "@/lib/needsWebSearch";
 import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
 import { sanitizePersonViewContext, type PersonView } from "@/lib/person";
+import { sanitizeExplicitSearchContext, type ExplicitSearchContext } from "@/lib/memorySearch";
 import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { AIProviderError } from "@/lib/ai/errors";
@@ -568,6 +569,53 @@ function isTimeDependentMemory(memory: RetrievedMemory): boolean {
   return TIME_DEPENDENT_MEMORY_MARKERS.some((marker) => text.includes(marker));
 }
 
+/**
+ * Explicit Memory Search Phase 1（memorySearch.ts）。ユーザーが「自分の保存済みの過去」を明示的に探している発言のときだけ、
+ * クライアントが保存済みMemory全体を検索した結果を渡す。通常のRetrieved Memories（summary/keywordsのみ・上位3件）と違い、
+ * detail（content抜粋）とユーザー発言の逐語抜粋（evidenceQuotes）も含める——「何話した？」にsummaryからの推測で答えさせないため。
+ * 0件でもsectionを作る（「探したが保存済みMemoryには見つからなかった」ことを伝え、存在しない記録を補わせない）。
+ */
+function buildExplicitSearchSection(ctx: ExplicitSearchContext | null): string {
+  if (ctx === null) return "";
+  const header = `
+
+## ユーザーが明示的に探している過去のMemory（保存済みMemoryの検索結果）
+
+ユーザーは、自分の保存済みMemoryを探す質問をしている（検索語：${ctx.terms.join("、")}）。`;
+  if (ctx.results.length === 0) {
+    return `${header}保存済みMemoryを検索したが、一致するものは見つからなかった。
+- 見つからなかったことを、「保存済みのMemoryの中では確認できなかった」と、自分に見えている範囲の限界として伝える。
+- 「一度も話していない」と断定しない（Memoryとして保存されていない会話・別の呼び方で保存された話題がありうる）。
+- 存在しない過去の発言・記録を補わない。別の呼び方（敬称・関係の呼称・別の言い方）を、ユーザーに尋ねてよい。`;
+  }
+  const lines = ctx.results
+    .map((memory) => {
+      const stated = memory.statedAt ? ` / 発言: ${jstDateOf(memory.statedAt) ?? memory.statedAt.slice(0, 10)}` : "";
+      const label = buildMemoryTimeLabel({
+        date: memory.date,
+        eventTime: memory.eventTime,
+        eventTimePrecision: memory.eventTimePrecision as RetrievedMemory["eventTimePrecision"],
+      }).replace(/\]$/, `${stated}]`);
+      const parts = [`- ${label}\n  要約：${memory.summary}`];
+      if (memory.detail) parts.push(`  詳細（記録本文の抜粋）：${memory.detail}`);
+      if (memory.evidenceQuotes.length > 0) parts.push(`  ユーザー発言の抜粋（逐語）：${memory.evidenceQuotes.map((q) => `「${q}」`).join("")}`);
+      if (memory.keywords.length > 0) parts.push(`  keywords: ${memory.keywords.join(", ")}`);
+      return parts.join("\n");
+    })
+    .join("\n");
+  const more = ctx.total > ctx.results.length ? `（一致したのは${ctx.total}件。関連度の高い上位${ctx.results.length}件を示す）` : `（${ctx.results.length}件）`;
+  return `${header}以下は、ローカルに保存されたMemoryを検索して見つかったもの${more}。
+
+${lines}
+
+この検索結果への回答のルール：
+- 「過去にこう話していた・記録している」という事実は、上の検索結果に書かれている内容だけを根拠にする。書かれていない内容を補って、過去の発言・出来事にしない。
+- 「ユーザー発言の抜粋（逐語）」だけが、ユーザー自身の実際の発言。要約・詳細は、AIが整理した記録を含みうるので、ユーザーが言った言葉として扱わない。
+- 検索結果にないことを「話していない」と断定しない。ここにあるのは保存済みMemoryの一部だけ。
+- 日付は、記録日・発言日・出来事の区別を保って述べる。
+- 解釈・感想・提案は述べてよいが、記録に基づく事実の部分とは区別する。`;
+}
+
 function buildRetrievedMemoriesSection(memories: RetrievedMemory[]): string {
   if (memories.length === 0) return "";
 
@@ -803,7 +851,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -815,6 +863,8 @@ export async function POST(request: Request) {
     personView?: PersonView[];
     /** Topic / Current State v1（optional）。クライアントが`computeTopicTimelines()`で計算した、grounded evidenceの時系列。上限はここでも再度守る。 */
     topicTimeline?: TopicTimeline[];
+    /** Explicit Memory Search Phase 1（optional）。ユーザーが保存済みの過去を明示的に探す発言のときだけ、クライアントが渡す検索結果。 */
+    explicitSearch?: ExplicitSearchContext;
     /**
      * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
      * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
@@ -856,9 +906,13 @@ export async function POST(request: Request) {
   // 抑制できなかったことが実機テストで確認済みのため）。isOriginMemoryは「過去からの
   // 問いかけ」機能の前提となる特別なMemoryなので、内容に関わらず除外しない。
   // Web検索が有効なターンでは、検索の妨げにならないようフィルタしない（全件そのまま渡す）。
+  // Explicit Memory Searchの結果にあるMemoryは、通常のRetrieved Memoriesから外す（同じMemoryを要約だけで二重に渡さない）。
+  const sanitizedExplicitSearch = sanitizeExplicitSearchContext(explicitSearch);
+  const explicitSearchIds = new Set((sanitizedExplicitSearch?.results ?? []).map((memory) => memory.id));
+  const retrievedForContext = (retrievedMemories ?? []).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));
   const memoriesForContext = searchNeeded
-    ? (retrievedMemories ?? [])
-    : (retrievedMemories ?? []).filter(
+    ? retrievedForContext
+    : retrievedForContext.filter(
         (memory) => memory.isOriginMemory === true || !isTimeDependentMemory(memory)
       );
 
@@ -942,7 +996,9 @@ export async function POST(request: Request) {
   const sanitizedProfile = sanitizeProfileContext(profile);
   const profileSection = buildProfileSection(sanitizedProfile);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
+
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${explicitSearchSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
@@ -952,7 +1008,7 @@ export async function POST(request: Request) {
   // Conversation・Topic Continuity Contextがあるターンも、Memoryがあるターンと同様に
   // 「継続の理解」に思考予算が要るため floor 512 とする。
   const thinkingBudget = computeThinkingBudget(latestUserMessage, {
-    hasRetrievedMemories: retrievedMemoriesSection.length > 0,
+    hasRetrievedMemories: retrievedMemoriesSection.length > 0 || explicitSearchSection.length > 0,
     hasRecentConversation: recentConversationSection.length > 0,
     hasTopicContext: topicContinuitySection.length > 0,
   });
