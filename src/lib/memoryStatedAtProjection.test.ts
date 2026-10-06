@@ -321,3 +321,24 @@ test("Resync 5: the existing merge semantics are untouched (day gate, local-only
   const hash = (m: MemoryObject) => vaultMod.hashVaultText(md.memoryObjectToMarkdown(m));
   assert.notEqual(hash(onDiskOf(without(local))), hash(onDiskOf(local)));
 });
+
+// ---------------------------------------------------------------------------
+// Temporal Phase 1B persistence (Capture output -> IndexedDB -> Outbox -> Vault Markdown -> Projection)
+// ---------------------------------------------------------------------------
+test("Phase 1B E22-E24: a Capture-style Memory with statedAt keeps it through IndexedDB, the Outbox projection, the Vault Markdown and a second reconcile", async () => {
+  const day = randomDay(), k = uid();
+  const stated = `${day}T09:20:00.000Z`;
+  const m = mem(`p1b-${k}`, day, { statedAt: stated, evidenceQuotes: ["引用"] });
+  const vault = new FakeVault(); vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "v1" }));
+  const entry = await dbMod.putMemoryObjectWithOutbox(m, "memory", DRY_NOW);
+  assert.equal((await dbMod.getMemoryObject(m.id))!.statedAt, stated, "IndexedDB keeps statedAt");
+  assert.equal((await proj.reconcileMemoryOutboxEntry(projEnv(vault), entry)).status, "done");
+  const file = vault.get(`Memories/${day}.md`)!;
+  assert.ok(file.includes(`statedAt: "${stated}"`), "Vault Markdown carries statedAt");
+  assert.equal(md.parseMemoryDayFile(file)[0].statedAt, stated, "23: the same value after parsing the Vault");
+  const again = await proj.reconcileMemoryOutboxEntry(projEnv(vault), await dbMod.putMemoryObjectWithOutbox(m, "memory", DRY_NOW));
+  assert.equal(again.status, "done");
+  assert.equal(vault.get(`Memories/${day}.md`), file, "24: a second reconcile is a no-op (Vault unchanged)");
+  assert.equal(md.parseMemoryDayFile(vault.get(`Memories/${day}.md`)!)[0].statedAt, stated);
+  assert.equal((await dbMod.getMemoryObject(m.id))!.statedAt, stated);
+});

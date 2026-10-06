@@ -33,6 +33,7 @@ import {
   validateTopicEventQuotes,
 } from "./topicEvent";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { trustedStatedAt } from "./captureEvidence";
 
 const AI_PROVIDER = "gemini";
 
@@ -117,6 +118,11 @@ interface ExtractedMemory {
    * （追跡用の付随情報。summary/contentの生成・検証には関与しない）。
    */
   evidenceQuotes?: unknown;
+  /**
+   * Temporal Phase 1B。/api/captureが、検証済みevidenceのuser turnのtimestampから決めた「ユーザーがその情報を述べた時刻」。
+   * ここでは再計算せず、validなUTC ISOで実際のuser turnのtimestampと一致する場合だけ採用する（`trustedStatedAt`）。
+   */
+  statedAt?: unknown;
 }
 
 /** /api/captureが返す、Evidence Boundaryの件数（内容は含まない）。 */
@@ -664,6 +670,8 @@ async function captureConversationImpl(
 
     const id = ulid();
     newlyCreatedIds.push(id);
+    // Temporal Phase 1B：新規の通常Memoryにだけ付ける（UPDATEは対象外）。他の時刻（Capture時刻・startedAt・Memory.date等）で補わない。
+    const statedAt = trustedStatedAt(item.statedAt, conversation.turns);
     return {
       id,
       date: conversation.startedAt,
@@ -682,6 +690,7 @@ async function captureConversationImpl(
       topicId: resolvedTopicId,
       eventTime: resolvedEventTime.eventTime,
       eventTimePrecision: resolvedEventTime.eventTimePrecision,
+      ...(statedAt !== undefined ? { statedAt } : {}),
       ...(newProfileClaims.length > 0 ? { profileClaims: newProfileClaims } : {}),
       ...(newPersonMentions.length > 0 ? { personMentions: newPersonMentions } : {}),
       ...(newTopicEvents.length > 0 ? { topicEvents: newTopicEvents } : {}),

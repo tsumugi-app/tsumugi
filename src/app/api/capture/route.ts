@@ -1,4 +1,4 @@
-import { validateMemoryEvidenceIndexes, type EvidenceIndexDropReason } from "@/lib/captureEvidence";
+import { resolveStatedAtFromEvidence, validateMemoryEvidenceIndexes, type EvidenceIndexDropReason } from "@/lib/captureEvidence";
 import type { CaptureDebugAttempt } from "@/lib/captureDebug";
 import { PERSON_RELATIONS, type ConversationTurn, type MemoryType, type Persona } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
@@ -835,6 +835,8 @@ export async function POST(request: Request) {
 
   // One canonical User-only array for input, validation, retry, finalization and Debug.
   const userMessages = Object.freeze(turns.filter(turn => turn.role === "user").map(turn => turn.content));
+  // Temporal Phase 1B：`userMessages`と同じfilter順のuser turn（indexは1:1対応）。statedAtを検証済みevidence indexから決めるために使う。
+  const userTurns = Object.freeze(turns.filter(turn => turn.role === "user"));
   const todayDateString = getJstTodayDateString();
   const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns, userMessages)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}${buildEventTimeReferenceSection(todayDateString)}`;
 
@@ -935,7 +937,12 @@ export async function POST(request: Request) {
       // Never accept model-produced quote text, even if it is included unexpectedly.
       const grounded = { ...memory };
       delete grounded.evidenceUserMessageIndexes;
+      // Temporal Phase 1B：モデルが（未知のfieldとして）statedAtを返しても信用しない。検証済みevidenceのuser turnのtimestampから
+      // サーバーが決めた値だけを使う（決められなければ付けない。他の時刻へのfallbackはしない）。
+      delete grounded.statedAt;
       grounded.evidenceQuotes = result.quotes;
+      const statedAt = resolveStatedAtFromEvidence(userTurns, result.indexes);
+      if (statedAt !== undefined) grounded.statedAt = statedAt;
       return [grounded];
     });
 

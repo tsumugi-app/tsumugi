@@ -700,3 +700,116 @@ test("identical User turns: server retains distinct references; existing storage
     assert.deepEqual(out.memoryObjects[0].evidenceQuotes, ["嫉妬。"]);
   });
 });
+
+// ===========================================================================
+// Temporal Phase 1B：Memory.statedAt（ユーザーがその情報を述べた時刻）。検証済みevidence indexのuser turn timestampだけから決める。
+// ===========================================================================
+const evidenceMod = require(path.join(ROOT, "lib/captureEvidence.js")) as typeof import("./captureEvidence");
+const userAt = (content: string, timestamp: string | undefined) => ({ role: "user" as const, content, ...(timestamp !== undefined ? { timestamp } : {}) });
+const aiAt = (content: string, timestamp: string) => ({ role: "ai" as const, content, timestamp });
+const TS = { t1000: "2026-08-26T01:00:00.000Z", t1020: "2026-08-26T01:20:00.000Z", t1100: "2026-08-26T02:00:00.000Z", nextDay: "2026-08-27T15:30:00.000Z" };
+const stamps = (...v: (string | undefined)[]) => v.map((timestamp) => ({ timestamp }));
+
+test("StatedAt A1-A5: single evidence = that timestamp; multiple = the latest instant (order of indexes is irrelevant); duplicates and cross-day evidence", () => {
+  const turns = stamps(TS.t1000, TS.t1100, TS.t1020, TS.nextDay);
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(turns, [2]), TS.t1020, "1: single evidence, returned unchanged");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(turns, [0, 2]), TS.t1020, "2: latest of 10:00 and 10:20");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(turns, [0, 1]), TS.t1100, "2: 10:00 + 11:00 -> 11:00 (the later statement)");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(turns, [2, 0, 1]), TS.t1100, "3: unordered indexes -> by timestamp, not by index order");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(turns, [1, 0, 1, 0]), TS.t1100, "4: duplicate indexes");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(turns, [0, 3]), TS.nextDay, "5: evidence across JST days -> the latest instant");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(stamps("2026-08-26T01:00:00Z"), [0]), "2026-08-26T01:00:00Z", "no rounding / rewriting of a valid UTC ISO value");
+});
+test("StatedAt A6-A9: one missing / empty / invalid / non-existent timestamp among the evidence -> undefined (never salvage the valid ones)", () => {
+  const good = TS.t1000;
+  for (const [label, bad] of [["missing", undefined], ["empty", ""], ["invalid ISO", "yesterday"], ["no timezone", "2026-08-26T01:00:00"], ["offset", "2026-08-26T10:00:00+09:00"], ["non-existent date", "2026-02-30T01:00:00.000Z"], ["non-string", 12345 as unknown as string]] as const) {
+    assert.equal(evidenceMod.resolveStatedAtFromEvidence(stamps(good, bad as string | undefined), [0, 1]), undefined, label);
+    assert.equal(evidenceMod.resolveStatedAtFromEvidence(stamps(bad as string | undefined), [0]), undefined, `${label} (single)`);
+  }
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(stamps(good), [5]), undefined, "an index outside the user turns never resolves");
+  assert.equal(evidenceMod.resolveStatedAtFromEvidence(stamps(good), []), undefined, "no evidence");
+});
+
+// ---- 直接サーバー（/api/capture）を呼ぶ ----
+async function callRoute(turns: unknown[], llmMemories: Json[], script?: Step[]) {
+  rec.allMemories = []; rec.fixed = llmMemories; rec.script = script ? [...script] : null; rec.requests = [];
+  try {
+    const res = await captureRoute.POST(new Request("http://x/api/capture", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ persona: "analyst", turns, existingMemories: [], relatedMemories: [] }) }));
+    return { status: res.status, body: (await res.json()) as { memories: Json[] } };
+  } finally { rec.script = null; }
+}
+const STATED_BASE = { ...BASE, summary: "黄金湯に行った", content: "黄金湯に行った", keywords: ["黄金湯"] };
+
+test("StatedAt B10-B12 / C13: invalid evidence is still dropped as before; an Assistant timestamp can never become statedAt; a model-supplied statedAt is never trusted", async () => {
+  const turns = [aiAt("先に話すAI", "2026-08-27T00:00:00.000Z"), userAt("昨日、黄金湯に行った", TS.t1000), aiAt("いいですね", "2026-08-27T00:01:00.000Z")];
+  for (const bad of [[7], [-1], [0.5], ["0"], []]) {
+    const { body } = await callRoute(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: bad }]);
+    assert.equal(body.memories.length, 0, `dropped as before: ${JSON.stringify(bad)}`);
+  }
+  // index 1 does not exist (only one user message): the Assistant turn is not selectable, so its timestamp can never be used
+  assert.equal((await callRoute(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [1] }])).body.memories.length, 0);
+  const ok = (await callRoute(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0], statedAt: "2030-01-01T00:00:00.000Z" }])).body.memories[0];
+  assert.equal(ok.statedAt, TS.t1000, "the user turn's timestamp, not the model's value nor the Assistant turn's");
+  // evidence whose timestamp is unusable: the model's value must not survive either
+  const noStamp = (await callRoute([userAt("昨日、黄金湯に行った", undefined), aiAt("…", TS.t1000)], [{ ...STATED_BASE, evidenceUserMessageIndexes: [0], statedAt: "2030-01-01T00:00:00.000Z" }])).body.memories[0];
+  assert.equal("statedAt" in noStamp, false, "fail closed: no fallback and no model value");
+});
+test("StatedAt C14-C16: statedAt comes only from validated evidence; the retry path does the same; evidenceUserMessageIndexes never leaves the server", async () => {
+  const turns = [userAt("最近、黄金湯によく行く", TS.t1000), aiAt("そうなんですね", TS.t1000), userAt("先週も行った", TS.t1020), aiAt("…", TS.nextDay), userAt("関係ない話", TS.nextDay)];
+  const multi = (await callRoute(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [1, 0] }])).body.memories[0];
+  assert.equal(multi.statedAt, TS.t1020, "14: latest of the validated evidence (user 0 and user 1), not of the whole conversation");
+  assert.equal("evidenceUserMessageIndexes" in multi, false, "16: the indexes are not in the response");
+  assert.deepEqual(multi.evidenceQuotes, ["先週も行った", "最近、黄金湯によく行く"]);
+  // 15: first attempt has an invalid index -> one retry -> the recovered candidate gets its own statedAt
+  const retried = await callRoute(turns, [], [{ memories: [{ ...STATED_BASE, evidenceUserMessageIndexes: [99] }] }, { memories: [{ ...STATED_BASE, evidenceUserMessageIndexes: [2] }] }]);
+  assert.equal(retried.body.memories.length, 1);
+  assert.equal(retried.body.memories[0].statedAt, TS.nextDay);
+  assert.equal("evidenceUserMessageIndexes" in retried.body.memories[0], false);
+});
+test("StatedAt C17: eventTime is unchanged and independent (yesterday relative to the evidence turn's JST day) while statedAt is the instant itself", async () => {
+  const said = "2026-08-26T11:15:00.000Z"; // JST 8/26 20:15
+  const turns = [userAt("昨日、黄金湯に行った", said), aiAt("いいですね", "2026-08-26T11:16:00.000Z")];
+  const m = (await callRoute(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0], eventTimeSource: "yesterday", eventTimeQuote: "昨日" }])).body.memories[0];
+  assert.equal(m.eventTime, "2026-08-25"); assert.equal(m.eventTimePrecision, "day");
+  assert.equal(m.statedAt, said, "the exact instant, not the JST date and not eventTime");
+  const without = (await callRoute(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0] }])).body.memories[0];
+  assert.equal(without.eventTime, undefined, "eventTime logic untouched when there is no eventTimeSource");
+});
+
+test("StatedAt D18-D21: the client keeps only a valid UTC ISO that equals a real user turn's timestamp; recomputation never happens; Memory.date is unchanged", async () => {
+  const turns = [userAt("昨日、黄金湯に行った", TS.t1000), aiAt("いいですね", TS.t1020), userAt("先週も行った", TS.t1100)];
+  const { out } = await runCapture(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0, 1] }]);
+  assert.equal(out.memoryObjects[0].statedAt, TS.t1100, "18: stored on the new Memory");
+  assert.equal(out.memoryObjects[0].date, T0, "Memory.date is still conversation.startedAt");
+  // a statedAt that the server could not have produced from this conversation is ignored by the client
+  const trusted = (v: unknown) => evidenceMod.trustedStatedAt(v, turns);
+  assert.equal(trusted(TS.t1000), TS.t1000);
+  assert.equal(trusted("2026-08-26T05:00:00.000Z"), undefined, "19: valid but not any user turn's timestamp");
+  assert.equal(trusted(TS.t1020), undefined, "an Assistant turn's timestamp is not a user timestamp");
+  for (const bad of ["yesterday", "", "2026-02-30T01:00:00.000Z", "2026-08-26T01:00:00+09:00", null, 5]) assert.equal(trusted(bad), undefined, `20: ${JSON.stringify(bad)}`);
+  // 21: Reflection / Source never carry statedAt (Phase 1B generates it for new normal Memory in Capture only)
+  const reflectionSrc = require("node:fs").readFileSync("src/lib/reflection.ts", "utf8");
+  assert.ok(!reflectionSrc.includes("statedAt"), "Reflection is untouched");
+});
+test("StatedAt: a Memory without a usable evidence timestamp is still saved (statedAt undefined, no fallback)", async () => {
+  const turns = [userAt("昨日、黄金湯に行った", "not-a-timestamp"), aiAt("いいですね", TS.t1020)];
+  const { out } = await runCapture(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0] }]);
+  assert.equal(out.outcome.kind, "saved");
+  assert.equal("statedAt" in out.memoryObjects[0], false);
+  assert.notEqual(out.memoryObjects[0].statedAt, T0);
+});
+test("StatedAt E22: the captured Memory's statedAt reaches IndexedDB (putMemoryObjectWithOutbox) and the Vault Markdown, and survives parsing", async () => {
+  const turns = [userAt("昨日、黄金湯に行った", TS.t1000), aiAt("いいですね", TS.t1020)];
+  const { out } = await runCapture(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0] }]);
+  const db = stubs["./db"] as Record<string, unknown>;
+  const oldPut = db.putMemoryObjectWithOutbox; const saved: Json[] = [];
+  db.putMemoryObjectWithOutbox = async (m: Json) => { saved.push(m); };
+  try {
+    const persist = (captureClient as unknown as { persistCapture: (h: null, c: unknown, m: unknown[]) => Promise<unknown> }).persistCapture;
+    await persist(null, out.conversation, out.memoryObjects);
+  } finally { db.putMemoryObjectWithOutbox = oldPut; }
+  assert.equal(saved[0].statedAt, TS.t1000, "IndexedDB / Outbox write receives statedAt");
+  const md = markdownMod.memoryObjectToMarkdown(out.memoryObjects[0] as never);
+  assert.ok(md.includes(`statedAt: "${TS.t1000}"`));
+  assert.equal((markdownMod.parseMemoryObjectMarkdown(md) as unknown as { statedAt?: string } | null)?.statedAt, TS.t1000);
+});
