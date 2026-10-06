@@ -4,7 +4,6 @@ import { PERSON_RELATIONS, type ConversationTurn, type MemoryType, type Persona 
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 import { stripLeadingTimeLabels } from "@/lib/timeLabel";
-import { getJstTodayDateString } from "@/lib/eventTimeResolver";
 import { finalizeEventTimeForMemory } from "@/lib/captureEventTime";
 import { PROFILE_LIMITS, draftsToCandidates, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
 import {
@@ -640,7 +639,6 @@ function buildMemoriesSchema(includeProfile: boolean, includePersonMemory: boole
 function finalizeProfileClaimsForMemory(
   memory: Record<string, unknown>,
   turns: ConversationTurn[],
-  todayDateString: string,
   budget: { remaining: number },
   stats: { proposed: number; accepted: number; dropped: Partial<Record<ProfileDropReason, number>> }
 ): Record<string, unknown> {
@@ -648,7 +646,6 @@ function finalizeProfileClaimsForMemory(
   if (profileClaims === undefined) return rest;
   const result = validateProfileCandidates(profileClaims, {
     turns,
-    todayJst: todayDateString,
     maxItems: Math.min(PROFILE_LIMITS.perMemoryItem, Math.max(0, budget.remaining)),
     fallbackStatedAt: turns.find((turn) => turn.role === "user" && !Number.isNaN(Date.parse(turn.timestamp)))?.timestamp,
   });
@@ -759,7 +756,6 @@ export async function POST(request: Request) {
   // Temporal Phase 2A-1：検証済みevidence indexを、Event Timeの確定（eventTimeQuoteの照合）まで運ぶ内部の対応表。
   // レスポンスには出ない（Mapのキーはサーバー内のgrounded objectだけ）。
   const evidenceIndexesByMemory = new WeakMap<object, readonly number[]>();
-  const todayDateString = getJstTodayDateString();
   const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns, userMessages)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}`;
 
   const provider = getProvider(providerName);
@@ -957,7 +953,7 @@ ${JSON.stringify(invalidCandidates)}
         void _ignored;
         return rest;
       }
-      return finalizeProfileClaimsForMemory(withPerson, turns, todayDateString, profileBudget, profileStats);
+      return finalizeProfileClaimsForMemory(withPerson, turns, profileBudget, profileStats);
     });
     const headers: Record<string, string> = { "Server-Timing": buildServerTimingHeader(requestStart, geminiCallStart, geminiCallEnd) };
     // 品質の観測用（件数・理由の列挙値のみ。会話・Memory本文・quoteの内容は含めない）。

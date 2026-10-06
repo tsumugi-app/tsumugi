@@ -25,6 +25,7 @@ import {
   isValidEventTimeValue,
   resolveEventTimeSourceDate,
 } from "./eventTimeResolver";
+import { jstDateOf } from "./dateModel";
 import {
   PROFILE_CATEGORIES_V1,
   type ConversationTurn,
@@ -215,8 +216,6 @@ export interface ProfileClaimDraft {
 
 export interface ProfileValidationContext {
   turns: ConversationTurn[];
-  /** JST基準の今日（YYYY-MM-DD）。validFromSourceの解決に使う。 */
-  todayJst: string;
   /** この呼び出しで受理する最大件数（既定：perMemoryItem） */
   maxItems?: number;
   /** quoteを含むturnにtimestampが無い場合の代替 */
@@ -235,6 +234,27 @@ function asTrimmedString(value: unknown): string | undefined {
 
 function isValidIso(value: unknown): value is string {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+// Temporal Phase 2A-2：validFromSourceの基準は、claimのquoteを発言したuser turnのMessage Time（JST暦日）だけ。
+// markdown.tsのvalidStatedAtと同じ厳格な条件（UTC ISO・Z付き・実在する日時）。markdown.tsはprofile.tsをimportするため、循環を避けて局所的に持つ。
+const STRICT_UTC_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+function strictUserTurnJstDay(timestamp: unknown): string | null {
+  if (typeof timestamp !== "string" || !STRICT_UTC_ISO.test(timestamp)) return null;
+  const ms = Date.parse(timestamp);
+  if (!Number.isFinite(ms)) return null;
+  const normalized = timestamp.replace(/(?:\.(\d{1,3}))?Z$/, (_, f: string | undefined) => `.${(f ?? "").padEnd(3, "0")}Z`);
+  return new Date(ms).toISOString() === normalized ? jstDateOf(ms) : null;
+}
+/** quoteに一致したuser turn全ての基準JST暦日。1件でも無効、または異なる日に割れるならnull（latest/earliestを選ばず、Capture日にもfallbackしない）。 */
+function profileQuoteBasisJstDate(matchedTurns: readonly { timestamp?: unknown }[]): string | null {
+  const days = new Set<string>();
+  for (const turn of matchedTurns) {
+    const day = strictUserTurnJstDay(turn.timestamp);
+    if (day === null) return null;
+    days.add(day);
+  }
+  return days.size === 1 ? [...days][0] : null;
 }
 
 function buildSlot(category: string, key: string | undefined, relation: HouseholdRelation | undefined): string | null {
@@ -316,7 +336,8 @@ export function validateProfileCandidates(raw: unknown, ctx: ProfileValidationCo
 
     // 3. quoteが、ユーザーturnに逐語で含まれること（AI発言にしか無い引用は根拠にしない）
     const nq = normalizeText(quote);
-    const sourceTurn = userTurns.find((turn) => normalizeText(turn.content).includes(nq));
+    const matchedUserTurns = userTurns.filter((turn) => normalizeText(turn.content).includes(nq));
+    const sourceTurn = matchedUserTurns[0];
     if (!sourceTurn) {
       drop(aiTurns.some((turn) => normalizeText(turn.content).includes(nq)) ? "not-user" : "quote");
       continue;
@@ -425,8 +446,13 @@ export function validateProfileCandidates(raw: unknown, ctx: ProfileValidationCo
     let validFrom: string | undefined;
     let validFromPrecision: EventTimePrecision | undefined;
     if (isValidEventTimeSource(c.validFromSource) && c.validFromSource !== "none") {
-      validFrom = resolveEventTimeSourceDate(ctx.todayJst, c.validFromSource);
-      validFromPrecision = "day";
+      // 固定語：sourceTurn（quoteを発言したuser turn）のMessage Timeから決定的に解決する。Capture実行日にはfallbackしない。
+      // 解決できない（timestamp無効・欠落、同じquoteが異なる日に存在）場合は、validFromだけを持たない（claim自体は残す）。LLMの日付も使わない。
+      const basisJstDate = profileQuoteBasisJstDate(matchedUserTurns);
+      if (basisJstDate !== null) {
+        validFrom = resolveEventTimeSourceDate(basisJstDate, c.validFromSource);
+        validFromPrecision = "day";
+      }
     } else if (
       typeof c.validFrom === "string" &&
       isValidEventTimePrecision(c.validFromPrecision) &&

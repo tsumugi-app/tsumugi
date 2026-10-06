@@ -958,3 +958,83 @@ test("EventTime D: changing the Capture day does not change the result (fixed to
     } finally { (globalThis as { Date: unknown }).Date = RealDate; }
   }
 });
+
+// ===========================================================================
+// Temporal Phase 2A-2：Profile validFromSourceの基準は、claimのquoteを発言したuser turnのMessage Time
+// ===========================================================================
+const PF_QUOTE = "明日からジムに通う予定";
+const pfClaim = (over: Json = {}): Json => ({ category: "goal", key: "ジム通い", statement: "ジムに通う予定", tense: "planned", change: "none", stated: "explicit", quote: PF_QUOTE, validFromSource: "tomorrow", ...over });
+const pfMemory = (claim: Json = pfClaim(), idx = [0]): Json => ({ ...STATED_BASE, evidenceUserMessageIndexes: idx, profileClaims: [claim] });
+async function pfRoute(turns: unknown[], claim: Json = pfClaim(), idx = [0]): Promise<Json | undefined> {
+  const r = await callRoute(turns, [pfMemory(claim, idx)]);
+  assert.equal(r.body.memories.length, 1);
+  return ((r.body.memories[0].profileClaims as Json[] | undefined) ?? [])[0];
+}
+const pfTurns = (said: string | undefined, content = PF_QUOTE) => [userAt(content, said), aiAt("いいですね", "2026-10-06T03:01:00.000Z")];
+async function withClock<T>(iso: string, fn: () => Promise<T>): Promise<T> {
+  const RealDate = Date; const t = new RealDate(iso).getTime();
+  (globalThis as { Date: unknown }).Date = class extends RealDate { constructor(...a: unknown[]) { if (a.length === 0) super(t); else super(...(a as [string])); } static now() { return t; } };
+  try { return await fn(); } finally { (globalThis as { Date: unknown }).Date = RealDate; }
+}
+
+test("Profile validFrom 1-2: 10/6 『明日から』 -> 10/7 whatever the Capture day is (server and end-to-end client)", async () => {
+  const said = "2026-10-06T03:00:00.000Z"; // JST 10/6 12:00
+  for (const now of ["2026-10-08T03:00:00.000Z", "2027-02-01T03:00:00.000Z", said]) {
+    await withClock(now, async () => {
+      const c = await pfRoute(pfTurns(said));
+      assert.equal(c?.validFrom, "2026-10-07", now); assert.equal(c?.validFromPrecision, "day");
+      const { out } = await runCapture(pfTurns(said), [pfMemory()]);
+      const claim = (out.memoryObjects[0].profileClaims as Json[])[0];
+      assert.equal(claim.validFrom, "2026-10-07", `client keeps it: ${now}`);
+    });
+  }
+});
+test("Profile validFrom 3-5: JST 23:59 / JST 00:01 / UTC date differs from JST date, for all five tokens", async () => {
+  const OFF: Record<string, [string, number]> = { today: ["今日", 0], yesterday: ["昨日", -1], "day-before-yesterday": ["一昨日", -2], tomorrow: ["明日", 1], "day-after-tomorrow": ["明後日", 2] };
+  const cases: [string, string][] = [["2026-10-06T14:59:00.000Z", "2026-10-06"], ["2026-10-06T15:01:00.000Z", "2026-10-07"], ["2026-10-06T16:30:00.000Z", "2026-10-07"]];
+  for (const [said, jst] of cases) for (const [src, [word, off]] of Object.entries(OFF)) {
+    const quote = `${word}からジムに通う予定`;
+    const c = await pfRoute(pfTurns(said, quote), pfClaim({ quote, validFromSource: src }));
+    assert.equal(c?.validFrom, addDays(jst, off), `${said} ${src}`);
+  }
+});
+test("Profile validFrom 6-7: a conversation spanning days uses the sourceTurn's own day; later turns on other days change nothing", async () => {
+  const turns = [userAt("今日は雑談", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z"), userAt(PF_QUOTE, "2026-10-06T03:00:00.000Z"), aiAt("…", "2026-10-06T03:01:00.000Z"), userAt("また別の日の話", "2026-10-20T03:00:00.000Z")];
+  const c = await pfRoute(turns, pfClaim(), [1]);
+  assert.equal(c?.validFrom, "2026-10-07");
+  const c2 = await pfRoute(turns, pfClaim(), [1, 2]);
+  assert.equal(c2?.validFrom, "2026-10-07", "a later evidence turn is not the anchor");
+  // same quote on different JST days -> no validFrom, but the claim itself stays
+  const dup = [userAt(PF_QUOTE, "2026-10-06T03:00:00.000Z"), aiAt("…", "2026-10-06T03:01:00.000Z"), userAt(PF_QUOTE, "2026-10-09T03:00:00.000Z")];
+  const c3 = await pfRoute(dup, pfClaim(), [0, 1]);
+  assert.ok(c3, "claim kept"); assert.equal("validFrom" in c3!, false);
+});
+test("Profile validFrom 8-9: invalid / missing / timezone-less / impossible timestamp -> no validFrom, never the Capture day; the claim itself is kept", async () => {
+  await withClock("2026-10-08T03:00:00.000Z", async () => {
+    for (const bad of [undefined, "", "not-a-timestamp", "2026-10-06T12:00:00", "2026-10-06T12:00:00+09:00", "2026-02-30T01:00:00.000Z"]) {
+      const c = await pfRoute(pfTurns(bad as string | undefined), pfClaim({ validFrom: "2030-01-01", validFromPrecision: "day" }));
+      // A claim needs a parseable statedAt (existing rule, unchanged), so a totally unparseable timestamp drops the claim as before.
+      // Whenever the claim survives (Date.parse accepts it, e.g. timezone-less / offset), it must carry no validFrom at all.
+      if (c !== undefined) { assert.equal("validFrom" in c, false, `no validFrom: ${String(bad)}`); assert.equal("validFromPrecision" in c, false); }
+      else assert.ok(["", "not-a-timestamp", "2026-02-30T01:00:00.000Z"].includes(String(bad)) || bad === undefined, `unexpected drop: ${String(bad)}`);
+      if (bad === "2026-10-06T12:00:00" || bad === "2026-10-06T12:00:00+09:00") assert.ok(c, `claim kept (statedAt rule unchanged): ${bad}`);
+    }
+  });
+  // end to end: the stored claim has no validFrom either, and no Capture-day value
+  const { out } = await withClock("2026-10-08T03:00:00.000Z", () => runCapture(pfTurns(undefined), [pfMemory()]));
+  const claim = ((out.memoryObjects[0].profileClaims ?? []) as Json[])[0];
+  assert.equal("validFrom" in (claim ?? {}), false);
+});
+test("Profile validFrom 10-12: ProfileClaim.statedAt is still the source turn's timestamp; Memory.statedAt and Memory eventTime (Phase 2A-1) are unaffected", async () => {
+  const said = "2026-10-06T03:00:00.000Z";
+  const turns = [userAt("昨日、黄金湯に行った", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z"), userAt(PF_QUOTE, said), aiAt("…", "2026-10-06T03:01:00.000Z")];
+  const mem = { ...STATED_BASE, evidenceUserMessageIndexes: [0, 1], eventTimeSource: "yesterday", eventTimeQuote: "昨日", profileClaims: [pfClaim()] };
+  const { out } = await withClock("2026-12-25T03:00:00.000Z", () => runCapture(turns, [mem]));
+  const m = out.memoryObjects[0];
+  const claim = (m.profileClaims as Json[])[0];
+  assert.equal(claim.statedAt, said, "10: the source turn's timestamp");
+  assert.equal(claim.validFrom, "2026-10-07");
+  assert.equal(m.statedAt, said, "11: Memory.statedAt = latest evidence timestamp (Phase 1B)");
+  assert.equal(m.eventTime, "2026-10-04", "12: Phase 2A-1 eventTime from the quote's own turn (10/5 - 1)");
+  assert.equal(m.date, T0);
+});

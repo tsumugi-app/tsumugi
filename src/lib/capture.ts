@@ -16,7 +16,7 @@ import { isSameConversation, scoreMemory, KEYWORD_WEIGHT, DEFAULT_LIMIT } from "
 import { withVaultWorldRead } from "./vaultWorldLock";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, ConversationTurn, EventTimePrecision, MemoryObject, MemoryType, Persona } from "./types";
-import { getJstTodayDateString, isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
+import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeResolver";
 import { PROFILE_LIMITS, draftsToClaims, mergeProfileClaims, sanitizeStoredProfileClaims, validateProfileCandidates } from "./profile";
 import {
   PERSON_MEMORY_LIMITS,
@@ -535,7 +535,6 @@ async function captureConversationImpl(
 
   // Personal Profile v1：候補を、この会話のユーザー発言に対して再検証し（サーバーの検証と同じ関数）、Tsumugi側で
   // id・slot・statedAt・sourceConversationId・recordedAt等を確定する。1回のCapture全体で最大perCapture件。
-  const todayJst = getJstTodayDateString();
   const fallbackStatedAt = conversation.turns.find((turn) => turn.role === "user" && !Number.isNaN(Date.parse(turn.timestamp)))?.timestamp ?? conversation.startedAt;
   let profileBudget = PROFILE_LIMITS.perCapture;
   let profileProposed = 0;
@@ -544,7 +543,6 @@ async function captureConversationImpl(
     if (item.profileClaims === undefined) return [];
     const validated = validateProfileCandidates(item.profileClaims, {
       turns: conversation.turns,
-      todayJst,
       maxItems: Math.min(PROFILE_LIMITS.perMemoryItem, Math.max(0, profileBudget)),
       fallbackStatedAt,
     });
