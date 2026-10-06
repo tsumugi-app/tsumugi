@@ -813,3 +813,148 @@ test("StatedAt E22: the captured Memory's statedAt reaches IndexedDB (putMemoryO
   assert.ok(md.includes(`statedAt: "${TS.t1000}"`));
   assert.equal((markdownMod.parseMemoryObjectMarkdown(md) as unknown as { statedAt?: string } | null)?.statedAt, TS.t1000);
 });
+
+// ===========================================================================
+// Temporal Phase 2A-1：eventTimeの基準は「quoteが発言されたuser turnのMessage Time」だけ
+// ===========================================================================
+const ET_BASE = { ...STATED_BASE };
+async function etOf(turns: unknown[], over: Json): Promise<Json> {
+  const r = await callRoute(turns, [{ ...ET_BASE, evidenceUserMessageIndexes: [0], ...over }]);
+  assert.equal(r.body.memories.length, 1);
+  return r.body.memories[0];
+}
+const one = (said: string, content: string) => [userAt(content, said), aiAt("そうなんですね", said)];
+const FIVE: [string, string, number][] = [["today", "今日", 0], ["yesterday", "昨日", -1], ["day-before-yesterday", "一昨日", -2], ["tomorrow", "明日", 1], ["day-after-tomorrow", "明後日", 2]];
+const addDays = (ymd: string, d: number) => new Date(Date.parse(ymd + "T00:00:00Z") + d * 86400000).toISOString().slice(0, 10);
+
+test("EventTime 1: the five fixed tokens resolve from the Message Time's JST day (daytime)", async () => {
+  const said = "2026-08-26T03:00:00.000Z"; // JST 8/26 12:00
+  for (const [src, word, off] of FIVE) {
+    const m = await etOf(one(said, `${word}、黄金湯に行った`), { eventTimeSource: src, eventTimeQuote: word });
+    assert.equal(m.eventTime, addDays("2026-08-26", off), src); assert.equal(m.eventTimePrecision, "day");
+  }
+});
+test("EventTime 2-4: JST 23:59 / JST 00:01 / UTC date differs from JST date", async () => {
+  const cases: [string, string][] = [["2026-08-26T14:59:00.000Z", "2026-08-26"], ["2026-08-26T15:01:00.000Z", "2026-08-27"], ["2026-08-26T16:30:00.000Z", "2026-08-27"], ["2026-08-26T14:00:00.000Z", "2026-08-26"]];
+  for (const [said, jst] of cases) for (const [src, word, off] of FIVE) {
+    const m = await etOf(one(said, `${word}のこと`), { eventTimeSource: src, eventTimeQuote: word });
+    assert.equal(m.eventTime, addDays(jst, off), `${said} ${src}`);
+  }
+});
+test("EventTime 5-6: a conversation spanning midnight uses the evidence turn's own day; Capture on a later day gives the same result", async () => {
+  const turns = [userAt("今日は忙しかった", "2026-08-26T14:00:00.000Z"), aiAt("…", "2026-08-26T14:01:00.000Z"), userAt("明日は休み", "2026-08-26T16:00:00.000Z")];
+  const a = await etOf(turns, { evidenceUserMessageIndexes: [0], eventTimeSource: "today", eventTimeQuote: "今日" });
+  const b = await etOf(turns, { evidenceUserMessageIndexes: [1], eventTimeSource: "tomorrow", eventTimeQuote: "明日" });
+  assert.equal(a.eventTime, "2026-08-26"); assert.equal(b.eventTime, "2026-08-28", "JST 8/27 01:00 + 1");
+  // Capture date is not an input: shifting the system clock a month later changes nothing
+  const RealDate = Date; const later = new RealDate("2026-10-06T12:00:00Z").getTime();
+  (globalThis as { Date: unknown }).Date = class extends RealDate { constructor(...args: unknown[]) { if (args.length === 0) super(later); else super(...(args as [string])); } static now() { return later; } };
+  try {
+    const a2 = await etOf(turns, { evidenceUserMessageIndexes: [0], eventTimeSource: "today", eventTimeQuote: "今日" });
+    assert.equal(a2.eventTime, "2026-08-26");
+  } finally { (globalThis as { Date: unknown }).Date = RealDate; }
+});
+test("EventTime 7-8: the quote is matched only against the validated evidence turns; a non-evidence duplicate is ignored", async () => {
+  const turns = [userAt("昨日、黄金湯に行った", "2026-08-26T03:00:00.000Z"), aiAt("…", "2026-08-26T03:01:00.000Z"), userAt("昨日は雨だった", "2026-08-30T03:00:00.000Z")];
+  const m = await etOf(turns, { evidenceUserMessageIndexes: [0], eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal(m.eventTime, "2026-08-25", "turn 1 (later day) is not evidence, so it cannot make the quote ambiguous");
+  const m2 = await etOf(turns, { evidenceUserMessageIndexes: [1], eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal(m2.eventTime, "2026-08-29", "only the evidence turn is used");
+  // a quote that exists only in a non-evidence turn does not resolve
+  const m3 = await etOf([userAt("黄金湯に行った", "2026-08-26T03:00:00.000Z"), aiAt("…", "2026-08-26T03:01:00.000Z"), userAt("昨日は雨", "2026-08-30T03:00:00.000Z")], { eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal("eventTime" in m3, false);
+});
+test("EventTime 9-10: the same quote on different JST days inside the evidence -> no eventTime; the same JST day (several matches) -> resolves", async () => {
+  const diff = [userAt("昨日、黄金湯に行った", "2026-08-26T03:00:00.000Z"), aiAt("…", "2026-08-26T03:01:00.000Z"), userAt("昨日もよかった", "2026-08-28T03:00:00.000Z")];
+  const m = await etOf(diff, { evidenceUserMessageIndexes: [0, 1], eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal("eventTime" in m, false); assert.equal("eventTimePrecision" in m, false);
+  const same = [userAt("昨日、黄金湯に行った", "2026-08-26T03:00:00.000Z"), aiAt("…", "2026-08-26T03:01:00.000Z"), userAt("昨日もよかった", "2026-08-26T09:00:00.000Z")];
+  const s = await etOf(same, { evidenceUserMessageIndexes: [0, 1], eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal(s.eventTime, "2026-08-25");
+  // same instant-day expressed across the UTC boundary is still one JST day
+  const edge = [userAt("昨日", "2026-08-26T14:30:00.000Z"), aiAt("…", "2026-08-26T14:31:00.000Z"), userAt("昨日", "2026-08-26T01:00:00.000Z")];
+  assert.equal((await etOf(edge, { evidenceUserMessageIndexes: [0, 1], eventTimeSource: "yesterday", eventTimeQuote: "昨日" })).eventTime, "2026-08-25");
+});
+test("EventTime 11-13: quote mismatch / invalid timestamp -> no eventTime, and the LLM's own eventTime is never retained", async () => {
+  const fake = { eventTime: "2030-01-01", eventTimePrecision: "day" };
+  const ts = "2026-08-26T03:00:00.000Z";
+  const mismatch = await etOf(one(ts, "黄金湯に行った"), { eventTimeSource: "yesterday", eventTimeQuote: "昨日", ...fake });
+  assert.equal("eventTime" in mismatch, false, "quote not in the evidence turn"); assert.equal("eventTimePrecision" in mismatch, false);
+  assert.equal("eventTimeSource" in mismatch, false); assert.equal("eventTimeQuote" in mismatch, false);
+  for (const bad of ["not-a-timestamp", "2026-08-26T03:00:00+09:00", undefined]) {
+    const m = await etOf([userAt("昨日、黄金湯に行った", bad), aiAt("…", ts)], { eventTimeSource: "yesterday", eventTimeQuote: "昨日", ...fake });
+    assert.equal("eventTime" in m, false, String(bad)); assert.equal("eventTimePrecision" in m, false, String(bad));
+  }
+  const blank = await etOf(one(ts, "昨日、黄金湯に行った"), { eventTimeSource: "yesterday", eventTimeQuote: "   ", ...fake });
+  assert.equal("eventTime" in blank, false);
+});
+test("EventTime 14-16: fixed source never falls back to the LLM value (quote failure, timestamp failure); explicit absolute dates on the none path still pass", async () => {
+  const ts = "2026-08-26T03:00:00.000Z";
+  const quoteFail = await etOf(one(ts, "黄金湯に行った"), { eventTimeSource: "today", eventTimeQuote: "今日", eventTime: "2026-01-01", eventTimePrecision: "day" });
+  assert.equal(quoteFail.eventTime, undefined);
+  const tsFail = await etOf([userAt("今日、黄金湯に行った", "bad"), aiAt("…", ts)], { eventTimeSource: "today", eventTimeQuote: "今日", eventTime: "2026-01-01", eventTimePrecision: "day" });
+  assert.equal(tsFail.eventTime, undefined);
+  const abs = await etOf(one(ts, "2026年10月5日に黄金湯に行った"), { eventTimeSource: "none", eventTime: "2026-10-05", eventTimePrecision: "day" });
+  assert.equal(abs.eventTime, "2026-10-05"); assert.equal(abs.eventTimePrecision, "day");
+});
+test("EventTime 17-19: Phase 1B statedAt is unchanged by eventTime resolution; statedAt = the instant, eventTime = the previous JST day; Memory.date is untouched", async () => {
+  const said = "2026-08-26T11:15:00.000Z";
+  const turns = [userAt("昨日、黄金湯に行った", said), aiAt("いいですね", "2026-08-26T11:16:00.000Z"), userAt("関係ない", "2026-08-29T01:00:00.000Z")];
+  const m = await etOf(turns, { evidenceUserMessageIndexes: [0], eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal(m.statedAt, said); assert.equal(m.eventTime, "2026-08-25");
+  // statedAt is the LATEST evidence timestamp (here turn 1), but eventTime still follows the turn that contains the quote
+  const two = await etOf(turns, { evidenceUserMessageIndexes: [0, 1], eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+  assert.equal(two.statedAt, "2026-08-29T01:00:00.000Z", "Phase 1B rule unchanged");
+  assert.equal(two.eventTime, "2026-08-25", "statedAt is NOT used as the eventTime anchor");
+  const { out } = await runCapture(turns, [{ ...ET_BASE, evidenceUserMessageIndexes: [0], eventTimeSource: "yesterday", eventTimeQuote: "昨日" }]);
+  assert.equal(out.memoryObjects[0].date, T0, "Memory.date is still conversation.startedAt");
+});
+test("EventTime 20: the prompt carries no global 'today' (Capture day / last message day / startedAt); the year-less and relative-year rules forbid supplying a year", async () => {
+  await callRoute(one("2026-08-26T16:00:00.000Z", "昨日の話"), []);
+  const { userContent, systemInstruction } = rec.requests[0];
+  for (const needle of ["本日の日付", "この会話の日付", "2026-08-27", "2026-08-26", new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10)]) assert.ok(!userContent.includes(needle), `userContent has no date anchor: ${needle}`);
+  assert.ok(systemInstruction.includes("年を補ってはいけない"));
+});
+test("EventTime A: a later message never becomes the anchor of an earlier statement (来年 is not concretised)", async () => {
+  const turns = [userAt("来年、引っ越そうかな", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z"), userAt("今日は仕事が忙しかった", "2026-10-08T03:00:00.000Z")];
+  for (const idx of [[0], [0, 1]]) {
+    const m = await etOf(turns, { evidenceUserMessageIndexes: idx, eventTimeSource: "none", eventTime: "2027", eventTimePrecision: "year" });
+    assert.equal("eventTime" in m, false, "an LLM-supplied year that the user never said is dropped"); assert.equal("eventTimePrecision" in m, false);
+  }
+  // 年なし日付・今年・去年も、具体化しない
+  for (const [said, et, prec] of [["10月5日に行った", "2026-10-05", "day"], ["今年行った", "2026", "year"], ["去年行った", "2025", "year"], ["去年の夏に行った", "2025", "year"]]) {
+    const m = await etOf(one("2026-10-08T03:00:00.000Z", said), { eventTimeSource: "none", eventTime: et, eventTimePrecision: prec });
+    assert.equal("eventTime" in m, false, said);
+  }
+});
+test("EventTime B: an absolute date the user actually said is kept as before, whatever the later messages are", async () => {
+  const later = [userAt("2026年10月4日に黄金湯へ行った", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z"), userAt("別の話", "2026-10-08T03:00:00.000Z")];
+  const m = await etOf(later, { eventTimeSource: "none", eventTime: "2026-10-04", eventTimePrecision: "day" });
+  assert.equal(m.eventTime, "2026-10-04"); assert.equal(m.eventTimePrecision, "day");
+  for (const [said, et, prec] of [["2026年8月に行った", "2026-08", "month"], ["2024年に行った", "2024", "year"], ["２０２６年１０月５日に行った", "2026-10-05", "day"], ["2026/10/05に行った", "2026-10-05", "day"]]) {
+    const r = await etOf(one("2026-10-08T03:00:00.000Z", said), { eventTimeSource: "none", eventTime: et, eventTimePrecision: prec });
+    assert.equal(r.eventTime, et, said);
+  }
+  // the year must be in the validated evidence: a year said only in a non-evidence turn does not count
+  const other = [userAt("10月4日に行った", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z"), userAt("2026年の話", "2026-10-08T03:00:00.000Z")];
+  assert.equal("eventTime" in (await etOf(other, { eventTimeSource: "none", eventTime: "2026-10-04", eventTimePrecision: "day" })), false);
+});
+test("EventTime C: changing the last user message's date does not change a fixed token's eventTime from an earlier evidence turn", async () => {
+  const mk = (lastStamp: string) => [userAt("昨日、黄金湯に行った", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z"), userAt("別の話", lastStamp)];
+  for (const last of ["2026-10-05T04:00:00.000Z", "2026-10-08T03:00:00.000Z", "2027-03-01T03:00:00.000Z"]) {
+    const m = await etOf(mk(last), { eventTimeSource: "yesterday", eventTimeQuote: "昨日" });
+    assert.equal(m.eventTime, "2026-10-04", last);
+  }
+});
+test("EventTime D: changing the Capture day does not change the result (fixed token and absolute date)", async () => {
+  const RealDate = Date;
+  const turns = [userAt("昨日、2026年10月3日の話もした", "2026-10-05T03:00:00.000Z"), aiAt("…", "2026-10-05T03:01:00.000Z")];
+  for (const now of ["2026-10-06T00:00:00Z", "2027-01-01T12:00:00Z", "2026-10-05T03:00:00Z"]) {
+    const t = new RealDate(now).getTime();
+    (globalThis as { Date: unknown }).Date = class extends RealDate { constructor(...a: unknown[]) { if (a.length === 0) super(t); else super(...(a as [string])); } static now() { return t; } };
+    try {
+      assert.equal((await etOf(turns, { eventTimeSource: "yesterday", eventTimeQuote: "昨日" })).eventTime, "2026-10-04", now);
+      assert.equal((await etOf(turns, { eventTimeSource: "none", eventTime: "2026-10-03", eventTimePrecision: "day" })).eventTime, "2026-10-03", now);
+    } finally { (globalThis as { Date: unknown }).Date = RealDate; }
+  }
+});

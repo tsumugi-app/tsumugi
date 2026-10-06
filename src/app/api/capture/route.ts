@@ -4,9 +4,9 @@ import { PERSON_RELATIONS, type ConversationTurn, type MemoryType, type Persona 
 import type { AISchema } from "@/lib/ai/schema";
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 import { stripLeadingTimeLabels } from "@/lib/timeLabel";
-import { getJstTodayDateString, isValidEventTimeSource, resolveEventTimeSourceDate } from "@/lib/eventTimeResolver";
-import { PROFILE_LIMITS, draftsToCandidates, normalizeText, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
-import { jstDateOf } from "@/lib/dateModel";
+import { getJstTodayDateString } from "@/lib/eventTimeResolver";
+import { finalizeEventTimeForMemory } from "@/lib/captureEventTime";
+import { PROFILE_LIMITS, draftsToCandidates, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
 import {
   PERSON_MEMORY_LIMITS,
   draftsToPersonMentionCandidates,
@@ -166,11 +166,11 @@ Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは�
   eventTimePrecisionを設定してよい（これは計算ではなく、会話に明示された内容の抽出）：
   - 「2024年に〜」「2026年8月に〜」のように年（および場合により月）が会話の中に明示的に
     書かれている場合は、その値をそのまま採用する。
-  - 「9月10日」のように年が明示されていない絶対日付は、会話の文脈から年が明確に特定
-    できる場合にのみ採用する。文脈からの安易な補完（「今年だろう」という推測だけ）は
-    しない。年が確定できなければeventTimeを設定しない。
+  - 「9月10日」のように年が明示されていない日付、および「去年」「今年」「来年」のような
+    相対的な年は、あなたには基準となる日付が与えられていないため、年を補ってはいけない。
+    eventTime・eventTimePrecisionとも設定しない（年が発言に明示されている場合だけ採用する）。
 - 存在しない時間精度を絶対に作らない。「2024年」から分かるのは年までであり、月・日は
-  絶対に作らない。「去年の夏」のように月未満の粒度（季節）しか分からない場合、無理に
+  絶対に作らない。「2024年の夏」のように月未満の粒度（季節）しか分からない場合、無理に
   特定の月へ丸めず年精度（precision: "year"）にとどめる。
 - 「◯年前」「◯週間前」「先週の日曜日」のような、固定表現5つに含まれない相対的な時間
   表現については、あなた自身で現在の日付から計算してeventTimeを作ってはいけない。
@@ -326,89 +326,8 @@ function buildRelatedMemoriesSection(relatedMemories: ExistingMemoryRef[]): stri
   return `\n\n=== 関連Memory候補（別のConversationから、ローカル検索で見つかった参考情報。更新対象ではない。話題判定にだけ使う） ===\n${formatMemoryRefLines(relatedMemories)}\n=== END 関連Memory候補 ===`;
 }
 
-/**
- * Time Axis Phase 2（Event Time, v1）。本日の日付（JST）だけを参考情報として渡す。
- * 「今日/昨日/一昨日/明日/明後日」の実際の日付計算はLLMの役割ではないため
- * （SYSTEM_PROMPT側のEvent Time判定ルール参照）、ここでは相対表現の対応表は渡さない。
- * 本日の日付自体は、「9月10日」のような年省略の絶対日付について、会話の文脈から年が
- * 明確かどうかをLLMが判断する際の参考として使われる。
- */
-function buildEventTimeReferenceSection(todayDateString: string): string {
-  return `\n\n=== 本日の日付（参考情報。日本時間） ===\n本日の日付は${todayDateString}です。\n=== END 本日の日付 ===`;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * JST日付モデル Phase 2（Event Time, Message Time基準への変更）。
- *
- * `eventTimeQuote`（LLMが返した、USER'S ACTUAL STATEMENTSからの短い逐語引用）を、
- * 実際のUser turnへ決定的に照合し、一致したturnの`timestamp`（Message Time）のJST暦日を
- * 「今日」の基準にする。Capture実行時刻（サーバーがこのリクエストを処理した時刻）は
- * 一切使わない——これにより、日付が変わった後に実行されるstartup catch-up Capture・
- * 遅延Captureでも、実際にユーザーが「今日」と述べた時点を基準に正しく解決できる
- * （Profile v1の`validateProfileCandidates`と同じ「quoteをユーザーturnへ逐語照合する」
- * 決定的な検証パターンを再利用する。`normalizeText`はprofile.tsからそのままimportし、
- * Profile側のロジック・挙動は一切変更しない）。
- *
- * fail-closed：以下のいずれかに該当する場合、Event Timeは付与しない
- * （Capture実行日など、もっともらしい値へのfallbackは行わない）。
- * - eventTimeQuoteが無い・空・文字列でない
- * - USER turnのどれにも一致しない（AI turnにしか無い場合を含む。Conversation Evidence
- *   Boundaryと同じ原則——Assistant/Tsumugi発言の「今日」「昨日」「明日」を根拠にしない）
- * - 一致したUser turnが複数あり、かつそれらのMessage TimeのJST暦日が割れる場合
- *   （日を跨いで同じ短い言い回しが複数回登場したケース。安全側で推測しない）
- * - 一致したUser turnに有効なtimestampが1件も無い場合
- *
- * それ以外（一致が1件、または複数だが全て同じJST暦日）は、その暦日から
- * `resolveEventTimeSourceDate()`で機械的に日付を計算する（この関数自体の実装は
- * 「基準日文字列＋固定語彙→日付」という既存のまま変更しない。Tsumugi側が最終決定者、
- * という既存原則も維持する）。
- *
- * eventTimeSourceが"none"（固定語彙のどれにも対応しないというLLMの判断結果）・無い・
- * 不正な場合は、eventTimeSource/eventTimeQuoteだけを取り除き、LLMが返したeventTime/
- * eventTimePrecision（「2024年に〜」のような明示的な絶対時間の抽出結果）があれば
- * そのまま素通しする（precision・実在暦日の検証はcapture.ts側の既存ロジックが
- * 引き続き担当する。この経路はMessage Time基準化の対象外——「今日/昨日」等の相対表現
- * ではなく、会話に明示された絶対時間の抽出結果のため）。
- *
- * eventTimeSource/eventTimeQuoteはいずれも一時的なLLM判定情報でありMemoryObject/
- * Markdownへ永続化しないため、どの経路でもレスポンスからは必ず取り除く
- * （クライアント側へ一切渡さない）。
- */
-function resolveEventTimeQuoteBasisJstDate(turns: ConversationTurn[], rawQuote: unknown): string | null {
-  const quote = typeof rawQuote === "string" ? rawQuote.trim() : "";
-  if (!quote) return null;
-  const nq = normalizeText(quote);
-  if (!nq) return null;
-
-  const userTurns = turns.filter((turn) => turn.role === "user");
-  const matchedUserTurns = userTurns.filter((turn) => normalizeText(turn.content).includes(nq));
-  if (matchedUserTurns.length === 0) return null; // AI発言にしか無い、または存在しない（fail-closed）
-
-  const jstDates = new Set<string>();
-  for (const turn of matchedUserTurns) {
-    const d = jstDateOf(turn.timestamp);
-    if (d) jstDates.add(d);
-  }
-  if (jstDates.size !== 1) return null; // timestampが1件も有効でない、または複数の異なるJST日に割れる
-
-  return [...jstDates][0];
-}
-
-function finalizeEventTimeForMemory(memory: Record<string, unknown>, turns: ConversationTurn[]): Record<string, unknown> {
-  const { eventTimeSource, eventTimeQuote, ...rest } = memory;
-  if (isValidEventTimeSource(eventTimeSource) && eventTimeSource !== "none") {
-    const basisJstDate = resolveEventTimeQuoteBasisJstDate(turns, eventTimeQuote);
-    if (basisJstDate) {
-      const resolvedDate = resolveEventTimeSourceDate(basisJstDate, eventTimeSource);
-      return { ...rest, eventTime: resolvedDate, eventTimePrecision: "day" };
-    }
-    return rest; // 根拠を検証できない → Event Timeを推測せず付けない（fail-closed）
-  }
-  return rest;
 }
 
 /**
@@ -837,8 +756,11 @@ export async function POST(request: Request) {
   const userMessages = Object.freeze(turns.filter(turn => turn.role === "user").map(turn => turn.content));
   // Temporal Phase 1B：`userMessages`と同じfilter順のuser turn（indexは1:1対応）。statedAtを検証済みevidence indexから決めるために使う。
   const userTurns = Object.freeze(turns.filter(turn => turn.role === "user"));
+  // Temporal Phase 2A-1：検証済みevidence indexを、Event Timeの確定（eventTimeQuoteの照合）まで運ぶ内部の対応表。
+  // レスポンスには出ない（Mapのキーはサーバー内のgrounded objectだけ）。
+  const evidenceIndexesByMemory = new WeakMap<object, readonly number[]>();
   const todayDateString = getJstTodayDateString();
-  const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns, userMessages)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}${buildEventTimeReferenceSection(todayDateString)}`;
+  const transcript = `会話中のペルソナ: ${PERSONA_LABEL[persona] ?? persona}\n\n---\n\n${buildTranscript(turns, userMessages)}${buildExistingMemoriesSection(existingMemories ?? [])}${buildRelatedMemoriesSection(relatedMemories ?? [])}`;
 
   const provider = getProvider(providerName);
   const profileEnabled = profileClaimsEnabled();
@@ -943,6 +865,7 @@ export async function POST(request: Request) {
       grounded.evidenceQuotes = result.quotes;
       const statedAt = resolveStatedAtFromEvidence(userTurns, result.indexes);
       if (statedAt !== undefined) grounded.statedAt = statedAt;
+      evidenceIndexesByMemory.set(grounded, result.indexes);
       return [grounded];
     });
 
@@ -1004,7 +927,9 @@ ${JSON.stringify(invalidCandidates)}
       if (!isRecord(memory)) return memory;
       // Already resolved from the canonical User array; no quote matching or model text.
       const groundedMemory = memory;
-      const withEventTime = finalizeEventTimeForMemory(groundedMemory, turns);
+      // eventTimeQuoteの照合は、検証済みevidenceのuser turnだけに限定する（Memory.statedAtは基準に使わない）。
+      const evidenceTurns = (evidenceIndexesByMemory.get(groundedMemory) ?? []).map((index) => userTurns[index]).filter((turn) => turn !== undefined);
+      const withEventTime = finalizeEventTimeForMemory(groundedMemory, evidenceTurns);
 
       let withTopic: Record<string, unknown>;
       if (topicEnabled) {
