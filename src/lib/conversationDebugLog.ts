@@ -190,6 +190,43 @@ export function clearConversationDebugLog(): void {
   }
 }
 
+/**
+ * Explicit Memory Search P0.5：サーバーが実際に受け取った`explicitSearch`の状態（`serverAccepted.explicitSearchServerAccepted`）を、
+ * Conversation Debuggerの「全てコピー」で取得できるよう、既存の`appendEntry`で同じログへ1行追記する（debug専用）。
+ * `?debugLog=1`のときだけ。保存するのは下の6項目の件数・真偽値・検索語だけ（whitelist。Memory本文・逐語抜粋・keywords・IDは扱わない）。
+ * Chat prompt・検索結果・API requestの意味には一切影響しない。失敗しても会話送信には影響させない（呼び出し元でvoidすること）。
+ */
+export interface ExplicitSearchAcceptanceNote {
+  received: boolean;
+  terms: string[];
+  total: number;
+  resultCount: number;
+  sectionLength: number;
+  includedInSystemInstruction: boolean;
+}
+export async function appendExplicitSearchAcceptanceNote(generationId: string, accepted: ExplicitSearchAcceptanceNote): Promise<void> {
+  if (!debugLogEnabled()) return;
+  try {
+    await withVaultWorldRead(async () => {
+      const epoch = getTabVaultEpoch();
+      if (epoch === null) return;
+      const safe: ExplicitSearchAcceptanceNote = {
+        received: accepted.received === true,
+        terms: Array.isArray(accepted.terms) ? accepted.terms.filter((t): t is string => typeof t === "string").slice(0, 5).map((t) => t.slice(0, 40)) : [],
+        total: Number.isFinite(accepted.total) ? accepted.total : 0,
+        resultCount: Number.isFinite(accepted.resultCount) ? accepted.resultCount : 0,
+        sectionLength: Number.isFinite(accepted.sectionLength) ? accepted.sectionLength : 0,
+        includedInSystemInstruction: accepted.includedInSystemInstruction === true,
+      };
+      const text = `[ConversationDebug:serverAccepted] generationId=${generationId.slice(0, 36)}\nexplicitSearchServerAccepted: ${JSON.stringify(safe)}`;
+      console.log(text);
+      appendEntry(text, epoch);
+    });
+  } catch (error) {
+    console.warn("[ConversationDebug] failed to append explicit search acceptance note", error);
+  }
+}
+
 /** route.ts の computeThinkingBudget() と同じ式をここに複製しているだけの表示用ミラー。
  * 実際にサーバーが使った値の取得ではない（上のファイル冒頭コメント参照）。 */
 function mirrorThinkingBudget(latestUserMessage: string): number {

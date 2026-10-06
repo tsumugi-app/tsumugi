@@ -10,10 +10,11 @@ import Module from "node:module";
 
 type Json = Record<string, unknown>;
 const ROOT = path.join(__dirname, "..");
-const chatRec: { systemInstruction: string; calls: number } = { systemInstruction: "", calls: 0 };
+const chatRec: { systemInstruction: string; calls: number; req: Record<string, unknown> | null } = { systemInstruction: "", calls: 0, req: null };
 const fakeProvider = {
   async generateStream(req: { systemInstruction?: string }) {
     chatRec.systemInstruction = req.systemInstruction ?? "";
+    chatRec.req = req as unknown as Record<string, unknown>;
     chatRec.calls += 1;
     return (async function* () { yield { text: "ok", finishReason: "stop" as const }; })();
   },
@@ -21,7 +22,7 @@ const fakeProvider = {
 const stubs: Record<string, unknown> = {
   "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini", resolveRequestedProvider: () => undefined },
   "./db": { getAllMemoryObjects: async () => [], getAllConversations: async () => [], getMemoryObject: async () => undefined },
-  "./vaultWorldLock": { withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn(), getTabVaultEpoch: () => 1 },
+  "./vaultWorldLock": { withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn(), getTabVaultEpoch: () => 1, getActiveVaultEpoch: async () => 1, getVaultWorldJournalVersion: async () => ({ status: "current" }), getCommittedVaultEpoch: async () => ({ status: "valid", epoch: 1 }) },
 };
 const mod = Module as unknown as { _load: (request: string, parent?: { filename?: string }, isMain?: boolean) => unknown; _resolveFilename: (request: string, ...rest: unknown[]) => string };
 const origLoad = mod._load;
@@ -295,4 +296,119 @@ test("P0 diag: logConversationDebug writes the diagnostics only with ?debugLog=1
     assert.ok(!explicit.includes(GOGANE_TEXT), "the full user turn is never dumped");
     assert.ok(!explicit.includes("昨日は黄金湯に行った"), "Memory content is never dumped");
   } finally { g.window = undefined; }
+});
+
+// ===========================================================================
+// P0.5：サーバーが受け取ったExplicit Searchの観測（[Server Accepted]。観測専用・promptは不変）
+// ===========================================================================
+const protocol = require(path.join(ROOT, "lib/generationDebugProtocol.js")) as typeof import("./generationDebugProtocol");
+async function callChatDebug(body: Json, debug = true): Promise<{ systemInstruction: string; text: string; accepted?: import("./generationDebugProtocol").ExplicitSearchServerAccepted; envelope?: Json }> {
+  chatRec.systemInstruction = ""; chatRec.calls = 0;
+  const res = await chatRoute.POST(new Request("http://x/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(debug ? { ...body, debugGenerationId: "gen-test" } : body) }));
+  const text = await res.text();
+  assert.equal(chatRec.calls, 1);
+  const i = text.indexOf(protocol.DEBUG_ENVELOPE_DELIMITER);
+  const envelope = i >= 0 ? (JSON.parse(text.slice(i + protocol.DEBUG_ENVELOPE_DELIMITER.length)) as { serverAccepted: { explicitSearchServerAccepted?: import("./generationDebugProtocol").ExplicitSearchServerAccepted } }) : undefined;
+  return { systemInstruction: chatRec.systemInstruction, text, accepted: envelope?.serverAccepted.explicitSearchServerAccepted, envelope: envelope as unknown as Json };
+}
+const gogane11 = Array.from({ length: 11 }, (_, i) => mem({ summary: `黄金湯に行った${i}`, content: `昨日、黄金湯に行った${i}`, keywords: ["黄金湯", "銭湯"], evidenceQuotes: ["昨日、黄金湯に行った"] }));
+
+test("P0.5 observe 1: no explicitSearch -> received=false, resultCount=0, sectionLength=0, includedInSystemInstruction=false", async () => {
+  const r = await callChatDebug({ persona: "analyst", turns: [turn("黄金湯に行きたい")], retrievedMemories: [] });
+  assert.deepEqual(r.accepted, { received: false, terms: [], total: 0, resultCount: 0, sectionLength: 0, includedInSystemInstruction: false });
+});
+test("P0.5 observe 2: 黄金湯 fixture (total=11, results=10) -> received, terms, total, resultCount, sectionLength>0, included", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane11, Q)!;
+  assert.equal(ctx.total, 11); assert.equal(ctx.results.length, 10);
+  const r = await callChatDebug({ persona: "analyst", turns: [turn(Q)], retrievedMemories: [], explicitSearch: JSON.parse(JSON.stringify(ctx)) });
+  const a = r.accepted!;
+  assert.equal(a.received, true); assert.deepEqual(a.terms, ["黄金湯"]); assert.equal(a.total, 11); assert.equal(a.resultCount, 10);
+  assert.ok(a.sectionLength > 0); assert.equal(a.includedInSystemInstruction, true);
+  assert.ok(r.systemInstruction.includes("## ユーザーが明示的に探している過去のMemory"), "and the section really is in the instruction handed to the provider");
+  // the debug field carries counts only: no Memory body, quotes, keywords or ids
+  const dump = JSON.stringify(r.envelope);
+  const accepted = JSON.stringify(a);
+  assert.ok(!accepted.includes("昨日、黄金湯に行った") && !accepted.includes("銭湯") && !accepted.includes(gogane11[0].id));
+  assert.ok(dump.includes("explicitSearchServerAccepted"));
+});
+test("P0.5 observe 3: 0-result search -> received, resultCount=0, the 0-result section exists and is included", async () => {
+  const ctx = ms.buildExplicitSearchContext([E, F], Q)!;
+  assert.equal(ctx.results.length, 0);
+  const r = await callChatDebug({ persona: "companion", turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx });
+  const a = r.accepted!;
+  assert.equal(a.received, true); assert.deepEqual(a.terms, ["黄金湯"]); assert.equal(a.total, 0); assert.equal(a.resultCount, 0);
+  assert.ok(a.sectionLength > 0 && r.systemInstruction.includes("一致するものは見つからなかった")); assert.equal(a.includedInSystemInstruction, true);
+  // a malformed payload is "received" but rejected by sanitize -> visible as resultCount 0 / not included
+  const bad = (await callChatDebug({ persona: "companion", turns: [turn(Q)], explicitSearch: { terms: "bad", results: 5 } })).accepted!;
+  assert.deepEqual(bad, { received: true, terms: [], total: 0, resultCount: 0, sectionLength: 0, includedInSystemInstruction: false });
+});
+test("P0.5 observe 4: the observation does not change the prompt (instruction identical with/without debugGenerationId; the normal response has no envelope)", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane11, Q)!;
+  for (const persona of ["companion", "analyst"]) {
+    for (const explicit of [undefined, ctx]) {
+      const body = { persona, turns: [turn(Q)], retrievedMemories: [], ...(explicit ? { explicitSearch: explicit } : {}) };
+      const plain = await callChatDebug(body, false);
+      const debug = await callChatDebug(body, true);
+      assert.equal(debug.systemInstruction, plain.systemInstruction, `${persona} explicit=${!!explicit}`);
+      assert.ok(!plain.text.includes(protocol.DEBUG_ENVELOPE_DELIMITER) && plain.accepted === undefined, "the normal response is unchanged");
+      assert.ok(debug.accepted !== undefined);
+    }
+  }
+});
+
+// ---- P0.5b：「Conversation Debugger → 全てコピー」（conversationDebugLog）へ載せる ----
+async function withDebugWindow<T>(search: string, fn: (store: Map<string, string>) => Promise<T>): Promise<T> {
+  const store = new Map<string, string>();
+  const g = globalThis as unknown as { window?: unknown };
+  g.window = { location: { search }, localStorage: { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v), removeItem: (k: string) => void store.delete(k) } };
+  const origLog = console.log; console.log = () => {};
+  try { return await fn(store); } finally { console.log = origLog; g.window = undefined; }
+}
+/** ConversationDebugPanelの「全てコピー」と同じ読み方：getConversationDebugLog()のtextを連結する。 */
+async function copyAll(): Promise<string> { return (await debugLog.getConversationDebugLog()).map((e) => e.text).join("\n\n---\n\n"); }
+
+test("P0.5b 1: a received explicitSearchServerAccepted is appended as one line to the log that 「全てコピー」 reads", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane11, Q)!;
+  const r = await callChatDebug({ persona: "analyst", turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx });
+  await withDebugWindow("?debugLog=1", async () => {
+    await debugLog.appendExplicitSearchAcceptanceNote("gen-test", r.accepted!);
+    const copied = await copyAll();
+    assert.ok(copied.includes('explicitSearchServerAccepted: {"received":true,"terms":["黄金湯"],"total":11,"resultCount":10,'), copied);
+    assert.ok(copied.includes('"includedInSystemInstruction":true}'));
+    assert.equal(copied.split("explicitSearchServerAccepted:").length - 1, 1, "exactly one line");
+    // the pre-existing per-turn debug entry and this note coexist in the same copied log
+    assert.equal((await debugLog.getConversationDebugLog()).length, 1);
+  });
+});
+test("P0.5b 2: nothing is appended without ?debugLog=1 (normal use)", async () => {
+  await withDebugWindow("", async (store) => {
+    await debugLog.appendExplicitSearchAcceptanceNote("gen-test", { received: true, terms: ["黄金湯"], total: 11, resultCount: 10, sectionLength: 1528, includedInSystemInstruction: true });
+    assert.equal(store.size, 0); assert.equal((await debugLog.getConversationDebugLog()).length, 0);
+  });
+});
+test("P0.5b 3: only the six whitelisted values are stored — no Memory body, evidence quotes, keywords or ids, even if the object has extras", async () => {
+  await withDebugWindow("?debugLog=1", async () => {
+    const dirty = { received: true, terms: ["黄金湯"], total: 11, resultCount: 10, sectionLength: 1528, includedInSystemInstruction: true, results: [{ id: "SECRET-ID", summary: "SECRET-SUMMARY", detail: "SECRET-DETAIL", evidenceQuotes: ["SECRET-QUOTE"], keywords: ["SECRET-KW"] }], id: "SECRET-ID2" };
+    await debugLog.appendExplicitSearchAcceptanceNote("gen-test", dirty as unknown as Parameters<typeof debugLog.appendExplicitSearchAcceptanceNote>[1]);
+    const copied = await copyAll();
+    for (const secret of ["SECRET", "summary", "detail", "evidenceQuotes", "keywords"]) assert.ok(!copied.includes(secret), secret);
+    assert.ok(copied.includes('"received":true') && copied.includes('"resultCount":10'));
+  });
+});
+test("P0.5b 4: provider request (systemInstruction, turns, providerOptions, maxOutputTokens, enableWebSearch) is identical with/without the debug envelope", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane11, Q)!;
+  for (const persona of ["companion", "analyst"]) {
+    const body = { persona, turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx };
+    await callChatDebug(body, false); const plain = chatRec.req!;
+    await callChatDebug(body, true); const debug = chatRec.req!;
+    for (const key of ["systemInstruction", "turns", "providerOptions", "maxOutputTokens", "enableWebSearch", "model"]) assert.deepEqual(debug[key], plain[key], `${persona}.${key}`);
+  }
+});
+test("P0.5b 5: ChatScreen wires the note only inside the debug-envelope branch (generationId && debugEnvelope), after appendGenerationDebugEntry", () => {
+  const src = require("node:fs").readFileSync(path.join(ROOT, "..", "src/components/ChatScreen.tsx"), "utf8") as string;
+  const a = src.indexOf("appendGenerationDebugEntry({"); const n = src.indexOf("appendExplicitSearchAcceptanceNote(generationId");
+  assert.ok(a > 0 && n > a, "note comes after appendGenerationDebugEntry");
+  const block = src.slice(src.lastIndexOf("if (generationId && debugEnvelope) {", a), n + 200);
+  assert.ok(block.includes("if (generationId && debugEnvelope) {") && block.includes("explicitSearchServerAccepted"), "inside the debug branch");
+  assert.equal(src.split("appendExplicitSearchAcceptanceNote(").length - 1, 1, "single call site");
 });

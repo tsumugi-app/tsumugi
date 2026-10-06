@@ -1127,6 +1127,16 @@ export async function POST(request: Request) {
             ? topicContext.filter((t) => t.memories.length > 0).map((t) => ({ topicId: t.topicId, memories: t.memories }))
             : null,
           retrievedMemory: memoriesForContext,
+          // Explicit Memory Search P0.5（観測専用）：サーバーが実際に受け取った状態。件数とsectionの有無だけ。
+          // `systemInstruction`は、下で`provider.generateStream`へ渡すのと同じ変数。
+          explicitSearchServerAccepted: {
+            received: explicitSearch !== undefined && explicitSearch !== null,
+            terms: sanitizedExplicitSearch?.terms ?? [],
+            total: sanitizedExplicitSearch?.total ?? 0,
+            resultCount: sanitizedExplicitSearch?.results.length ?? 0,
+            sectionLength: explicitSearchSection.length,
+            includedInSystemInstruction: explicitSearchSection.length > 0 && systemInstruction.includes(explicitSearchSection),
+          },
         },
       }
     : null;

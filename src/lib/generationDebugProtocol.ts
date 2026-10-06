@@ -49,6 +49,8 @@ export interface GenerationDebugContext {
   topicTimeline: TopicTimeline[] | null;
   topicContinuity: GenerationDebugTopicContinuityInput[] | null;
   retrievedMemory: RetrievedMemory[];
+  /** サーバーが実際に受け取ったExplicit Searchの状態。[Server Accepted]のdebug envelopeにだけ入る（[Client Sent]には無い）。 */
+  explicitSearchServerAccepted?: ExplicitSearchServerAccepted;
 }
 
 /** [Generation]：実際にプロバイダへ渡した値（推測・ミラーではない）。 */
@@ -59,6 +61,26 @@ export interface GenerationDebugGeneration {
   thinkingBudget: number;
   maxOutputTokens: number;
   searchNeeded: boolean;
+}
+
+/**
+ * Explicit Memory Search P0.5：サーバーが実際に受け取った`explicitSearch`の状態（観測専用）。
+ * `debugGenerationId`付きのリクエスト（`?debugLog=1`）の[Server Accepted]にだけ入る。件数とsectionの有無だけで、
+ * Memory本文・逐語抜粋・keywords・IDは含めない。Chat prompt・検索結果は変えない。
+ */
+export interface ExplicitSearchServerAccepted {
+  /** request bodyに`explicitSearch`が存在したか。 */
+  received: boolean;
+  /** sanitize後の検索語（無ければ空配列）。 */
+  terms: string[];
+  /** sanitize後のtotal（無ければ0）。 */
+  total: number;
+  /** sanitize後のresults.length（無ければ0）。 */
+  resultCount: number;
+  /** 生成されたexplicitSearch sectionの文字数（sectionが無ければ0）。 */
+  sectionLength: number;
+  /** provider.generateStreamへ渡すsystemInstructionにsectionが含まれているか。 */
+  includedInSystemInstruction: boolean;
 }
 
 export interface GenerationDebugEnvelope {

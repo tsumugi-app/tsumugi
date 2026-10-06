@@ -148,7 +148,7 @@ import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
 import { logStartupCatchupEnd, logStartupCatchupStart, logTimingEvent, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
 // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用（`?debugLog=1`のときだけ出力）。
-import { logConversationDebug } from "@/lib/conversationDebugLog";
+import { appendExplicitSearchAcceptanceNote, logConversationDebug } from "@/lib/conversationDebugLog";
 import ApiKeySetup from "./ApiKeySetup";
 import SettingsPanel from "./SettingsPanel";
 import ImportPanel from "./ImportPanel";
@@ -4792,6 +4792,10 @@ export default function ChatScreen() {
           serverAccepted: debugEnvelope.serverAccepted,
           generation: debugEnvelope.generation,
         });
+        // Explicit Memory Search P0.5：サーバーが受け取ったExplicit Searchの状態を、Conversation Debuggerの「全てコピー」
+        // （conversationDebugLog）にも1行残す。観測専用（?debugLog=1のときだけ。promptにも検索にも影響しない）。
+        const explicitSearchAccepted = debugEnvelope.serverAccepted.explicitSearchServerAccepted;
+        if (explicitSearchAccepted) void appendExplicitSearchAcceptanceNote(generationId, explicitSearchAccepted);
       }
 
       // Conversation本文の保存とMemory生成（Capture）は分離する（今回の再設計）。
