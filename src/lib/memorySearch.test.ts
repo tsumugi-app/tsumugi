@@ -412,3 +412,63 @@ test("P0.5b 5: ChatScreen wires the note only inside the debug-envelope branch (
   assert.ok(block.includes("if (generationId && debugEnvelope) {") && block.includes("explicitSearchServerAccepted"), "inside the debug branch");
   assert.equal(src.split("appendExplicitSearchAcceptanceNote(").length - 1, 1, "single call site");
 });
+
+// ===========================================================================
+// P1：Explicit Search結果を、回答の正式なEvidenceとして全personaのpromptに登録する（promptだけの修正）
+// ===========================================================================
+const gogane12 = Array.from({ length: 12 }, (_, i) => mem({ summary: `黄金湯に行った${i}`, content: `昨日、黄金湯に行った${i}`, keywords: ["黄金湯", "銭湯"], evidenceQuotes: ["昨日、黄金湯に行った"] }));
+const SHARED_LIST = "Retrieved Memories・明示的な保存済みMemory検索結果（Explicit Search Results）（いずれも実際に提示されている場合）";
+const NEW_PROMPT_MARKERS = ["Explicit Search Results", "正式なEvidence", "検索結果が存在するのに", "一次的なEvidence", "矛盾する回答をしない"];
+
+test("P1 prompt 1: 黄金湯 (total=12, results=10, analyst, normal retrievedCount=0) -> Explicit Search is registered as official Evidence in the final instruction", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane12, Q)!;
+  assert.equal(ctx.total, 12); assert.equal(ctx.results.length, 10);
+  const r = await callChatDebug({ persona: "analyst", turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx });
+  const si = r.systemInstruction;
+  // the section itself: primary Evidence + the do-not-say-"no record" rule + no internal details
+  for (const needle of ["これはユーザーが明示的に過去の記録を検索した結果であり、今回の質問に回答するための一次的なEvidenceとして使う", "結果の存在と矛盾する回答をしない", "「記録が見当たらない」「過去に話した記録はない」", "Memory ID、scoreは回答に出さない", "重複する記録は自然にまとめ、時系列が有用なら時系列で整理してよい", "書かれていない内容を補って"]) assert.ok(si.includes(needle), needle);
+  // shared prompt: the enumerated sources and the dedicated bullet
+  assert.ok(si.includes(SHARED_LIST)); assert.ok(si.includes("正式なEvidenceである")); assert.ok(si.includes("検索結果が存在するのに「記録が見当たらない」"));
+  // Evidence Boundary: allowed Evidence with strength distinction
+  assert.ok(si.includes("明示的な保存済みMemory検索結果（Explicit Search Results）も、ユーザーについての事実を述べる際の正式な根拠として使ってよい"));
+  assert.ok(si.includes("「ユーザー発言の抜粋（逐語）」だけが、ユーザー本人の直接発言として扱える") && si.includes("ユーザーが言った言葉として引用しない"));
+  // the diagnostic is still correct
+  assert.deepEqual({ ...r.accepted!, sectionLength: r.accepted!.sectionLength > 0 }, { received: true, terms: ["黄金湯"], total: 12, resultCount: 10, sectionLength: true, includedInSystemInstruction: true });
+});
+test("P1 prompt 2: all personas carry the same Explicit Search Evidence rules, with no contradiction", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane12, Q)!;
+  for (const persona of ["companion", "analyst", "coach"]) {
+    const si = (await callChatDebug({ persona, turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx })).systemInstruction;
+    for (const m of NEW_PROMPT_MARKERS) assert.ok(si.includes(m), `${persona}: ${m}`);
+    assert.ok(si.includes(SHARED_LIST), persona);
+    assert.ok(!si.includes("関連するMemoryがここに無ければ、Memoryを使わず"), `${persona}: no restriction text without a normal Retrieved block`);
+  }
+});
+test("P1 prompt 3: analyst with normal retrieved Memory + Explicit Search -> the allow-list includes Explicit Search and the 'ignore if none here' rule is replaced", async () => {
+  const ctx = ms.buildExplicitSearchContext(gogane12, Q)!;
+  const retrieved = [{ id: "OTHER", date: "2026-08-10T00:00:00.000Z", summary: "仕事の優先順位について考えた", keywords: ["仕事"] }];
+  const si = (await callChatDebug({ persona: "analyst", turns: [turn(Q)], retrievedMemories: retrieved, explicitSearch: ctx })).systemInstruction;
+  assert.ok(si.includes("セクション（ユーザー自身の明示的な発言に基づく前提）、および「ユーザーが明示的に探している過去のMemory（保存済みMemoryの検索結果）」セクションだけである"));
+  assert.ok(si.includes("このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する"));
+  assert.ok(!si.includes("関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する"), "the exclusion sentence is gone");
+  assert.ok(si.includes("仕事の優先順位について考えた"), "normal Retrieved Memory still present");
+  // without Explicit Search the analyst block is exactly the existing one
+  const plain = (await callChatDebug({ persona: "analyst", turns: [turn("仕事について")], retrievedMemories: retrieved })).systemInstruction;
+  assert.ok(plain.includes("関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する")); assert.ok(!plain.includes("明示的に探している過去のMemory"));
+});
+test("P1 prompt 4: ordinary conversation (no Explicit Search) gets none of the new text — the prompt is unchanged", async () => {
+  for (const persona of ["companion", "analyst", "coach"]) {
+    const si = (await callChatDebug({ persona, turns: [turn("黄金湯に行きたい")], retrievedMemories: [] })).systemInstruction;
+    for (const m of [...NEW_PROMPT_MARKERS, "明示的な保存済みMemory検索結果"]) assert.ok(!si.includes(m), `${persona}: ${m}`);
+    assert.ok(si.includes("Retrieved Memories（いずれも実際に提示されている場合）"), "original enumerated list is untouched");
+  }
+});
+test("P1 prompt 5: zero results -> limited wording ('within this search range'), no primary-Evidence claim, never 'not once talked'", async () => {
+  const ctx = ms.buildExplicitSearchContext([E, F], Q)!;
+  assert.equal(ctx.results.length, 0);
+  const r = await callChatDebug({ persona: "analyst", turns: [turn(Q)], retrievedMemories: [], explicitSearch: ctx });
+  const si = r.systemInstruction;
+  assert.ok(si.includes("今回の検索範囲では見つからなかった")); assert.ok(si.includes("一致するものは見つからなかった")); assert.ok(si.includes("「一度も話していない」と断定しない"));
+  assert.ok(!si.includes("一次的なEvidenceとして使う"), "no primary-evidence claim when nothing was found");
+  assert.equal(r.accepted!.resultCount, 0); assert.equal(r.accepted!.includedInSystemInstruction, true);
+});

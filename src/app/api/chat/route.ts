@@ -242,7 +242,19 @@ Memoryの記述と同じ一文・同じ見出し・同じ箇条書き項目の�
 提示する。Memory由来の情報のすぐ横や直下に、Web由来の固有名詞を並べない。`;
 }
 
-function buildSharedSystemPrompt(searchAvailable: boolean): string {
+/**
+ * Explicit Memory Search Results（保存済みMemoryの明示検索結果）を、回答の正式なEvidenceとして共通promptへ登録する文言。
+ * 検索結果のsectionがある（Explicit Search発火ターン）ときだけ挿入する。無いターンは、挿入文字列が空のため従来のpromptとバイト単位で同一。
+ */
+const EXPLICIT_SEARCH_SOURCE_LABEL = "・明示的な保存済みMemory検索結果（Explicit Search Results）";
+const EXPLICIT_SEARCH_SHARED_BULLET = `
+- 「ユーザーが明示的に探している過去のMemory（保存済みMemoryの検索結果）」のセクションがある場合、それは
+  ユーザーが自分の保存済みの記録を探した結果であり、今回の質問に答えるための正式なEvidenceである。
+  結果が1件以上あるときは、その内容を使って質問へ直接答える。検索結果が存在するのに「記録が見当たらない」
+  「話した記録はない」と答えない（結果に無いことを補って断定もしない）。結果が0件のときだけ、
+  「今回の検索範囲では見つからなかった」と、自分に見えている範囲の限界として述べる`;
+
+function buildSharedSystemPrompt(searchAvailable: boolean, explicitSearchActive = false): string {
   return `
 あなたはTsumugiという、ユーザー個人と自然に会話する相手です。
 普通の会話として、その場に自然な反応をしてください。短い反応、質問、意見、考察など
@@ -337,13 +349,13 @@ ${buildWebSearchSection(searchAvailable)}
 
 ## その他の大切な姿勢
 - ユーザーの人生の詳細のうち、今回のConversation turns・「直前の会話」・「継続中かもしれない
-  話題の候補」・Retrieved Memories（いずれも実際に提示されている場合）のいずれにも含まれていない
+  話題の候補」・Retrieved Memories${explicitSearchActive ? EXPLICIT_SEARCH_SOURCE_LABEL : ""}（いずれも実際に提示されている場合）のいずれにも含まれていない
   部分は、まだこの会話の中には無い。存在しない記憶を作り出したり、これらに書かれていない
   過去の詳細を聞いたかのように装ったりしない
 - ただし、今渡されている範囲に手がかりが無いからといって、「一度も話していない」「記録に存在
   しない」「これまでの会話を全部確認した」のように、ユーザーの過去全体について断定・保証しては
   いけない。今の範囲では確認できないときは、「今参照できている文脈では、その内容を確認できて
-  いない」のように、自分に見えている範囲の限界として述べる
+  いない」のように、自分に見えている範囲の限界として述べる${explicitSearchActive ? EXPLICIT_SEARCH_SHARED_BULLET : ""}
 - 現在のConversation turns・「直前の会話」の一部には「[YYYY-MM-DD HH:mm JST]」のような
   発言日時ラベルが付いている場合がある。これはシステムが確定できる事実（そのturnが実際に
   発言された時刻）であり、AIの推測ではない。ラベルが無いturnについては、日時を推測・
@@ -465,6 +477,20 @@ Memoryに内容が記録されていることと、ユーザーが過去にそ�
 明示的な発言記録がない限り、「前にそう言っていました」「以前おっしゃっていました」
 「覚えています」のように、Memoryの要約内容を過去の直接発言として表現しない。`;
 
+/**
+ * Explicit Search Resultsを、ユーザーについての事実を述べる際の正式なEvidenceとして加える（Explicit Search発火ターンのみ）。
+ * 強さを区別する：逐語抜粋＝ユーザー本人の直接発言／要約・詳細＝AIが整理した記録（ユーザーの逐語として引用しない）。
+ */
+const EXPLICIT_SEARCH_EVIDENCE_BOUNDARY = `
+
+明示的な保存済みMemory検索結果（Explicit Search Results）も、ユーザーについての事実を述べる際の正式な根拠として使ってよい。ただし強さを区別する：
+- 「ユーザー発言の抜粋（逐語）」だけが、ユーザー本人の直接発言として扱える。
+- 「要約」「詳細（記録本文の抜粋）」はAIが整理した記録であり、ユーザーが言った言葉として引用しない
+  （「〜と言っていた」ではなく「〜という記録がある」と述べる）。`;
+function buildEvidenceBoundarySection(explicitSearchActive: boolean): string {
+  return explicitSearchActive ? `${EVIDENCE_BOUNDARY_SECTION}${EXPLICIT_SEARCH_EVIDENCE_BOUNDARY}` : EVIDENCE_BOUNDARY_SECTION;
+}
+
 const MEMORY_TIME_INSTRUCTIONS = `
 ## 過去Memoryの時間の扱い（通常の記憶・話題候補・つながり・起点Memoryに共通）
 - 記録日はConversation／記録の日時であり、出来事の日付ではない。
@@ -584,7 +610,7 @@ function buildExplicitSearchSection(ctx: ExplicitSearchContext | null): string {
 ユーザーは、自分の保存済みMemoryを探す質問をしている（検索語：${ctx.terms.join("、")}）。`;
   if (ctx.results.length === 0) {
     return `${header}保存済みMemoryを検索したが、一致するものは見つからなかった。
-- 見つからなかったことを、「保存済みのMemoryの中では確認できなかった」と、自分に見えている範囲の限界として伝える。
+- 見つからなかったことを、「今回の検索範囲では見つからなかった」「保存済みのMemoryの中では確認できなかった」と、自分に見えている範囲の限界として伝える。
 - 「一度も話していない」と断定しない（Memoryとして保存されていない会話・別の呼び方で保存された話題がありうる）。
 - 存在しない過去の発言・記録を補わない。別の呼び方（敬称・関係の呼称・別の言い方）を、ユーザーに尋ねてよい。`;
   }
@@ -604,11 +630,16 @@ function buildExplicitSearchSection(ctx: ExplicitSearchContext | null): string {
     })
     .join("\n");
   const more = ctx.total > ctx.results.length ? `（一致したのは${ctx.total}件。関連度の高い上位${ctx.results.length}件を示す）` : `（${ctx.results.length}件）`;
-  return `${header}以下は、ローカルに保存されたMemoryを検索して見つかったもの${more}。
+  return `${header}
+これはユーザーが明示的に過去の記録を検索した結果であり、今回の質問に回答するための一次的なEvidenceとして使う。
+以下は、ローカルに保存されたMemoryを検索して見つかったもの${more}。
 
 ${lines}
 
 この検索結果への回答のルール：
+- 検索結果が存在する以上、「記録が見当たらない」「過去に話した記録はない」など、結果の存在と矛盾する回答をしない。上の結果を使って、質問へ直接答える。
+- 結果を全部羅列する必要はない。重複する記録は自然にまとめ、時系列が有用なら時系列で整理してよい。
+- 「検索結果がN件ありました」のような内部の説明、Memory ID、scoreは回答に出さない。
 - 「過去にこう話していた・記録している」という事実は、上の検索結果に書かれている内容だけを根拠にする。書かれていない内容を補って、過去の発言・出来事にしない。
 - 「ユーザー発言の抜粋（逐語）」だけが、ユーザー自身の実際の発言。要約・詳細は、AIが整理した記録を含みうるので、ユーザーが言った言葉として扱わない。
 - 検索結果にないことを「話していない」と断定しない。ここにあるのは保存済みMemoryの一部だけ。
@@ -923,13 +954,13 @@ export async function POST(request: Request) {
 
 今回「過去のユーザー情報」として利用してよいのは、このセクションのMemoryと、
 （提示されている場合は）上の「直前の会話」セクションの逐語、および「ユーザーについて、すでに分かっている前提」
-セクション（ユーザー自身の明示的な発言に基づく前提）だけである。現在のセッションの
+セクション（ユーザー自身の明示的な発言に基づく前提）${sanitizedExplicitSearch ? "、および「ユーザーが明示的に探している過去のMemory（保存済みMemoryの検索結果）」セクション" : ""}だけである。現在のセッションの
 会話履歴（contents）は会話の流れを理解するためだけに使い、その中の過去のmodel発言
 （AI自身の提案・解釈・仮説）を、ユーザー自身の過去の経験・興味・事実として再利用しない。
 ここに存在しない過去情報を会話履歴から補完しない。
 === CURRENT RETRIEVED MEMORIES ===${retrievedMemoriesSection}
 === END CURRENT RETRIEVED MEMORIES ===
-関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。`
+${sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}`
       : retrievedMemoriesSection;
 
   const webSearchInstruction = searchNeeded
@@ -998,7 +1029,7 @@ export async function POST(request: Request) {
 
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded)}${MEMORY_TIME_INSTRUCTIONS}${EVIDENCE_BOUNDARY_SECTION}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${explicitSearchSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${explicitSearchSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
