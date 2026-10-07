@@ -382,7 +382,8 @@ async function extractMemories(
       turns,
       ...(debugId ? { captureDebug: true } : {}),
       existingMemories: existingMemoryObjects.map(toRef),
-      relatedMemories: relatedMemoryObjects.map(toRef),
+      // 関連Memory候補はid + summaryだけを渡す（keywordsは渡さない。Memory Boundary：他の会話のkeywordsを語彙の出典にさせない）。
+      relatedMemories: relatedMemoryObjects.map((memory) => ({ id: memory.id, summary: memory.summary })),
     }),
   });
   if (!res.ok) {

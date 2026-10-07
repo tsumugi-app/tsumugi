@@ -51,6 +51,16 @@ interface ExistingMemoryRef {
 }
 
 /**
+ * 別Conversationからの関連Memory候補。Topic判定の参考情報だけに使う。keywordsは渡さない（Memory Boundary：関連Memoryの語彙を
+ * 新しいMemoryのkeywordsへ写させないため）。古いclientがkeywordsを送ってきても、ここでは読まない・promptへ出さない。
+ */
+interface RelatedMemoryRef {
+  id: string;
+  summary: string;
+  keywords?: string[];
+}
+
+/**
  * MEMORY_ENGINE.md 2.2 Capture / AI_DESIGN.md Memory Pipeline「Memory Analysis」に対応する。
  * この処理はまだ他の記憶との接続(Connect)は行わない。
  *
@@ -195,6 +205,12 @@ Event Time判定（出来事の時間。existingMemoryId・topicDecisionとは�
 - 関連Memory候補は、Topic判定（下記）の参考にだけ使う。今回の内容がその候補の続きのテーマである
   場合は、新規Memoryのまま、topicDecisionをsameTopicにしてその候補のidをsameTopicMemoryIdに
   設定する（同じ話題として関連づけられる）。
+- 関連Memory候補は、Evidenceではない。新しいMemoryの事実・意味・語彙の出典ではない。次を守る：
+  - 関連Memory候補にしか存在しない事実を、新しいMemoryへ追加しない。
+  - 関連Memory候補にしか存在しない関係・原因・意図・感情・属性（例：「特定の相手との関係性」「不安」）を、新しいMemoryへ追加しない。
+  - 関連Memory候補のsummaryの表現を、新しいMemoryのsummary/contentへコピーしない。
+  - 新しいMemoryのsummary / content / keywords / personMentions / Profile / topicEventsは、今回のConversationのUSER'S ACTUAL STATEMENTS
+    だけを根拠に作る。言い換え（paraphrase）と、意味を増やさない自然な抽象化は、これまでどおり許可される。
 
 厳守事項:
 - 実際に語られていないことを作り出さない(事実の捏造禁止)
@@ -271,7 +287,21 @@ User「車で移動したけど、運転は好き。」
 　→ content「移動手段としてだけでなく、運転そのものを楽しんでいる」→ NG（対比の追加・強調）
 　→ OK：summary「車の運転が好き」／content「車を運転するのが好き。」
 
+NG例3（関連Memory候補の表現をsummaryへ持ち込む場合）：
+User「女性について考えている。もう自分の居場所はないんじゃないかと思い始めている。」
+関連Memory候補のsummary「特定の女性との関係性の中で、自分の居場所に対する不安を感じている」
+　→ summary「特定の女性との関係性において、居場所がないのではないかという不安を感じている」→ NG
+　　（「特定の」「関係性」「不安」はUser発言に無く、関連Memory候補からの持ち込み）
+　→ OK：summary「女性について考えており、自分にはもう居場所がないのではないかと思い始めている」
+
 keywords:
+- keywordsは、今回のConversationのUser発言が表しているtopic / entity / conceptから生成する。User発言の意味を保った
+  自然な抽象化（例：「忙しい」→「多忙」）は許可される。
+- 関連Memory候補やAI RESPONSESにしか存在しない概念を、新しいkeywordとして追加しない。関連Memory候補のsummaryの語を、
+  keywordとして写さない。
+  NG例：User「最近フィロコフィアのことを調べてて、4:6メソッドを今度試してみようと思ってる。」、関連Memory候補のsummaryに
+  「コーヒー」「抽出」「実験」が含まれる場合（関連Memory側のkeywordsにそれらがあっても同じ） → keywordsに「コーヒー」「抽出」「実験」を足さない
+  （User発言が表すのは「フィロコフィア」「4:6メソッド」「試す」）。
 - keywordsも、Userの発言・検証済みevidenceQuotesが表すトピックに対応する語を優先する。
 - AI RESPONSESにしか登場しない、Assistant独自の解釈・言い換えの語をkeywordとして
   追加しない。
@@ -319,10 +349,12 @@ function buildExistingMemoriesSection(existingMemories: ExistingMemoryRef[]): st
  * 既存Memoryのセクションとは明確に分け、「類似度で見つかっただけで、同じ記憶とは
  * 限らない」ことをSYSTEM_PROMPT側の指示と合わせて伝える。
  */
-function buildRelatedMemoriesSection(relatedMemories: ExistingMemoryRef[]): string {
+function buildRelatedMemoriesSection(relatedMemories: RelatedMemoryRef[]): string {
   if (relatedMemories.length === 0) return "";
 
-  return `\n\n=== 関連Memory候補（別のConversationから、ローカル検索で見つかった参考情報。更新対象ではない。話題判定にだけ使う） ===\n${formatMemoryRefLines(relatedMemories)}\n=== END 関連Memory候補 ===`;
+  // id + summaryだけ（keywordsは出さない。古いclientがkeywordsを送ってきても使わない）。
+  const lines = relatedMemories.map((memory) => `- id: ${memory.id}\n  summary: ${memory.summary}`).join("\n");
+  return `\n\n=== 関連Memory候補（別のConversationから、ローカル検索で見つかった参考情報。更新対象ではない。話題判定にだけ使う。Evidenceではなく、新しいMemoryの事実・意味・語彙の出典でもない） ===\n${lines}\n=== END 関連Memory候補 ===`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -742,7 +774,7 @@ export async function POST(request: Request) {
     persona: Persona;
     turns: ConversationTurn[];
     existingMemories?: ExistingMemoryRef[];
-    relatedMemories?: ExistingMemoryRef[];
+    relatedMemories?: RelatedMemoryRef[];
   };
 
   if (!Array.isArray(turns) || turns.length === 0 || turns.some(turn => !turn || typeof turn.content !== "string")) {

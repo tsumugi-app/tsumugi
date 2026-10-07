@@ -1038,3 +1038,64 @@ test("Profile validFrom 10-12: ProfileClaim.statedAt is still the source turn's 
   assert.equal(m.eventTime, "2026-10-04", "12: Phase 2A-1 eventTime from the quote's own turn (10/5 - 1)");
   assert.equal(m.date, T0);
 });
+
+// ===========================================================================
+// Capture Memory Boundary：関連Memory候補（他のConversationのMemory）は、Evidenceでも事実・語彙の出典でもない
+// ===========================================================================
+const FILO_USER = "最近フィロコフィアのことを調べてて、4:6メソッドを今度試してみようと思ってる。";
+const FILO_RELATED = () => pastMemory({ id: "01RELATEDFILO0000000000000", content: "フィロコフィアの4:6メソッドを試したい。", summary: "フィロコフィアの4:6メソッドを実際に試してみたいと考えている", keywords: ["フィロコフィア", "4:6メソッド", "コーヒー", "抽出", "実験"], conversationId: "CONV-A" });
+const FILO_OUT = (keywords: string[]): Json => ({ ...BASE, types: ["idea"], topicDecision: "sameTopic", sameTopicMemoryId: "01RELATEDFILO0000000000000", summary: "フィロコフィアの4:6メソッドを今度試してみようと考えている", content: FILO_USER, keywords, evidenceUserMessageIndexes: [0] });
+const relatedSection = (userContent: string) => userContent.slice(userContent.indexOf("=== 関連Memory候補"), userContent.indexOf("=== END 関連Memory候補"));
+
+test("Boundary 1-2: the client sends related Memories as id + summary only (no keywords); the summary stays as a Topic reference", async () => {
+  const bodies: Json[] = [];
+  rec.allMemories = [FILO_RELATED()]; rec.fixed = [FILO_OUT(["フィロコフィア", "4:6メソッド", "試す"])]; rec.script = null; rec.requests = [];
+  const prev = global.fetch;
+  global.fetch = (async (url: string, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return captureRoute.POST(new Request("http://x" + url, init)); }) as typeof fetch;
+  try {
+    const conv = { id: "CONV-B", persona: "analyst", startedAt: T0, status: "active", createdAt: T0, updatedAt: T0, memoryObjectIds: [], turns: [user(FILO_USER), ai("抽出の変数化に興味がありますね。コーヒーの味を実験のように分解するのは面白そうです。")], metadata: { id: "x", schemaVersion: "0.1", source: "user", createdAt: T0, updatedAt: T0 } };
+    await captureClient.captureConversation(conv, []);
+  } finally { global.fetch = prev; }
+  const related = bodies[0].relatedMemories as Json[];
+  assert.equal(related.length, 1);
+  assert.deepEqual(Object.keys(related[0]).sort(), ["id", "summary"], "id + summary only");
+  const section = relatedSection(rec.requests[0].userContent);
+  assert.ok(section.includes("フィロコフィアの4:6メソッドを実際に試してみたいと考えている"), "the summary is kept for Topic judgement");
+  assert.ok(section.includes("01RELATEDFILO0000000000000"), "the id is kept (sameTopicMemoryId / topic inheritance)");
+  for (const w of ["keywords", "コーヒー", "抽出", "実験"]) assert.ok(!section.includes(w), `related section has no ${w}`);
+});
+test("Boundary 2b: a server that still receives keywords (older client) never shows them; the Memory's OWN existing keywords are unchanged", async () => {
+  rec.allMemories = []; rec.fixed = []; rec.script = null; rec.requests = [];
+  const res = await captureRoute.POST(new Request("http://x/api/capture", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ persona: "analyst", turns: [user(FILO_USER)], existingMemories: [{ id: "OWN1", summary: "この会話のMemory", keywords: ["自分のkeyword"] }], relatedMemories: [{ id: "REL1", summary: "関連の要約", keywords: ["コーヒー", "抽出", "実験"] }] }) }));
+  assert.equal(res.status, 200);
+  const uc = rec.requests[0].userContent;
+  const section = relatedSection(uc);
+  assert.ok(section.includes("関連の要約") && !section.includes("keywords") && !section.includes("コーヒー"));
+  assert.ok(uc.includes("keywords: 自分のkeyword"), "this conversation's own existing Memory still shows its keywords (UPDATE of the same conversation is unaffected)");
+});
+test("Boundary 3: the prompt states related Memories are not Evidence / not a source of facts, meaning or vocabulary, with the real NG examples", async () => {
+  const { firstReq } = await runCapture([user(FILO_USER), ai("…")], [FILO_OUT(["フィロコフィア"])], { allMemories: [FILO_RELATED()] });
+  const sys = firstReq.systemInstruction.replace(/\s+/g, "");
+  for (const needle of [
+    "関連Memory候補は、Evidenceではない。新しいMemoryの事実・意味・語彙の出典ではない",
+    "関連Memory候補にしか存在しない事実を、新しいMemoryへ追加しない",
+    "関連Memory候補にしか存在しない関係・原因・意図・感情・属性",
+    "関連Memory候補のsummaryの表現を、新しいMemoryのsummary/contentへコピーしない",
+    "今回のConversationのUSER'S ACTUAL STATEMENTSだけを根拠に作る",
+    "言い換え（paraphrase）と、意味を増やさない自然な抽象化は、これまでどおり許可される",
+    "関連Memory候補やAI RESPONSESにしか存在しない概念を、新しいkeywordとして追加しない",
+    "keywordsに「コーヒー」「抽出」「実験」を足さない",
+    "NG例3（関連Memory候補の表現をsummaryへ持ち込む場合）",
+    "「特定の」「関係性」「不安」はUser発言に無く、関連Memory候補からの持ち込み",
+  ].map((n) => n.replace(/\s+/g, ""))) assert.ok(sys.includes(needle), needle);
+  assert.ok(firstReq.userContent.includes("Evidenceではなく、新しいMemoryの事実・意味・語彙の出典でもない"));
+});
+test("Boundary 4-5: no new drop / trim / retry — a candidate whose keywords match the related Memory is accepted unchanged; accept/drop logic and Evidence validation are untouched", async () => {
+  const kws = ["フィロコフィア", "コーヒー", "抽出", "実験"];
+  const { out, calls } = await runCapture([user(FILO_USER), ai("…")], [FILO_OUT(kws)], { allMemories: [FILO_RELATED()] });
+  assert.equal(out.outcome.kind, "saved"); assert.equal(out.outcome.dropped, 0); assert.equal(calls, 1, "no retry added");
+  assert.deepEqual(out.memoryObjects[0].keywords, kws, "keywords are not trimmed or filtered");
+  // an invalid evidence reference is still dropped exactly as before
+  const bad = await runCapture([user(FILO_USER), ai("…")], [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }], { allMemories: [FILO_RELATED()], script: [{ memories: [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }] }, { memories: [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }] }] });
+  assert.equal(bad.out.outcome.kind, "all-dropped"); assert.equal(bad.out.memoryObjects.length, 0);
+});
