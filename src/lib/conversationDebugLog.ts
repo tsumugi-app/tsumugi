@@ -227,6 +227,42 @@ export async function appendExplicitSearchAcceptanceNote(generationId: string, a
   }
 }
 
+/**
+ * Memory Analytics Phase 1：サーバーが実際に受け取った`memoryAnalytics`の状態（`serverAccepted.memoryAnalyticsServerAccepted`）を、
+ * Conversation Debuggerの「全てコピー」で取得できるよう、同じログへ1行追記する（debug専用。`?debugLog=1`のときだけ）。
+ * 保存するのは6項目だけ（whitelist。ランキング本文・Memory IDは扱わない）。Chat prompt・集計結果には影響しない。
+ */
+export interface MemoryAnalyticsAcceptanceNote {
+  received: boolean;
+  metric: string;
+  requestedLimit: number;
+  resultCount: number;
+  sectionLength: number;
+  includedInSystemInstruction: boolean;
+}
+export async function appendMemoryAnalyticsAcceptanceNote(generationId: string, accepted: MemoryAnalyticsAcceptanceNote): Promise<void> {
+  if (!debugLogEnabled()) return;
+  try {
+    await withVaultWorldRead(async () => {
+      const epoch = getTabVaultEpoch();
+      if (epoch === null) return;
+      const safe: MemoryAnalyticsAcceptanceNote = {
+        received: accepted.received === true,
+        metric: typeof accepted.metric === "string" ? accepted.metric.slice(0, 60) : "",
+        requestedLimit: Number.isFinite(accepted.requestedLimit) ? accepted.requestedLimit : 0,
+        resultCount: Number.isFinite(accepted.resultCount) ? accepted.resultCount : 0,
+        sectionLength: Number.isFinite(accepted.sectionLength) ? accepted.sectionLength : 0,
+        includedInSystemInstruction: accepted.includedInSystemInstruction === true,
+      };
+      const text = `[ConversationDebug:serverAccepted] generationId=${generationId.slice(0, 36)}\nmemoryAnalyticsServerAccepted: ${JSON.stringify(safe)}`;
+      console.log(text);
+      appendEntry(text, epoch);
+    });
+  } catch (error) {
+    console.warn("[ConversationDebug] failed to append memory analytics acceptance note", error);
+  }
+}
+
 /** route.ts の computeThinkingBudget() と同じ式をここに複製しているだけの表示用ミラー。
  * 実際にサーバーが使った値の取得ではない（上のファイル冒頭コメント参照）。 */
 function mirrorThinkingBudget(latestUserMessage: string): number {

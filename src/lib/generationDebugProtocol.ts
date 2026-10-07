@@ -51,6 +51,8 @@ export interface GenerationDebugContext {
   retrievedMemory: RetrievedMemory[];
   /** サーバーが実際に受け取ったExplicit Searchの状態。[Server Accepted]のdebug envelopeにだけ入る（[Client Sent]には無い）。 */
   explicitSearchServerAccepted?: ExplicitSearchServerAccepted;
+  /** サーバーが実際に受け取ったMemory Analyticsの状態。[Server Accepted]のdebug envelopeにだけ入る。 */
+  memoryAnalyticsServerAccepted?: MemoryAnalyticsServerAccepted;
 }
 
 /** [Generation]：実際にプロバイダへ渡した値（推測・ミラーではない）。 */
@@ -80,6 +82,19 @@ export interface ExplicitSearchServerAccepted {
   /** 生成されたexplicitSearch sectionの文字数（sectionが無ければ0）。 */
   sectionLength: number;
   /** provider.generateStreamへ渡すsystemInstructionにsectionが含まれているか。 */
+  includedInSystemInstruction: boolean;
+}
+
+/**
+ * Memory Analytics Phase 1：サーバーが実際に受け取った集計結果の状態（観測専用）。`debugGenerationId`付きのリクエストの
+ * [Server Accepted]にだけ入る。ランキング本文・Memory IDは含めない。Chat prompt・集計結果は変えない。
+ */
+export interface MemoryAnalyticsServerAccepted {
+  received: boolean;
+  metric: string;
+  requestedLimit: number;
+  resultCount: number;
+  sectionLength: number;
   includedInSystemInstruction: boolean;
 }
 

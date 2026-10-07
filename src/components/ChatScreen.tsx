@@ -7,6 +7,7 @@ import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib
 import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
 import { computePersonViews, PERSON_VIEW_CONTEXT_LIMIT, type PersonView } from "@/lib/person";
 import { buildExplicitSearchContext, type ExplicitSearchContext } from "@/lib/memorySearch";
+import { buildMemoryAnalyticsContext, type MemoryAnalyticsContext } from "@/lib/memoryAnalytics";
 import { computeTopicTimelines, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { appendGenerationDebugEntry, createGenerationId, debugLogEnabled as generationDebugLogEnabled } from "@/lib/generationDebugLog";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
@@ -148,7 +149,7 @@ import { useWaitingMessage } from "@/lib/useWaitingMessage";
 // TEMP-TEST：起動処理とpage:hidden/page:loadの因果関係切り分け用の最小計測。
 import { logStartupCatchupEnd, logStartupCatchupStart, logTimingEvent, markBootPhaseDone, markBootStart } from "@/lib/debugTimingLog";
 // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用（`?debugLog=1`のときだけ出力）。
-import { appendExplicitSearchAcceptanceNote, logConversationDebug } from "@/lib/conversationDebugLog";
+import { appendExplicitSearchAcceptanceNote, appendMemoryAnalyticsAcceptanceNote, logConversationDebug } from "@/lib/conversationDebugLog";
 import ApiKeySetup from "./ApiKeySetup";
 import SettingsPanel from "./SettingsPanel";
 import ImportPanel from "./ImportPanel";
@@ -4594,10 +4595,20 @@ export default function ChatScreen() {
       // Explicit Memory Search Phase 1：ユーザーが保存済みの過去を明示的に探す発言のときだけ、保存済みMemory全体を検索する
       // （通常のAssociative Recall＝上のretrievedMemoriesは変更しない。追加のIDB読み込み・API呼び出しは無い）。
       let explicitSearchContext: ExplicitSearchContext | null = null;
+      // Memory Analytics Phase 1：保存済みMemory全体の集計（キーワードランキング）を求める発言のときだけ、code側で集計する。
+      // 優先順位は Memory Analytics → Explicit Search → 通常Retrieval。Analyticsが成立した発言は、Explicit Searchとして処理しない。
+      let memoryAnalyticsContext: MemoryAnalyticsContext | null = null;
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
         try {
-          explicitSearchContext = buildExplicitSearchContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
+          memoryAnalyticsContext = buildMemoryAnalyticsContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
+        } catch (analyticsError) {
+          console.error("Failed to run memory analytics", analyticsError);
+        }
+        try {
+          if (memoryAnalyticsContext === null) {
+            explicitSearchContext = buildExplicitSearchContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
+          }
         } catch (searchError) {
           console.error("Failed to run explicit memory search", searchError);
         }
@@ -4694,6 +4705,7 @@ export default function ChatScreen() {
           ...(personViewContext ? { personView: personViewContext } : {}),
           ...(topicTimelineContext ? { topicTimeline: topicTimelineContext } : {}),
           ...(explicitSearchContext ? { explicitSearch: explicitSearchContext } : {}),
+          ...(memoryAnalyticsContext ? { memoryAnalytics: memoryAnalyticsContext } : {}),
           ...(generationId ? { debugGenerationId: generationId } : {}),
         }),
       });
@@ -4796,6 +4808,9 @@ export default function ChatScreen() {
         // （conversationDebugLog）にも1行残す。観測専用（?debugLog=1のときだけ。promptにも検索にも影響しない）。
         const explicitSearchAccepted = debugEnvelope.serverAccepted.explicitSearchServerAccepted;
         if (explicitSearchAccepted) void appendExplicitSearchAcceptanceNote(generationId, explicitSearchAccepted);
+        // Memory Analytics Phase 1：同じく「全てコピー」へ1行残す（観測専用）。
+        const memoryAnalyticsAccepted = debugEnvelope.serverAccepted.memoryAnalyticsServerAccepted;
+        if (memoryAnalyticsAccepted) void appendMemoryAnalyticsAcceptanceNote(generationId, memoryAnalyticsAccepted);
       }
 
       // Conversation本文の保存とMemory生成（Capture）は分離する（今回の再設計）。

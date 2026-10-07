@@ -8,6 +8,7 @@ import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabe
 import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
 import { sanitizePersonViewContext, type PersonView } from "@/lib/person";
 import { sanitizeExplicitSearchContext, type ExplicitSearchContext } from "@/lib/memorySearch";
+import { sanitizeMemoryAnalyticsContext, type MemoryAnalyticsContext } from "@/lib/memoryAnalytics";
 import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { AIProviderError } from "@/lib/ai/errors";
@@ -254,7 +255,18 @@ const EXPLICIT_SEARCH_SHARED_BULLET = `
   「話した記録はない」と答えない（結果に無いことを補って断定もしない）。結果が0件のときだけ、
   「今回の検索範囲では見つからなかった」と、自分に見えている範囲の限界として述べる`;
 
-function buildSharedSystemPrompt(searchAvailable: boolean, explicitSearchActive = false): string {
+/**
+ * Memory Analytics Results（保存済みMemory全体の集計結果）を、回答の正式なEvidenceとして共通promptへ登録する文言。
+ * 集計結果のsectionがあるターンだけ挿入する（無いターンは空文字で、従来のpromptとバイト単位で同一）。
+ */
+const MEMORY_ANALYTICS_SOURCE_LABEL = "・Memory Analytics Results（保存済みMemory全体の集計結果）";
+const MEMORY_ANALYTICS_SHARED_BULLET = `
+- 「Memory Analytics Results（保存済みMemory全体の集計結果）」のセクションがある場合、それはTsumugiがプログラムで
+  確定した集計であり、今回の質問に答えるための正式なEvidenceである。順位と数値はその結果をそのまま使い、
+  再計算・変更しない。集計結果が存在するのに「全体は分からない」「一部のMemoryしか見えていないので
+  ランキングできない」「正確な回数は分からない」と答えない`;
+
+function buildSharedSystemPrompt(searchAvailable: boolean, explicitSearchActive = false, memoryAnalyticsActive = false): string {
   return `
 あなたはTsumugiという、ユーザー個人と自然に会話する相手です。
 普通の会話として、その場に自然な反応をしてください。短い反応、質問、意見、考察など
@@ -349,13 +361,13 @@ ${buildWebSearchSection(searchAvailable)}
 
 ## その他の大切な姿勢
 - ユーザーの人生の詳細のうち、今回のConversation turns・「直前の会話」・「継続中かもしれない
-  話題の候補」・Retrieved Memories${explicitSearchActive ? EXPLICIT_SEARCH_SOURCE_LABEL : ""}（いずれも実際に提示されている場合）のいずれにも含まれていない
+  話題の候補」・Retrieved Memories${explicitSearchActive ? EXPLICIT_SEARCH_SOURCE_LABEL : ""}${memoryAnalyticsActive ? MEMORY_ANALYTICS_SOURCE_LABEL : ""}（いずれも実際に提示されている場合）のいずれにも含まれていない
   部分は、まだこの会話の中には無い。存在しない記憶を作り出したり、これらに書かれていない
   過去の詳細を聞いたかのように装ったりしない
 - ただし、今渡されている範囲に手がかりが無いからといって、「一度も話していない」「記録に存在
   しない」「これまでの会話を全部確認した」のように、ユーザーの過去全体について断定・保証しては
   いけない。今の範囲では確認できないときは、「今参照できている文脈では、その内容を確認できて
-  いない」のように、自分に見えている範囲の限界として述べる${explicitSearchActive ? EXPLICIT_SEARCH_SHARED_BULLET : ""}
+  いない」のように、自分に見えている範囲の限界として述べる${explicitSearchActive ? EXPLICIT_SEARCH_SHARED_BULLET : ""}${memoryAnalyticsActive ? MEMORY_ANALYTICS_SHARED_BULLET : ""}
 - 現在のConversation turns・「直前の会話」の一部には「[YYYY-MM-DD HH:mm JST]」のような
   発言日時ラベルが付いている場合がある。これはシステムが確定できる事実（そのturnが実際に
   発言された時刻）であり、AIの推測ではない。ラベルが無いturnについては、日時を推測・
@@ -487,8 +499,18 @@ const EXPLICIT_SEARCH_EVIDENCE_BOUNDARY = `
 - 「ユーザー発言の抜粋（逐語）」だけが、ユーザー本人の直接発言として扱える。
 - 「要約」「詳細（記録本文の抜粋）」はAIが整理した記録であり、ユーザーが言った言葉として引用しない
   （「〜と言っていた」ではなく「〜という記録がある」と述べる）。`;
-function buildEvidenceBoundarySection(explicitSearchActive: boolean): string {
-  return explicitSearchActive ? `${EVIDENCE_BOUNDARY_SECTION}${EXPLICIT_SEARCH_EVIDENCE_BOUNDARY}` : EVIDENCE_BOUNDARY_SECTION;
+/**
+ * Memory Analytics Resultsを、Evidenceとして加える（集計結果のsectionがあるターンのみ）。code側で確定した集計であり、
+ * キーワードはAIがMemoryへ付けた語（ユーザーの逐語の発言ではない）。数値はcodeの結果を使い、LLMが数え直さない。
+ */
+const MEMORY_ANALYTICS_EVIDENCE_BOUNDARY = `
+
+Memory Analytics Results（保存済みMemory全体の集計結果）も、ユーザーの保存済みMemory全体についての事実を述べる際の正式な根拠として使ってよい。ただし：
+- 順位と数値はcode側が確定した結果であり、LLMが数え直したり変更したりしない。結果に無いキーワードを足さない。
+- キーワードは、AIが会話からMemoryへ付けた語であり、ユーザーが発言した言葉そのものではない。
+- 集計の単位は「そのキーワードが付いたMemoryを含む会話の数」で、「単語を発言した回数」「本文中の出現回数」ではない。`;
+function buildEvidenceBoundarySection(explicitSearchActive: boolean, memoryAnalyticsActive = false): string {
+  return `${EVIDENCE_BOUNDARY_SECTION}${explicitSearchActive ? EXPLICIT_SEARCH_EVIDENCE_BOUNDARY : ""}${memoryAnalyticsActive ? MEMORY_ANALYTICS_EVIDENCE_BOUNDARY : ""}`;
 }
 
 const MEMORY_TIME_INSTRUCTIONS = `
@@ -645,6 +667,42 @@ ${lines}
 - 検索結果にないことを「話していない」と断定しない。ここにあるのは保存済みMemoryの一部だけ。
 - 日付は、記録日・発言日・出来事の区別を保って述べる。
 - 解釈・感想・提案は述べてよいが、記録に基づく事実の部分とは区別する。`;
+}
+
+/**
+ * Memory Analytics Phase 1（memoryAnalytics.ts）。保存済みMemory全体のキーワードランキング（全期間）。数値はclient側のcodeが確定した
+ * 結果で、ここではsanitize済みの値を整形するだけ。LLMにMemoryを数えさせない。
+ */
+function buildMemoryAnalyticsSection(ctx: MemoryAnalyticsContext | null): string {
+  if (ctx === null) return "";
+  const range = ctx.scope.firstDate && ctx.scope.lastDate ? `${ctx.scope.firstDate}〜${ctx.scope.lastDate}` : "不明";
+  const header = `
+
+## Memory Analytics Results（保存済みMemory全体の集計結果）
+
+ユーザーは、保存済みMemory全体の集計（キーワードのランキング）を求めている。以下は、Tsumugiがこの端末のIndexedDBに保存されているMemoryをプログラムで集計した結果であり、今回の質問に回答するための正式なEvidenceである。
+metric: ${ctx.metric}（そのキーワードが付いた通常Memoryを含む会話の数。「単語を発言した回数」でも「本文中の出現回数」でもない）
+scope: 全期間（Memoryの日付 ${range}）。対象のMemory ${ctx.scope.memoryCount}件、会話 ${ctx.scope.conversationCount}件、異なるキーワード ${ctx.scope.distinctKeywordCount}種類。AIが生成する日記の振り返り（Reflection）${ctx.scope.excludedReflectionCount}件は、二重に数えないよう集計から除外している。`;
+  if (ctx.results.length === 0) {
+    return `${header}
+ranking: 集計できるキーワードがまだ無い（対象のMemoryに、キーワードが付いたものが無い）。
+- 集計結果が「無い」ことを、この端末に保存されているMemoryの範囲で、事実として伝える。存在しないキーワードを補わない。`;
+  }
+  const lines = ctx.results
+    .map((row) => `${row.rank}. ${row.keyword} — ${row.conversationCount}会話（Memory ${row.memoryCount}件、${row.firstDate ?? "?"}〜${row.lastDate ?? "?"}）`)
+    .join("\n");
+  return `${header}
+ranking（上位${ctx.results.length}件。ユーザーの指定は${ctx.requestedLimit}件）:
+${lines}
+
+この集計結果への回答のルール：
+- 順位と数値は、上の結果をそのまま使う。再計算・変更・補正をしない。結果に無いキーワードをランキングへ足さない。
+- 集計結果が存在する以上、「全体は分からない」「一部のMemoryしか見えていないのでランキングできない」「正確な回数は分からない」など、結果と矛盾する回答をしない。上の結果を使って、質問へ直接答える。
+- 「単語を発言した回数」「本文中の出現回数」とは言わない。「そのキーワードが付いたMemoryを含む会話の数（話題に出てきた会話の数）」として述べる。
+- 上位${ctx.results.length}件より先は集計していない。それ以上を求められたら、改めて件数を指定してもらう。
+- 内部のMemory ID・実装の説明は出さない。結果を全部機械的に羅列する必要はなく、自然な文章で、必要なら上位の傾向を一言添えてよい。
+- これは、この端末に保存されているMemoryの範囲の集計であることを、必要に応じて自然に示してよい。
+- キーワードはAIがMemoryへ付けた語で、表記の違い（例：「リュウ」と「リュウさん」）は別の語として数えている。必要なら一言触れてよい。`;
 }
 
 function buildRetrievedMemoriesSection(memories: RetrievedMemory[]): string {
@@ -882,7 +940,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -896,6 +954,8 @@ export async function POST(request: Request) {
     topicTimeline?: TopicTimeline[];
     /** Explicit Memory Search Phase 1（optional）。ユーザーが保存済みの過去を明示的に探す発言のときだけ、クライアントが渡す検索結果。 */
     explicitSearch?: ExplicitSearchContext;
+    /** Memory Analytics Phase 1（optional）。ユーザーが保存済みMemory全体の集計（キーワードランキング）を求める発言のときだけ、クライアントがcodeで集計して渡す。 */
+    memoryAnalytics?: MemoryAnalyticsContext;
     /**
      * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
      * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
@@ -924,7 +984,11 @@ export async function POST(request: Request) {
   // 「そのターン専用の指示文を足すかどうか」「Retrieved Memoryのフィルタ」「provider共通
   // requestのenableWebSearch」の3箇所に使う（一度だけ評価し、二重に判定しない）。
   const hasPriorConversationContext = turns.length > 1;
-  const searchNeeded = needsWebSearch(latestUserMessage, hasPriorConversationContext);
+  // Memory Analytics Phase 1：保存済みMemory全体の集計結果（code側で確定済み）が付いたターンは、ユーザー自身の保存済みMemoryについての
+  // 質問であり、外部の現在情報は不要。「今までよく出てきたキーワードTOP10は？」のようにneedsWebSearchが反応する語（TOP10等）を含んでも、
+  // Web検索を有効にしない（有効だと、集計結果ではなくWeb検索結果を根拠に答えてしまう）。Analyticsが無いターンは従来どおり。
+  const sanitizedMemoryAnalytics = sanitizeMemoryAnalyticsContext(memoryAnalytics);
+  const searchNeeded = needsWebSearch(latestUserMessage, hasPriorConversationContext) && sanitizedMemoryAnalytics === null;
 
   // Test 31：今回生成するAIターンが、明示的な記録依頼への応答かどうかを、
   // ユーザー発言の時点で確定させる。この結果はisRecordTurnとしてレスポンス
@@ -954,13 +1018,13 @@ export async function POST(request: Request) {
 
 今回「過去のユーザー情報」として利用してよいのは、このセクションのMemoryと、
 （提示されている場合は）上の「直前の会話」セクションの逐語、および「ユーザーについて、すでに分かっている前提」
-セクション（ユーザー自身の明示的な発言に基づく前提）${sanitizedExplicitSearch ? "、および「ユーザーが明示的に探している過去のMemory（保存済みMemoryの検索結果）」セクション" : ""}だけである。現在のセッションの
+セクション（ユーザー自身の明示的な発言に基づく前提）${sanitizedExplicitSearch ? "、および「ユーザーが明示的に探している過去のMemory（保存済みMemoryの検索結果）」セクション" : ""}${sanitizedMemoryAnalytics ? "、および「Memory Analytics Results（保存済みMemory全体の集計結果）」セクション" : ""}だけである。現在のセッションの
 会話履歴（contents）は会話の流れを理解するためだけに使い、その中の過去のmodel発言
 （AI自身の提案・解釈・仮説）を、ユーザー自身の過去の経験・興味・事実として再利用しない。
 ここに存在しない過去情報を会話履歴から補完しない。
 === CURRENT RETRIEVED MEMORIES ===${retrievedMemoriesSection}
 === END CURRENT RETRIEVED MEMORIES ===
-${sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}`
+${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、明示的な検索結果やMemory Analytics Resultsがある場合は、その結果を使って回答する。" : sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、Memory Analytics Resultsがある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}`
       : retrievedMemoriesSection;
 
   const webSearchInstruction = searchNeeded
@@ -1028,8 +1092,9 @@ ${sanitizedExplicitSearch ? "このセクションに関連するMemoryが無く
   const profileSection = buildProfileSection(sanitizedProfile);
 
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
+  const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${explicitSearchSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
@@ -1039,7 +1104,7 @@ ${sanitizedExplicitSearch ? "このセクションに関連するMemoryが無く
   // Conversation・Topic Continuity Contextがあるターンも、Memoryがあるターンと同様に
   // 「継続の理解」に思考予算が要るため floor 512 とする。
   const thinkingBudget = computeThinkingBudget(latestUserMessage, {
-    hasRetrievedMemories: retrievedMemoriesSection.length > 0 || explicitSearchSection.length > 0,
+    hasRetrievedMemories: retrievedMemoriesSection.length > 0 || explicitSearchSection.length > 0 || memoryAnalyticsSection.length > 0,
     hasRecentConversation: recentConversationSection.length > 0,
     hasTopicContext: topicContinuitySection.length > 0,
   });
@@ -1167,6 +1232,15 @@ ${sanitizedExplicitSearch ? "このセクションに関連するMemoryが無く
             resultCount: sanitizedExplicitSearch?.results.length ?? 0,
             sectionLength: explicitSearchSection.length,
             includedInSystemInstruction: explicitSearchSection.length > 0 && systemInstruction.includes(explicitSearchSection),
+          },
+          // Memory Analytics Phase 1（観測専用）：サーバーが実際に受け取った状態。ランキング本文・Memory IDは含めない。
+          memoryAnalyticsServerAccepted: {
+            received: memoryAnalytics !== undefined && memoryAnalytics !== null,
+            metric: sanitizedMemoryAnalytics?.metric ?? "",
+            requestedLimit: sanitizedMemoryAnalytics?.requestedLimit ?? 0,
+            resultCount: sanitizedMemoryAnalytics?.results.length ?? 0,
+            sectionLength: memoryAnalyticsSection.length,
+            includedInSystemInstruction: memoryAnalyticsSection.length > 0 && systemInstruction.includes(memoryAnalyticsSection),
           },
         },
       }
