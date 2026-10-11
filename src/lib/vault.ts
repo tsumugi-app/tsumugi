@@ -1811,6 +1811,11 @@ export function dayFileNameFor(isoDate: string) {
  */
 export interface VaultWriteOptions {
   adoptLocalOnly?: boolean;
+  /**
+   * Maintenance dry run only: do not record the IndexedDB sync ledger after the write. Used with a shadow (in-memory) Vault so that
+   * rehearsing the real writer can never mark a record "synced". Normal callers never set it; the default behaviour is unchanged.
+   */
+  skipLedger?: boolean;
 }
 
 /** `adoptLocalOnly`の書き込み先ファイルが既に存在した場合（既存ファイルを上書きしないための拒否）。 */
@@ -1937,7 +1942,7 @@ export async function writeConversationMarkdown(
     priority,
     vaultSyncKeyFor("conversation", conversation.id)
   );
-  await markVaultSynced("conversation", conversation.id, conversation.updatedAt);
+  if (!options?.skipLedger) await markVaultSynced("conversation", conversation.id, conversation.updatedAt);
 }
 
 /**
@@ -2281,7 +2286,7 @@ export async function writeMemoryObjectMarkdown(
     priority,
     vaultSyncKeyFor("memory", memoryObject.id)
   );
-  await markVaultSynced("memory", memoryObject.id, memoryObject.updatedAt);
+  if (!options?.skipLedger) await markVaultSynced("memory", memoryObject.id, memoryObject.updatedAt);
 }
 
 /**

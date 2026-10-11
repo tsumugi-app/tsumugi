@@ -46,3 +46,7 @@ next-env.d.ts
 
 # ローカル開発環境固有の設定（個人PCの絶対パス等を含みうるため）
 .claude/
+
+# Memory repair: 実データ由来の修復内容（個人情報）。絶対にコミットしない
+/private/
+*.memory-repair-data.json
