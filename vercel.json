@@ -1,4 +1,4 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "if [ -z \"$VERCEL_ENV\" ] || [ -z \"$VERCEL\" ]; then echo '[preview-verify] FAIL: VERCEL_ENV/VERCEL not set, tests would not run' >&2; exit 1; fi; if [ \"$VERCEL_ENV\" = \"preview\" ]; then echo '[preview-verify] START test:maintenance'; npm run test:maintenance || { echo '[preview-verify] FAIL: test:maintenance' >&2; exit 1; }; echo '[preview-verify] PASSED test:maintenance'; npm run build; else echo \"[preview-verify] VERCEL_ENV=$VERCEL_ENV: tests skipped, build only\"; npm run build; fi"
+  "buildCommand": "sh scripts/preview-verify.sh"
 }
