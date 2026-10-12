@@ -50,3 +50,6 @@ next-env.d.ts
 # Memory repair: 実データ由来の修復内容（個人情報）。絶対にコミットしない
 /private/
 *.memory-repair-data.json
+# Memory repair: 非公開の判断リスト（HOLD・除外の決定）。コミットしない
+memory-repair-decisions.json
+*.memory-repair-decisions.json

@@ -39,6 +39,9 @@ const FORBIDDEN = ["lib/capture.ts", "lib/connect.ts", "lib/retrieval.ts", "lib/
 test("no path from the maintenance area (proxy, page, panel, library) to AI / Capture / Connect / ChatScreen / API routes", () => {
   const { files, externals } = reachable([PROXY, PAGE, PANEL, ...maintSources]);
   for (const f of FORBIDDEN) assert.ok(!files.has(f), `must not reach ${f}`);
+  // the read-only repair pre-check is part of the graph; the repair runner / DB environment (which can write) must not be
+  for (const f of ["lib/memoryRepairRunner.ts", "lib/memoryRepairDbEnv.ts"]) assert.ok(!files.has(f), `must not reach ${f}`);
+  assert.ok(files.has("lib/memoryRepairPrecheck.ts") && files.has("lib/maintenance/precheckScope.ts"));
   // (type-only imports are erased at compile time and are not followed)
   for (const f of files) { assert.ok(!f.startsWith("lib/ai/"), f); assert.ok(!f.startsWith("app/api/"), f); }
   const ok = (e: string) => ["react", "next/server", "next/navigation", "next/headers", "next", "ulid", "idb"].includes(e) || e.startsWith("next/");
@@ -77,7 +80,10 @@ test("nothing runs on load: the panel has no effect hook and every action sits b
   assert.ok(page.indexOf("decideMaintenanceAccess") < page.indexOf("<MaintenancePanel"));
 });
 
-test("normal operation is untouched: ChatScreen, startup, layout, API routes, PWA manifest and next.config are not modified; vault.ts only gained the opt-in skipLedger option", () => {
+/** This one test compares the working tree with HEAD through git. A Vercel build has no usable git history, so it is skipped THERE only
+ *  (`VERCEL` is set by Vercel); the same comparison is done by hand before a deploy (see the pre-deploy diff check). */
+const ON_VERCEL = !!process.env.VERCEL;
+test("normal operation is untouched: ChatScreen, startup, layout, API routes, PWA manifest and next.config are not modified; vault.ts only gained the opt-in skipLedger option", { skip: ON_VERCEL ? "no git history in a Vercel build" : false }, () => {
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
   const changed = git("diff", "--name-only", "HEAD").split("\n").filter(Boolean);
   const untouchable = ["src/components/ChatScreen.tsx", "src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/capture.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts"];
