@@ -7,6 +7,12 @@ import {
   buildManifestDraft, diagnoseTargets, dryRun, executeSync, exportRecordBackup, inspectStates, preflight, verifyRecordBackup, verifyVaultBackup,
   type BackupVerification, type DiagnosisItem, type DryRunReport, type ExecuteReport, type Preflight, type TargetState,
 } from "@/lib/maintenance/scopedVaultSync";
+import {
+  analyzeSelection, decisionsError, diagnoseVaultForPrecheck, listItems, overallVerdict, parseDecisions, scanLiveStatuses, selectionError, MAX_SELECTED,
+  type Analysis, type Decisions, type LiveStatuses, type VaultCheck,
+} from "@/lib/maintenance/precheckScope";
+import { parsePrivateRepairData, type PrivateRepairData } from "@/lib/privateRepairData";
+import { readPrecheckInput, renderPrecheckText } from "@/lib/memoryRepairPrecheck";
 
 /**
  * Maintenance panel: S1 preflight, S2 dry run (+ non-target invariants), S3 execute + verify, for already-repaired records.
@@ -32,6 +38,14 @@ export default function MaintenancePanel() {
   const [diagnosis, setDiagnosis] = useState<DiagnosisItem[] | null>(null);
   const [draftIds, setDraftIds] = useState("");
   const [draftText, setDraftText] = useState<string | null>(null);
+  // repair pre-check (read-only). The reviewed data stays in this component's memory; it is never rendered, stored or sent.
+  const [repairData, setRepairData] = useState<PrivateRepairData | null>(null);
+  const [decisions, setDecisions] = useState<Decisions | null>(null);
+  const [live, setLive] = useState<LiveStatuses | null>(null);
+  const [picked, setPicked] = useState<string[]>([]);
+  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [vaultCheck, setVaultCheck] = useState<VaultCheck | null>(null);
+  const [precheckText, setPrecheckText] = useState<string | null>(null);
   const vaultHandle = session && session.status === "ready" ? session.handle : null;
   const locked = useRef(false);
 
@@ -78,6 +92,55 @@ export default function MaintenancePanel() {
     await guarded(async () => { setResult(await executeSync({ manifest, root: vaultHandle, report, vaultBackup, recordBackup, confirm })); });
   }
   async function runVerify() { if (!manifest || !vaultHandle) return; await guarded(async () => { setStates(await inspectStates(manifest, vaultHandle)); setDiagnosis(await diagnoseTargets(manifest, vaultHandle)); }); }
+  function loadRepairData(file: File | undefined) {
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const p = parsePrivateRepairData(String(r.result ?? ""));
+      setPicked([]); setAnalysis(null); setVaultCheck(null); setPrecheckText(null); setLive(null);
+      if (p.ok) { setRepairData(p.data); setError(null); } else { setRepairData(null); setError("repair data rejected: " + p.error); }
+    };
+    r.readAsText(file);
+  }
+  function loadDecisions(file: File | undefined) {
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const p = parseDecisions(String(r.result ?? ""));
+      setPicked([]); setAnalysis(null); setVaultCheck(null); setPrecheckText(null);
+      if (p.ok) { setDecisions(p.decisions); setError(null); } else { setDecisions(null); setError("decision list rejected: " + p.error); }
+    };
+    r.readAsText(file);
+  }
+  async function runScan() {
+    if (!repairData || decisionsError(repairData, decisions)) return;
+    await guarded(async () => {
+      const at = new Date().toISOString();
+      const input = await readPrecheckInput({ indexedDB: window.indexedDB, build: "maintenance", now: () => at }, repairData);
+      setPicked([]); setAnalysis(null); setVaultCheck(null); setPrecheckText(null);
+      setLive(input ? await scanLiveStatuses(input, repairData, at) : null);
+    });
+  }
+  const togglePick = (key: string) => { setAnalysis(null); setVaultCheck(null); setPrecheckText(null); setPicked((cur) => (cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key])); };
+  async function runPrecheck() {
+    if (!repairData) return;
+    const bad = selectionError(repairData, decisions, live, picked);
+    if (bad) { setError("selection refused: " + bad); return; }
+    await guarded(async () => {
+      setVaultCheck(null);
+      const at = new Date().toISOString();
+      // IndexedDB is opened WITHOUT a version and only with readonly transactions (see memoryRepairPrecheck.ts)
+      const input = await readPrecheckInput({ indexedDB: window.indexedDB, build: "maintenance", now: () => at }, repairData);
+      if (!input) { setAnalysis(null); setPrecheckText("status=no-database"); return; }
+      const a = await analyzeSelection(input, repairData, picked, at);
+      setAnalysis(a);
+      setPrecheckText(renderPrecheckText({ ...a.report, heldForeign: [] }, { build: "maintenance", at }));
+    });
+  }
+  async function runVaultCheck() {
+    if (!analysis || !vaultHandle) return;
+    await guarded(async () => { setVaultCheck(await diagnoseVaultForPrecheck(analysis.existing, vaultHandle)); });
+  }
   async function makeDraft() {
     await guarded(async () => {
       const ids = draftIds.split(/[\s,]+/).filter(Boolean).map((s) => { const [kind, id] = s.split(":"); return { kind: kind as "conversation" | "memory", id }; });
@@ -158,6 +221,38 @@ export default function MaintenancePanel() {
         <button disabled={busy || !manifest || !vaultHandle} onClick={() => void runVerify()} className="border px-3 py-1">Inspect</button>
         {diagnosis && <ul>{diagnosis.map((d, i) => <li key={i} className={d.status === "ok" ? "text-emerald-700" : d.status === "legacy-format" ? "text-amber-700" : "text-red-700"}>{d.kind} {tail(d.id)} {d.area}: {d.item} = {d.status}{d.detail ? ` (${d.detail})` : ""}</li>)}</ul>}
         {(states ?? result?.states) && <ul>{(states ?? result?.states ?? []).map((s, i) => <li key={i}>{s.kind} {tail(s.id)}: vault={String(s.vaultMatchesCanonical)} ledgerSynced={String(s.ledgerSynced)} outbox={s.outbox}</li>)}</ul>}
+      </section>
+
+      <section className="flex flex-col gap-2"><h2 className="font-medium">6. Repair pre-check (read-only; repairs and syncs nothing)</h2>
+        <p className="text-xs">Load the reviewed repair data and your decision list (files on this computer; read in this browser only, never sent anywhere). Without a valid decision list nothing can be selected. Scan first: only items that are READY now and not held / excluded by your decisions can be selected (up to {MAX_SELECTED}). The IndexedDB check and the Vault check are reported separately.</p>
+        <label className="text-xs">repair data <input type="file" accept=".json,application/json" onChange={(e) => loadRepairData(e.target.files?.[0])} /></label>
+        <label className="text-xs">decision list <input type="file" accept=".json,application/json" onChange={(e) => loadDecisions(e.target.files?.[0])} /></label>
+        {repairData && <p className={decisions && !decisionsError(repairData, decisions) ? "text-emerald-700" : "text-red-700"}>decision list: {decisions ? (decisionsError(repairData, decisions) ?? `loaded (held ${decisions.held.length}, excluded ${decisions.excluded.length})`) : "not loaded: nothing is selectable"}</p>}
+        <button disabled={busy || !repairData || !decisions || !!decisionsError(repairData, decisions)} onClick={() => void runScan()} className="border px-3 py-1">Scan all items (read-only)</button>
+        {repairData && (
+          <ul className="flex flex-wrap gap-3">{listItems(repairData, decisions, live).map((it) => (
+            <li key={it.key}><label className={it.selectable ? "" : "text-stone-400"}>
+              <input type="checkbox" disabled={!it.selectable || busy} checked={picked.includes(it.key)} onChange={() => togglePick(it.key)} /> {it.key} ({it.kind}){it.reason ? ` - ${it.reason}` : ""}
+            </label></li>
+          ))}</ul>
+        )}
+        <button disabled={busy || !repairData || picked.length === 0} onClick={() => void runPrecheck()} className="border px-3 py-1">A. Run IndexedDB pre-check</button>
+        {analysis && (<div>
+          <h3 className="font-medium">A. IndexedDB pre-flight</h3>
+          <ul>{analysis.report.items.map((it) => <li key={it.key} className={it.status === "READY" ? "text-emerald-700" : it.status === "HOLD" ? "text-red-700" : "text-amber-700"}>{it.key}: {it.status}{it.failed.length ? ` (failed: ${it.failed.join("; ")})` : ""}</li>)}</ul>
+          <h3 className="font-medium">B. Other unfinished Outbox entries ({analysis.conflicts.length})</h3>
+          {analysis.conflicts.length === 0 ? <p>none</p> : <ul>{analysis.conflicts.map((c, i) => <li key={i} className={c.shares.length ? "text-red-700" : ""}>{c.id.split(":")[0]} …{c.tail} {c.status}: {c.shares.length ? "shares " + c.shares.join(", ") + " with a target" : "no shared file"}</li>)}</ul>}
+          <button disabled={busy || !vaultHandle || analysis.existing.length === 0} onClick={() => void runVaultCheck()} className="border px-3 py-1">C. Check Vault consistency (reads files only)</button>
+          {!vaultHandle && <p className="text-xs">Find the Vault folder in step 1 first.</p>}
+          {vaultCheck && (<div>
+            <h3 className="font-medium">C. Vault vs IndexedDB ({vaultCheck.checkedRecords} existing record(s); ledger/Outbox are shown in B)</h3>
+            <ul>{vaultCheck.items.map((d, i) => <li key={i} className={d.status === "ok" ? "text-emerald-700" : d.status === "legacy-format" || d.status === "unreadable" ? "text-amber-700" : "text-red-700"}>{d.kind} {tail(d.id)} {d.area}: {d.item} = {d.status}{d.detail ? ` - ${d.detail}` : ""}</li>)}</ul>
+          </div>)}
+          <h3 className="font-medium">Overall (per item)</h3>
+          <ul>{analysis.report.items.map((it) => { const v = overallVerdict({ status: it.status, conflicts: analysis.conflicts, vault: vaultCheck });
+            return <li key={it.key} className={v.safeToRepair ? "text-emerald-700" : "text-red-700"}>{it.key}: {v.safeToRepair ? "SAFE TO REPAIR" : "NOT SAFE / NOT PROVEN"} - {v.label}{v.reasons.length ? ` [${v.reasons.join(", ")}]` : ""}</li>; })}</ul>
+        </div>)}
+        {precheckText && <details><summary>report text (IDs, verdicts and counts only)</summary><pre className="whitespace-pre-wrap text-xs">{precheckText}</pre></details>}
       </section>
     </main>
   );
