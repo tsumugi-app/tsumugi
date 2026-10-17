@@ -42,7 +42,21 @@ const R1 = fx.D.repair.items[0];
 const JP = /[぀-ヿ一-鿿]/;
 const CREATED = "Conversations/dummy-created-by-the-operation.md";   // stands in for a file the operation creates (absent before)
 
+/**
+ * `clearMemoryData` does not touch the `settings` store, but the repair commit writes its ledger / backup keys there and a present ledger makes
+ * the commit a no-op ("already-done"). So every scenario starts by removing exactly the four repair keys of the dummy test Memory, through the
+ * production restore transaction with the CURRENT value as the expectation (a value nobody expected makes it throw instead of being deleted).
+ */
+async function clearRepairSettings() {
+  const keys = [repair.repairLedgerKey, repair.repairBackupKey, repair.repairRollbackLedgerKey, repair.repairRollbackBackupKey].map((f) => f(R1.memoryId));
+  const current = await dbm.readMemoryRepairSettings(keys);
+  await dbm.commitMaintenanceRestore({
+    memories: [], conversations: [], outbox: [], syncLedger: [],
+    settings: keys.filter((k) => current[k] !== undefined).map((k) => ({ key: k, expectCurrent: current[k] as string, target: null })),
+  });
+}
 async function resetDb() {
+  await clearRepairSettings();
   await dbm.clearMemoryData(); await dbm.clearVaultSyncState();
   for (const e of [...await dbm.getPendingVaultOutboxEntries(), ...await dbm.getHeldVaultOutboxEntries(), ...await dbm.getDoneVaultOutboxEntries()]) await dbm.deleteVaultOutboxEntry(e.id);
 }
@@ -91,6 +105,8 @@ async function scenario() {
     conversations: [s.upd], conversationFilePaths: [...convPaths, CREATED],
   });
   const rp = await rpMod.captureRestorePoint(scope, env, () => NOW);
+  assert.deepEqual(Object.values(rp.idb.settings).filter((v) => v !== null), [], "the dummy world starts with no repair settings (no state carried over from an earlier scenario)");
+  assert.equal(Object.keys(rp.idb.settings).length, 4);
   const text = rpMod.serializeRestorePoint(rp);
   return { ...s, env, scope, rp, text, preSnapshot: JSON.stringify(s.vault.snapshot()), preDigest: await digest(), otherBefore: JSON.stringify(await dbm.getVaultOutboxEntry("memory:OTHER-1")) };
 }
