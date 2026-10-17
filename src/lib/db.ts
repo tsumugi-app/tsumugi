@@ -1555,3 +1555,36 @@ export async function readMemoryRepairSettings(keys: string[]): Promise<Record<s
   for (const key of keys) out[key] = await db.get("settings", key);
   return out;
 }
+
+/**
+ * Maintenance strict restore (src/lib/maintenance/restoreEngine.ts). Never called by startup, projection or any normal screen.
+ * ONE transaction over every store the repair + sync touch. Each entry names the value it expects to find RIGHT NOW (compared as JSON, no
+ * await on anything but IndexedDB inside the transaction); if any entry differs nothing at all is written. `target: null` deletes.
+ */
+export interface MaintenanceRestoreTransaction {
+  memories: { id: string; expectCurrent: MemoryObject | null; target: MemoryObject | null }[];
+  conversations: { id: string; expectCurrent: Conversation | null; target: Conversation | null }[];
+  outbox: { id: string; expectCurrent: VaultOutboxEntry | null; target: VaultOutboxEntry | null }[];
+  syncLedger: { key: string; expectCurrent: string | null; target: string | null }[];
+  settings: { key: string; expectCurrent: string | null; target: string | null }[];
+}
+export async function commitMaintenanceRestore(t: MaintenanceRestoreTransaction): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings"], "readwrite");
+  const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  try {
+    const memories = tx.objectStore("memoryObjects"), conversations = tx.objectStore("conversations"), outbox = tx.objectStore("vaultOutbox");
+    const ledger = tx.objectStore("vaultSyncState"), settings = tx.objectStore("settings");
+    for (const e of t.memories) if (!equal((await memories.get(e.id)) ?? null, e.expectCurrent)) throw new Error("restore-precondition-changed");
+    for (const e of t.conversations) if (!equal((await conversations.get(e.id)) ?? null, e.expectCurrent)) throw new Error("restore-precondition-changed");
+    for (const e of t.outbox) if (!equal((await outbox.get(e.id)) ?? null, e.expectCurrent)) throw new Error("restore-precondition-changed");
+    for (const e of t.syncLedger) if (!equal((await ledger.get(e.key)) ?? null, e.expectCurrent)) throw new Error("restore-precondition-changed");
+    for (const e of t.settings) if (!equal((await settings.get(e.key)) ?? null, e.expectCurrent)) throw new Error("restore-precondition-changed");
+    for (const e of t.memories) { if (e.target === null) await memories.delete(e.id); else await memories.put(e.target); }
+    for (const e of t.conversations) { if (e.target === null) await conversations.delete(e.id); else await conversations.put(e.target); }
+    for (const e of t.outbox) { if (e.target === null) await outbox.delete(e.id); else await outbox.put(e.target); }
+    for (const e of t.syncLedger) { if (e.target === null) await ledger.delete(e.key); else await ledger.put(e.target, e.key); }
+    for (const e of t.settings) { if (e.target === null) await settings.delete(e.key); else await settings.put(e.target, e.key); }
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+}
