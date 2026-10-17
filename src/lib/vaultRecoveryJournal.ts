@@ -263,6 +263,22 @@ export function runWithRecoveryWriteAccess<T>(fn: () => T): T {
     recoveryWriteAccessDepth -= 1;
   }
 }
+/**
+ * Maintenance window only (src/lib/maintenance/maintenanceWindow.ts). NULL in every normal tab, so `isRecoveryWriteAccessActive` is then
+ * exactly what it was: the probe exists only after the maintenance window module installed it in ITS OWN tab (module state is per
+ * JavaScript context, so no other tab or app screen can see it), and it answers true only while that window holds the exclusive Vault-world
+ * lock, its own journal gate is open and an explicit write scope is running. Any error counts as "no access".
+ */
+let maintenanceWriteAccessProbe: (() => boolean) | null = null;
+export function setMaintenanceWriteAccessProbe(probe: (() => boolean) | null): void {
+  maintenanceWriteAccessProbe = probe;
+}
 export function isRecoveryWriteAccessActive(): boolean {
-  return recoveryWriteAccessDepth > 0;
+  if (recoveryWriteAccessDepth > 0) return true;
+  if (maintenanceWriteAccessProbe === null) return false;
+  try {
+    return maintenanceWriteAccessProbe() === true;
+  } catch {
+    return false;
+  }
 }
