@@ -28,6 +28,7 @@
     "src/lib/maintenance/manifest.ts",
     "src/lib/maintenance/precheckScope.test.ts",
     "src/lib/maintenance/precheckScope.ts",
+    "src/lib/maintenance/repairSession.ts",
     "src/lib/maintenance/restore.test.ts",
     "src/lib/maintenance/restoreEngine.ts",
     "src/lib/maintenance/restoreGuard.ts",
