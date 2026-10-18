@@ -9,5 +9,9 @@
 
 Permissions: `ci` = contents:read. `review-loop` = pull-requests/issues:write. No secrets are used or stored.
 
-Unverified (must be tested on a real PR): whether Codex honours a `@codex review` comment authored by the Actions bot; whether Codex reviews bot-created PRs.
-Not automated: the fix step itself runs in a Claude Code session (desktop app CI monitor / review-comment events), not in Actions.
+## Verified on PR #1 (2026-10-18)
+- Codex auto-review on PR creation works (P2 finding posted as an inline comment). A `@codex review` comment by a human account also works.
+- A `@codex review` comment authored by `github-actions[bot]` is IGNORED by Codex (no review within 35 min). The draft->ready fallback with `GITHUB_TOKEN` is impossible ("Resource not accessible by integration").
+- `review-loop` timeout (25 min) and the `needs-human` label work. The round limit (2) is counted by marker comments.
+- So the automatic re-review needs a human-identity trigger: a person comments `@codex review`, or a PAT stored as a repo secret is used by the workflow (not set up).
+- The Claude-side fix step (reacting to Codex findings) is not automated in Actions; it relies on the Claude desktop app PR monitor, not tested.

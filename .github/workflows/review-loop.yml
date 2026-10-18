@@ -42,24 +42,13 @@ jobs:
               body: `${marker(rounds + 1)}\n@codex review\n\nRe-review requested for \`${sha.slice(0, 7)}\` (auto-fix round ${rounds + 1}/${max}).` });
             const deadline = Date.now() + Number(process.env.WAIT_MINUTES) * 60000;
             let found = null;
-            const start = Date.now();
-            let toggled = false;
             while (Date.now() < deadline && !found) {
               await new Promise((r) => setTimeout(r, 60000));
-              // Fallback trigger: Codex also reviews when a draft is marked ready. Bot-authored "@codex review" comments were observed to be ignored.
-              if (!toggled && Date.now() - start > 6 * 60000) {
-                toggled = true;
-                try {
-                  await github.graphql(`mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { clientMutationId } }`, { id: pr.node_id });
-                  await github.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }`, { id: pr.node_id });
-                  core.notice("No Codex review after 6 min: toggled draft -> ready as fallback trigger.");
-                } catch (e) { core.warning(`draft/ready fallback failed: ${e.message}`); }
-              }
               const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
               found = reviews.find((r) => r.commit_id === sha && /codex/i.test(r.user.login)) ?? null;
             }
             if (!found) {
-              core.warning(`No Codex review for ${sha} within ${process.env.WAIT_MINUTES} min (timeout). Either Codex ignored the bot-authored trigger or is slow; comment "@codex review" manually.`);
+              core.warning(`No Codex review for ${sha} within ${process.env.WAIT_MINUTES} min (timeout). Codex ignores comments authored by the Actions bot (verified); a human must comment "@codex review" manually.`);
               await escalate();
               core.summary.addRaw("Timed out waiting for Codex re-review.").write();
               return;
