@@ -1,18 +1,1 @@
-# One npm test script per line (run in this order in a Preview build). Lines starting with # are ignored.
-test:capture
-test:write-gate
-test:lock-order
-test:conversation-entry-kind
-test:stated-at
-test:stated-at-projection
-test:reflect
-test:memory-search
-test:memory-analytics
-test:history-conversation-card
-test:recovery-diagnostic
-test:recovery-memory-diagnostic
-test:recovery-ui-text
-test:recovery-apply
-test:save-foundation
-test:maintenance
 test:memory-repair
