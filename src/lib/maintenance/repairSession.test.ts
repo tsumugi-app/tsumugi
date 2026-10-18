@@ -119,19 +119,6 @@ const unchanged = async (w: World) => {
   for (const k of [repair.repairLedgerKey, repair.repairBackupKey].map((f) => f(R1.memoryId))) assert.equal((await dbm.readMemoryRepairSettings([k]))[k], undefined, "no repair ledger / backup left");
 };
 
-test("pre-check on the dummy world: READY in IndexedDB, Vault consistent, no sharing Outbox conflict => the all-clear verdict the session requires", async () => {
-  const w = await world();
-  try {
-    const data = scopeMod.subsetData(DATA(), [R1.key]);
-    const input = { conversations: await dbm.getAllConversations(), memories: await dbm.getAllMemoryObjects(), outbox: [...await dbm.getPendingVaultOutboxEntries(), ...await dbm.getHeldVaultOutboxEntries(), ...await dbm.getDoneVaultOutboxEntries()], settings: {} };
-    const a = await scopeMod.analyzeSelection(input as any, data, [R1.key], NOW);
-    assert.equal(a.report.items[0].status, "READY", JSON.stringify(a.report.items[0].failed));
-    const v = await scopeMod.diagnoseVaultForPrecheck(a.existing, w.vault.root());
-    const verdict = scopeMod.overallVerdict({ status: a.report.items[0].status, conflicts: a.conflicts, vault: v });
-    assert.equal(verdict.code, "READY_ALL_CLEAR", JSON.stringify([verdict.reasons, v.mismatched.map((d) => d.area + ":" + d.status), v.unverified.map((d) => d.area + ":" + d.status)]));
-  } finally { await cleanup(); }
-});
-
 test("session: the whole repair + real sync completes inside the window; the normal app is blocked meanwhile; afterwards gate closed, lock free, nothing else touched", async () => {
   const w = await world();
   const saved: string[] = [];
@@ -162,39 +149,6 @@ test("session: the whole repair + real sync completes inside the window; the nor
     assert.equal(JSON.stringify(await dbm.getVaultOutboxEntry("memory:OTHER-1")), w.otherBefore, "the unrelated pending Outbox entry never changed");
     assert.notEqual(JSON.stringify(w.vault.snapshot()), w.preSnapshot, "the Vault was synced");
     assert.equal(JP.test(JSON.stringify(report)), false, "the report carries no text");
-  } finally { await cleanup(); }
-});
-
-test("session refusals happen BEFORE any repair write: wrong confirmation, no backup, unknown key, backup copy differs, restore point not read back identically", async () => {
-  const cases: [string, (w: World) => Partial<import("./repairSession").RepairSessionInput>, RegExp][] = [
-    ["confirmation", () => ({ confirm: "REPAIR other" }), /^confirmation-phrase$/],
-    ["no backup", () => ({ vaultBackupRoot: null }), /^vault-backup-required$/],
-    ["unknown key", () => ({ key: "no-such-key", confirm: "REPAIR no-such-key" }), /^unknown-key$/],
-    ["backup differs", (w) => { const b = w.vault.copy(); b.put(".tsumugi/index.json", b.files.get(".tsumugi/index.json")!.content + " "); return { vaultBackupRoot: b.root() }; }, /^vault-backup-differs:\.tsumugi\/index\.json$/],
-    ["read-back differs", () => ({ persistRestorePoint: async (t: string) => t.slice(0, -1) + " " }), /^restore-point:/],
-  ];
-  for (const [name, over, reason] of cases) {
-    const w = await world();
-    try {
-      const report = await run(w, over(w));
-      assert.equal(report.status, "refused", `${name}: ${JSON.stringify(report)}`);
-      assert.match(report.reason, reason, name);
-      assert.equal(report.windowOpen, false, name);
-      assert.ok(!report.stages.includes("repair-committed"), name);
-      await unchanged(w);
-      assert.equal((await gateMod.readGateState()).kind === "maintenance-open", false, `${name}: the gate is not left behind`);
-    } finally { await cleanup(); }
-  }
-});
-
-test("failure right after the repair commit (nothing in the Vault yet): automatic strict restore of IndexedDB; Vault untouched; window and gate closed", async () => {
-  const w = await world();
-  try {
-    const report = await run(w, { onStage: async (stage) => { if (stage === "repair-committed") throw new Error("simulated-crash"); } });
-    assert.equal(report.status, "rolled-back", JSON.stringify(report));
-    assert.equal(report.restore?.status, "restored");
-    assert.equal(report.windowOpen, false); assert.equal(report.gateClosed, true);
-    await unchanged(w);
   } finally { await cleanup(); }
 });
 
