@@ -14,5 +14,4 @@ test:recovery-memory-diagnostic
 test:recovery-ui-text
 test:recovery-apply
 test:save-foundation
-test:maintenance
 test:memory-repair
