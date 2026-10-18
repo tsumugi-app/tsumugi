@@ -29,6 +29,7 @@ const lockMod = require(path.join(OUT, "lib/vaultWorldLock.js")) as typeof impor
 const repair = require(path.join(OUT, "lib/memoryContaminationRepair.js")) as typeof import("../memoryContaminationRepair");
 const fx = require(path.join(OUT, "lib/memoryRepairTestWorld.js")) as typeof import("../memoryRepairTestWorld");
 const hashMod = require(path.join(OUT, "lib/maintenance/hash.js")) as typeof import("./hash");
+const invMod = require(path.join(OUT, "lib/maintenance/invariants.js")) as typeof import("./invariants");
 const rpMod = require(path.join(OUT, "lib/maintenance/restorePoint.js")) as typeof import("./restorePoint");
 const engine = require(path.join(OUT, "lib/maintenance/restoreEngine.js")) as typeof import("./restoreEngine");
 const guardMod = require(path.join(OUT, "lib/maintenance/restoreGuard.js")) as typeof import("./restoreGuard");
@@ -130,7 +131,18 @@ async function operate(s: Scenario) {
   assert.equal(res.ok, true, JSON.stringify(res.refused ?? res.stoppedAt ?? res.verification));
   s.vault.put(CREATED, "a file created by the operation");     // pre-state: absent
   const expectation: import("./restoreEngine").RestoreExpectation = { vaultFiles: {}, records: {}, updatedAts: {} };
-  for (const f of report.files) expectation.vaultFiles[f.path] = [f.afterHash];
+  // What the operation is accepted to have produced = what the maintenance code READ BACK right after its own sync (a "receipt"), never the
+  // dry-run prediction and never "whatever is there at restore time". A receipt is recorded only if the sync itself reports the file as
+  // written as planned AND the real content equals the prediction apart from the two known volatile fields (Registry mtime, History-meta updatedAt).
+  const progress = new Map<string, string>(res.fileProgress.map((p) => [p.path, p.state] as [string, string]));
+  for (const f of report.files) {
+    assert.equal(progress.get(f.path), "written-as-planned", `${f.path}: the sync did not report this file as written as planned`);
+    const actual = await guardMod.readTextOrNull(s.vault.root(), f.path);
+    assert.notEqual(actual, null, `${f.path} must exist after the sync`);
+    assert.equal(invMod.normalizeForActualComparison(f.path, actual!), invMod.normalizeForActualComparison(f.path, f.after), `${f.path}: real content differs from the prediction beyond the known volatile fields`);
+    const h = await hashMod.sha256Hex(actual!);
+    if (h !== (s.rp.vault.files[f.path]?.hash ?? null)) expectation.vaultFiles[f.path] = [h];   // a file the sync left byte-identical needs no allowance
+  }
   expectation.vaultFiles[CREATED] = [await hashMod.sha256Hex("a file created by the operation")];
   for (const [kind, id] of [["memory", s.M.id], ["memory", s.plan.newMemory.id], ["conversation", s.upd.id]] as const) {
     const rec: any = kind === "memory" ? await dbm.getMemoryObject(id) : await dbm.getConversation(id);
@@ -228,7 +240,8 @@ test("strict restore: repair + real Vault sync, then ONE restore brings IndexedD
   assert.equal(JSON.stringify(await dbm.getConversation(s.upd.id)), JSON.stringify(s.rp.idb.conversations[s.upd.id]));
   for (const key of s.scope.settingsKeys) assert.equal((await dbm.readMemoryRepairSettings([key]))[key], undefined, "repair ledger / backup keys removed");
   assert.equal(JSON.stringify(await dbm.getVaultOutboxEntry("memory:OTHER-1")), s.otherBefore, "the unrelated pending Outbox entry never changed");
-  assert.equal((await engine.executeRestore(s.rp, expectation, s.env)).status, "nothing-to-restore");
+  const again = await engine.executeRestore(s.rp, expectation, s.env);
+  assert.equal(again.status, "nothing-to-restore", JSON.stringify(again.plan.stopReasons));
   await engine.assertRestorePointReady((await engine.createReadBackReceipt(s.text, s.text, s.env) as any).receipt, s.env);
 });
 
@@ -249,6 +262,33 @@ test("CAS: anything that is not the restore point's state or a known post-operat
       const rep = await engine.executeRestore(s.rp, expectation, s.env);
       assert.equal(rep.status, "stopped", name);
       assert.ok(rep.plan.stopReasons.some((r) => reason.test(r)), `${name}: ${JSON.stringify(rep.plan.stopReasons)}`);
+      assert.deepEqual(rep.vaultWritten, []); assert.deepEqual(rep.vaultDeleted, []);
+    });
+  }
+});
+
+test("receipts are exact: a later change to a Registry mtime, to History-meta updatedAt or to a day-file body is detected -> stopped, nothing written", async () => {
+  const volatile = (re: RegExp, change: (c: string) => string): [string, (e: import("./restoreEngine").RestoreExpectation) => string, (c: string) => string] =>
+    [String(re), (e) => Object.keys(e.vaultFiles).find((p) => re.test(p))!, change];
+  const cases = [
+    ["Registry shard: only a file entry's mtime", volatile(/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/, (c) => c.replace(/("mtime":\s*)(\d+)/, (_m, a, b) => a + String(Number(b) + 1)))],
+    ["History meta: only updatedAt", volatile(/^\.tsumugi\/history-meta\.json$/, (c) => c.replace(/("updatedAt":\s*")([^"]+)(")/, (_m, a, _b, d) => a + "2099-01-01T00:00:00.000Z" + d))],
+    ["day-file body", volatile(/^Memories\/.+\.md$/, (c) => c + "\nan external edit")],
+  ] as const;
+  for (const [name, [, pick, change]] of cases) {
+    const s = await scenario(); const { expectation } = await operate(s);
+    const target = pick(expectation);
+    assert.ok(target, `${name}: the sync produced a receipt for this kind of file`);
+    // control: before the later change the restore is allowed (so the stop below is caused by the change alone)
+    const plan0 = await engine.planRestore(s.rp, expectation, s.env);
+    assert.equal(plan0.status, "restorable", `${name}: ${JSON.stringify(plan0.stopReasons)}`);
+    const before = s.vault.files.get(target)!.content;
+    mutate(s.vault, target, change);
+    assert.notEqual(s.vault.files.get(target)!.content, before, `${name}: the change really altered the file`);
+    await noWrites(s, async () => {
+      const rep = await engine.executeRestore(s.rp, expectation, s.env);
+      assert.equal(rep.status, "stopped", `${name}: ${JSON.stringify(rep.plan.stopReasons)}`);
+      assert.ok(rep.plan.stopReasons.includes(`vault-unidentified:${target}`), `${name}: ${JSON.stringify(rep.plan.stopReasons)}`);
       assert.deepEqual(rep.vaultWritten, []); assert.deepEqual(rep.vaultDeleted, []);
     });
   }
@@ -275,7 +315,7 @@ test("collateral: a change anywhere outside the enumerated scope stops the resto
   const s = await scenario(); const { expectation } = await operate(s);
   await dbm.putMemoryObjectWithOutbox({ ...(await dbm.getMemoryObject("nb-a"))!, summary: "touched" } as any, "memory");
   const rep = await engine.executeRestore(s.rp, expectation, s.env, { allowCollateral: true });
-  assert.equal(rep.status, "verification-failed");
+  assert.equal(rep.status, "verification-failed", JSON.stringify([rep.plan.stopReasons, rep.verification?.stopReasons]));
 });
 
 test("interrupted restore: a failed Vault write stops before IndexedDB is touched; re-running resumes and completes (idempotent)", async () => {
@@ -284,7 +324,7 @@ test("interrupted restore: a failed Vault write stops before IndexedDB is touche
   const idbPost = await digest();
   s.vault.failNextWrites(victim, 1);
   const first = await engine.executeRestore(s.rp, expectation, s.env);
-  assert.equal(first.status, "vault-incomplete");
+  assert.equal(first.status, "vault-incomplete", JSON.stringify([first.failure, first.plan.stopReasons]));
   assert.equal(await digest(), idbPost, "IndexedDB was not touched while the Vault part is incomplete");
   const second = await engine.executeRestore(s.rp, expectation, s.env);
   assert.equal(second.status, "restored", JSON.stringify([second.failure, second.plan.stopReasons]));
@@ -295,11 +335,11 @@ test("interrupted restore: a failed IndexedDB transaction writes nothing there; 
   const s = await scenario(); const { expectation } = await operate(s);
   const failing = { ...s.env, idb: { ...s.env.idb, commit: async () => { throw new Error("simulated-failure"); } } };
   const first = await engine.executeRestore(s.rp, expectation, failing);
-  assert.equal(first.status, "indexeddb-failed");
+  assert.equal(first.status, "indexeddb-failed", JSON.stringify([first.failure, first.plan.stopReasons]));
   assert.notEqual(await digest(), s.preDigest, "IndexedDB still holds the post-operation state");
   assert.equal(JSON.stringify(s.vault.snapshot()), s.preSnapshot, "the Vault was already restored");
   const second = await engine.executeRestore(s.rp, expectation, s.env);
-  assert.equal(second.status, "restored");
+  assert.equal(second.status, "restored", JSON.stringify([second.failure, second.plan.stopReasons]));
   assert.equal(await digest(), s.preDigest);
 });
 
