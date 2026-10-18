@@ -18,6 +18,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import Module from "node:module";
 
@@ -1098,4 +1099,55 @@ test("Boundary 4-5: no new drop / trim / retry — a candidate whose keywords ma
   // an invalid evidence reference is still dropped exactly as before
   const bad = await runCapture([user(FILO_USER), ai("…")], [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }], { allMemories: [FILO_RELATED()], script: [{ memories: [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }] }, { memories: [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }] }] });
   assert.equal(bad.out.outcome.kind, "all-dropped"); assert.equal(bad.out.memoryObjects.length, 0);
+});
+
+// ===========================================================================
+// M1+：契約の強制（existingMemoryObjectsは、このConversation自身のMemoryだけ）と、敵対的なAI応答
+// ===========================================================================
+test("M1+: 呼び出し側が誤って別Conversation由来のMemoryをexistingとして渡しても、UPDATEされず新規Memoryとして保存される（契約の強制）", async () => {
+  const foreign = pastMemory({ content: "別の会話で話した内容。", summary: "別の会話の要約", keywords: ["別"], conversationId: "CONV-A" });
+  const before = clone(foreign);
+  const { out } = await runCapture(
+    [user("今日は新しいことを話した。"), ai("…")],
+    [{ ...BASE, existingMemoryId: foreign.id, topicDecision: "uncertain", summary: "新しい話", content: "今日は新しいことを話した。", keywords: ["新しい"], evidenceUserMessageIndexes: [0] }],
+    { existing: [foreign], allMemories: [foreign] }
+  );
+  assert.deepEqual(foreign, before, "別Conversation由来のMemoryは不変");
+  assert.equal(out.memoryObjects.length, 1);
+  assert.notEqual(out.memoryObjects[0].id, foreign.id);
+  assert.equal(out.memoryObjects[0].conversationId, "CONV-B");
+  assert.deepEqual(out.conversation.memoryObjectIds, [out.memoryObjects[0].id]);
+});
+
+test("M1+: 敵対的なAI応答（他Conversation・Reflection・存在しないid・自Conversationのid・topic参照の併用）でも、更新されるのはこのConversation自身のMemoryだけ。出力は全てCONV-B", async () => {
+  const foreign = pastMemory({ id: "01FOREIGNFOREIGNFOREIGNFO", content: "別の会話の内容。", summary: "別の会話の要約", keywords: ["別"], conversationId: "CONV-A", topicId: "TOPIC-X" });
+  const reflection = pastMemory({ id: "01REFLECTREFLECTREFLECT01", content: "振り返り", summary: "振り返りの要約", keywords: ["振り返り"], conversationId: "CONV-A" });
+  (reflection.metadata as Json).source = "system-generated";
+  const own = pastMemory({ id: "01OWNOWNOWNOWNOWNOWNOWNOW1", content: "この会話の最初のメモ。", summary: "この会話の最初のメモ", keywords: ["メモ"], conversationId: "CONV-B" });
+  const snapshots = clone([foreign, reflection]);
+  const item = (n: number, extra: Json): Json => ({ ...BASE, topicDecision: "uncertain", summary: `要約${n}`, content: `内容${n}`, keywords: [`語${n}`], evidenceUserMessageIndexes: [0], ...extra });
+  const llm = [
+    item(1, { existingMemoryId: foreign.id }),
+    item(2, { existingMemoryId: reflection.id }),
+    item(3, { existingMemoryId: "01NOSUCHNOSUCHNOSUCHNOSU" }),
+    item(4, { existingMemoryId: own.id }),
+    item(5, { existingMemoryId: foreign.id, topicDecision: "sameTopic", sameTopicMemoryId: foreign.id }),
+  ];
+  const { out } = await runCapture([user("今日の出来事を話した。"), ai("…")], llm, { existing: [own], allMemories: [foreign, reflection, own] });
+  assert.deepEqual([foreign, reflection], snapshots, "他Conversation由来のMemoryとReflectionは不変");
+  assert.ok(out.memoryObjects.length > 0);
+  const ids = out.memoryObjects.map((m) => m.id);
+  assert.ok(!ids.includes(foreign.id) && !ids.includes(reflection.id), "他Conversation由来のMemory・Reflectionは保存対象に含まれない");
+  assert.ok(ids.filter((id) => id === own.id).length <= 1, "自Conversationのidが指された場合だけ、1件がUPDATEとして扱われる");
+  for (const m of out.memoryObjects) assert.equal(m.conversationId, "CONV-B", "出力は全てこのConversation由来");
+  assert.equal(new Set(out.conversation.memoryObjectIds).has(foreign.id), false);
+});
+
+test("M1+: 会話境界のCaptureは、このConversation自身のMemoryが無い前提（existingは空）で呼ばれる。この前提を変える変更は、ここで検出されレビューされる", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
+  const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");   // コメント中の言及は数えない
+  const all = (src.match(/\bcaptureConversation\(\s*[^)\s]/g) ?? []).length;
+  const emptyExisting = (src.match(/\bcaptureConversation\(\s*[\w.]+\s*,\s*\[\]\s*\)/g) ?? []).length;
+  assert.ok(all >= 1, "呼び出し元が存在する");
+  assert.equal(emptyExisting, all, "captureConversationの全呼び出しで、既存Memory引数は空配列（UPDATE対象が構造的に存在しない）");
 });

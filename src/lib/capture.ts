@@ -450,9 +450,13 @@ export async function captureConversation(
 
 async function captureConversationImpl(
   conversation: Conversation,
-  existingMemoryObjects: MemoryObject[],
+  existingMemoryObjectsArg: MemoryObject[],
   debugId?: string
 ): Promise<CaptureResult> {
+  // 契約の強制（M1の三重目の防御）：existingMemoryObjectsは「このConversation自身から既に生成済みのMemory」だけ。
+  // 現在の唯一の呼び出し元は空配列を渡す（会話境界のCaptureは1回だけ）ため通常は何も除外されないが、将来の呼び出し元が
+  // 別Conversation由来のMemoryを誤って渡しても、UPDATE対象にもLLMへの「更新可能」提示にもならないよう、ここで必ず絞る。
+  const existingMemoryObjects = existingMemoryObjectsArg.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
   const relatedMemoryObjects = await findRelatedMemoriesFromOtherConversations(conversation, existingMemoryObjects);
   const { memories: extracted, diagnostics } = await extractMemories(
     conversation.persona,
