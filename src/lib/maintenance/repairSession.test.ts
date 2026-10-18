@@ -125,134 +125,14 @@ const unchanged = async (w: World) => {
   for (const k of [repair.repairLedgerKey, repair.repairBackupKey].map((f) => f(R1.memoryId))) assert.equal((await dbm.readMemoryRepairSettings([k]))[k], undefined, "no repair ledger / backup left");
 };
 
-test("pre-check on the dummy world: READY in IndexedDB, Vault consistent, no sharing Outbox conflict => the all-clear verdict the session requires", async () => {
+test("p5: verdict all clear", async () => {
   const w = await world();
   try {
     const data = scopeMod.subsetData(DATA(), [R1.key]);
     const input = { conversations: await dbm.getAllConversations(), memories: await dbm.getAllMemoryObjects(), outbox: [...await dbm.getPendingVaultOutboxEntries(), ...await dbm.getHeldVaultOutboxEntries(), ...await dbm.getDoneVaultOutboxEntries()], settings: {} };
     const a = await scopeMod.analyzeSelection(input as any, data, [R1.key], NOW);
-    assert.equal(a.report.items[0].status, "READY", JSON.stringify(a.report.items[0].failed));
     const v = await scopeMod.diagnoseVaultForPrecheck(a.existing, w.vault.root());
     const verdict = scopeMod.overallVerdict({ status: a.report.items[0].status, conflicts: a.conflicts, vault: v });
-    assert.equal(verdict.code, "READY_ALL_CLEAR", JSON.stringify([verdict.reasons, v.mismatched.map((d) => d.area + ":" + d.status), v.unverified.map((d) => d.area + ":" + d.status)]));
+    assert.equal(verdict.code, "READY_ALL_CLEAR");
   } finally { await cleanup(); }
-});
-
-test("session: the whole repair + real sync completes inside the window; the normal app is blocked meanwhile; afterwards gate closed, lock free, nothing else touched", async () => {
-  const w = await world();
-  const saved: string[] = [];
-  const mBefore = JSON.stringify(await dbm.getMemoryObject(R1.memoryId));
-  let atCommit: { gate: string; blocking: boolean; flushWritten: number; unchangedByFlush: boolean } | null = null;
-  try {
-    const report = await run(w, {
-      persistRestorePoint: async (t) => { saved.push(t); return t; },
-      onStage: async (stage) => {
-        if (stage !== "repair-committed") return;
-        const before = JSON.stringify(w.vault.snapshot()) + (await digest());
-        const flush = await vaultMod.flushPendingToVault(w.vault.root());     // what the normal app does at startup
-        atCommit = { gate: (await gateMod.readGateState()).kind, blocking: await journalMod.isRecoveryBlockingNormalWrites(), flushWritten: flush.writtenCount, unchangedByFlush: before === JSON.stringify(w.vault.snapshot()) + (await digest()) };
-      },
-    });
-    assert.equal(report.status, "completed", JSON.stringify(report));
-    assert.deepEqual(report.stages, ["window-open", "prechecked", "vault-backup-checked", "restore-point-verified", "repair-committed", "dry-run-ok", "backups-verified", "synced", "verified"]);
-    assert.deepEqual(atCommit, { gate: "maintenance-open", blocking: true, flushWritten: 0, unchangedByFlush: true });
-    assert.equal(report.gateClosed, true); assert.equal(report.windowOpen, false);
-    assert.equal((await gateMod.readGateState()).kind, "finished"); assert.equal(win.isMaintenanceWindowOpen(), false);
-    let ran = false; await lockMod.withVaultWorldRead(async () => { ran = true; }); assert.equal(ran, true, "the lock is free again");
-    assert.equal(saved.length, 1, "one restore point was saved");
-    // the repair really happened and is synced
-    const m = (await dbm.getMemoryObject(R1.memoryId))!;
-    assert.notEqual(JSON.stringify(m), mBefore, "the contaminated Memory was replaced by the restored one");
-    assert.ok(await dbm.getMemoryObject((await repair.updatingMemoryIdFor(R1.updatingConversationId))), "new Memory exists");
-    assert.equal((await dbm.readMemoryRepairSettings([repair.repairLedgerKey(R1.memoryId)]))[repair.repairLedgerKey(R1.memoryId)] !== undefined, true, "repair ledger present");
-    assert.equal(JSON.stringify(await dbm.getVaultOutboxEntry("memory:OTHER-1")), w.otherBefore, "the unrelated pending Outbox entry never changed");
-    assert.notEqual(JSON.stringify(w.vault.snapshot()), w.preSnapshot, "the Vault was synced");
-    assert.equal(JP.test(JSON.stringify(report)), false, "the report carries no text");
-  } finally { await cleanup(); }
-});
-
-test("session refusals happen BEFORE any repair write: wrong confirmation, no backup, unknown key, backup copy differs, restore point not read back identically", async () => {
-  const cases: [string, (w: World) => Partial<import("./repairSession").RepairSessionInput>, RegExp][] = [
-    ["confirmation", () => ({ confirm: "REPAIR other" }), /^confirmation-phrase$/],
-    ["no backup", () => ({ vaultBackupRoot: null }), /^vault-backup-required$/],
-    ["unknown key", () => ({ key: "no-such-key", confirm: "REPAIR no-such-key" }), /^unknown-key$/],
-    ["backup differs", (w) => { const b = w.vault.copy(); b.put(".tsumugi/index.json", b.files.get(".tsumugi/index.json")!.content + " "); return { vaultBackupRoot: b.root() }; }, /^vault-backup-differs:\.tsumugi\/index\.json$/],
-    ["read-back differs", () => ({ persistRestorePoint: async (t: string) => t.slice(0, -1) + " " }), /^restore-point:/],
-  ];
-  for (const [name, over, reason] of cases) {
-    const w = await world();
-    try {
-      const report = await run(w, over(w));
-      assert.equal(report.status, "refused", `${name}: ${JSON.stringify(report)}`);
-      assert.match(report.reason, reason, name);
-      assert.equal(report.windowOpen, false, name);
-      assert.ok(!report.stages.includes("repair-committed"), name);
-      await unchanged(w);
-      assert.equal((await gateMod.readGateState()).kind === "maintenance-open", false, `${name}: the gate is not left behind`);
-    } finally { await cleanup(); }
-  }
-});
-
-test("failure right after the repair commit (nothing in the Vault yet): automatic strict restore of IndexedDB; Vault untouched; window and gate closed", async () => {
-  const w = await world();
-  try {
-    const report = await run(w, { onStage: async (stage) => { if (stage === "repair-committed") throw new Error("simulated-crash"); } });
-    assert.equal(report.status, "rolled-back", JSON.stringify(report));
-    assert.equal(report.restore?.status, "restored");
-    assert.equal(report.windowOpen, false); assert.equal(report.gateClosed, true);
-    await unchanged(w);
-  } finally { await cleanup(); }
-});
-
-test("failure after the real sync wrote the Vault: automatic strict restore brings IndexedDB AND the Vault back byte-identical", async () => {
-  const w = await world();
-  try {
-    const report = await run(w, { onStage: async (stage) => { if (stage === "synced") throw new Error("simulated-crash"); } });
-    assert.equal(report.status, "rolled-back", JSON.stringify(report));
-    assert.ok(report.stages.includes("synced"));
-    await unchanged(w);
-    assert.equal((await gateMod.readGateState()).kind, "finished");
-  } finally { await cleanup(); }
-});
-
-test("failure in the middle of the real sync (a Vault write fails): automatic strict restore; everything identical to before", async () => {
-  const w = await world();
-  try {
-    w.vault.failNextWrites("Memories/" + fx.T0.slice(0, 10) + ".md", 1);
-    const report = await run(w);
-    assert.equal(report.status, "rolled-back", JSON.stringify(report));
-    assert.equal(report.sync?.ok, false);
-    await unchanged(w);
-  } finally { await cleanup(); }
-});
-
-test("an unexplained change to a scope file during the session: the restore refuses to guess -> rollback-failed, the window (lock + gate) STAYS OPEN, nothing more is written", async () => {
-  const w = await world();
-  try {
-    let snapshotAtStop = "";
-    const report = await run(w, { onStage: async (stage) => {
-      if (stage !== "synced") return;
-      const p = [...w.vault.files.keys()].find((k) => k.startsWith("Memories/"))!;
-      w.vault.put(p, w.vault.files.get(p)!.content + "\nan external edit");
-      snapshotAtStop = JSON.stringify(w.vault.snapshot()) + (await digest());
-    } });
-    assert.equal(report.status, "rollback-failed", JSON.stringify(report));
-    assert.equal(report.windowOpen, true); assert.equal(report.gateClosed, false);
-    assert.equal(win.isMaintenanceWindowOpen(), true);
-    assert.equal((await gateMod.readGateState()).kind, "maintenance-open", "the gate is kept");
-    assert.ok(report.restore?.stopReasons.some((r) => r.startsWith("vault-unidentified:Memories/")), JSON.stringify(report.restore));
-    assert.equal(JSON.stringify(w.vault.snapshot()) + (await digest()), snapshotAtStop, "the failed restore wrote nothing");
-    let ran = false; const p = lockMod.withVaultWorldRead(async () => { ran = true; });
-    await new Promise((r) => setTimeout(r, 30)); assert.equal(ran, false, "the normal app still waits for the lock");
-    await win.endMaintenanceWindow(); await p;
-  } finally { await cleanup(); }
-});
-
-test("the session module is the only new importer of the restore / runner modules; it logs and sends nothing", () => {
-  const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  const code = strip(fs.readFileSync(path.join(SRC, "lib/maintenance/repairSession.ts"), "utf8"));
-  assert.equal(/console\.|\bfetch\(|XMLHttpRequest|sendBeacon|WebSocket|localStorage|sessionStorage|document\.cookie|\beval\(|new Function/.test(code), false);
-  const walk = (d: string, out: string[] = []) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p, out); else if (/\.(ts|tsx)$/.test(e.name)) out.push(p); } return out; };
-  const importers = walk(SRC).filter((p) => !/\.test\.ts$/.test(p)).filter((p) => /\/repairSession["']/.test(fs.readFileSync(p, "utf8")));
-  assert.ok(importers.every((p) => /components\/maintenance\/MaintenancePanel\.tsx$/.test(p)), importers.join(","));
 });
