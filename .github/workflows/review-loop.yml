@@ -29,10 +29,12 @@ jobs:
             const max = Number(process.env.MAX_FIXES);
             const marker = (n) => `<!-- review-loop:round=${n} -->`;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+            // addLabels creates the label if it is missing; a failure must fail the job so the escalation is never silent.
+            const escalate = () => github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ["needs-human"] });
             const rounds = comments.filter((c) => c.body.includes("<!-- review-loop:round=")).length;
             if (rounds >= max) {
               core.warning(`Auto-fix limit reached (${rounds}/${max}). No further re-review requested; a human must take over.`);
-              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ["needs-human"] }).catch(() => {});
+              await escalate();
               core.summary.addRaw(`Auto-fix limit reached (${rounds}/${max}); stopped.`).write();
               return;
             }
@@ -47,7 +49,7 @@ jobs:
             }
             if (!found) {
               core.warning(`No Codex review for ${sha} within ${process.env.WAIT_MINUTES} min (timeout). Either Codex ignored the bot-authored trigger or is slow; comment "@codex review" manually.`);
-              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ["needs-human"] }).catch(() => {});
+              await escalate();
               core.summary.addRaw("Timed out waiting for Codex re-review.").write();
               return;
             }
