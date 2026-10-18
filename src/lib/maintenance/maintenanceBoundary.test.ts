@@ -39,8 +39,12 @@ const FORBIDDEN = ["lib/capture.ts", "lib/connect.ts", "lib/retrieval.ts", "lib/
 test("no path from the maintenance area (proxy, page, panel, library) to AI / Capture / Connect / ChatScreen / API routes", () => {
   const { files, externals } = reachable([PROXY, PAGE, PANEL, ...maintSources]);
   for (const f of FORBIDDEN) assert.ok(!files.has(f), `must not reach ${f}`);
-  // the read-only repair pre-check is part of the graph; the repair runner / DB environment (which can write) must not be
-  for (const f of ["lib/memoryRepairRunner.ts", "lib/memoryRepairDbEnv.ts"]) assert.ok(!files.has(f), `must not reach ${f}`);
+  // the repair runner / DB environment (which can write) are reachable ONLY through the single-item repair session
+  const walkSrc = (d: string, out: string[] = []) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walkSrc(p, out); else if (/\.(ts|tsx)$/.test(e.name) && !/\.test\.ts$/.test(e.name)) out.push(p); } return out; };
+  for (const [mod, allowed] of [["memoryRepairRunner", ["lib/maintenance/repairSession.ts", "lib/memoryRepairDbEnv.ts"]], ["memoryRepairDbEnv", ["lib/maintenance/repairSession.ts"]]] as const) {
+    const importers = walkSrc(SRC).filter((p) => !p.endsWith(`${mod}.ts`)).filter((p) => new RegExp(`/${mod}["']`).test(fs.readFileSync(p, "utf8"))).map((p) => path.relative(SRC, p)).sort();
+    assert.deepEqual(importers, [...allowed].sort(), `${mod} importers`);
+  }
   assert.ok(files.has("lib/memoryRepairPrecheck.ts") && files.has("lib/maintenance/precheckScope.ts"));
   // (type-only imports are erased at compile time and are not followed)
   for (const f of files) { assert.ok(!f.startsWith("lib/ai/"), f); assert.ok(!f.startsWith("app/api/"), f); }

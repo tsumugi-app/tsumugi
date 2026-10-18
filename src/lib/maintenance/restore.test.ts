@@ -373,7 +373,7 @@ test("restore guard: only enumerated paths can be written; only enumerated creat
   assert.equal(await guardMod.readTextOrNull(v.root(), "nope/x.md"), null);
 });
 
-test("no logging / network / storage in the restore modules; nothing imports them yet (not connected to the runner, the sync or any screen); errors carry codes only", async () => {
+test("no logging / network / storage in the restore modules; only the repair session imports them (no screen, startup, Capture or Connect); errors carry codes only", async () => {
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   const files = ["lib/maintenance/restorePoint.ts", "lib/maintenance/restoreEngine.ts", "lib/maintenance/restoreGuard.ts"];
   for (const f of files) {
@@ -381,8 +381,8 @@ test("no logging / network / storage in the restore modules; nothing imports the
     assert.equal(/console\.|\bfetch\(|XMLHttpRequest|sendBeacon|WebSocket|localStorage|sessionStorage|document\.cookie|\beval\(|new Function/.test(code), false, f);
   }
   const walk = (d: string, out: string[] = []) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p, out); else if (/\.(ts|tsx)$/.test(e.name)) out.push(p); } return out; };
-  const importers = walk(SRC).filter((p) => !/restore(Point|Engine|Guard)\.ts$|restore\.test\.ts$/.test(p)).filter((p) => /\/restore(Point|Engine|Guard)["']/.test(fs.readFileSync(p, "utf8")));
-  assert.deepEqual(importers.map((p) => path.relative(SRC, p)), []);
+  const importers = walk(SRC).filter((p) => !/restore(Point|Engine|Guard)\.ts$|\.test\.ts$/.test(p)).filter((p) => /\/restore(Point|Engine|Guard)["']/.test(fs.readFileSync(p, "utf8")));
+  assert.deepEqual(importers.map((p) => path.relative(SRC, p)), ["lib/maintenance/repairSession.ts"], "only the single-item repair session uses the restore modules");
   const s = await scenario();
   const errs: string[] = [];
   for (const t of ["{ nope " + JP.source, JSON.stringify({ ...JSON.parse(s.text), contentHash: "x" })]) { const r = await rpMod.parseRestorePoint(t); if (!r.ok) errs.push(r.error); }
