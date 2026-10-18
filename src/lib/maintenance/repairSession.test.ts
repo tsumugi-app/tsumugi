@@ -105,6 +105,12 @@ async function cleanup() {
 async function world() {
   await cleanup();
   const s = await seedPre();
+  // The reviewed item's link counterparts, the bystander and every other fixture record exist in the real database. Planning needs them (a Memory
+  // whose link counterpart is missing is HOLD), so the dummy database holds the WHOLE fixture world, written plainly (no Outbox entry: they are
+  // bystanders that must never be touched by the session).
+  const tagged = (m: any) => ({ ...m, metadata: { ...m.metadata, sourceType: "chat" } });
+  for (const c of s.w.conversations) if (!(await dbm.getConversation(c.id))) await dbm.putConversation(c as any);
+  for (const m of s.w.memories) if (!(await dbm.getMemoryObject(m.id))) await dbm.putMemoryObject(tagged(m) as any);
   return { ...s, backup: s.vault.copy(), preSnapshot: JSON.stringify(s.vault.snapshot()), preDigest: await digest(), otherBefore: JSON.stringify(await dbm.getVaultOutboxEntry("memory:OTHER-1")) };
 }
 type World = Awaited<ReturnType<typeof world>>;
@@ -198,3 +204,55 @@ test("failure right after the repair commit (nothing in the Vault yet): automati
   } finally { await cleanup(); }
 });
 
+test("failure after the real sync wrote the Vault: automatic strict restore brings IndexedDB AND the Vault back byte-identical", async () => {
+  const w = await world();
+  try {
+    const report = await run(w, { onStage: async (stage) => { if (stage === "synced") throw new Error("simulated-crash"); } });
+    assert.equal(report.status, "rolled-back", JSON.stringify(report));
+    assert.ok(report.stages.includes("synced"));
+    await unchanged(w);
+    assert.equal((await gateMod.readGateState()).kind, "finished");
+  } finally { await cleanup(); }
+});
+
+test("failure in the middle of the real sync (a Vault write fails): automatic strict restore; everything identical to before", async () => {
+  const w = await world();
+  try {
+    w.vault.failNextWrites("Memories/" + fx.T0.slice(0, 10) + ".md", 1);
+    const report = await run(w);
+    assert.equal(report.status, "rolled-back", JSON.stringify(report));
+    assert.equal(report.sync?.ok, false);
+    await unchanged(w);
+  } finally { await cleanup(); }
+});
+
+test("an unexplained change to a scope file during the session: the restore refuses to guess -> rollback-failed, the window (lock + gate) STAYS OPEN, nothing more is written", async () => {
+  const w = await world();
+  try {
+    let snapshotAtStop = "";
+    const report = await run(w, { onStage: async (stage) => {
+      if (stage !== "synced") return;
+      const p = [...w.vault.files.keys()].find((k) => k.startsWith("Memories/"))!;
+      w.vault.put(p, w.vault.files.get(p)!.content + "\nan external edit");
+      snapshotAtStop = JSON.stringify(w.vault.snapshot()) + (await digest());
+    } });
+    assert.equal(report.status, "rollback-failed", JSON.stringify(report));
+    assert.equal(report.windowOpen, true); assert.equal(report.gateClosed, false);
+    assert.equal(win.isMaintenanceWindowOpen(), true);
+    assert.equal((await gateMod.readGateState()).kind, "maintenance-open", "the gate is kept");
+    assert.ok(report.restore?.stopReasons.some((r) => r.startsWith("vault-unidentified:Memories/")), JSON.stringify(report.restore));
+    assert.equal(JSON.stringify(w.vault.snapshot()) + (await digest()), snapshotAtStop, "the failed restore wrote nothing");
+    let ran = false; const p = lockMod.withVaultWorldRead(async () => { ran = true; });
+    await new Promise((r) => setTimeout(r, 30)); assert.equal(ran, false, "the normal app still waits for the lock");
+    await win.endMaintenanceWindow(); await p;
+  } finally { await cleanup(); }
+});
+
+test("the session module is the only new importer of the restore / runner modules; it logs and sends nothing", () => {
+  const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const code = strip(fs.readFileSync(path.join(SRC, "lib/maintenance/repairSession.ts"), "utf8"));
+  assert.equal(/console\.|\bfetch\(|XMLHttpRequest|sendBeacon|WebSocket|localStorage|sessionStorage|document\.cookie|\beval\(|new Function/.test(code), false);
+  const walk = (d: string, out: string[] = []) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p, out); else if (/\.(ts|tsx)$/.test(e.name)) out.push(p); } return out; };
+  const importers = walk(SRC).filter((p) => !/\.test\.ts$/.test(p)).filter((p) => /\/repairSession["']/.test(fs.readFileSync(p, "utf8")));
+  assert.ok(importers.every((p) => /components\/maintenance\/MaintenancePanel\.tsx$/.test(p)), importers.join(","));
+});
