@@ -86,10 +86,13 @@ async function recordReceipts(rp: RestorePoint, env: RestoreEnv, sync: ExecuteRe
     const hash = cur === null ? null : await sha256Hex(cur);
     const preHash = rp.vault.files[path]?.hash ?? null;
     if (hash === preHash) continue;
-    // a changed file is accepted as "produced by this operation" only if the sync itself reported it as written as planned and the real
-    // content equals the prediction apart from the two known volatile fields
+    // a changed file is accepted as "produced by this operation" only if (a) it holds EXACTLY a content the sync's own guarded writer wrote
+    // (hash taken at write time; this also covers the intermediate states of a sync that stopped half-way), or (b) the sync reported it as
+    // written as planned and the real content equals the prediction apart from the two known volatile fields
+    const own = sync?.writtenHashes?.[path] ?? [];
     const p = predicted.get(path);
-    if (cur !== null && p !== undefined && progress.get(path) === "written-as-planned" && normalizeForActualComparison(path, cur) === normalizeForActualComparison(path, p)) exp.vaultFiles[path] = [hash];
+    if (hash !== null && own.includes(hash)) exp.vaultFiles[path] = [...new Set(own)];
+    else if (cur !== null && p !== undefined && progress.get(path) === "written-as-planned" && normalizeForActualComparison(path, cur) === normalizeForActualComparison(path, p)) exp.vaultFiles[path] = [hash];
   }
   for (const id of rp.scope.memoryIds) {
     const cur = await env.idb.getMemory(id);

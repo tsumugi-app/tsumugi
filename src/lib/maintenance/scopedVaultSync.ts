@@ -358,6 +358,8 @@ export interface ExecuteReport {
     unexpectedCreated: string[]; unexpectedChanged: string[]; unexpectedDeleted: string[]; blockedWrites: string[];
   };
   fileProgress: FileProgress[];
+  /** hash of every content the sync itself wrote into each file (see GuardedVault.writtenHashes); lets a caller tell its own writes from anyone else's */
+  writtenHashes?: Record<string, string[]>;
   states: TargetState[];
   diagnosis: DiagnosisItem[];
 }
@@ -421,6 +423,7 @@ async function executeBody(input: ExecuteInput): Promise<ExecuteReport> {
       // ---- verification (also after a stop: it shows the half-finished state)
       const v = out.verification;
       v.blockedWrites = [...guard.blocked];
+      out.writtenHashes = { ...guard.writtenHashes };
       const realChanges: FileChange[] = [];
       for (const f of report.files) {
         const actual = await readVaultText(root, f.path).catch(() => null);
