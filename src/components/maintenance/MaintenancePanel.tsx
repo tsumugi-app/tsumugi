@@ -13,6 +13,8 @@ import {
 } from "@/lib/maintenance/precheckScope";
 import { parsePrivateRepairData, type PrivateRepairData } from "@/lib/privateRepairData";
 import { readPrecheckInput, renderPrecheckText } from "@/lib/memoryRepairPrecheck";
+import { runRepairSession, type RepairSessionReport } from "@/lib/maintenance/repairSession";
+import { releaseStaleMaintenanceGate } from "@/lib/maintenance/maintenanceWindow";
 
 /**
  * Maintenance panel: S1 preflight, S2 dry run (+ non-target invariants), S3 execute + verify, for already-repaired records.
@@ -46,6 +48,14 @@ export default function MaintenancePanel() {
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [vaultCheck, setVaultCheck] = useState<VaultCheck | null>(null);
   const [precheckText, setPrecheckText] = useState<string | null>(null);
+  // single-item repair (stage 2d)
+  const [backupRoot, setBackupRoot] = useState<FileSystemDirectoryHandle | null>(null);
+  const [repairConfirm, setRepairConfirm] = useState("");
+  const [repairReport, setRepairReport] = useState<RepairSessionReport | null>(null);
+  const [awaitingReadBack, setAwaitingReadBack] = useState(false);
+  const readBackResolve = useRef<((text: string) => void) | null>(null);
+  const [releaseConfirm, setReleaseConfirm] = useState("");
+  const [releaseResult, setReleaseResult] = useState<string | null>(null);
   const vaultHandle = session && session.status === "ready" ? session.handle : null;
   const locked = useRef(false);
 
@@ -136,6 +146,40 @@ export default function MaintenancePanel() {
       setAnalysis(a);
       setPrecheckText(renderPrecheckText({ ...a.report, heldForeign: [] }, { build: "maintenance", at }));
     });
+  }
+  async function pickRepairBackup() {
+    await guarded(async () => {
+      const picker = (window as unknown as { showDirectoryPicker?: (o: unknown) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+      if (!picker) { setError("this browser cannot select a folder"); return; }
+      setBackupRoot(await picker({ mode: "read" }));
+    });
+  }
+  /** Saves the restore point as a file and waits until the operator re-selects the SAVED file; what that file contains is what the session verifies. */
+  const persistRestorePoint = (text: string) => new Promise<string>((resolve) => {
+    download(`tsumugi-restore-point-${new Date().toISOString().replace(/[:.]/g, "-")}.json`, text);
+    readBackResolve.current = resolve; setAwaitingReadBack(true);
+  });
+  function loadSavedRestorePoint(file: File | undefined) {
+    if (!file || !readBackResolve.current) return;
+    const r = new FileReader();
+    r.onload = () => { const resolve = readBackResolve.current; readBackResolve.current = null; setAwaitingReadBack(false); resolve?.(String(r.result ?? "")); };
+    r.readAsText(file);
+  }
+  const repairKey = picked.length === 1 && repairData?.repair.items.some((i) => i.key === picked[0]) ? picked[0] : null;
+  const repairReady = !!repairKey && !!repairData && !!decisions && !decisionsError(repairData, decisions) && !!vaultHandle && session?.status === "ready" && session.writePermission === "granted"
+    && !!backupRoot && repairConfirm === `REPAIR ${repairKey}`;
+  async function runRepair() {
+    if (!repairReady || !repairData || !repairKey || !vaultHandle) return;
+    const bad = selectionError(repairData, decisions, live, [repairKey]);
+    if (bad) { setError("selection refused: " + bad); return; }
+    await guarded(async () => {
+      setRepairReport(null);
+      setRepairReport(await runRepairSession({ data: repairData, key: repairKey, root: vaultHandle, confirm: repairConfirm, vaultBackupRoot: backupRoot, persistRestorePoint }));
+      setRepairConfirm(""); setAnalysis(null); setVaultCheck(null); setLive(null); setPicked([]);
+    });
+  }
+  async function runReleaseStale() {
+    await guarded(async () => { const r = await releaseStaleMaintenanceGate(); setReleaseResult(r.released ? "released" : `not released: ${r.reason}`); setReleaseConfirm(""); });
   }
   async function runVaultCheck() {
     if (!analysis || !vaultHandle) return;
@@ -253,6 +297,31 @@ export default function MaintenancePanel() {
             return <li key={it.key} className={v.safeToRepair ? "text-emerald-700" : "text-red-700"}>{it.key}: {v.safeToRepair ? "SAFE TO REPAIR" : "NOT SAFE / NOT PROVEN"} - {v.label}{v.reasons.length ? ` [${v.reasons.join(", ")}]` : ""}</li>; })}</ul>
         </div>)}
         {precheckText && <details><summary>report text (IDs, verdicts and counts only)</summary><pre className="whitespace-pre-wrap text-xs">{precheckText}</pre></details>}
+      </section>
+
+      <section className="flex flex-col gap-2"><h2 className="font-medium">7. Repair one item (writes IndexedDB and the Vault; restores everything itself if anything fails)</h2>
+        <p className="text-xs">One item per run, inside one maintenance window (the normal app cannot write to the Vault meanwhile). Needs: repair data + decision list loaded, a scan done (step 6), exactly ONE READY repair item selected, the Vault folder found with write access granted (steps 1 and 4), and your own copy of the Vault folder. A restore point is created first; you save it and re-select the saved file, and nothing is changed until it reads back identically. Keep Tsumugi and Obsidian closed meanwhile.</p>
+        <p>selected: {repairKey ?? "(select exactly one repair item in step 6)"}</p>
+        <button disabled={busy || !vaultHandle} onClick={() => void pickRepairBackup()} className="border px-3 py-1">Select the folder that holds your copy of the Vault</button>
+        <p>Vault copy folder: {backupRoot ? "selected" : "not selected"} | Vault write access: {session?.status === "ready" ? session.writePermission : "n/a"}</p>
+        <input className="border px-2 py-1" placeholder={repairKey ? `REPAIR ${repairKey}` : "REPAIR <key>"} value={repairConfirm} onChange={(e) => setRepairConfirm(e.target.value)} />
+        <button disabled={busy || !repairReady} onClick={() => void runRepair()} className="border border-red-700 px-3 py-1">Run the repair</button>
+        {awaitingReadBack && <label className="text-red-700">Restore point downloaded. Select the SAVED file here to continue: <input type="file" accept=".json,application/json" onChange={(e) => loadSavedRestorePoint(e.target.files?.[0])} /></label>}
+        {repairReport && (<div>
+          <p className={repairReport.status === "completed" ? "text-emerald-700" : repairReport.status === "refused" ? "text-amber-700" : "text-red-700"}>{repairReport.status}: {repairReport.reason}</p>
+          <p>stages: {repairReport.stages.join(" > ")}</p>
+          {repairReport.sync && <p>sync: ok={String(repairReport.sync.ok)}{repairReport.sync.refused ? ` refused=${repairReport.sync.refused}` : ""}{repairReport.sync.stoppedAt ? ` stoppedAt=${repairReport.sync.stoppedAt}` : ""}</p>}
+          {repairReport.restore && <p>restore: {repairReport.restore.status}{repairReport.restore.failure ? ` (${repairReport.restore.failure})` : ""} {repairReport.restore.stopReasons.join("; ")}</p>}
+          {repairReport.problems.length > 0 && <ul>{repairReport.problems.map((p, i) => <li key={i} className="text-red-700">{p}</li>)}</ul>}
+          {repairReport.windowOpen && <p className="text-red-700">The maintenance window is STILL OPEN (lock and gate kept). Do not open Tsumugi. Keep this tab open and report the lines above.</p>}
+          {repairReport.status === "completed" && <p className="text-emerald-700">Done and verified: IndexedDB and the Vault are consistent; the gate is closed.</p>}
+        </div>)}
+        <details><summary>after a crash: release a stale maintenance gate</summary>
+          <p className="text-xs">Use only when no repair is running anywhere and you have checked the state (step 5). Releasing lets the normal app write to the Vault again.</p>
+          <input className="border px-2 py-1" placeholder="RELEASE GATE" value={releaseConfirm} onChange={(e) => setReleaseConfirm(e.target.value)} />
+          <button disabled={busy || releaseConfirm !== "RELEASE GATE"} onClick={() => void runReleaseStale()} className="border px-3 py-1">Release the gate</button>
+          {releaseResult && <p>{releaseResult}</p>}
+        </details>
       </section>
     </main>
   );
