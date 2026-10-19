@@ -27,6 +27,12 @@ jobs:
           github-token: ${{ secrets.CODEX_TRIGGER_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
+            // Make API permission failures diagnosable (endpoint + permissions GitHub says it accepts). Never prints the token.
+            github.hook.error("request", (e) => {
+              const h = e.response?.headers ?? {};
+              core.error(`API ${e.request?.method} ${e.request?.url} -> ${e.status}; accepted permissions: ${h["x-accepted-github-permissions"] ?? "n/a"}`);
+              throw e;
+            });
             const pr = context.payload.pull_request;
             const sha = pr.head.sha;
             const max = Number(process.env.MAX_FIXES);
