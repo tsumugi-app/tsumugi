@@ -45,7 +45,7 @@ jobs:
               core.setFailed("Secret CODEX_TRIGGER_TOKEN is not set: cannot request a re-review as a human identity. See docs/auto-review-flow.md.");
               return;
             }
-            await github.getOctokit(trigger).rest.issues.createComment({ owner, repo, issue_number: pr.number,
+            await getOctokit(trigger).rest.issues.createComment({ owner, repo, issue_number: pr.number,
               body: `${marker(rounds + 1)}\n@codex review\n\nRe-review requested for \`${sha.slice(0, 7)}\` (auto-fix round ${rounds + 1}/${max}).` });
             const deadline = Date.now() + Number(process.env.WAIT_MINUTES) * 60000;
             let found = null;
