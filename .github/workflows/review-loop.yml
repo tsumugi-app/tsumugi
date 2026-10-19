@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
+      CODEX_TRIGGER_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
       MAX_FIXES: "2"
       WAIT_MINUTES: "25"
     steps:
@@ -38,7 +39,13 @@ jobs:
               core.summary.addRaw(`Auto-fix limit reached (${rounds}/${max}); stopped.`).write();
               return;
             }
-            await github.rest.issues.createComment({ owner, repo, issue_number: pr.number,
+            // Codex ignores comments authored by the Actions bot, so the trigger comment is posted with a user-owned token (repo secret).
+            const trigger = process.env.CODEX_TRIGGER_TOKEN;
+            if (!trigger) {
+              core.setFailed("Secret CODEX_TRIGGER_TOKEN is not set: cannot request a re-review as a human identity. See docs/auto-review-flow.md.");
+              return;
+            }
+            await github.getOctokit(trigger).rest.issues.createComment({ owner, repo, issue_number: pr.number,
               body: `${marker(rounds + 1)}\n@codex review\n\nRe-review requested for \`${sha.slice(0, 7)}\` (auto-fix round ${rounds + 1}/${max}).` });
             const deadline = Date.now() + Number(process.env.WAIT_MINUTES) * 60000;
             let found = null;

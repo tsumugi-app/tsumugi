@@ -15,3 +15,9 @@ Permissions: `ci` = contents:read. `review-loop` = pull-requests/issues:write. N
 - `review-loop` timeout (25 min) and the `needs-human` label work. The round limit (2) is counted by marker comments.
 - So the automatic re-review needs a human-identity trigger: a person comments `@codex review`, or a PAT stored as a repo secret is used by the workflow (not set up).
 - The Claude-side fix step (reacting to Codex findings) is not automated in Actions; it relies on the Claude desktop app PR monitor, not tested.
+
+## Re-review trigger (needs one-time owner setup)
+Codex ignores bot-authored comments, so `review-loop` posts `@codex review` with a user-owned token stored as the repo secret `CODEX_TRIGGER_TOKEN`
+(fine-grained PAT, repository tsumugi-app/tsumugi only, permission "Pull requests: Read and write" or "Issues: Read and write"; nothing else).
+Without the secret the job fails with an explicit message and the PR is not re-reviewed. Claude Code on the Mac cannot post comments itself: it has no `gh`
+and using the stored git credential for API calls was refused by the environment's safety classifier, so that path is deliberately not used.
