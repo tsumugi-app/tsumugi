@@ -41,12 +41,11 @@ jobs:
             // addLabels creates the label if it is missing; a failure must fail the job so the escalation is never silent.
             const escalate = () => github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ["needs-human"] });
             const rounds = comments.filter((c) => c.body.includes("<!-- review-loop:v2:round=")).length;
-            // A timed-out round labels the PR needs-human: later pushes must not request more reviews until a human intervenes.
-            const lastReq = comments.filter((c) => c.body.includes("<!-- review-loop:v2:round=")).map((c) => c.created_at).sort().pop();
-            const events = await github.paginate(github.rest.issues.listEvents, { owner, repo, issue_number: pr.number, per_page: 100 });
-            const lastLabeled = events.filter((e) => e.event === "labeled" && e.label?.name === "needs-human").map((e) => e.created_at).sort().pop();
-            if (lastLabeled && (!lastReq || lastLabeled > lastReq)) {
-              core.warning("PR is labeled needs-human by a timed-out or exhausted round; not requesting another review.");
+            // A timed-out or exhausted round labels the PR needs-human: no further reviews are requested while the label is currently set.
+            // A human removes the label to resume; a received Codex review removes it automatically.
+            const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, { owner, repo, issue_number: pr.number, per_page: 100 });
+            if (labels.some((l) => l.name === "needs-human")) {
+              core.warning("PR currently has the needs-human label; not requesting another review.");
               core.summary.addRaw("Stopped: needs-human is set.").write();
               return;
             }
@@ -69,7 +68,7 @@ jobs:
             while (Date.now() < deadline && !found) {
               await new Promise((r) => setTimeout(r, 60000));
               const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
-              found = reviews.find((r) => r.commit_id === sha && /codex/i.test(r.user.login)) ?? null;
+              found = reviews.find((r) => r.commit_id === sha && r.user.login === "chatgpt-codex-connector[bot]") ?? null;
             }
             if (!found) {
               core.warning(`No Codex review for ${sha} within ${process.env.WAIT_MINUTES} min (timeout). Codex ignores comments authored by the Actions bot (verified); a human must comment "@codex review" manually.`);
