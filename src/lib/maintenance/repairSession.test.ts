@@ -65,7 +65,7 @@ async function resetDb() {
 const digest = async () => [...(await sync.idbSnapshot()).entries()].sort().map(([k, v]) => `${k}=${v}`).join("\n");
 
 /** the world BEFORE the repair (same shape as the sync test, minus the repair itself) */
-async function seedPre(keys: string[] = [R1.key]) {
+async function seedPre(keys: string[] = [R1.key], full = false) {
   await resetDb();
   const w = fx.world();
   const vault = new FakeVault();
@@ -76,8 +76,9 @@ async function seedPre(keys: string[] = [R1.key]) {
   await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated(); lockMod.setTabVaultEpoch(0);
   const items = fx.D.repair.items.filter((i) => keys.includes(i.key));
   const orig = w.conversations.find((c) => c.id === R1.originalConversationId)!, upd = w.conversations.find((c) => c.id === R1.updatingConversationId)!, M = w.memories.find((m) => m.id === R1.memoryId)!;
-  const seedConvs = [...new Map(items.flatMap((i) => [i.originalConversationId, i.updatingConversationId]).map((id) => [id, w.conversations.find((c) => c.id === id)!])).values()];
-  const seedMems = items.map((i) => w.memories.find((m) => m.id === i.memoryId)!);
+  // full: the Vault + Outbox hold EVERY fixture record (the link counterparts of a reviewed item are targets of the pre-check, so they must be consistent in the Vault too)
+  const seedConvs = full ? (w.conversations as any[]) : [...new Map(items.flatMap((i) => [i.originalConversationId, i.updatingConversationId]).map((id) => [id, w.conversations.find((c) => c.id === id)!])).values()];
+  const seedMems = full ? (w.memories as any[]) : items.map((i) => w.memories.find((m) => m.id === i.memoryId)!);
   const T0 = fx.T0, DAY2 = "2026-08-21T00:00:00.000Z";
   const withType = (m: any) => ({ ...m, metadata: { ...m.metadata, sourceType: "chat" } });
   const neighbours = [
@@ -105,9 +106,9 @@ async function cleanup() {
   if (win.isMaintenanceWindowOpen()) await win.endMaintenanceWindow();
   await win.releaseStaleMaintenanceGate({ now: () => NOW });
 }
-async function world(keys: string[] = [R1.key]) {
+async function world(keys: string[] = [R1.key], full = false) {
   await cleanup();
-  const s = await seedPre(keys);
+  const s = await seedPre(keys, full);
   // The reviewed item's link counterparts, the bystander and every other fixture record exist in the real database. Planning needs them (a Memory
   // whose link counterpart is missing is HOLD), so the dummy database holds the WHOLE fixture world, written plainly (no Outbox entry: they are
   // bystanders that must never be touched by the session).
@@ -256,7 +257,7 @@ const runItem = (w: World, key: string, over: Partial<import("./repairSession").
 
 test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape: R3 then R4) repair one after the other through the full session; the shared new Memory exists exactly once", async () => {
   const [A, B] = [itemOf("R3"), itemOf("R4")];
-  const w = await world([A.key, B.key]);
+  const w = await world([A.key, B.key], true);
   try {
     const first = await runItem(w, A.key);
     assert.equal(first.status, "completed", JSON.stringify(first));
@@ -284,7 +285,7 @@ test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape:
 
 test("the SECOND item of a shared pair fails after the real sync: it is restored to exactly the state after the first item (the first item's repair is kept, nothing else changes)", async () => {
   const [A, B] = [itemOf("R3"), itemOf("R4")];
-  const w = await world([A.key, B.key]);
+  const w = await world([A.key, B.key], true);
   try {
     const first = await runItem(w, A.key);
     assert.equal(first.status, "completed", JSON.stringify(first));
