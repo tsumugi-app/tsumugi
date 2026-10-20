@@ -97,6 +97,12 @@ class FakeTransaction {
       async delete(key: Key) {
         staging.set(key, { op: "delete" });
       },
+      /** committed values overlaid with this transaction's staged writes (test-only; mirrors IDB getAll inside a transaction). */
+      async getAll() {
+        const merged = new Map<Key, unknown>(store.committed);
+        for (const [k, op] of staging) { if (op.op === "delete") merged.delete(k); else merged.set(k, op.value); }
+        return [...merged.values()];
+      },
     };
   }
 

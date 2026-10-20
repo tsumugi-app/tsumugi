@@ -21,6 +21,8 @@
     "test:reflect": "tsc -p tsconfig.reflect.json && node --test .test-out/lib/reflection.test.js",
     "test:history-conversation-card": "tsc -p tsconfig.history-conversation-card.json && node --test .test-out/lib/historyConversationCard.test.js",
     "test:save-foundation": "tsc -p tsconfig.save-foundation.json && node --test .test-out/lib/db.foundation.test.js .test-out/lib/vaultOutbox.test.js .test-out/lib/recordAdapter.test.js .test-out/lib/vaultProjection.test.js .test-out/lib/vaultIdentityAdoption.test.js .test-out/lib/vaultProductionMigration.test.js .test-out/lib/storagePersistence.test.js .test-out/lib/saveFoundationBootstrap.test.js .test-out/lib/productionBootstrap.test.js .test-out/lib/productionWiring.test.js .test-out/lib/productionMemoryWiring.test.js .test-out/lib/vaultRecoveryLegacyCleanup.test.js .test-out/lib/connect.test.js",
+    "test:memory-repair": "tsc -p tsconfig.memory-repair.json && node --test .test-out/lib/memoryRepair.test.js .test-out/lib/memoryRepairPrecheck.test.js .test-out/lib/memoryRepairPrivacy.test.js",
+    "test:maintenance": "tsc -p tsconfig.maintenance.json && node --test .test-out/lib/maintenance/maintenanceAuth.test.js .test-out/lib/maintenance/maintenanceInvariants.test.js .test-out/lib/maintenance/maintenanceSync.test.js .test-out/lib/maintenance/maintenanceBoundary.test.js .test-out/lib/maintenance/maintenanceGuard.test.js .test-out/lib/maintenance/precheckScope.test.js .test-out/lib/maintenance/maintenanceGate.test.js .test-out/lib/maintenance/restore.test.js .test-out/lib/maintenance/repairSession.test.js",
     "test:recovery-memory-diagnostic": "tsc -p tsconfig.recovery-memory-diagnostic.json && node --test .test-out/lib/recoveryMemoryDiagnostic.test.js"
   },
   "dependencies": {

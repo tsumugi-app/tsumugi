@@ -22,6 +22,7 @@ import { IncompleteVaultWorldError, StaleVaultTabError, runVaultWorldExclusive }
 import { withVaultSaveLock } from "../vaultSaveLock";
 import { conversationEntryTypeOf } from "../conversationEntryKind";
 import { GuardedVault, diffTree, snapshotTree } from "./vaultGuard";
+import { isMaintenanceWindowOpen, runWithMaintenanceWriteAccess } from "./maintenanceWindow";
 import type { VaultOutboxEntry } from "../vaultOutbox";
 import { hashRecord, sha256Hex, stableStringify } from "./hash";
 import { checkVaultInvariants, normalizeForActualComparison, type FileChange, type InvariantContext, type Violation } from "./invariants";
@@ -45,6 +46,11 @@ const dayOf = (t: ResolvedTarget) => (t.kind === "conversation" ? (t.record as C
 const ledgerKey = (t: { kind: string; id: string }) => `${t.kind}:${t.id}`;
 const outboxId = (t: { kind: string; id: string }) => `${t.kind}:${t.id}`;
 const check = (checks: Check[], code: string, pass: boolean, detail = "") => { checks.push({ code, pass, detail: pass ? "" : detail }); return pass; };
+/**
+ * Inside an open maintenance window (journal gate in place) the legacy writers are refused by the app's own write gate; this runs them
+ * with the window-limited permission. Without an open window (every existing caller / test) it is exactly `fn()`.
+ */
+const scoped = <T,>(fn: () => Promise<T>): Promise<T> => (isMaintenanceWindowOpen() ? runWithMaintenanceWriteAccess(fn) : fn());
 
 async function readVaultText(root: FileSystemDirectoryHandle, path: string): Promise<string | null> {
   return new ShadowVault(root).readText(path); // read-only access path (create:false)
@@ -130,8 +136,8 @@ export async function dryRun(manifest: MaintenanceManifest, root: FileSystemDire
   const writers: WriterOutcome[] = []; const warnings: string[] = [];
   for (const t of pf.targets) {
     try {
-      if (t.kind === "conversation") await writeConversationMarkdown(shadow.root(), clone(t.record as Conversation), "interactive", undefined, { skipLedger: true });
-      else await writeMemoryObjectMarkdown(shadow.root(), clone(t.record as MemoryObject), "interactive", undefined, { skipLedger: true });
+      if (t.kind === "conversation") await scoped(() => writeConversationMarkdown(shadow.root(), clone(t.record as Conversation), "interactive", undefined, { skipLedger: true }));
+      else await scoped(() => writeMemoryObjectMarkdown(shadow.root(), clone(t.record as MemoryObject), "interactive", undefined, { skipLedger: true }));
       writers.push({ kind: t.kind, id: t.id, status: "would-write" });
     } catch (e) {
       writers.push({ kind: t.kind, id: t.id, status: e instanceof VaultRecordNeedsResyncError ? "held" : "error", reason: e instanceof VaultRecordNeedsResyncError ? e.holdReason : (e as Error)?.name ?? "error" });
@@ -352,28 +358,36 @@ export interface ExecuteReport {
     unexpectedCreated: string[]; unexpectedChanged: string[]; unexpectedDeleted: string[]; blockedWrites: string[];
   };
   fileProgress: FileProgress[];
+  /** hash of every content the sync itself wrote into each file (see GuardedVault.writtenHashes); lets a caller tell its own writes from anyone else's */
+  writtenHashes?: Record<string, string[]>;
   states: TargetState[];
   diagnosis: DiagnosisItem[];
 }
 const emptyVerification = (): ExecuteReport["verification"] => ({ predictedVsActual: [], invariantViolations: [], idbCollateral: [], canonicalChanged: [], unexpectedCreated: [], unexpectedChanged: [], unexpectedDeleted: [], blockedWrites: [] });
 
-export async function executeSync(input: ExecuteInput): Promise<ExecuteReport> {
-  const { manifest, root, report } = input;
-  const now = input.now ?? (() => new Date().toISOString());
-  const base: ExecuteReport = { ok: false, steps: [], verification: emptyVerification(), fileProgress: [], states: [], diagnosis: [] };
-  const refuse = (why: string): ExecuteReport => ({ ...base, refused: why });
+/** Everything `executeSync` checks BEFORE it takes the Vault-world lock. Returns the refusal, or null when execution may start. */
+async function refusalBeforeExecute(input: ExecuteInput): Promise<ExecuteReport | null> {
+  const { root, report } = input;
+  const refuse = (why: string): ExecuteReport => ({ ok: false, steps: [], verification: emptyVerification(), fileProgress: [], states: [], diagnosis: [], refused: why });
   if (!report.ok) return refuse("dry-run-not-clean");
   if (input.confirm !== `SYNC ${report.preflight.targets.length}`) return refuse("confirmation-phrase");
   for (const b of [input.vaultBackup, input.recordBackup]) if (!b || !b.ok || b.forFingerprint !== report.fingerprint) return refuse("backup-not-verified-for-this-dry-run");
   const perm = typeof (root as unknown as { queryPermission?: unknown }).queryPermission === "function" ? await root.queryPermission({ mode: "readwrite" }) : "granted";
   if (perm !== "granted") return refuse("vault-write-permission-not-granted");
+  return null;
+}
 
-  // M1: from here on this tab owns the Vault world EXCLUSIVELY (other tabs' Capture / Connect / flush / bootstrap wait or are refused).
-  // Lock order is the app's own: world lock (outer) -> save lock (inner, taken by the writers / around each projection) -> registry/history locks.
-  // Nothing inside calls withVaultWorldRead / runVaultWorldExclusive again, and the writers are NOT wrapped in the save lock (they take it themselves).
-  let locked: Awaited<ReturnType<typeof runVaultWorldExclusive<ExecuteReport>>>;
-  try {
-    locked = await runVaultWorldExclusive<ExecuteReport>(async () => {
+/**
+ * The execution itself. The CALLER holds the exclusive Vault-world lock (`executeSync` takes it; the maintenance window holds it for its
+ * whole duration and calls `executeSyncLocked`). Nothing in here takes it again (the lock is not re-entrant).
+ */
+async function executeBody(input: ExecuteInput): Promise<ExecuteReport> {
+  const { manifest, root, report } = input;
+  const now = input.now ?? (() => new Date().toISOString());
+  const base: ExecuteReport = { ok: false, steps: [], verification: emptyVerification(), fileProgress: [], states: [], diagnosis: [] };
+  const refuse = (why: string): ExecuteReport => ({ ...base, refused: why });
+  {
+    {
       // the world must be exactly what the dry run saw: re-run it UNDER the lock (any change anywhere, including other records, refuses)
       const again = await dryRun(manifest, root, now);
       if (!again.ok || again.fingerprint !== report.fingerprint) return refuse("data-changed-since-dry-run");
@@ -393,15 +407,15 @@ export async function executeSync(input: ExecuteInput): Promise<ExecuteReport> {
         if (!fresh || fresh.updatedAt !== t.record.updatedAt) { step.writer = "record-changed"; out.stoppedAt = `${t.kind}:${t.id}`; break; }
         try {
           // the writers stamp `metadata.obsidian` on the object they are given: hand them a copy so the canonical object is never mutated
-          if (t.kind === "conversation") await writeConversationMarkdown(guarded, clone(fresh as Conversation), "interactive");
-          else await writeMemoryObjectMarkdown(guarded, clone(fresh as MemoryObject), "interactive");
+          if (t.kind === "conversation") await scoped(() => writeConversationMarkdown(guarded, clone(fresh as Conversation), "interactive"));
+          else await scoped(() => writeMemoryObjectMarkdown(guarded, clone(fresh as MemoryObject), "interactive"));
           step.writer = "written";
         } catch (e) { step.writer = e instanceof VaultRecordNeedsResyncError ? `held:${e.holdReason}` : `error:${(e as Error)?.message?.startsWith("guarded-vault") ? "blocked-unplanned-write" : (e as Error)?.name ?? "error"}`; out.stoppedAt = `${t.kind}:${t.id}`; break; }
         const entry = await getVaultOutboxEntry(outboxId(t));
         if (!entry) { step.projection = "no-entry"; out.stoppedAt = `${t.kind}:${t.id}`; break; }
         const env = { root: guarded, vaultIdentity: identity ?? null, now };
         // the projection is the "bootstrap" side of the save lock (same as saveFoundationBootstrap): serialised against the legacy writers
-        const res = await withVaultSaveLock(() => (t.kind === "conversation" ? reconcileConversationOutboxEntry(env, entry) : reconcileMemoryOutboxEntry(env, entry)));
+        const res = await scoped(() => withVaultSaveLock(() => (t.kind === "conversation" ? reconcileConversationOutboxEntry(env, entry) : reconcileMemoryOutboxEntry(env, entry))));
         step.projection = res.status + ("reason" in res && res.reason ? `:${res.reason}` : "");
         const okPending = res.status === "pending" && "reason" in res && res.reason === "verify-history-mismatch";
         if (res.status !== "done" && !okPending) { out.stoppedAt = `${t.kind}:${t.id}`; break; }
@@ -409,6 +423,7 @@ export async function executeSync(input: ExecuteInput): Promise<ExecuteReport> {
       // ---- verification (also after a stop: it shows the half-finished state)
       const v = out.verification;
       v.blockedWrites = [...guard.blocked];
+      out.writtenHashes = { ...guard.writtenHashes };
       const realChanges: FileChange[] = [];
       for (const f of report.files) {
         const actual = await readVaultText(root, f.path).catch(() => null);
@@ -438,7 +453,20 @@ export async function executeSync(input: ExecuteInput): Promise<ExecuteReport> {
         && out.diagnosis.every((d) => d.status === "ok" || legacyDay(d) || (d.area === "outbox" && historyPending.has(`${d.kind}:${d.id}`)))
         && out.states.every((s) => s.vaultMatchesCanonical === true && s.ledgerSynced);
       return out;
-    }, input.lockTimeoutMs ?? 15000);
+    }
+  }
+}
+
+export async function executeSync(input: ExecuteInput): Promise<ExecuteReport> {
+  const refusal = await refusalBeforeExecute(input);
+  if (refusal) return refusal;
+  const refuse = (why: string): ExecuteReport => ({ ok: false, steps: [], verification: emptyVerification(), fileProgress: [], states: [], diagnosis: [], refused: why });
+  // M1: from here on this tab owns the Vault world EXCLUSIVELY (other tabs' Capture / Connect / flush / bootstrap wait or are refused).
+  // Lock order is the app's own: world lock (outer) -> save lock (inner, taken by the writers / around each projection) -> registry/history locks.
+  // Nothing inside calls withVaultWorldRead / runVaultWorldExclusive again, and the writers are NOT wrapped in the save lock (they take it themselves).
+  let locked: Awaited<ReturnType<typeof runVaultWorldExclusive<ExecuteReport>>>;
+  try {
+    locked = await runVaultWorldExclusive<ExecuteReport>(() => executeBody(input), input.lockTimeoutMs ?? 15000);
   } catch (e) {
     if (e instanceof StaleVaultTabError) return refuse("stale-vault-tab");
     if (e instanceof IncompleteVaultWorldError) return refuse("vault-world-not-in-a-committed-state");
@@ -446,6 +474,16 @@ export async function executeSync(input: ExecuteInput): Promise<ExecuteReport> {
   }
   if (locked.timedOut || !locked.result) return refuse("vault-world-lock-unavailable-another-tab-or-unsupported-browser");
   return locked.result;
+}
+
+/**
+ * Same execution as `executeSync`, for a caller that ALREADY holds the exclusive Vault-world lock (the maintenance window). It takes no lock
+ * of its own (the lock is not re-entrant), so calling `executeSync` from inside the window would deadlock.
+ */
+export async function executeSyncLocked(input: ExecuteInput): Promise<ExecuteReport> {
+  const refusal = await refusalBeforeExecute(input);
+  if (refusal) return refusal;
+  return executeBody(input);
 }
 
 /** Operator helper: builds a manifest draft for the given records (IDs + reviewed state + hash). Reads only; the file is reviewed and re-loaded. */

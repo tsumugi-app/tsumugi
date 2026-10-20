@@ -1,0 +1,29 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/memoryRepair.test.ts",
+    "src/lib/memoryRepairPrecheck.test.ts",
+    "src/lib/memoryRepairTestWorld.ts",
+    "src/lib/memoryContaminationRepair.ts",
+    "src/lib/memoryBackfill.ts",
+    "src/lib/memoryRepairRunner.ts",
+    "src/lib/memoryRepairDbEnv.ts",
+    "src/lib/memoryRepairPrecheck.ts",
+    "src/lib/db.ts",
+    "src/lib/fakeIdb.ts",
+    "src/lib/privateRepairData.ts",
+    "src/lib/memoryRepairFictionalData.ts",
+    "src/lib/memoryRepairPrivacy.test.ts"
+  ]
+}

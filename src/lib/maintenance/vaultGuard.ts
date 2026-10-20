@@ -20,6 +20,8 @@ export const TSUMUGI_AREAS = [".tsumugi", "Memories", "Conversations", "Sources"
 export class GuardedVault {
   readonly blocked: string[] = [];
   readonly writes: string[] = [];
+  /** path -> hash of EVERY content a (successfully closed) write left in that file, in order. Lets the caller recognise exactly what it wrote itself. */
+  readonly writtenHashes: Record<string, string[]> = {};
   private readonly dirs = new Set<string>();
   constructor(private readonly real: FileSystemDirectoryHandle, private readonly allowedFiles: Set<string>) {
     for (const f of allowedFiles) { const parts = f.split("/"); for (let i = 1; i < parts.length; i++) this.dirs.add(parts.slice(0, i).join("/")); }
@@ -70,7 +72,24 @@ export class GuardedVault {
       async createWritable(options?: FileSystemCreateWritableOptions) {
         if (!self.allowedFiles.has(path)) self.deny("write", path);
         self.writes.push(path);
-        return real.createWritable(options);
+        const stream = await real.createWritable(options);
+        let buffered: string | null = null;   // null after a non-string / seeked write: the content is then not recorded
+        let any = false;
+        const wrapped = {
+          async write(data: unknown) {
+            if (typeof data === "string") { buffered = any && buffered !== null ? buffered + data : data; } else buffered = null;
+            any = true;
+            return (stream as unknown as { write(d: unknown): Promise<void> }).write(data);
+          },
+          async truncate(size: number) { buffered = size === 0 ? "" : null; any = true; return stream.truncate(size); },
+          async seek(position: number) { buffered = null; return stream.seek(position); },
+          async close() {
+            await stream.close();
+            if (buffered !== null) (self.writtenHashes[path] ??= []).push(await sha256Hex(buffered));
+          },
+          async abort(reason?: unknown) { return stream.abort(reason); },
+        };
+        return wrapped as unknown as FileSystemWritableFileStream;
       },
     } as unknown as FileSystemFileHandle;
   }
