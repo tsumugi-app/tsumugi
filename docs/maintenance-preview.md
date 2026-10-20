@@ -26,3 +26,16 @@ Variables apply to NEW deployments: redeploy the branch afterwards (Deployments 
 Screens, wording, buttons, the file pickers and permission prompts (Vault copy folder, restore-point download and read-back), tab behaviour.
 Load `docs/demo/fictional-repair-data.json` (fictional data) as the repair data. The Preview database holds no matching records, so the pre-check reports the items as HOLD and a
 repair is refused before any write; that refusal path and the messages are part of what is being looked at. The full repair pipeline on dummy records is covered by the automated tests.
+
+## Read-only test of step 6 ("Repair pre-check") with fictional files
+Both files are fictional and contain nothing from real data:
+- repair data: `docs/demo/fictional-repair-data.json` (8 repair items R1-R8, 9 backfill items B1-B9; the same data the automated tests use)
+- decision list: `docs/demo/fictional-decisions.json` (`{"format":"tsumugi-repair-decisions","schema":1,"held":["R7"],"excluded":["B1","B2"]}`)
+
+Download them from the branch (right-click -> save as, or "Download raw file"):
+- https://raw.githubusercontent.com/tsumugi-app/tsumugi/claude/storage-safety/docs/demo/fictional-repair-data.json
+- https://raw.githubusercontent.com/tsumugi-app/tsumugi/claude/storage-safety/docs/demo/fictional-decisions.json
+
+In the panel, step 6: "repair data" -> choose the first file; "decision list" -> choose the second. The line "decision list: loaded (held 1, excluded 2)" appears and
+"Scan all items (read-only)" becomes enabled. Scan reads IndexedDB only (the Preview's own, empty one), so every item is reported as not READY and nothing is selectable;
+that is expected here. A key that is not in the repair data is rejected on purpose (try editing a key in the decision list to see the message).
