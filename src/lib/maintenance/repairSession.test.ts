@@ -252,6 +252,11 @@ test("an unexplained change to a scope file during the session: the restore refu
   } finally { await cleanup(); }
 });
 
+/** let any fire-and-forget Vault work of the seeding finish, then take the operator's copy of the Vault and the "before" digests */
+async function settled(w: World): Promise<World> {
+  await new Promise((r) => setTimeout(r, 50));
+  return { ...w, backup: w.vault.copy(), preSnapshot: JSON.stringify(w.vault.snapshot()), preDigest: await digest() };
+}
 const itemOf = (key: string) => fx.D.repair.items.find((i) => i.key === key)!;
 /** failure message: the report, and for a refused backup comparison the first differing region of the live Vault file versus the operator's copy */
 const explain = (w: World, r: { reason: string }) => {
@@ -265,7 +270,7 @@ const runItem = (w: World, key: string, over: Partial<import("./repairSession").
 
 test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape: R3 then R4) repair one after the other through the full session; the shared new Memory exists exactly once", async () => {
   const [A, B] = [itemOf("R3"), itemOf("R4")];
-  const w = await world([A.key, B.key], true);
+  const w = await settled(await world([A.key, B.key]));
   try {
     const first = await runItem(w, A.key);
     assert.equal(first.status, "completed", explain(w, first));
@@ -293,7 +298,7 @@ test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape:
 
 test("the SECOND item of a shared pair fails after the real sync: it is restored to exactly the state after the first item (the first item's repair is kept, nothing else changes)", async () => {
   const [A, B] = [itemOf("R3"), itemOf("R4")];
-  const w = await world([A.key, B.key], true);
+  const w = await settled(await world([A.key, B.key]));
   try {
     const first = await runItem(w, A.key);
     assert.equal(first.status, "completed", explain(w, first));
