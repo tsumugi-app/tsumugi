@@ -50,7 +50,7 @@ const CREATED = "Conversations/dummy-created-by-the-operation.md";   // stands i
  * production restore transaction with the CURRENT value as the expectation (a value nobody expected makes it throw instead of being deleted).
  */
 async function clearRepairSettings() {
-  const keys = [repair.repairLedgerKey, repair.repairBackupKey, repair.repairRollbackLedgerKey, repair.repairRollbackBackupKey].map((f) => f(R1.memoryId));
+  const keys = fx.D.repair.items.flatMap((i) => [repair.repairLedgerKey, repair.repairBackupKey, repair.repairRollbackLedgerKey, repair.repairRollbackBackupKey].map((f) => f(i.memoryId)));
   const current = await dbm.readMemoryRepairSettings(keys);
   await dbm.commitMaintenanceRestore({
     memories: [], conversations: [], outbox: [], syncLedger: [],
@@ -65,7 +65,7 @@ async function resetDb() {
 const digest = async () => [...(await sync.idbSnapshot()).entries()].sort().map(([k, v]) => `${k}=${v}`).join("\n");
 
 /** the world BEFORE the repair (same shape as the sync test, minus the repair itself) */
-async function seedPre() {
+async function seedPre(keys: string[] = [R1.key]) {
   await resetDb();
   const w = fx.world();
   const vault = new FakeVault();
@@ -74,7 +74,10 @@ async function seedPre() {
   const ident = { id: "current", vaultId: "vault-restore-1", activeVaultEpoch: 0, registryGeneration: "g", pairedAt: NOW, pendingCandidateVaultId: null, updatedAt: NOW };
   await dbm.putVaultIdentityRecord(ident as any);
   await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated(); lockMod.setTabVaultEpoch(0);
+  const items = fx.D.repair.items.filter((i) => keys.includes(i.key));
   const orig = w.conversations.find((c) => c.id === R1.originalConversationId)!, upd = w.conversations.find((c) => c.id === R1.updatingConversationId)!, M = w.memories.find((m) => m.id === R1.memoryId)!;
+  const seedConvs = [...new Map(items.flatMap((i) => [i.originalConversationId, i.updatingConversationId]).map((id) => [id, w.conversations.find((c) => c.id === id)!])).values()];
+  const seedMems = items.map((i) => w.memories.find((m) => m.id === i.memoryId)!);
   const T0 = fx.T0, DAY2 = "2026-08-21T00:00:00.000Z";
   const withType = (m: any) => ({ ...m, metadata: { ...m.metadata, sourceType: "chat" } });
   const neighbours = [
@@ -86,8 +89,8 @@ async function seedPre() {
   const nbConv = fx.conv("nb-conv-c", ["別の会話の発言"], T0, ["nb-c"]);
   const env0 = { root: vault.root(), vaultIdentity: ident as any, now: () => NOW };
   const seed: any[] = [];
-  for (const c of [orig, upd, nbConv]) seed.push(["conversation", await dbm.putConversationWithOutbox(c as any)]);
-  for (const m of [...neighbours, withType(M)]) seed.push(["memory", await dbm.putMemoryObjectWithOutbox(m as any, "memory")]);
+  for (const c of [...seedConvs, nbConv]) seed.push(["conversation", await dbm.putConversationWithOutbox(c as any)]);
+  for (const m of [...neighbours, ...seedMems.map(withType)]) seed.push(["memory", await dbm.putMemoryObjectWithOutbox(m as any, "memory")]);
   for (const [kind, entry] of seed) { const r = kind === "conversation" ? await proj.reconcileConversationOutboxEntry(env0, entry) : await proj.reconcileMemoryOutboxEntry(env0, entry); assert.equal(r.status, "done", kind + JSON.stringify(r)); }
   // unrelated pending Outbox entry (stand-in for the 6 real ones)
   await dbm.putVaultOutboxEntry({ id: "memory:OTHER-1", recordType: "memory", recordId: "OTHER-1", recordUpdatedAt: "x", steps: {}, attempt: { count: 62, lastError: "verify-history-mismatch", lastAttemptAt: "x" }, status: "pending", heldReason: null, createdAt: "c", updatedAt: "u" } as any);
@@ -102,9 +105,9 @@ async function cleanup() {
   if (win.isMaintenanceWindowOpen()) await win.endMaintenanceWindow();
   await win.releaseStaleMaintenanceGate({ now: () => NOW });
 }
-async function world() {
+async function world(keys: string[] = [R1.key]) {
   await cleanup();
-  const s = await seedPre();
+  const s = await seedPre(keys);
   // The reviewed item's link counterparts, the bystander and every other fixture record exist in the real database. Planning needs them (a Memory
   // whose link counterpart is missing is HOLD), so the dummy database holds the WHOLE fixture world, written plainly (no Outbox entry: they are
   // bystanders that must never be touched by the session).
@@ -245,6 +248,54 @@ test("an unexplained change to a scope file during the session: the restore refu
     let ran = false; const p = lockMod.withVaultWorldRead(async () => { ran = true; });
     await new Promise((r) => setTimeout(r, 30)); assert.equal(ran, false, "the normal app still waits for the lock");
     await win.endMaintenanceWindow(); await p;
+  } finally { await cleanup(); }
+});
+
+const itemOf = (key: string) => fx.D.repair.items.find((i) => i.key === key)!;
+const runItem = (w: World, key: string, over: Partial<import("./repairSession").RepairSessionInput> = {}) => run(w, { key, confirm: `REPAIR ${key}`, ...over });
+
+test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape: R3 then R4) repair one after the other through the full session; the shared new Memory exists exactly once", async () => {
+  const [A, B] = [itemOf("R3"), itemOf("R4")];
+  const w = await world([A.key, B.key]);
+  try {
+    const first = await runItem(w, A.key);
+    assert.equal(first.status, "completed", JSON.stringify(first));
+    const second = await runItem(w, B.key);
+    assert.equal(second.status, "completed", JSON.stringify(second));
+    for (const r of [first, second]) { assert.equal(r.gateClosed, true); assert.equal(r.windowOpen, false); }
+    const sharedId = await repair.updatingMemoryIdFor(A.updatingConversationId);
+    const shared = await dbm.getMemoryObject(sharedId);
+    assert.ok(shared, "the shared new Memory exists");
+    const upd = (await dbm.getConversation(A.updatingConversationId))!;
+    assert.equal(upd.memoryObjectIds.filter((id) => id === sharedId).length, 1, "the updating conversation references it exactly once");
+    assert.equal((await dbm.getAllMemoryObjects()).filter((m) => m.id === sharedId).length, 1);
+    for (const it of [A, B]) {
+      const m = (await dbm.getMemoryObject(it.memoryId))!;
+      assert.equal(m.summary, it.restored.summary, `${it.key} restored`);
+      assert.ok((await dbm.readMemoryRepairSettings([repair.repairLedgerKey(it.memoryId)]))[repair.repairLedgerKey(it.memoryId)] !== undefined, `${it.key} ledger present`);
+    }
+    assert.equal(JSON.stringify(await dbm.getVaultOutboxEntry("memory:OTHER-1")), w.otherBefore, "the unrelated pending Outbox entry never changed");
+    assert.equal((await gateMod.readGateState()).kind, "finished");
+    // a second run of the same item is a no-op refusal, never a second write
+    const again = await runItem(w, B.key);
+    assert.equal(again.status, "refused", JSON.stringify(again));
+  } finally { await cleanup(); }
+});
+
+test("the SECOND item of a shared pair fails after the real sync: it is restored to exactly the state after the first item (the first item's repair is kept, nothing else changes)", async () => {
+  const [A, B] = [itemOf("R3"), itemOf("R4")];
+  const w = await world([A.key, B.key]);
+  try {
+    const first = await runItem(w, A.key);
+    assert.equal(first.status, "completed", JSON.stringify(first));
+    const vaultAfterFirst = JSON.stringify(w.vault.snapshot()), digestAfterFirst = await digest();
+    const second = await runItem(w, B.key, { onStage: async (stage) => { if (stage === "synced") throw new Error("simulated-crash"); } });
+    assert.equal(second.status, "rolled-back", JSON.stringify(second));
+    assert.equal(JSON.stringify(w.vault.snapshot()), vaultAfterFirst, "Vault identical to the state after the first item");
+    assert.equal(await digest(), digestAfterFirst, "IndexedDB (records, ledger, Outbox) identical to the state after the first item");
+    assert.equal((await dbm.getMemoryObject(A.memoryId))!.summary, A.restored.summary, "the first item stays repaired");
+    assert.equal((await dbm.readMemoryRepairSettings([repair.repairLedgerKey(B.memoryId)]))[repair.repairLedgerKey(B.memoryId)], undefined, "no ledger for the failed item");
+    assert.equal((await gateMod.readGateState()).kind, "finished");
   } finally { await cleanup(); }
 });
 
