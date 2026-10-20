@@ -253,6 +253,14 @@ test("an unexplained change to a scope file during the session: the restore refu
 });
 
 const itemOf = (key: string) => fx.D.repair.items.find((i) => i.key === key)!;
+/** failure message: the report, and for a refused backup comparison the first differing region of the live Vault file versus the operator's copy */
+const explain = (w: World, r: { reason: string }) => {
+  const m = /vault-backup-differs:(.+)$/.exec(r.reason);
+  if (!m) return JSON.stringify(r);
+  const a = w.vault.snapshot()[m[1]] ?? "<absent>", b = w.backup.snapshot()[m[1]] ?? "<absent>";
+  let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return `${JSON.stringify(r)} live[${a.length}]@${i}: ${a.slice(Math.max(0, i - 60), i + 120)} || backup[${b.length}]: ${b.slice(Math.max(0, i - 60), i + 120)}`;
+};
 const runItem = (w: World, key: string, over: Partial<import("./repairSession").RepairSessionInput> = {}) => run(w, { key, confirm: `REPAIR ${key}`, ...over });
 
 test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape: R3 then R4) repair one after the other through the full session; the shared new Memory exists exactly once", async () => {
@@ -260,7 +268,7 @@ test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape:
   const w = await world([A.key, B.key], true);
   try {
     const first = await runItem(w, A.key);
-    assert.equal(first.status, "completed", JSON.stringify(first));
+    assert.equal(first.status, "completed", explain(w, first));
     const second = await runItem(w, B.key);
     assert.equal(second.status, "completed", JSON.stringify(second));
     for (const r of [first, second]) { assert.equal(r.gateClosed, true); assert.equal(r.windowOpen, false); }
@@ -288,7 +296,7 @@ test("the SECOND item of a shared pair fails after the real sync: it is restored
   const w = await world([A.key, B.key], true);
   try {
     const first = await runItem(w, A.key);
-    assert.equal(first.status, "completed", JSON.stringify(first));
+    assert.equal(first.status, "completed", explain(w, first));
     const vaultAfterFirst = JSON.stringify(w.vault.snapshot()), digestAfterFirst = await digest();
     const second = await runItem(w, B.key, { onStage: async (stage) => { if (stage === "synced") throw new Error("simulated-crash"); } });
     assert.equal(second.status, "rolled-back", JSON.stringify(second));
