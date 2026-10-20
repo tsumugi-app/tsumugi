@@ -53,3 +53,5 @@ next-env.d.ts
 # Memory repair: 非公開の判断リスト（HOLD・除外の決定）。コミットしない
 memory-repair-decisions.json
 *.memory-repair-decisions.json
+/e2e/node_modules/
+/e2e/test-results/

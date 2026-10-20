@@ -1,0 +1,6 @@
+{
+  "name": "tsumugi-e2e",
+  "private": true,
+  "description": "Browser E2E tooling kept apart from the app's dependencies",
+  "devDependencies": { "@playwright/test": "1.49.1" }
+}

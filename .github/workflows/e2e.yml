@@ -29,9 +29,11 @@ jobs:
       - name: Compile the fictional test world (reused by the E2E seed)
         run: npx tsc -p tsconfig.maintenance.json
       - run: npm run build
-      - name: Install @playwright/test (not an app dependency)
-        run: npm install --no-save @playwright/test@1.49.1
+      - name: Install @playwright/test (kept in e2e/, not an app dependency)
+        working-directory: e2e
+        run: npm install --no-audit --no-fund
       - name: Install Chromium
+        working-directory: e2e
         run: npx playwright install --with-deps chromium
       - name: Job-local dummy password
         run: |
@@ -39,4 +41,5 @@ jobs:
           echo "::add-mask::$PW"
           echo "E2E_PW=$PW" >> "$GITHUB_ENV"
       - name: E2E
-        run: npx playwright test -c e2e/playwright.config.ts
+        working-directory: e2e
+        run: npx playwright test -c playwright.config.ts
