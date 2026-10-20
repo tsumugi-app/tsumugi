@@ -39,9 +39,11 @@ for (const name of suites) {
   if (why) {
     failed++;
     const lines = log.split("\n").filter((l) => !NOISE.test(l));
-    const failing = lines.filter((l) => /^\s*(not ok|✖)/.test(l)).slice(0, 30);
+    // each failing test with its diagnostic block (TAP YAML: error / expected / actual / stack head), not only its name
+    const failing = [];
+    lines.forEach((l, i) => { if (/^\s*(not ok|✖)/.test(l) && failing.length < 120) failing.push(...lines.slice(i, i + 22).map((x) => x.slice(0, 400))); });
     const tail = lines.slice(-80);
-    console.log(`::error title=${esc(name)} failed (${esc(why)})::${esc([...failing, "---", ...tail].join("\n").slice(0, 6000))}`);
+    console.log(`::error title=${esc(name)} failed (${esc(why)})::${esc([...failing, "---", ...tail].join("\n").slice(0, 9000))}`);
   }
 }
 if (process.env.GITHUB_STEP_SUMMARY) {
