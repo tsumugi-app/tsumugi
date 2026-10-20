@@ -274,7 +274,8 @@ test("two items that share one updating conversation (the TWKAB3 / E2Y6NN shape:
   try {
     const first = await runItem(w, A.key);
     assert.equal(first.status, "completed", explain(w, first));
-    const second = await runItem(w, B.key);
+    // the operator copies the (now changed) Vault again before the next item: the session requires the copy to equal the live files
+    const second = await runItem({ ...w, backup: w.vault.copy() }, B.key);
     assert.equal(second.status, "completed", JSON.stringify(second));
     for (const r of [first, second]) { assert.equal(r.gateClosed, true); assert.equal(r.windowOpen, false); }
     const sharedId = await repair.updatingMemoryIdFor(A.updatingConversationId);
@@ -303,7 +304,7 @@ test("the SECOND item of a shared pair fails after the real sync: it is restored
     const first = await runItem(w, A.key);
     assert.equal(first.status, "completed", explain(w, first));
     const vaultAfterFirst = JSON.stringify(w.vault.snapshot()), digestAfterFirst = await digest();
-    const second = await runItem(w, B.key, { onStage: async (stage) => { if (stage === "synced") throw new Error("simulated-crash"); } });
+    const second = await runItem({ ...w, backup: w.vault.copy() }, B.key, { onStage: async (stage) => { if (stage === "synced") throw new Error("simulated-crash"); } });
     assert.equal(second.status, "rolled-back", JSON.stringify(second));
     assert.equal(JSON.stringify(w.vault.snapshot()), vaultAfterFirst, "Vault identical to the state after the first item");
     assert.equal(await digest(), digestAfterFirst, "IndexedDB (records, ledger, Outbox) identical to the state after the first item");
