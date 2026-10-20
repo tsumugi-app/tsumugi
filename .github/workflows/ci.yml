@@ -1,0 +1,32 @@
+# Runs every test suite of the branch and the production build. Read-only: no secrets, no deploy, no write access.
+name: ci
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Test suites
+        run: node scripts/ci/run-tests.mjs
+      - name: Production build (type check included)
+        run: npm run build
