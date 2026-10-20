@@ -1,0 +1,30 @@
+# Builds the real-browser smoke harness (scripts/browser-harness) and publishes the bundle to the branch `harness-dist` so it can be loaded
+# by hand into a browser tab. Only runs when the harness changes. Write access is limited to this job and only pushes that one branch.
+name: browser-harness
+on:
+  push:
+    paths: ["scripts/browser-harness/**", ".github/workflows/browser-harness.yml"]
+    branches: ["claude/**"]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx --yes esbuild@0.21.5 scripts/browser-harness/entry.ts --bundle --format=iife --platform=browser --target=es2022 --outfile=out/harness.js --tsconfig=tsconfig.json --log-level=warning
+      - name: Publish bundle to harness-dist
+        run: |
+          mkdir -p /tmp/dist && cp out/harness.js /tmp/dist/harness.js
+          git config user.name "harness-bot" && git config user.email "harness-bot@users.noreply.github.com"
+          git checkout --orphan harness-dist && git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/dist/harness.js ./harness.js && git add harness.js
+          git commit -m "harness bundle for ${GITHUB_SHA}" && git push --force origin harness-dist
