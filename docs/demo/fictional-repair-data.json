@@ -1,0 +1,571 @@
+{
+ "format": "tsumugi-memory-repair-data",
+ "schema": 1,
+ "repair": {
+  "items": [
+   {
+    "key": "R1",
+    "links": {
+     "lk-r1-a": "keep"
+    },
+    "memoryId": "mem-r1",
+    "originalConversationId": "conv-r1-orig",
+    "updatingConversationId": "conv-r1-upd",
+    "expectedBefore": {
+     "summary": "週末のボードゲーム会が楽しみ",
+     "content": "週末のボードゲーム会が楽しみで、駅前での開催を期待している。",
+     "updatedAt": "2026-08-22T21:17:00.000Z"
+    },
+    "restored": {
+     "summary": "駅前のパン屋の新作がまだ売っているか気になっている",
+     "content": "駅前のパン屋の新作がまだ売っているかどうかを知りたいと思っている。",
+     "keywords": [
+      "パン屋",
+      "新作"
+     ],
+     "types": [
+      "conversation"
+     ],
+     "evidence": [
+      "駅前のパン屋の新作はまだ売っている？"
+     ],
+     "topicId": "keep",
+     "dropEventTime": false
+    }
+   },
+   {
+    "key": "R2",
+    "links": {
+     "lk-r2-a": "keep",
+     "lk-r2r3": "keep"
+    },
+    "memoryId": "mem-r2",
+    "originalConversationId": "conv-r2-orig",
+    "updatingConversationId": "conv-r2-upd",
+    "expectedBefore": {
+     "summary": "自転車のサドルの交換を検討中",
+     "content": "自転車のサドルが硬く、交換を検討している。庭の野菜についても触れた。",
+     "updatedAt": "2026-08-25T08:49:18.000Z"
+    },
+    "restored": {
+     "summary": "庭のミニトマトが赤くなり、毎朝の水やりが日課になっている",
+     "content": "庭のミニトマトが赤くなってきた。毎朝の水やりが日課になっていると述べた。",
+     "keywords": [
+      "ミニトマト",
+      "水やり"
+     ],
+     "types": [
+      "conversation",
+      "idea"
+     ],
+     "evidence": [
+      "庭のミニトマトが赤くなってきた。",
+      "毎朝の水やりが日課になっている。"
+     ],
+     "topicId": "keep",
+     "dropEventTime": false
+    }
+   },
+   {
+    "key": "R3",
+    "links": {
+     "lk-r2r3": "keep",
+     "lk-r3r4": "keep",
+     "lk-r3-a": "keep",
+     "lk-r3-b": "keep"
+    },
+    "memoryId": "mem-r3",
+    "originalConversationId": "conv-r3-orig",
+    "updatingConversationId": "conv-r34-upd",
+    "expectedBefore": {
+     "summary": "来月のキャンプ場探しと山の靴の話",
+     "content": "来月のキャンプ場を探している。山登りの靴の話もした。",
+     "updatedAt": "2026-08-26T11:03:32.000Z"
+    },
+    "restored": {
+     "summary": "山登りの靴を新調したく、軽さを重視したい",
+     "content": "山登りの靴を新調したいと述べ、軽さを重視したいと述べた。",
+     "keywords": [
+      "山登り",
+      "靴",
+      "軽さ"
+     ],
+     "types": [
+      "conversation",
+      "idea"
+     ],
+     "evidence": [
+      "山登りの靴を新調したい",
+      "軽さを重視したい"
+     ],
+     "topicId": "keep",
+     "dropEventTime": false
+    }
+   },
+   {
+    "key": "R4",
+    "links": {
+     "lk-r3r4": "keep",
+     "lk-r4-a": "keep"
+    },
+    "memoryId": "mem-r4",
+    "originalConversationId": "conv-r4-orig",
+    "updatingConversationId": "conv-r34-upd",
+    "expectedBefore": {
+     "summary": "キャンプ場の希望条件を整理している",
+     "content": "来月のキャンプ場に焚き火と犬連れ可を求めている。",
+     "updatedAt": "2026-08-26T11:03:32.000Z"
+    },
+    "restored": {
+     "summary": "手作りの石けんに興味があり、香りはラベンダーがいい",
+     "content": "手作りの石けんに興味があり、香りはラベンダーがいいと述べた。",
+     "keywords": [
+      "石けん",
+      "ラベンダー"
+     ],
+     "types": [
+      "conversation",
+      "idea"
+     ],
+     "evidence": [
+      "手作りの石けんに興味がある",
+      "香りはラベンダーがいい"
+     ],
+     "topicId": "keep",
+     "dropEventTime": false
+    }
+   },
+   {
+    "key": "R5",
+    "links": {
+     "lk-r5-a": "keep"
+    },
+    "memoryId": "mem-r5",
+    "originalConversationId": "conv-r5-orig",
+    "updatingConversationId": "conv-r5-upd",
+    "expectedBefore": {
+     "summary": "図書館で絵本を借りた",
+     "content": "近所の図書館で絵本を借りた。挿絵が綺麗だった。",
+     "updatedAt": "2026-08-29T19:51:33.000Z"
+    },
+    "restored": {
+     "summary": "紅茶は濃いめが好きで、ミルクは入れない",
+     "content": "紅茶は濃いめが好き。ミルクは入れないと述べた。",
+     "keywords": [
+      "紅茶",
+      "ミルク"
+     ],
+     "types": [
+      "conversation"
+     ],
+     "evidence": [
+      "紅茶は濃いめが好き。",
+      "ミルクは入れない。"
+     ],
+     "topicId": "keep",
+     "dropEventTime": false
+    }
+   },
+   {
+    "key": "R6",
+    "links": {
+     "lk-r6-a": "keep",
+     "lk-r6-b": "keep"
+    },
+    "memoryId": "mem-r6",
+    "originalConversationId": "conv-r6-orig",
+    "updatingConversationId": "conv-r6-upd",
+    "expectedBefore": {
+     "summary": "引っ越し先を決める期限を考えている",
+     "content": "引っ越し先の契約を3月までにしたい。",
+     "updatedAt": "2026-09-20T03:22:36.000Z"
+    },
+    "restored": {
+     "summary": "最近よく眠れない",
+     "content": "最近よく眠れないと述べた。",
+     "keywords": [
+      "眠れない"
+     ],
+     "types": [
+      "emotion"
+     ],
+     "evidence": [
+      "最近よく眠れない。"
+     ],
+     "topicId": "move-to-updating",
+     "dropEventTime": true
+    }
+   },
+   {
+    "key": "R7",
+    "links": {
+     "lk-r7-a": "keep",
+     "lk-r7-b": "keep",
+     "lk-r7-c": "keep"
+    },
+    "memoryId": "mem-r7",
+    "originalConversationId": "conv-r7-orig",
+    "updatingConversationId": "conv-r7-upd",
+    "expectedBefore": {
+     "summary": "ヤマダさんと電話で話した",
+     "content": "ヤマダさんと久しぶりに電話で話した。",
+     "updatedAt": "2026-09-23T16:51:51.000Z"
+    },
+    "restored": {
+     "summary": "ヤマダさんに借りた本を返しそびれており、早めに返したい",
+     "content": "ヤマダさんに借りた本を返しそびれていて、早めに返したいと述べた。",
+     "keywords": [
+      "ヤマダさん",
+      "本",
+      "返し"
+     ],
+     "types": [
+      "conversation",
+      "emotion"
+     ],
+     "evidence": [
+      "ヤマダさんに借りた本を返しそびれている。",
+      "早めに返したい。"
+     ],
+     "topicId": "move-to-updating",
+     "dropEventTime": false
+    }
+   },
+   {
+    "key": "R8",
+    "links": {
+     "lk-r8-a": "remove"
+    },
+    "memoryId": "mem-r8",
+    "originalConversationId": "conv-r8-orig",
+    "updatingConversationId": "conv-r8-upd",
+    "expectedBefore": {
+     "summary": "タナカさんは釣りが好き",
+     "content": "タナカさんが意外と釣り好きだと述べた。",
+     "updatedAt": "2026-09-25T08:23:52.000Z"
+    },
+    "restored": {
+     "summary": "同じ部署のタナカさんと最近一緒に作業する機会が多い",
+     "content": "最近、タナカさんと一緒に作業する機会が多い。タナカさんは同じ部署だと述べた。",
+     "keywords": [
+      "タナカさん",
+      "作業",
+      "部署"
+     ],
+     "types": [
+      "person",
+      "conversation"
+     ],
+     "evidence": [
+      "最近タナカさんと一緒に作業する機会が多い。",
+      "タナカさんは同じ部署です。"
+     ],
+     "topicId": "keep",
+     "dropEventTime": true
+    }
+   }
+  ],
+  "updating": {
+   "conv-r1-upd": {
+    "summary": "週末のボードゲーム会が楽しみだと述べた",
+    "content": "週末にボードゲーム会があり、楽しみだと述べた。",
+    "keywords": [
+     "ボードゲーム会",
+     "週末"
+    ],
+    "types": [
+     "conversation"
+    ],
+    "evidence": [
+     "週末のボードゲーム会が楽しみ"
+    ]
+   },
+   "conv-r2-upd": {
+    "summary": "新しい自転車のサドルが硬く、交換したいと考えている",
+    "content": "新しい自転車のサドルが硬いと述べ、サドルを交換したいと考えている。",
+    "keywords": [
+     "自転車",
+     "サドル"
+    ],
+    "types": [
+     "conversation",
+     "idea"
+    ],
+    "evidence": [
+     "新しい自転車のサドルが硬い",
+     "サドルを交換したい"
+    ]
+   },
+   "conv-r34-upd": {
+    "summary": "来月のキャンプ場を探しており、焚き火ができて犬連れ可の場所がいい",
+    "content": "来月のキャンプ場を探している。焚き火ができる場所がいいと述べ、犬連れ可だと助かると述べた。",
+    "keywords": [
+     "キャンプ場",
+     "焚き火",
+     "犬連れ"
+    ],
+    "types": [
+     "conversation",
+     "goal"
+    ],
+    "evidence": [
+     "来月のキャンプ場を探している。",
+     "焚き火ができる場所がいい。",
+     "犬連れ可だと助かる。"
+    ]
+   },
+   "conv-r5-upd": {
+    "summary": "近所の図書館で絵本を借り、挿絵が綺麗だった",
+    "content": "近所の図書館で絵本を借りた。絵本の挿絵が綺麗だった。",
+    "keywords": [
+     "図書館",
+     "絵本",
+     "挿絵"
+    ],
+    "types": [
+     "diary",
+     "event"
+    ],
+    "evidence": [
+     "近所の図書館で絵本を借りた。",
+     "絵本の挿絵が綺麗だった。"
+    ]
+   },
+   "conv-r6-upd": {
+    "summary": "来月までに引っ越し先を決めたく、3月までには契約したい",
+    "content": "来月までに引っ越し先を決めたいと述べ、3月までには契約したいと述べた。",
+    "keywords": [
+     "引っ越し先",
+     "契約"
+    ],
+    "types": [
+     "goal"
+    ],
+    "evidence": [
+     "来月までに引っ越し先を決めたい。",
+     "3月までには契約したい。"
+    ],
+    "eventTime": {
+     "value": "2027-03",
+     "precision": "month"
+    }
+   },
+   "conv-r7-upd": {
+    "summary": "ヤマダさんと久しぶりに電話で話し、元気そうだった",
+    "content": "ヤマダさんと久しぶりに電話で話した。元気そうだったと述べた。",
+    "keywords": [
+     "ヤマダさん",
+     "電話"
+    ],
+    "types": [
+     "conversation",
+     "event"
+    ],
+    "evidence": [
+     "ヤマダさんと久しぶりに電話で話した。",
+     "元気そうだった。"
+    ]
+   },
+   "conv-r8-upd": {
+    "summary": "タナカさんは意外と釣りが好きだと述べた",
+    "content": "タナカさんは意外と釣りが好きだと述べた。",
+    "keywords": [
+     "タナカさん",
+     "釣り"
+    ],
+    "types": [
+     "person",
+     "conversation"
+    ],
+    "evidence": [
+     "タナカさん、意外と釣りが好きなんだよね。"
+    ]
+   }
+  }
+ },
+ "backfill": [
+  {
+   "key": "B1",
+   "conversationId": "conv-b1",
+   "expectedFirstUserTurn": "来週の健康診断が楽しみだ。",
+   "memory": {
+    "summary": "来週の健康診断を楽しみにしている",
+    "content": "来週の健康診断が楽しみだと述べた。",
+    "keywords": [
+     "健康診断"
+    ],
+    "types": [
+     "conversation"
+    ],
+    "evidence": [
+     "来週の健康診断が楽しみだ。"
+    ]
+   }
+  },
+  {
+   "key": "B2",
+   "conversationId": "conv-b2",
+   "expectedFirstUserTurn": "最近タナカさんと一緒に作業する機会が多い。",
+   "memory": {
+    "summary": "同じ部署のタナカさんと最近一緒に作業する機会が多い",
+    "content": "最近、タナカさんと一緒に作業する機会が多い。タナカさんは同じ部署だと述べた。",
+    "keywords": [
+     "タナカさん",
+     "作業",
+     "部署"
+    ],
+    "types": [
+     "person",
+     "conversation"
+    ],
+    "evidence": [
+     "最近タナカさんと一緒に作業する機会が多い。",
+     "タナカさんは同じ部署です。"
+    ]
+   }
+  },
+  {
+   "key": "B3",
+   "conversationId": "conv-b3",
+   "expectedFirstUserTurn": "今日は町内会の掃除に参加した。",
+   "memory": {
+    "summary": "町内会の掃除に参加した",
+    "content": "今日は町内会の掃除に参加したと述べた。",
+    "keywords": [
+     "町内会",
+     "掃除"
+    ],
+    "types": [
+     "conversation",
+     "event"
+    ],
+    "evidence": [
+     "今日は町内会の掃除に参加した。"
+    ],
+    "eventTime": {
+     "value": "2026-09-05",
+     "precision": "day"
+    }
+   }
+  },
+  {
+   "key": "B4",
+   "conversationId": "conv-b4",
+   "expectedFirstUserTurn": "新しいノートパソコンのキーボードが打ちやすい。",
+   "memory": {
+    "summary": "新しいノートパソコンのキーボードが打ちやすい",
+    "content": "新しいノートパソコンのキーボードが打ちやすいと述べた。",
+    "keywords": [
+     "ノートパソコン",
+     "キーボード"
+    ],
+    "types": [
+     "conversation"
+    ],
+    "evidence": [
+     "新しいノートパソコンのキーボードが打ちやすい。"
+    ]
+   }
+  },
+  {
+   "key": "B5",
+   "conversationId": "conv-b5",
+   "expectedFirstUserTurn": "朝のランニングを再開した。",
+   "memory": {
+    "summary": "朝のランニングを再開した",
+    "content": "朝のランニングを再開したと述べた。",
+    "keywords": [
+     "ランニング",
+     "再開"
+    ],
+    "types": [
+     "conversation",
+     "event"
+    ],
+    "evidence": [
+     "朝のランニングを再開した。"
+    ]
+   }
+  },
+  {
+   "key": "B6",
+   "conversationId": "conv-b6",
+   "expectedFirstUserTurn": "祖母の誕生日プレゼントを選んでいる。",
+   "memory": {
+    "summary": "祖母の誕生日プレゼントを選んでいる",
+    "content": "祖母の誕生日プレゼントを選んでいると述べた。",
+    "keywords": [
+     "祖母",
+     "誕生日"
+    ],
+    "types": [
+     "conversation"
+    ],
+    "evidence": [
+     "祖母の誕生日プレゼントを選んでいる。"
+    ]
+   }
+  },
+  {
+   "key": "B7",
+   "conversationId": "conv-b7",
+   "expectedFirstUserTurn": "週末に映画を観に行く予定がある。",
+   "memory": {
+    "summary": "週末に映画を観に行く予定がある",
+    "content": "週末に映画を観に行く予定があると述べた。",
+    "keywords": [
+     "映画",
+     "週末"
+    ],
+    "types": [
+     "conversation",
+     "event"
+    ],
+    "evidence": [
+     "週末に映画を観に行く予定がある。"
+    ]
+   }
+  },
+  {
+   "key": "B8",
+   "conversationId": "conv-b8",
+   "expectedFirstUserTurn": "水族館のペンギンが可愛かった。",
+   "memory": {
+    "summary": "水族館のペンギンが可愛く、また見に行きたい",
+    "content": "水族館のペンギンが可愛かったと述べ、また見に行きたいと述べた。",
+    "keywords": [
+     "水族館",
+     "ペンギン"
+    ],
+    "types": [
+     "diary",
+     "event"
+    ],
+    "evidence": [
+     "水族館のペンギンが可愛かった。",
+     "また見に行きたい。"
+    ]
+   }
+  },
+  {
+   "key": "B9",
+   "conversationId": "conv-b9",
+   "expectedFirstUserTurn": "来月の資格試験の勉強を始めた。",
+   "memory": {
+    "summary": "来月の資格試験の勉強を始めた",
+    "content": "来月の資格試験の勉強を始めたと述べた。",
+    "keywords": [
+     "資格試験",
+     "勉強"
+    ],
+    "types": [
+     "conversation",
+     "goal"
+    ],
+    "evidence": [
+     "来月の資格試験の勉強を始めた。"
+    ]
+   }
+  }
+ ]
+}
