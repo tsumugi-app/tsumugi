@@ -18,7 +18,7 @@ import type { Conversation, MemoryObject } from "../types";
 import {
   getAllConversations, getAllMemoryObjects, getDoneVaultOutboxEntries, getHeldVaultOutboxEntries, getPendingVaultOutboxEntries, readMemoryRepairSettings,
 } from "../db";
-import { planRepairItem, repairLedgerKey, repairRollbackLedgerKey } from "../memoryContaminationRepair";
+import { isReflection, planRepairItem, repairLedgerKey, repairRollbackLedgerKey } from "../memoryContaminationRepair";
 import { createDbRepairEnv } from "../memoryRepairDbEnv";
 import { runContaminationRepair, verifyContaminationRepair } from "../memoryRepairRunner";
 import type { PrivateRepairData } from "../privateRepairData";
@@ -160,6 +160,10 @@ async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repa
   if (plan.status !== "READY") return fail("refused", `plan:${plan.status}`);
   const before: MemoryObject | undefined = snapshot.memories.find((m) => m.id === spec.memoryId);
   if (!before) return fail("refused", "memory-missing");
+  // A removed link also changes its counterpart. A system-generated counterpart (Reflection) is projected through a `reflection:` Outbox entry that
+  // the scoped sync deliberately does not cover (out of scope), so such an item would commit and then always roll back: refuse BEFORE any write.
+  const reflectionCounterparts = plan.counterparts.filter((c) => isReflection(c.before));
+  if (reflectionCounterparts.length > 0) return fail("refused", `reflection-counterpart-unsupported:${reflectionCounterparts.map((c) => tail(c.before.id)).join(",")}`);
 
   // ---- restore point: captured, SAVED by the caller, READ BACK, round trip no-op. No repair write is possible before this succeeds.
   const memories = [before, plan.restoredAfter, ...(plan.newMemory ? [plan.newMemory] : []), ...plan.counterparts.map((c) => c.before)];

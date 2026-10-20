@@ -314,6 +314,22 @@ test("the SECOND item of a shared pair fails after the real sync: it is restored
   } finally { await cleanup(); }
 });
 
+test("an item whose removed link has a system-generated (Reflection) counterpart is refused BEFORE any write: the scoped sync does not cover reflection records", async () => {
+  const w = await world();
+  try {
+    const data = DATA();
+    const item = data.repair.items.find((i) => i.key === R1.key)!;
+    const reflectionLinkId = Object.keys(item.links)[0];       // the fixture's first link goes to a system-generated Memory
+    item.links[reflectionLinkId] = "remove";
+    const report = await run(w, { data });
+    assert.equal(report.status, "refused", JSON.stringify(report));
+    assert.match(report.reason, /^reflection-counterpart-unsupported:/);
+    assert.deepEqual(report.stages, ["window-open", "prechecked"], "refused before the restore point and before any write");
+    assert.equal(report.windowOpen, false); assert.equal(report.gateClosed, true);
+    await unchanged(w);
+  } finally { await cleanup(); }
+});
+
 test("the session module is the only new importer of the restore / runner modules; it logs and sends nothing", () => {
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   const code = strip(fs.readFileSync(path.join(SRC, "lib/maintenance/repairSession.ts"), "utf8"));
