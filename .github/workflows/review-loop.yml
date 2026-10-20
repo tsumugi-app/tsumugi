@@ -70,3 +70,20 @@ jobs:
             }
             core.notice(`Codex reviewed ${sha}: state=${found.state}`);
             core.summary.addRaw(`Codex re-review received for \`${sha.slice(0, 7)}\` (${found.state}).`).write();
+      - name: Diagnose token (runs only when the step above failed; prints identity and permission flags, never the token)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CODEX_TRIGGER_TOKEN || github.token }}
+          script: |
+            const out = {};
+            out.secretPresent = Boolean(process.env.CODEX_TRIGGER_TOKEN);
+            const u = await github.request("GET /user").catch((e) => ({ status: e.status, data: {}, headers: e.response?.headers ?? {} }));
+            out.user = { status: u.status, login: u.data.login, type: u.data.type };
+            out.tokenExpires = u.headers["github-authentication-token-expiration"] ?? "n/a";
+            out.classicScopes = u.headers["x-oauth-scopes"] ?? "n/a";
+            const r = await github.request("GET /repos/{owner}/{repo}", context.repo).catch((e) => ({ status: e.status, data: {} }));
+            out.repo = { status: r.status, owner: r.data.owner?.login, ownerType: r.data.owner?.type, permissions: r.data.permissions };
+            const c = await github.request("POST /repos/{owner}/{repo}/issues/{n}/comments", { ...context.repo, n: 0, body: "x" }).catch((e) => ({ status: e.status, msg: e.message, accepted: e.response?.headers?.["x-accepted-github-permissions"] }));
+            out.probePostToInvalidIssue = { status: c.status, msg: c.msg, accepted: c.accepted };
+            core.error(JSON.stringify(out));
