@@ -1,0 +1,98 @@
+# Review loop guard. On every push to a PR (after the first review round) it asks Codex for a re-review, then waits for the review of that
+# exact commit with a timeout and reports the outcome. Bounded: the initial review + at most MAX_FIXES re-reviews per PR. Never merges, never deploys.
+name: review-loop
+on:
+  pull_request:
+    types: [synchronize]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+concurrency:
+  group: review-loop-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  re-review:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'chatgpt-codex-connector[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CODEX_TRIGGER_TOKEN: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+      MAX_FIXES: "2"
+      WAIT_MINUTES: "25"
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          # The whole script runs as the user-owned token (needs issues/PR write only): Codex ignores bot-authored comments.
+          github-token: ${{ secrets.CODEX_TRIGGER_TOKEN || github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            // Make API permission failures diagnosable (endpoint + permissions GitHub says it accepts). Never prints the token.
+            github.hook.error("request", (e) => {
+              const h = e.response?.headers ?? {};
+              core.error(`API ${e.request?.method} ${e.request?.url} -> ${e.status}; accepted permissions: ${h["x-accepted-github-permissions"] ?? "n/a"}`);
+              throw e;
+            });
+            const pr = context.payload.pull_request;
+            const sha = pr.head.sha;
+            const max = Number(process.env.MAX_FIXES);
+            const marker = (n) => `<!-- review-loop:v2:round=${n} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+            // addLabels creates the label if it is missing; a failure must fail the job so the escalation is never silent.
+            const escalate = () => github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ["needs-human"] });
+            const rounds = comments.filter((c) => c.body.includes("<!-- review-loop:v2:round=")).length;
+            // A timed-out or exhausted round labels the PR needs-human: no further reviews are requested while the label is currently set.
+            // A human removes the label to resume; a received Codex review removes it automatically.
+            const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, { owner, repo, issue_number: pr.number, per_page: 100 });
+            if (labels.some((l) => l.name === "needs-human")) {
+              core.warning("PR currently has the needs-human label; not requesting another review.");
+              core.summary.addRaw("Stopped: needs-human is set.").write();
+              return;
+            }
+            if (rounds >= max) {
+              core.warning(`Auto-fix limit reached (${rounds}/${max}). No further re-review requested; a human must take over.`);
+              await escalate();
+              core.summary.addRaw(`Auto-fix limit reached (${rounds}/${max}); stopped.`).write();
+              return;
+            }
+            // Codex ignores comments authored by the Actions bot, so the trigger comment is posted with a user-owned token (repo secret).
+            const trigger = process.env.CODEX_TRIGGER_TOKEN;
+            if (!trigger) {
+              core.setFailed("Secret CODEX_TRIGGER_TOKEN is not set: cannot request a re-review as a human identity. See docs/auto-review-flow.md.");
+              return;
+            }
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr.number,
+              body: `${marker(rounds + 1)}\n@codex review\n\nRe-review requested for \`${sha.slice(0, 7)}\` (auto-fix round ${rounds + 1}/${max}).` });
+            const deadline = Date.now() + Number(process.env.WAIT_MINUTES) * 60000;
+            let found = null;
+            while (Date.now() < deadline && !found) {
+              await new Promise((r) => setTimeout(r, 60000));
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
+              found = reviews.find((r) => r.commit_id === sha && r.user.login === "chatgpt-codex-connector[bot]") ?? null;
+            }
+            if (!found) {
+              core.warning(`No Codex review for ${sha} within ${process.env.WAIT_MINUTES} min (timeout). Codex ignores comments authored by the Actions bot (verified); a human must comment "@codex review" manually.`);
+              await escalate();
+              core.summary.addRaw("Timed out waiting for Codex re-review.").write();
+              return;
+            }
+            await github.rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name: "needs-human" }).catch((e) => { if (e.status !== 404) throw e; });
+            core.notice(`Codex reviewed ${sha}: state=${found.state}`);
+            core.summary.addRaw(`Codex re-review received for \`${sha.slice(0, 7)}\` (${found.state}).`).write();
+      - name: Diagnose token (runs only when the step above failed; prints identity and permission flags, never the token)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CODEX_TRIGGER_TOKEN || github.token }}
+          script: |
+            const out = {};
+            out.secretPresent = Boolean(process.env.CODEX_TRIGGER_TOKEN);
+            const u = await github.request("GET /user").catch((e) => ({ status: e.status, data: {}, headers: e.response?.headers ?? {} }));
+            out.user = { status: u.status, login: u.data.login, type: u.data.type };
+            out.tokenExpires = u.headers["github-authentication-token-expiration"] ?? "n/a";
+            out.classicScopes = u.headers["x-oauth-scopes"] ?? "n/a";
+            const r = await github.request("GET /repos/{owner}/{repo}", context.repo).catch((e) => ({ status: e.status, data: {} }));
+            out.repo = { status: r.status, owner: r.data.owner?.login, ownerType: r.data.owner?.type, permissions: r.data.permissions };
+            const c = await github.request("POST /repos/{owner}/{repo}/issues/{n}/comments", { ...context.repo, n: 0, body: "x" }).catch((e) => ({ status: e.status, msg: e.message, accepted: e.response?.headers?.["x-accepted-github-permissions"] }));
+            out.probePostToInvalidIssue = { status: c.status, msg: c.msg, accepted: c.accepted };
+            core.error(JSON.stringify(out));
