@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maintenance-panel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: the Playwright version used here supports Ubuntu 24.04
     timeout-minutes: 25
     env:
       NEXT_TELEMETRY_DISABLED: "1"
@@ -29,10 +29,10 @@ jobs:
       - name: Compile the fictional test world (reused by the E2E seed)
         run: npx tsc -p tsconfig.maintenance.json
       - run: npm run build
-      - name: Install Playwright (not an app dependency)
-        run: |
-          npm install --no-save @playwright/test@1.49.1
-          npx playwright install --with-deps chromium
+      - name: Install @playwright/test (not an app dependency)
+        run: npm install --no-save @playwright/test@1.49.1
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
       - name: Job-local dummy password
         run: |
           PW=$(openssl rand -hex 16)
