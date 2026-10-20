@@ -69,6 +69,12 @@ jobs:
               await new Promise((r) => setTimeout(r, 60000));
               const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
               found = reviews.find((r) => r.commit_id === sha && r.user.login === "chatgpt-codex-connector[bot]") ?? null;
+              if (!found) {
+                // A clean result ("Didn't find any major issues") is posted as an issue comment, not as a PR review object.
+                const cs = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+                const clean = cs.find((c) => c.user.login === "chatgpt-codex-connector[bot]" && c.body.includes(sha.slice(0, 10)));
+                if (clean) found = { state: "CLEAN_COMMENT" };
+              }
             }
             if (!found) {
               core.warning(`No Codex review for ${sha} within ${process.env.WAIT_MINUTES} min (timeout). Codex ignores comments authored by the Actions bot (verified); a human must comment "@codex review" manually.`);
