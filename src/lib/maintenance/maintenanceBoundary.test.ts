@@ -87,7 +87,9 @@ test("nothing runs on load: the panel has no effect hook and every action sits b
 /** This one test compares the working tree with HEAD through git. A Vercel build has no usable git history, so it is skipped THERE only
  *  (`VERCEL` is set by Vercel); the same comparison is done by hand before a deploy (see the pre-deploy diff check). */
 const ON_VERCEL = !!process.env.VERCEL;
-test("normal operation is untouched: ChatScreen, startup, layout, API routes, PWA manifest and next.config are not modified; vault.ts only gained the opt-in skipLedger option", { skip: ON_VERCEL ? "no git history in a Vercel build" : false }, () => {
+/** CI checks out a clean commit: there is no uncommitted working-tree diff to compare, so this local pre-deploy check is skipped there too. */
+const NO_WORKTREE_DIFF = ON_VERCEL || !!process.env.CI;
+test("normal operation is untouched: ChatScreen, startup, layout, API routes, PWA manifest and next.config are not modified; vault.ts only gained the opt-in skipLedger option", { skip: NO_WORKTREE_DIFF ? "no git history (Vercel) or clean CI checkout: local pre-deploy check only" : false }, () => {
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
   const changed = git("diff", "--name-only", "HEAD").split("\n").filter(Boolean);
   const untouchable = ["src/components/ChatScreen.tsx", "src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/capture.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts"];
