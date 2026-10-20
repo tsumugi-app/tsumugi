@@ -84,18 +84,22 @@ test("nothing runs on load: the panel has no effect hook and every action sits b
   assert.ok(page.indexOf("decideMaintenanceAccess") < page.indexOf("<MaintenancePanel"));
 });
 
-/** This one test compares the working tree with HEAD through git. A Vercel build has no usable git history, so it is skipped THERE only
- *  (`VERCEL` is set by Vercel); the same comparison is done by hand before a deploy (see the pre-deploy diff check). */
-const ON_VERCEL = !!process.env.VERCEL;
-/** CI checks out a clean commit: there is no uncommitted working-tree diff to compare, so this local pre-deploy check is skipped there too. */
-const NO_WORKTREE_DIFF = ON_VERCEL || !!process.env.CI;
-test("normal operation is untouched: ChatScreen, startup, layout, API routes, PWA manifest and next.config are not modified; vault.ts only gained the opt-in skipLedger option", { skip: NO_WORKTREE_DIFF ? "no git history (Vercel) or clean CI checkout: local pre-deploy check only" : false }, () => {
+/** This test compares the code with git. Locally (before a deploy) it compares the working tree with HEAD. In CI the workflow sets BOUNDARY_BASE
+ *  (the PR base, e.g. origin/main) and the PR's own commits are compared with it, so a committed boundary violation fails the PR. A Vercel build
+ *  has no usable git history, and a CI run without a base (a plain branch push) has nothing to compare: skipped THERE only. */
+const BASE = process.env.BOUNDARY_BASE || "";
+const SKIP_REASON = process.env.VERCEL ? "no git history in a Vercel build" : process.env.CI && !BASE ? "CI run without a PR base to compare with" : false;
+test("normal operation is untouched: ChatScreen, startup, layout, API routes, PWA manifest and next.config are not modified; Capture only gained the own-conversation filter; vault.ts only gained the opt-in skipLedger option", { skip: SKIP_REASON }, () => {
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
-  const changed = git("diff", "--name-only", "HEAD").split("\n").filter(Boolean);
-  const untouchable = ["src/components/ChatScreen.tsx", "src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/capture.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts"];
+  const range = BASE ? [`${BASE}...HEAD`] : ["HEAD"];
+  const changed = git("diff", "--name-only", ...range).split("\n").filter(Boolean);
+  const untouchable = ["src/components/ChatScreen.tsx", "src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts"];
   for (const f of untouchable) assert.ok(!changed.includes(f), `${f} must not be modified`);
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/")), "API routes must not be modified");
-  const vaultDiff = git("diff", "-U0", "HEAD", "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  assert.ok(vaultDiff.length > 0);
+  // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
+  const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
+  for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
+  if (!BASE) assert.ok(vaultDiff.length > 0);
   for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
 });

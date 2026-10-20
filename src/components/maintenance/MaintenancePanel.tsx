@@ -314,6 +314,7 @@ export default function MaintenancePanel() {
           {repairReport.restore && <p>restore: {repairReport.restore.status}{repairReport.restore.failure ? ` (${repairReport.restore.failure})` : ""} {repairReport.restore.stopReasons.join("; ")}</p>}
           {repairReport.problems.length > 0 && <ul>{repairReport.problems.map((p, i) => <li key={i} className="text-red-700">{p}</li>)}</ul>}
           {repairReport.windowOpen && <p className="text-red-700">The maintenance window is STILL OPEN (lock and gate kept). Do not open Tsumugi. Keep this tab open and report the lines above.</p>}
+          {repairReport.gateStuck && <p className="text-red-700">The durable maintenance gate is STILL IN PLACE: the normal app stays blocked from writing. Check the state (step 5), then release it with "release a stale maintenance gate" below.</p>}
           {repairReport.status === "completed" && <p className="text-emerald-700">Done and verified: IndexedDB and the Vault are consistent; the gate is closed.</p>}
         </div>)}
         <details><summary>after a crash: release a stale maintenance gate</summary>

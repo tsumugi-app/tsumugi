@@ -59,6 +59,8 @@ export interface RepairSessionReport {
   /** true when the window (lock + gate) is still open and must be resolved by the operator */
   windowOpen: boolean;
   gateClosed: boolean;
+  /** true when closing the window was attempted but the durable gate is still in place (normal Vault / Outbox writes stay blocked) */
+  gateStuck?: boolean;
   sync?: { ok: boolean; refused?: string; stoppedAt?: string };
   restore?: Pick<RestoreReport, "status" | "failure"> & { stopReasons: string[] };
   problems: string[];
@@ -121,7 +123,16 @@ export async function runRepairSession(input: RepairSessionInput): Promise<Repai
   catch (e) { report = { status: "needs-review", reason: `unexpected:${(e as Error)?.name ?? "error"}`, stages, windowOpen: true, gateClosed: false, problems: [] }; }
   // finished cleanly (nothing written, fully restored, or completed and verified): close the gate and release the lock. Otherwise KEEP both.
   if (report.status === "completed" || report.status === "refused" || report.status === "rolled-back") {
-    if (isMaintenanceWindowOpen()) { const end = await endMaintenanceWindow(); report.gateClosed = end.ok && end.gateClosed; report.windowOpen = !end.ok; }
+    if (isMaintenanceWindowOpen()) {
+      const end = await endMaintenanceWindow();
+      report.gateClosed = end.ok && end.gateClosed; report.windowOpen = !end.ok;
+      if (!report.gateClosed) {
+        // the lock may be gone but the durable journal still blocks the normal app: never report a clean "completed" in that state
+        report.gateStuck = true;
+        if (report.status === "completed") { report.status = "needs-review"; report.reason = `gate-not-closed:${"reason" in end ? end.reason : "unknown"}`; }
+        else report.problems = [...report.problems, "gate-not-closed"];
+      }
+    }
   } else report.windowOpen = isMaintenanceWindowOpen();
   return report;
 }
