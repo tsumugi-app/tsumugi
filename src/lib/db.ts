@@ -229,9 +229,74 @@ export async function getAllConversations() {
   return db.getAll("conversations");
 }
 
+/**
+ * STORAGE-LAYER INVARIANT (root cause of the 2026 Memory contamination): a Memory's lineage (the conversation it came from) never changes. Any write
+ * that would replace a STORED Memory with one from ANOTHER conversation is refused here, whoever the caller is (Capture, restore, apply, repair). The
+ * original bug let an AI-chosen id overwrite another conversation's Memory; with this check the same mistake in any future writer fails loudly and
+ * writes nothing, instead of destroying data. Pure; the caller passes the stored record it read INSIDE its transaction.
+ */
+export class MemoryLineageViolationError extends Error {
+  constructor(public readonly memoryId: string) { super("memory-lineage-violation"); this.name = "MemoryLineageViolationError"; }
+}
+export function assertMemoryLineage(stored: { id: string; conversationId?: string | null } | undefined, incoming: { id: string; conversationId?: string | null }): void {
+  if (stored?.conversationId && incoming.conversationId !== stored.conversationId) throw new MemoryLineageViolationError(incoming.id);
+}
+/** Thrown when a write that was computed from an earlier read finds the stored record changed in the meantime (lost-update protection). */
+export class ConcurrentModificationError extends Error {
+  constructor(public readonly recordId: string) { super("concurrent-modification"); this.name = "ConcurrentModificationError"; }
+}
+
 export async function putMemoryObject(memoryObject: MemoryObject) {
   const db = await getDB();
-  await db.put("memoryObjects", memoryObject);
+  const tx = db.transaction(["memoryObjects"], "readwrite");
+  try {
+    assertMemoryLineage(await tx.objectStore("memoryObjects").get(memoryObject.id), memoryObject);
+    await tx.objectStore("memoryObjects").put(memoryObject);
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+}
+
+/**
+ * Restore-from-Vault writers (the user pressed "restore"): they never replace a stored record with an OLDER version ("kept-newer"), so a stale Vault copy can
+ * not silently discard newer local data. Equal or newer versions are written. A Memory also passes the lineage invariant.
+ */
+export type RestoreWriteResult = "written" | "kept-newer";
+export async function restoreConversationIfNotNewer(conversation: Conversation): Promise<RestoreWriteResult> {
+  const db = await getDB();
+  const tx = db.transaction(["conversations"], "readwrite");
+  let result: RestoreWriteResult = "written";
+  try {
+    const stored = await tx.objectStore("conversations").get(conversation.id);
+    if (stored && stored.updatedAt > conversation.updatedAt) result = "kept-newer";
+    else await tx.objectStore("conversations").put(conversation);
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return result;
+}
+export async function restoreMemoryObjectIfNotNewer(memoryObject: MemoryObject): Promise<RestoreWriteResult> {
+  const db = await getDB();
+  const tx = db.transaction(["memoryObjects"], "readwrite");
+  let result: RestoreWriteResult = "written";
+  try {
+    const stored = await tx.objectStore("memoryObjects").get(memoryObject.id);
+    assertMemoryLineage(stored, memoryObject);
+    if (stored && stored.updatedAt > memoryObject.updatedAt) result = "kept-newer";
+    else await tx.objectStore("memoryObjects").put(memoryObject);
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return result;
+}
+export async function restoreSourceIfNotNewer(source: Source): Promise<RestoreWriteResult> {
+  const db = await getDB();
+  const tx = db.transaction(["sources"], "readwrite");
+  let result: RestoreWriteResult = "written";
+  try {
+    const stored = await tx.objectStore("sources").get(source.id);
+    if (stored && stored.updatedAt > source.updatedAt) result = "kept-newer";
+    else await tx.objectStore("sources").put(source);
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return result;
 }
 
 export async function getAllMemoryObjects() {
@@ -460,10 +525,12 @@ export async function setVaultSyncState(key: string, updatedAt: string): Promise
  * `setVaultSyncState`（ledgerのみ）は無変更のまま維持し、通常の書込経路
  * （vault.tsのwrite関数群）には一切影響しない。
  */
-export async function putConversationAndMarkSynced(conversation: Conversation, syncKey: string): Promise<void> {
+export async function putConversationAndMarkSynced(conversation: Conversation, syncKey: string, expectedStoredUpdatedAt?: string): Promise<void> {
   const db = await getDB();
   const tx = db.transaction(["conversations", "vaultSyncState"], "readwrite");
   try {
+    // `expectedStoredUpdatedAt`: the version the caller's merge was computed from; a record changed in the meantime is never overwritten with a stale merge
+    if (expectedStoredUpdatedAt !== undefined && (await tx.objectStore("conversations").get(conversation.id))?.updatedAt !== expectedStoredUpdatedAt) throw new ConcurrentModificationError(conversation.id);
     await tx.objectStore("conversations").put(conversation);
     await tx.objectStore("vaultSyncState").put(conversation.updatedAt, syncKey);
   } catch (error) {
@@ -472,10 +539,13 @@ export async function putConversationAndMarkSynced(conversation: Conversation, s
   await tx.done;
 }
 
-export async function putMemoryObjectAndMarkSynced(memoryObject: MemoryObject, syncKey: string): Promise<void> {
+export async function putMemoryObjectAndMarkSynced(memoryObject: MemoryObject, syncKey: string, expectedStoredUpdatedAt?: string): Promise<void> {
   const db = await getDB();
   const tx = db.transaction(["memoryObjects", "vaultSyncState"], "readwrite");
   try {
+    const stored = await tx.objectStore("memoryObjects").get(memoryObject.id);
+    assertMemoryLineage(stored, memoryObject);
+    if (expectedStoredUpdatedAt !== undefined && stored?.updatedAt !== expectedStoredUpdatedAt) throw new ConcurrentModificationError(memoryObject.id);
     await tx.objectStore("memoryObjects").put(memoryObject);
     await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
   } catch (error) {
@@ -691,6 +761,7 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   try {
     const outboxStore = tx.objectStore("vaultOutbox");
     const existing = await outboxStore.get(outboxId);
+    if (storeName === "memoryObjects") assertMemoryLineage(await tx.objectStore(storeName).get(record.id) as MemoryObject | undefined, record as unknown as MemoryObject);
     entry = buildOutboxEntryForUpdate(existing, recordType, record.id, record.updatedAt, now);
     await Promise.all([tx.objectStore(storeName).put(record), outboxStore.put(entry)]);
   } catch (error) {
@@ -1513,6 +1584,7 @@ export async function commitMemoryRepairTransaction(t: MemoryRepairTransaction):
         const current = await memories.get(before.id);
         if (!equal(current, before)) throw new Error("repair-precondition-changed");
         if (after.id !== before.id) throw new Error("repair-id-changed");
+        assertMemoryLineage(before, after);
         backup.memories.push(before); backup.afterMemories.push(after);
       }
       for (const { before, after } of t.replaceConversations) {

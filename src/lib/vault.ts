@@ -6176,7 +6176,7 @@ async function applySingleRecordEdited(
       return { outcome: "conflict", anchorCommit };
     }
     const syncKey = vaultSyncKeyFor("conversation", record.registryKey);
-    await putConversationAndMarkSynced(merged, syncKey);
+    await putConversationAndMarkSynced(merged, syncKey, existing.updatedAt);
     await updateHistoryIndexForSingleRecord(root, kind, merged);
     await commitVaultRegistrySingleRecordOk(
       root,
@@ -6203,7 +6203,7 @@ async function applySingleRecordEdited(
     return { outcome: "conflict", anchorCommit };
   }
   const syncKey = vaultSyncKeyFor("memory", record.registryKey);
-  await putMemoryObjectAndMarkSynced(merged, syncKey);
+  await putMemoryObjectAndMarkSynced(merged, syncKey, existing.updatedAt);
   await updateHistoryIndexForSingleRecord(root, kind, merged);
   await commitVaultRegistrySingleRecordOk(
     root,
@@ -6327,7 +6327,7 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
           allSucceeded = false;
           continue;
         }
-        await putMemoryObjectAndMarkSynced(merged, syncKey);
+        await putMemoryObjectAndMarkSynced(merged, syncKey, existing.updatedAt);
       } else if (member.outcome === "ledger-repair") {
         // classifyResyncMembers側で既にnormalized semantic equalityを確認済み
         // （Vault側・IndexedDB側の内容が完全に一致している）。そのため"edited"とは

@@ -366,3 +366,66 @@ test("memoryRepairScopeOk: links/updatedAt, plus metadata.sourceType only when a
   assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, metadata: { ...legacy.metadata, sourceType: "chat", confidence: 0.1 } } as MemoryObject), false, "no other metadata");
   assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, summary: "x" }), false);
 });
+
+
+// ===========================================================================
+// Storage-layer invariants (root cause of the 2026 Memory contamination: an AI-chosen id overwrote another conversation's Memory).
+// ===========================================================================
+const fromConversation = (id: string, conversationId: string, updatedAt: string = T): MemoryObject => ({ ...memory(id, updatedAt), conversationId });
+
+test("lineage invariant: NO writer can replace a stored Memory with one from another conversation (the original corruption), and nothing at all is written", async () => {
+  await dbMod.putMemoryObject(fromConversation("lin-1", "conv-A"));
+  const stolen = { ...fromConversation("lin-1", "conv-B", "2026-02-01T00:00:00.000Z"), content: "another conversation's content", summary: "another summary" };
+  await assert.rejects(() => dbMod.putMemoryObject(stolen), (e: Error) => e.name === "MemoryLineageViolationError");
+  await assert.rejects(() => dbMod.putMemoryObjectWithOutbox(stolen), (e: Error) => e.name === "MemoryLineageViolationError");
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced(stolen, "memory:lin-1"), (e: Error) => e.name === "MemoryLineageViolationError");
+  await assert.rejects(() => dbMod.restoreMemoryObjectIfNotNewer(stolen), (e: Error) => e.name === "MemoryLineageViolationError");
+  const kept = await dbMod.getMemoryObject("lin-1");
+  assert.equal(kept?.conversationId, "conv-A"); assert.equal(kept?.content, "内容"); assert.equal(kept?.summary, "要約");
+  assert.equal(await dbMod.getVaultOutboxEntry("memory:lin-1"), undefined, "the atomic Outbox entry was rolled back with the refused record");
+  assert.equal(await dbMod.getVaultSyncState("memory:lin-1"), undefined, "no sync ledger was written for the refused record");
+  // a Memory that drops its lineage can not replace one that has it either
+  await assert.rejects(() => dbMod.putMemoryObject({ ...memory("lin-1", "2026-03-01T00:00:00.000Z"), conversationId: undefined } as unknown as MemoryObject), (e: Error) => e.name === "MemoryLineageViolationError");
+  // the legitimate rewrite (same conversation) and a first write are untouched
+  await dbMod.putMemoryObject({ ...fromConversation("lin-1", "conv-A", "2026-04-01T00:00:00.000Z"), content: "edited in its own conversation" });
+  assert.equal((await dbMod.getMemoryObject("lin-1"))?.content, "edited in its own conversation");
+  await dbMod.putMemoryObjectWithOutbox(fromConversation("lin-2", "conv-B"));
+  assert.equal((await dbMod.getMemoryObject("lin-2"))?.conversationId, "conv-B");
+});
+
+test("restore from the Vault never replaces newer local data with an older Vault copy (conversation, Memory, Source); equal or newer copies are written", async () => {
+  const newer = "2026-09-01T00:00:00.000Z", older = "2026-01-01T00:00:00.000Z";
+  await dbMod.putConversationWithOutbox({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "local newer", timestamp: newer }] } as Conversation);
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-1", older)), "kept-newer");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "local newer");
+  assert.equal(await dbMod.restoreConversationIfNotNewer({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "same version", timestamp: newer }] } as Conversation), "written");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "same version");
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-new", older)), "written");   // nothing stored: written
+
+  await dbMod.putMemoryObject({ ...fromConversation("rm-1", "c1", newer), content: "local newer memory" });
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", older)), "kept-newer");
+  assert.equal((await dbMod.getMemoryObject("rm-1"))?.content, "local newer memory");
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", "2026-12-01T00:00:00.000Z")), "written");
+
+  await dbMod.saveSource({ ...source("rs-1", newer), content: "local newer source" } as Source);
+  assert.equal(await dbMod.restoreSourceIfNotNewer(source("rs-1", older)), "kept-newer");
+  assert.equal((await dbMod.getSource("rs-1"))?.content, "local newer source");
+});
+
+test("lost-update protection: an apply computed from an earlier read is refused (nothing written) when the stored record changed meanwhile", async () => {
+  await dbMod.putMemoryObject(fromConversation("cas-1", "c1", "2026-05-01T00:00:00.000Z"));
+  const merged = { ...fromConversation("cas-1", "c1", "2026-05-02T00:00:00.000Z"), content: "merged from the Vault" };
+  // somebody (a link, a revisit prompt, Capture) changes the record after the merge was computed from the 05-01 version
+  await dbMod.putMemoryObject({ ...fromConversation("cas-1", "c1", "2026-05-03T00:00:00.000Z"), content: "changed meanwhile" });
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", "2026-05-01T00:00:00.000Z"), (e: Error) => e.name === "ConcurrentModificationError");
+  assert.equal((await dbMod.getMemoryObject("cas-1"))?.content, "changed meanwhile");
+  assert.equal(await dbMod.getVaultSyncState("memory:cas-1"), undefined);
+  await dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", "2026-05-03T00:00:00.000Z");     // matches the stored version: written
+  assert.equal((await dbMod.getMemoryObject("cas-1"))?.content, "merged from the Vault");
+  assert.equal(await dbMod.getVaultSyncState("memory:cas-1"), merged.updatedAt);
+
+  await dbMod.putConversation(conversation("cas-c", "2026-05-01T00:00:00.000Z"));
+  await dbMod.putConversation({ ...conversation("cas-c", "2026-05-03T00:00:00.000Z") });
+  await assert.rejects(() => dbMod.putConversationAndMarkSynced(conversation("cas-c", "2026-05-02T00:00:00.000Z"), "conversation:cas-c", "2026-05-01T00:00:00.000Z"), (e: Error) => e.name === "ConcurrentModificationError");
+  assert.equal((await dbMod.getConversation("cas-c"))?.updatedAt, "2026-05-03T00:00:00.000Z");
+});

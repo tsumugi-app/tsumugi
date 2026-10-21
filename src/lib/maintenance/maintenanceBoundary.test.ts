@@ -93,15 +93,18 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
   const range = BASE ? [`${BASE}...HEAD`] : ["HEAD"];
   const changed = git("diff", "--name-only", ...range).split("\n").filter(Boolean);
-  const untouchable = ["src/components/ChatScreen.tsx", "src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts"];
+  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts", "src/lib/vaultProjection.ts"];
   for (const f of untouchable) assert.ok(!changed.includes(f), `${f} must not be modified`);
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/")), "API routes must not be modified");
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  // ChatScreen: the only allowed change is the reviewed swap of the three restore-from-Vault writers (never replace newer local data with an older Vault copy)
+  const chatDiff = git("diff", "-U0", ...range, "--", "src/components/ChatScreen.tsx").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
+  for (const l of chatDiff) assert.ok(/restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l), "unexpected ChatScreen.tsx change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
-  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\.updatedAt\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**
@@ -113,7 +116,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
  *   topPrompt: revisit prompt.  vault: applying a user's Vault edit (field merge, conflicts are held).  vaultProductionMigration: one-time migration.
  */
 test("Memory write surface: only the reviewed production files write Memory records or name the raw store", () => {
-  const WRITE = /\b(putMemoryObject|putMemoryObjectWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent)\s*\(/g;
+  const WRITE = /\b(putMemoryObject|putMemoryObjectWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
   const STORE = /["']memoryObjects["']/;
   const writers: Record<string, string[]> = {}, storeUsers: string[] = [];
   const walk = (d: string) => {
@@ -130,7 +133,7 @@ test("Memory write surface: only the reviewed production files write Memory reco
   };
   walk(SRC);
   assert.deepEqual(writers, {
-    "components/ChatScreen.tsx": ["putMemoryObject", "updateMemoryRevisitPrompt"],
+    "components/ChatScreen.tsx": ["restoreMemoryObjectIfNotNewer", "updateMemoryRevisitPrompt"],
     "lib/capture.ts": ["putMemoryObjectWithOutbox"],
     "lib/connect.ts": ["addMemoryLinkDurably"],
     "lib/topPrompt.ts": ["updateMemoryRevisitPrompt"],
