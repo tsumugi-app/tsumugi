@@ -213,23 +213,26 @@ export async function analyzeSelection(input: PrecheckInput, data: PrivateRepair
     ...targets.conversationIds.filter((id) => convIds.has(id)).map((id) => ({ kind: "conversation" as const, id })),
     ...targets.memoryIds.filter((id) => memIds.has(id)).map((id) => ({ kind: "memory" as const, id })),
   ];
-  const conflicts = outboxConflicts({ outbox: input.outbox, memories: input.memories, conversations: input.conversations, targets });
-  // A removed link also rewrites its counterpart (record + Outbox entry + Vault projection). The counterpart is NOT a target of the item, so it needs its own checks.
+  // A removed link also rewrites its counterpart (record + Outbox entry + Vault projection). The counterpart is NOT a target of the item, so it needs its own
+  // checks, and ITS files (day-file / shard / month, possibly different from the target's) must be part of the Outbox conflict detection too.
   const blockers: string[] = [];
   const snapshot = { memories: input.memories, conversations: input.conversations };
   const known = new Set(existing.map((e) => `${e.kind}:${e.id}`));
   const guarded = new Set(protectedMemoryIds);
+  const counterpartIds: string[] = [];
   for (const spec of sub.repair.items) {
     const planned = await planRepairItem(spec, snapshot, now, sub.repair.updating);
     if (planned.status !== "READY") continue;
     for (const c of planned.counterparts) {
       const id = c.before.id, tail = id.slice(-6);
+      counterpartIds.push(id);
       if (input.outbox.some((o) => o.status !== "done" && (o.recordType === "memory" || o.recordType === "reflection") && o.recordId === id)) blockers.push(`counterpart-unfinished-outbox:${tail}`);
-      if (guarded.has(id)) blockers.push(`counterpart-protected-by-decision:${tail}`);
+      if (guarded.has(id)) blockers.push(`counterpart-protected:${tail}`);
       if (isReflection(c.before)) blockers.push(`counterpart-system-generated:${tail}`);
       if (!known.has(`memory:${id}`)) { existing.push({ kind: "memory", id }); known.add(`memory:${id}`); }
     }
   }
+  const conflicts = outboxConflicts({ outbox: input.outbox, memories: input.memories, conversations: input.conversations, targets: { memoryIds: [...targets.memoryIds, ...counterpartIds], conversationIds: targets.conversationIds } });
   return { report, conflicts, existing, pendingOtherTotal: conflicts.length, blockers: [...new Set(blockers)] };
 }
 

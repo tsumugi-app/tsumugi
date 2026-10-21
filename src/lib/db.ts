@@ -1508,7 +1508,7 @@ export async function commitMemoryRepairTransaction(t: MemoryRepairTransaction):
       if (ledger !== t.ledgerValue) throw new Error("repair-ledger-conflict");
       result = "already-done";
     } else {
-      const backup: { memories: MemoryObject[]; conversations: Conversation[]; outbox: (VaultOutboxEntry | null)[]; absentMemoryIds: string[]; afterMemories: MemoryObject[]; afterConversations: Conversation[] } = { memories: [], conversations: [], outbox: [], absentMemoryIds: [], afterMemories: [], afterConversations: [] };
+      const backup: { memories: MemoryObject[]; conversations: Conversation[]; outbox: (VaultOutboxEntry | null)[]; absentMemoryIds: string[]; afterMemories: MemoryObject[]; afterConversations: Conversation[]; addedMemories: MemoryObject[] } = { memories: [], conversations: [], outbox: [], absentMemoryIds: [], afterMemories: [], afterConversations: [], addedMemories: [] };
       for (const { before, after } of t.replaceMemories) {
         const current = await memories.get(before.id);
         if (!equal(current, before)) throw new Error("repair-precondition-changed");
@@ -1524,7 +1524,7 @@ export async function commitMemoryRepairTransaction(t: MemoryRepairTransaction):
       for (const added of t.addMemories) {
         const existing = await memories.get(added.id);
         if (existing !== undefined && !equal(existing, added)) throw new Error("repair-id-conflict");
-        if (existing === undefined) backup.absentMemoryIds.push(added.id);
+        if (existing === undefined) { backup.absentMemoryIds.push(added.id); backup.addedMemories.push(added); }
       }
       if (t.requireNoOtherMemoryFor?.length) {
         const addedIds = new Set(t.addMemories.map((m) => m.id));

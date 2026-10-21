@@ -156,7 +156,7 @@ test("link counterparts: a removed link rewrites its counterpart, so an unfinish
   assert.equal(v1.safeToRepair, false); assert.equal(v1.code, "READY_COUNTERPART_BLOCKED");
   // a counterpart that belongs to an item the operator holds / excludes
   const a2 = await scope.analyzeSelection(input(), d, [spec.key], fx.NOW, [cpId]);
-  assert.deepEqual(a2.blockers, [`counterpart-protected-by-decision:${cpId.slice(-6)}`]);
+  assert.deepEqual(a2.blockers, [`counterpart-protected:${cpId.slice(-6)}`]);
   assert.equal(scope.overallVerdict({ status: "READY", conflicts: a2.conflicts, vault: clean, blockers: a2.blockers }).safeToRepair, false);
   // a system-generated counterpart (Reflection)
   const inp3 = input();
@@ -164,6 +164,23 @@ test("link counterparts: a removed link rewrites its counterpart, so an unfinish
   cp3.metadata = { ...cp3.metadata, source: "system-generated" } as MemoryObject["metadata"];
   const a3 = await scope.analyzeSelection(inp3, d, [spec.key], fx.NOW);
   assert.deepEqual(a3.blockers, [`counterpart-system-generated:${cpId.slice(-6)}`]);
+});
+
+test("link counterparts: the counterpart's own files join the Outbox conflict detection (a counterpart on another day / month / shard than the item)", async () => {
+  const d = data(); const spec = d.repair.items.find((i) => i.key === "R8")!;
+  const removed = Object.keys(spec.links).find((id) => spec.links[id] === "remove")!;
+  const cpId = `CP-${removed}`;
+  const inp = input();
+  const cp = inp.memories.find((m) => m.id === cpId)!;
+  // the counterpart lives on a far-away day; an unrelated Memory on that same day has an unfinished Outbox entry
+  const farDay = "2031-01-15T00:00:00.000Z";
+  inp.memories = inp.memories.map((m) => (m.id === cpId ? { ...m, date: farDay } : m));
+  const neighbour: MemoryObject = { ...cp, id: "far-neighbour-000009", date: farDay, links: [] };
+  inp.memories = [...inp.memories, neighbour];
+  inp.outbox = [{ id: `memory:${neighbour.id}`, recordType: "memory", recordId: neighbour.id, recordUpdatedAt: neighbour.updatedAt, status: "pending" } as OutboxLike];
+  const a = await scope.analyzeSelection(inp, d, [spec.key], fx.NOW);
+  const hit = a.conflicts.find((c) => c.id === `memory:${neighbour.id}`);
+  assert.ok(hit && hit.shares.includes("day-file"), "the unfinished entry that shares the COUNTERPART's day-file is a conflict: " + JSON.stringify(a.conflicts));
 });
 
 test("Vault diagnosis summary: file areas only; unreadable / legacy-format are unverified, mismatch / missing are mismatched", () => {

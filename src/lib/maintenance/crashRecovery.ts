@@ -18,7 +18,6 @@
  * Nothing here logs, sends or stores anything; reports carry fixed codes, counts and id tails.
  */
 import type { Conversation, MemoryObject } from "../types";
-import { CONTAMINATION_REPAIR_VERSION } from "../memoryContaminationRepair";
 import { deleteMaintenanceEvidence, readMaintenanceEvidence } from "../db";
 import { hashRecord, sha256Hex } from "./hash";
 import { readGateState } from "./maintenanceGate";
@@ -53,30 +52,37 @@ export interface CrashInput {
   env?: RestoreEnv;
 }
 
-/** the single `updatedAt` stamped by the repair commit on every record it wrote (null if no stamped record exists, "ambiguous" if several times) */
-async function commitStampOf(rp: RestorePoint, env: RestoreEnv): Promise<string | null | "ambiguous"> {
-  const stamps = new Set<string>();
-  for (const id of rp.scope.memoryIds) {
-    const cur = await env.idb.getMemory(id);
-    const now = (cur?.metadata?.sourceDetail as { memoryRepair?: string } | undefined)?.memoryRepair;
-    const pre = (rp.idb.memories[id]?.metadata?.sourceDetail as { memoryRepair?: string } | undefined)?.memoryRepair;
-    if (cur && now === CONTAMINATION_REPAIR_VERSION && now !== pre) stamps.add(cur.updatedAt);
-  }
-  return stamps.size === 0 ? null : stamps.size === 1 ? [...stamps][0] : "ambiguous";
+/**
+ * The exact images the interrupted repair COMMIT wrote, taken from the durable backup the commit stored in the same transaction
+ * (`afterMemories`, `afterConversations`, `addedMemories`). Provenance is the exact content, not a timestamp: a record that was rewritten after the
+ * crash, even keeping the repair's `updatedAt`, does not match and stops the recovery.
+ * null = no commit happened (no backup); "unreadable" = a backup that does not parse or has no exact images for the added Memories.
+ */
+interface CommitImages { at: string; memories: Record<string, MemoryObject>; conversations: Record<string, Conversation>; added: Record<string, MemoryObject> }
+async function commitImagesOf(rp: RestorePoint, env: RestoreEnv): Promise<CommitImages | null | "unreadable"> {
+  const key = rp.scope.settingsKeys.find((k) => /^memoryRepair:[^:]+:backup:/.test(k));
+  if (!key) return null;
+  const raw = (await env.idb.getSettings([key]))[key];
+  if (raw === null || raw === undefined) return null;
+  try {
+    const b = JSON.parse(raw) as { at?: string; afterMemories?: MemoryObject[]; afterConversations?: Conversation[]; addedMemories?: MemoryObject[]; absentMemoryIds?: string[] };
+    if (typeof b.at !== "string" || !Array.isArray(b.afterMemories) || !Array.isArray(b.afterConversations) || !Array.isArray(b.absentMemoryIds)) return "unreadable";
+    // every Memory the commit created must have its exact image recorded (backups written before this field existed can not prove them)
+    const added = Object.fromEntries((b.addedMemories ?? []).map((m) => [m.id, m]));
+    if (b.absentMemoryIds.some((id) => !added[id])) return "unreadable";
+    return { at: b.at, memories: Object.fromEntries(b.afterMemories.map((m) => [m.id, m])), conversations: Object.fromEntries(b.afterConversations.map((c) => [c.id, c])), added };
+  } catch { return "unreadable"; }
 }
 
-async function buildExpectation(rp: RestorePoint, env: RestoreEnv, stamp: string | null | "ambiguous", copyProvesPreState: boolean, evidence: Record<string, string[]>): Promise<RestoreExpectation> {
+async function buildExpectation(rp: RestorePoint, env: RestoreEnv, images: CommitImages | null | "unreadable", copyProvesPreState: boolean, evidence: Record<string, string[]>): Promise<RestoreExpectation> {
   const exp = emptyExpectation();
-  if (stamp !== null && stamp !== "ambiguous") {
-    const pre = (v: unknown) => (v ? hashRecord(v) : Promise.resolve(null));
-    for (const id of rp.scope.memoryIds) {
-      const cur: MemoryObject | null = await env.idb.getMemory(id);
-      if (cur && cur.updatedAt === stamp && (await hashRecord(cur)) !== (await pre(rp.idb.memories[id]))) { exp.records[`memory:${id}`] = [await hashRecord(cur)]; exp.updatedAts[id] = [stamp]; }
-    }
-    for (const id of rp.scope.conversationIds) {
-      const cur: Conversation | null = await env.idb.getConversation(id);
-      if (cur && cur.updatedAt === stamp && (await hashRecord(cur)) !== (await pre(rp.idb.conversations[id]))) { exp.records[`conversation:${id}`] = [await hashRecord(cur)]; exp.updatedAts[id] = [stamp]; }
-    }
+  if (images !== null && images !== "unreadable") {
+    const accept = async (kind: "memory" | "conversation", id: string, image: { updatedAt: string }) => {
+      exp.records[`${kind}:${id}`] = [await hashRecord(image)];
+      exp.updatedAts[id] = [image.updatedAt];
+    };
+    for (const id of rp.scope.memoryIds) { const img = images.memories[id] ?? images.added[id]; if (img) await accept("memory", id, img); }
+    for (const id of rp.scope.conversationIds) { const img = images.conversations[id]; if (img) await accept("conversation", id, img); }
   }
   if (copyProvesPreState) {
     // A scope file is explained ONLY if its current content is one the interrupted window recorded durably BEFORE writing it (write-ahead evidence,
@@ -123,9 +129,10 @@ async function analyze(input: CrashInput): Promise<{ diagnosis: CrashDiagnosis; 
   const differs = await copyDiffers(rp, input.vaultCopyRoot);
   if (differs.length > 0) return { rp, diagnosis: { ...base, ...head, vaultCopyDiffers: differs, status: "vault-copy-differs", reason: `copy-differs:${differs.length}` } };
   const env: RestoreEnv = input.env ?? { idb: createDbRestoreIdb(), root: input.root };
-  const stamp = await commitStampOf(rp, env);
-  if (stamp === "ambiguous") return { rp, diagnosis: { ...base, ...head, status: "stopped", reason: "commit-stamp-ambiguous" } };
-  const exp = await buildExpectation(rp, env, stamp, true, await readMaintenanceEvidence(gate.operationId));
+  const images = await commitImagesOf(rp, env);
+  if (images === "unreadable") return { rp, diagnosis: { ...base, ...head, status: "stopped", reason: "repair-backup-unreadable" } };
+  const stamp = images ? images.at : null;
+  const exp = await buildExpectation(rp, env, images, true, await readMaintenanceEvidence(gate.operationId));
   const plan = await planRestore(rp, exp, env);
   const common = { ...base, ...head, commitStamp: stamp, plan: planSummary(plan) };
   if (plan.status === "nothing-to-restore") return { rp, diagnosis: { ...common, status: "intact", reason: "identical-to-restore-point" } };
@@ -167,7 +174,7 @@ export async function runCrashRecovery(input: CrashInput & { confirm: string }):
     if (!rp || rp.contentHash !== rp0.contentHash || (inside.status !== "intact" && inside.status !== "restorable")) {
       report = keep("stopped", rp ? inside.reason : "restore-point-lost", { diagnosis: inside });
     } else {
-      const exp = await buildExpectation(rp, env, await commitStampOf(rp, env), true, await readMaintenanceEvidence(adopted.operationId));
+      const exp = await buildExpectation(rp, env, await commitImagesOf(rp, env), true, await readMaintenanceEvidence(adopted.operationId));
       const r = await runWithMaintenanceWriteAccess(() => executeRestore(rp, exp, env));
       const restore = { status: r.status, failure: r.failure, vaultWritten: r.vaultWritten.length, vaultDeleted: r.vaultDeleted.length };
       if (r.status !== "restored" && r.status !== "nothing-to-restore") {

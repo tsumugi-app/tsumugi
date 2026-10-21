@@ -393,9 +393,13 @@ test("crash recovery refuses and KEEPS the gate when the state can not be proven
     ["a record of the scope holds a version the interrupted repair can not explain", async (w, text) => {
       const c = (await dbm.getConversation(R1.updatingConversationId))!;
       await dbm.putConversation({ ...c, updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /record-unidentified/],
-    ["a Memory of the scope carries a second, foreign repair time (the commit time is ambiguous)", async (w, text) => {
+    ["a record of the scope was rewritten after the crash but kept the repair's updatedAt (not the exact image the commit wrote)", async (w, text) => {
       const m = (await dbm.getMemoryObject(R1.memoryId))!;
-      await dbm.putMemoryObject({ ...m, updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /commit-stamp-ambiguous/],
+      await dbm.putMemoryObject({ ...m, summary: m.summary + "!" } as any); return { text }; }, /record-unidentified/],
+    ["the new Memory created by the commit was rewritten after the crash (same updatedAt)", async (w, text) => {
+      const id = await repair.updatingMemoryIdFor(R1.updatingConversationId);
+      const m = (await dbm.getMemoryObject(id))!;
+      await dbm.putMemoryObject({ ...m, content: m.content + "!" } as any); return { text }; }, /record-unidentified/],
     ["the operator's Vault copy differs from the restore point", async (w, text) => { w.backup.put(".tsumugi/index.json", "{}"); return { text }; }, /copy-differs/],
     ["the restore point file was damaged", async (_w, text) => ({ text: text.replace(/"contentHash":"[0-9a-f]{8}/, '"contentHash":"00000000') }), /content-hash/],
     ["a restore point captured under a different gate", async (_w, text) => {
@@ -463,6 +467,23 @@ test("a link counterpart with an unfinished Outbox entry or protected by a decis
       assert.equal(JSON.stringify(w.vault.snapshot()), vaultBefore); assert.equal(await digest(), digestBefore);
     } finally { await cleanup(); }
   }
+});
+
+test("a link counterpart that is not READY right now (a HOLD item that the decision list does not name) is protected: the item is refused before any write", async () => {
+  const w = await world();
+  try {
+    const data = DATA();
+    const a = data.repair.items.find((i) => i.key === "R2")!, b = data.repair.items.find((i) => i.key === "R3")!;
+    const shared = Object.keys(a.links).find((id) => id in b.links)!;           // the fixture link that joins R2 and R3
+    a.links[shared] = "remove";                                                  // R2 would rewrite R3's Memory as its counterpart
+    const m3 = (await dbm.getMemoryObject(b.memoryId))!;
+    await dbm.putMemoryObject({ ...m3, summary: m3.summary + "（変更済み）" } as any);   // R3 no longer matches its reviewed state: live HOLD
+    const vaultBefore = JSON.stringify(w.vault.snapshot()), digestBefore = await digest();
+    const report = await session.runRepairSession({ data, key: "R2", root: w.vault.root(), confirm: "REPAIR R2", vaultBackupRoot: w.backup.root(), persistRestorePoint: async (t) => t, now: () => NOW });
+    assert.equal(report.status, "refused", JSON.stringify(report));
+    assert.equal(report.reason, "verdict:READY_COUNTERPART_BLOCKED");
+    assert.equal(JSON.stringify(w.vault.snapshot()), vaultBefore); assert.equal(await digest(), digestBefore);
+  } finally { await cleanup(); }
 });
 
 test("the session module is the only new importer of the restore / runner modules; it logs and sends nothing", () => {

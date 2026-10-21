@@ -26,7 +26,7 @@ import type { PrivateRepairData } from "../privateRepairData";
 import type { PrecheckInput } from "../memoryRepairPrecheck";
 import { hashRecord, sha256Hex } from "./hash";
 import { normalizeForActualComparison } from "./invariants";
-import { analyzeSelection, diagnoseVaultForPrecheck, overallVerdict, subsetData } from "./precheckScope";
+import { analyzeSelection, diagnoseVaultForPrecheck, overallVerdict, scanLiveStatuses, subsetData } from "./precheckScope";
 import { buildManifestDraft, dryRun, exportRecordBackup, executeSyncLocked, verifyRecordBackup, verifyVaultBackup, type ExecuteReport } from "./scopedVaultSync";
 import { endMaintenanceWindow, enterMaintenanceWindow, isMaintenanceWindowOpen } from "./maintenanceWindow";
 import { captureRestorePoint, computeRestoreScope, readIndexedConversationPaths, serializeRestorePoint, type RestoreEnv, type RestorePoint } from "./restorePoint";
@@ -150,7 +150,11 @@ async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repa
 
   // ---- pre-check inside the window (nothing can change underneath: exclusive lock + gate)
   const data = subsetData(input.data, [input.key]);
-  const analysis = await analyzeSelection(await readPrecheckInputViaDb(data), data, [input.key], now(), input.protectedMemoryIds ?? []);
+  // Memories that must never be rewritten, not even as a link counterpart: the operator's held / excluded items AND every other item that is not
+  // READY right now (HOLD, already done, unknown): their live state decides, not only the decision file.
+  const liveStatuses = await scanLiveStatuses(await readPrecheckInputViaDb(input.data), input.data, now());
+  const protectedIds = [...new Set([...(input.protectedMemoryIds ?? []), ...input.data.repair.items.filter((i) => i.key !== input.key && liveStatuses[i.key] !== "READY").map((i) => i.memoryId)])];
+  const analysis = await analyzeSelection(await readPrecheckInputViaDb(data), data, [input.key], now(), protectedIds);
   const item = analysis.report.items[0];
   if (!item || item.status !== "READY") return fail("refused", `precheck:${item?.status ?? "none"}`);
   const vaultCheck = await diagnoseVaultForPrecheck(analysis.existing, input.root);

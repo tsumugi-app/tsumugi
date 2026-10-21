@@ -127,7 +127,7 @@ export default function MaintenancePanel() {
     r.readAsText(file);
   }
   /** the Memories of the items the operator holds or excludes: a repair must never rewrite them (not even as a link counterpart) */
-  const protectedIds = (): string[] => (repairData && decisions ? repairData.repair.items.filter((i) => decisions.held.includes(i.key) || decisions.excluded.includes(i.key)).map((i) => i.memoryId) : []);
+  const protectedIds = (): string[] => (repairData && decisions ? repairData.repair.items.filter((i) => decisions.held.includes(i.key) || decisions.excluded.includes(i.key) || (!picked.includes(i.key) && (!live || live[i.key] !== "READY"))).map((i) => i.memoryId) : []);
   async function runScan() {
     if (!repairData || decisionsError(repairData, decisions)) return;
     await guarded(async () => {
