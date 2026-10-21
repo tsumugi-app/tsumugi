@@ -423,20 +423,46 @@ test("restore from the Vault replaces a stored record only with a strictly newer
   assert.equal((await dbMod.getSource("rs-1"))?.content, "local newer source");
 });
 
-test("lost-update protection: an apply computed from an earlier read is refused (nothing written) when the stored record changed meanwhile", async () => {
-  await dbMod.putMemoryObject(fromConversation("cas-1", "c1", "2026-05-01T00:00:00.000Z"));
+test("lost-update protection: an apply computed from an earlier read is refused (nothing written) when the stored record changed meanwhile - even when only a local-only field changed and updatedAt did not", async () => {
+  const v1 = fromConversation("cas-1", "c1", "2026-05-01T00:00:00.000Z");
+  await dbMod.putMemoryObject(v1);
   const merged = { ...fromConversation("cas-1", "c1", "2026-05-02T00:00:00.000Z"), content: "merged from the Vault" };
-  // somebody (a link, a revisit prompt, Capture) changes the record after the merge was computed from the 05-01 version
-  await dbMod.putMemoryObject({ ...fromConversation("cas-1", "c1", "2026-05-03T00:00:00.000Z"), content: "changed meanwhile" });
-  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", "2026-05-01T00:00:00.000Z"), (e: Error) => e.name === "ConcurrentModificationError");
+  // somebody (a link, a revisit prompt, Capture) changes the record after the merge was computed from v1
+  await dbMod.putMemoryObject({ ...v1, updatedAt: "2026-05-03T00:00:00.000Z", content: "changed meanwhile" });
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", v1), (e: Error) => e.name === "ConcurrentModificationError");
   assert.equal((await dbMod.getMemoryObject("cas-1"))?.content, "changed meanwhile");
   assert.equal(await dbMod.getVaultSyncState("memory:cas-1"), undefined);
-  await dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", "2026-05-03T00:00:00.000Z");     // matches the stored version: written
+  const v2 = (await dbMod.getMemoryObject("cas-1"))!;
+  await dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", v2);     // matches the stored snapshot exactly: written
   assert.equal((await dbMod.getMemoryObject("cas-1"))?.content, "merged from the Vault");
   assert.equal(await dbMod.getVaultSyncState("memory:cas-1"), merged.updatedAt);
 
+  // the revisit-prompt case: the field is added WITHOUT advancing updatedAt, so a version-only check would not notice
+  const base = fromConversation("cas-2", "c1", "2026-06-01T00:00:00.000Z");
+  await dbMod.putMemoryObject(base);
+  const snapshot = (await dbMod.getMemoryObject("cas-2"))!;
+  await dbMod.updateMemoryRevisitPrompt("cas-2", "a prompt generated meanwhile");
+  assert.equal((await dbMod.getMemoryObject("cas-2"))?.updatedAt, base.updatedAt, "the prompt does not advance updatedAt");
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced({ ...snapshot, content: "stale merge" }, "memory:cas-2", snapshot), (e: Error) => e.name === "ConcurrentModificationError");
+  assert.equal((await dbMod.getMemoryObject("cas-2"))?.revisitPrompt, "a prompt generated meanwhile", "the prompt was not lost");
+
   await dbMod.putConversation(conversation("cas-c", "2026-05-01T00:00:00.000Z"));
+  const c1 = (await dbMod.getConversation("cas-c"))!;
   await dbMod.putConversation({ ...conversation("cas-c", "2026-05-03T00:00:00.000Z") });
-  await assert.rejects(() => dbMod.putConversationAndMarkSynced(conversation("cas-c", "2026-05-02T00:00:00.000Z"), "conversation:cas-c", "2026-05-01T00:00:00.000Z"), (e: Error) => e.name === "ConcurrentModificationError");
+  await assert.rejects(() => dbMod.putConversationAndMarkSynced(conversation("cas-c", "2026-05-02T00:00:00.000Z"), "conversation:cas-c", c1), (e: Error) => e.name === "ConcurrentModificationError");
   assert.equal((await dbMod.getConversation("cas-c"))?.updatedAt, "2026-05-03T00:00:00.000Z");
+});
+
+test("restore ordering uses strict ISO timestamps: impossible calendar dates, bad clocks and loose formats are not orderable (fail closed)", () => {
+  assert.equal(dbMod.strictInstantOf("2026-02-30T00:00:00.000Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-13-01T00:00:00Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01T24:00:00Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01 00:00:00Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01T00:00:00"), null, "no offset: ambiguous");
+  assert.equal(dbMod.strictInstantOf("2026-01-01T00:00:00+25:00"), null);
+  assert.equal(dbMod.strictInstantOf("2028-02-29T12:00:00.5+09:00"), Date.parse("2028-02-29T12:00:00.5+09:00"));       // real leap day
+  assert.equal(dbMod.strictInstantOf("2027-02-29T12:00:00Z"), null, "2027 is not a leap year");
+  assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-03-01T00:00:00Z" }, { updatedAt: "2026-02-30T00:00:00.000Z" }), false);
+  assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-01-01T00:00:00Z" }, { updatedAt: "2026-01-01T00:00:01Z" }), true);
 });

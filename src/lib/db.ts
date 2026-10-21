@@ -263,7 +263,20 @@ export async function putMemoryObject(memoryObject: MemoryObject) {
  * and a copy whose timestamp can not be parsed (fail closed). A Memory also passes the lineage invariant. Nothing local is silently discarded.
  */
 export type RestoreWriteResult = "written" | "kept-local";
-const instantOf = (iso: unknown): number | null => { const t = typeof iso === "string" ? Date.parse(iso) : NaN; return Number.isFinite(t) ? t : null; };
+/** Strict ISO-8601 instant (`YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`) with a REAL calendar date and clock time; anything else is null (Date.parse alone would normalise "2026-02-30" to March 2). */
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/;
+export function strictInstantOf(iso: unknown): number | null {
+  if (typeof iso !== "string") return null;
+  const m = ISO_INSTANT.exec(iso);
+  if (!m) return null;
+  const [y, mo, d, h, mi, s] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])];
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  if (mo < 1 || mo > 12 || day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d || h > 23 || mi > 59 || s > 59) return null;
+  if (m[7] !== undefined && (Number(m[7]) > 23 || Number(m[8]) > 59)) return null;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : null;
+}
+const instantOf = strictInstantOf;
 /** true only when `incoming` is strictly newer than `stored` as a point in time; equal, older or unparseable => false */
 export function isStrictlyNewerVersion(stored: { updatedAt: string }, incoming: { updatedAt: string }): boolean {
   const a = instantOf(stored.updatedAt), b = instantOf(incoming.updatedAt);
@@ -516,12 +529,13 @@ export async function setVaultSyncState(key: string, updatedAt: string): Promise
  * `setVaultSyncState`（ledgerのみ）は無変更のまま維持し、通常の書込経路
  * （vault.tsのwrite関数群）には一切影響しない。
  */
-export async function putConversationAndMarkSynced(conversation: Conversation, syncKey: string, expectedStoredUpdatedAt?: string): Promise<void> {
+export async function putConversationAndMarkSynced(conversation: Conversation, syncKey: string, expectedStored?: Conversation): Promise<void> {
   const db = await getDB();
   const tx = db.transaction(["conversations", "vaultSyncState"], "readwrite");
   try {
-    // `expectedStoredUpdatedAt`: the version the caller's merge was computed from; a record changed in the meantime is never overwritten with a stale merge
-    if (expectedStoredUpdatedAt !== undefined && (await tx.objectStore("conversations").get(conversation.id))?.updatedAt !== expectedStoredUpdatedAt) throw new ConcurrentModificationError(conversation.id);
+    // `expectedStored`: the COMPLETE snapshot the caller's merge was computed from (not just its version: local-only changes such as a revisit prompt do not
+    // advance `updatedAt`); a record that differs now is never overwritten with a stale merge
+    if (expectedStored !== undefined && JSON.stringify(await tx.objectStore("conversations").get(conversation.id)) !== JSON.stringify(expectedStored)) throw new ConcurrentModificationError(conversation.id);
     await tx.objectStore("conversations").put(conversation);
     await tx.objectStore("vaultSyncState").put(conversation.updatedAt, syncKey);
   } catch (error) {
@@ -530,13 +544,13 @@ export async function putConversationAndMarkSynced(conversation: Conversation, s
   await tx.done;
 }
 
-export async function putMemoryObjectAndMarkSynced(memoryObject: MemoryObject, syncKey: string, expectedStoredUpdatedAt?: string): Promise<void> {
+export async function putMemoryObjectAndMarkSynced(memoryObject: MemoryObject, syncKey: string, expectedStored?: MemoryObject): Promise<void> {
   const db = await getDB();
   const tx = db.transaction(["memoryObjects", "vaultSyncState"], "readwrite");
   try {
     const stored = await tx.objectStore("memoryObjects").get(memoryObject.id);
     assertMemoryLineage(stored, memoryObject);
-    if (expectedStoredUpdatedAt !== undefined && stored?.updatedAt !== expectedStoredUpdatedAt) throw new ConcurrentModificationError(memoryObject.id);
+    if (expectedStored !== undefined && JSON.stringify(stored) !== JSON.stringify(expectedStored)) throw new ConcurrentModificationError(memoryObject.id);
     await tx.objectStore("memoryObjects").put(memoryObject);
     await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
   } catch (error) {
