@@ -21,5 +21,12 @@ jobs:
             const prs = await github.rest.pulls.list({ owner, repo, state: "open", head: `${owner}:${head}`, per_page: 1 });
             if (!prs.data.length) { core.warning("no open PR for this branch"); return; }
             const sha = context.sha.slice(0, 7);
-            await github.rest.issues.createComment({ owner, repo, issue_number: prs.data[0].number,
-              body: `@codex review\\n\\nOn-demand independent review of \\`${sha}\\`. Review-only: no merge, no deploy, no production data. Focus on the newest changes: crash recovery (src/lib/maintenance/crashRecovery.ts, adoptStaleMaintenanceGate in maintenanceWindow.ts, the panel's step 8), whether the gate can ever be released without a verified restore, whether the restore can overwrite data it cannot explain, and Outbox / HOLD / protected-data non-mutation.` });
+            const body = [
+              "@codex review",
+              "",
+              "On-demand independent review of " + sha + ". Review-only: no merge, no deploy, no production data.",
+              "Focus on the newest changes: crash recovery (src/lib/maintenance/crashRecovery.ts, adoptStaleMaintenanceGate in maintenanceWindow.ts, the panel step 8),",
+              "whether the maintenance gate can ever be released without a verified restore, whether the restore can overwrite data it cannot explain,",
+              "and Outbox / HOLD / protected-data non-mutation.",
+            ].join("\n");
+            await github.rest.issues.createComment({ owner, repo, issue_number: prs.data[0].number, body });
