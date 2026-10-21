@@ -466,3 +466,22 @@ test("restore ordering uses strict ISO timestamps: impossible calendar dates, ba
   assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-03-01T00:00:00Z" }, { updatedAt: "2026-02-30T00:00:00.000Z" }), false);
   assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-01-01T00:00:00Z" }, { updatedAt: "2026-01-01T00:00:01Z" }), true);
 });
+
+test("the historical Capture bug at the storage API: content produced by conversation B, built by spreading a stored Memory of conversation A (so the copied lineage still says A), is refused", async () => {
+  await dbMod.putCapturedMemoryWithOutbox(fromConversation("hist-1", "conv-A"), "conv-A");                  // A's own Memory, saved by A's Capture
+  const original = (await dbMod.getMemoryObject("hist-1"))!;
+  // what the buggy code effectively did in conversation B: spread the stored Memory, replace the content with text derived from B
+  const overwrite = { ...original, content: "text derived from conversation B", summary: "summary from B", keywords: ["B"], updatedAt: "2026-02-01T00:00:00.000Z" };
+  await assert.rejects(() => dbMod.putCapturedMemoryWithOutbox(overwrite, "conv-B"), (e: Error) => e.name === "MemoryLineageViolationError");
+  const kept = (await dbMod.getMemoryObject("hist-1"))!;
+  assert.equal(kept.content, original.content); assert.equal(kept.summary, original.summary); assert.equal(kept.conversationId, "conv-A");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:hist-1"))?.recordUpdatedAt, original.updatedAt, "the Outbox entry was not replaced either");
+  // the legitimate paths: A updates its own Memory; B saves a NEW Memory under its own lineage
+  await dbMod.putCapturedMemoryWithOutbox({ ...original, content: "A edited its own", updatedAt: "2026-03-01T00:00:00.000Z" }, "conv-A");
+  assert.equal((await dbMod.getMemoryObject("hist-1"))?.content, "A edited its own");
+  await dbMod.putCapturedMemoryWithOutbox(fromConversation("hist-2", "conv-B"), "conv-B");
+  assert.equal((await dbMod.getMemoryObject("hist-2"))?.conversationId, "conv-B");
+  // a record whose lineage does not match the producing conversation can not be saved at all
+  await assert.rejects(() => dbMod.putCapturedMemoryWithOutbox(fromConversation("hist-3", "conv-A"), "conv-B"), (e: Error) => e.name === "MemoryLineageViolationError");
+  assert.equal(await dbMod.getMemoryObject("hist-3"), undefined);
+});

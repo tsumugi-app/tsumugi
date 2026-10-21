@@ -781,6 +781,22 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
 }
 
 /** `recordType`は既定で`"memory"`（normal Memory）。Reflectionを書く場合は`"reflection"`を渡す。 */
+/**
+ * The write API for Memories PRODUCED BY A CAPTURE. The conversation that produced the content is passed independently of the record: the record's own
+ * `conversationId` can be copied from a stored Memory (the 2026 bug spread a stored Memory of conversation A and replaced its content with text derived
+ * from conversation B, so the copied lineage still said A). Content produced by B can only be saved under B's lineage, and the stored Memory (if any)
+ * must be B's own - otherwise nothing is written (the transaction, including the Outbox entry, is rolled back).
+ */
+export async function putCapturedMemoryWithOutbox(
+  memoryObject: MemoryObject,
+  producedByConversationId: string,
+  recordType: "memory" | "reflection" = "memory",
+  now: string = new Date().toISOString()
+): Promise<VaultOutboxEntry> {
+  if (!producedByConversationId || memoryObject.conversationId !== producedByConversationId) throw new MemoryLineageViolationError(memoryObject.id);
+  return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now);
+}
+
 export async function putMemoryObjectWithOutbox(
   memoryObject: MemoryObject,
   recordType: "memory" | "reflection" = "memory",

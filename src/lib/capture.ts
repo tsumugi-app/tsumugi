@@ -8,7 +8,7 @@
 
 import { beginCaptureDebug, bindCaptureDebug, captureDebugId, observeCapture, observeCaptureSave, type CaptureDebugServer } from "./captureDebug";
 import { ulid } from "ulid";
-import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObjectWithOutbox } from "./db";
+import { getAllMemoryObjects, loadApiKey, putConversation, putCapturedMemoryWithOutbox } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
 import { isReflectionSummary, writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import type { ConversationEntryKind } from "./conversationEntryKind";
@@ -974,14 +974,14 @@ async function persistCaptureImpl(
   for (const memoryObject of memoryObjects) {
     try {
       // 新保存基盤 Phase 3-9：canonical writeと同一IndexedDB transactionでvaultOutboxを
-      // upsertする（`putMemoryObjectWithOutbox`、Invariant 1/2。Conversation Phase 3-2と
+      // upsertする（`putCapturedMemoryWithOutbox`、Invariant 1/2。Conversation Phase 3-2と
       // 同じ原則）。これにより、この後のVault write（下の`writeMemoryObjectMarkdown`、
       // 既存のlegacy経路。まだ削除しない）が失敗しても、次回startup bootstrap
       // （`runSaveFoundationBootstrap`→`reconcilePendingVaultOutbox`）がこのMemoryを
       // 自己修復できる。`recordType`は"reflection"（`isReflectionSummary`）と"memory"を
       // 区別する——Phase 3-7で確立した、Reflectionをnormal Memory day-file logicへ
       // 混入させない規約をここでも維持する。
-      await putMemoryObjectWithOutbox(memoryObject, isReflectionSummary(memoryObject) ? "reflection" : "memory");
+      await putCapturedMemoryWithOutbox(memoryObject, conversation.id, isReflectionSummary(memoryObject) ? "reflection" : "memory");
       observeCaptureSave(debugId, memoryObject.id, "indexedDB", "success");
     } catch (error) {
       console.error(`[Tsumugi Capture] memory IndexedDB write failed for ${memoryObject.id}:`, error);

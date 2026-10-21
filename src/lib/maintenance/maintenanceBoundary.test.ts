@@ -116,7 +116,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
  *   topPrompt: revisit prompt.  vault: applying a user's Vault edit (field merge, conflicts are held).  vaultProductionMigration: one-time migration.
  */
 test("Memory write surface: only the reviewed production files write Memory records or name the raw store", () => {
-  const WRITE = /\b(putMemoryObject|putMemoryObjectWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
+  const WRITE = /\b(putMemoryObject|putMemoryObjectWithOutbox|putCapturedMemoryWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
   const STORE = /["']memoryObjects["']/;
   const writers: Record<string, string[]> = {}, storeUsers: string[] = [];
   const walk = (d: string) => {
@@ -134,7 +134,7 @@ test("Memory write surface: only the reviewed production files write Memory reco
   walk(SRC);
   assert.deepEqual(writers, {
     "components/ChatScreen.tsx": ["restoreMemoryObjectIfNotNewer", "updateMemoryRevisitPrompt"],
-    "lib/capture.ts": ["putMemoryObjectWithOutbox"],
+    "lib/capture.ts": ["putCapturedMemoryWithOutbox"],
     "lib/connect.ts": ["addMemoryLinkDurably"],
     "lib/topPrompt.ts": ["updateMemoryRevisitPrompt"],
     "lib/vault.ts": ["putMemoryObjectAndMarkSynced"],
