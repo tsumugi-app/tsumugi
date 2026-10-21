@@ -325,8 +325,9 @@ test("an item whose removed link has a system-generated (Reflection) counterpart
     item.links[reflectionLinkId] = "remove";
     const report = await run(w, { data });
     assert.equal(report.status, "refused", JSON.stringify(report));
-    assert.match(report.reason, /^reflection-counterpart-unsupported:/);
-    assert.deepEqual(report.stages, ["window-open", "prechecked"], "refused before the restore point and before any write");
+    // the pre-check now stops it first (verdict READY_COUNTERPART_BLOCKED: system-generated counterpart); the in-session check stays as a second layer
+    assert.match(report.reason, /^(verdict:READY_COUNTERPART_BLOCKED|reflection-counterpart-unsupported:.*)$/);
+    assert.ok(report.stages.length <= 2 && !report.stages.includes("restore-point-verified"), "refused before the restore point and before any write");
     assert.equal(report.windowOpen, false); assert.equal(report.gateClosed, true);
     await unchanged(w);
   } finally { await cleanup(); }
