@@ -55,3 +55,4 @@ memory-repair-decisions.json
 *.memory-repair-decisions.json
 /e2e/node_modules/
 /e2e/test-results/
+/e2e/.build/

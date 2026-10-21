@@ -35,6 +35,9 @@ jobs:
       - name: Install Chromium
         working-directory: e2e
         run: npx playwright install --with-deps chromium
+      - name: Build the browser harness (production modules bundled; loaded from a local file by the tests)
+        working-directory: e2e
+        run: npm run build:harness
       - name: Job-local dummy password
         run: |
           PW=$(openssl rand -hex 16)
