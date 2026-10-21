@@ -124,3 +124,60 @@ test("real browser: closing the tab in the middle of the window frees the Web Lo
   expect(released.released, JSON.stringify(released)).toBe(true);
   expect(await H(page2, "await H.blocking()")).toBe(false);
 });
+
+/** the tab dies mid-repair after the real sync (IndexedDB repaired AND Vault written); returns the SAVED restore point and the state before */
+async function killMidRepair(context: any) {
+  const page1 = await tab(context);
+  const before: any = await page1.evaluate((p) => (window as any).H.setup(p), payload(["R1"]));
+  await page1.evaluate(() => { (window as any).H.run({ key: "R1", blockAt: "synced" }); });
+  await page1.waitForFunction(() => (window as any).__reached === "synced");
+  const saved: string = await page1.evaluate(() => (window as any).__saved);
+  await page1.close();                                                                       // the tab dies
+  const page2 = await tab(context);
+  await page2.evaluate(() => (window as any).H.attach());
+  await expect.poll(async () => (await H<string[]>(page2, "await H.lockHeld()")).includes("tsumugi-vault-world"), { timeout: 10_000 }).toBe(false);
+  return { page2, saved, before };
+}
+
+test("real browser: tab killed mid-repair -> diagnosis -> typed confirmation -> strict restore -> verification -> gate released -> normal operation resumes", async ({ context }) => {
+  const { page2, saved, before } = await killMidRepair(context);
+  const crashed: any = await page2.evaluate(() => (window as any).H.state());
+  expect(crashed.vault).not.toEqual(before.vault);                                           // the crash left Vault files changed
+  expect(crashed.idb).not.toBe(before.idb);                                                  // and IndexedDB changed
+  expect(await H(page2, "await H.blocking()")).toBe(true);
+  const diag: any = await page2.evaluate((t) => (window as any).H.diagnose(t), saved);
+  expect(diag.status, JSON.stringify(diag)).toBe("restorable");
+  expect(JSON.stringify(diag)).not.toMatch(/[぀-ヿ一-鿿]/);                                    // the diagnosis carries no record text
+  expect(await H(page2, "await H.blocking()")).toBe(true);                                   // diagnosing changed nothing
+  const wrong: any = await page2.evaluate((t) => (window as any).H.recover(t, "RESTORE wrong"), saved);
+  expect(wrong.status).toBe("refused");
+  expect(await H(page2, "await H.blocking()")).toBe(true);
+  const report: any = await page2.evaluate(([t, c]) => (window as any).H.recover(t, c), [saved, diag.restorePoint.confirmPhrase]);
+  expect(report.status, JSON.stringify(report)).toBe("recovered");
+  expect(report.gateStillInPlace).toBe(false);
+  expect(report.consistency).toEqual({ mismatched: 0, unverified: 0 });
+  const after: any = await page2.evaluate(() => (window as any).H.state());
+  expect(after.vault, "Vault byte-identical to before the repair").toEqual(before.vault);
+  expect(after.idb, "IndexedDB (records, ledger, Outbox) identical to before the repair").toBe(before.idb);
+  expect(after.other).toBe(before.other);
+  expect(await H(page2, "await H.readGate()")).toBe("finished");
+  expect(await H(page2, "await H.blocking()")).toBe(false);
+  expect(await H(page2, "await H.readOrTimeout(2000)")).toBe("ran");
+});
+
+test("real browser: an unexplained change after the crash stops the recovery; the gate stays, nothing is written, normal writes stay blocked", async ({ context }) => {
+  const { page2, saved } = await killMidRepair(context);
+  await page2.evaluate(() => (window as any).H.writeVaultFile("Memories/zz-foreign.md", "not written by the repair"));   // a foreign file inside a Tsumugi area
+  const stateBefore: any = await page2.evaluate(() => (window as any).H.state());
+  const diag: any = await page2.evaluate((t) => (window as any).H.diagnose(t), saved);
+  expect(diag.status, JSON.stringify(diag)).toBe("stopped");
+  expect(diag.reason).toMatch(/collateral/);
+  const report: any = await page2.evaluate(([t, c]) => (window as any).H.recover(t, c), [saved, diag.restorePoint.confirmPhrase]);
+  expect(report.status).toBe("stopped");
+  expect(report.gateStillInPlace).toBe(true);
+  const stateAfter: any = await page2.evaluate(() => (window as any).H.state());
+  expect(stateAfter.vault).toEqual(stateBefore.vault); expect(stateAfter.idb).toBe(stateBefore.idb);
+  expect(await H(page2, "await H.readGate()")).toBe("maintenance-open");
+  expect(await H(page2, "await H.blocking()")).toBe(true);
+  expect(await H(page2, "await H.lockHeld()")).not.toContain("tsumugi-vault-world");        // the lock was given back
+});

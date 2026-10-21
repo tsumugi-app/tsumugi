@@ -9,6 +9,7 @@ import * as win from "../../src/lib/maintenance/maintenanceWindow";
 import * as gateMod from "../../src/lib/maintenance/maintenanceGate";
 import * as journal from "../../src/lib/vaultRecoveryJournal";
 import * as sync from "../../src/lib/maintenance/scopedVaultSync";
+import * as recovery from "../../src/lib/maintenance/crashRecovery";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const NOW = "2026-10-10T00:00:00.000Z";
@@ -68,7 +69,7 @@ function run(o: { key: string; blockAt?: string; throwAt?: string; refreshCopy?:
     if (o.refreshCopy) { backupRoot = await dirAt("vault-copy"); for (const [path, text] of Object.entries(await snapshot(vaultRoot))) await writeFile(backupRoot, path, text); }
     return sessionMod.runRepairSession({
       data: DATA, key: o.key, root: vaultRoot, confirm: `REPAIR ${o.key}`, vaultBackupRoot: backupRoot,
-      persistRestorePoint: async (t: string) => t, now: () => NOW,
+      persistRestorePoint: async (t: string) => { g.__saved = t; return t; }, now: () => NOW,
       onStage: async (stage: string) => {
         if (o.blockAt === stage) { g.__reached = stage; await new Promise<void>((r) => { g.__release = r; }); }
         if (o.throwAt === stage) throw new Error("simulated-crash");
@@ -78,8 +79,17 @@ function run(o: { key: string; blockAt?: string; throwAt?: string; refreshCopy?:
   g.__p = go();
   return g.__p;
 }
+/** a tab opened after the crash: points at the SAME OPFS directories (nothing is cleared) */
+async function attach() {
+  const root = await navigator.storage.getDirectory();
+  vaultRoot = await root.getDirectoryHandle("vault"); backupRoot = await root.getDirectoryHandle("vault-copy");
+  return state();
+}
 g.H = {
-  setup, state, run, snapshot, idbDigest, NOW,
+  setup, state, run, snapshot, idbDigest, NOW, attach,
+  writeVaultFile: (p: string, t: string) => writeFile(vaultRoot, p, t),
+  diagnose: (text: string) => recovery.diagnoseCrash({ restorePointText: text, root: vaultRoot, vaultCopyRoot: backupRoot }),
+  recover: (text: string, confirm: string) => recovery.runCrashRecovery({ restorePointText: text, root: vaultRoot, vaultCopyRoot: backupRoot, confirm }),
   /** what a real tab does at startup: adopt the committed Vault epoch (without it every Vault-world operation of that tab is refused as stale) */
   initTab: () => lockMod.setTabVaultEpoch(0),
   getMemory: (id: string) => dbm.getMemoryObject(id),
