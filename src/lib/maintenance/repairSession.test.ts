@@ -35,6 +35,7 @@ const win = require(path.join(OUT, "lib/maintenance/maintenanceWindow.js")) as t
 const scopeMod = require(path.join(OUT, "lib/maintenance/precheckScope.js")) as typeof import("./precheckScope");
 const session = require(path.join(OUT, "lib/maintenance/repairSession.js")) as typeof import("./repairSession");
 const crash = require(path.join(OUT, "lib/maintenance/crashRecovery.js")) as typeof import("./crashRecovery");
+const hashMod = require(path.join(OUT, "lib/maintenance/hash.js")) as typeof import("./hash");
 const testSupport = require(path.join(OUT, "lib/maintenance/testSupport.js")) as typeof import("./testSupport");
 const FakeVault = testSupport.FakeVault;
 type FakeVault = import("./testSupport").FakeVault;
@@ -105,7 +106,7 @@ async function seedPre(keys: string[] = [R1.key], full = false) {
 const DATA = (): import("../privateRepairData").PrivateRepairData => JSON.parse(JSON.stringify(fx.D));
 async function cleanup() {
   if (win.isMaintenanceWindowOpen()) await win.endMaintenanceWindow();
-  await win.releaseStaleMaintenanceGate({ now: () => NOW });
+  await testSupport.releaseStaleMaintenanceGateForTests({ now: () => NOW });
 }
 async function world(keys: string[] = [R1.key], full = false) {
   await cleanup();
@@ -396,6 +397,12 @@ test("crash recovery refuses and KEEPS the gate when the state can not be proven
       await dbm.putMemoryObject({ ...m, updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /commit-stamp-ambiguous/],
     ["the operator's Vault copy differs from the restore point", async (w, text) => { w.backup.put(".tsumugi/index.json", "{}"); return { text }; }, /copy-differs/],
     ["the restore point file was damaged", async (_w, text) => ({ text: text.replace(/"contentHash":"[0-9a-f]{8}/, '"contentHash":"00000000') }), /content-hash/],
+    ["a restore point captured under a different gate", async (_w, text) => {
+      const { contentHash, ...body } = JSON.parse(text); void contentHash;
+      body.gateOperationId = "another-gate";
+      return { text: JSON.stringify({ ...body, contentHash: await hashMod.sha256Hex(hashMod.stableStringify(body)) }) }; }, /gate-mismatch/],
+    ["a Vault file of the scope was edited by someone else after the crash (not recorded by the interrupted window)", async (w, text) => {
+      const f = ".tsumugi/index.json"; w.vault.put(f, (w.vault.files.get(f)?.content ?? "") + "\n"); return { text }; }, /vault-unidentified/],
     ["no Vault copy was selected", async (_w, text) => ({ text, input: { vaultCopyRoot: null } }), /select-the-vault-copy/],
   ];
   for (const [label, tamper, expected] of cases) {

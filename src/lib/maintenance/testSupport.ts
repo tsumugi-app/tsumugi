@@ -1,3 +1,5 @@
+import type { GateDeps } from "./maintenanceGate";
+
 /** Test-only support: an in-memory Vault with failure / interference hooks and a Web Locks fake (shared + exclusive, FIFO, abortable). */
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-this-alias */
 export class FakeVault {
@@ -66,4 +68,34 @@ export function installFakeLocks(): FakeLockManager {
   const locks = new FakeLockManager();
   Object.defineProperty(globalThis.navigator, "locks", { value: locks, configurable: true, writable: true });
   return locks;
+}
+
+
+/**
+ * TEST ONLY. Closes a stale maintenance gate WITHOUT any recovery or verification (the production code no longer has such a function: the only
+ * release of a stale gate is `runCrashRecovery`, which closes it after a verified restore). Used to reset the gate between unit tests. Never imported by
+ * production code (asserted by maintenanceBoundary.test.ts).
+ */
+export type TestReleaseResult = { released: true } | { released: false; reason: string };
+export async function releaseStaleMaintenanceGateForTests(opts: GateDeps & { timeoutMs?: number; queryLocks?: () => Promise<{ held?: { name?: string }[]; pending?: { name?: string }[] } | null> } = {}): Promise<TestReleaseResult> {
+  // loaded lazily: this file is imported by tests that install their own IndexedDB / locks fakes first
+  /* eslint-disable-next-line @typescript-eslint/no-require-imports */
+  const { runVaultWorldExclusive } = require("../vaultWorldLock") as typeof import("../vaultWorldLock");
+  /* eslint-disable-next-line @typescript-eslint/no-require-imports */
+  const { closeMaintenanceGate } = require("./maintenanceGate") as typeof import("./maintenanceGate");
+  /* eslint-disable-next-line @typescript-eslint/no-require-imports */
+  const { VAULT_WORLD_LOCK_NAME, isMaintenanceWindowOpen } = require("./maintenanceWindow") as typeof import("./maintenanceWindow");
+  if (isMaintenanceWindowOpen()) return { released: false, reason: "window-open-in-this-tab" };
+  try {
+    const snap = await (opts.queryLocks ?? (async () => (typeof navigator !== "undefined" && (navigator as any).locks?.query ? (navigator as any).locks.query() : null)))();
+    if ([...(snap?.held ?? []), ...(snap?.pending ?? [])].some((l) => l.name === VAULT_WORLD_LOCK_NAME)) return { released: false, reason: "lock-contention" };
+  } catch { /* extra check only */ }
+  try {
+    const r = await runVaultWorldExclusive(() => closeMaintenanceGate(null, opts), opts.timeoutMs);
+    const result = r.result;
+    if (r.timedOut || !result) return { released: false, reason: "lock-unavailable" };
+    return result.closed ? { released: true } : { released: false, reason: result.reason === "no-journal" || result.reason === "not-in-progress" ? "no-maintenance-gate" : result.reason };
+  } catch (error) {
+    return { released: false, reason: `lock-error:${(error as Error)?.name ?? "error"}` };
+  }
 }

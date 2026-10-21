@@ -19,6 +19,7 @@
  */
 import type { Conversation, MemoryObject } from "../types";
 import { CONTAMINATION_REPAIR_VERSION } from "../memoryContaminationRepair";
+import { deleteMaintenanceEvidence, readMaintenanceEvidence } from "../db";
 import { hashRecord, sha256Hex } from "./hash";
 import { readGateState } from "./maintenanceGate";
 import { adoptStaleMaintenanceGate, endMaintenanceWindow, isMaintenanceWindowOpen, releaseWindowKeepingGate, runWithMaintenanceWriteAccess } from "./maintenanceWindow";
@@ -27,7 +28,7 @@ import { parseRestorePoint, summarizeRestorePoint, type RestoreEnv, type Restore
 import { createDbRestoreIdb, emptyExpectation, executeRestore, planRestore, type RestoreExpectation, type RestorePlan } from "./restoreEngine";
 import { readTextOrNull } from "./restoreGuard";
 
-export type CrashDiagnosisStatus = "no-stale-gate" | "restore-point-invalid" | "vault-copy-missing" | "vault-copy-differs" | "intact" | "restorable" | "stopped";
+export type CrashDiagnosisStatus = "no-stale-gate" | "restore-point-invalid" | "restore-point-not-for-this-gate" | "vault-copy-missing" | "vault-copy-differs" | "intact" | "restorable" | "stopped";
 export interface CrashDiagnosis {
   status: CrashDiagnosisStatus;
   /** fixed code(s) only */
@@ -64,7 +65,7 @@ async function commitStampOf(rp: RestorePoint, env: RestoreEnv): Promise<string 
   return stamps.size === 0 ? null : stamps.size === 1 ? [...stamps][0] : "ambiguous";
 }
 
-async function buildExpectation(rp: RestorePoint, env: RestoreEnv, stamp: string | null | "ambiguous", copyProvesPreState: boolean): Promise<RestoreExpectation> {
+async function buildExpectation(rp: RestorePoint, env: RestoreEnv, stamp: string | null | "ambiguous", copyProvesPreState: boolean, evidence: Record<string, string[]>): Promise<RestoreExpectation> {
   const exp = emptyExpectation();
   if (stamp !== null && stamp !== "ambiguous") {
     const pre = (v: unknown) => (v ? hashRecord(v) : Promise.resolve(null));
@@ -78,12 +79,11 @@ async function buildExpectation(rp: RestorePoint, env: RestoreEnv, stamp: string
     }
   }
   if (copyProvesPreState) {
-    // the session can only have written enumerated scope files; whatever such a file holds now is restored from the proven pre-state
+    // A scope file is explained ONLY if its current content is one the interrupted window recorded durably BEFORE writing it (write-ahead evidence,
+    // keyed by this gate). Any other content (an edit by someone else, Obsidian, a sync tool) is not explained and stops the recovery.
     for (const path of rp.scope.vaultPaths) {
-      let text: string | null;
-      try { text = await readTextOrNull(env.root, path); } catch { continue; }
-      const h = text === null ? null : await sha256Hex(text);
-      if (h !== (rp.vault.files[path]?.hash ?? null)) exp.vaultFiles[path] = [h];
+      const known = evidence[path] ?? [];
+      if (known.length > 0) exp.vaultFiles[path] = [...known];
     }
   }
   return exp;
@@ -118,13 +118,14 @@ async function analyze(input: CrashInput): Promise<{ diagnosis: CrashDiagnosis; 
   const rp = parsed.restorePoint;
   const sum = summarizeRestorePoint(rp);
   const head = { gate: { operationId: gate.operationId, openedAt: gate.openedAt }, restorePoint: { createdAt: rp.createdAt, contentHash: rp.contentHash, records: sum.records, vaultFiles: sum.vaultFiles, confirmPhrase: confirmPhraseFor(rp) } };
+  if (!rp.gateOperationId || rp.gateOperationId !== gate.operationId) return { rp, diagnosis: { ...base, ...head, status: "restore-point-not-for-this-gate", reason: rp.gateOperationId ? "gate-mismatch" : "restore-point-has-no-gate-binding" } };
   if (!input.vaultCopyRoot) return { rp, diagnosis: { ...base, ...head, status: "vault-copy-missing", reason: "select-the-vault-copy" } };
   const differs = await copyDiffers(rp, input.vaultCopyRoot);
   if (differs.length > 0) return { rp, diagnosis: { ...base, ...head, vaultCopyDiffers: differs, status: "vault-copy-differs", reason: `copy-differs:${differs.length}` } };
   const env: RestoreEnv = input.env ?? { idb: createDbRestoreIdb(), root: input.root };
   const stamp = await commitStampOf(rp, env);
   if (stamp === "ambiguous") return { rp, diagnosis: { ...base, ...head, status: "stopped", reason: "commit-stamp-ambiguous" } };
-  const exp = await buildExpectation(rp, env, stamp, true);
+  const exp = await buildExpectation(rp, env, stamp, true, await readMaintenanceEvidence(gate.operationId));
   const plan = await planRestore(rp, exp, env);
   const common = { ...base, ...head, commitStamp: stamp, plan: planSummary(plan) };
   if (plan.status === "nothing-to-restore") return { rp, diagnosis: { ...common, status: "intact", reason: "identical-to-restore-point" } };
@@ -166,7 +167,7 @@ export async function runCrashRecovery(input: CrashInput & { confirm: string }):
     if (!rp || rp.contentHash !== rp0.contentHash || (inside.status !== "intact" && inside.status !== "restorable")) {
       report = keep("stopped", rp ? inside.reason : "restore-point-lost", { diagnosis: inside });
     } else {
-      const exp = await buildExpectation(rp, env, await commitStampOf(rp, env), true);
+      const exp = await buildExpectation(rp, env, await commitStampOf(rp, env), true, await readMaintenanceEvidence(adopted.operationId));
       const r = await runWithMaintenanceWriteAccess(() => executeRestore(rp, exp, env));
       const restore = { status: r.status, failure: r.failure, vaultWritten: r.vaultWritten.length, vaultDeleted: r.vaultDeleted.length };
       if (r.status !== "restored" && r.status !== "nothing-to-restore") {
@@ -190,6 +191,7 @@ export async function runCrashRecovery(input: CrashInput & { confirm: string }):
     report = keep("incomplete", `exception:${(e as Error)?.name ?? "error"}`);
   }
   if (report.status === "recovered") {
+    try { await deleteMaintenanceEvidence(adopted.operationId); } catch { /* housekeeping only */ }
     const end = await endMaintenanceWindow();          // closes the gate: the only place that does
     if (end.ok && end.gateClosed) report.gateStillInPlace = false;
     else report = keep("incomplete", "gate-not-closed", { diagnosis: report.diagnosis, restore: report.restore, consistency: report.consistency });

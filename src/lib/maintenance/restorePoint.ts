@@ -102,6 +102,8 @@ export interface RestorePoint {
   schema: 1;
   createdAt: string;
   vaultId: string | null;
+  /** the maintenance gate (operation id) this restore point was captured under; a recovery accepts it only for that gate */
+  gateOperationId?: string | null;
   scope: RestoreScope;
   idb: {
     memories: Record<string, MemoryObject | null>;
@@ -156,7 +158,7 @@ const contentHashOf = (rp: Omit<RestorePoint, "contentHash">) => sha256Hex(stabl
  * Captures the restore point (read-only). Any part that can not be read exactly aborts the capture (`RestorePointError`): a restore point
  * with a gap would give a false sense of safety.
  */
-export async function captureRestorePoint(scope: RestoreScope, env: RestoreEnv, now: () => string = () => new Date().toISOString()): Promise<RestorePoint> {
+export async function captureRestorePoint(scope: RestoreScope, env: RestoreEnv, now: () => string = () => new Date().toISOString(), gateOperationId: string | null = null): Promise<RestorePoint> {
   const idb: RestorePoint["idb"] = { memories: {}, conversations: {}, outbox: {}, ledger: {}, settings: {}, hashes: {} };
   try {
     for (const id of scope.memoryIds) idb.memories[id] = clone(await env.idb.getMemory(id));
@@ -175,7 +177,7 @@ export async function captureRestorePoint(scope: RestoreScope, env: RestoreEnv, 
   let tree;
   try { tree = await summarizeVaultTree(env.root); } catch { throw new RestorePointError("vault-tree-unreadable"); }
   const body: Omit<RestorePoint, "contentHash"> = {
-    format: RESTORE_POINT_FORMAT, schema: 1, createdAt: now(), vaultId: await readVaultId(env.root), scope, idb,
+    format: RESTORE_POINT_FORMAT, schema: 1, createdAt: now(), vaultId: await readVaultId(env.root), gateOperationId, scope, idb,
     vault: { files, areaFiles: tree.areaFiles, dirs: tree.dirs, otherDigest: tree.otherDigest },
   };
   return { ...body, contentHash: await contentHashOf(body) };
@@ -196,6 +198,7 @@ export async function parseRestorePoint(text: string): Promise<RestorePointParse
   try { json = JSON.parse(text); } catch { return { ok: false, error: "not-json" }; }
   if (!isObj(json) || json.format !== RESTORE_POINT_FORMAT || json.schema !== 1) return { ok: false, error: "wrong-format-or-schema" };
   const { scope, idb, vault } = json as Record<string, unknown>;
+  if (json.gateOperationId !== undefined && !(json.gateOperationId === null || typeof json.gateOperationId === "string")) return { ok: false, error: "header" };
   if (typeof json.createdAt !== "string" || !(json.vaultId === null || typeof json.vaultId === "string") || typeof json.contentHash !== "string") return { ok: false, error: "header" };
   if (!isObj(scope) || !["memoryIds", "conversationIds", "outboxIds", "ledgerKeys", "settingsKeys", "vaultPaths"].every((k) => strs(scope[k]))) return { ok: false, error: "scope" };
   if (!isObj(idb) || !mapOf(idb.memories, (x) => x === null || isObj(x)) || !mapOf(idb.conversations, (x) => x === null || isObj(x)) || !mapOf(idb.outbox, (x) => x === null || isObj(x))

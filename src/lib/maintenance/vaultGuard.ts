@@ -23,7 +23,8 @@ export class GuardedVault {
   /** path -> hash of EVERY content a (successfully closed) write left in that file, in order. Lets the caller recognise exactly what it wrote itself. */
   readonly writtenHashes: Record<string, string[]> = {};
   private readonly dirs = new Set<string>();
-  constructor(private readonly real: FileSystemDirectoryHandle, private readonly allowedFiles: Set<string>) {
+  /** `beforeCommit` is awaited with the hash of the content right BEFORE each write is committed (write-ahead evidence). A write whose content can not be hashed is refused when a hook is set. */
+  constructor(private readonly real: FileSystemDirectoryHandle, private readonly allowedFiles: Set<string>, private readonly beforeCommit?: (path: string, hash: string) => Promise<void>) {
     for (const f of allowedFiles) { const parts = f.split("/"); for (let i = 1; i < parts.length; i++) this.dirs.add(parts.slice(0, i).join("/")); }
   }
   root(): FileSystemDirectoryHandle { return this.dir(this.real, ""); }
@@ -84,8 +85,14 @@ export class GuardedVault {
           async truncate(size: number) { buffered = size === 0 ? "" : null; any = true; return stream.truncate(size); },
           async seek(position: number) { buffered = null; return stream.seek(position); },
           async close() {
+            let hash: string | null = null;
+            if (buffered !== null) hash = await sha256Hex(buffered);
+            if (self.beforeCommit) {
+              if (hash === null) { await stream.abort("unrecordable-write"); throw new Error("guarded-vault: a write whose content can not be recorded is refused (" + path + ")"); }
+              await self.beforeCommit(path, hash);       // durable BEFORE the file changes; if this throws the write is not committed
+            }
             await stream.close();
-            if (buffered !== null) (self.writtenHashes[path] ??= []).push(await sha256Hex(buffered));
+            if (hash !== null) (self.writtenHashes[path] ??= []).push(hash);
           },
           async abort(reason?: unknown) { return stream.abort(reason); },
         };

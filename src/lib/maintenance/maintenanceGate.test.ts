@@ -69,7 +69,7 @@ const ledgerState = async () => {
 const everything = async (v: FakeVault) => JSON.stringify({ vault: v.snapshot(), writes: v.writeCount, outbox: await outboxState(), ledger: await ledgerState() });
 async function cleanup() {
   if (win.isMaintenanceWindowOpen()) await win.endMaintenanceWindow();
-  await win.releaseStaleMaintenanceGate({ now: () => NOW });
+  await testSupport.releaseStaleMaintenanceGateForTests({ now: () => NOW });
   delete (globalThis as any).location;
 }
 
@@ -171,7 +171,7 @@ test("a lost tab leaves the gate in place: after the lock is gone the app still 
     // a new maintenance attempt must not silently take over the stale gate
     assert.deepEqual(await win.enterMaintenanceWindow({ purpose: "again" }), { ok: false, reason: "maintenance-gate-already-open" });
     // releasing needs the exclusive lock and touches only a maintenance gate
-    assert.deepEqual(await win.releaseStaleMaintenanceGate({ now: () => NOW }), { released: true });
+    assert.deepEqual(await testSupport.releaseStaleMaintenanceGateForTests({ now: () => NOW }), { released: true });
     assert.equal(await journalMod.isRecoveryBlockingNormalWrites(), false);
     // control: with the gate gone the same writer works, so the gate was the only thing stopping it
     await vaultMod.writeMemoryObjectMarkdown(vault.root(), mems[0]);

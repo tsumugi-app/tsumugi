@@ -347,6 +347,8 @@ export interface FileProgress { path: string; state: "not-written" | "written-as
 export interface ExecuteInput {
   manifest: MaintenanceManifest; root: FileSystemDirectoryHandle; report: DryRunReport; vaultBackup: BackupVerification | null; recordBackup: BackupVerification | null;
   confirm: string; now?: () => string;
+  /** write-ahead evidence: called with (path, hash) durably BEFORE each Vault write is committed (used by the repair session for crash recovery) */
+  evidenceSink?: (path: string, hash: string) => Promise<void>;
   /** How long to wait for the Vault-world lock held by another tab (default 15 s). */
   lockTimeoutMs?: number;
 }
@@ -393,7 +395,7 @@ async function executeBody(input: ExecuteInput): Promise<ExecuteReport> {
       if (!again.ok || again.fingerprint !== report.fingerprint) return refuse("data-changed-since-dry-run");
 
       const planned = new Set(report.files.map((f) => f.path));
-      const guard = new GuardedVault(root, planned);
+      const guard = new GuardedVault(root, planned, input.evidenceSink);
       const before = await idbSnapshot();
       const treeBefore = await snapshotTree(root);
       const identity = await getVaultIdentityRecord();

@@ -97,7 +97,6 @@ g.H = {
   blocking: () => journal.isRecoveryBlockingNormalWrites(),
   enterWindow: () => win.enterMaintenanceWindow({ purpose: "single-item-repair", now: () => NOW }),
   windowOpen: () => win.isMaintenanceWindowOpen(),
-  releaseStale: () => win.releaseStaleMaintenanceGate({ now: () => NOW }),
   readOrTimeout: (ms: number) => Promise.race([lockMod.withVaultWorldRead(async () => "ran"), new Promise<string>((r) => setTimeout(() => r("blocked"), ms))]),
   lockHeld: async () => ((await navigator.locks.query()).held ?? []).map((l) => l.name),
 };

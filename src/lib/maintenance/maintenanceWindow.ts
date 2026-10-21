@@ -106,29 +106,6 @@ export async function runWithMaintenanceWriteAccess<T>(fn: () => Promise<T>): Pr
   try { return await fn(); } finally { h.scopeDepth -= 1; }
 }
 
-export type StaleReleaseResult = { released: true } | { released: false; reason: "window-open-in-this-tab" | "not-maintenance-context" | "lock-contention" | "lock-unavailable" | `lock-error:${string}` | "no-maintenance-gate" | string };
-
-/**
- * After a crash / closed tab the gate is still in place (by design). This releases it, under the exclusive Vault-world lock so that no other
- * maintenance tab is active. Only a MAINTENANCE gate is ever closed; any other journal is left alone.
- */
-export async function releaseStaleMaintenanceGate(opts: GateDeps & { timeoutMs?: number; queryLocks?: QueryLocks } = {}): Promise<StaleReleaseResult> {
-  if (held) return { released: false, reason: "window-open-in-this-tab" };
-  if (!inMaintenanceContext()) return { released: false, reason: "not-maintenance-context" };
-  try {
-    const snap = await (opts.queryLocks ?? defaultQueryLocks)();
-    if ([...(snap?.held ?? []), ...(snap?.pending ?? [])].some((l) => l.name === VAULT_WORLD_LOCK_NAME)) return { released: false, reason: "lock-contention" };
-  } catch { /* extra check only */ }
-  try {
-    const r = await runVaultWorldExclusive(() => closeMaintenanceGate(null, opts), opts.timeoutMs);
-    const result = r.result;
-    if (r.timedOut || !result) return { released: false, reason: "lock-unavailable" };
-    return result.closed ? { released: true } : { released: false, reason: result.reason === "no-journal" || result.reason === "not-in-progress" ? "no-maintenance-gate" : result.reason };
-  } catch (error) {
-    return { released: false, reason: `lock-error:${(error as Error)?.name ?? "error"}` };
-  }
-}
-
 export type AdoptResult =
   | { ok: true; operationId: string }
   | { ok: false; reason: "window-already-open" | "not-maintenance-context" | "lock-contention" | "lock-unavailable" | `lock-error:${string}` | "no-stale-gate" };

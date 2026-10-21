@@ -140,3 +140,15 @@ test("Memory write surface: only the reviewed production files write Memory reco
   assert.deepEqual(storeUsers.sort(), ["components/ChatScreen.tsx", "lib/androidDiagnostics.ts", "lib/vaultRecovery.ts"],
     "a new file names the raw memoryObjects store: review it and update the list");
 });
+
+test("the only release of a stale maintenance gate is the verified crash recovery: no exported release function, closeMaintenanceGate is used by the window only, testSupport is never imported by production code", () => {
+  const files: string[] = [];
+  const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/\.(ts|tsx)$/.test(e.name) && !/\.test\.ts$/.test(e.name)) files.push(p); } };
+  walk(SRC);
+  const rel = (p: string) => path.relative(SRC, p).split(path.sep).join("/");
+  const code = (p: string) => strip(fs.readFileSync(p, "utf8"));
+  assert.deepEqual(files.filter((p) => /releaseStale\w*\s*[(:=]|export (async )?function releaseStale/.test(code(p)) && rel(p) !== "lib/maintenance/testSupport.ts").map(rel), [], "no production release function");
+  assert.deepEqual(files.filter((p) => /\bcloseMaintenanceGate\b/.test(code(p))).map(rel).sort(), ["lib/maintenance/maintenanceGate.ts", "lib/maintenance/maintenanceWindow.ts", "lib/maintenance/testSupport.ts"],
+    "only the window (end of a verified window) and test support close a gate");
+  assert.deepEqual(files.filter((p) => /["']\.\/testSupport["']|maintenance\/testSupport["']/.test(code(p))).map(rel), [], "test support is test-only");
+});

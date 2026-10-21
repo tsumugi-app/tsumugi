@@ -1557,6 +1557,35 @@ export async function readMemoryRepairSettings(keys: string[]): Promise<Record<s
 }
 
 /**
+ * Maintenance write-ahead evidence (src/lib/maintenance/*): the hash of every content a maintenance window is ABOUT to write to a Vault file, kept
+ * durably BEFORE the write, so a recovery after a dead tab can tell "written by that window" from "changed by someone else". One settings value per
+ * window (key = `maintenance-evidence:<operation id>`, JSON {path: [hashes]}); holds hashes only, never content. Read-modify-write in one transaction.
+ */
+export const maintenanceEvidenceKey = (operationId: string) => `maintenance-evidence:${operationId}`;
+export async function appendMaintenanceEvidence(operationId: string, path: string, hash: string): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(["settings"], "readwrite");
+  try {
+    const store = tx.objectStore("settings");
+    const cur = await store.get(maintenanceEvidenceKey(operationId));
+    const map = (typeof cur === "string" ? JSON.parse(cur) : {}) as Record<string, string[]>;
+    const list = (map[path] ??= []);
+    if (!list.includes(hash)) list.push(hash);
+    await store.put(JSON.stringify(map), maintenanceEvidenceKey(operationId));
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+}
+export async function readMaintenanceEvidence(operationId: string): Promise<Record<string, string[]>> {
+  const db = await getDB();
+  const cur = await db.get("settings", maintenanceEvidenceKey(operationId));
+  try { return typeof cur === "string" ? (JSON.parse(cur) as Record<string, string[]>) : {}; } catch { return {}; }
+}
+export async function deleteMaintenanceEvidence(operationId: string): Promise<void> {
+  const db = await getDB();
+  await db.delete("settings", maintenanceEvidenceKey(operationId));
+}
+
+/**
  * Maintenance strict restore (src/lib/maintenance/restoreEngine.ts). Never called by startup, projection or any normal screen.
  * ONE transaction over every store the repair + sync touch. Each entry names the value it expects to find RIGHT NOW (compared as JSON, no
  * await on anything but IndexedDB inside the transaction); if any entry differs nothing at all is written. `target: null` deletes.

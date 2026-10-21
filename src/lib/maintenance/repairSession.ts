@@ -16,6 +16,7 @@
  */
 import type { Conversation, MemoryObject } from "../types";
 import {
+  appendMaintenanceEvidence, deleteMaintenanceEvidence,
   getAllConversations, getAllMemoryObjects, getDoneVaultOutboxEntries, getHeldVaultOutboxEntries, getPendingVaultOutboxEntries, readMemoryRepairSettings,
 } from "../db";
 import { isReflection, planRepairItem, repairLedgerKey, repairRollbackLedgerKey } from "../memoryContaminationRepair";
@@ -119,13 +120,15 @@ export async function runRepairSession(input: RepairSessionInput): Promise<Repai
   const entered = await enterMaintenanceWindow({ purpose: "single-item-repair", timeoutMs: input.lockTimeoutMs, now });
   if (!entered.ok) return refused(`window:${entered.reason}`);
   let report: RepairSessionReport;
-  try { report = await inWindow(input, spec, stages, now); }
+  try { report = await inWindow(input, spec, stages, now, entered.operationId); }
   catch (e) { report = { status: "needs-review", reason: `unexpected:${(e as Error)?.name ?? "error"}`, stages, windowOpen: true, gateClosed: false, problems: [] }; }
   // finished cleanly (nothing written, fully restored, or completed and verified): close the gate and release the lock. Otherwise KEEP both.
   if (report.status === "completed" || report.status === "refused" || report.status === "rolled-back") {
     if (isMaintenanceWindowOpen()) {
+      const opId = entered.operationId;
       const end = await endMaintenanceWindow();
       report.gateClosed = end.ok && end.gateClosed; report.windowOpen = !end.ok;
+      if (report.gateClosed) { try { await deleteMaintenanceEvidence(opId); } catch { /* evidence of a finished window is only housekeeping */ } }
       if (!report.gateClosed) {
         // the lock may be gone but the durable journal still blocks the normal app: never report a clean "completed" in that state
         report.gateStuck = true;
@@ -137,7 +140,7 @@ export async function runRepairSession(input: RepairSessionInput): Promise<Repai
   return report;
 }
 
-async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repair"]["items"][number], stages: string[], now: () => string): Promise<RepairSessionReport> {
+async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repair"]["items"][number], stages: string[], now: () => string, gateOperationId: string): Promise<RepairSessionReport> {
   const done = async (stage: string) => { stages.push(stage); await input.onStage?.(stage); };
   const fail = (status: RepairSessionStatus, reason: string, extra: Partial<RepairSessionReport> = {}): RepairSessionReport => ({ status, reason, stages, windowOpen: true, gateClosed: false, problems: [], ...extra });
   const env: RestoreEnv = { idb: createDbRestoreIdb(), root: input.root };
@@ -173,7 +176,7 @@ async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repa
     conversationFilePaths: await readIndexedConversationPaths(input.root, conversations.map((c) => c.id)),
   });
   // the operator's Vault copy must be byte-identical for every existing file the operation may touch (checked BEFORE any write)
-  const rp = await captureRestorePoint(scope, env, now);
+  const rp = await captureRestorePoint(scope, env, now, gateOperationId);
   for (const [path, file] of Object.entries(rp.vault.files)) {
     if (!file) continue;
     let copy: string | null;
@@ -230,7 +233,7 @@ async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repa
     const recordBackup = await verifyRecordBackup(await exportRecordBackup(dry), dry);
     if (!vaultBackup.ok || !recordBackup.ok) return await rollback("backups-not-verified", [...vaultBackup.problems, ...recordBackup.problems]);
     await done("backups-verified");
-    lastSync = await executeSyncLocked({ manifest, root: input.root, report: dry, vaultBackup, recordBackup, confirm: `SYNC ${dry.preflight.targets.length}`, now });
+    lastSync = await executeSyncLocked({ manifest, root: input.root, report: dry, vaultBackup, recordBackup, confirm: `SYNC ${dry.preflight.targets.length}`, now, evidenceSink: (p, h) => appendMaintenanceEvidence(gateOperationId, p, h) });
     syncSummary = { ok: lastSync.ok, refused: lastSync.refused, stoppedAt: lastSync.stoppedAt };
     if (!lastSync.ok) return await rollback(lastSync.refused ? `sync-refused:${lastSync.refused}` : "sync-failed", lastSync.verification.predictedVsActual);
     await done("synced");

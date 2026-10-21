@@ -109,19 +109,26 @@ test("real browser: a failure right after the repair commit restores IndexedDB (
   expect(after.vault).toEqual(before.vault); expect(after.idb).toBe(before.idb); expect(after.other).toBe(before.other);
 });
 
-test("real browser: closing the tab in the middle of the window frees the Web Lock but the durable gate stays; another tab sees it and can release it deliberately", async ({ context }) => {
+test("real browser: closing the tab in the middle of the window frees the Web Lock but the durable gate stays; there is NO way to release it without the verified recovery", async ({ context }) => {
   const page1 = await tab(context);
-  await page1.evaluate((p) => (window as any).H.setup(p), payload(["R1"]));
+  const before: any = await page1.evaluate((p) => (window as any).H.setup(p), payload(["R1"]));
   await page1.evaluate(() => { (window as any).H.run({ key: "R1", blockAt: "repair-committed" }); });
   await page1.waitForFunction(() => (window as any).__reached === "repair-committed");
+  const saved: string = await page1.evaluate(() => (window as any).__saved);
   const page2 = await tab(context);
   expect(await H<string[]>(page2, "await H.lockHeld()")).toContain("tsumugi-vault-world");
   await page1.close();                                                                       // the tab dies mid-window
   await expect.poll(async () => (await H<string[]>(page2, "await H.lockHeld()")).includes("tsumugi-vault-world"), { timeout: 10_000 }).toBe(false);
   expect(await H(page2, "await H.blocking()")).toBe(true);                                   // the gate survives the crash: normal writes stay blocked
   expect(await H(page2, "await H.readGate()")).toBe("maintenance-open");
-  const released: any = await H(page2, "await H.releaseStale()");
-  expect(released.released, JSON.stringify(released)).toBe(true);
+  expect(await page2.evaluate(() => typeof (window as any).H.releaseStale)).toBe("undefined");   // the harness (= the production modules) exposes no bare release
+  await page2.evaluate(() => (window as any).H.attach());
+  const diag: any = await page2.evaluate((t) => (window as any).H.diagnose(t), saved);
+  expect(diag.status, JSON.stringify(diag)).toBe("restorable");                              // IndexedDB was repaired, the Vault untouched
+  const report: any = await page2.evaluate(([t, c]) => (window as any).H.recover(t, c), [saved, diag.restorePoint.confirmPhrase]);
+  expect(report.status, JSON.stringify(report)).toBe("recovered");
+  const after: any = await page2.evaluate(() => (window as any).H.state());
+  expect(after.idb).toBe(before.idb); expect(after.vault).toEqual(before.vault);
   expect(await H(page2, "await H.blocking()")).toBe(false);
 });
 
