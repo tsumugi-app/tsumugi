@@ -408,6 +408,9 @@ test("crash recovery refuses and KEEPS the gate when the state can not be proven
       return { text: JSON.stringify({ ...body, contentHash: await hashMod.sha256Hex(hashMod.stableStringify(body)) }) }; }, /gate-mismatch/],
     ["a Vault file of the scope was edited by someone else after the crash (not recorded by the interrupted window)", async (w, text) => {
       const f = ".tsumugi/index.json"; w.vault.put(f, (w.vault.files.get(f)?.content ?? "") + "\n"); return { text }; }, /vault-unidentified/],
+    ["an Outbox entry of the scope was turned into 'held' after the crash (HOLD state is never repair-produced)", async (w, text) => {
+      const e = (await dbm.getVaultOutboxEntry(`memory:${R1.memoryId}`))!;
+      await dbm.putVaultOutboxEntry({ ...e, status: "held", heldReason: "someone-held-it" } as any); return { text }; }, /outbox-unidentified/],
     ["no Vault copy was selected", async (_w, text) => ({ text, input: { vaultCopyRoot: null } }), /select-the-vault-copy/],
   ];
   for (const [label, tamper, expected] of cases) {
@@ -428,6 +431,28 @@ test("crash recovery refuses and KEEPS the gate when the state can not be proven
       assert.equal(win.isMaintenanceWindowOpen(), false, "the lock was given back");
     } finally { await cleanup(); }
   }
+});
+
+test("crash recovery re-checks every Vault file immediately before writing it: a file edited after the plan is NEVER overwritten (recovery stops, the gate stays)", async () => {
+  const w = await world();
+  try {
+    const text = await crashAt(w, "synced");
+    const diag0 = await crash.diagnoseCrash(recoverInput(w, text));
+    assert.equal(diag0.status, "restorable", JSON.stringify(diag0));
+    const changed = Object.keys(w.vault.snapshot()).filter((p) => w.vault.snapshot()[p] !== (w.backup.snapshot()[p] ?? null)).sort();
+    assert.ok(changed.length >= 2, "the sync changed at least two files: " + changed.join(","));
+    const victim = changed[changed.length - 1];                      // restored last
+    let touched = false;
+    w.vault.afterWrite = (p) => { if (!touched && p !== victim) { touched = true; w.vault.put(victim, "EDITED BY ANOTHER PROGRAM AFTER THE PLAN"); } };
+    const report = await crash.runCrashRecovery({ ...recoverInput(w, text), confirm: await phraseOf(w, text) });
+    w.vault.afterWrite = null;
+    assert.equal(touched, true);
+    assert.notEqual(report.status, "recovered", JSON.stringify(report));
+    assert.equal(report.gateStillInPlace, true);
+    assert.match(report.reason, /restore:vault-incomplete/);
+    assert.equal(w.vault.snapshot()[victim], "EDITED BY ANOTHER PROGRAM AFTER THE PLAN", "the concurrent edit was not overwritten");
+    await stillBlocked();
+  } finally { await cleanup(); }
 });
 
 test("crash recovery: with no stale gate there is nothing to recover and nothing is touched", async () => {

@@ -55,6 +55,8 @@ export interface RestoreExpectation {
   records: Record<string, string[]>;
   /** record id -> every `updatedAt` the operation may have written (accepted for that record's Outbox entries and sync ledger) */
   updatedAts: Record<string, string[]>;
+  /** optional, per Outbox entry id: besides the version (`updatedAts`) the entry must be in one of these statuses and must not be held (a held / re-held entry is never explained by the operation) */
+  outboxRules?: Record<string, { statuses: string[] }>;
 }
 export const emptyExpectation = (): RestoreExpectation => ({ vaultFiles: {}, records: {}, updatedAts: {} });
 
@@ -71,8 +73,9 @@ export interface RestorePlan {
   work: PlanWork;
 }
 interface PlanWork {
-  writes: { path: string; content: string; hash: string }[];
-  deletes: { path: string }[];
+  /** `seen` = the hash of the file when it was classified: the executor re-checks it immediately before touching the file (compare-and-swap) */
+  writes: { path: string; content: string; hash: string; seen: string | null }[];
+  deletes: { path: string; seen: string | null }[];
   tx: MaintenanceRestoreTransaction;
   createdDirs: string[];
 }
@@ -120,7 +123,9 @@ export async function planRestore(rp: RestorePoint, expectation: RestoreExpectat
     const cur = await env.idb.getOutbox(id); const before = (pre.outbox[id] ?? null) as VaultOutboxEntry | null;
     if (same(cur, before)) { records.push({ key: `outbox:${id}`, verdict: "pre" }); continue; }
     const recordId = id.slice(id.indexOf(":") + 1);
-    if (cur === null || knownUpdatedAts(recordId).has(cur.recordUpdatedAt)) { records.push({ key: `outbox:${id}`, verdict: "restore" }); work.tx.outbox.push({ id, expectCurrent: cur, target: before }); }
+    const rule = expectation.outboxRules?.[id];
+    const ruleOk = !rule || cur === null || (rule.statuses.includes(cur.status) && !cur.heldReason);
+    if (cur === null || (knownUpdatedAts(recordId).has(cur.recordUpdatedAt) && ruleOk)) { records.push({ key: `outbox:${id}`, verdict: "restore" }); work.tx.outbox.push({ id, expectCurrent: cur, target: before }); }
     else { records.push({ key: `outbox:${id}`, verdict: "unidentified" }); stop.push(`outbox-unidentified:${id.split(":")[0]}:${tail(recordId)}`); }
   }
   for (const key of rp.scope.ledgerKeys) {
@@ -149,9 +154,9 @@ export async function planRestore(rp: RestorePoint, expectation: RestoreExpectat
     const preHash = before ? before.hash : null;
     if (curHash === preHash) { vault.push({ path, verdict: "pre", action: "none" }); continue; }
     if ((expectation.vaultFiles[path] ?? []).includes(curHash)) {
-      if (before) { vault.push({ path, verdict: "restore", action: "write" }); work.writes.push({ path, content: before.content, hash: before.hash }); }
+      if (before) { vault.push({ path, verdict: "restore", action: "write" }); work.writes.push({ path, content: before.content, hash: before.hash, seen: curHash }); }
       else {
-        vault.push({ path, verdict: "restore", action: "delete" }); work.deletes.push({ path });
+        vault.push({ path, verdict: "restore", action: "delete" }); work.deletes.push({ path, seen: curHash });
         const parts = path.split("/"); for (let i = 1; i < parts.length; i++) createdDirCandidates.add(parts.slice(0, i).join("/"));
       }
     } else { vault.push({ path, verdict: "unidentified", action: "none" }); stop.push(`vault-unidentified:${path}`); }
@@ -213,13 +218,20 @@ export async function executeRestore(rp: RestorePoint, expectation: RestoreExpec
   });
   const root = guard.root();
   try {
+    const unchangedSincePlan = async (path: string, seen: string | null) => {
+      let now: string | null;
+      try { now = await readTextOrNull(env.root, path); } catch { return false; }
+      return (now === null ? null : await sha256Hex(now)) === seen;
+    };
     for (const w of plan.work.writes) {
+      if (!(await unchangedSincePlan(w.path, w.seen))) throw new Error("changed-since-plan");   // someone touched the file after it was classified: never overwrite it
       await writeText(root, w.path, w.content);
       const back = await readTextOrNull(env.root, w.path);
       if (back === null || (await sha256Hex(back)) !== w.hash) throw new Error("read-back-differs");
       base.vaultWritten.push(w.path);
     }
     for (const d of plan.work.deletes) {
+      if (!(await unchangedSincePlan(d.path, d.seen))) throw new Error("changed-since-plan");
       await removeFile(root, d.path);
       if ((await readTextOrNull(env.root, d.path)) !== null) throw new Error("still-present");
       base.vaultDeleted.push(d.path);

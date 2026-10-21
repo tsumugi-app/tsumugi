@@ -84,6 +84,8 @@ async function buildExpectation(rp: RestorePoint, env: RestoreEnv, images: Commi
     for (const id of rp.scope.memoryIds) { const img = images.memories[id] ?? images.added[id]; if (img) await accept("memory", id, img); }
     for (const id of rp.scope.conversationIds) { const img = images.conversations[id]; if (img) await accept("conversation", id, img); }
   }
+  // an Outbox entry of the scope is explained only as the repair's own version AND only as pending / done, never held (HOLD state is never repair-produced)
+  exp.outboxRules = Object.fromEntries(rp.scope.outboxIds.map((id) => [id, { statuses: ["pending", "done"] }]));
   if (copyProvesPreState) {
     // A scope file is explained ONLY if its current content is one the interrupted window recorded durably BEFORE writing it (write-ahead evidence,
     // keyed by this gate). Any other content (an edit by someone else, Obsidian, a sync tool) is not explained and stops the recovery.
