@@ -152,3 +152,13 @@ test("the only release of a stale maintenance gate is the verified crash recover
     "only the window (end of a verified window) and test support close a gate");
   assert.deepEqual(files.filter((p) => /["']\.\/testSupport["']|maintenance\/testSupport["']/.test(code(p))).map(rel), [], "test support is test-only");
 });
+
+test("a stale gate can only be adopted and closed by the crash recovery (static): nothing else uses adoptStaleMaintenanceGate / closeAdoptedWindowAfterVerifiedRecovery", () => {
+  const files: string[] = [];
+  const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/\.(ts|tsx)$/.test(e.name) && !/\.test\.ts$/.test(e.name)) files.push(p); } };
+  walk(SRC);
+  const rel = (p: string) => path.relative(SRC, p).split(path.sep).join("/");
+  const users = (name: string) => files.filter((p) => new RegExp("\\b" + name + "\\b").test(strip(fs.readFileSync(p, "utf8")))).map(rel).sort();
+  assert.deepEqual(users("adoptStaleMaintenanceGate"), ["lib/maintenance/crashRecovery.ts", "lib/maintenance/maintenanceWindow.ts"]);
+  assert.deepEqual(users("closeAdoptedWindowAfterVerifiedRecovery"), ["lib/maintenance/crashRecovery.ts", "lib/maintenance/maintenanceWindow.ts"]);
+});

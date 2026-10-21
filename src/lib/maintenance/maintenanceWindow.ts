@@ -43,7 +43,7 @@ export type EnterResult =
   | { ok: true; operationId: string }
   | { ok: false; reason: "window-already-open" | "not-maintenance-context" | "lock-contention" | "lock-unavailable" | `lock-error:${string}` | Extract<GateOpenResult, { ok: false }>["reason"] };
 
-interface Held { operationId: string; release: () => void; settled: Promise<unknown>; scopeDepth: number; deps: GateDeps }
+interface Held { operationId: string; release: () => void; settled: Promise<unknown>; scopeDepth: number; deps: GateDeps; /** a window that adopted a stale gate: only the verified crash recovery may close it */ adopted?: boolean }
 let held: Held | null = null;
 
 /** In a browser the page must be under /maintenance. Outside a browser (unit tests) there is no location to check. */
@@ -84,13 +84,26 @@ export async function enterMaintenanceWindow(opts: EnterOptions): Promise<EnterR
   return { ok: true, operationId: gate.operationId };
 }
 
-export type EndResult = { ok: true; gateClosed: true } | { ok: false; reason: "no-window" | "write-scope-active" } | { ok: true; gateClosed: false; reason: string };
+export type EndResult = { ok: true; gateClosed: true } | { ok: false; reason: "no-window" | "write-scope-active" | "adopted-window-needs-verified-recovery" } | { ok: true; gateClosed: false; reason: string };
 
 /** Closes the gate, then releases the lock. If the gate can not be closed it STAYS closed to the app (safe) and is reported. */
 export async function endMaintenanceWindow(): Promise<EndResult> {
   const h = held;
   if (!h) return { ok: false, reason: "no-window" };
+  if (h.adopted) return { ok: false, reason: "adopted-window-needs-verified-recovery" };   // a stale gate is closed by the verified recovery only
   if (h.scopeDepth > 0) return { ok: false, reason: "write-scope-active" };
+  return closeHeldWindow(h);
+}
+
+/** Closes the gate of an ADOPTED window. Called only by the crash recovery, and only after its verification succeeded (asserted by maintenanceBoundary.test.ts). */
+export async function closeAdoptedWindowAfterVerifiedRecovery(): Promise<EndResult> {
+  const h = held;
+  if (!h || !h.adopted) return { ok: false, reason: "no-window" };
+  if (h.scopeDepth > 0) return { ok: false, reason: "write-scope-active" };
+  return closeHeldWindow(h);
+}
+
+async function closeHeldWindow(h: Held): Promise<EndResult> {
   const closed = await closeMaintenanceGate(h.operationId, h.deps);
   held = null; setMaintenanceWriteAccessProbe(null);
   h.release(); await h.settled;
@@ -133,7 +146,7 @@ export async function adoptStaleMaintenanceGate(opts: GateDeps & { timeoutMs?: n
   }
   const state = await readGateState(opts.store);
   if (state.kind !== "maintenance-open") { releaseHold(); await settled; return { ok: false, reason: "no-stale-gate" }; }
-  held = { operationId: state.operationId, release: releaseHold, settled, scopeDepth: 0, deps: opts };
+  held = { operationId: state.operationId, release: releaseHold, settled, scopeDepth: 0, deps: opts, adopted: true };
   setMaintenanceWriteAccessProbe(permitted);
   return { ok: true, operationId: state.operationId };
 }

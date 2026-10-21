@@ -433,6 +433,20 @@ test("crash recovery refuses and KEEPS the gate when the state can not be proven
   }
 });
 
+test("an adopted stale gate can not be closed with the generic endMaintenanceWindow: it refuses, the gate and the lock-free state stay until a verified recovery", async () => {
+  const w = await world();
+  try {
+    await crashAt(w, "synced");
+    const adopted = await win.adoptStaleMaintenanceGate();
+    assert.equal(adopted.ok, true, JSON.stringify(adopted));
+    const end = await win.endMaintenanceWindow();
+    assert.deepEqual(end, { ok: false, reason: "adopted-window-needs-verified-recovery" });
+    await stillBlocked();
+    assert.equal((await win.releaseWindowKeepingGate()).ok, true);          // the lock is given back, the gate stays
+    await stillBlocked();
+  } finally { await cleanup(); }
+});
+
 test("crash recovery re-checks every Vault file immediately before writing it: a file edited after the plan is NEVER overwritten (recovery stops, the gate stays)", async () => {
   const w = await world();
   try {

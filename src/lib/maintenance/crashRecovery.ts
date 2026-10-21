@@ -21,7 +21,7 @@ import type { Conversation, MemoryObject } from "../types";
 import { deleteMaintenanceEvidence, readMaintenanceEvidence } from "../db";
 import { hashRecord, sha256Hex } from "./hash";
 import { readGateState } from "./maintenanceGate";
-import { adoptStaleMaintenanceGate, endMaintenanceWindow, isMaintenanceWindowOpen, releaseWindowKeepingGate, runWithMaintenanceWriteAccess } from "./maintenanceWindow";
+import { adoptStaleMaintenanceGate, closeAdoptedWindowAfterVerifiedRecovery, isMaintenanceWindowOpen, releaseWindowKeepingGate, runWithMaintenanceWriteAccess } from "./maintenanceWindow";
 import { diagnoseVaultForPrecheck } from "./precheckScope";
 import { parseRestorePoint, summarizeRestorePoint, type RestoreEnv, type RestorePoint } from "./restorePoint";
 import { createDbRestoreIdb, emptyExpectation, executeRestore, planRestore, type RestoreExpectation, type RestorePlan } from "./restoreEngine";
@@ -201,7 +201,7 @@ export async function runCrashRecovery(input: CrashInput & { confirm: string }):
   }
   if (report.status === "recovered") {
     try { await deleteMaintenanceEvidence(adopted.operationId); } catch { /* housekeeping only */ }
-    const end = await endMaintenanceWindow();          // closes the gate: the only place that does
+    const end = await closeAdoptedWindowAfterVerifiedRecovery();   // closes the gate: the only place that does
     if (end.ok && end.gateClosed) report.gateStillInPlace = false;
     else report = keep("incomplete", "gate-not-closed", { diagnosis: report.diagnosis, restore: report.restore, consistency: report.consistency });
   } else if (isMaintenanceWindowOpen()) {
