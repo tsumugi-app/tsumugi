@@ -25,8 +25,8 @@ jobs:
               "@codex review",
               "",
               "On-demand independent review of " + sha + ". Review-only: no merge, no deploy, no production data.",
-              "Focus on the newest changes: crash recovery (src/lib/maintenance/crashRecovery.ts, adoptStaleMaintenanceGate in maintenanceWindow.ts, the panel step 8),",
-              "whether the maintenance gate can ever be released without a verified restore, whether the restore can overwrite data it cannot explain,",
-              "and Outbox / HOLD / protected-data non-mutation.",
+              "Focus on the newest changes: (1) the storage-layer Memory lineage invariant in src/lib/db.ts (assertMemoryLineage, MemoryLineageViolationError) and whether ANY writer of the Memory store can still replace a stored Memory with one from another conversation;",
+              "(2) restore-from-Vault writers that must never replace newer local data (restore*IfNotNewer) and the ChatScreen swap; (3) compare-and-set on Vault apply (putMemoryObjectAndMarkSynced / putConversationAndMarkSynced with the expected version in src/lib/vault.ts);",
+              "(4) the crash recovery and maintenance session (src/lib/maintenance/*), Outbox / HOLD / protected-data non-mutation. Report only real defects with a concrete failure scenario.",
             ].join("\n");
             await github.rest.issues.createComment({ owner, repo, issue_number: prs.data[0].number, body });
