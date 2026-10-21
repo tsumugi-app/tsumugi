@@ -393,22 +393,33 @@ test("lineage invariant: NO writer can replace a stored Memory with one from ano
   assert.equal((await dbMod.getMemoryObject("lin-2"))?.conversationId, "conv-B");
 });
 
-test("restore from the Vault never replaces newer local data with an older Vault copy (conversation, Memory, Source); equal or newer copies are written", async () => {
+test("restore from the Vault replaces a stored record only with a strictly newer version IN TIME; older, equal-but-different and unparseable versions keep the local record (conversation, Memory, Source)", async () => {
   const newer = "2026-09-01T00:00:00.000Z", older = "2026-01-01T00:00:00.000Z";
   await dbMod.putConversationWithOutbox({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "local newer", timestamp: newer }] } as Conversation);
-  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-1", older)), "kept-newer");
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-1", older)), "kept-local");
   assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "local newer");
-  assert.equal(await dbMod.restoreConversationIfNotNewer({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "same version", timestamp: newer }] } as Conversation), "written");
-  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "same version");
+  // same version, different content: a local-only change must survive (kept), never be overwritten
+  assert.equal(await dbMod.restoreConversationIfNotNewer({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "same version, other content", timestamp: newer }] } as Conversation), "kept-local");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "local newer");
+  assert.equal(await dbMod.restoreConversationIfNotNewer({ ...conversation("rc-1", "2027-01-01T00:00:00.000Z"), turns: [{ role: "user", content: "strictly newer", timestamp: newer }] } as Conversation), "written");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "strictly newer");
   assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-new", older)), "written");   // nothing stored: written
+  // timestamps with different UTC offsets are ordered as instants, not as strings
+  await dbMod.putConversationWithOutbox(conversation("rc-tz", "2025-12-31T23:30:00-02:00"));          // = 2026-01-01T01:30Z
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-tz", "2026-01-01T00:00:00Z")), "kept-local", "00:00Z is OLDER than 01:30Z");
+  assert.equal((await dbMod.getConversation("rc-tz"))?.updatedAt, "2025-12-31T23:30:00-02:00");
+  // an unparseable timestamp fails closed
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-tz", "not-a-time")), "kept-local");
+  assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-01-01T00:00:00Z" }, { updatedAt: "garbage" }), false);
 
   await dbMod.putMemoryObject({ ...fromConversation("rm-1", "c1", newer), content: "local newer memory" });
-  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", older)), "kept-newer");
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", older)), "kept-local");
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer({ ...fromConversation("rm-1", "c1", newer), revisitPrompt: undefined, content: "stale vault copy" }), "kept-local", "equal version, different content");
   assert.equal((await dbMod.getMemoryObject("rm-1"))?.content, "local newer memory");
   assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", "2026-12-01T00:00:00.000Z")), "written");
 
   await dbMod.saveSource({ ...source("rs-1", newer), content: "local newer source" } as Source);
-  assert.equal(await dbMod.restoreSourceIfNotNewer(source("rs-1", older)), "kept-newer");
+  assert.equal(await dbMod.restoreSourceIfNotNewer(source("rs-1", older)), "kept-local");
   assert.equal((await dbMod.getSource("rs-1"))?.content, "local newer source");
 });
 

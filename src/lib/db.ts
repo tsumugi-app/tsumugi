@@ -257,47 +257,38 @@ export async function putMemoryObject(memoryObject: MemoryObject) {
 }
 
 /**
- * Restore-from-Vault writers (the user pressed "restore"): they never replace a stored record with an OLDER version ("kept-newer"), so a stale Vault copy can
- * not silently discard newer local data. Equal or newer versions are written. A Memory also passes the lineage invariant.
+ * Restore-from-Vault writers (the user pressed "restore"). A stored record is replaced ONLY by a version that is strictly newer IN TIME (timestamps are
+ * parsed, never compared as strings, so different UTC offsets order correctly); a record that is identical is left as it is; anything else is kept:
+ * an older copy, a copy with the SAME version but different content (a local-only change such as a revisit prompt does not advance `updatedAt`),
+ * and a copy whose timestamp can not be parsed (fail closed). A Memory also passes the lineage invariant. Nothing local is silently discarded.
  */
-export type RestoreWriteResult = "written" | "kept-newer";
-export async function restoreConversationIfNotNewer(conversation: Conversation): Promise<RestoreWriteResult> {
+export type RestoreWriteResult = "written" | "kept-local";
+const instantOf = (iso: unknown): number | null => { const t = typeof iso === "string" ? Date.parse(iso) : NaN; return Number.isFinite(t) ? t : null; };
+/** true only when `incoming` is strictly newer than `stored` as a point in time; equal, older or unparseable => false */
+export function isStrictlyNewerVersion(stored: { updatedAt: string }, incoming: { updatedAt: string }): boolean {
+  const a = instantOf(stored.updatedAt), b = instantOf(incoming.updatedAt);
+  return a !== null && b !== null && b > a;
+}
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+async function restoreIfNotNewer<T extends { id: string; updatedAt: string }>(store: "conversations" | "memoryObjects" | "sources", record: T, check?: (stored: T | undefined) => void): Promise<RestoreWriteResult> {
   const db = await getDB();
-  const tx = db.transaction(["conversations"], "readwrite");
+  const tx = db.transaction([store], "readwrite");
   let result: RestoreWriteResult = "written";
   try {
-    const stored = await tx.objectStore("conversations").get(conversation.id);
-    if (stored && stored.updatedAt > conversation.updatedAt) result = "kept-newer";
-    else await tx.objectStore("conversations").put(conversation);
+    const os = tx.objectStore(store) as unknown as { get(id: string): Promise<T | undefined>; put(v: T): Promise<unknown> };
+    const stored = await os.get(record.id);
+    check?.(stored);
+    if (stored === undefined) await os.put(record);
+    else if (sameJson(stored, record)) result = "written";             // identical: nothing to do
+    else if (isStrictlyNewerVersion(stored, record)) await os.put(record);
+    else result = "kept-local";
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
   return result;
 }
-export async function restoreMemoryObjectIfNotNewer(memoryObject: MemoryObject): Promise<RestoreWriteResult> {
-  const db = await getDB();
-  const tx = db.transaction(["memoryObjects"], "readwrite");
-  let result: RestoreWriteResult = "written";
-  try {
-    const stored = await tx.objectStore("memoryObjects").get(memoryObject.id);
-    assertMemoryLineage(stored, memoryObject);
-    if (stored && stored.updatedAt > memoryObject.updatedAt) result = "kept-newer";
-    else await tx.objectStore("memoryObjects").put(memoryObject);
-  } catch (error) { await abortAndSettleTransaction(tx, error); }
-  await tx.done;
-  return result;
-}
-export async function restoreSourceIfNotNewer(source: Source): Promise<RestoreWriteResult> {
-  const db = await getDB();
-  const tx = db.transaction(["sources"], "readwrite");
-  let result: RestoreWriteResult = "written";
-  try {
-    const stored = await tx.objectStore("sources").get(source.id);
-    if (stored && stored.updatedAt > source.updatedAt) result = "kept-newer";
-    else await tx.objectStore("sources").put(source);
-  } catch (error) { await abortAndSettleTransaction(tx, error); }
-  await tx.done;
-  return result;
-}
+export const restoreConversationIfNotNewer = (conversation: Conversation) => restoreIfNotNewer("conversations", conversation);
+export const restoreMemoryObjectIfNotNewer = (memoryObject: MemoryObject) => restoreIfNotNewer("memoryObjects", memoryObject, (stored) => assertMemoryLineage(stored, memoryObject));
+export const restoreSourceIfNotNewer = (source: Source) => restoreIfNotNewer("sources", source);
 
 export async function getAllMemoryObjects() {
   const db = await getDB();
