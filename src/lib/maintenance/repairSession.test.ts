@@ -199,6 +199,21 @@ test("session refusals happen BEFORE any repair write: wrong confirmation, no ba
   }
 });
 
+test("an unexpected failure BEFORE the first write (here: after the restore point was verified) closes the window and the gate; nothing is left stale", async () => {
+  const w = await world();
+  try {
+    for (const stage of ["prechecked", "vault-backup-checked", "restore-point-verified"]) {
+      const report = await run(w, { onStage: async (s) => { if (s === stage) throw new Error("simulated-setup-failure"); } });
+      assert.equal(report.status, "refused", stage + JSON.stringify(report));
+      assert.match(report.reason, /^exception-before-write:/);
+      assert.equal(report.gateClosed, true); assert.equal(report.windowOpen, false);
+      assert.equal((await gateMod.readGateState()).kind, "finished");
+      assert.equal(await journalMod.isRecoveryBlockingNormalWrites(), false);
+      await unchanged(w);
+    }
+  } finally { await cleanup(); }
+});
+
 test("failure right after the repair commit (nothing in the Vault yet): automatic strict restore of IndexedDB; Vault untouched; window and gate closed", async () => {
   const w = await world();
   try {

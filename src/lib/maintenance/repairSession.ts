@@ -122,8 +122,16 @@ export async function runRepairSession(input: RepairSessionInput): Promise<Repai
   const entered = await enterMaintenanceWindow({ purpose: "single-item-repair", timeoutMs: input.lockTimeoutMs, now });
   if (!entered.ok) return refused(`window:${entered.reason}`);
   let report: RepairSessionReport;
-  try { report = await inWindow(input, spec, stages, now, entered.operationId); }
-  catch (e) { report = { status: "needs-review", reason: `unexpected:${(e as Error)?.name ?? "error"}`, stages, windowOpen: true, gateClosed: false, problems: [] }; }
+  const progress = { wrote: false };
+  try { report = await inWindow(input, spec, stages, now, entered.operationId, progress); }
+  catch (e) {
+    const name = (e as Error)?.name ?? "error";
+    // Before the first write nothing exists that needs protecting (and no restore point may exist yet, so a kept gate could never be recovered by step 8):
+    // the failure is a refusal and the window + gate are closed. After the first write the gate stays (needs-review).
+    report = progress.wrote
+      ? { status: "needs-review", reason: `unexpected:${name}`, stages, windowOpen: true, gateClosed: false, problems: [] }
+      : { status: "refused", reason: `exception-before-write:${name}`, stages, windowOpen: true, gateClosed: false, problems: [] };
+  }
   // finished cleanly (nothing written, fully restored, or completed and verified): close the gate and release the lock. Otherwise KEEP both.
   if (report.status === "completed" || report.status === "refused" || report.status === "rolled-back") {
     if (isMaintenanceWindowOpen()) {
@@ -142,7 +150,7 @@ export async function runRepairSession(input: RepairSessionInput): Promise<Repai
   return report;
 }
 
-async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repair"]["items"][number], stages: string[], now: () => string, gateOperationId: string): Promise<RepairSessionReport> {
+async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repair"]["items"][number], stages: string[], now: () => string, gateOperationId: string, progress: { wrote: boolean }): Promise<RepairSessionReport> {
   const done = async (stage: string) => { stages.push(stage); await input.onStage?.(stage); };
   const fail = (status: RepairSessionStatus, reason: string, extra: Partial<RepairSessionReport> = {}): RepairSessionReport => ({ status, reason, stages, windowOpen: true, gateClosed: false, problems: [], ...extra });
   const env: RestoreEnv = { idb: createDbRestoreIdb(), root: input.root };
@@ -210,6 +218,7 @@ async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repa
     return fail(ok ? "rolled-back" : "rollback-failed", reason, { restore, sync: syncSummary, problems });
   };
   try {
+    progress.wrote = true;                                   // from here on a failure restores (inner catch) or keeps the gate
     const run = await runContaminationRepair(repairEnv, "execute", { spec: [spec], updating: data.repair.updating, only: [spec.key] });
     const outcome = run.items[0]?.outcome;
     if (outcome !== "committed") {
