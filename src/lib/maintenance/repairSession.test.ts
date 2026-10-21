@@ -34,6 +34,7 @@ const gateMod = require(path.join(OUT, "lib/maintenance/maintenanceGate.js")) as
 const win = require(path.join(OUT, "lib/maintenance/maintenanceWindow.js")) as typeof import("./maintenanceWindow");
 const scopeMod = require(path.join(OUT, "lib/maintenance/precheckScope.js")) as typeof import("./precheckScope");
 const session = require(path.join(OUT, "lib/maintenance/repairSession.js")) as typeof import("./repairSession");
+const crash = require(path.join(OUT, "lib/maintenance/crashRecovery.js")) as typeof import("./crashRecovery");
 const testSupport = require(path.join(OUT, "lib/maintenance/testSupport.js")) as typeof import("./testSupport");
 const FakeVault = testSupport.FakeVault;
 type FakeVault = import("./testSupport").FakeVault;
@@ -327,6 +328,101 @@ test("an item whose removed link has a system-generated (Reflection) counterpart
     assert.deepEqual(report.stages, ["window-open", "prechecked"], "refused before the restore point and before any write");
     assert.equal(report.windowOpen, false); assert.equal(report.gateClosed, true);
     await unchanged(w);
+  } finally { await cleanup(); }
+});
+
+// ------------------------------------------------------------------------------------------------ recovery after a dead tab
+/** the tab dies in the middle of the session: its lock is released and its module state is gone, but the durable gate stays. Returns the SAVED restore point. */
+async function crashAt(w: World, stage: string): Promise<string> {
+  let saved = "";
+  let reached!: () => void; const hit = new Promise<void>((r) => { reached = r; });
+  void run(w, { persistRestorePoint: async (t) => { saved = t; return t; }, onStage: async (s) => { if (s === stage) { reached(); await new Promise<void>(() => { /* never resumes: the tab is dead */ }); } } });
+  await hit;
+  win.__simulateTabLossForTests();
+  return saved;
+}
+const recoverInput = (w: World, text: string, over: Partial<import("./crashRecovery").CrashInput> = {}) => ({ restorePointText: text, root: w.vault.root(), vaultCopyRoot: w.backup.root(), ...over });
+const phraseOf = async (w: World, text: string) => (await crash.diagnoseCrash(recoverInput(w, text))).restorePoint!.confirmPhrase;
+const stillBlocked = async () => { assert.equal((await gateMod.readGateState()).kind, "maintenance-open"); assert.equal(await journalMod.isRecoveryBlockingNormalWrites(), true); };
+
+for (const [stage, label] of [["repair-committed", "after the repair commit (IndexedDB changed, Vault untouched)"], ["synced", "after the real sync (IndexedDB AND Vault changed)"]] as const) {
+  test(`crash recovery: the tab dies ${label}: diagnosis, typed confirmation, strict restore, verification; only then the gate is released`, async () => {
+    const w = await world();
+    try {
+      const text = await crashAt(w, stage);
+      await stillBlocked();
+      assert.notEqual(await digest(), w.preDigest, "the crash left a changed state behind");
+      const diag = await crash.diagnoseCrash(recoverInput(w, text));
+      assert.equal(diag.status, "restorable", JSON.stringify(diag));
+      assert.ok(diag.commitStamp);
+      assert.equal(JP.test(JSON.stringify(diag)), false, "the diagnosis carries no text");
+      await stillBlocked();                                                              // the diagnosis changed nothing
+      const wrong = await crash.runCrashRecovery({ ...recoverInput(w, text), confirm: "RESTORE nope" });
+      assert.equal(wrong.status, "refused"); assert.equal(wrong.reason, "confirmation-phrase"); assert.equal(wrong.gateStillInPlace, true);
+      await stillBlocked();
+      const report = await crash.runCrashRecovery({ ...recoverInput(w, text), confirm: await phraseOf(w, text) });
+      assert.equal(report.status, "recovered", JSON.stringify(report));
+      assert.equal(report.gateStillInPlace, false);
+      assert.deepEqual(report.consistency, { mismatched: 0, unverified: 0 });
+      await unchanged(w);                                                                  // Vault byte-identical, IndexedDB (records, ledger, Outbox) identical
+      assert.equal((await gateMod.readGateState()).kind, "finished");
+      assert.equal(await journalMod.isRecoveryBlockingNormalWrites(), false);
+      let ran = false; await lockMod.withVaultWorldRead(async () => { ran = true; }); assert.equal(ran, true, "the lock is free");
+    } finally { await cleanup(); }
+  });
+}
+
+test("crash recovery: a crash before anything was written is diagnosed as intact; recovery only verifies and then closes the gate", async () => {
+  const w = await world();
+  try {
+    const text = await crashAt(w, "restore-point-verified");
+    const diag = await crash.diagnoseCrash(recoverInput(w, text));
+    assert.equal(diag.status, "intact", JSON.stringify(diag));
+    const report = await crash.runCrashRecovery({ ...recoverInput(w, text), confirm: await phraseOf(w, text) });
+    assert.equal(report.status, "recovered", JSON.stringify(report));
+    await unchanged(w);
+    assert.equal((await gateMod.readGateState()).kind, "finished");
+  } finally { await cleanup(); }
+});
+
+test("crash recovery refuses and KEEPS the gate when the state can not be proven: foreign change outside the scope, unexplained change inside it, wrong Vault copy, damaged restore point", async () => {
+  const cases: [string, (w: World, text: string) => Promise<{ text: string; input?: Partial<import("./crashRecovery").CrashInput> }>, RegExp][] = [
+    ["a foreign file appeared in a Tsumugi area (outside the scope)", async (w, text) => { w.vault.put("Memories/zz-foreign.md", "x"); return { text }; }, /collateral/],
+    ["a record of the scope holds a version the interrupted repair can not explain", async (w, text) => {
+      const m = (await dbm.getMemoryObject(R1.memoryId))!;
+      await dbm.putMemoryObject({ ...m, summary: m.summary + "!", updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /record-unidentified/],
+    ["the operator's Vault copy differs from the restore point", async (w, text) => { w.backup.put(".tsumugi/index.json", "{}"); return { text }; }, /copy-differs/],
+    ["the restore point file was damaged", async (_w, text) => ({ text: text.replace(/"contentHash":"[0-9a-f]{8}/, '"contentHash":"00000000') }), /content-hash/],
+    ["no Vault copy was selected", async (_w, text) => ({ text, input: { vaultCopyRoot: null } }), /select-the-vault-copy/],
+  ];
+  for (const [label, tamper, expected] of cases) {
+    const w = await world();
+    try {
+      const text0 = await crashAt(w, "synced");
+      const { text, input } = await tamper(w, text0);
+      const vaultBefore = JSON.stringify(w.vault.snapshot()), digestBefore = await digest();
+      const diag = await crash.diagnoseCrash({ ...recoverInput(w, text), ...input });
+      assert.match(diag.reason, expected, label + " " + JSON.stringify(diag));
+      assert.ok(!["restorable", "intact"].includes(diag.status), label);
+      const report = await crash.runCrashRecovery({ ...recoverInput(w, text), ...input, confirm: "RESTORE 00000000" });
+      assert.notEqual(report.status, "recovered", label);
+      assert.equal(report.gateStillInPlace, true, label);
+      assert.equal(JSON.stringify(w.vault.snapshot()), vaultBefore, label + ": the Vault was not written");
+      assert.equal(await digest(), digestBefore, label + ": IndexedDB was not written");
+      await stillBlocked();                                                              // gate kept: the normal app stays blocked
+      assert.equal(win.isMaintenanceWindowOpen(), false, "the lock was given back");
+    } finally { await cleanup(); }
+  }
+});
+
+test("crash recovery: with no stale gate there is nothing to recover and nothing is touched", async () => {
+  const w = await world();
+  try {
+    const text = await (async () => { let saved = ""; await run(w, { persistRestorePoint: async (t) => { saved = t; return t; } }); return saved; })();
+    const diag = await crash.diagnoseCrash(recoverInput(w, text));
+    assert.equal(diag.status, "no-stale-gate");
+    const report = await crash.runCrashRecovery({ ...recoverInput(w, text), confirm: "RESTORE x" });
+    assert.equal(report.status, "refused");
   } finally { await cleanup(); }
 });
 

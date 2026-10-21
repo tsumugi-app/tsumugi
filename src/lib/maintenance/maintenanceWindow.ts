@@ -18,7 +18,7 @@
  */
 import { runVaultWorldExclusive } from "../vaultWorldLock";
 import { setMaintenanceWriteAccessProbe } from "../vaultRecoveryJournal";
-import { closeMaintenanceGate, openMaintenanceGate, type GateDeps, type GateOpenResult } from "./maintenanceGate";
+import { closeMaintenanceGate, openMaintenanceGate, readGateState, type GateDeps, type GateOpenResult } from "./maintenanceGate";
 
 /** Must equal LOCK_NAME in vaultWorldLock.ts (asserted by maintenanceGate.test.ts). */
 export const VAULT_WORLD_LOCK_NAME = "tsumugi-vault-world";
@@ -127,6 +127,47 @@ export async function releaseStaleMaintenanceGate(opts: GateDeps & { timeoutMs?:
   } catch (error) {
     return { released: false, reason: `lock-error:${(error as Error)?.name ?? "error"}` };
   }
+}
+
+export type AdoptResult =
+  | { ok: true; operationId: string }
+  | { ok: false; reason: "window-already-open" | "not-maintenance-context" | "lock-contention" | "lock-unavailable" | `lock-error:${string}` | "no-stale-gate" };
+
+/**
+ * Crash recovery: takes the exclusive Vault-world lock and ADOPTS the maintenance gate that a dead tab left behind (the gate is never re-opened or
+ * replaced: it stays in place the whole time). The returned window can run `runWithMaintenanceWriteAccess` scopes. It does NOT close the gate by
+ * itself: `endMaintenanceWindow` closes it (only after a verified recovery) and `releaseWindowKeepingGate` gives the lock back with the gate still in place.
+ */
+export async function adoptStaleMaintenanceGate(opts: GateDeps & { timeoutMs?: number; queryLocks?: QueryLocks } = {}): Promise<AdoptResult> {
+  if (held) return { ok: false, reason: "window-already-open" };
+  if (!inMaintenanceContext()) return { ok: false, reason: "not-maintenance-context" };
+  try {
+    const snap = await (opts.queryLocks ?? defaultQueryLocks)();
+    if ([...(snap?.held ?? []), ...(snap?.pending ?? [])].some((l) => l.name === VAULT_WORLD_LOCK_NAME)) return { ok: false, reason: "lock-contention" };
+  } catch { /* extra check only; the exclusive request below is the real guard */ }
+  let signalAcquired!: () => void; let releaseHold!: () => void;
+  const acquired = new Promise<void>((r) => { signalAcquired = r; });
+  const hold = new Promise<void>((r) => { releaseHold = r; });
+  const settled = runVaultWorldExclusive(async () => { signalAcquired(); await hold; }, opts.timeoutMs).then((r) => ({ r }), (error: unknown) => ({ error }));
+  const first = await Promise.race([acquired.then(() => "held" as const), settled]);
+  if (first !== "held") {
+    if ("error" in first) return { ok: false, reason: `lock-error:${(first.error as Error)?.name ?? "error"}` };
+    return { ok: false, reason: "lock-unavailable" };
+  }
+  const state = await readGateState(opts.store);
+  if (state.kind !== "maintenance-open") { releaseHold(); await settled; return { ok: false, reason: "no-stale-gate" }; }
+  held = { operationId: state.operationId, release: releaseHold, settled, scopeDepth: 0, deps: opts };
+  setMaintenanceWriteAccessProbe(permitted);
+  return { ok: true, operationId: state.operationId };
+}
+
+/** Gives the lock back and drops the write permission, leaving the durable gate IN PLACE (a recovery that could not be completed or verified). */
+export async function releaseWindowKeepingGate(): Promise<{ ok: boolean }> {
+  const h = held;
+  if (!h || h.scopeDepth > 0) return { ok: false };
+  held = null; setMaintenanceWriteAccessProbe(null);
+  h.release(); await h.settled;
+  return { ok: true };
 }
 
 /** TEST ONLY: the tab disappears (lock released by the browser, module state gone) without closing the gate. */

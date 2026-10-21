@@ -375,14 +375,14 @@ test("restore guard: only enumerated paths can be written; only enumerated creat
 
 test("no logging / network / storage in the restore modules; only the repair session imports them (no screen, startup, Capture or Connect); errors carry codes only", async () => {
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  const files = ["lib/maintenance/restorePoint.ts", "lib/maintenance/restoreEngine.ts", "lib/maintenance/restoreGuard.ts"];
+  const files = ["lib/maintenance/restorePoint.ts", "lib/maintenance/restoreEngine.ts", "lib/maintenance/restoreGuard.ts", "lib/maintenance/crashRecovery.ts"];
   for (const f of files) {
     const code = strip(fs.readFileSync(path.join(SRC, f), "utf8"));
     assert.equal(/console\.|\bfetch\(|XMLHttpRequest|sendBeacon|WebSocket|localStorage|sessionStorage|document\.cookie|\beval\(|new Function/.test(code), false, f);
   }
   const walk = (d: string, out: string[] = []) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p, out); else if (/\.(ts|tsx)$/.test(e.name)) out.push(p); } return out; };
   const importers = walk(SRC).filter((p) => !/restore(Point|Engine|Guard)\.ts$|\.test\.ts$/.test(p)).filter((p) => /\/restore(Point|Engine|Guard)["']/.test(fs.readFileSync(p, "utf8")));
-  assert.deepEqual(importers.map((p) => path.relative(SRC, p)), ["lib/maintenance/repairSession.ts"], "only the single-item repair session uses the restore modules");
+  assert.deepEqual(importers.map((p) => path.relative(SRC, p)).sort(), ["lib/maintenance/crashRecovery.ts", "lib/maintenance/repairSession.ts"], "only the single-item repair session and the crash recovery use the restore modules");
   const s = await scenario();
   const errs: string[] = [];
   for (const t of ["{ nope " + JP.source, JSON.stringify({ ...JSON.parse(s.text), contentHash: "x" })]) { const r = await rpMod.parseRestorePoint(t); if (!r.ok) errs.push(r.error); }

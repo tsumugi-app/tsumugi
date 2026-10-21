@@ -16,6 +16,7 @@
     "src/lib/db.ts",
     "src/lib/fakeIdb.ts",
     "src/lib/maintenance/auth.ts",
+    "src/lib/maintenance/crashRecovery.ts",
     "src/lib/maintenance/invariants.ts",
     "src/lib/maintenance/maintenanceAuth.test.ts",
     "src/lib/maintenance/maintenanceBoundary.test.ts",

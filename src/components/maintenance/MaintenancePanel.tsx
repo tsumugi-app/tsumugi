@@ -14,7 +14,7 @@ import {
 import { parsePrivateRepairData, type PrivateRepairData } from "@/lib/privateRepairData";
 import { readPrecheckInput, renderPrecheckText } from "@/lib/memoryRepairPrecheck";
 import { runRepairSession, type RepairSessionReport } from "@/lib/maintenance/repairSession";
-import { releaseStaleMaintenanceGate } from "@/lib/maintenance/maintenanceWindow";
+import { diagnoseCrash, runCrashRecovery, type CrashDiagnosis, type CrashRecoveryReport } from "@/lib/maintenance/crashRecovery";
 
 /**
  * Maintenance panel: S1 preflight, S2 dry run (+ non-target invariants), S3 execute + verify, for already-repaired records.
@@ -54,8 +54,12 @@ export default function MaintenancePanel() {
   const [repairReport, setRepairReport] = useState<RepairSessionReport | null>(null);
   const [awaitingReadBack, setAwaitingReadBack] = useState(false);
   const readBackResolve = useRef<((text: string) => void) | null>(null);
-  const [releaseConfirm, setReleaseConfirm] = useState("");
-  const [releaseResult, setReleaseResult] = useState<string | null>(null);
+  // recovery after an interrupted repair (the ONLY way to release a gate left behind by a dead tab)
+  const [recoveryText, setRecoveryText] = useState<string | null>(null);
+  const [recoveryCopy, setRecoveryCopy] = useState<FileSystemDirectoryHandle | null>(null);
+  const [recoveryDiag, setRecoveryDiag] = useState<(Omit<CrashDiagnosis, "_rp">) | null>(null);
+  const [recoveryConfirm, setRecoveryConfirm] = useState("");
+  const [recoveryReport, setRecoveryReport] = useState<CrashRecoveryReport | null>(null);
   const vaultHandle = session && session.status === "ready" ? session.handle : null;
   const locked = useRef(false);
 
@@ -178,8 +182,26 @@ export default function MaintenancePanel() {
       setRepairConfirm(""); setAnalysis(null); setVaultCheck(null); setLive(null); setPicked([]);
     });
   }
-  async function runReleaseStale() {
-    await guarded(async () => { const r = await releaseStaleMaintenanceGate(); setReleaseResult(r.released ? "released" : `not released: ${r.reason}`); setReleaseConfirm(""); });
+  function loadRecoveryPoint(file: File | undefined) {
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => { setRecoveryText(String(r.result ?? "")); setRecoveryDiag(null); setRecoveryReport(null); setRecoveryConfirm(""); };
+    r.readAsText(file);
+  }
+  async function pickRecoveryCopy() {
+    await guarded(async () => {
+      const picker = (window as unknown as { showDirectoryPicker?: (o: unknown) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+      if (!picker) { setError("this browser cannot select a folder"); return; }
+      setRecoveryCopy(await picker({ mode: "read" })); setRecoveryDiag(null); setRecoveryReport(null);
+    });
+  }
+  async function runRecoveryDiagnosis() {
+    if (!vaultHandle || recoveryText === null) return;
+    await guarded(async () => { const { _rp, ...d } = await diagnoseCrash({ restorePointText: recoveryText, root: vaultHandle, vaultCopyRoot: recoveryCopy }); void _rp; setRecoveryDiag(d); setRecoveryReport(null); });
+  }
+  async function runRecovery() {
+    if (!vaultHandle || recoveryText === null) return;
+    await guarded(async () => { setRecoveryReport(await runCrashRecovery({ restorePointText: recoveryText, root: vaultHandle, vaultCopyRoot: recoveryCopy, confirm: recoveryConfirm })); setRecoveryConfirm(""); setRecoveryDiag(null); });
   }
   async function runVaultCheck() {
     if (!analysis || !vaultHandle) return;
@@ -314,15 +336,35 @@ export default function MaintenancePanel() {
           {repairReport.restore && <p>restore: {repairReport.restore.status}{repairReport.restore.failure ? ` (${repairReport.restore.failure})` : ""} {repairReport.restore.stopReasons.join("; ")}</p>}
           {repairReport.problems.length > 0 && <ul>{repairReport.problems.map((p, i) => <li key={i} className="text-red-700">{p}</li>)}</ul>}
           {repairReport.windowOpen && <p className="text-red-700">The maintenance window is STILL OPEN (lock and gate kept). Do not open Tsumugi. Keep this tab open and report the lines above.</p>}
-          {repairReport.gateStuck && <p className="text-red-700">The durable maintenance gate is STILL IN PLACE: the normal app stays blocked from writing. Check the state (step 5), then release it with "release a stale maintenance gate" below.</p>}
+          {repairReport.gateStuck && <p className="text-red-700">The durable maintenance gate is STILL IN PLACE: the normal app stays blocked from writing. It can only be released by the recovery in step 8 (it needs your saved restore point and your Vault copy).</p>}
           {repairReport.status === "completed" && <p className="text-emerald-700">Done and verified: IndexedDB and the Vault are consistent; the gate is closed.</p>}
         </div>)}
-        <details><summary>after a crash: release a stale maintenance gate</summary>
-          <p className="text-xs">Use only when no repair is running anywhere and you have checked the state (step 5). Releasing lets the normal app write to the Vault again.</p>
-          <input className="border px-2 py-1" placeholder="RELEASE GATE" value={releaseConfirm} onChange={(e) => setReleaseConfirm(e.target.value)} />
-          <button disabled={busy || releaseConfirm !== "RELEASE GATE"} onClick={() => void runReleaseStale()} className="border px-3 py-1">Release the gate</button>
-          {releaseResult && <p>{releaseResult}</p>}
-        </details>
+      </section>
+
+      <section className="flex flex-col gap-2"><h2 className="font-medium">8. Recover after an interrupted repair (the only way to release a maintenance gate that a closed or crashed tab left behind)</h2>
+        <p className="text-xs">Use this when a repair was cut off (tab or browser closed, crash) and the normal app stays blocked. You need: the restore point file that step 7 asked you to save, and your own copy of the Vault folder taken before that repair. Nothing is released by guessing: the state is diagnosed first (read-only), the pre-repair state is proven by BOTH the restore point and your copy, only changes that the interrupted repair can explain are restored, and the gate is closed only after a fresh comparison equals the restore point and the Vault agrees with IndexedDB. If anything cannot be proven the gate stays and the app stays blocked: do not open Tsumugi, keep your restore point and your Vault copy, and report the line below.</p>
+        <label className="text-xs">restore point file <input type="file" accept=".json,application/json" onChange={(e) => loadRecoveryPoint(e.target.files?.[0])} /></label>
+        <button disabled={busy} onClick={() => void pickRecoveryCopy()} className="border px-3 py-1">Select the folder that holds your copy of the Vault</button>
+        <p className="text-xs">Vault folder (step 1): {vaultHandle ? "found" : "not found"} | restore point: {recoveryText === null ? "not loaded" : "loaded"} | Vault copy: {recoveryCopy ? "selected" : "not selected"}</p>
+        <button disabled={busy || !vaultHandle || recoveryText === null} onClick={() => void runRecoveryDiagnosis()} className="border px-3 py-1">Diagnose (read-only)</button>
+        {recoveryDiag && (<div>
+          <p className={recoveryDiag.status === "restorable" || recoveryDiag.status === "intact" ? "text-emerald-700" : "text-red-700"}>diagnosis: {recoveryDiag.status} ({recoveryDiag.reason})</p>
+          {recoveryDiag.restorePoint && <p className="text-xs">restore point {recoveryDiag.restorePoint.createdAt}: {recoveryDiag.restorePoint.records} record(s), {recoveryDiag.restorePoint.vaultFiles} Vault file(s)</p>}
+          {recoveryDiag.vaultCopyDiffers.length > 0 && <ul>{recoveryDiag.vaultCopyDiffers.map((p) => <li key={p} className="text-red-700">your Vault copy differs from the restore point: {p}</li>)}</ul>}
+          {recoveryDiag.plan && <p className="text-xs">to restore: {recoveryDiag.plan.recordsToRestore} IndexedDB item(s), {recoveryDiag.plan.vaultToWrite} Vault file(s) rewritten, {recoveryDiag.plan.vaultToDelete} created file(s) removed; outside the scope changed: {recoveryDiag.plan.collateral}{recoveryDiag.plan.stopReasons.length ? ` | stop: ${recoveryDiag.plan.stopReasons.join(", ")}` : ""}</p>}
+          {(recoveryDiag.status === "stopped" || recoveryDiag.status === "vault-copy-differs" || recoveryDiag.status === "restore-point-invalid") && <p className="text-red-700">Recovery is NOT possible from here. The gate stays in place and the app stays blocked. Do not open Tsumugi and do not edit the Vault; keep the restore point and your Vault copy and report this screen.</p>}
+          {(recoveryDiag.status === "restorable" || recoveryDiag.status === "intact") && recoveryDiag.restorePoint && (<div className="flex flex-col gap-1">
+            <p className="text-xs">{recoveryDiag.status === "intact" ? "Nothing was changed by the interrupted repair; recovery only verifies this and closes the gate." : "The state differs from the restore point only in ways the interrupted repair explains. Recovery puts everything back exactly as the restore point."} Other Tsumugi tabs must be closed and no other program (for example Obsidian sync) may be changing the Vault.</p>
+            <input className="border px-2 py-1" placeholder={recoveryDiag.restorePoint.confirmPhrase} value={recoveryConfirm} onChange={(e) => setRecoveryConfirm(e.target.value)} />
+            <button disabled={busy || recoveryConfirm !== recoveryDiag.restorePoint.confirmPhrase} onClick={() => void runRecovery()} className="border border-red-700 px-3 py-1">Restore and close the gate</button>
+          </div>)}
+        </div>)}
+        {recoveryReport && (<div>
+          <p className={recoveryReport.status === "recovered" ? "text-emerald-700" : "text-red-700"}>{recoveryReport.status}: {recoveryReport.reason}</p>
+          {recoveryReport.restore && <p className="text-xs">restore: {recoveryReport.restore.status}{recoveryReport.restore.failure ? ` (${recoveryReport.restore.failure})` : ""}; Vault files written {recoveryReport.restore.vaultWritten}, removed {recoveryReport.restore.vaultDeleted}</p>}
+          {recoveryReport.consistency && <p className="text-xs">Vault vs IndexedDB after the restore: {recoveryReport.consistency.mismatched} mismatch(es), {recoveryReport.consistency.unverified} unverified</p>}
+          {recoveryReport.status === "recovered" ? <p className="text-emerald-700">Restored and verified; the gate is closed.</p> : <p className="text-red-700">The gate is STILL IN PLACE and the normal app stays blocked. Do not open Tsumugi. Keep your restore point and Vault copy and report this screen.</p>}
+        </div>)}
       </section>
     </main>
   );
