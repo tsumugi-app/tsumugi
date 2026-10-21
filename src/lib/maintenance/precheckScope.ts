@@ -243,8 +243,8 @@ export function overallVerdict(i: { status: PrecheckStatus; conflicts: OutboxCon
   if (i.status === "ALREADY_DONE" || i.status === "LEDGER_DONE") {
     return { code: "ALREADY_DONE", safeToRepair: false, label: "Already repaired: nothing to do", reasons: [`IndexedDB pre-flight is ${i.status}`] };
   }
-  if ((i.blockers ?? []).length > 0) return { code: "READY_COUNTERPART_BLOCKED", safeToRepair: false, label: "READY, but a link counterpart that the repair would rewrite is protected or unfinished: not safe", reasons: i.blockers ?? [] };
   const sharing = i.conflicts.filter((c) => c.shares.length > 0);
+  if ((i.blockers ?? []).length > 0) return { code: "READY_COUNTERPART_BLOCKED", safeToRepair: false, label: "READY, but a link counterpart that the repair would rewrite is protected or unfinished: not safe", reasons: i.blockers ?? [] };
   if (!i.vault) return { code: "READY_VAULT_NOT_CHECKED", safeToRepair: false, label: "READY in IndexedDB, but the Vault has not been checked: not proven safe", reasons: ["run the Vault consistency check"] };
   if (i.vault.mismatched.length > 0) {
     return { code: "READY_VAULT_MISMATCH", safeToRepair: false, label: "READY in IndexedDB, but the Vault disagrees: not safe", reasons: i.vault.mismatched.map((d) => `${d.area}:${d.status}`) };
