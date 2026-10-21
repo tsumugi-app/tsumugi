@@ -32,3 +32,14 @@ No real data, ids or text appear here.
 - Any repair on real data. The reviewed repair data is private and was never read; which of the 6 items hit the Reflection refusal or share files with a pending Outbox entry is unknown until the pre-check runs on the real database.
 - Recovery needs the SAVED restore point and the operator's Vault copy of THAT item; without them the gate stays (by design).
 - `main` merge: the code is complete and tested as above, but merging only ADDS the maintenance area (404 unless enabled) and the Capture filter. Repairs still need the owner's approvals listed in the report.
+
+## The 6 remaining items: order, constraints, effect on the unprocessed Outbox (no private data was read)
+- Order: independent items first, one at a time, each with a fresh Vault copy; the two items that share one updating conversation strictly one after the other (tested end to end, including a failure of the second one).
+- What can refuse an item BEFORE any write (each is a fixed code on screen): the pre-check verdict (HOLD, Vault mismatch / unverified, Outbox entry sharing a day-file / shard / month with a target OR with a link counterpart), a link counterpart that is system-generated (Reflection), has its own unfinished Outbox entry, belongs to a held / excluded / not-READY item, or is not consistent in the Vault.
+- Effect on unprocessed Outbox entries: a pending / held entry is never rewritten, reset or re-queued by the session (tested: byte-identical in every path). An item that would have to rewrite one (as a target's neighbour in the same files, or as a link counterpart) is refused instead. Which of the 6 items that affects is unknown until the pre-check runs on the real database.
+- The HOLD item and every item the decision list holds / excludes (and every item that is not READY at that moment) is protected, also as a link counterpart.
+- Private data limit: the reviewed repair data and the real database were never available here. Per-item READY / refusal, the Reflection-link case and the real Outbox overlaps can only be known by running the read-only Scan and pre-check in the owner's browser.
+
+## Merge assessment (main)
+- Safe to merge in the sense that matters: the change only ADDS the maintenance area (404 unless MAINTENANCE_ENABLED=1 and a password are set; nothing links to it) and the Capture own-conversation filter; normal operation, startup, API routes, PWA files and next.config are untouched (checked in CI against the PR base). Production repair stays impossible until the owner enables the area and runs it.
+- Not a statement about repair safety on real data: that needs the owner's approvals (enable the area, the per-item runs with fresh Vault copy and saved restore point) and the real-device checks listed above.
