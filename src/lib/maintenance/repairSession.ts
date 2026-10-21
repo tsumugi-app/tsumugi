@@ -43,6 +43,8 @@ export interface RepairSessionInput {
   root: FileSystemDirectoryHandle;
   /** must equal `REPAIR <key>` */
   confirm: string;
+  /** Memory ids that must never be rewritten (items held / excluded by the operator's decision list); a link counterpart among them refuses the item */
+  protectedMemoryIds?: string[];
   /** the operator's own copy of the Vault folder; every file the operation may touch must be byte-identical there */
   vaultBackupRoot: FileSystemDirectoryHandle | null;
   /** saves the serialized restore point where the operator keeps it and returns what a re-read of the SAVED file contains */
@@ -148,11 +150,11 @@ async function inWindow(input: RepairSessionInput, spec: PrivateRepairData["repa
 
   // ---- pre-check inside the window (nothing can change underneath: exclusive lock + gate)
   const data = subsetData(input.data, [input.key]);
-  const analysis = await analyzeSelection(await readPrecheckInputViaDb(data), data, [input.key], now());
+  const analysis = await analyzeSelection(await readPrecheckInputViaDb(data), data, [input.key], now(), input.protectedMemoryIds ?? []);
   const item = analysis.report.items[0];
   if (!item || item.status !== "READY") return fail("refused", `precheck:${item?.status ?? "none"}`);
   const vaultCheck = await diagnoseVaultForPrecheck(analysis.existing, input.root);
-  const verdict = overallVerdict({ status: item.status, conflicts: analysis.conflicts, vault: vaultCheck });
+  const verdict = overallVerdict({ status: item.status, conflicts: analysis.conflicts, vault: vaultCheck, blockers: analysis.blockers });
   if (!verdict.safeToRepair) return fail("refused", `verdict:${verdict.code}`);
   await done("prechecked");
 

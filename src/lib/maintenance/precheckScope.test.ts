@@ -135,6 +135,37 @@ test("Outbox conflicts: unfinished entries that share a day-file / shard / month
   for (const x of c) assert.equal(x.tail.length, 6);
 });
 
+test("link counterparts: a removed link rewrites its counterpart, so an unfinished Outbox entry of the counterpart, a decision-protected Memory or a system-generated counterpart block the item (and the counterpart joins the Vault check)", async () => {
+  const d = data(); const spec = d.repair.items.find((i) => i.key === "R8")!;       // the fixture item with a "remove" link
+  const removed = Object.keys(spec.links).find((id) => spec.links[id] === "remove")!;
+  const cpId = `CP-${removed}`;
+  const clean = scope.summarizeDiagnosis([{ kind: "memory", id: "m", area: "markdown", item: "f", status: "ok", detail: "" }], 1);
+  // clean world: the counterpart is part of the Vault check, nothing blocks
+  const a0 = await scope.analyzeSelection(input(), d, [spec.key], fx.NOW);
+  assert.equal(a0.report.items[0].status, "READY");
+  assert.deepEqual(a0.blockers, []);
+  assert.ok(a0.existing.some((r) => r.kind === "memory" && r.id === cpId), "the counterpart is handed to the Vault check");
+  assert.equal(scope.overallVerdict({ status: "READY", conflicts: a0.conflicts, vault: clean, blockers: a0.blockers }).safeToRepair, true);
+  // an unfinished Outbox entry of the counterpart that shares no file with the targets must still block
+  const inp = input();
+  const cp = inp.memories.find((m) => m.id === cpId)!;
+  inp.outbox = [{ id: `memory:${cpId}`, recordType: "memory", recordId: cpId, recordUpdatedAt: cp.updatedAt, status: "pending" } as OutboxLike];
+  const a1 = await scope.analyzeSelection(inp, d, [spec.key], fx.NOW);
+  assert.deepEqual(a1.blockers, [`counterpart-unfinished-outbox:${cpId.slice(-6)}`]);
+  const v1 = scope.overallVerdict({ status: "READY", conflicts: a1.conflicts, vault: clean, blockers: a1.blockers });
+  assert.equal(v1.safeToRepair, false); assert.equal(v1.code, "READY_COUNTERPART_BLOCKED");
+  // a counterpart that belongs to an item the operator holds / excludes
+  const a2 = await scope.analyzeSelection(input(), d, [spec.key], fx.NOW, [cpId]);
+  assert.deepEqual(a2.blockers, [`counterpart-protected-by-decision:${cpId.slice(-6)}`]);
+  assert.equal(scope.overallVerdict({ status: "READY", conflicts: a2.conflicts, vault: clean, blockers: a2.blockers }).safeToRepair, false);
+  // a system-generated counterpart (Reflection)
+  const inp3 = input();
+  const cp3 = inp3.memories.find((m) => m.id === cpId)!;
+  cp3.metadata = { ...cp3.metadata, source: "system-generated" } as MemoryObject["metadata"];
+  const a3 = await scope.analyzeSelection(inp3, d, [spec.key], fx.NOW);
+  assert.deepEqual(a3.blockers, [`counterpart-system-generated:${cpId.slice(-6)}`]);
+});
+
 test("Vault diagnosis summary: file areas only; unreadable / legacy-format are unverified, mismatch / missing are mismatched", () => {
   const row = (area: "markdown" | "ledger" | "outbox" | "index" | "registry" | "history", status: "ok" | "mismatch" | "missing" | "legacy-format" | "unreadable") => ({ kind: "memory", id: "m1", area, item: "x", status, detail: "" });
   const v = scope.summarizeDiagnosis([row("markdown", "ok"), row("ledger", "mismatch"), row("outbox", "mismatch"), row("index", "missing"), row("registry", "unreadable"), row("history", "legacy-format")], 1);

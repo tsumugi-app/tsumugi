@@ -11,6 +11,7 @@ import type { Conversation, MemoryObject } from "../types";
 import type { PrivateRepairData } from "../privateRepairData";
 import type { OutboxLike, PrecheckInput, PrecheckItem, PrecheckReport, PrecheckStatus } from "../memoryRepairPrecheck";
 import { buildPrecheckReport } from "../memoryRepairPrecheck";
+import { isReflection, planRepairItem } from "../memoryContaminationRepair";
 import { dayFileRegistryKey, vaultRegistryBucketOf } from "../vault";
 import { MANIFEST_FORMAT, type MaintenanceManifest } from "./manifest";
 import { diagnoseTargets, type DiagnosisItem } from "./scopedVaultSync";
@@ -196,12 +197,14 @@ export async function diagnoseVaultForPrecheck(existing: { kind: "conversation" 
 export interface Analysis {
   report: PrecheckReport;                                   // IndexedDB pre-flight (separate finding 1)
   conflicts: OutboxConflict[];                              // separate finding 2
-  existing: { kind: "conversation" | "memory"; id: string }[]; // what the Vault check may look at (records that exist today)
+  existing: { kind: "conversation" | "memory"; id: string }[]; // what the Vault check may look at (records that exist today); includes the link counterparts a repair would rewrite
   pendingOtherTotal: number;
+  /** fixed codes: a link counterpart that the repair would rewrite is unsafe to touch (unfinished Outbox entry, protected by a decision, system-generated) */
+  blockers: string[];
 }
 
 /** Pure: pre-flight + conflicts + the list of existing records, from one already-read snapshot restricted to the selected keys. */
-export async function analyzeSelection(input: PrecheckInput, data: PrivateRepairData, keys: string[], now: string): Promise<Analysis> {
+export async function analyzeSelection(input: PrecheckInput, data: PrivateRepairData, keys: string[], now: string, protectedMemoryIds: string[] = []): Promise<Analysis> {
   const sub = subsetData(data, keys);
   const report = await buildPrecheckReport(input, sub, now);
   const targets = targetsOf(sub, (it) => it.facts?.newMemoryId ?? null, report.items);
@@ -211,19 +214,36 @@ export async function analyzeSelection(input: PrecheckInput, data: PrivateRepair
     ...targets.memoryIds.filter((id) => memIds.has(id)).map((id) => ({ kind: "memory" as const, id })),
   ];
   const conflicts = outboxConflicts({ outbox: input.outbox, memories: input.memories, conversations: input.conversations, targets });
-  return { report, conflicts, existing, pendingOtherTotal: conflicts.length };
+  // A removed link also rewrites its counterpart (record + Outbox entry + Vault projection). The counterpart is NOT a target of the item, so it needs its own checks.
+  const blockers: string[] = [];
+  const snapshot = { memories: input.memories, conversations: input.conversations };
+  const known = new Set(existing.map((e) => `${e.kind}:${e.id}`));
+  const guarded = new Set(protectedMemoryIds);
+  for (const spec of sub.repair.items) {
+    const planned = await planRepairItem(spec, snapshot, now, sub.repair.updating);
+    if (planned.status !== "READY") continue;
+    for (const c of planned.counterparts) {
+      const id = c.before.id, tail = id.slice(-6);
+      if (input.outbox.some((o) => o.status !== "done" && (o.recordType === "memory" || o.recordType === "reflection") && o.recordId === id)) blockers.push(`counterpart-unfinished-outbox:${tail}`);
+      if (guarded.has(id)) blockers.push(`counterpart-protected-by-decision:${tail}`);
+      if (isReflection(c.before)) blockers.push(`counterpart-system-generated:${tail}`);
+      if (!known.has(`memory:${id}`)) { existing.push({ kind: "memory", id }); known.add(`memory:${id}`); }
+    }
+  }
+  return { report, conflicts, existing, pendingOtherTotal: conflicts.length, blockers: [...new Set(blockers)] };
 }
 
 export type VerdictCode =
-  | "HOLD" | "ALREADY_DONE" | "READY_VAULT_NOT_CHECKED" | "READY_VAULT_MISMATCH" | "READY_VAULT_UNVERIFIED" | "READY_OUTBOX_CONFLICT" | "READY_ALL_CLEAR";
+  | "HOLD" | "ALREADY_DONE" | "READY_COUNTERPART_BLOCKED" | "READY_VAULT_NOT_CHECKED" | "READY_VAULT_MISMATCH" | "READY_VAULT_UNVERIFIED" | "READY_OUTBOX_CONFLICT" | "READY_ALL_CLEAR";
 export interface Verdict { code: VerdictCode; safeToRepair: boolean; label: string; reasons: string[] }
 
 /** Only READY_ALL_CLEAR is "safe to repair". Anything not proven (Vault not checked, unreadable, legacy-format) is NOT safe. */
-export function overallVerdict(i: { status: PrecheckStatus; conflicts: OutboxConflict[]; vault: VaultCheck | null }): Verdict {
+export function overallVerdict(i: { status: PrecheckStatus; conflicts: OutboxConflict[]; vault: VaultCheck | null; blockers?: string[] }): Verdict {
   if (i.status === "HOLD") return { code: "HOLD", safeToRepair: false, label: "HOLD: do not repair", reasons: ["IndexedDB pre-flight is HOLD"] };
   if (i.status === "ALREADY_DONE" || i.status === "LEDGER_DONE") {
     return { code: "ALREADY_DONE", safeToRepair: false, label: "Already repaired: nothing to do", reasons: [`IndexedDB pre-flight is ${i.status}`] };
   }
+  if ((i.blockers ?? []).length > 0) return { code: "READY_COUNTERPART_BLOCKED", safeToRepair: false, label: "READY, but a link counterpart that the repair would rewrite is protected or unfinished: not safe", reasons: i.blockers ?? [] };
   const sharing = i.conflicts.filter((c) => c.shares.length > 0);
   if (!i.vault) return { code: "READY_VAULT_NOT_CHECKED", safeToRepair: false, label: "READY in IndexedDB, but the Vault has not been checked: not proven safe", reasons: ["run the Vault consistency check"] };
   if (i.vault.mismatched.length > 0) {

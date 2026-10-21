@@ -436,6 +436,34 @@ test("crash recovery: with no stale gate there is nothing to recover and nothing
   } finally { await cleanup(); }
 });
 
+test("a link counterpart with an unfinished Outbox entry or protected by a decision refuses the item BEFORE any write (the protected entry is never rewritten)", async () => {
+  for (const mode of ["outbox", "protected"] as const) {
+    const w = await world();
+    try {
+      const data = DATA();
+      const item = data.repair.items.find((i) => i.key === R1.key)!;
+      const linkId = Object.keys(item.links)[0];
+      item.links[linkId] = "remove";                                  // the fixture's first link goes to a system-generated Memory ...
+      const cpId = `CP-${linkId}`;
+      if (mode === "outbox") {
+        // ... so use a NORMAL counterpart instead: the next fixture link of another item is not reachable from R1, hence make the counterpart normal
+        const cp = (await dbm.getMemoryObject(cpId))!;
+        await dbm.putMemoryObject({ ...cp, metadata: { ...cp.metadata, source: "ai-capture" } } as any);
+        await dbm.putVaultOutboxEntry({ id: `memory:${cpId}`, recordType: "memory", recordId: cpId, recordUpdatedAt: cp.updatedAt, steps: {}, attempt: { count: 3, lastError: "x", lastAttemptAt: "x" }, status: "pending", heldReason: null, createdAt: "c", updatedAt: "u" } as any);
+      } else {
+        const cp = (await dbm.getMemoryObject(cpId))!;
+        await dbm.putMemoryObject({ ...cp, metadata: { ...cp.metadata, source: "ai-capture" } } as any);
+      }
+      const vaultBefore = JSON.stringify(w.vault.snapshot()), digestBefore = await digest();
+      const report = await run(w, { data, protectedMemoryIds: mode === "protected" ? [cpId] : [] });
+      assert.equal(report.status, "refused", mode + JSON.stringify(report));
+      assert.match(report.reason, /^verdict:READY_COUNTERPART_BLOCKED$/, mode);
+      assert.deepEqual(report.stages, ["window-open"], "refused at the pre-check inside the window, before any restore point or write");
+      assert.equal(JSON.stringify(w.vault.snapshot()), vaultBefore); assert.equal(await digest(), digestBefore);
+    } finally { await cleanup(); }
+  }
+});
+
 test("the session module is the only new importer of the restore / runner modules; it logs and sends nothing", () => {
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   const code = strip(fs.readFileSync(path.join(SRC, "lib/maintenance/repairSession.ts"), "utf8"));

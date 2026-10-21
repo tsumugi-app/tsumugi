@@ -126,6 +126,8 @@ export default function MaintenancePanel() {
     };
     r.readAsText(file);
   }
+  /** the Memories of the items the operator holds or excludes: a repair must never rewrite them (not even as a link counterpart) */
+  const protectedIds = (): string[] => (repairData && decisions ? repairData.repair.items.filter((i) => decisions.held.includes(i.key) || decisions.excluded.includes(i.key)).map((i) => i.memoryId) : []);
   async function runScan() {
     if (!repairData || decisionsError(repairData, decisions)) return;
     await guarded(async () => {
@@ -146,7 +148,7 @@ export default function MaintenancePanel() {
       // IndexedDB is opened WITHOUT a version and only with readonly transactions (see memoryRepairPrecheck.ts)
       const input = await readPrecheckInput({ indexedDB: window.indexedDB, build: "maintenance", now: () => at }, repairData);
       if (!input) { setAnalysis(null); setPrecheckText("status=no-database"); return; }
-      const a = await analyzeSelection(input, repairData, picked, at);
+      const a = await analyzeSelection(input, repairData, picked, at, protectedIds());
       setAnalysis(a);
       setPrecheckText(renderPrecheckText({ ...a.report, heldForeign: [] }, { build: "maintenance", at }));
     });
@@ -178,7 +180,7 @@ export default function MaintenancePanel() {
     if (bad) { setError("selection refused: " + bad); return; }
     await guarded(async () => {
       setRepairReport(null);
-      setRepairReport(await runRepairSession({ data: repairData, key: repairKey, root: vaultHandle, confirm: repairConfirm, vaultBackupRoot: backupRoot, persistRestorePoint }));
+      setRepairReport(await runRepairSession({ data: repairData, key: repairKey, root: vaultHandle, confirm: repairConfirm, vaultBackupRoot: backupRoot, persistRestorePoint, protectedMemoryIds: protectedIds() }));
       setRepairConfirm(""); setAnalysis(null); setVaultCheck(null); setLive(null); setPicked([]);
     });
   }
@@ -315,7 +317,7 @@ export default function MaintenancePanel() {
             <ul>{vaultCheck.items.map((d, i) => <li key={i} className={d.status === "ok" ? "text-emerald-700" : d.status === "legacy-format" || d.status === "unreadable" ? "text-amber-700" : "text-red-700"}>{d.kind} {tail(d.id)} {d.area}: {d.item} = {d.status}{d.detail ? ` - ${d.detail}` : ""}</li>)}</ul>
           </div>)}
           <h3 className="font-medium">Overall (per item)</h3>
-          <ul>{analysis.report.items.map((it) => { const v = overallVerdict({ status: it.status, conflicts: analysis.conflicts, vault: vaultCheck });
+          <ul>{analysis.report.items.map((it) => { const v = overallVerdict({ status: it.status, conflicts: analysis.conflicts, vault: vaultCheck, blockers: analysis.blockers });
             return <li key={it.key} className={v.safeToRepair ? "text-emerald-700" : "text-red-700"}>{it.key}: {v.safeToRepair ? "SAFE TO REPAIR" : "NOT SAFE / NOT PROVEN"} - {v.label}{v.reasons.length ? ` [${v.reasons.join(", ")}]` : ""}</li>; })}</ul>
         </div>)}
         {precheckText && <details><summary>report text (IDs, verdicts and counts only)</summary><pre className="whitespace-pre-wrap text-xs">{precheckText}</pre></details>}
