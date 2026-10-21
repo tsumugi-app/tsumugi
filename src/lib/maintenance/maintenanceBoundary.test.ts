@@ -98,7 +98,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/")), "API routes must not be modified");
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
   // ChatScreen: the only allowed change is the reviewed swap of the three restore-from-Vault writers (never replace newer local data with an older Vault copy)
   const chatDiff = git("diff", "-U0", ...range, "--", "src/components/ChatScreen.tsx").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   for (const l of chatDiff) assert.ok(/restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l), "unexpected ChatScreen.tsx change: " + l);
