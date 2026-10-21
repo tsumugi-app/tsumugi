@@ -165,3 +165,25 @@ test("a stale gate can only be adopted and closed by the crash recovery (static)
   assert.deepEqual(users("adoptStaleMaintenanceGate"), ["lib/maintenance/crashRecovery.ts", "lib/maintenance/maintenanceWindow.ts"]);
   assert.deepEqual(users("closeAdoptedWindowAfterVerifiedRecovery"), ["lib/maintenance/crashRecovery.ts", "lib/maintenance/maintenanceWindow.ts"]);
 });
+
+/**
+ * Storage-layer lineage invariant (see db.ts `assertMemoryLineage`): every db.ts function that writes the Memory store must apply it, except the reviewed
+ * read-modify-write / insert-only / bookkeeping functions below (they change the STORED record itself, insert only when absent, or do not write Memories).
+ * A new Memory writer in db.ts fails this test until it applies the invariant or is reviewed into the list.
+ */
+test("every db.ts function that writes the Memory store applies the lineage invariant, except the reviewed read-modify-write / insert-only ones", () => {
+  const src = strip(fs.readFileSync(path.join(SRC, "lib/db.ts"), "utf8"));
+  const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
+  const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
+    "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent"]);
+  const missing: string[] = [];
+  heads.forEach((h, i) => {
+    const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);
+    if (!/memoryObjects/.test(body) || !/\.(put|add|delete)\(/.test(body)) return;
+    if (reviewed.has(h.name)) return;
+    if (!/assertMemoryLineage\(/.test(body)) missing.push(h.name);
+  });
+  assert.deepEqual(missing, [], "these db.ts functions write Memories without the lineage invariant");
+  // the invariant itself must stay: the error class, the check, and its use by the unconditional writers
+  for (const must of ["export class MemoryLineageViolationError", "export function assertMemoryLineage", "export async function restoreMemoryObjectIfNotNewer"]) assert.ok(src.includes(must), must);
+});
