@@ -17,6 +17,16 @@ No real data, ids or text appear here.
 - Unrelated pending Outbox entries and protected records are byte-identical in every path.
 - Codex independent reviews: findings fixed in this PR (gate-close failure reported as completed, CI boundary check skipped, Reflection counterpart, three P1 on crash recovery).
 
+## Hardening added after the Codex reviews of the crash recovery
+- A restore point is accepted only for the gate it was captured under.
+- IndexedDB records are explained only by the EXACT after-images the repair commit stored in its own durable backup (not by a timestamp); Outbox entries only as pending/done, never held; Vault files only by content hashes the dead window recorded durably BEFORE writing (write-ahead evidence). Anything else stops the recovery and keeps the gate.
+- Every Vault file is re-read and compared with what the plan saw immediately before it is restored or removed; a file edited after the plan is never overwritten.
+- A link counterpart that a repair would rewrite is protected before any write: unfinished Outbox entry, held / excluded by the decision list, not READY right now, system-generated; its files join the Outbox conflict check and its Vault state joins the consistency check.
+
+## Residual, accepted limits
+- Between the last re-check and the write of one Vault file there is a window of milliseconds that only an OS-level file lock could close; the Vault is also protected by the gate, the exclusive lock and the operator being told to stop other programs.
+- A scoped Outbox entry changed by hand to another pending/done version of the same record is restored to the restore-point value (that value is what the repair started from).
+
 ## Not verified (needs a person or real data)
 - The OS folder picker and its permission prompts, Vault folder permissions on the real folder, behaviour with Obsidian / sync tools running, usability of the screens on a real device.
 - Any repair on real data. The reviewed repair data is private and was never read; which of the 6 items hit the Reflection refusal or share files with a pending Outbox entry is unknown until the pre-check runs on the real database.
