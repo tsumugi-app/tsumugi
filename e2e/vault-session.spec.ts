@@ -42,6 +42,7 @@ async function tab(context: any): Promise<Page> {
   await page.goto(PANEL);
   await page.addScriptTag({ path: BUNDLE });
   await page.waitForFunction(() => !!(window as any).H);
+  await page.evaluate(() => (window as any).H.initTab());
   return page;
 }
 const H = <T,>(page: Page, expr: string, arg?: unknown): Promise<T> => page.evaluate(`(async () => { const H = window.H; const a = ${JSON.stringify(arg ?? null)}; return (${expr}); })()`) as Promise<T>;

@@ -80,6 +80,8 @@ function run(o: { key: string; blockAt?: string; throwAt?: string; refreshCopy?:
 }
 g.H = {
   setup, state, run, snapshot, idbDigest, NOW,
+  /** what a real tab does at startup: adopt the committed Vault epoch (without it every Vault-world operation of that tab is refused as stale) */
+  initTab: () => lockMod.setTabVaultEpoch(0),
   getMemory: (id: string) => dbm.getMemoryObject(id),
   readGate: async () => (await gateMod.readGateState()).kind,
   blocking: () => journal.isRecoveryBlockingNormalWrites(),
