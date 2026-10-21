@@ -105,28 +105,31 @@ const planSummary = (p: RestorePlan) => ({
   vaultToWrite: p.work.writes.length, vaultToDelete: p.work.deletes.length,
 });
 
-/** Read-only. Safe to run any number of times. */
-export async function diagnoseCrash(input: CrashInput): Promise<CrashDiagnosis & { _rp?: RestorePoint }> {
+/** Read-only. Safe to run any number of times. The diagnosis carries codes and counts only (never record or file text). */
+export async function diagnoseCrash(input: CrashInput): Promise<CrashDiagnosis> { return (await analyze(input)).diagnosis; }
+
+/** the diagnosis plus the parsed restore point (which holds text): internal to this module */
+async function analyze(input: CrashInput): Promise<{ diagnosis: CrashDiagnosis; rp?: RestorePoint }> {
   const base = { vaultCopyDiffers: [] as string[], commitStamp: null as string | null };
   const gate = await readGateState();
-  if (gate.kind !== "maintenance-open") return { ...base, status: "no-stale-gate", reason: `gate:${gate.kind}` };
+  if (gate.kind !== "maintenance-open") return { diagnosis: { ...base, status: "no-stale-gate", reason: `gate:${gate.kind}` } };
   const parsed = await parseRestorePoint(input.restorePointText);
-  if (!parsed.ok) return { ...base, status: "restore-point-invalid", reason: parsed.error, gate: { operationId: gate.operationId, openedAt: gate.openedAt } };
+  if (!parsed.ok) return { diagnosis: { ...base, status: "restore-point-invalid", reason: parsed.error, gate: { operationId: gate.operationId, openedAt: gate.openedAt } } };
   const rp = parsed.restorePoint;
   const sum = summarizeRestorePoint(rp);
   const head = { gate: { operationId: gate.operationId, openedAt: gate.openedAt }, restorePoint: { createdAt: rp.createdAt, contentHash: rp.contentHash, records: sum.records, vaultFiles: sum.vaultFiles, confirmPhrase: confirmPhraseFor(rp) } };
-  if (!input.vaultCopyRoot) return { ...base, ...head, status: "vault-copy-missing", reason: "select-the-vault-copy" };
+  if (!input.vaultCopyRoot) return { rp, diagnosis: { ...base, ...head, status: "vault-copy-missing", reason: "select-the-vault-copy" } };
   const differs = await copyDiffers(rp, input.vaultCopyRoot);
-  if (differs.length > 0) return { ...base, ...head, vaultCopyDiffers: differs, status: "vault-copy-differs", reason: `copy-differs:${differs.length}` };
+  if (differs.length > 0) return { rp, diagnosis: { ...base, ...head, vaultCopyDiffers: differs, status: "vault-copy-differs", reason: `copy-differs:${differs.length}` } };
   const env: RestoreEnv = input.env ?? { idb: createDbRestoreIdb(), root: input.root };
   const stamp = await commitStampOf(rp, env);
-  if (stamp === "ambiguous") return { ...base, ...head, status: "stopped", reason: "commit-stamp-ambiguous" };
+  if (stamp === "ambiguous") return { rp, diagnosis: { ...base, ...head, status: "stopped", reason: "commit-stamp-ambiguous" } };
   const exp = await buildExpectation(rp, env, stamp, true);
   const plan = await planRestore(rp, exp, env);
-  const common = { ...base, ...head, commitStamp: stamp, plan: planSummary(plan), _rp: rp };
-  if (plan.status === "nothing-to-restore") return { ...common, status: "intact", reason: "identical-to-restore-point" };
-  if (plan.status === "stopped") return { ...common, status: "stopped", reason: plan.stopReasons.slice(0, 6).join(",") };
-  return { ...common, status: "restorable", reason: "differences-explained-by-the-interrupted-repair" };
+  const common = { ...base, ...head, commitStamp: stamp, plan: planSummary(plan) };
+  if (plan.status === "nothing-to-restore") return { rp, diagnosis: { ...common, status: "intact", reason: "identical-to-restore-point" } };
+  if (plan.status === "stopped") return { rp, diagnosis: { ...common, status: "stopped", reason: plan.stopReasons.slice(0, 6).join(",") } };
+  return { rp, diagnosis: { ...common, status: "restorable", reason: "differences-explained-by-the-interrupted-repair" } };
 }
 
 export type CrashRecoveryStatus = "recovered" | "refused" | "stopped" | "incomplete";
@@ -136,7 +139,7 @@ export interface CrashRecoveryReport {
   reason: string;
   /** true when the durable gate is still in place (always, unless status is "recovered") */
   gateStillInPlace: boolean;
-  diagnosis?: Omit<CrashDiagnosis, "_rp">;
+  diagnosis?: CrashDiagnosis;
   restore?: { status: string; failure?: string; vaultWritten: number; vaultDeleted: number };
   consistency?: { mismatched: number; unverified: number };
 }
@@ -146,30 +149,28 @@ export interface CrashRecoveryReport {
  */
 export async function runCrashRecovery(input: CrashInput & { confirm: string }): Promise<CrashRecoveryReport> {
   const keep = (status: CrashRecoveryStatus, reason: string, extra: Partial<CrashRecoveryReport> = {}): CrashRecoveryReport => ({ status, reason, gateStillInPlace: true, ...extra });
-  const strip = (d: CrashDiagnosis & { _rp?: RestorePoint }): Omit<CrashDiagnosis, "_rp"> => { const { _rp, ...rest } = d; void _rp; return rest; };
-
-  const pre = await diagnoseCrash(input);
-  const rp0 = pre._rp;
-  if (!rp0) return keep("refused", pre.reason, { diagnosis: strip(pre) });
-  if (pre.status !== "intact" && pre.status !== "restorable") return keep("stopped", pre.reason, { diagnosis: strip(pre) });
-  if (input.confirm !== confirmPhraseFor(rp0)) return keep("refused", "confirmation-phrase", { diagnosis: strip(pre) });
+  const first = await analyze(input);
+  const pre = first.diagnosis, rp0 = first.rp;
+  if (!rp0) return keep("refused", pre.reason, { diagnosis: pre });
+  if (pre.status !== "intact" && pre.status !== "restorable") return keep("stopped", pre.reason, { diagnosis: pre });
+  if (input.confirm !== confirmPhraseFor(rp0)) return keep("refused", "confirmation-phrase", { diagnosis: pre });
 
   const adopted = await adoptStaleMaintenanceGate();
-  if (!adopted.ok) return keep("refused", `window:${adopted.reason}`, { diagnosis: strip(pre) });
+  if (!adopted.ok) return keep("refused", `window:${adopted.reason}`, { diagnosis: pre });
   const env: RestoreEnv = input.env ?? { idb: createDbRestoreIdb(), root: input.root };
   let report: CrashRecoveryReport;
   try {
     // everything is decided again INSIDE the window (exclusive lock held): the state may have moved since the read-only diagnosis
-    const inside = await diagnoseCrash(input);
-    const rp = inside._rp;
+    const again = await analyze(input);
+    const inside = again.diagnosis, rp = again.rp;
     if (!rp || rp.contentHash !== rp0.contentHash || (inside.status !== "intact" && inside.status !== "restorable")) {
-      report = keep("stopped", rp ? inside.reason : "restore-point-lost", { diagnosis: strip(inside) });
+      report = keep("stopped", rp ? inside.reason : "restore-point-lost", { diagnosis: inside });
     } else {
       const exp = await buildExpectation(rp, env, await commitStampOf(rp, env), true);
       const r = await runWithMaintenanceWriteAccess(() => executeRestore(rp, exp, env));
       const restore = { status: r.status, failure: r.failure, vaultWritten: r.vaultWritten.length, vaultDeleted: r.vaultDeleted.length };
       if (r.status !== "restored" && r.status !== "nothing-to-restore") {
-        report = keep("incomplete", `restore:${r.status}`, { diagnosis: strip(inside), restore });
+        report = keep("incomplete", `restore:${r.status}`, { diagnosis: inside, restore });
       } else {
         // final proof 1: a fresh STRICT comparison (no expectation, no tolerance) equals the restore point
         const strict = await planRestore(rp, emptyExpectation(), env);
@@ -180,9 +181,9 @@ export async function runCrashRecovery(input: CrashInput & { confirm: string }):
         ];
         const vaultCheck = await diagnoseVaultForPrecheck(existing, input.root);
         const consistency = { mismatched: vaultCheck.mismatched.length, unverified: vaultCheck.unverified.length };
-        if (strict.status !== "nothing-to-restore") report = keep("incomplete", `verification:${strict.status}`, { diagnosis: strip(inside), restore, consistency });
-        else if (consistency.mismatched > 0 || consistency.unverified > 0) report = keep("incomplete", "vault-and-indexeddb-disagree", { diagnosis: strip(inside), restore, consistency });
-        else report = { status: "recovered", reason: "verified", gateStillInPlace: true, diagnosis: strip(inside), restore, consistency };
+        if (strict.status !== "nothing-to-restore") report = keep("incomplete", `verification:${strict.status}`, { diagnosis: inside, restore, consistency });
+        else if (consistency.mismatched > 0 || consistency.unverified > 0) report = keep("incomplete", "vault-and-indexeddb-disagree", { diagnosis: inside, restore, consistency });
+        else report = { status: "recovered", reason: "verified", gateStillInPlace: true, diagnosis: inside, restore, consistency };
       }
     }
   } catch (e) {

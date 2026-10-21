@@ -57,7 +57,7 @@ export default function MaintenancePanel() {
   // recovery after an interrupted repair (the ONLY way to release a gate left behind by a dead tab)
   const [recoveryText, setRecoveryText] = useState<string | null>(null);
   const [recoveryCopy, setRecoveryCopy] = useState<FileSystemDirectoryHandle | null>(null);
-  const [recoveryDiag, setRecoveryDiag] = useState<(Omit<CrashDiagnosis, "_rp">) | null>(null);
+  const [recoveryDiag, setRecoveryDiag] = useState<CrashDiagnosis | null>(null);
   const [recoveryConfirm, setRecoveryConfirm] = useState("");
   const [recoveryReport, setRecoveryReport] = useState<CrashRecoveryReport | null>(null);
   const vaultHandle = session && session.status === "ready" ? session.handle : null;
@@ -197,7 +197,7 @@ export default function MaintenancePanel() {
   }
   async function runRecoveryDiagnosis() {
     if (!vaultHandle || recoveryText === null) return;
-    await guarded(async () => { const { _rp, ...d } = await diagnoseCrash({ restorePointText: recoveryText, root: vaultHandle, vaultCopyRoot: recoveryCopy }); void _rp; setRecoveryDiag(d); setRecoveryReport(null); });
+    await guarded(async () => { setRecoveryDiag(await diagnoseCrash({ restorePointText: recoveryText, root: vaultHandle, vaultCopyRoot: recoveryCopy })); setRecoveryReport(null); });
   }
   async function runRecovery() {
     if (!vaultHandle || recoveryText === null) return;

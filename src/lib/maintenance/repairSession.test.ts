@@ -389,8 +389,11 @@ test("crash recovery refuses and KEEPS the gate when the state can not be proven
   const cases: [string, (w: World, text: string) => Promise<{ text: string; input?: Partial<import("./crashRecovery").CrashInput> }>, RegExp][] = [
     ["a foreign file appeared in a Tsumugi area (outside the scope)", async (w, text) => { w.vault.put("Memories/zz-foreign.md", "x"); return { text }; }, /collateral/],
     ["a record of the scope holds a version the interrupted repair can not explain", async (w, text) => {
+      const c = (await dbm.getConversation(R1.updatingConversationId))!;
+      await dbm.putConversation({ ...c, updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /record-unidentified/],
+    ["a Memory of the scope carries a second, foreign repair time (the commit time is ambiguous)", async (w, text) => {
       const m = (await dbm.getMemoryObject(R1.memoryId))!;
-      await dbm.putMemoryObject({ ...m, summary: m.summary + "!", updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /record-unidentified/],
+      await dbm.putMemoryObject({ ...m, updatedAt: "2099-01-01T00:00:00.000Z" } as any); return { text }; }, /commit-stamp-ambiguous/],
     ["the operator's Vault copy differs from the restore point", async (w, text) => { w.backup.put(".tsumugi/index.json", "{}"); return { text }; }, /copy-differs/],
     ["the restore point file was damaged", async (_w, text) => ({ text: text.replace(/"contentHash":"[0-9a-f]{8}/, '"contentHash":"00000000') }), /content-hash/],
     ["no Vault copy was selected", async (_w, text) => ({ text, input: { vaultCopyRoot: null } }), /select-the-vault-copy/],
