@@ -175,7 +175,7 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   const src = strip(fs.readFileSync(path.join(SRC, "lib/db.ts"), "utf8"));
   const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
   const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
-    "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent"]);
+    "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
   const missing: string[] = [];
   heads.forEach((h, i) => {
     const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);
@@ -185,5 +185,5 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   });
   assert.deepEqual(missing, [], "these db.ts functions write Memories without the lineage invariant");
   // the invariant itself must stay: the error class, the check, and its use by the unconditional writers
-  for (const must of ["export class MemoryLineageViolationError", "export function assertMemoryLineage", "export async function restoreMemoryObjectIfNotNewer"]) assert.ok(src.includes(must), must);
+  for (const must of ["export class MemoryLineageViolationError", "export function assertMemoryLineage", "export const restoreMemoryObjectIfNotNewer = (memoryObject: MemoryObject) => restoreIfNotNewer(\"memoryObjects\", memoryObject, (stored) => assertMemoryLineage(stored, memoryObject))"]) assert.ok(src.includes(must), must);
 });
