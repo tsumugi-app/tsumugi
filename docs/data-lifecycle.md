@@ -17,6 +17,7 @@ Principle: protecting data is not enough. The user must be able to see, resolve 
 | Maintenance write-ahead evidence | IndexedDB settings | per gate | deleted at a clean end / after a verified recovery | unchanged |
 
 ## Resurrection paths (a deleted record coming back by itself)
+Besides the Vault -> IndexedDB copies listed below, a Capture that is still running when the user deletes its conversation can not undo the deletion: the conversation write and the Memory writes (`putConversation`, `putCapturedMemoryWithOutbox`) check the tombstones inside their own transaction and write nothing (and nothing reaches the Vault).
 All three ways records are copied from the Vault into IndexedDB now refuse a record that has a tombstone:
 1. startup auto import (`importMissingRecordsIfAbsent`): counted as skipped;
 2. Vault resync "added" outcomes (`addConversationIfAbsentAndMarkSynced`, `addMemoryObjectIfAbsentAndMarkSynced`, and in `vault.ts` no History row / no registry commit for a tombstoned record);
@@ -30,10 +31,10 @@ The full-device wipe is unchanged by design: it clears IndexedDB including tombs
 Vault sync of a deletion: the app does not remove Vault files itself. The tombstone (a) stops the Vault copy from coming back, (b) lets `/data` verify read-only whether the Vault still holds a copy, (c) tells the user when it is safe to forget the tombstone.
 
 ## When a tombstone may be forgotten (purge)
-All of: the Vault copy was verified absent (`vault: "absent"`; the check reads the day file / index and is re-run on demand, and a copy that reappears puts the state back to `unverified`); at least 30 days have passed since the deletion (other devices / profiles syncing through the same Vault have had time); the user did not choose "keep the Vault copy" (`kept` is never purged automatically). The user can instead press "allow it back" (lifts the tombstone; the record is not recreated, it can be restored from the Vault if the Vault still has it).
+All of: the Vault copy is absent NOW (the stored `absent` verdict can be old, so the Vault is read again right before each tombstone is cleared; the search finds the record's `id:` line in every Markdown file under `Memories/` and `Conversations/`, wherever the user moved it, and an `index.json` key alone is not presence; a copy that reappeared puts the state back to `unverified`; without a readable Vault nothing is purged); at least 30 days have passed since the deletion (other devices / profiles syncing through the same Vault have had time); the user did not choose "keep the Vault copy" (`kept` is never purged automatically). The user can instead press "allow it back" (lifts the tombstone; the record is not recreated, it can be restored from the Vault if the Vault still has it).
 
 ## Stuck sync states: every state has a way out
-- held, record exists: retry / keep both as they are (entry closed, ledger = current version; a later change re-queues it) / delete from this device.
+- held, record exists: retry / keep both as they are (entry closed and a durable marker for that record version, so the startup integrity check does not hold it again; a later change re-queues it normally) / delete from this device.
 - held, record missing (orphan): tidy up as a deletion (also keeps a remaining Vault copy from coming back) or just tidy up the entry.
 - pending after many attempts: same actions as held.
 - A normal pending entry (few attempts) is not shown: it resolves by itself.
@@ -43,5 +44,5 @@ Refused while a maintenance window or a recovery is blocking normal writes.
 - Physically removing the Memory / Conversation file (and its History / registry / index rows) from the Vault when the user deletes a record. The Vault projection engine has no delete step; adding one touches the registry and History machinery and needs its own reviewed design and tests. Until then the user removes the file in the Vault (Obsidian) and uses "check the Vault" on `/data`.
 - Automatic pruning of orphan Outbox entries at startup (they are resolved from `/data`).
 - Purging the Recovery Archive: needs a rule tied to the verified restoration of the archived record; not implemented.
-- Source (素材) deletion with a tombstone.
+- Source (素材) deletion with a tombstone (so orphan Source entries can be tidied up, but not as a "deletion").
 - Resolving Vault resync "conflict" registry states from the UI (the full resync is not a user-facing operation).
