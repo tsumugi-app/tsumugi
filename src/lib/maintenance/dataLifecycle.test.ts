@@ -99,7 +99,7 @@ test("purge re-reads the Vault right before clearing: a copy that came back afte
   // concurrent decisions: a stale verification never overwrites the user's newer choice
   await dbm.setTombstoneVaultState("memory", "pr-a", "absent", "2026-10-01T00:00:00.000Z");
   const scanned = (await dbm.getTombstone("memory", "pr-a"))!;
-  await life.keepVaultCopy("memory", "pr-a", "2026-10-22T00:00:00.000Z");                   // another tab: "keep the Vault copy"
+  assert.equal(await life.keepVaultCopy((await dbm.getTombstone("memory", "pr-a"))!, "2026-10-22T00:00:00.000Z"), true);   // another tab: "keep the Vault copy"
   assert.equal(await dbm.setTombstoneVaultStateIfUnchanged(scanned, "unverified", "2026-10-22T01:00:00.000Z"), false);
   assert.equal((await dbm.getTombstone("memory", "pr-a"))!.vault, "kept");
 });
@@ -118,4 +118,46 @@ test("an in-flight Capture can not undo a deletion: the deleted conversation is 
   await dbm.putMemoryObject({ ...memory("cap-old"), conversationId: "cap-live" });
   await dbm.deleteMemoryByUser("cap-old", "2026-10-22T00:00:00.000Z");
   await assert.rejects(() => dbm.putCapturedMemoryWithOutbox({ ...memory("cap-old"), conversationId: "cap-live" }, "cap-live"), (e: Error) => e.name === "TombstonedRecordError");
+});
+
+test("Vault presence uses the record's FRONTMATTER only: an 'id:' line pasted into a body or another record's text is not presence", async () => {
+  const v = new testSupport.FakeVault();
+  v.put("Conversations/note.md", "---\ntsumugi: true\nid: other-conv\n---\nmy notes\nid: gone-conv\nmore text\n");
+  v.put("Memories/2026-08-20.md", md.serializeMemoryDayFile([{ ...memory("other-mem"), content: "pasted yaml:\nid: gone-mem\n" }]));
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("conversation", "gone-conv")), "absent");
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("memory", "gone-mem")), "absent");
+  v.put("Conversations/real.md", "---\ntsumugi: true\nid: gone-conv\n---\nbody\n");
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("conversation", "gone-conv")), "present");
+});
+
+test("'allow back' and 'keep the Vault copy' act only on the tombstone the user saw: a newer deletion of the same id is never erased by a stale click", async () => {
+  await dbm.putMemoryObject(memory("ab-1"));
+  await dbm.deleteMemoryByUser("ab-1", "2026-10-01T00:00:00.000Z");
+  const seenByTabA = (await dbm.getTombstone("memory", "ab-1"))!;
+  // tab B: allow back, the record is restored, and the user deletes it again
+  assert.equal(await life.allowBack(seenByTabA), true);
+  await dbm.putMemoryObject(memory("ab-1"));
+  await dbm.deleteMemoryByUser("ab-1", "2026-10-22T00:00:00.000Z");
+  // tab A: the stale click
+  assert.equal(await life.allowBack(seenByTabA), false);
+  assert.equal(await life.keepVaultCopy(seenByTabA), false);
+  assert.equal((await dbm.getTombstone("memory", "ab-1"))!.deletedAt, "2026-10-22T00:00:00.000Z", "the newer deletion intent survived");
+});
+
+test("the in-transaction gate decision equals the app-wide gate (isRecoveryBlockingNormalWrites) for journals of every kind", async () => {
+  const journalMod = require(path.join(OUT, "lib/vaultRecoveryJournal.js")) as typeof import("../vaultRecoveryJournal");
+  assert.equal(dbm.GATE_JOURNAL_VERSION, journalMod.RECOVERY_JOURNAL_VERSION, "the copied constant must follow the real one");
+  const j = (over: Record<string, unknown>, epoch = 0) => JSON.stringify({ version: journalMod.RECOVERY_JOURNAL_VERSION, operationId: "op", status: "in-progress", createdAt: T, updatedAt: T, world: { activeVaultEpoch: epoch, committedVaultEpoch: null, registryGenerationEpoch: 0, journalVersion: "current", backend: null }, baselineAtStart: { status: "x", value: null }, managedBefore: {}, ops: [], held: [], result: null, unresolvedMetadata: false, ...over });
+  const cases: [string, string][] = [
+    ["in-progress, current world", j({})], ["in-progress, other world", j({}, 9)], ["completed", j({ status: "completed" })], ["abandoned", j({ status: "abandoned" })],
+    ["not json", "{ nope"], ["wrong version", j({ version: 99 })], ["missing world", JSON.stringify({ version: 1, operationId: "op", status: "in-progress" })],
+  ];
+  for (const [label, text] of cases) {
+    await dbm.writeRecoveryJournalRaw(text);
+    const canonical = await journalMod.isRecoveryBlockingNormalWrites();
+    let blockedHere = false;
+    try { await dbm.retryOutboxEntry("memory:probe-none"); } catch (e) { blockedHere = (e as Error).name === "RecoveryPendingError"; }
+    assert.equal(blockedHere, canonical, label);
+  }
+  await dbm.writeRecoveryJournalRaw(j({ status: "completed" }));
 });

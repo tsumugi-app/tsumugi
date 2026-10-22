@@ -647,7 +647,8 @@ test("every lifecycle mutation re-checks the durable maintenance gate INSIDE its
   await dbMod.putVaultOutboxEntry({ id: `memory:${w.B}`, recordType: "memory", recordId: w.B, recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 1, lastError: "x", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
   const before = async () => JSON.stringify([await dbMod.getMemoryObject(w.A), await dbMod.getMemoryObject(w.B), await dbMod.getConversation(w.conv), await dbMod.getVaultOutboxEntry(`memory:${w.B}`), await dbMod.getAcceptedDivergences(), await dbMod.listTombstones()]);
   const snap = await before();
-  await dbMod.writeRecoveryJournalRaw(JSON.stringify({ version: 1, status: "in-progress" }));
+  const journal = (status: string, epoch: number) => JSON.stringify({ version: dbMod.GATE_JOURNAL_VERSION, operationId: "op", status, createdAt: T, updatedAt: T, world: { activeVaultEpoch: epoch, committedVaultEpoch: null, registryGenerationEpoch: 0, journalVersion: "current", backend: null }, baselineAtStart: { status: "x", value: null }, managedBefore: {}, ops: [], held: [], result: null, unresolvedMetadata: false });
+  await dbMod.writeRecoveryJournalRaw(journal("in-progress", 0));     // the CURRENT Vault world (active epoch 0)
   try {
     const blocked = (e: Error) => e.name === "RecoveryPendingError";
     await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
@@ -660,8 +661,13 @@ test("every lifecycle mutation re-checks the durable maintenance gate INSIDE its
     await dbMod.writeRecoveryJournalRaw("{ not json");                                  // an unreadable journal also refuses (fail closed)
     await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
     assert.equal(await before(), snap);
+    await dbMod.writeRecoveryJournalRaw(JSON.stringify({ version: 1, status: "in-progress" }));   // malformed (no world): refuses too
+    await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
+    // an unfinished journal of an OLDER Vault world (the Vault was switched since) no longer concerns this Vault: allowed (same rule as the app-wide gate)
+    await dbMod.writeRecoveryJournalRaw(journal("in-progress", 7));
+    assert.equal(await dbMod.retryOutboxEntry("memory:nope"), "not-found", "not blocked");
   } finally {
-    await dbMod.writeRecoveryJournalRaw(JSON.stringify({ version: 1, status: "completed" }));   // a finished journal does not block
+    await dbMod.writeRecoveryJournalRaw(journal("completed", 0));   // a finished journal does not block
   }
   assert.equal((await dbMod.deleteMemoryByUser(w.A, NOW1)).status, "deleted");
 });
@@ -676,4 +682,31 @@ test("every conversation / Memory writer refuses a tombstoned record: a stale ch
   await dbMod.deleteMemoryByUser("tb-mem", NOW1);
   await assert.rejects(() => dbMod.putMemoryObjectWithOutbox(fromConversation("tb-mem", "c9", "2026-12-01T00:00:00.000Z")), (e: Error) => e.name === "TombstonedRecordError");
   assert.equal(await dbMod.getMemoryObject("tb-mem"), undefined);
+});
+
+test("cascade intent: after 'delete the conversation with its Memories', a Memory of that conversation that was not on this device is NOT imported either; deleting only the conversation does not block them", async () => {
+  const w = await seedWorldForDelete("cas7");
+  await dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1);
+  const vaultOnly = fromConversation("cas7-vault-only", w.conv);                  // a Memory of the conversation that exists only in the Vault
+  const imp = await dbMod.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [vaultOnly], sources: [] });
+  assert.equal(imp.insertedMemoryObjects, 0); assert.equal(imp.skippedMemoryObjects, 1);
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(vaultOnly, "memory:cas7-vault-only"), false);
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(vaultOnly), "tombstoned");
+  assert.equal(await dbMod.isMemoryBlockedByTombstone(vaultOnly), true);
+  assert.equal(await dbMod.isMemoryBlockedByTombstone(fromConversation("cas7-unrelated", "other-conv")), false);
+  // conversation-only deletion: no cascade, the Memories of that conversation remain importable
+  const w2 = await seedWorldForDelete("cas8");
+  await dbMod.deleteConversationByUser(w2.conv, NOW1);
+  const keep = fromConversation("cas8-vault-only", w2.conv);
+  assert.equal(await dbMod.isMemoryBlockedByTombstone(keep), false);
+  assert.equal((await dbMod.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [keep], sources: [] })).insertedMemoryObjects, 1);
+});
+
+test("retry that loses a race with 'keep both' does not erase the accepted-divergence marker", async () => {
+  await dbMod.putMemoryObject(fromConversation("rr-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:rr-1", recordType: "memory", recordId: "rr-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 2, lastError: "c", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:rr-1", NOW1), "accepted");          // the other tab
+  assert.equal(await dbMod.retryOutboxEntry("memory:rr-1", NOW1), "not-found");                // this tab's stale click
+  assert.equal((await dbMod.getAcceptedDivergences())["memory:rr-1"], T, "the marker survived");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:rr-1"))!.status, "done");
 });

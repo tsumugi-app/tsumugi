@@ -19,6 +19,7 @@
 import {
   addConversationIfAbsentAndMarkSynced,
   addMemoryObjectIfAbsentAndMarkSynced,
+  isMemoryBlockedByTombstone,
   isTombstoned,
   addSourceIfAbsentAndMarkSynced,
   bumpRegistryGenerationEpoch,
@@ -6096,7 +6097,8 @@ async function applySingleRecordAdded(
     // 真の新規import（E節）：Markdown非往復fieldはparserの既定値のまま取り込む
     // （Beta仕様として許容）。
     // ユーザーが削除した記録（tombstone）は取り込まない（History行も作らない）。
-    if (kind !== "source" && (await isTombstoned(kind === "conversation" ? "conversation" : "memory", record.registryKey))) return;
+    if (kind === "conversation" && (await isTombstoned("conversation", record.registryKey))) return;
+    if (kind === "reflection" && (await isMemoryBlockedByTombstone(record.parsed as MemoryObject))) return;
     let inserted = true;
     if (kind === "conversation") {
       inserted = await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
@@ -6106,7 +6108,8 @@ async function applySingleRecordAdded(
       inserted = await addMemoryObjectIfAbsentAndMarkSynced(record.parsed as MemoryObject, syncKey);
     }
     // ユーザーが削除した記録（tombstone）が直前に作られていた場合：履歴行もRegistryも更新しない
-    if (!inserted && kind !== "source" && (await isTombstoned(kind === "conversation" ? "conversation" : "memory", record.registryKey))) return;
+    if (!inserted && kind === "conversation" && (await isTombstoned("conversation", record.registryKey))) return;
+    if (!inserted && kind === "reflection" && (await isMemoryBlockedByTombstone(record.parsed as MemoryObject))) return;
     if (kind !== "source") {
       await updateHistoryIndexForSingleRecord(root, kind, record.parsed);
     }
@@ -6318,7 +6321,7 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
             throw new Error(`legacy-equivalent member ${member.id} disappeared from IndexedDB during apply`);
           }
           await setVaultSyncState(syncKey, existingUpdatedAt);
-        } else if (await isTombstoned("memory", member.id)) {
+        } else if (await isMemoryBlockedByTombstone(member.parsed)) {
           // ユーザーが削除した記録（tombstone）は取り込まない
         } else {
           await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey);

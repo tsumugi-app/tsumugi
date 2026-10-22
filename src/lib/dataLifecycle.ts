@@ -16,7 +16,7 @@
  * Nothing here logs or sends anything.
  */
 import {
-  clearTombstone, clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultState, setTombstoneVaultStateIfUnchanged,
+  clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultStateIfUnchanged,
   type Tombstone,
 } from "./db";
 import { dayFileNameFor } from "./vault";
@@ -46,6 +46,18 @@ const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * Matches the frontmatter line `id: <id>` exactly (a mere mention of the id in another record's text or links does not count). Read-only.
  * "unknown" when the folder tree can not be read or is larger than MAX_FILES_SCANNED files (never "absent" on a partial look).
  */
+/** the YAML frontmatter blocks of a Tsumugi Markdown file: one per record (a day file holds several, separated by the entry marker). Only a block that STARTS the record counts. */
+function frontmatterBlocks(text: string): string[] {
+  const out: string[] = [];
+  for (const entry of text.split(/\r?\n<!-- tsumugi:entry -->\r?\n/)) {
+    const t = entry.replace(/^\s+/, "");
+    if (!t.startsWith("---")) continue;
+    const end = t.indexOf("\n---", 3);
+    if (end > 0) out.push(t.slice(3, end));
+  }
+  return out;
+}
+
 async function scanVaultForId(root: FileSystemDirectoryHandle, id: string): Promise<VaultPresence> {
   const idLine = new RegExp(`^id:\\s*["']?${escapeRegExp(id)}["']?\\s*$`, "m");
   let scanned = 0;
@@ -57,7 +69,7 @@ async function scanVaultForId(root: FileSystemDirectoryHandle, id: string): Prom
       } else if (name.toLowerCase().endsWith(".md")) {
         if (++scanned > MAX_FILES_SCANNED) return "unknown";
         const text = await (await (handle as FileSystemFileHandle).getFile()).text();
-        if (idLine.test(text)) return "present";
+        if (frontmatterBlocks(text).some((fm) => idLine.test(fm))) return "present";     // pasted YAML in a body, or a mention in another record, does not count
       }
     }
     return "absent";
@@ -115,10 +127,12 @@ export async function verifyTombstone(root: FileSystemDirectoryHandle, kind: Tom
 }
 
 /** The user keeps the Vault copy on purpose: the tombstone stays (the copy still can not re-enter the app) and is never purged automatically. */
-export const keepVaultCopy = (kind: Tombstone["kind"], id: string, now: string = new Date().toISOString()) => setTombstoneVaultState(kind, id, "kept", now);
+/** Only if the tombstone is still exactly the one the user saw (another tab may have changed it meanwhile). Returns whether it was applied. */
+export const keepVaultCopy = (seen: Tombstone, now: string = new Date().toISOString()): Promise<boolean> => setTombstoneVaultStateIfUnchanged(seen, "kept", now);
 
 /** "Allow it back": lifts the tombstone. The deleted record is NOT recreated; it can be restored from the Vault again if the Vault still holds it. */
-export const allowBack = clearTombstone;
+/** Only if the tombstone is still exactly the one the user saw (a newer deletion by another tab is never erased by a stale click). Returns whether it was lifted. */
+export const allowBack = (seen: Tombstone): Promise<boolean> => clearTombstoneIfUnchanged(seen);
 
 /**
  * Forgets every tombstone that satisfies the purge conditions. A stored "absent" verdict can be old, so the Vault is READ AGAIN immediately before each

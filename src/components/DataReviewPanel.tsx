@@ -84,7 +84,7 @@ export default function DataReviewPanel() {
               <div className="flex flex-wrap gap-2">
                 {e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await retryOutboxEntry(e.id)) === "retried" ? "もう一度同期を試す状態にしました。" : "項目が見つかりませんでした。"))}>再試行</button>}
                 {e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await acceptOutboxDivergence(e.id)) === "accepted" ? "この端末と保存先をそのままにして、同期を終了しました。" : "できませんでした。"))}>両方そのままにする</button>}
-                {e.recordExists && confirming !== `del:${e.id}` && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => setConfirming(`del:${e.id}`)}>この端末から削除…</button>}
+                {e.recordExists && e.recordType !== "source" && confirming !== `del:${e.id}` && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => setConfirming(`del:${e.id}`)}>この端末から削除…</button>}
                 {e.recordExists && confirming === `del:${e.id}` && (<>
                   <span className="text-red-700">本当に削除しますか？</span>
                   <button disabled={busy || blocked} className="border border-red-700 px-2 py-1 text-red-700" onClick={() => void act(async () => {
@@ -151,8 +151,8 @@ export default function DataReviewPanel() {
                     const p = await verifyTombstone(root, t.kind, t.id);
                     return p === "absent" ? "保存先にも見つかりませんでした。" : p === "present" ? "保存先にファイルが残っています。この画面からは削除しません。保存先のアプリで削除してから、もう一度確認してください。" : "保存先を確認できませんでした。";
                   })}>保存先を確認</button>
-                  {t.vault !== "kept" && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => { await keepVaultCopy(t.kind, t.id); return "保存先のコピーを残す設定にしました。"; })}>保存先のコピーは残す</button>}
-                  <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => { await allowBack(t.kind, t.id); return "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。"; })}>戻せるようにする</button>
+                  {t.vault !== "kept" && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => ((await keepVaultCopy(t)) ? "保存先のコピーを残す設定にしました。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>保存先のコピーは残す</button>}
+                  <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => ((await allowBack(t)) ? "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>戻せるようにする</button>
                   {d.purgeable && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => {
                     const root = await vaultRoot();
                     if (!root) return "保存先を確認できないため、整理できません（接続と読み取りの許可が必要です）。";
