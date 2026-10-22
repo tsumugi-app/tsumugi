@@ -461,6 +461,26 @@ test("Wiring H2: Source側でも、canonical+outbox transactionの途中失敗�
 });
 
 
+test("accepted divergence is respected by the startup integrity reconcile: the Vault file is NOT rewritten for it, while an ordinary done entry is repaired", async () => {
+  await setUpVaultWorld();
+  const vault = new FakeVault();
+  vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
+  await seedPrepairedIdentity(vault);
+  const dayA = "2026-10-11", dayB = "2026-10-12";
+  const conv = conversation("acc-conv");
+  const a = memory("acc-a", dayA), b = memory("acc-b", dayB);
+  await captureMod.persistCapture(null, conv, [a, b]);                       // canonical + Outbox only
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));             // both are projected: done
+  const pathA = `Memories/${vaultMod.dayFileNameFor(dayA)}`, pathB = `Memories/${vaultMod.dayFileNameFor(dayB)}`;
+  assert.ok(vault.get(pathA) && vault.get(pathB), "projected into the Vault");
+  vault.files.delete(pathA); vault.files.delete(pathB);                      // the Vault diverges from this device
+  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${a.id}`), "accepted");   // the user: "keep both as they are" for A only
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.equal(vault.get(pathA), undefined, "the accepted divergence is not repaired behind the user's back");
+  assert.ok(vault.get(pathB), "an ordinary done entry is still repaired by the integrity reconcile");
+  assert.equal((await dbMod.getVaultOutboxEntry(`memory:${a.id}`))?.status, "done", "and it does not return to held");
+});
+
 test("atomic failure: Memory/Reflection must not call either foreground or background Vault writer", async () => {
   const oldWrite = vaultMod.writeMemoryObjectMarkdown;
   let calls = 0;
