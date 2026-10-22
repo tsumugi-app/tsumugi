@@ -542,6 +542,17 @@ async function deleteAcceptedDivergenceInTx(tx: { objectStore(name: string): any
   if (outboxId in map) { delete map[outboxId]; await store.put(JSON.stringify(map), ACCEPTED_DIVERGENCE_KEY); }
 }
 
+/** Thrown by the lifecycle mutators while a maintenance window / recovery owns the durable gate. Nothing is written. */
+export class RecoveryPendingError extends Error { constructor() { super("recovery-or-maintenance-in-progress"); this.name = "RecoveryPendingError"; } }
+/** Read INSIDE the caller's transaction (it must include "settings"): an unfinished journal (or one that can not be read) refuses the mutation, so a repair never sees the data change under it. */
+async function assertNoPendingRecoveryInTx(tx: { objectStore(name: string): any }): Promise<void> {   // eslint-disable-line @typescript-eslint/no-explicit-any
+  const raw = await tx.objectStore("settings").get(VAULT_RECOVERY_JOURNAL_KEY);
+  if (raw === undefined) return;
+  let status: unknown;
+  try { status = (JSON.parse(String(raw)) as { status?: unknown }).status; } catch { throw new RecoveryPendingError(); }
+  if (status === "in-progress" || typeof status !== "string") throw new RecoveryPendingError();
+}
+
 const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings"] as const;
 
 /** Deletes one Memory (see removeMemoryInTx) in ONE transaction and writes the tombstone. */
@@ -550,6 +561,7 @@ export async function deleteMemoryByUser(memoryId: string, now: string = new Dat
   const tx = db.transaction([...LIFECYCLE_STORES], "readwrite");
   const result: UserDeleteResult = { status: "not-found", countersUpdated: 0, conversationUpdated: false };
   try {
+    await assertNoPendingRecoveryInTx(tx);
     const settings = tx.objectStore("settings");
     const map = parseTombstoneMap(await settings.get(TOMBSTONES_KEY));
     if (map === null) throw new TombstoneStoreCorruptError();
@@ -570,6 +582,7 @@ export async function deleteConversationByUser(conversationId: string, now: stri
   const tx = db.transaction([...LIFECYCLE_STORES], "readwrite");
   const result: UserDeleteResult & { memoryIds: string[] } = { status: "not-found", countersUpdated: 0, conversationUpdated: false, memoryIds: [] };
   try {
+    await assertNoPendingRecoveryInTx(tx);
     const settings = tx.objectStore("settings");
     const map = parseTombstoneMap(await settings.get(TOMBSTONES_KEY));
     if (map === null) throw new TombstoneStoreCorruptError();
@@ -602,6 +615,7 @@ export async function deleteConversationWithMemoriesByUser(conversationId: strin
   const conversation: UserDeleteResult = { status: "not-found", countersUpdated: 0, conversationUpdated: false };
   let memoriesDeleted = 0;
   try {
+    await assertNoPendingRecoveryInTx(tx);
     const settings = tx.objectStore("settings");
     const map = parseTombstoneMap(await settings.get(TOMBSTONES_KEY));
     if (map === null) throw new TombstoneStoreCorruptError();
@@ -650,6 +664,7 @@ export async function retryOutboxEntry(id: string, now: string = new Date().toIS
   const tx = db.transaction(["vaultOutbox", "settings"], "readwrite");
   let result: "retried" | "not-found" = "not-found";
   try {
+    await assertNoPendingRecoveryInTx(tx);
     const store = tx.objectStore("vaultOutbox");
     const e = await store.get(id);
     await deleteAcceptedDivergenceInTx(tx, id);
@@ -665,6 +680,7 @@ export async function acceptOutboxDivergence(id: string, now: string = new Date(
   const tx = db.transaction(["vaultOutbox", "memoryObjects", "conversations", "sources", "vaultSyncState", "settings"], "readwrite");
   let result: "accepted" | "not-found" | "record-missing" = "not-found";
   try {
+    await assertNoPendingRecoveryInTx(tx);
     const store = tx.objectStore("vaultOutbox");
     const e = await store.get(id);
     if (e) {
@@ -694,6 +710,7 @@ export async function removeOrphanOutboxEntry(id: string, options: { tombstone?:
   const tx = db.transaction(["vaultOutbox", "memoryObjects", "conversations", "sources", "vaultSyncState", "settings"], "readwrite");
   let result: "removed" | "not-found" | "record-exists" = "not-found";
   try {
+    await assertNoPendingRecoveryInTx(tx);
     const store = tx.objectStore("vaultOutbox");
     const e = await store.get(id);
     if (e) {
@@ -1132,7 +1149,10 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
 }
 
 export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
-  return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now);
+  // a conversation the user deleted is never recreated by a stale chat tab / an in-flight request (the check runs inside the same transaction)
+  return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
+    if (blockedByTombstone(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+  });
 }
 
 /** `recordType`は既定で`"memory"`（normal Memory）。Reflectionを書く場合は`"reflection"`を渡す。 */
@@ -1162,7 +1182,9 @@ export async function putMemoryObjectWithOutbox(
   recordType: "memory" | "reflection" = "memory",
   now: string = new Date().toISOString()
 ): Promise<VaultOutboxEntry> {
-  return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now);
+  return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
+    if (blockedByTombstone(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), "memory", memoryObject.id)) throw new TombstonedRecordError("memory", memoryObject.id);
+  });
 }
 
 export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {

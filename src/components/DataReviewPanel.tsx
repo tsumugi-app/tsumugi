@@ -51,7 +51,7 @@ export default function DataReviewPanel() {
   async function act(fn: () => Promise<string>) {
     if (busy) return;
     setBusy(true); setMessage(null); setConfirming(null);
-    try { setMessage(await fn()); } catch (e) { setMessage("できませんでした: " + ((e as Error)?.name ?? "error")); }
+    try { setMessage(await fn()); } catch (e) { const n = (e as Error)?.name ?? "error"; setMessage(n === "RecoveryPendingError" ? "メンテナンス中、または復旧が必要な状態のため、今はできません。" : n === "TombstonedRecordError" ? "削除済みの記録のため、できません。" : "できませんでした: " + n); }
     finally { setBusy(false); await load(); }
   }
   async function vaultRoot(): Promise<FileSystemDirectoryHandle | null> {

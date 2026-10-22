@@ -641,3 +641,39 @@ test("'keep both as they are' is durable: the divergence marker is stored for th
   assert.ok(await dbMod.getVaultOutboxEntry("source:ghost"), "the entry is still there");
   assert.equal(await dbMod.removeOrphanOutboxEntry("source:ghost", {}, NOW1), "removed", "plain tidy-up without a promise is allowed");
 });
+
+test("every lifecycle mutation re-checks the durable maintenance gate INSIDE its transaction: while a recovery / maintenance is in progress nothing is deleted, retried, accepted or tidied", async () => {
+  const w = await seedWorldForDelete("gate1");
+  await dbMod.putVaultOutboxEntry({ id: `memory:${w.B}`, recordType: "memory", recordId: w.B, recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 1, lastError: "x", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
+  const before = async () => JSON.stringify([await dbMod.getMemoryObject(w.A), await dbMod.getMemoryObject(w.B), await dbMod.getConversation(w.conv), await dbMod.getVaultOutboxEntry(`memory:${w.B}`), await dbMod.getAcceptedDivergences(), await dbMod.listTombstones()]);
+  const snap = await before();
+  await dbMod.writeRecoveryJournalRaw(JSON.stringify({ version: 1, status: "in-progress" }));
+  try {
+    const blocked = (e: Error) => e.name === "RecoveryPendingError";
+    await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
+    await assert.rejects(() => dbMod.deleteConversationByUser(w.conv, NOW1), blocked);
+    await assert.rejects(() => dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1), blocked);
+    await assert.rejects(() => dbMod.retryOutboxEntry(`memory:${w.B}`, NOW1), blocked);
+    await assert.rejects(() => dbMod.acceptOutboxDivergence(`memory:${w.B}`, NOW1), blocked);
+    await assert.rejects(() => dbMod.removeOrphanOutboxEntry(`memory:${w.B}`, {}, NOW1), blocked);
+    assert.equal(await before(), snap, "nothing changed while the gate was in place");
+    await dbMod.writeRecoveryJournalRaw("{ not json");                                  // an unreadable journal also refuses (fail closed)
+    await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
+    assert.equal(await before(), snap);
+  } finally {
+    await dbMod.writeRecoveryJournalRaw(JSON.stringify({ version: 1, status: "completed" }));   // a finished journal does not block
+  }
+  assert.equal((await dbMod.deleteMemoryByUser(w.A, NOW1)).status, "deleted");
+});
+
+test("every conversation / Memory writer refuses a tombstoned record: a stale chat tab or an in-flight request can not recreate a deleted conversation (and its pending projection)", async () => {
+  await dbMod.putConversationWithOutbox(conversation("tb-conv"));
+  await dbMod.deleteConversationByUser("tb-conv", NOW1);
+  await assert.rejects(() => dbMod.putConversationWithOutbox(conversation("tb-conv", "2026-12-01T00:00:00.000Z")), (e: Error) => e.name === "TombstonedRecordError");
+  assert.equal(await dbMod.getConversation("tb-conv"), undefined);
+  assert.equal(await dbMod.getVaultOutboxEntry("conversation:tb-conv"), undefined, "no pending projection either");
+  await dbMod.putMemoryObjectWithOutbox(fromConversation("tb-mem", "c9"));
+  await dbMod.deleteMemoryByUser("tb-mem", NOW1);
+  await assert.rejects(() => dbMod.putMemoryObjectWithOutbox(fromConversation("tb-mem", "c9", "2026-12-01T00:00:00.000Z")), (e: Error) => e.name === "TombstonedRecordError");
+  assert.equal(await dbMod.getMemoryObject("tb-mem"), undefined);
+});
