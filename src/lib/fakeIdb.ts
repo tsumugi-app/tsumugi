@@ -94,6 +94,16 @@ class FakeTransaction {
         staging.set(k, { op: "put", value });
         return k;
       },
+      /** like IndexedDB's add(): refuses to overwrite an existing key (ConstraintError) */
+      async add(value: unknown, key?: Key) {
+        const k = keyOf(store, value, key);
+        const staged = staging.get(k);
+        const exists = staged ? staged.op !== "delete" : store.committed.has(k);
+        if (exists) { const error = Object.assign(new Error(`fakeIdb: key already exists in store "${name}"`), { name: "ConstraintError" }); fail(error); throw error; }
+        if (failOnPut.has(name)) { const error = new Error(`fakeIdb: simulated put failure on store "${name}"`); fail(error); throw error; }
+        staging.set(k, { op: "put", value });
+        return k;
+      },
       async delete(key: Key) {
         staging.set(key, { op: "delete" });
       },
