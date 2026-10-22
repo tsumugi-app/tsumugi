@@ -28,15 +28,13 @@ async function openWith(page: Page, withVault = false) {
   await expect(page.getByRole("heading", { name: "データの管理" })).toBeVisible();
   await page.evaluate(async ({ rows, withVault }) => {
     const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    // the OPFS directory is obtained BEFORE the transaction opens (an IndexedDB transaction closes itself when awaited work outside IndexedDB happens inside it)
+    const vaultDir = withVault ? await (await navigator.storage.getDirectory()).getDirectoryHandle("data-e2e-vault", { create: true }) : null;
     const tx = db.transaction(["conversations", "memoryObjects", "vaultOutbox", "handles"], "readwrite");
     for (const c of rows.conversations) tx.objectStore("conversations").put(c);
     for (const m of rows.memories) tx.objectStore("memoryObjects").put(m);
     for (const o of rows.outbox) tx.objectStore("vaultOutbox").put(o);
-    if (withVault) {
-      const root = await navigator.storage.getDirectory();
-      const v = await root.getDirectoryHandle("data-e2e-vault", { create: true });
-      tx.objectStore("handles").put(v, "vaultRoot");
-    }
+    if (vaultDir) tx.objectStore("handles").put(vaultDir, "vaultRoot");
     await new Promise<void>((res, rej) => { tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); });
     db.close();
   }, {
