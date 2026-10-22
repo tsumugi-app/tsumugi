@@ -16,10 +16,10 @@
  * Nothing here logs or sends anything.
  */
 import {
-  clearTombstone, getTombstone, listTombstones, setTombstoneVaultState,
+  clearTombstone, clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultState,
   type Tombstone,
 } from "./db";
-import { dayFileNameFor, fileNameFor } from "./vault";
+import { dayFileNameFor } from "./vault";
 import { parseMemoryDayFile } from "./markdown";
 
 export const PURGE_AFTER_DAYS = 30;
@@ -38,29 +38,56 @@ async function readTextIfExists(root: FileSystemDirectoryHandle, path: string): 
   }
 }
 
-/** Read-only. "present": the Vault still holds the record; "absent": it holds no copy; "unknown": it can not be decided (missing date, unreadable / unparsable file). */
+const MAX_FILES_SCANNED = 20000;
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Looks for the record's id in every Markdown file under Memories/ and Conversations/ (recursively: a file the user moved or renamed is still found).
+ * Matches the frontmatter line `id: <id>` exactly (a mere mention of the id in another record's text or links does not count). Read-only.
+ * "unknown" when the folder tree can not be read or is larger than MAX_FILES_SCANNED files (never "absent" on a partial look).
+ */
+async function scanVaultForId(root: FileSystemDirectoryHandle, id: string): Promise<VaultPresence> {
+  const idLine = new RegExp(`^id:\\s*["']?${escapeRegExp(id)}["']?\\s*$`, "m");
+  let scanned = 0;
+  const walk = async (dir: FileSystemDirectoryHandle): Promise<VaultPresence> => {
+    for await (const [name, handle] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
+      if (handle.kind === "directory") {
+        const inner = await walk(handle as FileSystemDirectoryHandle);
+        if (inner !== "absent") return inner;
+      } else if (name.toLowerCase().endsWith(".md")) {
+        if (++scanned > MAX_FILES_SCANNED) return "unknown";
+        const text = await (await (handle as FileSystemFileHandle).getFile()).text();
+        if (idLine.test(text)) return "present";
+      }
+    }
+    return "absent";
+  };
+  for (const top of ["Memories", "Conversations"]) {
+    let dir: FileSystemDirectoryHandle;
+    try { dir = await root.getDirectoryHandle(top, { create: false }); }
+    catch (e) { if ((e as { name?: string })?.name === "NotFoundError") continue; return "unknown"; }
+    const r = await walk(dir);
+    if (r !== "absent") return r;
+  }
+  return "absent";
+}
+
+/**
+ * Read-only. "present": the Vault still holds the record; "absent": it holds no copy anywhere under Memories/ or Conversations/ (found by id, wherever the
+ * file was moved to); "unknown": it can not be decided (unreadable tree, too many files). A quick look at the canonical path comes first; an index.json
+ * key alone is NOT treated as presence (deleting the file in the Vault leaves the key behind).
+ */
 export async function checkTombstoneInVault(root: FileSystemDirectoryHandle, t: Tombstone): Promise<VaultPresence> {
   try {
-    if (t.kind === "memory") {
-      if (!t.date) return "unknown";
+    if (t.kind === "memory" && t.date) {
       const day = await readTextIfExists(root, `Memories/${dayFileNameFor(t.date)}`);
       if (day !== null) {
         let members;
         try { members = parseMemoryDayFile(day); } catch { return "unknown"; }
         if (members.some((m) => m.id === t.id)) return "present";
       }
-      if ((await readTextIfExists(root, `Memories/${fileNameFor(t.id, t.date)}`)) !== null) return "present";    // a Reflection / legacy one-file-per-record Memory
-      return "absent";
     }
-    const indexRaw = await readTextIfExists(root, ".tsumugi/index.json");
-    if (indexRaw !== null) {
-      let index: unknown;
-      try { index = JSON.parse(indexRaw); } catch { return "unknown"; }
-      if (index && typeof index === "object" && !Array.isArray(index) && t.id in (index as Record<string, unknown>)) return "present";
-    }
-    if (!t.startedAt) return indexRaw === null ? "unknown" : "absent";
-    if ((await readTextIfExists(root, `Conversations/${fileNameFor(t.id, t.startedAt)}`)) !== null) return "present";
-    return "absent";
+    return await scanVaultForId(root, t.id);
   } catch { return "unknown"; }
 }
 
@@ -93,7 +120,8 @@ export const allowBack = clearTombstone;
 export async function purgeEligibleTombstones(now: string = new Date().toISOString(), retentionDays: number = PURGE_AFTER_DAYS): Promise<{ kind: Tombstone["kind"]; id: string }[]> {
   const purged: { kind: Tombstone["kind"]; id: string }[] = [];
   for (const t of await listTombstones()) {
-    if (purgeDecision(t, now, retentionDays).purgeable) { await clearTombstone(t.kind, t.id); purged.push({ kind: t.kind, id: t.id }); }
+    // the decision was made on THIS tombstone; it is cleared only if it is still exactly this one when the transaction runs (another tab may have found the Vault copy again)
+    if (purgeDecision(t, now, retentionDays).purgeable && (await clearTombstoneIfUnchanged(t))) purged.push({ kind: t.kind, id: t.id });
   }
   return purged;
 }

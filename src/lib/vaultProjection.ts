@@ -19,7 +19,7 @@
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
-import { getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, getHeldVaultOutboxEntries, getProjectionHeldReevaluationMarker, setProjectionHeldReevaluationMarker, putVaultOutboxEntry, putMemoryProjectionOutcome } from "./db";
+import { getAcceptedDivergences, getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, getHeldVaultOutboxEntries, getProjectionHeldReevaluationMarker, setProjectionHeldReevaluationMarker, putVaultOutboxEntry, putMemoryProjectionOutcome } from "./db";
 import { conversationEntryTypeOf } from "./conversationEntryKind";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
 import type { VaultIdentityRecord } from "./vaultIdentity";
@@ -1295,5 +1295,7 @@ export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: 
 }
 
 export async function reconcileDoneVaultOutboxIntegrity(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
-  return reconcileOutboxEntries(env, await getDoneVaultOutboxEntries());
+  // 「両方そのままにする」でユーザーが受け入れた食い違い（その版に限る）は、再びheldに戻さない。recordが新しい版へ進めば、通常どおり再projectionされる。
+  const accepted = await getAcceptedDivergences();
+  return reconcileOutboxEntries(env, (await getDoneVaultOutboxEntries()).filter((e) => accepted[e.id] !== e.recordUpdatedAt));
 }

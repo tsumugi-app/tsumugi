@@ -93,7 +93,7 @@ export default function DataReviewPanel() {
                   })}>削除する</button>
                   <button className="border px-2 py-1" onClick={() => setConfirming(null)}>やめる</button>
                 </>)}
-                {!e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await removeOrphanOutboxEntry(e.id, { tombstone: true })) === "removed" ? "削除済みとして整理しました。保存先に残っていても、この端末には戻りません。" : "できませんでした。"))}>削除済みとして整理</button>}
+                {!e.recordExists && e.recordType !== "source" && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await removeOrphanOutboxEntry(e.id, { tombstone: true })) === "removed" ? "削除済みとして整理しました。保存先に残っていても、この端末には戻りません。" : "できませんでした。"))}>削除済みとして整理</button>}
                 {!e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await removeOrphanOutboxEntry(e.id)) === "removed" ? "この項目だけを整理しました。" : "できませんでした。"))}>この項目だけ整理</button>}
               </div>
             </li>

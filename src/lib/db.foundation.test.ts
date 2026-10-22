@@ -611,3 +611,33 @@ test("stuck Outbox entries: listed, and each can be resolved by the user (retry,
   assert.ok(await dbMod.getTombstone("memory", "st-ghost"), "the user's deletion intent is kept so the Vault copy can not come back");
   assert.deepEqual((await dbMod.listOutboxNeedingAttention()).map((e) => e.id), [], "nothing is left without an outcome");
 });
+
+test("deleting a conversation together with its Memories is ONE transaction: an interruption commits nothing; a Memory added meanwhile is covered because the Memories are read inside the transaction", async () => {
+  const w = await seedWorldForDelete("del6");
+  const snapshot = async () => JSON.stringify([await dbMod.getMemoryObject(w.A), await dbMod.getMemoryObject(w.B), await dbMod.getMemoryObject(w.D), await dbMod.getConversation(w.conv), await dbMod.getVaultOutboxEntry(`memory:${w.B}`), await dbMod.getVaultOutboxEntry(`conversation:${w.conv}`), await dbMod.listTombstones()]);
+  const before = await snapshot();
+  fakeIdbMod.__failNextPutOn("tsumugi", "settings");                 // the tombstone write at the END fails
+  await assert.rejects(() => dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1));
+  assert.equal(await snapshot(), before, "no Memory, link, reference or conversation changed");
+  // a third Memory of the conversation that exists when the transaction runs is deleted too (nothing dangles)
+  await dbMod.putMemoryObjectWithOutbox(fromConversation(`${w.conv}-late`, w.conv));
+  const r = await dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1);
+  assert.equal(r.memoriesDeleted, 3);
+  assert.equal(await dbMod.getMemoryObject(`${w.conv}-late`), undefined);
+  assert.equal(await dbMod.getConversation(w.conv), undefined);
+});
+
+test("'keep both as they are' is durable: the divergence marker is stored for that record version only, is dropped by a retry and with the record", async () => {
+  await dbMod.putMemoryObject(fromConversation("dv-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:dv-1", recordType: "memory", recordId: "dv-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 3, lastError: "conflict", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:dv-1", NOW1), "accepted");
+  assert.deepEqual(await dbMod.getAcceptedDivergences(), { "memory:dv-1": T });
+  assert.equal(await dbMod.retryOutboxEntry("memory:dv-1"), "not-found", "an accepted (done) entry is not retried; a new canonical version re-queues it normally");
+  await dbMod.deleteMemoryByUser("dv-1", NOW1);
+  assert.deepEqual(await dbMod.getAcceptedDivergences(), {}, "the marker is dropped with the record");
+  // a Source orphan can not get a deletion tombstone (no guard exists for Sources): nothing changes
+  await dbMod.putVaultOutboxEntry({ id: "source:ghost", recordType: "source", recordId: "ghost", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 0, lastError: null, lastAttemptAt: null }, status: "held", heldReason: "canonical-record-missing", createdAt: T, updatedAt: T } as never);
+  await assert.rejects(() => dbMod.removeOrphanOutboxEntry("source:ghost", { tombstone: true }, NOW1), /tombstone-unsupported/);
+  assert.ok(await dbMod.getVaultOutboxEntry("source:ghost"), "the entry is still there");
+  assert.equal(await dbMod.removeOrphanOutboxEntry("source:ghost", {}, NOW1), "removed", "plain tidy-up without a promise is allowed");
+});

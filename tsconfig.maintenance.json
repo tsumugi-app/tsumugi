@@ -29,6 +29,7 @@
     "src/lib/maintenance/manifest.ts",
     "src/lib/maintenance/precheckScope.test.ts",
     "src/lib/maintenance/precheckScope.ts",
+    "src/lib/maintenance/dataLifecycle.test.ts",
     "src/lib/maintenance/repairSession.test.ts",
     "src/lib/maintenance/repairSession.ts",
     "src/lib/maintenance/restore.test.ts",
