@@ -25,8 +25,9 @@ jobs:
               "@codex review",
               "",
               "On-demand independent review of " + sha + ". Review-only: no merge, no deploy, no production data.",
-              "Focus on the newest changes: (1) the storage-layer Memory lineage invariant in src/lib/db.ts (assertMemoryLineage, MemoryLineageViolationError) and whether ANY writer of the Memory store can still replace a stored Memory with one from another conversation;",
-              "(2) restore-from-Vault writers that must never replace newer local data (restore*IfNotNewer) and the ChatScreen swap; (3) compare-and-set on Vault apply (putMemoryObjectAndMarkSynced / putConversationAndMarkSynced with the expected version in src/lib/vault.ts);",
-              "(4) the crash recovery and maintenance session (src/lib/maintenance/*), Outbox / HOLD / protected-data non-mutation. Report only real defects with a concrete failure scenario.",
+              "Focus on the data lifecycle work: user deletion of Memories / Conversations (deleteMemoryByUser, deleteConversationByUser, deleteConversationWithMemoriesByUser in src/lib/db.ts) and whether links, owning-conversation references, Outbox entries, sync ledger and tombstones stay consistent in one transaction;",
+              "(2) the tombstone store and every resurrection guard (importMissingRecordsIfAbsent, add*IfAbsentAndMarkSynced, restore*IfNotNewer, the vault.ts resync apply) - can any path still re-insert a deleted record, or can a guard block legitimate data;",
+              "(3) stuck Outbox entry resolution (listOutboxNeedingAttention, retryOutboxEntry, acceptOutboxDivergence, removeOrphanOutboxEntry) and the /data screen (src/components/DataReviewPanel.tsx) - is there still any state without a way out for the user, or any action that can lose data;",
+              "(4) tombstone purge rules (src/lib/dataLifecycle.ts). Report only real defects with a concrete failure scenario.",
             ].join("\n");
             await github.rest.issues.createComment({ owner, repo, issue_number: prs.data[0].number, body });
