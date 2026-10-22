@@ -104,7 +104,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of chatDiff) assert.ok(/restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l), "unexpected ChatScreen.tsx change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
-  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|isTombstoned|ユーザーが削除した記録|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**

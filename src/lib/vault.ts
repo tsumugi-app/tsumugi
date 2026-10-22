@@ -19,6 +19,7 @@
 import {
   addConversationIfAbsentAndMarkSynced,
   addMemoryObjectIfAbsentAndMarkSynced,
+  isTombstoned,
   addSourceIfAbsentAndMarkSynced,
   bumpRegistryGenerationEpoch,
   getAllConversations,
@@ -6094,6 +6095,8 @@ async function applySingleRecordAdded(
   } else {
     // 真の新規import（E節）：Markdown非往復fieldはparserの既定値のまま取り込む
     // （Beta仕様として許容）。
+    // ユーザーが削除した記録（tombstone）は取り込まない（History行も作らない）。
+    if (kind !== "source" && (await isTombstoned(kind === "conversation" ? "conversation" : "memory", record.registryKey))) return;
     if (kind === "conversation") {
       await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
     } else if (kind === "source") {
@@ -6312,6 +6315,8 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
             throw new Error(`legacy-equivalent member ${member.id} disappeared from IndexedDB during apply`);
           }
           await setVaultSyncState(syncKey, existingUpdatedAt);
+        } else if (await isTombstoned("memory", member.id)) {
+          // ユーザーが削除した記録（tombstone）は取り込まない
         } else {
           await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey);
         }
