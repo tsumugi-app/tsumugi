@@ -214,9 +214,19 @@ function getDB() {
   return dbPromise;
 }
 
+/** Thrown when a write would (re)create a record the user deleted. Nothing is written. */
+export class TombstonedRecordError extends Error {
+  constructor(public readonly kind: "memory" | "conversation", public readonly recordId: string) { super("record-is-tombstoned"); this.name = "TombstonedRecordError"; }
+}
+/** Plain conversation write (Capture's persistence). Refuses a conversation the user deleted (an in-flight Capture must not silently undo a deletion). */
 export async function putConversation(conversation: Conversation) {
   const db = await getDB();
-  await db.put("conversations", conversation);
+  const tx = db.transaction(["conversations", "settings"], "readwrite");
+  try {
+    if (blockedByTombstone(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    await tx.objectStore("conversations").put(conversation);
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
 }
 
 export async function getConversation(id: string) {
@@ -445,6 +455,15 @@ async function mutateTombstones(fn: (map: TombstoneMap) => void): Promise<void> 
     await store.put(JSON.stringify(map), TOMBSTONES_KEY);
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
+}
+/** Records a verification verdict ONLY if the tombstone is still exactly the one that was scanned (a decision made meanwhile in another tab is never overwritten). */
+export async function setTombstoneVaultStateIfUnchanged(expected: Tombstone, vault: TombstoneVaultState, now: string = new Date().toISOString()): Promise<boolean> {
+  let changed = false;
+  await mutateTombstones((map) => {
+    const key = tombstoneId(expected.kind, expected.id);
+    if (map[key] && JSON.stringify(map[key]) === JSON.stringify(expected)) { map[key] = { ...expected, vault, vaultCheckedAt: now }; changed = true; }
+  });
+  return changed;
 }
 export const setTombstoneVaultState = (kind: TombstoneKind, id: string, vault: TombstoneVaultState, now: string = new Date().toISOString()) =>
   mutateTombstones((map) => { const t = map[tombstoneId(kind, id)]; if (t) map[tombstoneId(kind, id)] = { ...t, vault, vaultCheckedAt: now }; });
@@ -1090,13 +1109,16 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   storeName: S,
   recordType: string,
   record: CanonicalStoreValueMap[S] & { id: string; updatedAt: string },
-  now: string
+  now: string,
+  /** checked INSIDE the transaction before anything is written (e.g. the tombstones); a throw writes nothing */
+  guard?: (tx: { objectStore(name: string): any }) => Promise<void>   // eslint-disable-line @typescript-eslint/no-explicit-any
 ): Promise<VaultOutboxEntry> {
   const db = await getDB();
   const outboxId = vaultOutboxIdFor(recordType, record.id);
-  const tx = db.transaction([storeName, "vaultOutbox"], "readwrite");
+  const tx = db.transaction(guard ? [storeName, "vaultOutbox", "settings"] : [storeName, "vaultOutbox"], "readwrite");
   let entry: VaultOutboxEntry;
   try {
+    if (guard) await guard(tx);
     const outboxStore = tx.objectStore("vaultOutbox");
     const existing = await outboxStore.get(outboxId);
     if (storeName === "memoryObjects") assertMemoryLineage(await tx.objectStore(storeName).get(record.id) as MemoryObject | undefined, record as unknown as MemoryObject);
@@ -1127,7 +1149,12 @@ export async function putCapturedMemoryWithOutbox(
   now: string = new Date().toISOString()
 ): Promise<VaultOutboxEntry> {
   if (!producedByConversationId || memoryObject.conversationId !== producedByConversationId) throw new MemoryLineageViolationError(memoryObject.id);
-  return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now);
+  return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
+    const tombstones = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    // neither the producing conversation nor the Memory id may be a record the user deleted
+    if (blockedByTombstone(tombstones, "conversation", producedByConversationId)) throw new TombstonedRecordError("conversation", producedByConversationId);
+    if (blockedByTombstone(tombstones, "memory", memoryObject.id)) throw new TombstonedRecordError("memory", memoryObject.id);
+  });
 }
 
 export async function putMemoryObjectWithOutbox(

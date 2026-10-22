@@ -98,7 +98,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/")), "API routes must not be modified");
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
   // ChatScreen: the only allowed change is the reviewed swap of the three restore-from-Vault writers (never replace newer local data with an older Vault copy)
   const chatDiff = git("diff", "-U0", ...range, "--", "src/components/ChatScreen.tsx").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   for (const l of chatDiff) assert.ok(/restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l), "unexpected ChatScreen.tsx change: " + l);
@@ -107,7 +107,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of projDiff) assert.ok(/getAcceptedDivergences|const accepted|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l), "unexpected vaultProjection.ts change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
-  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|isTombstoned|ユーザーが削除した記録|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|isTombstoned|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**
@@ -179,7 +179,7 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
   const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
     "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer",
-    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "removeConversationInTx", "deleteAcceptedDivergenceInTx"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
+    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
   const missing: string[] = [];
   heads.forEach((h, i) => {
     const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);

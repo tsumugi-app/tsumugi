@@ -6097,13 +6097,16 @@ async function applySingleRecordAdded(
     // （Beta仕様として許容）。
     // ユーザーが削除した記録（tombstone）は取り込まない（History行も作らない）。
     if (kind !== "source" && (await isTombstoned(kind === "conversation" ? "conversation" : "memory", record.registryKey))) return;
+    let inserted = true;
     if (kind === "conversation") {
-      await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
+      inserted = await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
     } else if (kind === "source") {
       await addSourceIfAbsentAndMarkSynced(record.parsed as Source, syncKey);
     } else {
-      await addMemoryObjectIfAbsentAndMarkSynced(record.parsed as MemoryObject, syncKey);
+      inserted = await addMemoryObjectIfAbsentAndMarkSynced(record.parsed as MemoryObject, syncKey);
     }
+    // ユーザーが削除した記録（tombstone）が直前に作られていた場合：履歴行もRegistryも更新しない
+    if (!inserted && kind !== "source" && (await isTombstoned(kind === "conversation" ? "conversation" : "memory", record.registryKey))) return;
     if (kind !== "source") {
       await updateHistoryIndexForSingleRecord(root, kind, record.parsed);
     }

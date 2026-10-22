@@ -481,6 +481,24 @@ test("accepted divergence is respected by the startup integrity reconcile: the V
   assert.equal((await dbMod.getVaultOutboxEntry(`memory:${a.id}`))?.status, "done", "and it does not return to held");
 });
 
+test("persistCapture for a conversation the user deleted meanwhile: nothing is recreated in IndexedDB and nothing is written to the Vault", async () => {
+  await setUpVaultWorld();
+  const vault = new FakeVault();
+  vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
+  await seedPrepairedIdentity(vault);
+  const conv = conversation("del-cap-conv");
+  const mem = memory("del-cap-mem", "2026-10-13");
+  await dbMod.putConversationWithOutbox(conv);
+  await dbMod.deleteConversationByUser(conv.id, "2026-10-20T00:00:00.000Z");
+  const writesBefore = vault.writes.length;
+  const result = await captureMod.persistCapture(vault.root(), conv, [mem]);
+  assert.equal(result.conversationFailed, true);
+  assert.equal(await dbMod.getConversation(conv.id), undefined, "the deleted conversation is not recreated");
+  assert.equal(await dbMod.getMemoryObject(mem.id), undefined, "no Memory of the deleted conversation is saved");
+  assert.deepEqual(result.failedMemoryIds, [mem.id]);
+  assert.equal(vault.writes.length, writesBefore, "nothing reached the Vault");
+});
+
 test("atomic failure: Memory/Reflection must not call either foreground or background Vault writer", async () => {
   const oldWrite = vaultMod.writeMemoryObjectMarkdown;
   let calls = 0;

@@ -153,7 +153,12 @@ export default function DataReviewPanel() {
                   })}>保存先を確認</button>
                   {t.vault !== "kept" && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => { await keepVaultCopy(t.kind, t.id); return "保存先のコピーを残す設定にしました。"; })}>保存先のコピーは残す</button>}
                   <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => { await allowBack(t.kind, t.id); return "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。"; })}>戻せるようにする</button>
-                  {d.purgeable && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => { const n = (await purgeEligibleTombstones()).length; return `${n} 件を整理しました。`; })}>整理する</button>}
+                  {d.purgeable && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => {
+                    const root = await vaultRoot();
+                    if (!root) return "保存先を確認できないため、整理できません（接続と読み取りの許可が必要です）。";
+                    const n = (await purgeEligibleTombstones(root)).length;
+                    return n > 0 ? `${n} 件を整理しました。` : "保存先にコピーが戻っていないか確認しましたが、整理できる記録はありませんでした。";
+                  })}>整理する</button>}
                 </div>
               </li>
             );

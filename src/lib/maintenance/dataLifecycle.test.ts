@@ -70,7 +70,7 @@ test("purge is conditional: a tombstone another tab changed after the decision (
   await dbm.setTombstoneVaultState("memory", "pg-a", "unverified", "2026-10-22T00:00:00.000Z");   // ... then another tab finds the Vault copy again
   assert.equal(await dbm.clearTombstoneIfUnchanged(staleView), false);
   assert.ok(await dbm.getTombstone("memory", "pg-a"), "the changed tombstone survived");
-  const purged = await life.purgeEligibleTombstones("2026-10-23T00:00:00.000Z");
+  const purged = await life.purgeEligibleTombstones(v.root(), "2026-10-23T00:00:00.000Z");
   assert.deepEqual(purged, [{ kind: "memory", id: "pg-b" }]);
   assert.equal(await dbm.getTombstone("memory", "pg-b"), undefined);
   assert.ok(await dbm.getTombstone("memory", "pg-a"));
@@ -80,4 +80,42 @@ test("purge is conditional: a tombstone another tab changed after the decision (
   await dbm.setTombstoneVaultState("memory", "pg-a", "absent", "2026-10-22T00:00:00.000Z");
   assert.equal(await life.verifyTombstone(v2.root(), "memory", "pg-a"), "present");
   assert.equal((await dbm.getTombstone("memory", "pg-a"))!.vault, "unverified");
+});
+
+test("purge re-reads the Vault right before clearing: a copy that came back after the stored 'absent' verdict keeps the tombstone; without a readable Vault nothing is purged; a concurrent 'keep' is not overwritten by a stale verification", async () => {
+  await dbm.putMemoryObject(memory("pr-a")); await dbm.putMemoryObject(memory("pr-b"));
+  await dbm.deleteMemoryByUser("pr-a", "2026-01-01T00:00:00.000Z");
+  await dbm.deleteMemoryByUser("pr-b", "2026-01-01T00:00:00.000Z");
+  const empty = new testSupport.FakeVault();
+  await life.verifyTombstone(empty.root(), "memory", "pr-a", "2026-01-02T00:00:00.000Z");
+  await life.verifyTombstone(empty.root(), "memory", "pr-b", "2026-01-02T00:00:00.000Z");
+  assert.deepEqual(await life.purgeEligibleTombstones(null, "2026-10-23T00:00:00.000Z"), [], "no Vault, no purge");
+  // day 20: another device restored the file of pr-a into the Vault; the stored verdict is still 'absent'
+  const back = new testSupport.FakeVault();
+  back.put("Memories/2026-08-20.md", md.serializeMemoryDayFile([memory("pr-a")]));
+  const purged = await life.purgeEligibleTombstones(back.root(), "2026-10-23T00:00:00.000Z");
+  assert.deepEqual(purged, [{ kind: "memory", id: "pr-b" }]);
+  assert.equal((await dbm.getTombstone("memory", "pr-a"))!.vault, "unverified", "the guard stays and is marked unverified again");
+  // concurrent decisions: a stale verification never overwrites the user's newer choice
+  await dbm.setTombstoneVaultState("memory", "pr-a", "absent", "2026-10-01T00:00:00.000Z");
+  const scanned = (await dbm.getTombstone("memory", "pr-a"))!;
+  await life.keepVaultCopy("memory", "pr-a", "2026-10-22T00:00:00.000Z");                   // another tab: "keep the Vault copy"
+  assert.equal(await dbm.setTombstoneVaultStateIfUnchanged(scanned, "unverified", "2026-10-22T01:00:00.000Z"), false);
+  assert.equal((await dbm.getTombstone("memory", "pr-a"))!.vault, "kept");
+});
+
+test("an in-flight Capture can not undo a deletion: the deleted conversation is not recreated and no Memory of it is saved", async () => {
+  await dbm.putConversation({ id: "cap-conv", persona: "companion", status: "captured", startedAt: T, createdAt: T, updatedAt: T, turns: [], memoryObjectIds: [], metadata: meta } as any);
+  await dbm.deleteConversationByUser("cap-conv", "2026-10-22T00:00:00.000Z");          // the user deletes it from another tab ...
+  const conv = { id: "cap-conv", persona: "companion", status: "captured", startedAt: T, createdAt: T, updatedAt: T, turns: [], memoryObjectIds: [], metadata: meta } as any;
+  await assert.rejects(() => dbm.putConversation(conv), (e: Error) => e.name === "TombstonedRecordError");   // ... then the finishing Capture tries to write
+  const m = { ...memory("cap-mem"), conversationId: "cap-conv" };
+  await assert.rejects(() => dbm.putCapturedMemoryWithOutbox(m, "cap-conv"), (e: Error) => e.name === "TombstonedRecordError");
+  assert.equal(await dbm.getConversation("cap-conv"), undefined);
+  assert.equal(await dbm.getMemoryObject("cap-mem"), undefined);
+  assert.equal(await dbm.getVaultOutboxEntry("memory:cap-mem"), undefined, "no Outbox task either");
+  // a tombstoned Memory id is refused too
+  await dbm.putMemoryObject({ ...memory("cap-old"), conversationId: "cap-live" });
+  await dbm.deleteMemoryByUser("cap-old", "2026-10-22T00:00:00.000Z");
+  await assert.rejects(() => dbm.putCapturedMemoryWithOutbox({ ...memory("cap-old"), conversationId: "cap-live" }, "cap-live"), (e: Error) => e.name === "TombstonedRecordError");
 });

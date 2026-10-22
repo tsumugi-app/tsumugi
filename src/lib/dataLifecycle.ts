@@ -16,7 +16,7 @@
  * Nothing here logs or sends anything.
  */
 import {
-  clearTombstone, clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultState,
+  clearTombstone, clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultState, setTombstoneVaultStateIfUnchanged,
   type Tombstone,
 } from "./db";
 import { dayFileNameFor } from "./vault";
@@ -100,13 +100,17 @@ export function purgeDecision(t: Tombstone, now: string, retentionDays: number =
   return { purgeable: true, reason: "ok" };
 }
 
-/** Read-only check of the Vault copy; records the verdict on the tombstone ("absent" is remembered, a still-present copy keeps the tombstone "unverified"). */
+/**
+ * Read-only check of the Vault copy; records the verdict on the tombstone ("absent" is remembered, a still-present copy keeps the tombstone "unverified").
+ * The verdict is recorded only if the tombstone is still exactly the one that was scanned (a decision another tab made meanwhile, e.g. "keep the Vault copy", is never overwritten).
+ */
 export async function verifyTombstone(root: FileSystemDirectoryHandle, kind: Tombstone["kind"], id: string, now: string = new Date().toISOString()): Promise<VaultPresence | "no-tombstone"> {
   const t = await getTombstone(kind, id);
   if (!t) return "no-tombstone";
   const presence = await checkTombstoneInVault(root, t);
-  if (presence === "absent") await setTombstoneVaultState(kind, id, "absent", now);
-  else if (presence === "present" && t.vault === "absent") await setTombstoneVaultState(kind, id, "unverified", now);   // it came back into the Vault: the guard must stay
+  if (presence === "absent" && t.vault !== "absent") await setTombstoneVaultStateIfUnchanged(t, "absent", now);
+  else if (presence === "absent") await setTombstoneVaultStateIfUnchanged(t, "absent", now);          // refreshes the check time
+  else if (presence === "present" && t.vault === "absent") await setTombstoneVaultStateIfUnchanged(t, "unverified", now);   // it came back into the Vault: the guard must stay
   return presence;
 }
 
@@ -116,12 +120,20 @@ export const keepVaultCopy = (kind: Tombstone["kind"], id: string, now: string =
 /** "Allow it back": lifts the tombstone. The deleted record is NOT recreated; it can be restored from the Vault again if the Vault still holds it. */
 export const allowBack = clearTombstone;
 
-/** Forgets every tombstone that satisfies the purge conditions. Returns what was forgotten. */
-export async function purgeEligibleTombstones(now: string = new Date().toISOString(), retentionDays: number = PURGE_AFTER_DAYS): Promise<{ kind: Tombstone["kind"]; id: string }[]> {
+/**
+ * Forgets every tombstone that satisfies the purge conditions. A stored "absent" verdict can be old, so the Vault is READ AGAIN immediately before each
+ * tombstone is cleared: only a copy that is absent NOW allows it (a copy that came back keeps the tombstone and puts it back to "unverified"). Without a
+ * readable Vault nothing is purged. The clear itself is conditional on the tombstone being unchanged. Returns what was forgotten.
+ */
+export async function purgeEligibleTombstones(root: FileSystemDirectoryHandle | null, now: string = new Date().toISOString(), retentionDays: number = PURGE_AFTER_DAYS): Promise<{ kind: Tombstone["kind"]; id: string }[]> {
   const purged: { kind: Tombstone["kind"]; id: string }[] = [];
+  if (!root) return purged;
   for (const t of await listTombstones()) {
-    // the decision was made on THIS tombstone; it is cleared only if it is still exactly this one when the transaction runs (another tab may have found the Vault copy again)
-    if (purgeDecision(t, now, retentionDays).purgeable && (await clearTombstoneIfUnchanged(t))) purged.push({ kind: t.kind, id: t.id });
+    if (!purgeDecision(t, now, retentionDays).purgeable) continue;
+    const presence = await checkTombstoneInVault(root, t);
+    if (presence === "present") { await setTombstoneVaultStateIfUnchanged(t, "unverified", now); continue; }
+    if (presence !== "absent") continue;
+    if (await clearTombstoneIfUnchanged(t)) purged.push({ kind: t.kind, id: t.id });
   }
   return purged;
 }
