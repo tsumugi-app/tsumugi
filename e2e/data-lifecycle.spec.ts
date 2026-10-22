@@ -127,24 +127,23 @@ test("deleted records: the Vault copy is checked read-only (OPFS stands in for t
   await item(page, "E2E会話ひとつめ").getByRole("button", { name: "削除…" }).click();
   await page.getByRole("button", { name: "削除する" }).click();
   await expect(page.getByRole("heading", { name: "削除済みの記録 (1)" })).toBeVisible();
-  // the Vault still lists the conversation (index.json): reported as remaining, nothing is deleted by this screen
+  // the Vault still holds the conversation file, MOVED into a sub folder by the user: it is found by its id (an index.json key alone would not count)
   await page.evaluate(async (id) => {
     const root = await navigator.storage.getDirectory();
     const v = await root.getDirectoryHandle("data-e2e-vault", { create: true });
-    const ts = await v.getDirectoryHandle(".tsumugi", { create: true });
-    const w = await (await ts.getFileHandle("index.json", { create: true })).createWritable();
-    await w.write(JSON.stringify({ [id]: "Conversations/x.md" })); await w.close();
+    const sub = await (await v.getDirectoryHandle("Conversations", { create: true })).getDirectoryHandle("moved-by-user", { create: true });
+    const w = await (await sub.getFileHandle("talk.md", { create: true })).createWritable();
+    await w.write(`---\ntsumugi: true\nid: ${id}\n---\nbody\n`); await w.close();
   }, C1);
   await page.getByRole("button", { name: "保存先を確認" }).click();
   await expect(page.getByRole("status")).toContainText("保存先にファイルが残っています");
   await expect(page.getByText("保存先にコピーが残っている可能性があります")).toBeVisible();
-  // after the file is gone from the index, the check reports it and remembers it
+  // the user deletes the file in the Vault: the check reports it and remembers it
   await page.evaluate(async () => {
     const root = await navigator.storage.getDirectory();
     const v = await root.getDirectoryHandle("data-e2e-vault");
-    const ts = await v.getDirectoryHandle(".tsumugi");
-    const w = await (await ts.getFileHandle("index.json")).createWritable();
-    await w.write("{}"); await w.close();
+    const sub = await (await v.getDirectoryHandle("Conversations")).getDirectoryHandle("moved-by-user");
+    await sub.removeEntry("talk.md");
   });
   await page.getByRole("button", { name: "保存先を確認" }).click();
   await expect(page.getByRole("status")).toContainText("保存先にも見つかりませんでした");

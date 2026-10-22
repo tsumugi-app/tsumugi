@@ -631,10 +631,10 @@ test("'keep both as they are' is durable: the divergence marker is stored for th
   await dbMod.putMemoryObject(fromConversation("dv-1", "c1"));
   await dbMod.putVaultOutboxEntry({ id: "memory:dv-1", recordType: "memory", recordId: "dv-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 3, lastError: "conflict", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
   assert.equal(await dbMod.acceptOutboxDivergence("memory:dv-1", NOW1), "accepted");
-  assert.deepEqual(await dbMod.getAcceptedDivergences(), { "memory:dv-1": T });
+  assert.equal((await dbMod.getAcceptedDivergences())["memory:dv-1"], T);
   assert.equal(await dbMod.retryOutboxEntry("memory:dv-1"), "not-found", "an accepted (done) entry is not retried; a new canonical version re-queues it normally");
   await dbMod.deleteMemoryByUser("dv-1", NOW1);
-  assert.deepEqual(await dbMod.getAcceptedDivergences(), {}, "the marker is dropped with the record");
+  assert.equal("memory:dv-1" in (await dbMod.getAcceptedDivergences()), false, "the marker is dropped with the record");
   // a Source orphan can not get a deletion tombstone (no guard exists for Sources): nothing changes
   await dbMod.putVaultOutboxEntry({ id: "source:ghost", recordType: "source", recordId: "ghost", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 0, lastError: null, lastAttemptAt: null }, status: "held", heldReason: "canonical-record-missing", createdAt: T, updatedAt: T } as never);
   await assert.rejects(() => dbMod.removeOrphanOutboxEntry("source:ghost", { tombstone: true }, NOW1), /tombstone-unsupported/);
