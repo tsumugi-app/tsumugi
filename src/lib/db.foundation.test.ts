@@ -555,15 +555,16 @@ test("resurrection guards: a tombstoned record is NOT re-inserted by auto import
   assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(gone), "written");
   assert.ok(await dbMod.getMemoryObject(w.A));
   // a corrupt tombstone store blocks every re-insertion and every deletion (fail closed) instead of silently disabling the guard
-  const db = await (dbMod as unknown as { getDB: () => Promise<{ put(s: string, v: unknown, k: string): Promise<void> }> }).getDB?.();
-  if (db) {
-    await db.put("settings", "{not json", dbMod.TOMBSTONES_KEY);
-    assert.equal(await dbMod.isTombstoned("memory", "anything"), true);
-    assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(fromConversation("fresh-x", "c"), "memory:fresh-x"), false);
-    await assert.rejects(() => dbMod.deleteMemoryByUser(w.D, NOW1), (e: Error) => e.name === "TombstoneStoreCorruptError");
-    assert.ok(await dbMod.getMemoryObject(w.D), "nothing was deleted");
-    await db.put("settings", "{}", dbMod.TOMBSTONES_KEY);          // reset for the other tests
-  }
+  const setTombstoneStore = async (target: string) => {
+    const cur = (await dbMod.readMemoryRepairSettings([dbMod.TOMBSTONES_KEY]))[dbMod.TOMBSTONES_KEY] ?? null;
+    await dbMod.commitMaintenanceRestore({ memories: [], conversations: [], outbox: [], syncLedger: [], settings: [{ key: dbMod.TOMBSTONES_KEY, expectCurrent: cur, target }] });
+  };
+  await setTombstoneStore("{not json");
+  assert.equal(await dbMod.isTombstoned("memory", "anything"), true);
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(fromConversation("fresh-x", "c"), "memory:fresh-x"), false);
+  await assert.rejects(() => dbMod.deleteMemoryByUser(w.D, NOW1), (e: Error) => e.name === "TombstoneStoreCorruptError");
+  assert.ok(await dbMod.getMemoryObject(w.D), "nothing was deleted");
+  await setTombstoneStore("{}");                                   // reset for the other tests
 });
 
 test("deleting a conversation with its Memories (the user's choice) leaves no dangling reference; deleting only the conversation keeps its Memories", async () => {
