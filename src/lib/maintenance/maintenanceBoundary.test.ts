@@ -179,7 +179,7 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
   const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
     "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer",
-    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
+    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
   const missing: string[] = [];
   heads.forEach((h, i) => {
     const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);

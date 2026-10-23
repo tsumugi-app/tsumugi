@@ -60,13 +60,22 @@ const read = <T,>(page: Page, store: string, key: string) => page.evaluate(async
 const item = (page: Page, text: string) => page.getByRole("listitem").filter({ hasText: text });
 
 test("stuck sync items: listed (held and long-pending, not ordinary pending), and every one has a way out", async ({ page }) => {
-  await openWith(page);
+  await openWith(page, true);
   await expect(page.getByRole("heading", { name: "確認が必要な項目 (3)" })).toBeVisible();
   // retry
   await item(page, "A00001").getByRole("button", { name: "再試行" }).click();
   await expect(page.getByRole("status")).toContainText("もう一度同期を試す状態");
   expect((await read<any>(page, "vaultOutbox", `memory:${M1}`)).status).toBe("pending");
-  // keep both as they are
+  // keep both as they are: refused while the Vault holds no copy of the record (the local record could be the only one)
+  await item(page, "B00002").getByRole("button", { name: "両方そのままにする" }).click();
+  await expect(page.getByRole("status")).toContainText("保存先に、この記録のコピーが見つかりません");
+  expect((await read<any>(page, "vaultOutbox", `memory:${M2}`)).status).toBe("pending");
+  await page.evaluate(async (id) => {
+    const v = await (await navigator.storage.getDirectory()).getDirectoryHandle("data-e2e-vault", { create: true });
+    const dir = await v.getDirectoryHandle("Memories", { create: true });
+    const w = await (await dir.getFileHandle("copy.md", { create: true })).createWritable();
+    await w.write(`---\ntsumugi: true\nid: ${id}\n---\nbody\n`); await w.close();
+  }, M2);
   await item(page, "B00002").getByRole("button", { name: "両方そのままにする" }).click();
   await expect(page.getByRole("status")).toContainText("同期を終了しました");
   expect((await read<any>(page, "vaultOutbox", `memory:${M2}`)).status).toBe("done");
