@@ -295,7 +295,7 @@ export function isStrictlyNewerVersion(stored: { updatedAt: string }, incoming: 
 const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 async function restoreIfNotNewer<T extends { id: string; updatedAt: string }>(store: "conversations" | "memoryObjects" | "sources", record: T, check?: (stored: T | undefined) => void): Promise<RestoreWriteResult> {
   const db = await getDB();
-  const tx = db.transaction([store, "settings"], "readwrite");
+  const tx = db.transaction(store === "memoryObjects" ? [store, "settings", "vaultOutbox"] : [store, "settings"], "readwrite");
   let result: RestoreWriteResult = "written";
   try {
     const os = tx.objectStore(store) as unknown as { get(id: string): Promise<T | undefined>; put(v: T): Promise<unknown> };
@@ -304,9 +304,9 @@ async function restoreIfNotNewer<T extends { id: string; updatedAt: string }>(st
     const kind: TombstoneKind | null = store === "conversations" ? "conversation" : store === "memoryObjects" ? "memory" : null;
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (kind && (kind === "memory" ? memoryBlocked(tombs, record as unknown as { id: string; conversationId?: string }) : blockedByTombstone(tombs, kind, record.id))) result = "tombstoned";   // deleted by the user: not restored
-    else if (stored === undefined) await os.put(record);
+    else if (stored === undefined) await os.put(store === "memoryObjects" ? (await sanitizeTombstonedLinksInTx(tx, record as unknown as MemoryObject, tombs)).memory as unknown as T : record);
     else if (sameJson(stored, record)) result = "written";             // identical: nothing to do
-    else if (isStrictlyNewerVersion(stored, record)) await os.put(record);
+    else if (isStrictlyNewerVersion(stored, record)) await os.put(store === "memoryObjects" ? (await sanitizeTombstonedLinksInTx(tx, record as unknown as MemoryObject, tombs)).memory as unknown as T : record);
     else result = "kept-local";
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
@@ -579,6 +579,26 @@ async function assertNoPendingRecoveryInTx(tx: { objectStore(name: string): any 
   if ((epoch.status === "missing" ? 0 : epoch.epoch) === w.activeVaultEpoch) throw new RecoveryPendingError();
 }
 
+/**
+ * A Memory copied in from the Vault may still carry a link to a Memory the user deleted. Such a link would dangle on this device, so it is dropped before the
+ * insert: the stored copy gets a new updatedAt and is queued for the Vault in the same transaction (the Vault copy still has the link until that is projected).
+ * Returns the record to store and whether it changed. Only the other end's OWN tombstone counts here.
+ */
+async function sanitizeTombstonedLinksInTx(tx: { objectStore(name: string): any }, m: MemoryObject, map: TombstoneMap | null): Promise<{ memory: MemoryObject; changed: boolean }> {   // eslint-disable-line @typescript-eslint/no-explicit-any
+  if (!map) return { memory: m, changed: false };
+  const kept = (m.links ?? []).filter((l) => {
+    const otherId = l.sourceId === m.id ? l.targetId : l.sourceId;
+    return otherId === m.id || !map[tombstoneId("memory", otherId)];
+  });
+  if (kept.length === (m.links ?? []).length) return { memory: m, changed: false };
+  const now = new Date().toISOString();
+  const next: MemoryObject = { ...m, links: kept, updatedAt: now > m.updatedAt ? now : m.updatedAt, metadata: { ...m.metadata, updatedAt: now > m.updatedAt ? now : m.updatedAt } };
+  const type = next.metadata.source === "system-generated" ? "reflection" : "memory";
+  const outbox = tx.objectStore("vaultOutbox");
+  await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor(type, next.id)), type, next.id, next.updatedAt, next.updatedAt));
+  return { memory: next, changed: true };
+}
+
 const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings"] as const;
 
 /** Deletes one Memory (see removeMemoryInTx) in ONE transaction and writes the tombstone. */
@@ -699,8 +719,13 @@ export async function retryOutboxEntry(id: string, now: string = new Date().toIS
   return result;
 }
 
-/** "Keep both as they are": the user accepts that the Vault copy and this device differ; the entry is closed (no projection needed) and the sync ledger points at the current version. A later change re-queues it normally. */
-export async function acceptOutboxDivergence(id: string, now: string = new Date().toISOString()): Promise<"accepted" | "not-found" | "record-missing"> {
+/**
+ * "Keep both as they are": the user accepts that the Vault copy and this device differ; the entry is closed (no projection needed) and the sync ledger points at the current version. A later change re-queues it normally.
+ * Closing the entry means this device stops trying to write the record to the Vault, so it is allowed ONLY when the caller has just verified that the Vault really holds a copy
+ * (`vaultCopyVerified: true`, obtained from dataLifecycle.findRecordInVault === "present"); otherwise the local record could be the only copy and would never be saved.
+ */
+export async function acceptOutboxDivergence(id: string, evidence: { vaultCopyVerified: true }, now: string = new Date().toISOString()): Promise<"accepted" | "not-found" | "record-missing"> {
+  if (evidence?.vaultCopyVerified !== true) throw new Error("vault-copy-not-verified");
   const db = await getDB();
   const tx = db.transaction(["vaultOutbox", "memoryObjects", "conversations", "sources", "vaultSyncState", "settings"], "readwrite");
   let result: "accepted" | "not-found" | "record-missing" = "not-found";
@@ -819,7 +844,7 @@ export async function importMissingRecordsIfAbsent(
   let insertedMemoryObjects = 0;
   let skippedMemoryObjects = 0;
   if (candidates.memoryObjects.length > 0) {
-    const tx = db.transaction(["memoryObjects", "settings"], "readwrite");
+    const tx = db.transaction(["memoryObjects", "settings", "vaultOutbox"], "readwrite");
     try {
       const tombstones = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
       for (const memoryObject of candidates.memoryObjects) {
@@ -827,7 +852,7 @@ export async function importMissingRecordsIfAbsent(
         if (memoryBlocked(tombstones, memoryObject)) {
           skippedMemoryObjects += 1;                      // the user deleted it: it does not come back from the Vault
         } else if (existing === undefined) {
-          await tx.objectStore("memoryObjects").add(memoryObject);
+          await tx.objectStore("memoryObjects").add((await sanitizeTombstonedLinksInTx(tx, memoryObject, tombstones)).memory);
           insertedMemoryObjects += 1;
         } else {
           skippedMemoryObjects += 1;
@@ -998,16 +1023,18 @@ export async function addMemoryObjectIfAbsentAndMarkSynced(
   syncKey: string
 ): Promise<boolean> {
   const db = await getDB();
-  const tx = db.transaction(["memoryObjects", "vaultSyncState", "settings"], "readwrite");
+  const tx = db.transaction(["memoryObjects", "vaultSyncState", "settings", "vaultOutbox"], "readwrite");
   let inserted = false;
   try {
     const store = tx.objectStore("memoryObjects");
     const existing = await store.get(memoryObject.id);
-    if (memoryBlocked(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), memoryObject)) {
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (memoryBlocked(tombs, memoryObject)) {
       // deleted by the user: never re-inserted from the Vault
     } else if (existing === undefined) {
-      await store.add(memoryObject);
-      await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
+      const s = await sanitizeTombstonedLinksInTx(tx, memoryObject, tombs);
+      await store.add(s.memory);
+      if (!s.changed) await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);   // a changed copy differs from the Vault: it is not "synced", it is queued
       inserted = true;
     }
   } catch (error) {

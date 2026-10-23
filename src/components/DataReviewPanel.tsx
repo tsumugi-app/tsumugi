@@ -6,7 +6,7 @@ import {
   listOutboxNeedingAttention, listTombstones, loadVaultHandle, removeOrphanOutboxEntry, retryOutboxEntry,
   type AttentionEntry, type Tombstone,
 } from "@/lib/db";
-import { allowBack, keepVaultCopy, purgeDecision, purgeEligibleTombstones, verifyTombstone } from "@/lib/dataLifecycle";
+import { allowBack, findRecordInVault, keepVaultCopy, purgeDecision, purgeEligibleTombstones, verifyTombstone } from "@/lib/dataLifecycle";
 import { isRecoveryBlockingNormalWrites } from "@/lib/vaultRecoveryJournal";
 import type { Conversation, MemoryObject } from "@/lib/types";
 
@@ -83,7 +83,12 @@ export default function DataReviewPanel() {
               <p className="text-xs text-stone-500">{e.recordExists ? "この端末には記録があります。" : "この端末に記録がありません。"}{e.tombstoned ? " 削除済みとして記録されています。" : ""}</p>
               <div className="flex flex-wrap gap-2">
                 {e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await retryOutboxEntry(e.id)) === "retried" ? "もう一度同期を試す状態にしました。" : "項目が見つかりませんでした。"))}>再試行</button>}
-                {e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => ((await acceptOutboxDivergence(e.id)) === "accepted" ? "この端末と保存先をそのままにして、同期を終了しました。" : "できませんでした。"))}>両方そのままにする</button>}
+                {e.recordExists && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => {
+                  const root = await vaultRoot();
+                  if (!root) return "保存先（Vault）を読めないため、この操作はできません。保存先に記録があることを確認できないと、同期を終了できません。";
+                  if ((await findRecordInVault(root, e.recordId)) !== "present") return "保存先に、この記録のコピーが見つかりません。このまま同期を終了すると、この端末の記録が保存先に残らなくなるため、できません。「もう一度試す」を使ってください。";
+                  return (await acceptOutboxDivergence(e.id, { vaultCopyVerified: true })) === "accepted" ? "この端末と保存先をそのままにして、同期を終了しました。" : "できませんでした。";
+                })}>両方そのままにする</button>}
                 {e.recordExists && e.recordType !== "source" && confirming !== `del:${e.id}` && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => setConfirming(`del:${e.id}`)}>この端末から削除…</button>}
                 {e.recordExists && confirming === `del:${e.id}` && (<>
                   <span className="text-red-700">本当に削除しますか？</span>

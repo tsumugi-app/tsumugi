@@ -161,3 +161,16 @@ test("the in-transaction gate decision equals the app-wide gate (isRecoveryBlock
   }
   await dbm.writeRecoveryJournalRaw(j({ status: "completed" }));
 });
+
+test("a cascade conversation tombstone keeps guarding while a Memory made from that conversation is still in the Vault; a plain one does not care", async () => {
+  const v = new testSupport.FakeVault();
+  v.put("Memories/2026-08-20.md", md.serializeMemoryDayFile([{ ...memory("child-mem"), conversationId: "gone-conv" }]));
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("conversation", "gone-conv", { cascade: true })), "present", "the child Memory's file is still there");
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("conversation", "gone-conv")), "absent", "without the cascade intent only the conversation file counts");
+  const v2 = new testSupport.FakeVault();
+  v2.put("Memories/2026-08-20.md", md.serializeMemoryDayFile([{ ...memory("child-mem"), conversationId: "another-conv" }]));
+  assert.equal(await life.checkTombstoneInVault(v2.root(), tomb("conversation", "gone-conv", { cascade: true })), "absent", "a Memory of another conversation is not a reason");
+  // "keep both" needs a Vault copy of the record itself
+  assert.equal(await life.findRecordInVault(v.root(), "child-mem"), "present");
+  assert.equal(await life.findRecordInVault(v.root(), "nobody"), "absent");
+});

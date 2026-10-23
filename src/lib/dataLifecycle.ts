@@ -58,8 +58,9 @@ function frontmatterBlocks(text: string): string[] {
   return out;
 }
 
-async function scanVaultForId(root: FileSystemDirectoryHandle, id: string): Promise<VaultPresence> {
+async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, ownerConversationId?: string): Promise<VaultPresence> {
   const idLine = new RegExp(`^id:\\s*["']?${escapeRegExp(id)}["']?\\s*$`, "m");
+  const ownerLine = ownerConversationId ? new RegExp(`^conversationId:\\s*["']?${escapeRegExp(ownerConversationId)}["']?\\s*$`, "m") : null;
   let scanned = 0;
   const walk = async (dir: FileSystemDirectoryHandle): Promise<VaultPresence> => {
     for await (const [name, handle] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
@@ -69,7 +70,7 @@ async function scanVaultForId(root: FileSystemDirectoryHandle, id: string): Prom
       } else if (name.toLowerCase().endsWith(".md")) {
         if (++scanned > MAX_FILES_SCANNED) return "unknown";
         const text = await (await (handle as FileSystemFileHandle).getFile()).text();
-        if (frontmatterBlocks(text).some((fm) => idLine.test(fm))) return "present";     // pasted YAML in a body, or a mention in another record, does not count
+        if (frontmatterBlocks(text).some((fm) => idLine.test(fm) || (ownerLine !== null && ownerLine.test(fm)))) return "present";     // pasted YAML in a body, or a mention in another record, does not count
       }
     }
     return "absent";
@@ -99,8 +100,14 @@ export async function checkTombstoneInVault(root: FileSystemDirectoryHandle, t: 
         if (members.some((m) => m.id === t.id)) return "present";
       }
     }
-    return await scanVaultForId(root, t.id);
+    // a cascade conversation tombstone also guards the Memories made from that conversation: while any of their files remains, the guard must stay
+    return await scanVaultForId(root, t.id, t.kind === "conversation" && t.cascade ? t.id : undefined);
   } catch { return "unknown"; }
+}
+
+/** Read-only. Does the Vault hold a copy of this record (by frontmatter id, wherever the file is)? Used before the user may close a stuck entry with "keep both as they are". */
+export async function findRecordInVault(root: FileSystemDirectoryHandle, id: string): Promise<VaultPresence> {
+  try { return await scanVaultForId(root, id); } catch { return "unknown"; }
 }
 
 /** Pure. Why a tombstone may or may not be forgotten now. */

@@ -474,7 +474,7 @@ test("accepted divergence is respected by the startup integrity reconcile: the V
   const pathA = `Memories/${vaultMod.dayFileNameFor(dayA)}`, pathB = `Memories/${vaultMod.dayFileNameFor(dayB)}`;
   assert.ok(vault.get(pathA) && vault.get(pathB), "projected into the Vault");
   vault.files.delete(pathA); vault.files.delete(pathB);                      // the Vault diverges from this device
-  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${a.id}`), "accepted");   // the user: "keep both as they are" for A only
+  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${a.id}`, { vaultCopyVerified: true }), "accepted");   // the user: "keep both as they are" for A only
   await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
   assert.equal(vault.get(pathA), undefined, "the accepted divergence is not repaired behind the user's back");
   assert.ok(vault.get(pathB), "an ordinary done entry is still repaired by the integrity reconcile");

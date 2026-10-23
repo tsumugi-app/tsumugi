@@ -22,6 +22,7 @@ All three ways records are copied from the Vault into IndexedDB now refuse a rec
 1. startup auto import (`importMissingRecordsIfAbsent`): counted as skipped;
 2. Vault resync "added" outcomes (`addConversationIfAbsentAndMarkSynced`, `addMemoryObjectIfAbsentAndMarkSynced`, and in `vault.ts` no History row / no registry commit for a tombstoned record);
 3. manual "restore from the Vault" (`restoreConversationIfNotNewer`, `restoreMemoryObjectIfNotNewer`): result `tombstoned`.
+A Memory copied in by any of these paths loses a link whose other end is a tombstoned Memory (new `updatedAt`, queued for the Vault in the same transaction, not marked as synced).
 If the tombstone store itself is unreadable, every re-insertion is refused (fail closed) and deleting is refused.
 Recovery Apply / legacy cleanup only write to the Vault side and do not insert records into IndexedDB.
 The full-device wipe is unchanged by design: it clears IndexedDB including tombstones, and the Vault files remain.
@@ -34,7 +35,7 @@ Vault sync of a deletion: the app does not remove Vault files itself. The tombst
 All of: the Vault copy is absent NOW (the stored `absent` verdict can be old, so the Vault is read again right before each tombstone is cleared; the search finds the record's `id:` line in every Markdown file under `Memories/` and `Conversations/`, wherever the user moved it, and an `index.json` key alone is not presence; a copy that reappeared puts the state back to `unverified`; without a readable Vault nothing is purged); at least 30 days have passed since the deletion (other devices / profiles syncing through the same Vault have had time); the user did not choose "keep the Vault copy" (`kept` is never purged automatically). The user can instead press "allow it back" (lifts the tombstone; the record is not recreated, it can be restored from the Vault if the Vault still has it).
 
 ## Stuck sync states: every state has a way out
-- held, record exists: retry / keep both as they are (entry closed and a durable marker for that record version, so the startup integrity check does not hold it again; a later change re-queues it normally) / delete from this device.
+- held, record exists: retry / keep both as they are (allowed only after a read-only check finds the record's copy in the Vault: closing the entry stops this device from saving it, so the local record must not be the only copy; entry closed and a durable marker for that record version, so the startup integrity check does not hold it again; a later change re-queues it normally) / delete from this device.
 - held, record missing (orphan): tidy up as a deletion (also keeps a remaining Vault copy from coming back) or just tidy up the entry.
 - pending after many attempts: same actions as held.
 - A normal pending entry (few attempts) is not shown: it resolves by itself.
