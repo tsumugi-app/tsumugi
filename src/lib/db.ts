@@ -414,6 +414,8 @@ export interface Tombstone {
   /** "unverified": the Vault may still hold a copy; "absent": verified gone; "kept": the user chose to keep the Vault copy (it can not come back into the app) */
   vault: TombstoneVaultState;
   vaultCheckedAt?: string;
+  /** the Vault this device was paired with when the user deleted the record (null: not paired / unknown). A check against a DIFFERENT Vault says nothing about this one, so it never lets the tombstone be forgotten. */
+  vaultId?: string | null;
 }
 export const TOMBSTONES_KEY = "tombstones:v1";
 const tombstoneId = (kind: TombstoneKind, id: string) => `${kind}:${id}`;
@@ -606,7 +608,13 @@ async function sanitizeTombstonedLinksInTx(tx: { objectStore(name: string): any 
   return { memory: next, changed: true };
 }
 
-const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings"] as const;
+const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings", "vaultIdentity"] as const;
+
+/** Tombstones created in this transaction remember which Vault this device was paired with. */
+async function stampNewTombstonesInTx(tx: { objectStore(name: string): any }, map: TombstoneMap, now: string): Promise<void> {   // eslint-disable-line @typescript-eslint/no-explicit-any
+  const vaultId = ((await tx.objectStore("vaultIdentity").get(VAULT_IDENTITY_RECORD_ID)) as VaultIdentityRecord | undefined)?.vaultId ?? null;
+  for (const t of Object.values(map)) if (t.deletedAt === now && t.vaultId === undefined) t.vaultId = vaultId;
+}
 
 /** Deletes one Memory (see removeMemoryInTx) in ONE transaction and writes the tombstone. */
 export async function deleteMemoryByUser(memoryId: string, now: string = new Date().toISOString()): Promise<UserDeleteResult> {
@@ -621,6 +629,7 @@ export async function deleteMemoryByUser(memoryId: string, now: string = new Dat
     const m = await tx.objectStore("memoryObjects").get(memoryId);
     if (m) {
       await removeMemoryInTx(tx, m, now, map, result);
+      await stampNewTombstonesInTx(tx, map, now);
       await settings.put(JSON.stringify(map), TOMBSTONES_KEY);
       result.status = "deleted";
     }
@@ -643,6 +652,7 @@ export async function deleteConversationByUser(conversationId: string, now: stri
     if (c) {
       result.memoryIds = (await tx.objectStore("memoryObjects").getAll()).filter((m) => m.conversationId === c.id).map((m) => m.id);
       await removeConversationInTx(tx, c, now, map);
+      await stampNewTombstonesInTx(tx, map, now);
       await settings.put(JSON.stringify(map), TOMBSTONES_KEY);
       result.status = "deleted";
     }
@@ -681,6 +691,7 @@ export async function deleteConversationWithMemoriesByUser(conversationId: strin
       }
       const cNow = (await tx.objectStore("conversations").get(c.id)) ?? c;
       await removeConversationInTx(tx, cNow, now, map, true);          // cascade: Memories of this conversation that are not on this device yet are not imported either
+      await stampNewTombstonesInTx(tx, map, now);
       await settings.put(JSON.stringify(map), TOMBSTONES_KEY);
       conversation.status = "deleted";
     }
@@ -765,7 +776,7 @@ export async function acceptOutboxDivergence(id: string, evidence: { vaultCopyVe
 /** An Outbox entry whose record does not exist (orphan bookkeeping): removed together with its ledger entry. Refuses if the record exists. Optionally records the user's deletion intent. */
 export async function removeOrphanOutboxEntry(id: string, options: { tombstone?: boolean } = {}, now: string = new Date().toISOString()): Promise<"removed" | "not-found" | "record-exists"> {
   const db = await getDB();
-  const tx = db.transaction(["vaultOutbox", "memoryObjects", "conversations", "sources", "vaultSyncState", "settings"], "readwrite");
+  const tx = db.transaction(["vaultOutbox", "memoryObjects", "conversations", "sources", "vaultSyncState", "settings", "vaultIdentity"], "readwrite");
   let result: "removed" | "not-found" | "record-exists" = "not-found";
   try {
     await assertNoPendingRecoveryInTx(tx);
@@ -786,6 +797,7 @@ export async function removeOrphanOutboxEntry(id: string, options: { tombstone?:
           const map = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
           if (map === null) throw new TombstoneStoreCorruptError();
           if (!map[tombstoneId(tombKind, e.recordId)]) map[tombstoneId(tombKind, e.recordId)] = { v: 1, kind: tombKind, id: e.recordId, deletedAt: now, vault: "unverified" };
+          await stampNewTombstonesInTx(tx, map, now);
           await tx.objectStore("settings").put(JSON.stringify(map), TOMBSTONES_KEY);
         }
         result = "removed";

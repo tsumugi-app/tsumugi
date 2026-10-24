@@ -88,6 +88,14 @@ async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, owner
  */
 export async function checkTombstoneInVault(root: FileSystemDirectoryHandle, t: Tombstone): Promise<VaultPresence> {
   try {
+    // A tombstone remembers the Vault the record was deleted from. Looking at a DIFFERENT Vault says nothing about that one (switching back would bring the record back),
+    // so the answer is "unknown" and the tombstone is neither verified nor purged.
+    if (typeof t.vaultId === "string") {
+      const idText = await readTextIfExists(root, ".tsumugi/vault-identity.json");
+      let onDisk: unknown = null;
+      try { onDisk = idText === null ? null : (JSON.parse(idText) as { vaultId?: unknown }).vaultId; } catch { onDisk = null; }
+      if (onDisk !== t.vaultId) return "unknown";
+    }
     if (t.kind === "memory" && t.date) {
       const day = await readTextIfExists(root, `Memories/${dayFileNameFor(t.date)}`);
       if (day !== null) {

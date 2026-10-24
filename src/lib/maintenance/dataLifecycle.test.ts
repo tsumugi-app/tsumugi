@@ -201,3 +201,20 @@ test("verifying an empty Vault never replaces the user's 'keep the Vault copy' d
   assert.equal((await dbm.getTombstone("memory", "kept-mem"))!.vault, "kept");
   assert.deepEqual(await life.purgeEligibleTombstones(new testSupport.FakeVault().root(), "2027-01-01T00:00:00.000Z"), [], "kept is never purged");
 });
+
+test("a tombstone is bound to the Vault the record was deleted from: another Vault's emptiness neither verifies nor purges it", async () => {
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: "vault-A", activeVaultEpoch: 0, registryGeneration: null, pairedAt: T } as never);
+  await dbm.putMemoryObject(memory("bound-mem"));
+  await dbm.deleteMemoryByUser("bound-mem", "2026-01-01T00:00:00.000Z");
+  const t = (await dbm.getTombstone("memory", "bound-mem"))!;
+  assert.equal(t.vaultId, "vault-A");
+  const withId = (id: string) => { const v = new testSupport.FakeVault(); v.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: id })); return v; };
+  const other = withId("vault-B");
+  assert.equal(await life.verifyTombstone(other.root(), "memory", "bound-mem", "2026-06-01T00:00:00.000Z"), "unknown");
+  assert.equal((await dbm.getTombstone("memory", "bound-mem"))!.vault, "unverified", "not marked absent");
+  assert.deepEqual(await life.purgeEligibleTombstones(other.root(), "2027-01-01T00:00:00.000Z"), [], "an empty OTHER Vault does not allow forgetting");
+  assert.equal(await life.verifyTombstone(new testSupport.FakeVault().root(), "memory", "bound-mem", "2026-06-01T00:00:00.000Z"), "unknown", "a Vault without identity can not be matched either");
+  const same = withId("vault-A");                      // the original Vault, copy gone
+  assert.equal(await life.verifyTombstone(same.root(), "memory", "bound-mem", "2026-06-01T00:00:00.000Z"), "absent");
+  assert.deepEqual((await life.purgeEligibleTombstones(same.root(), "2027-01-01T00:00:00.000Z")).map((x) => x.id), ["bound-mem"]);
+});
