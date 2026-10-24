@@ -708,7 +708,7 @@ test("every lifecycle mutation re-checks the durable maintenance gate INSIDE its
     await assert.rejects(() => dbMod.deleteConversationByUser(w.conv, NOW1), blocked);
     await assert.rejects(() => dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1), blocked);
     await assert.rejects(() => dbMod.retryOutboxEntry(`memory:${w.B}`, NOW1), blocked);
-    await assert.rejects(() => dbMod.acceptOutboxDivergence(`memory:${w.B}`, await ev(`memory:${w.B}`), NOW1), blocked);
+    await assert.rejects(async () => dbMod.acceptOutboxDivergence(`memory:${w.B}`, await ev(`memory:${w.B}`), NOW1), blocked);
     await assert.rejects(() => dbMod.removeOrphanOutboxEntry(`memory:${w.B}`, {}, NOW1), blocked);
     assert.equal(await before(), snap, "nothing changed while the gate was in place");
     await dbMod.writeRecoveryJournalRaw("{ not json");                                  // an unreadable journal also refuses (fail closed)
