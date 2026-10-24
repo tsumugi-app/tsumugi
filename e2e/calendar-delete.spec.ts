@@ -39,6 +39,12 @@ const vaultText = (page: Page) => page.evaluate(async () => {
   const walk = async (d: any, p: string) => { for await (const [n, h] of d.entries()) { if (h.kind === "directory") await walk(h, p + n + "/"); else out.push(p + n + "\n" + await (await h.getFile()).text()); } };
   await walk(root, ""); return out.join("\n=====\n");
 });
+/** phones show the history button in the bottom bar; wide screens show it next to the input, which appears after the entry type was chosen */
+async function openHistoryButton(page: Page) {
+  const history = page.getByRole("button", { name: "これまでの記憶を見る" });
+  if (!(await history.isVisible())) await page.getByRole("button", { name: "会話", exact: true }).click();
+  await history.click();
+}
 /** the app starts on a splash screen with one button */
 async function openHome(page: Page) {
   await page.goto(BASE);
@@ -46,7 +52,7 @@ async function openHome(page: Page) {
 }
 async function openCalendar(page: Page) {
   await openHome(page);
-  await page.getByRole("button", { name: "これまでの記憶を見る" }).click();
+  await openHistoryButton(page);
   await expect(page.getByRole("button", { name: /会話A/ })).toBeVisible({ timeout: 30_000 });
 }
 
@@ -88,7 +94,7 @@ for (const [name, size] of [["PC", { width: 1280, height: 800 }], ["Android", { 
     await expect(page.getByRole("button", { name: /会話A/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible();
     // nothing comes back after a restart
-    await page.reload(); await page.getByRole("button", { name: "tsumugiを開く" }).click(); await page.getByRole("button", { name: "これまでの記憶を見る" }).click();
+    await page.reload(); await page.getByRole("button", { name: "tsumugiを開く" }).click(); await openHistoryButton(page);
     await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByRole("button", { name: /会話A/ })).toHaveCount(0);
     expect(await read<any>(page, "conversations", A)).toBeUndefined();
@@ -110,6 +116,9 @@ test("settings: no 'データの管理' entry any more, and no notice while noth
 
 test("settings: an unfinished deletion is announced and can be continued from there", async ({ page }) => {
   await seed(page);
+  await openHome(page);                                                       // let the app finish its own start-up work (it refreshes registry metadata) before the interrupted state is made
+  await page.waitForTimeout(4000);
+  await attach(page);
   await page.evaluate(async ([A]) => {
     const { dbm, deletion } = (window as any).D; const root = await navigator.storage.getDirectory();
     await dbm.deleteConversationWithMemoriesByUser(A);
@@ -118,7 +127,6 @@ test("settings: an unfinished deletion is announced and can be continued from th
     const plan = await deletion.previewVaultDeletion(root, t); await dbm.beginPhysicalDeletion(t, JSON.stringify(plan), plan.ids.filter((id: string) => id !== A));
     await deletion.applyVaultDeletionEdits(root, { ...plan, edits: plan.edits.slice(0, 1) });          // stopped after the first file
   }, [A]);
-  await openHome(page);
   await page.getByRole("button", { name: "設定" }).click();
   await expect(page.getByText("削除を完了する必要があります")).toBeVisible();
   await page.getByRole("button", { name: "削除を続ける" }).click();
