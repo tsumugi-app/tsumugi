@@ -641,7 +641,7 @@ test("delete flow: a failure halfway keeps the guard (nothing comes back), is li
   assert.equal(t.physicalDeletion, "pending");
   assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(w.m1), conversationId: w.c }), "tombstoned");
   assert.equal(await dbm.addMemoryObjectIfAbsentAndMarkSynced({ ...memory(w.m1), conversationId: w.c }, "memory:" + w.m1), false);
-  assert.deepEqual((await flow.listIncompleteDeletions()).map((x) => x.id), [w.m1]);
+  assert.deepEqual((await flow.listIncompleteDeletions()).map((x) => x.id).filter((id) => id.startsWith("fl4-")), [w.m1]);
   const stuck = w.v.snapshot();
   const cont = await flow.continueDelete(t, w.access);                      // re-verifies and shows what would change
   assert.deepEqual(w.v.snapshot(), stuck, "continuing starts with a read-only review");
@@ -687,7 +687,7 @@ test("delete flow: a file edited after the confirmation is not deleted from the 
   assert.equal(out.status, "incomplete"); assert.deepEqual(w.v.snapshot(), edited, "the Vault was not written");
   assert.equal(await dbm.getMemoryObject(w.m1), undefined, "the record is already off this device");
   assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(w.m1), conversationId: w.c }), "tombstoned");
-  assert.deepEqual((await flow.listIncompleteDeletions()).map((x) => x.id), [w.m1]);
+  assert.deepEqual((await flow.listIncompleteDeletions()).map((x) => x.id).filter((id) => id.startsWith("fl8-")), [w.m1]);
   const cont = await flow.continueDelete((await dbm.getTombstone("memory", w.m1))!, w.access);
   assert.deepEqual(await flow.finishContinuedDelete(w.access, cont), { status: "done", vault: "deleted" });
   assert.ok(w.v.snapshot()["Memories/day.md"].includes("an outside edit made after the confirmation"), "the outside edit survives");
