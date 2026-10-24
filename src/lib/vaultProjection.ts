@@ -19,6 +19,7 @@
  * このファイルはまだどの本番経路（ChatScreen.tsx／capture.ts／起動処理）からも呼ばれない
  * （テストから呼べるlibraryとして完成させるところまで）。
  */
+import { findRecordInVault } from "./dataLifecycle";
 import { getAcceptedDivergences, getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries, getDoneVaultOutboxEntries, getHeldVaultOutboxEntries, getProjectionHeldReevaluationMarker, setProjectionHeldReevaluationMarker, putVaultOutboxEntry, putMemoryProjectionOutcome } from "./db";
 import { conversationEntryTypeOf } from "./conversationEntryKind";
 import type { VaultOutboxEntry, ProjectionStepName, ProjectionStepState } from "./vaultOutbox";
@@ -1296,6 +1297,13 @@ export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: 
 
 export async function reconcileDoneVaultOutboxIntegrity(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
   // 「両方そのままにする」でユーザーが受け入れた食い違い（その版に限る）は、再びheldに戻さない。recordが新しい版へ進めば、通常どおり再projectionされる。
+  // Only the CONTENT comparison is skipped: an accepted entry whose Vault copy is gone ("absent") is checked like any other done entry (so a lost copy is re-projected
+  // and the local record is not the only one); "present" and "unknown" (unreadable / too large to decide) leave it alone.
   const accepted = await getAcceptedDivergences();
-  return reconcileOutboxEntries(env, (await getDoneVaultOutboxEntries()).filter((e) => accepted[e.id] !== e.recordUpdatedAt));
+  const entries: VaultOutboxEntry[] = [];
+  for (const e of await getDoneVaultOutboxEntries()) {
+    if (accepted[e.id] !== e.recordUpdatedAt) { entries.push(e); continue; }
+    if ((await findRecordInVault(env.root, e.recordId)) === "absent") entries.push(e);
+  }
+  return reconcileOutboxEntries(env, entries);
 }

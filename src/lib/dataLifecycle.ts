@@ -58,7 +58,7 @@ function frontmatterBlocks(text: string): string[] {
   return out;
 }
 
-async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, ownerConversationId?: string): Promise<VaultPresence> {
+async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, ownerConversationId?: string, tops: string[] = ["Memories", "Conversations"]): Promise<VaultPresence> {
   const idLine = new RegExp(`^id:\\s*["']?${escapeRegExp(id)}["']?\\s*$`, "m");
   const ownerLine = ownerConversationId ? new RegExp(`^conversationId:\\s*["']?${escapeRegExp(ownerConversationId)}["']?\\s*$`, "m") : null;
   let scanned = 0;
@@ -75,7 +75,7 @@ async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, owner
     }
     return "absent";
   };
-  for (const top of ["Memories", "Conversations"]) {
+  for (const top of tops) {
     let dir: FileSystemDirectoryHandle;
     try { dir = await root.getDirectoryHandle(top, { create: false }); }
     catch (e) { if ((e as { name?: string })?.name === "NotFoundError") continue; return "unknown"; }
@@ -105,9 +105,9 @@ export async function checkTombstoneInVault(root: FileSystemDirectoryHandle, t: 
   } catch { return "unknown"; }
 }
 
-/** Read-only. Does the Vault hold a copy of this record (by frontmatter id, wherever the file is)? Used before the user may close a stuck entry with "keep both as they are". */
+/** Read-only. Does the Vault hold a copy of this record (by frontmatter id, wherever the file is; Sources included)? Used before the user may close a stuck entry with "keep both as they are", and by the startup check of accepted entries. */
 export async function findRecordInVault(root: FileSystemDirectoryHandle, id: string): Promise<VaultPresence> {
-  try { return await scanVaultForId(root, id); } catch { return "unknown"; }
+  try { return await scanVaultForId(root, id, undefined, ["Memories", "Conversations", "Sources"]); } catch { return "unknown"; }
 }
 
 /** Pure. Why a tombstone may or may not be forgotten now. */

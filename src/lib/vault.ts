@@ -6322,9 +6322,11 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
           }
           await setVaultSyncState(syncKey, existingUpdatedAt);
         } else if (await isMemoryBlockedByTombstone(member.parsed)) {
-          // ユーザーが削除した記録（tombstone）は取り込まない
-        } else {
-          await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey);
+          // ユーザーが削除した記録（tombstone）は取り込まない。取り込めなかったので、このdayをappliedとしてRegistryへcommitしない
+          // （後で「戻せるようにする」を選んだとき、hashが変わらず取り込まれなくなるのを防ぐ）
+          allSucceeded = false;
+        } else if (!(await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey)) && (await isMemoryBlockedByTombstone(member.parsed))) {
+          allSucceeded = false;       // the user deleted it between the check and the guarded insert
         }
       } else if (member.outcome === "edited") {
         const existing = await getMemoryObject(member.id);

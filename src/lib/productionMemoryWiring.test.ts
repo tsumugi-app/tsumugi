@@ -34,6 +34,7 @@ mod._load = function (request, parent, isMain) {
 };
 
 const dbMod = require(path.join(OUT, "lib/db.js")) as typeof import("./db");
+const ev = async (id: string) => ({ vaultCopyVerified: true as const, seenOutboxUpdatedAt: (await dbMod.getVaultOutboxEntry(id))!.updatedAt });
 const vaultMod = require(path.join(OUT, "lib/vault.js")) as typeof import("./vault");
 const markdownMod = require(path.join(OUT, "lib/markdown.js")) as typeof import("./markdown");
 const captureMod = require(path.join(OUT, "lib/capture.js")) as typeof import("./capture");
@@ -466,17 +467,21 @@ test("accepted divergence is respected by the startup integrity reconcile: the V
   const vault = new FakeVault();
   vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
   await seedPrepairedIdentity(vault);
-  const dayA = "2026-10-11", dayB = "2026-10-12";
+  const dayA = "2026-10-11", dayB = "2026-10-12", dayC = "2026-10-14";
   const conv = conversation("acc-conv");
-  const a = memory("acc-a", dayA), b = memory("acc-b", dayB);
-  await captureMod.persistCapture(null, conv, [a, b]);                       // canonical + Outbox only
+  const a = memory("acc-a", dayA), b = memory("acc-b", dayB), c = memory("acc-c", dayC);
+  await captureMod.persistCapture(null, conv, [a, b, c]);                    // canonical + Outbox only
   await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));             // both are projected: done
   const pathA = `Memories/${vaultMod.dayFileNameFor(dayA)}`, pathB = `Memories/${vaultMod.dayFileNameFor(dayB)}`;
   assert.ok(vault.get(pathA) && vault.get(pathB), "projected into the Vault");
-  vault.files.delete(pathA); vault.files.delete(pathB);                      // the Vault diverges from this device
-  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${a.id}`, { vaultCopyVerified: true }), "accepted");   // the user: "keep both as they are" for A only
+  const pathC = `Memories/${vaultMod.dayFileNameFor(dayC)}`;
+  const editedA = vault.get(pathA) + "\n\n(the user's own note)\n";
+  vault.put(pathA, editedA); vault.files.delete(pathB); vault.files.delete(pathC);   // the Vault diverges from this device (A edited, B and C lost)
+  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${a.id}`, await ev(`memory:${a.id}`)), "accepted");   // the user: "keep both as they are" for A (its Vault copy exists)
+  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${c.id}`, await ev(`memory:${c.id}`)), "accepted");   // accepted while a copy existed...
   await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
-  assert.equal(vault.get(pathA), undefined, "the accepted divergence is not repaired behind the user's back");
+  assert.equal(vault.get(pathA), editedA, "the accepted divergence is not repaired behind the user's back");
+  assert.ok(vault.get(pathC), "...but an accepted entry whose Vault copy is LOST is re-projected: the local record must not be the only copy");
   assert.ok(vault.get(pathB), "an ordinary done entry is still repaired by the integrity reconcile");
   assert.equal((await dbMod.getVaultOutboxEntry(`memory:${a.id}`))?.status, "done", "and it does not return to held");
 });

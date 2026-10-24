@@ -30,6 +30,7 @@ mod._load = function (request, parent, isMain) {
 };
 
 const dbMod = require(path.join(OUT, "lib/db.js")) as typeof import("./db");
+const ev = async (id: string) => ({ vaultCopyVerified: true as const, seenOutboxUpdatedAt: (await dbMod.getVaultOutboxEntry(id))!.updatedAt });
 const fakeIdbMod = require(path.join(OUT, "lib/fakeIdb.js")) as { __failNextPutOn: (dbName: string, storeName: string) => void };
 
 type Conversation = import("./types").Conversation;
@@ -600,10 +601,10 @@ test("stuck Outbox entries: listed, and each can be resolved by the user (retry,
   assert.equal(retried.status, "pending"); assert.equal(retried.heldReason, null); assert.equal(retried.attempt.count, 0);
   assert.equal(await dbMod.retryOutboxEntry("memory:nope"), "not-found");
   // keep both as they are
-  assert.equal(await dbMod.acceptOutboxDivergence("memory:st-2", { vaultCopyVerified: true }, NOW1), "accepted");
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:st-2", await ev("memory:st-2"), NOW1), "accepted");
   const accepted = (await dbMod.getVaultOutboxEntry("memory:st-2"))!;
   assert.equal(accepted.status, "done"); assert.equal(await dbMod.getVaultSyncState("memory:st-2"), (await dbMod.getMemoryObject("st-2"))!.updatedAt);
-  assert.equal(await dbMod.acceptOutboxDivergence("memory:st-ghost", { vaultCopyVerified: true }), "record-missing");
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:st-ghost", await ev("memory:st-ghost")), "record-missing");
   // orphan: removable only when the record really is missing
   assert.equal(await dbMod.removeOrphanOutboxEntry("memory:st-1"), "record-exists");
   assert.equal(await dbMod.removeOrphanOutboxEntry("memory:st-ghost", { tombstone: true }, NOW1), "removed");
@@ -660,10 +661,29 @@ test("'keep both as they are' needs proof that the Vault holds a copy: without i
   assert.equal("memory:ev-1" in (await dbMod.getAcceptedDivergences()), false);
 });
 
+test("'keep both as they are' is bound to the entry the user saw: if the entry moved on meanwhile nothing is closed", async () => {
+  await dbMod.putMemoryObject(fromConversation("sn-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:sn-1", recordType: "memory", recordId: "sn-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "verify-history-mismatch", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  const seen = await ev("memory:sn-1");
+  await dbMod.putVaultOutboxEntry({ ...(await dbMod.getVaultOutboxEntry("memory:sn-1"))!, status: "pending", heldReason: null, updatedAt: NOW1 } as never);   // another tab queued a newer version
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:sn-1", seen, NOW1), "changed");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:sn-1"))!.status, "pending");
+  assert.equal("memory:sn-1" in (await dbMod.getAcceptedDivergences()), false);
+});
+
+test("deleting a Memory never moves a neighbour's / the conversation's version backwards (future or offset timestamps)", async () => {
+  const FUTURE = "2999-01-01T00:00:00.000Z";
+  const w = await seedWorldForDelete("fut1");
+  const nb = (await dbMod.getMemoryObject(w.B))!;
+  await dbMod.putMemoryObject({ ...nb, updatedAt: FUTURE, metadata: { ...nb.metadata, updatedAt: FUTURE } });
+  await dbMod.deleteMemoryByUser(w.A, NOW1);
+  assert.ok(Date.parse((await dbMod.getMemoryObject(w.B))!.updatedAt) > Date.parse(FUTURE), "strictly later than the previous version");
+});
+
 test("'keep both as they are' is durable: the divergence marker is stored for that record version only, is dropped by a retry and with the record", async () => {
   await dbMod.putMemoryObject(fromConversation("dv-1", "c1"));
   await dbMod.putVaultOutboxEntry({ id: "memory:dv-1", recordType: "memory", recordId: "dv-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 3, lastError: "conflict", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
-  assert.equal(await dbMod.acceptOutboxDivergence("memory:dv-1", { vaultCopyVerified: true }, NOW1), "accepted");
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:dv-1", await ev("memory:dv-1"), NOW1), "accepted");
   assert.equal((await dbMod.getAcceptedDivergences())["memory:dv-1"], T);
   assert.equal(await dbMod.retryOutboxEntry("memory:dv-1"), "not-found", "an accepted (done) entry is not retried; a new canonical version re-queues it normally");
   await dbMod.deleteMemoryByUser("dv-1", NOW1);
@@ -688,7 +708,7 @@ test("every lifecycle mutation re-checks the durable maintenance gate INSIDE its
     await assert.rejects(() => dbMod.deleteConversationByUser(w.conv, NOW1), blocked);
     await assert.rejects(() => dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1), blocked);
     await assert.rejects(() => dbMod.retryOutboxEntry(`memory:${w.B}`, NOW1), blocked);
-    await assert.rejects(() => dbMod.acceptOutboxDivergence(`memory:${w.B}`, { vaultCopyVerified: true }, NOW1), blocked);
+    await assert.rejects(() => dbMod.acceptOutboxDivergence(`memory:${w.B}`, await ev(`memory:${w.B}`), NOW1), blocked);
     await assert.rejects(() => dbMod.removeOrphanOutboxEntry(`memory:${w.B}`, {}, NOW1), blocked);
     assert.equal(await before(), snap, "nothing changed while the gate was in place");
     await dbMod.writeRecoveryJournalRaw("{ not json");                                  // an unreadable journal also refuses (fail closed)
@@ -738,7 +758,7 @@ test("cascade intent: after 'delete the conversation with its Memories', a Memor
 test("retry that loses a race with 'keep both' does not erase the accepted-divergence marker", async () => {
   await dbMod.putMemoryObject(fromConversation("rr-1", "c1"));
   await dbMod.putVaultOutboxEntry({ id: "memory:rr-1", recordType: "memory", recordId: "rr-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 2, lastError: "c", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
-  assert.equal(await dbMod.acceptOutboxDivergence("memory:rr-1", { vaultCopyVerified: true }, NOW1), "accepted");          // the other tab
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:rr-1", await ev("memory:rr-1"), NOW1), "accepted");          // the other tab
   assert.equal(await dbMod.retryOutboxEntry("memory:rr-1", NOW1), "not-found");                // this tab's stale click
   assert.equal((await dbMod.getAcceptedDivergences())["memory:rr-1"], T, "the marker survived");
   assert.equal((await dbMod.getVaultOutboxEntry("memory:rr-1"))!.status, "done");

@@ -174,3 +174,10 @@ test("a cascade conversation tombstone keeps guarding while a Memory made from t
   assert.equal(await life.findRecordInVault(v.root(), "child-mem"), "present");
   assert.equal(await life.findRecordInVault(v.root(), "nobody"), "absent");
 });
+
+test("the Vault copy check for 'keep both' also looks in Sources/", async () => {
+  const v = new testSupport.FakeVault();
+  v.put("Sources/2026-08-20-note.md", "---\ntsumugi: true\nid: src-1\n---\nbody\n");
+  assert.equal(await life.findRecordInVault(v.root(), "src-1"), "present");
+  assert.equal(await life.findRecordInVault(v.root(), "src-2"), "absent");
+});

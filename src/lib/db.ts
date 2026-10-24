@@ -513,18 +513,20 @@ async function removeMemoryInTx(
     if (!other) continue;
     const kept = other.links.filter((l) => l.id !== link.id);
     if (kept.length === other.links.length) continue;
-    const next: MemoryObject = { ...other, links: kept, updatedAt: now, metadata: { ...other.metadata, updatedAt: now } };
+    const at = strictlyLaterInstant(other.updatedAt, now);
+    const next: MemoryObject = { ...other, links: kept, updatedAt: at, metadata: { ...other.metadata, updatedAt: at } };
     await memories.put(next);
     const type = next.metadata.source === "system-generated" ? "reflection" : "memory";
-    await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor(type, next.id)), type, next.id, now, now));
+    await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor(type, next.id)), type, next.id, at, at));
     result.countersUpdated += 1;
   }
   if (m.conversationId) {
     const c = (await conversations.get(m.conversationId)) as Conversation | undefined;
     if (c && c.memoryObjectIds.includes(m.id)) {
-      const next: Conversation = { ...c, memoryObjectIds: c.memoryObjectIds.filter((id) => id !== m.id), updatedAt: now, metadata: { ...c.metadata, updatedAt: now } };
+      const at = strictlyLaterInstant(c.updatedAt, now);
+      const next: Conversation = { ...c, memoryObjectIds: c.memoryObjectIds.filter((id) => id !== m.id), updatedAt: at, metadata: { ...c.metadata, updatedAt: at } };
       await conversations.put(next);
-      await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor("conversation", c.id)), "conversation", c.id, now, now));
+      await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor("conversation", c.id)), "conversation", c.id, at, at));
       result.conversationUpdated = true;
     }
   }
@@ -579,6 +581,13 @@ async function assertNoPendingRecoveryInTx(tx: { objectStore(name: string): any 
   if ((epoch.status === "missing" ? 0 : epoch.epoch) === w.activeVaultEpoch) throw new RecoveryPendingError();
 }
 
+/** An instant strictly later than `prev` (offset-aware: ISO strings are not compared as text). `now` when it is already later. */
+function strictlyLaterInstant(prev: string, now: string): string {
+  const p = Date.parse(prev), n = Date.parse(now);
+  if (!Number.isFinite(p)) return now;
+  return Number.isFinite(n) && n > p ? now : new Date(p + 1).toISOString();
+}
+
 /**
  * A Memory copied in from the Vault may still carry a link to a Memory the user deleted. Such a link would dangle on this device, so it is dropped before the
  * insert: the stored copy gets a new updatedAt and is queued for the Vault in the same transaction (the Vault copy still has the link until that is projected).
@@ -591,8 +600,8 @@ async function sanitizeTombstonedLinksInTx(tx: { objectStore(name: string): any 
     return otherId === m.id || !map[tombstoneId("memory", otherId)];
   });
   if (kept.length === (m.links ?? []).length) return { memory: m, changed: false };
-  const now = new Date().toISOString();
-  const next: MemoryObject = { ...m, links: kept, updatedAt: now > m.updatedAt ? now : m.updatedAt, metadata: { ...m.metadata, updatedAt: now > m.updatedAt ? now : m.updatedAt } };
+  const at = strictlyLaterInstant(m.updatedAt, new Date().toISOString());
+  const next: MemoryObject = { ...m, links: kept, updatedAt: at, metadata: { ...m.metadata, updatedAt: at } };
   const type = next.metadata.source === "system-generated" ? "reflection" : "memory";
   const outbox = tx.objectStore("vaultOutbox");
   await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor(type, next.id)), type, next.id, next.updatedAt, next.updatedAt));
@@ -724,16 +733,17 @@ export async function retryOutboxEntry(id: string, now: string = new Date().toIS
  * Closing the entry means this device stops trying to write the record to the Vault, so it is allowed ONLY when the caller has just verified that the Vault really holds a copy
  * (`vaultCopyVerified: true`, obtained from dataLifecycle.findRecordInVault === "present"); otherwise the local record could be the only copy and would never be saved.
  */
-export async function acceptOutboxDivergence(id: string, evidence: { vaultCopyVerified: true }, now: string = new Date().toISOString()): Promise<"accepted" | "not-found" | "record-missing"> {
-  if (evidence?.vaultCopyVerified !== true) throw new Error("vault-copy-not-verified");
+export async function acceptOutboxDivergence(id: string, evidence: { vaultCopyVerified: true; seenOutboxUpdatedAt: string }, now: string = new Date().toISOString()): Promise<"accepted" | "not-found" | "record-missing" | "changed"> {
+  if (evidence?.vaultCopyVerified !== true || typeof evidence.seenOutboxUpdatedAt !== "string") throw new Error("vault-copy-not-verified");
   const db = await getDB();
   const tx = db.transaction(["vaultOutbox", "memoryObjects", "conversations", "sources", "vaultSyncState", "settings"], "readwrite");
-  let result: "accepted" | "not-found" | "record-missing" = "not-found";
+  let result: "accepted" | "not-found" | "record-missing" | "changed" = "not-found";
   try {
     await assertNoPendingRecoveryInTx(tx);
     const store = tx.objectStore("vaultOutbox");
     const e = await store.get(id);
-    if (e) {
+    if (e && e.updatedAt !== evidence.seenOutboxUpdatedAt) result = "changed";       // the entry moved on since the Vault copy was verified (another tab): the check no longer applies
+    else if (e) {
       const memoryLike = e.recordType === "memory" || e.recordType === "reflection";
       const rec = memoryLike ? await tx.objectStore("memoryObjects").get(e.recordId)
         : e.recordType === "conversation" ? await tx.objectStore("conversations").get(e.recordId)

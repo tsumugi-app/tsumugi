@@ -87,7 +87,8 @@ export default function DataReviewPanel() {
                   const root = await vaultRoot();
                   if (!root) return "保存先（Vault）を読めないため、この操作はできません。保存先に記録があることを確認できないと、同期を終了できません。";
                   if ((await findRecordInVault(root, e.recordId)) !== "present") return "保存先に、この記録のコピーが見つかりません。このまま同期を終了すると、この端末の記録が保存先に残らなくなるため、できません。「もう一度試す」を使ってください。";
-                  return (await acceptOutboxDivergence(e.id, { vaultCopyVerified: true })) === "accepted" ? "この端末と保存先をそのままにして、同期を終了しました。" : "できませんでした。";
+                  const r = await acceptOutboxDivergence(e.id, { vaultCopyVerified: true, seenOutboxUpdatedAt: e.updatedAt });
+                  return r === "accepted" ? "この端末と保存先をそのままにして、同期を終了しました。" : r === "changed" ? "確認している間に、この項目が更新されました。もう一度内容を確認してください。" : "できませんでした。";
                 })}>両方そのままにする</button>}
                 {e.recordExists && e.recordType !== "source" && confirming !== `del:${e.id}` && <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => setConfirming(`del:${e.id}`)}>この端末から削除…</button>}
                 {e.recordExists && confirming === `del:${e.id}` && (<>
