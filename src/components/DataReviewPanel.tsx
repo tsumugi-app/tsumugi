@@ -227,7 +227,11 @@ export default function DataReviewPanel() {
                     return p === "absent" ? "保存先にも見つかりませんでした。" : p === "present" ? "保存先にファイルが残っています。「保存先の削除対象を確認…」で確認できます。" : "保存先を確認できませんでした。";
                   })}>保存先を確認</button>
                   {t.vault !== "kept" && <button disabled={busy || t.physicalDeletion === "pending"} className={BTN} onClick={() => void act(async () => ((await keepVaultCopy(t)) ? "保存先のコピーを残す設定にしました。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>保存先のコピーは残す</button>}
-                  <button disabled={busy || t.physicalDeletion === "pending"} className={BTN} onClick={() => void act(async () => ((await allowBack(t)) ? "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>戻せるようにする</button>
+                  <button disabled={busy || t.physicalDeletion === "pending"} className={BTN} onClick={() => void act(async () => {
+                    const r = await allowBack(t);
+                    return r === "parent-guard" ? "この記憶は、会話と一緒に削除されたため、先にその会話の削除保護を解除する必要があります。「削除済みの記録」の会話の項目で「戻せるようにする」を押してください。まだ何も変更していません。"
+                      : r ? "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。" : "別の画面で状態が変わりました。もう一度確認してください。";
+                  })}>戻せるようにする</button>
                   {d.purgeable && <button disabled={busy} className={BTN} onClick={() => void act(async () => {
                     const root = await vaultRoot();
                     if (!root) return "保存先を確認できないため、整理できません（接続と読み取りの許可が必要です）。";

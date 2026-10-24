@@ -16,7 +16,7 @@
  * Nothing here logs or sends anything.
  */
 import {
-  clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultStateIfUnchanged,
+  clearTombstoneForRestoreIfUnchanged, clearTombstoneIfUnchanged, getTombstone, listTombstones, setTombstoneVaultStateIfUnchanged,
   type Tombstone,
 } from "./db";
 import { dayFileNameFor } from "./vault";
@@ -151,8 +151,9 @@ export async function verifyTombstone(root: FileSystemDirectoryHandle, kind: Tom
 export const keepVaultCopy = (seen: Tombstone, now: string = new Date().toISOString()): Promise<boolean> => setTombstoneVaultStateIfUnchanged(seen, "kept", now);
 
 /** "Allow it back": lifts the tombstone. The deleted record is NOT recreated; it can be restored from the Vault again if the Vault still holds it. */
-/** Only if the tombstone is still exactly the one the user saw (a newer deletion by another tab is never erased by a stale click). Returns whether it was lifted. */
-export const allowBack = (seen: Tombstone): Promise<boolean> => clearTombstoneIfUnchanged(seen);
+/** Only if the tombstone is still exactly the one the user saw (a newer deletion by another tab is never erased by a stale click). Returns whether it was lifted, or "parent-guard" when
+ * the owning Conversation's cascade guard is still in place (that one has to be lifted first: nothing is changed, and there is no per-Memory exception). */
+export const allowBack = (seen: Tombstone): Promise<boolean | "parent-guard"> => clearTombstoneForRestoreIfUnchanged(seen);
 
 /**
  * Forgets every tombstone that satisfies the purge conditions. A stored "absent" verdict can be old, so the Vault is READ AGAIN immediately before each

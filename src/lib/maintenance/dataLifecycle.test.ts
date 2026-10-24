@@ -462,3 +462,21 @@ test("the presence scan reads frontmatter as generously as the restore parser: s
   v2.put("moved/b.md", "---\ntsumugi: true\nid: 'quoted-1'\n---\nbody\n");
   assert.equal(await life.checkTombstoneInVault(v2.root(), tomb("conversation", "quoted-1")), "present");
 });
+
+test("a child Memory can not be allowed back while the cascade tombstone of its Conversation is in place: refused, nothing changes, the Conversation guard lifts first", async () => {
+  await dbm.putConversation({ id: "cg-conv", persona: "companion", status: "captured", startedAt: T, createdAt: T, updatedAt: T, turns: [], memoryObjectIds: ["cg-child"], metadata: meta } as never);
+  await dbm.putMemoryObject({ ...memory("cg-child"), conversationId: "cg-conv" });
+  await dbm.deleteConversationWithMemoriesByUser("cg-conv", "2026-01-01T00:00:00.000Z");
+  const child = (await dbm.getTombstone("memory", "cg-child"))!;
+  const before = JSON.stringify(await dbm.listTombstones());
+  assert.equal(await life.allowBack(child), "parent-guard");
+  assert.equal(JSON.stringify(await dbm.listTombstones()), before, "no tombstone was removed");
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory("cg-child"), conversationId: "cg-conv" }), "tombstoned", "and the Memory is still not restorable");
+  // lifting the Conversation's guard first makes the child's own allow-back possible
+  assert.equal(await life.allowBack((await dbm.getTombstone("conversation", "cg-conv"))!), true);
+  assert.equal(await life.allowBack((await dbm.getTombstone("memory", "cg-child"))!), true);
+  // a Memory deleted on its own (no cascade) is unaffected
+  await dbm.putMemoryObject({ ...memory("solo-mem"), conversationId: "solo-conv" });
+  await dbm.deleteMemoryByUser("solo-mem", "2026-01-01T00:00:00.000Z");
+  assert.equal(await life.allowBack((await dbm.getTombstone("memory", "solo-mem"))!), true);
+});

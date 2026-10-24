@@ -548,6 +548,21 @@ export const setTombstoneVaultState = (kind: TombstoneKind, id: string, vault: T
 /** Removes a tombstone: the record may then be restored from the Vault again ("undelete" - the record itself is NOT recreated here) or, after the purge conditions, forgotten. */
 export const clearTombstone = (kind: TombstoneKind, id: string) => mutateTombstones((map) => { if (map[tombstoneId(kind, id)]?.physicalDeletion !== "pending") delete map[tombstoneId(kind, id)]; });
 /** Purge: clears the tombstone ONLY if it is still exactly the one the eligibility decision was made on (another tab may have changed its Vault state meanwhile). */
+/**
+ * "Allow it back" for the user. Same as clearTombstoneIfUnchanged, except that a Memory whose owning Conversation still has a CASCADE tombstone is refused
+ * ("parent-guard"): that guard would keep rejecting the Memory anyway, so lifting only the Memory's own record would report success without restoring anything.
+ * There is no per-Memory exception and no automatic lifting: the Conversation's guard has to be lifted first.
+ */
+export async function clearTombstoneForRestoreIfUnchanged(expected: Tombstone): Promise<boolean | "parent-guard"> {
+  let result: boolean | "parent-guard" = false;
+  await mutateTombstones((map) => {
+    const cur = map[tombstoneId(expected.kind, expected.id)];
+    if (!cur || cur.physicalDeletion === "pending" || JSON.stringify(cur) !== JSON.stringify(expected)) return;
+    if (cur.kind === "memory" && cur.conversationId && map[tombstoneId("conversation", cur.conversationId)]?.cascade === true) { result = "parent-guard"; return; }
+    delete map[tombstoneId(expected.kind, expected.id)]; result = true;
+  });
+  return result;
+}
 export async function clearTombstoneIfUnchanged(expected: Tombstone): Promise<boolean> {
   let cleared = false;
   await mutateTombstones((map) => {
@@ -684,6 +699,31 @@ async function sanitizeTombstonedMemoryRefsInTx(tx: { objectStore(name: string):
   const outbox = tx.objectStore("vaultOutbox");
   await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor("conversation", next.id)), "conversation", next.id, at, at));
   return { conversation: next, changed: true };
+}
+
+/**
+ * The reference cleanup of a user deletion for a Memory whose record is ALREADY missing (an orphan Outbox entry): every Memory that links to it loses the
+ * link, every Conversation that lists it loses the id, each as a new version queued for the Vault, inside the caller's transaction. Nothing is deleted.
+ */
+async function cleanReferencesToMissingMemoryInTx(tx: { objectStore(name: string): any }, memoryId: string, now: string): Promise<void> {   // eslint-disable-line @typescript-eslint/no-explicit-any
+  const memories = tx.objectStore("memoryObjects"), conversations = tx.objectStore("conversations"), outbox = tx.objectStore("vaultOutbox");
+  for (const other of (await memories.getAll()) as MemoryObject[]) {
+    if (other.id === memoryId) continue;
+    const kept = (other.links ?? []).filter((l) => l.sourceId !== memoryId && l.targetId !== memoryId);
+    if (kept.length === (other.links ?? []).length) continue;
+    const at = strictlyLaterInstant(other.updatedAt, now);
+    const next: MemoryObject = { ...other, links: kept, updatedAt: at, metadata: { ...other.metadata, updatedAt: at } };
+    await memories.put(next);
+    const type = next.metadata.source === "system-generated" ? "reflection" : "memory";
+    await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor(type, next.id)), type, next.id, at, at));
+  }
+  for (const c of (await conversations.getAll()) as Conversation[]) {
+    if (!(c.memoryObjectIds ?? []).includes(memoryId)) continue;
+    const at = strictlyLaterInstant(c.updatedAt, now);
+    const next: Conversation = { ...c, memoryObjectIds: c.memoryObjectIds.filter((id) => id !== memoryId), updatedAt: at, metadata: { ...c.metadata, updatedAt: at } };
+    await conversations.put(next);
+    await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor("conversation", c.id)), "conversation", c.id, at, at));
+  }
 }
 
 const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings", "vaultIdentity"] as const;
@@ -874,6 +914,7 @@ export async function removeOrphanOutboxEntry(id: string, options: { tombstone?:
         if (options.tombstone && tombKind) {
           const map = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
           if (map === null) throw new TombstoneStoreCorruptError();
+          if (tombKind === "memory") await cleanReferencesToMissingMemoryInTx(tx, e.recordId, now);   // same reference consistency as an ordinary deletion; any failure rolls everything back
           if (!map[tombstoneId(tombKind, e.recordId)]) map[tombstoneId(tombKind, e.recordId)] = { v: 1, kind: tombKind, id: e.recordId, deletedAt: now, vault: "unverified" };
           await stampNewTombstonesInTx(tx, map, now);
           await tx.objectStore("settings").put(JSON.stringify(map), TOMBSTONES_KEY);

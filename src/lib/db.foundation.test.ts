@@ -709,6 +709,33 @@ test("a stale Memory snapshot written through the ordinary writer (bootstrap mig
   assert.equal((await dbMod.getVaultOutboxEntry("memory:sm-b"))?.recordUpdatedAt, b.updatedAt);
 });
 
+test("tidying an orphan Outbox entry as a deletion cleans the surviving references like an ordinary deletion, atomically, and deletes nothing else", async () => {
+  await dbMod.putMemoryObject({ ...fromConversation("or-keep", "or-c"), links: [testLink("or-l", "or-keep", "or-ghost")] });
+  await dbMod.putMemoryObject(fromConversation("or-other", "or-c"));
+  await dbMod.putConversation({ ...conversation("or-c"), memoryObjectIds: ["or-keep", "or-ghost", "or-other"] });
+  await dbMod.putVaultOutboxEntry({ id: "memory:or-ghost", recordType: "memory", recordId: "or-ghost", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "canonical-record-missing", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  const otherBefore = JSON.stringify(await dbMod.getMemoryObject("or-other"));
+  // an interruption (the tombstone write at the end fails) commits nothing
+  const snap = async () => JSON.stringify([await dbMod.getMemoryObject("or-keep"), await dbMod.getConversation("or-c"), await dbMod.getVaultOutboxEntry("memory:or-ghost"), await dbMod.getVaultOutboxEntry("memory:or-keep")]);
+  const before = await snap();
+  fakeIdbMod.__failNextPutOn("tsumugi", "settings");
+  await assert.rejects(() => dbMod.removeOrphanOutboxEntry("memory:or-ghost", { tombstone: true }, NOW1));
+  assert.equal(await snap(), before, "all or nothing");
+  assert.equal(await dbMod.removeOrphanOutboxEntry("memory:or-ghost", { tombstone: true }, NOW1), "removed");
+  assert.deepEqual((await dbMod.getMemoryObject("or-keep"))!.links, [], "the link to the missing Memory is gone");
+  assert.deepEqual((await dbMod.getConversation("or-c"))!.memoryObjectIds, ["or-keep", "or-other"]);
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:or-keep"))?.status, "pending", "the corrected Memory is queued for the Vault");
+  assert.equal((await dbMod.getVaultOutboxEntry("conversation:or-c"))?.status, "pending", "and so is the Conversation");
+  assert.equal(JSON.stringify(await dbMod.getMemoryObject("or-other")), otherBefore, "an unrelated Memory is untouched");
+  assert.ok(await dbMod.getMemoryObject("or-keep") && await dbMod.getConversation("or-c"), "nothing was deleted");
+  assert.ok(await dbMod.getTombstone("memory", "or-ghost"));
+  // a plain tidy-up (no deletion intent) changes no record
+  await dbMod.putVaultOutboxEntry({ id: "memory:or-ghost2", recordType: "memory", recordId: "or-ghost2", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "canonical-record-missing", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  const kBefore = JSON.stringify(await dbMod.getMemoryObject("or-keep"));
+  assert.equal(await dbMod.removeOrphanOutboxEntry("memory:or-ghost2", {}, NOW1), "removed");
+  assert.equal(JSON.stringify(await dbMod.getMemoryObject("or-keep")), kBefore);
+});
+
 test("deleting a Memory removes EVERY link that points at it, also a one-sided link whose reciprocal copy is missing", async () => {
   await dbMod.putMemoryObject(fromConversation("os-a", "c1"));
   await dbMod.putMemoryObject({ ...fromConversation("os-b", "c1"), links: [testLink("os-l", "os-b", "os-a")] });   // B points at A; A holds no reciprocal link
