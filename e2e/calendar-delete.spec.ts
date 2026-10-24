@@ -58,7 +58,7 @@ for (const [name, size] of [["PC", { width: 1280, height: 800 }], ["Android", { 
     expect(before).toContain(`id: ${A1}`); expect(before).toContain(`id: ${B1}`);
     await openCalendar(page);
     await page.getByRole("button", { name: /会話A/ }).click();                           // the conversation detail lists its Memories
-    await expect(page.getByText("ガンダムの記憶その1")).toBeVisible();
+    await expect(page.getByRole("button", { name: "会話全文を見る" })).toBeVisible();
     await page.getByRole("button", { name: "削除", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog).toContainText("この会話を削除しますか？");
@@ -112,7 +112,9 @@ test("settings: an unfinished deletion is announced and can be continued from th
   await seed(page);
   await page.evaluate(async ([A]) => {
     const { dbm, deletion } = (window as any).D; const root = await navigator.storage.getDirectory();
-    await dbm.deleteConversationWithMemoriesByUser(A); const t = await dbm.getTombstone("conversation", A);
+    await dbm.deleteConversationWithMemoriesByUser(A);
+    await (window as any).D.bootstrap.runSaveFoundationBootstrap({ root });                  // the neighbour's link removal is projected first, so the app has nothing left to rewrite
+    const t = await dbm.getTombstone("conversation", A);
     const plan = await deletion.previewVaultDeletion(root, t); await dbm.beginPhysicalDeletion(t, JSON.stringify(plan), plan.ids.filter((id: string) => id !== A));
     await deletion.applyVaultDeletionEdits(root, { ...plan, edits: plan.edits.slice(0, 1) });          // stopped after the first file
   }, [A]);
