@@ -39,8 +39,13 @@ const vaultText = (page: Page) => page.evaluate(async () => {
   const walk = async (d: any, p: string) => { for await (const [n, h] of d.entries()) { if (h.kind === "directory") await walk(h, p + n + "/"); else out.push(p + n + "\n" + await (await h.getFile()).text()); } };
   await walk(root, ""); return out.join("\n=====\n");
 });
-async function openCalendar(page: Page) {
+/** the app starts on a splash screen with one button */
+async function openHome(page: Page) {
   await page.goto(BASE);
+  await page.getByRole("button", { name: "tsumugiを開く" }).click();
+}
+async function openCalendar(page: Page) {
+  await openHome(page);
   await page.getByRole("button", { name: "これまでの記憶を見る" }).click();
   await expect(page.getByRole("button", { name: /会話A/ })).toBeVisible({ timeout: 30_000 });
 }
@@ -83,7 +88,7 @@ for (const [name, size] of [["PC", { width: 1280, height: 800 }], ["Android", { 
     await expect(page.getByRole("button", { name: /会話A/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible();
     // nothing comes back after a restart
-    await page.reload(); await page.getByRole("button", { name: "これまでの記憶を見る" }).click();
+    await page.reload(); await page.getByRole("button", { name: "tsumugiを開く" }).click(); await page.getByRole("button", { name: "これまでの記憶を見る" }).click();
     await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByRole("button", { name: /会話A/ })).toHaveCount(0);
     expect(await read<any>(page, "conversations", A)).toBeUndefined();
@@ -93,7 +98,7 @@ for (const [name, size] of [["PC", { width: 1280, height: 800 }], ["Android", { 
 
 test("settings: no 'データの管理' entry any more, and no notice while nothing is unfinished; the old /data URL is only a recovery page", async ({ page }) => {
   await seed(page);
-  await page.goto(BASE);
+  await openHome(page);
   await page.getByRole("button", { name: "設定" }).click();
   await expect(page.getByText("データの管理")).toHaveCount(0);
   await expect(page.getByText("削除を完了する必要があります")).toHaveCount(0);
@@ -111,7 +116,7 @@ test("settings: an unfinished deletion is announced and can be continued from th
     const plan = await deletion.previewVaultDeletion(root, t); await dbm.beginPhysicalDeletion(t, JSON.stringify(plan), plan.ids.filter((id: string) => id !== A));
     await deletion.applyVaultDeletionEdits(root, { ...plan, edits: plan.edits.slice(0, 1) });          // stopped after the first file
   }, [A]);
-  await page.goto(BASE);
+  await openHome(page);
   await page.getByRole("button", { name: "設定" }).click();
   await expect(page.getByText("削除を完了する必要があります")).toBeVisible();
   await page.getByRole("button", { name: "削除を続ける" }).click();

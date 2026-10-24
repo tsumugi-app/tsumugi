@@ -29,7 +29,7 @@ const M1 = "e2e-mem-A00001", M2 = "e2e-mem-B00002", M3 = "e2e-mem-C00003", M4 = 
 /** the app's own schema is created by loading the page once; then the fictional records go straight into IndexedDB and the page is reloaded */
 async function openWith(page: Page, withVault = false, advanced = false) {
   await page.goto(DATA);
-  await expect(page.getByRole("heading", { name: "データの管理" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "削除を完了する" })).toBeVisible();
   await page.evaluate(async ({ rows, withVault }) => {
     const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
     // the OPFS directory is obtained BEFORE the transaction opens (an IndexedDB transaction closes itself when awaited work outside IndexedDB happens inside it)
