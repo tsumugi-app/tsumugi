@@ -169,7 +169,14 @@ test("physical deletion: durable pending intent cannot be lifted; restart retrie
   w.v.perm.readwrite = "denied";
   await assert.rejects(deletion.retryVaultDeletion(root, pending), /permission-required/);
   w.v.perm.readwrite = "granted"; w.v.writeShouldFail.clear();
-  await deletion.retryVaultDeletion(root, pending);
+  w.v.put("moved/deep/renamed.MD", "torn Worker write after process termination");
+  await assert.rejects(deletion.retryVaultDeletion(root, pending), /content-changed/);
+  const repair = await deletion.previewVaultDeletionRepair(root, pending);
+  assert.equal(repair.edits.find((e) => e.path === "moved/deep/renamed.MD")!.before, "torn Worker write after process termination");
+  assert.equal(repair.edits.find((e) => e.path === "moved/deep/renamed.MD")!.after, w.kept);
+  w.v.put("moved/deep/renamed.MD", "a new external edit after repair preview");
+  await assert.rejects(deletion.confirmVaultDeletion(root, repair), /preview-changed/);
+  await deletion.confirmVaultDeletion(root, await deletion.previewVaultDeletionRepair(root, pending));
   const done = (await dbm.getTombstone("memory", w.t.id))!;
   assert.equal(done.physicalDeletion, "complete"); assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), undefined);
   assert.equal(life.purgeDecision(done, "2030-01-01").purgeable, false);

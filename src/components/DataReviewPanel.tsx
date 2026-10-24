@@ -9,7 +9,7 @@ import {
 import { allowBack, findRecordInVault, keepVaultCopy, purgeDecision, purgeEligibleTombstones, verifyTombstone } from "@/lib/dataLifecycle";
 import { getVaultBackend } from "@/lib/vault";
 import { isRecoveryBlockingNormalWrites } from "@/lib/vaultRecoveryJournal";
-import { previewVaultDeletion, confirmVaultDeletion, retryVaultDeletion, type VaultDeletionPlan } from "@/lib/vaultDeletion";
+import { previewVaultDeletion, previewVaultDeletionRepair, confirmVaultDeletion, retryVaultDeletion, type VaultDeletionPlan } from "@/lib/vaultDeletion";
 import type { Conversation, MemoryObject } from "@/lib/types";
 
 /**
@@ -81,8 +81,16 @@ export default function DataReviewPanel() {
       {deletionPlan && <section role="region" aria-label="保存先の削除確認" className="rounded border border-red-500 p-4">
         <p>次のファイルから対象の記録を削除し、履歴・索引も更新します。取り消せません。同じファイルの別の記憶は残します。</p>
         <ul>{deletionPlan.edits.map((e) => <li key={e.path}>{e.path}（{e.after === null ? "ファイルを削除" : "対象箇所を更新"}）</li>)}</ul>
+        {deletionPlan.repairOf && <>
+          <p role="alert">中断した変更を、前回確定した削除結果に修復します。中断後の追加編集は失われる可能性があります。各ファイルの現在の内容と修復後の内容を確認してください。</p>
+          {deletionPlan.edits.filter((e) => e.before !== e.after).map((e) => <details key={e.path}>
+            <summary>{e.path} の内容を確認</summary>
+            <p>現在の内容</p><pre className="max-h-60 overflow-auto whitespace-pre-wrap">{e.before ?? "（ファイルなし）"}</pre>
+            <p>修復後の内容</p><pre className="max-h-60 overflow-auto whitespace-pre-wrap">{e.after ?? "（ファイルを削除）"}</pre>
+          </details>)}
+        </>}
         <p>対象 {deletionPlan.ids.length} 件。復旧用アーカイブや外部バックアップは残ります。復活を防ぐ記録は保持します。</p>
-        <label><input type="checkbox" checked={editorsStopped} onChange={(e) => setEditorsStopped(e.target.checked)} /> 他のアプリ・端末で、この保存先の編集と同期を停止しました</label>
+        <label><input type="checkbox" checked={editorsStopped} onChange={(e) => setEditorsStopped(e.target.checked)} /> 内容を確認し、他のアプリ・端末で、この保存先の編集と同期を停止しました</label>
         <div className="flex gap-2">
           <button disabled={busy || blocked || !editorsStopped} className="border border-red-700 px-2 py-1" onClick={() => void act(async () => {
             const plan = deletionPlan; setDeletionPlan(null);
@@ -182,6 +190,11 @@ export default function DataReviewPanel() {
                       const root = await vaultRoot("readwrite"); if (!root) return "書き込みの許可が必要です。";
                       await retryVaultDeletion(root, t); return "保存先の削除と履歴・索引の更新が完了しました。";
                     })}>確定済みの削除を再試行</button>
+                    <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => {
+                      const root = await vaultRoot(); if (!root) return "保存先の読み取りの許可が必要です。";
+                      setDeletionPlan(await previewVaultDeletionRepair(root, t)); setEditorsStopped(false);
+                      return "現在の内容と修復後の内容を確認してください。まだファイルは変更していません。";
+                    })}>中断した変更を確認して修復…</button>
                   </>}
                   <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => {
                     const root = await vaultRoot();

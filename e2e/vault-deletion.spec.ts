@@ -105,3 +105,37 @@ test("Vault deletion: concurrent tabs cannot double-confirm; a stale save from t
   expect(await text(page)).not.toContain("id: delete-target");
   await other.close();
 });
+
+test("Vault deletion: OPFS Worker path works when native createWritable is unavailable", async ({ page }) => {
+  await setup(page);
+  await page.evaluate(async () => {
+    const { dbm, deletion } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const plan = await deletion.previewVaultDeletion(root, await dbm.getTombstone("memory", "delete-target"));
+    Object.defineProperty(FileSystemFileHandle.prototype, "createWritable", { value: undefined, configurable: true });
+    await deletion.confirmVaultDeletion(root, plan);
+  });
+  expect(await text(page)).not.toContain("id: delete-target"); expect(await text(page)).toContain("id: retained-neighbor");
+});
+
+test("Vault deletion: a torn Worker result requires a new content review before repair", async ({ page }) => {
+  await setup(page);
+  await page.evaluate(async () => {
+    const { dbm, deletion } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const t = await dbm.getTombstone("memory", "delete-target"); const plan = await deletion.previewVaultDeletion(root, t);
+    await dbm.beginPhysicalDeletion(t, JSON.stringify(plan));
+    const h = await (await root.getDirectoryHandle("moved")).getFileHandle("renamed.md");
+    const w = await h.createWritable(); await w.write("torn Worker result"); await w.close();
+  });
+  await page.reload(); await attach(page);
+  await page.getByRole("button", { name: "確定済みの削除を再試行" }).click();
+  await expect(page.getByRole("status")).toContainText("content-changed");
+  await page.getByRole("button", { name: "中断した変更を確認して修復…" }).click();
+  const review = page.getByRole("region", { name: "保存先の削除確認" });
+  await review.getByText("moved/renamed.md の内容を確認").click();
+  await expect(review).toContainText("torn Worker result"); await expect(review).toContainText("retained-neighbor");
+  await review.getByRole("button", { name: "取り消す" }).click(); expect(await text(page)).toBe("torn Worker result");
+  await page.getByRole("button", { name: "中断した変更を確認して修復…" }).click();
+  await review.getByRole("checkbox").check(); await review.getByRole("button", { name: "保存先からも完全に削除する" }).click();
+  await expect(page.getByRole("status")).toContainText("更新が完了");
+  expect(await text(page)).not.toContain("id: delete-target"); expect(await text(page)).toContain("id: retained-neighbor");
+});

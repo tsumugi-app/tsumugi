@@ -9,23 +9,26 @@ import {
 } from "./db";
 import { isRecoveryBlockingNormalWrites } from "./vaultRecoveryJournal";
 import { withVaultSaveLock } from "./vaultSaveLock";
+import { writeFileHandleContent } from "./vaultWriter";
 import { parseFrontmatter, parseMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
 import { computeMonthAggregate, getVaultBackend, hashVaultText, type HistoryMonthIndex } from "./vault";
 
-export interface DeletionEdit { path: string; before: string; after: string | null }
+export interface DeletionEdit { path: string; before: string | null; after: string | null }
 export interface VaultDeletionPlan {
   version: 1; tombstone: Tombstone; vaultId: string; epoch: number;
   ids: string[]; edits: DeletionEdit[];
+  /** A fresh explicit review can repair a partial Worker write; bound to the saved plan. */
+  repairOf?: string;
 }
 const fail = (reason: string): never => { throw new Error(`vault-deletion:${reason}`); };
 const object = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v); // eslint-disable-line @typescript-eslint/no-explicit-any
 const json = (s: string) => { const v: unknown = JSON.parse(s); if (!object(v)) return fail("malformed-metadata"); return v; };
 const encode = (v: unknown) => JSON.stringify(v, null, 2);
 const safePath = (p: string) => p.length > 0 && !p.includes("\\") && p.split("/").every((x) => x !== "" && x !== "." && x !== "..");
-async function parent(root: FileSystemDirectoryHandle, path: string) {
+async function parent(root: FileSystemDirectoryHandle, path: string, create = false) {
   if (!safePath(path)) return fail("unsafe-path");
   const parts = path.split("/"); let dir = root;
-  for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create: false });
+  for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create });
   return { dir, name: parts.at(-1)! };
 }
 async function read(root: FileSystemDirectoryHandle, path: string): Promise<string | null> {
@@ -33,9 +36,15 @@ async function read(root: FileSystemDirectoryHandle, path: string): Promise<stri
   catch (e) { if ((e as Error).name === "NotFoundError") return null; throw e; }
 }
 async function write(root: FileSystemDirectoryHandle, e: DeletionEdit) {
-  const { dir, name } = await parent(root, e.path);
+  const { dir, name } = await parent(root, e.path, e.after !== null);
   if (e.after === null) { await dir.removeEntry(name); return; }
-  const stream = await (await dir.getFileHandle(name)).createWritable();
+  const file = await dir.getFileHandle(name, { create: true });
+  if (typeof file.createWritable !== "function") {
+    // Existing OPFS Worker writer verifies readback and attempts rollback on a live failure.
+    // A killed Worker is recovered only by an explicit, content-reviewed repair below.
+    await writeFileHandleContent(file, e.after); return;
+  }
+  const stream = await file.createWritable();
   try { await stream.write(e.after); await stream.close(); }
   catch (error) { try { await stream.abort(); } catch { /* retain the original failure */ } throw error; }
 }
@@ -232,18 +241,45 @@ export async function previewVaultDeletion(root: FileSystemDirectoryHandle, seen
     const t = await getTombstone(seen.kind, seen.id);
     if (!t || JSON.stringify(t) !== JSON.stringify(seen) || t.vaultId !== vaultId) return fail("deletion-intent-changed");
     const prior = await readPhysicalDeletionJournal(t.kind, t.id);
-    const priorIds: string[] = prior ? JSON.parse(prior).ids : [];
+    const saved: VaultDeletionPlan | null = prior ? JSON.parse(prior) : null;
+    if (saved) validateSavedPlan(saved, t, vaultId, epoch);
+    const priorIds = saved?.ids ?? [];
     return buildVaultDeletionPlan(await inventory(root), t, vaultId, epoch, priorIds);
   });
 }
 export async function confirmVaultDeletion(root: FileSystemDirectoryHandle, confirmed: VaultDeletionPlan): Promise<void> {
   return locked(root, async (vaultId, epoch) => {
     if (vaultId !== confirmed.vaultId || epoch !== confirmed.epoch) return fail("vault-world-changed");
-    const now = buildVaultDeletionPlan(await inventory(root), confirmed.tombstone, vaultId, epoch, confirmed.ids);
+    const now = confirmed.repairOf
+      ? await buildRepairPlan(root, confirmed.tombstone, vaultId, epoch)
+      : buildVaultDeletionPlan(await inventory(root), confirmed.tombstone, vaultId, epoch, confirmed.ids);
     if (JSON.stringify(now) !== JSON.stringify(confirmed)) return fail("preview-changed");
     await beginPhysicalDeletion(confirmed.tombstone, JSON.stringify(confirmed));
     await execute(root, confirmed);
   }, "readwrite");
+}
+function validateSavedPlan(plan: VaultDeletionPlan, seen: Tombstone, vaultId: string, epoch: number): void {
+  if (plan.version !== 1 || plan.vaultId !== vaultId || plan.epoch !== epoch || plan.tombstone.deletedAt !== seen.deletedAt || plan.tombstone.id !== seen.id || plan.tombstone.kind !== seen.kind || plan.tombstone.cascade !== seen.cascade) return fail("journal-world-mismatch");
+  if (!Array.isArray(plan.edits) || !Array.isArray(plan.ids) || plan.ids.some((id) => typeof id !== "string") || plan.edits.some((e) => typeof e.path !== "string" || (e.before !== null && typeof e.before !== "string") || (e.after !== null && typeof e.after !== "string") || !safePath(e.path) || !(e.path.toLowerCase().endsWith(".md") && !e.path.split("/").some((p) => p.startsWith(".")) || /^\.tsumugi\/(index|history-meta|registry-meta)\.json$/.test(e.path) || /^\.tsumugi\/(history\/\d{4}-\d{2}|registry\/[0-9a-f]{2})\.json$/.test(e.path)))) return fail("journal-malformed");
+}
+async function journalDigest(raw: string): Promise<string> {
+  return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw))), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function buildRepairPlan(root: FileSystemDirectoryHandle, seen: Tombstone, vaultId: string, epoch: number): Promise<VaultDeletionPlan> {
+  const current = await getTombstone(seen.kind, seen.id);
+  if (!current || JSON.stringify(current) !== JSON.stringify(seen) || current.physicalDeletion !== "pending") return fail("deletion-intent-changed");
+  const raw = await readPhysicalDeletionJournal(seen.kind, seen.id); if (!raw) return fail("journal-missing");
+  const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, seen, vaultId, epoch);
+  const edits: DeletionEdit[] = [];
+  // Preserve the previously confirmed AFTER text. No parsing/reserializing a possibly torn file.
+  for (const e of saved.edits) edits.push({ ...e, before: await read(root, e.path) });
+  return { ...saved, tombstone: current, edits, repairOf: await journalDigest(raw) };
+}
+/** Read-only preview of restoring the already-confirmed results after a torn write.
+ * UI must display current/desired text, and confirmation rechecks both journal and files.
+ */
+export async function previewVaultDeletionRepair(root: FileSystemDirectoryHandle, seen: Tombstone): Promise<VaultDeletionPlan> {
+  return locked(root, (vaultId, epoch) => buildRepairPlan(root, seen, vaultId, epoch));
 }
 async function execute(root: FileSystemDirectoryHandle, plan: VaultDeletionPlan): Promise<void> {
   // A stale in-memory registry mirror cannot authorize writes after this point.
@@ -261,8 +297,7 @@ export async function retryVaultDeletion(root: FileSystemDirectoryHandle, seen: 
     const raw = await readPhysicalDeletionJournal(seen.kind, seen.id);
     if (!raw) return fail("journal-missing");
     const plan: VaultDeletionPlan = JSON.parse(raw);
-    if (plan.version !== 1 || plan.vaultId !== vaultId || plan.epoch !== epoch || plan.tombstone.deletedAt !== seen.deletedAt || plan.tombstone.id !== seen.id || plan.tombstone.kind !== seen.kind || plan.tombstone.cascade !== seen.cascade) return fail("journal-world-mismatch");
-    if (!Array.isArray(plan.edits) || !Array.isArray(plan.ids) || plan.ids.some((id) => typeof id !== "string") || plan.edits.some((e) => typeof e.path !== "string" || typeof e.before !== "string" || (e.after !== null && typeof e.after !== "string") || !safePath(e.path) || !(e.path.toLowerCase().endsWith(".md") && !e.path.split("/").some((p) => p.startsWith(".")) || /^\.tsumugi\/(index|history-meta|registry-meta)\.json$/.test(e.path) || /^\.tsumugi\/(history\/\d{4}-\d{2}|registry\/[0-9a-f]{2})\.json$/.test(e.path)))) return fail("journal-malformed");
+    validateSavedPlan(plan, seen, vaultId, epoch);
     await execute(root, plan);
   }, "readwrite");
 }
