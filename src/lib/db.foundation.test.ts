@@ -697,6 +697,26 @@ test("an ordinary conversation write (a stale chat tab) never brings back a refe
   assert.deepEqual((await dbMod.getConversation("sw-c"))!.memoryObjectIds, ["sw-other"]);
 });
 
+test("a Capture that read Memory B before the AI call can not bring back a link to Memory A the user deleted while it ran; content and valid links are kept", async () => {
+  await dbMod.putMemoryObject(fromConversation("cp-a", "cp-conv"));
+  await dbMod.putMemoryObject(fromConversation("cp-c", "cp-conv"));
+  const snapshotOfB = { ...fromConversation("cp-b", "cp-conv"), links: [testLink("cp-l1", "cp-b", "cp-a"), testLink("cp-l2", "cp-b", "cp-c")] };
+  await dbMod.putMemoryObject(snapshotOfB);                                       // Capture's UPDATE branch snapshot (before the AI call)
+  await dbMod.deleteMemoryByUser("cp-a", NOW1);                                    // the user deletes A while the AI request is running
+  assert.deepEqual((await dbMod.getMemoryObject("cp-b"))!.links.map((l) => l.id), ["cp-l2"]);
+  const updated = { ...snapshotOfB, summary: "Captureが更新した要約", content: "Captureが更新した本文", updatedAt: "2026-10-23T12:00:00.000Z" };
+  await dbMod.putCapturedMemoryWithOutbox(updated, "cp-conv");                     // ...and Capture saves its update from the old snapshot
+  const b = (await dbMod.getMemoryObject("cp-b"))!;
+  assert.deepEqual(b.links.map((l) => l.id), ["cp-l2"], "no link to the deleted Memory; the valid one stays");
+  assert.equal(b.summary, "Captureが更新した要約");
+  assert.equal(b.content, "Captureが更新した本文");
+  assert.ok(Date.parse(b.updatedAt) > Date.parse("2026-10-23T12:00:00.000Z"), "a new version, so the corrected record is what the Vault receives");
+  const entry = (await dbMod.getVaultOutboxEntry("memory:cp-b"))!;
+  assert.equal(entry.recordUpdatedAt, b.updatedAt, "the Outbox entry matches the stored record");
+  assert.equal(entry.status, "pending");
+  assert.equal(await dbMod.hasDeletedMemoryReferences(b.links.flatMap((l) => [l.sourceId, l.targetId]).filter((id) => id !== "cp-b")), false, "nothing references a deleted Memory any more");
+});
+
 test("a stale Memory snapshot written through the ordinary writer (bootstrap migration) never brings back a link to a deleted Memory", async () => {
   await dbMod.putMemoryObject(fromConversation("sm-a", "c1"));
   const snapshot = { ...fromConversation("sm-b", "c1"), links: [testLink("sm-l", "sm-b", "sm-a")] };

@@ -191,7 +191,7 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
   const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
     "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer",
-    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "cleanReferencesToMissingMemoryInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
+    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "cleanReferencesToMissingMemoryInTx", "withoutDeletedLinksInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
   const missing: string[] = [];
   // New deletion wrapper only removes records and cleans stored references. It must never
   // become a replacement writer or accept a child owned by a different conversation.
