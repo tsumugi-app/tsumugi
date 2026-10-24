@@ -12,6 +12,7 @@
  * このファイルはまだどの本番経路からも呼ばれない（Phase 3-4はlibrary＋testまで）。
  */
 import {
+  getActiveVaultEpoch,
   getAllConversations,
   getAllMemoryObjects,
   getAllSources,
@@ -296,7 +297,7 @@ async function persistIdbRecord(patch: Partial<VaultIdentityRecord>, now: string
  */
 async function pairToExistingVaultId(env: VaultIdentityEnv, vaultId: string): Promise<VaultIdentityEnsureResult> {
   const now = nowOf(env);
-  await persistIdbRecord({ vaultId, pendingCandidateVaultId: null, pairedAt: now }, now);
+  await persistIdbRecord({ vaultId, pendingCandidateVaultId: null, pairedAt: now, activeVaultEpoch: await getActiveVaultEpoch() }, now);
   return { kind: "newly-paired", vaultId };
 }
 
@@ -315,7 +316,7 @@ async function establishNewIdentity(env: VaultIdentityEnv, candidateVaultId: str
   // 書き直すだけで安全＝idempotent）。
   await writeVaultIdentityFile(env, candidateVaultId);
   // Step 3：IndexedDB側を最終pairへ。
-  await persistIdbRecord({ vaultId: candidateVaultId, pendingCandidateVaultId: null, pairedAt: now }, now);
+  await persistIdbRecord({ vaultId: candidateVaultId, pendingCandidateVaultId: null, pairedAt: now, activeVaultEpoch: await getActiveVaultEpoch() }, now);
   // Step 4：verify。
   const verifyRead = await readJsonAt(env.root, VAULT_IDENTITY_PATH);
   const idbRecord = await getVaultIdentityRecord();
@@ -422,6 +423,14 @@ export async function ensureVaultIdentityForCurrentWorld(env: VaultIdentityEnv):
   const decision = await decideVaultIdentityAdoption(env);
   switch (decision.action) {
     case "done":
+      // The identity was just verified against the Vault (the file's id equals the stored id), so it holds for the CURRENT world: record the epoch it was verified under.
+      // Everything that needs "this device is paired with this Vault" (e.g. the Vault deletion engine) compares this epoch with the active one; nothing used to write it,
+      // so that check could never pass in the real app (the "unpaired-vault" error). It is refreshed here after a reconnect; a mismatch / unreadable identity is never refreshed.
+      if (decision.result.kind === "identified") {
+        const record = await getVaultIdentityRecord();
+        const epoch = await getActiveVaultEpoch();
+        if (record?.vaultId === decision.result.vaultId && record.activeVaultEpoch !== epoch) await persistIdbRecord({ activeVaultEpoch: epoch }, nowOf(env));
+      }
       return decision.result;
     case "pair-existing":
       return pairToExistingVaultId(env, decision.vaultId);

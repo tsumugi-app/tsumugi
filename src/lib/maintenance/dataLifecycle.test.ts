@@ -24,6 +24,7 @@ const md = require(path.join(OUT, "lib/markdown.js")) as typeof import("../markd
 const testSupport = require(path.join(OUT, "lib/maintenance/testSupport.js")) as typeof import("./testSupport");
 const deletion = require(path.join(OUT, "lib/vaultDeletion.js")) as typeof import("../vaultDeletion");
 const flow = require(path.join(OUT, "lib/deleteFlow.js")) as typeof import("../deleteFlow");
+const adoption = require(path.join(OUT, "lib/vaultIdentityAdoption.js")) as typeof import("../vaultIdentityAdoption");
 
 const T = "2026-08-20T00:00:00.000Z";
 const meta = { id: "meta", source: "ai-capture" as const, sourceType: "chat" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
@@ -710,4 +711,22 @@ test("delete flow: every engine error code is explained in Japanese without the 
     assert.ok(/[ぁ-ん]/.test(text) && !/vault-deletion|[a-z]+-[a-z]+-/.test(text), `${code}: ${text}`);
   }
   assert.ok(/[ぁ-ん]/.test(flow.explainDeletionError(new Error("something unexpected"))));
+});
+
+test("delete flow: a Vault paired by the REAL startup adoption (not a hand-written identity record) can be deleted from; this was the 'unpaired-vault' failure", async () => {
+  testSupport.installFakeLocks();
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: null, activeVaultEpoch: null, registryGeneration: null, pairedAt: null, pendingCandidateVaultId: null, updatedAt: T } as never);
+  const epoch = await dbm.getActiveVaultEpoch(); await dbm.markVaultEpochCommitted(epoch); await dbm.markVaultWorldJournalMigrated();
+  const v = new testSupport.FakeVault(); const root = v.root(); root.isSameEntry = async () => true; await dbm.saveVaultHandle(root);
+  const id = "adopt-mem"; const mem = { ...memory(id), conversationId: "adopt-conv" };
+  await dbm.putConversation(conv("adopt-conv", [id])); await dbm.putMemoryObject(mem);
+  v.put(".tsumugi/schema-version.json", JSON.stringify({ schemaVersion: "0.1" }));             // what connecting a Vault creates
+  v.put(".tsumugi/index.json", "{}");
+  const paired = await adoption.ensureVaultIdentityForCurrentWorld({ root, now: () => T, storageCapability: "origin-bound" });
+  assert.equal(paired.kind, "newly-paired");
+  v.put("Memories/2026-08-20.md", md.serializeMemoryDayFile([mem]));                            // the projection writes the record into the now-identified Vault
+  const review = await flow.prepareDelete({ kind: "memory", id }, { kind: "ready", root });
+  assert.equal(review.blocker, null, review.blocker ?? "");
+  assert.deepEqual(await flow.executeDelete(review, { kind: "ready", root }), { status: "done", vault: "deleted" });
+  assert.ok(!hasId(v.snapshot()["Memories/2026-08-20.md"] ?? "", id));
 });

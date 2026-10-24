@@ -315,6 +315,29 @@ test("Identity OPFS-empty: any record file in the Vault (even unrelated) still p
   assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined);
 });
 
+test("Identity epoch: the pairing records the world epoch it was verified under; a later startup refreshes it (and never refreshes a mismatching identity)", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  const first = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault));          // empty Vault -> new identity
+  assert.equal(first.kind, "newly-paired");
+  const epoch = await dbMod.getActiveVaultEpoch();
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch, "bound to the active epoch");
+  // the world moves on (the same Vault is reconnected): the next startup verifies the identity again and follows the epoch
+  await dbMod.bumpActiveVaultEpoch(epoch); await dbMod.markVaultEpochCommitted(epoch + 1);
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch);
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault))).kind, "identified");
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch + 1);
+  // a records from before this fix (paired, but no epoch) are refreshed too
+  await dbMod.putVaultIdentityRecord({ ...(await dbMod.getVaultIdentityRecord())!, activeVaultEpoch: null });
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault))).kind, "identified");
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch + 1);
+  // another Vault: held, and the record is NOT touched
+  const other = new FakeVault(); other.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "someone-else" }));
+  await dbMod.putVaultIdentityRecord({ ...(await dbMod.getVaultIdentityRecord())!, activeVaultEpoch: 0 });
+  assert.deepEqual(await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(other)), { kind: "held", reason: "identity-mismatch" });
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, 0);
+});
+
 test("Identity G-OPFS: origin-bound＋共通IDが無い → unrelated（HOLD。identityを作らない）", async () => {
   const vault = new FakeVault();
   await resetIdbIdentity();
