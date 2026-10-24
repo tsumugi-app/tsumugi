@@ -129,6 +129,9 @@ test("Vault deletion: a torn Worker result requires a new content review before 
   await page.reload(); await attach(page);
   await page.getByRole("button", { name: "確定済みの削除を再試行" }).click();
   await expect(page.getByRole("status")).toContainText("content-changed");
+  await page.getByRole("button", { name: "保存先の削除対象を確認…" }).click();
+  await expect(page.getByRole("status")).toContainText("content-review-required");
+  expect(await text(page)).toBe("torn Worker result");
   await page.getByRole("button", { name: "中断した変更を確認して修復…" }).click();
   const review = page.getByRole("region", { name: "保存先の削除確認" });
   await review.getByText("moved/renamed.md の内容を確認").click();

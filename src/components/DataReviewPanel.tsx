@@ -179,12 +179,13 @@ export default function DataReviewPanel() {
               <li key={`${t.kind}:${t.id}`} className="flex flex-col gap-2 rounded border border-stone-300 px-3 py-2">
                 <p>{kindLabel(t.kind)} …{tail(t.id)}（{t.deletedAt.slice(0, 10)}に削除）：{t.vault === "absent" ? "保存先にも見つかりません" : t.vault === "kept" ? "保存先のコピーを残す設定です" : "保存先にコピーが残っている可能性があります"}</p>
                 <div className="flex flex-wrap gap-2">
-                  <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => {
+                  <button disabled={busy || blocked || !!t.physicalDeletionParent} className="border px-2 py-1" onClick={() => void act(async () => {
                     const root = await vaultRoot(); if (!root) return "保存先の読み取りの許可が必要です。";
                     const plan = await previewVaultDeletion(root, t); setEditorsStopped(false); setDeletionPlan(plan);
                     return "削除対象を確認してください。まだ保存先のファイルは変更していません。";
                   })}>保存先の削除対象を確認…</button>
-                  {t.physicalDeletion === "pending" && <>
+                  {t.physicalDeletionParent && <p>会話 …{tail(t.physicalDeletionParent)} の削除と一緒に処理します。会話の項目から再試行してください。</p>}
+                  {t.physicalDeletion === "pending" && !t.physicalDeletionParent && <>
                     <span role="alert">保存先の削除は未完了です。復活防止の記録を保持しています。</span>
                     <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => {
                       const root = await vaultRoot("readwrite"); if (!root) return "書き込みの許可が必要です。";

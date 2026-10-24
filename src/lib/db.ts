@@ -417,6 +417,8 @@ export interface Tombstone {
   v: 1;
   /** Physical deletion is explicit and resumable. Keep this guard until an explicit allow-back. */
   physicalDeletion?: "pending" | "complete";
+  /** A Vault-only cascade child's pending work is owned by this conversation's journal. */
+  physicalDeletionParent?: string;
   kind: TombstoneKind;
   id: string;
   deletedAt: string;
@@ -438,13 +440,22 @@ export async function readPhysicalDeletionJournal(kind: TombstoneKind, id: strin
   return (await getDB()).get("settings", deletionJournalKey(kind, id));
 }
 /** The confirmed plan and the non-liftable guard commit together, BEFORE any Vault mutation. */
-export async function beginPhysicalDeletion(expected: Tombstone, journal: string): Promise<void> {
-  const tx = (await getDB()).transaction(["settings"], "readwrite");
+export async function beginPhysicalDeletion(expected: Tombstone, journal: string, discoveredMemoryIds: string[] = []): Promise<void> {
+  const tx = (await getDB()).transaction([...LIFECYCLE_STORES], "readwrite");
   try {
     await assertNoPendingRecoveryInTx(tx);
     const s = tx.objectStore("settings");
     const map = parseTombstoneMap(await s.get(TOMBSTONES_KEY));
     if (!map || JSON.stringify(map[tombstoneId(expected.kind, expected.id)]) !== JSON.stringify(expected)) throw new Error("deletion-intent-changed");
+    if (discoveredMemoryIds.length && (expected.kind !== "conversation" || !expected.cascade)) throw new Error("unconfirmed-cascade");
+    for (const id of discoveredMemoryIds) {
+      const m = await tx.objectStore("memoryObjects").get(id);
+      if (m && m.conversationId !== expected.id) throw new Error("cascade-child-owner-changed");
+      const old = map[tombstoneId("memory", id)];
+      await removeMemoryInTx(tx, m ?? { id, conversationId: expected.id }, expected.deletedAt, map, { status: "deleted", countersUpdated: 0, conversationUpdated: false });
+      if (old?.physicalDeletion === "pending" && !old.physicalDeletionParent) map[tombstoneId("memory", id)] = old;
+      else map[tombstoneId("memory", id)] = { ...map[tombstoneId("memory", id)], vaultId: expected.vaultId, physicalDeletion: "pending", physicalDeletionParent: expected.id };
+    }
     map[tombstoneId(expected.kind, expected.id)] = { ...expected, physicalDeletion: "pending" };
     await s.put(JSON.stringify(map), TOMBSTONES_KEY);
     await s.put(journal, deletionJournalKey(expected.kind, expected.id));
@@ -459,6 +470,9 @@ export async function finishPhysicalDeletion(expected: Tombstone): Promise<void>
     const t = map?.[tombstoneId(expected.kind, expected.id)];
     if (!map || !t || t.deletedAt !== expected.deletedAt || t.physicalDeletion !== "pending") throw new Error("deletion-intent-changed");
     map[tombstoneId(t.kind, t.id)] = { ...t, physicalDeletion: "complete", vault: "absent" };
+    for (const child of Object.values(map)) if (t.kind === "conversation" && t.cascade && child.physicalDeletionParent === t.id && child.deletedAt === t.deletedAt && child.physicalDeletion === "pending") {
+      child.physicalDeletion = "complete"; child.vault = "absent"; delete child.physicalDeletionParent;
+    }
     await s.put(JSON.stringify(map), TOMBSTONES_KEY);
     await s.delete(deletionJournalKey(t.kind, t.id));
   } catch (e) { await abortAndSettleTransaction(tx, e); }
@@ -556,7 +570,7 @@ export interface UserDeleteResult { status: "deleted" | "not-found"; countersUpd
  */
 async function removeMemoryInTx(
   tx: { objectStore(name: string): any },   // eslint-disable-line @typescript-eslint/no-explicit-any
-  m: MemoryObject, now: string, map: TombstoneMap, result: UserDeleteResult
+  m: Pick<MemoryObject, "id" | "conversationId"> & { date?: string }, now: string, map: TombstoneMap, result: UserDeleteResult
 ): Promise<void> {
   const memories = tx.objectStore("memoryObjects"), conversations = tx.objectStore("conversations"), outbox = tx.objectStore("vaultOutbox"), ledger = tx.objectStore("vaultSyncState");
   // every Memory that links to this one is corrected, whether or not this Memory holds the reciprocal copy of the link (imports can leave one-sided links)

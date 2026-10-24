@@ -193,6 +193,15 @@ test("every db.ts function that writes the Memory store applies the lineage inva
     "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer",
     "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
   const missing: string[] = [];
+  // New deletion wrapper only removes records and cleans stored references. It must never
+  // become a replacement writer or accept a child owned by a different conversation.
+  const deletionStart = heads.find((h) => h.name === "beginPhysicalDeletion")!;
+  const deletionEnd = heads.find((h) => h.at > deletionStart.at)!.at;
+  const deletionBody = src.slice(deletionStart.at, deletionEnd);
+  assert.ok(deletionBody.includes('m.conversationId !== expected.id'));
+  assert.ok(deletionBody.includes('await removeMemoryInTx('));
+  assert.ok(!/objectStore\("memoryObjects"\)\.(put|add)\(/.test(deletionBody));
+  reviewed.add("beginPhysicalDeletion");
   heads.forEach((h, i) => {
     const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);
     if (!/memoryObjects/.test(body) || !/\.(put|add|delete)\(/.test(body)) return;

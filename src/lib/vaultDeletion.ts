@@ -10,8 +10,8 @@ import {
 import { isRecoveryBlockingNormalWrites } from "./vaultRecoveryJournal";
 import { withVaultSaveLock } from "./vaultSaveLock";
 import { writeFileHandleContent } from "./vaultWriter";
-import { parseFrontmatter, parseMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
-import { computeMonthAggregate, getVaultBackend, hashVaultText, type HistoryMonthIndex } from "./vault";
+import { parseFrontmatter, parseMemoryDayFile, memoryObjectToMarkdown, MEMORY_ENTRY_SEPARATOR } from "./markdown";
+import { computeMonthAggregate, getVaultBackend, hashVaultText, dayFileRegistryKey, vaultRegistryBucketOf, type HistoryMonthIndex } from "./vault";
 
 export interface DeletionEdit { path: string; before: string | null; after: string | null }
 export interface VaultDeletionPlan {
@@ -68,10 +68,10 @@ async function inventory(root: FileSystemDirectoryHandle): Promise<Map<string, s
 }
 interface Entry { raw: string; separator: string; fm?: Record<string, unknown> }
 function entries(text: string): Entry[] {
-  const chunks = text.split(/(\r?\n<!-- tsumugi:entry -->\r?\n(?:\r?\n)?)/);
-  const result: Entry[] = [];
-  for (let i = 0; i < chunks.length; i += 2) result.push({ raw: chunks[i], separator: i === 0 ? "" : chunks[i - 1], fm: parseFrontmatter(chunks[i].trim())?.frontmatter });
-  return result;
+  const first = parseFrontmatter(text.trim())?.frontmatter;
+  // Conversations and Reflections are single records, even when their prose contains a day separator.
+  if (typeof first?.startedAt === "string" || first?.source === "system-generated") return [{ raw: text, separator: "", fm: first }];
+  return text.split(MEMORY_ENTRY_SEPARATOR).map((raw, i) => ({ raw, separator: i === 0 ? "" : MEMORY_ENTRY_SEPARATOR, fm: parseFrontmatter(raw.trim())?.frontmatter }));
 }
 function target(f: Record<string, unknown> | undefined, t: Tombstone): boolean {
   if (!f || (f.id !== t.id && !(t.kind === "conversation" && t.cascade && f.conversationId === t.id))) return false;
@@ -113,6 +113,7 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
   const affectedDays = new Set<string>();
   if (t.date) affectedDays.add(t.date.slice(0, 10));
   const remainingByDay = new Map<string, Set<string>>();
+  const remainingPathsByDay = new Map<string, Set<string>>();
   // Discover the complete cascade before editing references in an earlier file.
   for (const [path, text] of files) if (path.toLowerCase().endsWith(".md") && !path.startsWith(".tsumugi/")) {
     for (const p of entries(text)) if (target(p.fm, t) && typeof p.fm?.id === "string") ids.add(p.fm.id);
@@ -130,6 +131,7 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
       const f = p.fm;
       if (f?.tsumugi === true && typeof f.date === "string" && typeof f.id === "string" && f.source !== "system-generated") {
         const day = f.date.slice(0, 10); const set = remainingByDay.get(day) ?? new Set<string>(); set.add(f.id); remainingByDay.set(day, set);
+        const paths = remainingPathsByDay.get(day) ?? new Set<string>(); paths.add(path); remainingPathsByDay.set(day, paths);
       }
     }
     if (kept.length !== parts.length || kept.some((p, i) => p.raw !== parts[i].raw)) {
@@ -149,13 +151,16 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
       if (!object(row) || !Array.isArray(row.memberIds)) return fail("malformed-registry-row");
       const members = row.memberIds.filter((id: string) => !ids.has(id));
       if (members.length === row.memberIds.length && !changedPaths.has(p)) continue;
-      if (!members.length) {
+      const content = changedPaths.has(p) ? changedPaths.get(p) : files.get(p);
+      if (!members.length && (content === null || content === undefined)) {
         delete v.files[p]; for (const [key, value] of Object.entries(v.records)) if (value === p) delete v.records[key];
       } else {
-        row.memberIds = members;
+        const actual = typeof content === "string" && row.recordType === "memory-day" ? parseMemoryDayFile(content) : [];
+        row.memberIds = [...new Set([...members, ...actual.map((m) => m.id)])];
+        // A surviving container retains its path guard even if the registry never knew its added members.
+        if (row.status === "ok" && (!members.length || actual.some((m) => !members.includes(m.id)))) row.status = "needs-resync";
         if (object(row.memberHashes)) for (const id of ids) delete row.memberHashes[id];
         // Exact confirmed content, with a deliberately stale stat so the write gate reads its hash.
-        const content = changedPaths.has(p) ? changedPaths.get(p) : files.get(p);
         if (typeof content === "string") {
           // A deletion is not permission to adopt an unrelated external edit as a safe baseline.
           if (row.status === "ok" && row.contentHash !== hashVaultText(files.get(p) ?? "")) row.status = "needs-resync";
@@ -167,6 +172,40 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
     }
     for (const id of ids) delete v.records[id];
   });
+  // Every surviving affected day container needs a guard, including a moved or previously
+  // unregistered file. Do not make "all registered members were deleted" mean "safe new day".
+  for (const day of affectedDays) {
+    const survivors: { path: string; content: string }[] = [];
+    for (const path of remainingPathsByDay.get(day) ?? []) {
+      const before = files.get(path);
+      const content = changedPaths.has(path) ? changedPaths.get(path) : before;
+      if (typeof content === "string") survivors.push({ path, content });
+    }
+    if (!survivors.length) continue;
+    const key = dayFileRegistryKey(day); const bucket = vaultRegistryBucketOf(key);
+    const path = `.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`;
+    const previous = edits.find((e) => e.path === path);
+    const original = files.get(path) ?? null;
+    const current = previous ? previous.after : original;
+    const shard = current === null ? { schemaVersion: 1, bucket, records: {}, files: {} } : json(current);
+    if (shard.schemaVersion !== 1 || !object(shard.records) || !object(shard.files)) return fail("malformed-registry");
+    const guardedPath = shard.records[key];
+    if (survivors.length === 1 && guardedPath === survivors[0].path && object(shard.files[guardedPath])) continue;
+    for (const survivor of survivors) {
+      const existing = shard.files[survivor.path];
+      if (existing && (!object(existing) || existing.recordType !== "memory-day")) return fail("registry-path-collision");
+      const members = parseMemoryDayFile(survivor.content);
+      shard.files[survivor.path] = {
+        ...existing, recordType: "memory-day", mtime: 0, size: new TextEncoder().encode(survivor.content).length,
+        contentHash: hashVaultText(survivor.content), memberIds: members.map((m) => m.id),
+        memberHashes: Object.fromEntries(members.map((m) => [m.id, hashVaultText(memoryObjectToMarkdown(m))])),
+        status: survivors.length > 1 || existing?.status === "conflict" ? "conflict" : "needs-resync",
+      };
+    }
+    shard.records[key] = survivors[0].path;
+    const next: DeletionEdit = { path, before: original, after: encode(shard) };
+    if (previous) Object.assign(previous, next); else edits.push(next);
+  }
   const aggregates: Record<string, { memories: number; conversations: number }> = {};
   for (const path of files.keys()) if (/^\.tsumugi\/history\/\d{4}-\d{2}\.json$/.test(path)) update(path, (v) => {
     if (!object(v.days)) return fail("malformed-history");
@@ -240,23 +279,38 @@ export async function previewVaultDeletion(root: FileSystemDirectoryHandle, seen
   return locked(root, async (vaultId, epoch) => {
     const t = await getTombstone(seen.kind, seen.id);
     if (!t || JSON.stringify(t) !== JSON.stringify(seen) || t.vaultId !== vaultId) return fail("deletion-intent-changed");
+    if (t.physicalDeletionParent) return fail("parent-deletion-required");
     const prior = await readPhysicalDeletionJournal(t.kind, t.id);
     const saved: VaultDeletionPlan | null = prior ? JSON.parse(prior) : null;
     if (saved) validateSavedPlan(saved, t, vaultId, epoch);
+    if (saved) await assertReplayable(root, saved);
     const priorIds = saved?.ids ?? [];
     return buildVaultDeletionPlan(await inventory(root), t, vaultId, epoch, priorIds);
   });
 }
 export async function confirmVaultDeletion(root: FileSystemDirectoryHandle, confirmed: VaultDeletionPlan): Promise<void> {
   return locked(root, async (vaultId, epoch) => {
+    if (confirmed.tombstone.physicalDeletionParent) return fail("parent-deletion-required");
     if (vaultId !== confirmed.vaultId || epoch !== confirmed.epoch) return fail("vault-world-changed");
+    if (!confirmed.repairOf && confirmed.tombstone.physicalDeletion === "pending") {
+      const raw = await readPhysicalDeletionJournal(confirmed.tombstone.kind, confirmed.tombstone.id);
+      if (!raw) return fail("journal-missing");
+      const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, confirmed.tombstone, vaultId, epoch);
+      await assertReplayable(root, saved);
+    }
     const now = confirmed.repairOf
       ? await buildRepairPlan(root, confirmed.tombstone, vaultId, epoch)
       : buildVaultDeletionPlan(await inventory(root), confirmed.tombstone, vaultId, epoch, confirmed.ids);
     if (JSON.stringify(now) !== JSON.stringify(confirmed)) return fail("preview-changed");
-    await beginPhysicalDeletion(confirmed.tombstone, JSON.stringify(confirmed));
+    await beginPhysicalDeletion(confirmed.tombstone, JSON.stringify(confirmed), confirmed.tombstone.kind === "conversation" && confirmed.tombstone.cascade ? confirmed.ids.filter((id) => id !== confirmed.tombstone.id) : []);
     await execute(root, confirmed);
   }, "readwrite");
+}
+async function assertReplayable(root: FileSystemDirectoryHandle, saved: VaultDeletionPlan): Promise<void> {
+  for (const e of saved.edits) {
+    const current = await read(root, e.path);
+    if (current !== e.before && current !== e.after) return fail("content-review-required:" + e.path);
+  }
 }
 function validateSavedPlan(plan: VaultDeletionPlan, seen: Tombstone, vaultId: string, epoch: number): void {
   if (plan.version !== 1 || plan.vaultId !== vaultId || plan.epoch !== epoch || plan.tombstone.deletedAt !== seen.deletedAt || plan.tombstone.id !== seen.id || plan.tombstone.kind !== seen.kind || plan.tombstone.cascade !== seen.cascade) return fail("journal-world-mismatch");
@@ -268,6 +322,7 @@ async function journalDigest(raw: string): Promise<string> {
 async function buildRepairPlan(root: FileSystemDirectoryHandle, seen: Tombstone, vaultId: string, epoch: number): Promise<VaultDeletionPlan> {
   const current = await getTombstone(seen.kind, seen.id);
   if (!current || JSON.stringify(current) !== JSON.stringify(seen) || current.physicalDeletion !== "pending") return fail("deletion-intent-changed");
+  if (current.physicalDeletionParent) return fail("parent-deletion-required");
   const raw = await readPhysicalDeletionJournal(seen.kind, seen.id); if (!raw) return fail("journal-missing");
   const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, seen, vaultId, epoch);
   const edits: DeletionEdit[] = [];
@@ -294,6 +349,7 @@ export async function retryVaultDeletion(root: FileSystemDirectoryHandle, seen: 
   return locked(root, async (vaultId, epoch) => {
     const current = await getTombstone(seen.kind, seen.id);
     if (!current || JSON.stringify(current) !== JSON.stringify(seen) || current.physicalDeletion !== "pending") return fail("deletion-intent-changed");
+    if (current.physicalDeletionParent) return fail("parent-deletion-required");
     const raw = await readPhysicalDeletionJournal(seen.kind, seen.id);
     if (!raw) return fail("journal-missing");
     const plan: VaultDeletionPlan = JSON.parse(raw);

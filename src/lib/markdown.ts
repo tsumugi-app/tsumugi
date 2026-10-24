@@ -391,7 +391,7 @@ export function inferSourceType(source: MemorySource): SourceType {
  * 旧形式（1ファイル1エントリ、このマーカーを含まない）をsplitしても要素数1の配列になるだけなので、
  * 下記のparse関数は新旧どちらの形式にもそのまま使える。
  */
-const MEMORY_ENTRY_SEPARATOR = "\n<!-- tsumugi:entry -->\n\n";
+export const MEMORY_ENTRY_SEPARATOR = "\n<!-- tsumugi:entry -->\n\n";
 
 export function serializeMemoryDayFile(memoryObjects: MemoryObject[]): string {
   return memoryObjects.map((memory) => memoryObjectToMarkdown(memory)).join(MEMORY_ENTRY_SEPARATOR);
