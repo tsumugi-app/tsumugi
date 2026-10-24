@@ -281,7 +281,7 @@ test("Projection E: History write直後（outboxをdoneに記録する前）にk
   // Vault側の4 step（Markdown/Registry/index/History）はすべて成功し、final verifyも
   // 通った直後、outboxをdoneとして記録する一歩（`putVaultOutboxEntry`＝単発put、
   // transactionを介さない）だけが失敗する、という状況を模する。
-  fakeIdbMod.__failNextPlainPutOn("tsumugi", "vaultOutbox");
+  fakeIdbMod.__failNextPutOn("tsumugi", "vaultOutbox");
   const first = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry);
   assert.equal(first.status, "pending", "Vault実体は完成しているが、outbox記録自体の失敗はpendingとして扱う");
   assert.equal(vault.get(path), markdownMod.conversationToMarkdown(c), "Vault側は既に完成している");

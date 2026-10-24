@@ -120,7 +120,7 @@ export const repairRollbackBackupKey = (memoryId: string) => `memoryRepair:${CON
 
 const day = (iso: string) => `${iso.slice(0, 10)}T00:00:00.000Z`;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-const isReflection = (m: MemoryObject) => m.metadata.source === "system-generated";
+export const isReflection = (m: MemoryObject) => m.metadata.source === "system-generated";
 
 function withoutKeys<T extends object>(value: T, keys: string[]): T {
   const copy = { ...value } as Record<string, unknown>;

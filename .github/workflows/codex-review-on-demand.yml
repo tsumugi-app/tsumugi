@@ -1,0 +1,33 @@
+# One-shot Codex review request: runs only when the pushed head commit's message contains the marker [codex-review]. Posts a single `@codex review`
+# comment on the branch's open PR with the user-owned token (Codex ignores bot-authored comments). Not a loop: nothing is counted, waited for or re-posted.
+name: codex-review-on-demand
+on:
+  push:
+    branches: ["claude/**"]
+permissions:
+  contents: read
+jobs:
+  request:
+    if: contains(github.event.head_commit.message, '[codex-review]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CODEX_TRIGGER_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const head = context.ref.replace("refs/heads/", "");
+            const prs = await github.rest.pulls.list({ owner, repo, state: "open", head: `${owner}:${head}`, per_page: 1 });
+            if (!prs.data.length) { core.warning("no open PR for this branch"); return; }
+            const sha = context.sha.slice(0, 7);
+            const body = [
+              "@codex review",
+              "",
+              "On-demand independent review of " + sha + ". Review-only: no merge, no deploy, no production data.",
+              "Focus on the data lifecycle work: user deletion of Memories / Conversations (deleteMemoryByUser, deleteConversationByUser, deleteConversationWithMemoriesByUser in src/lib/db.ts) and whether links, owning-conversation references, Outbox entries, sync ledger and tombstones stay consistent in one transaction;",
+              "(2) the tombstone store and every resurrection guard (importMissingRecordsIfAbsent, add*IfAbsentAndMarkSynced, restore*IfNotNewer, the vault.ts resync apply) - can any path still re-insert a deleted record, or can a guard block legitimate data;",
+              "(3) stuck Outbox entry resolution (listOutboxNeedingAttention, retryOutboxEntry, acceptOutboxDivergence, removeOrphanOutboxEntry) and the /data screen (src/components/DataReviewPanel.tsx) - is there still any state without a way out for the user, or any action that can lose data;",
+              "(4) tombstone purge rules (src/lib/dataLifecycle.ts). Report only real defects with a concrete failure scenario.",
+            ].join("\n");
+            await github.rest.issues.createComment({ owner, repo, issue_number: prs.data[0].number, body });

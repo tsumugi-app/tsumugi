@@ -94,8 +94,24 @@ class FakeTransaction {
         staging.set(k, { op: "put", value });
         return k;
       },
+      /** like IndexedDB's add(): refuses to overwrite an existing key (ConstraintError) */
+      async add(value: unknown, key?: Key) {
+        const k = keyOf(store, value, key);
+        const staged = staging.get(k);
+        const exists = staged ? staged.op !== "delete" : store.committed.has(k);
+        if (exists) { const error = Object.assign(new Error(`fakeIdb: key already exists in store "${name}"`), { name: "ConstraintError" }); fail(error); throw error; }
+        if (failOnPut.has(name)) { const error = new Error(`fakeIdb: simulated put failure on store "${name}"`); fail(error); throw error; }
+        staging.set(k, { op: "put", value });
+        return k;
+      },
       async delete(key: Key) {
         staging.set(key, { op: "delete" });
+      },
+      /** committed values overlaid with this transaction's staged writes (test-only; mirrors IDB getAll inside a transaction). */
+      async getAll() {
+        const merged = new Map<Key, unknown>(store.committed);
+        for (const [k, op] of staging) { if (op.op === "delete") merged.delete(k); else merged.set(k, op.value); }
+        return [...merged.values()];
       },
     };
   }
@@ -168,8 +184,10 @@ class FakeIDBPDatabase {
   transaction(storeNames: string | string[], mode: "readonly" | "readwrite") {
     void mode; // フェイクではreadonly/readwriteを区別しない（テスト用途に十分なため）
     const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-    const failOnPut = this.db.failOnPutForNextTransaction;
-    this.db.failOnPutForNextTransaction = new Set(); // 一発だけ有効（次のtransactionには持ち越さない）
+    // 一発だけ有効：失敗を仕込んだstoreを含む「次のtransaction」だけが対象。そのstoreを含まないtransaction（例：別storeだけを触る設定確認用のtransaction）は
+    // 仕込みを消費せず、持ち越す（transactionの数え方という実装詳細にテストが依存しないため）。
+    const failOnPut = new Set<string>();
+    for (const n of names) if (this.db.failOnPutForNextTransaction.delete(n)) failOnPut.add(n);
     return new FakeTransaction(this.db, names, failOnPut);
   }
 }

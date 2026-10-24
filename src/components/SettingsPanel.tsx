@@ -1516,6 +1516,10 @@ export default function SettingsPanel({
         <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
           <p className="text-sm text-stone-500 dark:text-stone-400">データ</p>
 
+          <a href="/data" className="text-xs text-stone-600 underline underline-offset-2 dark:text-stone-300">
+            データの管理（記憶・会話の削除、同期が止まった項目の確認）
+          </a>
+
           {vaultBackend === "opfs" && (
           <>
             <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">

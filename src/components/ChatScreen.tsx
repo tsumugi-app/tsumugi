@@ -52,12 +52,12 @@ import {
   loadApiKey,
   loadChatProvider,
   loadVaultHandle,
-  putConversation,
+  restoreConversationIfNotNewer,
   putConversationWithOutbox,
-  putMemoryObject,
+  restoreMemoryObjectIfNotNewer,
   updateMemoryRevisitPrompt,
   saveChatProvider,
-  saveSource,
+  restoreSourceIfNotNewer,
   saveVaultHandle,
 } from "@/lib/db";
 import { createZipBlob } from "@/lib/zip";
@@ -1808,15 +1808,15 @@ export default function ChatScreen() {
   ): Promise<{ status: "restored" | "stale" }> {
     for (const conversation of records.conversations) {
       if (generation !== vaultGenerationRef.current) return { status: "stale" };
-      await putConversation(conversation);
+      await restoreConversationIfNotNewer(conversation);
     }
     for (const memoryObject of records.memoryObjects) {
       if (generation !== vaultGenerationRef.current) return { status: "stale" };
-      await putMemoryObject(memoryObject);
+      await restoreMemoryObjectIfNotNewer(memoryObject);
     }
     for (const source of records.sources) {
       if (generation !== vaultGenerationRef.current) return { status: "stale" };
-      await saveSource(source);
+      await restoreSourceIfNotNewer(source);
     }
     if (generation !== vaultGenerationRef.current) return { status: "stale" };
     return { status: "restored" };

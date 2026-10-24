@@ -34,6 +34,7 @@ mod._load = function (request, parent, isMain) {
 };
 
 const dbMod = require(path.join(OUT, "lib/db.js")) as typeof import("./db");
+const ev = async (id: string) => ({ vaultCopyVerified: true as const, seenOutboxUpdatedAt: (await dbMod.getVaultOutboxEntry(id))!.updatedAt });
 const vaultMod = require(path.join(OUT, "lib/vault.js")) as typeof import("./vault");
 const markdownMod = require(path.join(OUT, "lib/markdown.js")) as typeof import("./markdown");
 const captureMod = require(path.join(OUT, "lib/capture.js")) as typeof import("./capture");
@@ -97,11 +98,10 @@ class FakeVault {
           yield { name: first } as unknown as FileSystemHandle;
         }
       },
-      async *entries() {
+      async *entries() {   // like a real folder: the root lists its sub folders too
         const children = new Map<string, "directory" | "file">();
         for (const p of self.files.keys()) {
           if (prefix && !p.startsWith(`${prefix}/`)) continue;
-          if (!prefix && p.includes("/")) continue;
           const rel = prefix ? p.slice(prefix.length + 1) : p;
           const first = rel.split("/")[0];
           children.set(first, rel.includes("/") ? "directory" : "file");
@@ -155,7 +155,10 @@ class FakeVault {
 
 const T = "2026-10-01T09:00:00.000Z";
 const convMeta = { id: "meta", source: "ai-capture" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
+/** production invariant: the Memories a Capture persists belong to the conversation being captured; the helpers below give Memories the id of the most recently built conversation */
+let lastConversationId = "c1";
 function conversation(id: string, overrides: Partial<Conversation> = {}): Conversation {
+  lastConversationId = id;
   return {
     id, persona: "companion", status: "active", startedAt: T, endedAt: T, createdAt: T, updatedAt: T,
     turns: [{ role: "user", content: "ユーザー発言", timestamp: T }], memoryObjectIds: [],
@@ -167,7 +170,7 @@ const memMeta = { id: "meta", source: "ai-capture" as const, sourceType: "chat" 
 function memory(id: string, day: string, overrides: Partial<MemoryObject> = {}): MemoryObject {
   const iso = `${day}T09:00:00.000Z`;
   return {
-    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["event"] as MemoryObject["types"], conversationId: "c1",
+    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["event"] as MemoryObject["types"], conversationId: lastConversationId,
     keywords: [], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
     createdAt: iso, updatedAt: iso, metadata: { ...memMeta },
     ...overrides,
@@ -178,7 +181,7 @@ const reflectionMeta = { id: "meta", source: "system-generated" as const, source
 function reflection(id: string, day: string, overrides: Partial<MemoryObject> = {}): MemoryObject {
   const iso = `${day}T09:00:00.000Z`;
   return {
-    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["insight"] as MemoryObject["types"],
+    id, date: iso, content: `内容-${id}`, summary: `要約-${id}`, types: ["insight"] as MemoryObject["types"], conversationId: lastConversationId,
     keywords: [], links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
     createdAt: iso, updatedAt: iso, metadata: { ...reflectionMeta },
     ...overrides,
@@ -458,6 +461,48 @@ test("Wiring H2: Source側でも、canonical+outbox transactionの途中失敗�
 });
 
 
+test("accepted divergence is respected by the startup integrity reconcile: the Vault file is NOT rewritten for it, while an ordinary done entry is repaired", async () => {
+  await setUpVaultWorld();
+  const vault = new FakeVault();
+  vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
+  await seedPrepairedIdentity(vault);
+  const dayA = "2026-10-11", dayB = "2026-10-12", dayC = "2026-10-14";
+  const conv = conversation("acc-conv");
+  const a = memory("acc-a", dayA), b = memory("acc-b", dayB), c = memory("acc-c", dayC);
+  await captureMod.persistCapture(null, conv, [a, b, c]);                    // canonical + Outbox only
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));             // both are projected: done
+  const pathA = `Memories/${vaultMod.dayFileNameFor(dayA)}`, pathB = `Memories/${vaultMod.dayFileNameFor(dayB)}`;
+  assert.ok(vault.get(pathA) && vault.get(pathB), "projected into the Vault");
+  const pathC = `Memories/${vaultMod.dayFileNameFor(dayC)}`;
+  const editedA = vault.get(pathA) + "\n\n(the user's own note)\n";
+  vault.put(pathA, editedA); vault.files.delete(pathB); vault.files.delete(pathC);   // the Vault diverges from this device (A edited, B and C lost)
+  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${a.id}`, await ev(`memory:${a.id}`)), "accepted");   // the user: "keep both as they are" for A (its Vault copy exists)
+  assert.equal(await dbMod.acceptOutboxDivergence(`memory:${c.id}`, await ev(`memory:${c.id}`)), "accepted");   // accepted while a copy existed...
+  await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
+  assert.equal(vault.get(pathA), editedA, "the accepted divergence is not repaired behind the user's back");
+  assert.ok(vault.get(pathC), "...but an accepted entry whose Vault copy is LOST is re-projected: the local record must not be the only copy");
+  assert.ok(vault.get(pathB), "an ordinary done entry is still repaired by the integrity reconcile");
+  assert.equal((await dbMod.getVaultOutboxEntry(`memory:${a.id}`))?.status, "done", "and it does not return to held");
+});
+
+test("persistCapture for a conversation the user deleted meanwhile: nothing is recreated in IndexedDB and nothing is written to the Vault", async () => {
+  await setUpVaultWorld();
+  const vault = new FakeVault();
+  vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
+  await seedPrepairedIdentity(vault);
+  const conv = conversation("del-cap-conv");
+  const mem = memory("del-cap-mem", "2026-10-13");
+  await dbMod.putConversationWithOutbox(conv);
+  await dbMod.deleteConversationByUser(conv.id, "2026-10-20T00:00:00.000Z");
+  const writesBefore = vault.writes.length;
+  const result = await captureMod.persistCapture(vault.root(), conv, [mem]);
+  assert.equal(result.conversationFailed, true);
+  assert.equal(await dbMod.getConversation(conv.id), undefined, "the deleted conversation is not recreated");
+  assert.equal(await dbMod.getMemoryObject(mem.id), undefined, "no Memory of the deleted conversation is saved");
+  assert.deepEqual(result.failedMemoryIds, [mem.id]);
+  assert.equal(vault.writes.length, writesBefore, "nothing reached the Vault");
+});
+
 test("atomic failure: Memory/Reflection must not call either foreground or background Vault writer", async () => {
   const oldWrite = vaultMod.writeMemoryObjectMarkdown;
   let calls = 0;
@@ -465,9 +510,10 @@ test("atomic failure: Memory/Reflection must not call either foreground or backg
   try {
     for (const make of [memory, reflection]) for (const awaitSync of [true, false]) {
       await setUpVaultWorld();
+      const atomicConv = conversation("atomic-c");
       const mem = make("atomic-failed", "2026-10-08");
       fakeIdbMod.__failNextPutOn("tsumugi", "vaultOutbox");
-      const result = await captureMod.persistCapture(new FakeVault().root(), conversation("atomic-c"), [mem], "interactive", awaitSync);
+      const result = await captureMod.persistCapture(new FakeVault().root(), atomicConv, [mem], "interactive", awaitSync);
       await result.backgroundSyncPromise;
       assert.deepEqual(result.failedMemoryIds, [mem.id]);
       assert.equal(calls, 0, "no projection before canonical transaction commits");
@@ -479,11 +525,12 @@ test("dual writer: bootstrap and legacy Memory writes never drop already-written
   await setUpVaultWorld();
   const vault = new FakeVault();
   const day = "2026-10-09";
+  const raceConv = conversation("race-c");
   const first = memory("race-initial", day);
-  await captureMod.persistCapture(null, conversation("race-c"), [first]);
+  await captureMod.persistCapture(null, raceConv, [first]);
   await bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
   const a = memory("race-a", day), b = memory("race-b", day);
-  await captureMod.persistCapture(null, conversation("race-c"), [a]);
+  await captureMod.persistCapture(null, raceConv, [a]);
   const filePath = `Memories/${vaultMod.dayFileNameFor(day)}`;
   const primitives = vaultMod.vaultProjectionPrimitives;
   const oldWrite = primitives.writeFileInDir;
@@ -498,7 +545,7 @@ test("dual writer: bootstrap and legacy Memory writes never drop already-written
   try {
     const bootstrap = bootstrapMod.runSaveFoundationBootstrap(makeEnv(vault));
     await paused;
-    const legacy = captureMod.persistCapture(vault.root(), conversation("race-c"), [b]);
+    const legacy = captureMod.persistCapture(vault.root(), raceConv, [b]);
     // Allow the competing writer to reach the paused read/modify/write interval.
     await new Promise(r => setTimeout(r, 30));
     release();
@@ -534,10 +581,11 @@ test("partial metadata write failure: pending outbox repairs History after Markd
   const vault = new FakeVault();
   vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
   await seedPrepairedIdentity(vault);
+  const historyConv = conversation("history-retry-c");
   const day = "2026-10-10", mem = memory("history-retry", day);
   const historyPath = ".tsumugi/history/2026-10.json";
   vault.writeShouldFail.add(historyPath);
-  await captureMod.persistCapture(vault.root(), conversation("history-retry-c"), [mem]);
+  await captureMod.persistCapture(vault.root(), historyConv, [mem]);
   assert.ok(vault.failedWrites.includes(historyPath));
   assert.ok(vault.get(`Memories/${vaultMod.dayFileNameFor(day)}`));
   assert.equal((await dbMod.getVaultOutboxEntry(`memory:${mem.id}`))?.status, "pending");

@@ -1,0 +1,48 @@
+# Browser E2E of the maintenance panel (Playwright, headless Chromium) against a production build with job-local dummy credentials.
+# Fictional data only; no secrets, no deploy. Read-only permissions.
+name: e2e
+on:
+  pull_request:
+  push:
+    branches: ["claude/**"]
+permissions:
+  contents: read
+concurrency:
+  group: e2e-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  maintenance-panel:
+    runs-on: ubuntu-24.04   # pinned: the Playwright version used here supports Ubuntu 24.04
+    timeout-minutes: 25
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Compile the fictional test world (reused by the E2E seed)
+        run: npx tsc -p tsconfig.maintenance.json
+      - run: npm run build
+      - name: Install @playwright/test (kept in e2e/, not an app dependency)
+        working-directory: e2e
+        run: npm install --no-audit --no-fund
+      - name: Install Chromium
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+      - name: Build the browser harness (production modules bundled; loaded from a local file by the tests)
+        working-directory: e2e
+        run: npm run build:harness
+      - name: Job-local dummy password
+        run: |
+          PW=$(openssl rand -hex 16)
+          echo "::add-mask::$PW"
+          echo "E2E_PW=$PW" >> "$GITHUB_ENV"
+      - name: E2E
+        working-directory: e2e
+        run: npx playwright test -c playwright.config.ts

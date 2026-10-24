@@ -13,6 +13,8 @@ import {
 } from "@/lib/maintenance/precheckScope";
 import { parsePrivateRepairData, type PrivateRepairData } from "@/lib/privateRepairData";
 import { readPrecheckInput, renderPrecheckText } from "@/lib/memoryRepairPrecheck";
+import { runRepairSession, type RepairSessionReport } from "@/lib/maintenance/repairSession";
+import { diagnoseCrash, runCrashRecovery, type CrashDiagnosis, type CrashRecoveryReport } from "@/lib/maintenance/crashRecovery";
 
 /**
  * Maintenance panel: S1 preflight, S2 dry run (+ non-target invariants), S3 execute + verify, for already-repaired records.
@@ -46,6 +48,18 @@ export default function MaintenancePanel() {
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [vaultCheck, setVaultCheck] = useState<VaultCheck | null>(null);
   const [precheckText, setPrecheckText] = useState<string | null>(null);
+  // single-item repair (stage 2d)
+  const [backupRoot, setBackupRoot] = useState<FileSystemDirectoryHandle | null>(null);
+  const [repairConfirm, setRepairConfirm] = useState("");
+  const [repairReport, setRepairReport] = useState<RepairSessionReport | null>(null);
+  const [awaitingReadBack, setAwaitingReadBack] = useState(false);
+  const readBackResolve = useRef<((text: string) => void) | null>(null);
+  // recovery after an interrupted repair (the ONLY way to release a gate left behind by a dead tab)
+  const [recoveryText, setRecoveryText] = useState<string | null>(null);
+  const [recoveryCopy, setRecoveryCopy] = useState<FileSystemDirectoryHandle | null>(null);
+  const [recoveryDiag, setRecoveryDiag] = useState<CrashDiagnosis | null>(null);
+  const [recoveryConfirm, setRecoveryConfirm] = useState("");
+  const [recoveryReport, setRecoveryReport] = useState<CrashRecoveryReport | null>(null);
   const vaultHandle = session && session.status === "ready" ? session.handle : null;
   const locked = useRef(false);
 
@@ -112,6 +126,8 @@ export default function MaintenancePanel() {
     };
     r.readAsText(file);
   }
+  /** the Memories of the items the operator holds or excludes: a repair must never rewrite them (not even as a link counterpart) */
+  const protectedIds = (): string[] => (repairData && decisions ? repairData.repair.items.filter((i) => decisions.held.includes(i.key) || decisions.excluded.includes(i.key) || (!picked.includes(i.key) && (!live || live[i.key] !== "READY"))).map((i) => i.memoryId) : []);
   async function runScan() {
     if (!repairData || decisionsError(repairData, decisions)) return;
     await guarded(async () => {
@@ -132,10 +148,62 @@ export default function MaintenancePanel() {
       // IndexedDB is opened WITHOUT a version and only with readonly transactions (see memoryRepairPrecheck.ts)
       const input = await readPrecheckInput({ indexedDB: window.indexedDB, build: "maintenance", now: () => at }, repairData);
       if (!input) { setAnalysis(null); setPrecheckText("status=no-database"); return; }
-      const a = await analyzeSelection(input, repairData, picked, at);
+      const a = await analyzeSelection(input, repairData, picked, at, protectedIds());
       setAnalysis(a);
       setPrecheckText(renderPrecheckText({ ...a.report, heldForeign: [] }, { build: "maintenance", at }));
     });
+  }
+  async function pickRepairBackup() {
+    await guarded(async () => {
+      const picker = (window as unknown as { showDirectoryPicker?: (o: unknown) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+      if (!picker) { setError("this browser cannot select a folder"); return; }
+      setBackupRoot(await picker({ mode: "read" }));
+    });
+  }
+  /** Saves the restore point as a file and waits until the operator re-selects the SAVED file; what that file contains is what the session verifies. */
+  const persistRestorePoint = (text: string) => new Promise<string>((resolve) => {
+    download(`tsumugi-restore-point-${new Date().toISOString().replace(/[:.]/g, "-")}.json`, text);
+    readBackResolve.current = resolve; setAwaitingReadBack(true);
+  });
+  function loadSavedRestorePoint(file: File | undefined) {
+    if (!file || !readBackResolve.current) return;
+    const r = new FileReader();
+    r.onload = () => { const resolve = readBackResolve.current; readBackResolve.current = null; setAwaitingReadBack(false); resolve?.(String(r.result ?? "")); };
+    r.readAsText(file);
+  }
+  const repairKey = picked.length === 1 && repairData?.repair.items.some((i) => i.key === picked[0]) ? picked[0] : null;
+  const repairReady = !!repairKey && !!repairData && !!decisions && !decisionsError(repairData, decisions) && !!vaultHandle && session?.status === "ready" && session.writePermission === "granted"
+    && !!backupRoot && repairConfirm === `REPAIR ${repairKey}`;
+  async function runRepair() {
+    if (!repairReady || !repairData || !repairKey || !vaultHandle) return;
+    const bad = selectionError(repairData, decisions, live, [repairKey]);
+    if (bad) { setError("selection refused: " + bad); return; }
+    await guarded(async () => {
+      setRepairReport(null);
+      setRepairReport(await runRepairSession({ data: repairData, key: repairKey, root: vaultHandle, confirm: repairConfirm, vaultBackupRoot: backupRoot, persistRestorePoint, protectedMemoryIds: protectedIds() }));
+      setRepairConfirm(""); setAnalysis(null); setVaultCheck(null); setLive(null); setPicked([]);
+    });
+  }
+  function loadRecoveryPoint(file: File | undefined) {
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => { setRecoveryText(String(r.result ?? "")); setRecoveryDiag(null); setRecoveryReport(null); setRecoveryConfirm(""); };
+    r.readAsText(file);
+  }
+  async function pickRecoveryCopy() {
+    await guarded(async () => {
+      const picker = (window as unknown as { showDirectoryPicker?: (o: unknown) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+      if (!picker) { setError("this browser cannot select a folder"); return; }
+      setRecoveryCopy(await picker({ mode: "read" })); setRecoveryDiag(null); setRecoveryReport(null);
+    });
+  }
+  async function runRecoveryDiagnosis() {
+    if (!vaultHandle || recoveryText === null) return;
+    await guarded(async () => { setRecoveryDiag(await diagnoseCrash({ restorePointText: recoveryText, root: vaultHandle, vaultCopyRoot: recoveryCopy })); setRecoveryReport(null); });
+  }
+  async function runRecovery() {
+    if (!vaultHandle || recoveryText === null) return;
+    await guarded(async () => { setRecoveryReport(await runCrashRecovery({ restorePointText: recoveryText, root: vaultHandle, vaultCopyRoot: recoveryCopy, confirm: recoveryConfirm })); setRecoveryConfirm(""); setRecoveryDiag(null); });
   }
   async function runVaultCheck() {
     if (!analysis || !vaultHandle) return;
@@ -249,10 +317,56 @@ export default function MaintenancePanel() {
             <ul>{vaultCheck.items.map((d, i) => <li key={i} className={d.status === "ok" ? "text-emerald-700" : d.status === "legacy-format" || d.status === "unreadable" ? "text-amber-700" : "text-red-700"}>{d.kind} {tail(d.id)} {d.area}: {d.item} = {d.status}{d.detail ? ` - ${d.detail}` : ""}</li>)}</ul>
           </div>)}
           <h3 className="font-medium">Overall (per item)</h3>
-          <ul>{analysis.report.items.map((it) => { const v = overallVerdict({ status: it.status, conflicts: analysis.conflicts, vault: vaultCheck });
+          <ul>{analysis.report.items.map((it) => { const v = overallVerdict({ status: it.status, conflicts: analysis.conflicts, vault: vaultCheck, blockers: analysis.blockers });
             return <li key={it.key} className={v.safeToRepair ? "text-emerald-700" : "text-red-700"}>{it.key}: {v.safeToRepair ? "SAFE TO REPAIR" : "NOT SAFE / NOT PROVEN"} - {v.label}{v.reasons.length ? ` [${v.reasons.join(", ")}]` : ""}</li>; })}</ul>
         </div>)}
         {precheckText && <details><summary>report text (IDs, verdicts and counts only)</summary><pre className="whitespace-pre-wrap text-xs">{precheckText}</pre></details>}
+      </section>
+
+      <section className="flex flex-col gap-2"><h2 className="font-medium">7. Repair one item (writes IndexedDB and the Vault; restores everything itself if anything fails)</h2>
+        <p className="text-xs">One item per run, inside one maintenance window (the normal app cannot write to the Vault meanwhile). Needs: repair data + decision list loaded, a scan done (step 6), exactly ONE READY repair item selected, the Vault folder found with write access granted (steps 1 and 4), and your own copy of the Vault folder. A restore point is created first; you save it and re-select the saved file, and nothing is changed until it reads back identically. Keep Tsumugi and Obsidian closed meanwhile.</p>
+        <p>selected: {repairKey ?? "(select exactly one repair item in step 6)"}</p>
+        <button disabled={busy || !vaultHandle} onClick={() => void pickRepairBackup()} className="border px-3 py-1">Select the folder that holds your copy of the Vault</button>
+        <p>Vault copy folder: {backupRoot ? "selected" : "not selected"} | Vault write access: {session?.status === "ready" ? session.writePermission : "n/a"}</p>
+        <input className="border px-2 py-1" placeholder={repairKey ? `REPAIR ${repairKey}` : "REPAIR <key>"} value={repairConfirm} onChange={(e) => setRepairConfirm(e.target.value)} />
+        <button disabled={busy || !repairReady} onClick={() => void runRepair()} className="border border-red-700 px-3 py-1">Run the repair</button>
+        {awaitingReadBack && <label className="text-red-700">Restore point downloaded. Select the SAVED file here to continue: <input type="file" accept=".json,application/json" onChange={(e) => loadSavedRestorePoint(e.target.files?.[0])} /></label>}
+        {repairReport && (<div>
+          <p className={repairReport.status === "completed" ? "text-emerald-700" : repairReport.status === "refused" ? "text-amber-700" : "text-red-700"}>{repairReport.status}: {repairReport.reason}</p>
+          <p>stages: {repairReport.stages.join(" > ")}</p>
+          {repairReport.sync && <p>sync: ok={String(repairReport.sync.ok)}{repairReport.sync.refused ? ` refused=${repairReport.sync.refused}` : ""}{repairReport.sync.stoppedAt ? ` stoppedAt=${repairReport.sync.stoppedAt}` : ""}</p>}
+          {repairReport.restore && <p>restore: {repairReport.restore.status}{repairReport.restore.failure ? ` (${repairReport.restore.failure})` : ""} {repairReport.restore.stopReasons.join("; ")}</p>}
+          {repairReport.problems.length > 0 && <ul>{repairReport.problems.map((p, i) => <li key={i} className="text-red-700">{p}</li>)}</ul>}
+          {repairReport.windowOpen && <p className="text-red-700">The maintenance window is STILL OPEN (lock and gate kept). Do not open Tsumugi. Keep this tab open and report the lines above.</p>}
+          {repairReport.gateStuck && <p className="text-red-700">The durable maintenance gate is STILL IN PLACE: the normal app stays blocked from writing. It can only be released by the recovery in step 8 (it needs your saved restore point and your Vault copy).</p>}
+          {repairReport.status === "completed" && <p className="text-emerald-700">Done and verified: IndexedDB and the Vault are consistent; the gate is closed.</p>}
+        </div>)}
+      </section>
+
+      <section className="flex flex-col gap-2"><h2 className="font-medium">8. Recover after an interrupted repair (the only way to release a maintenance gate that a closed or crashed tab left behind)</h2>
+        <p className="text-xs">Use this when a repair was cut off (tab or browser closed, crash) and the normal app stays blocked. You need: the restore point file that step 7 asked you to save, and your own copy of the Vault folder taken before that repair. Nothing is released by guessing: the state is diagnosed first (read-only), the pre-repair state is proven by BOTH the restore point and your copy, only changes that the interrupted repair can explain are restored, and the gate is closed only after a fresh comparison equals the restore point and the Vault agrees with IndexedDB. If anything cannot be proven the gate stays and the app stays blocked: do not open Tsumugi, keep your restore point and your Vault copy, and report the line below.</p>
+        <label className="text-xs">restore point file <input type="file" accept=".json,application/json" onChange={(e) => loadRecoveryPoint(e.target.files?.[0])} /></label>
+        <button disabled={busy} onClick={() => void pickRecoveryCopy()} className="border px-3 py-1">Select the folder that holds your copy of the Vault</button>
+        <p className="text-xs">Vault folder (step 1): {vaultHandle ? "found" : "not found"} | restore point: {recoveryText === null ? "not loaded" : "loaded"} | Vault copy: {recoveryCopy ? "selected" : "not selected"}</p>
+        <button disabled={busy || !vaultHandle || recoveryText === null} onClick={() => void runRecoveryDiagnosis()} className="border px-3 py-1">Diagnose (read-only)</button>
+        {recoveryDiag && (<div>
+          <p className={recoveryDiag.status === "restorable" || recoveryDiag.status === "intact" ? "text-emerald-700" : "text-red-700"}>diagnosis: {recoveryDiag.status} ({recoveryDiag.reason})</p>
+          {recoveryDiag.restorePoint && <p className="text-xs">restore point {recoveryDiag.restorePoint.createdAt}: {recoveryDiag.restorePoint.records} record(s), {recoveryDiag.restorePoint.vaultFiles} Vault file(s)</p>}
+          {recoveryDiag.vaultCopyDiffers.length > 0 && <ul>{recoveryDiag.vaultCopyDiffers.map((p) => <li key={p} className="text-red-700">your Vault copy differs from the restore point: {p}</li>)}</ul>}
+          {recoveryDiag.plan && <p className="text-xs">to restore: {recoveryDiag.plan.recordsToRestore} IndexedDB item(s), {recoveryDiag.plan.vaultToWrite} Vault file(s) rewritten, {recoveryDiag.plan.vaultToDelete} created file(s) removed; outside the scope changed: {recoveryDiag.plan.collateral}{recoveryDiag.plan.stopReasons.length ? ` | stop: ${recoveryDiag.plan.stopReasons.join(", ")}` : ""}</p>}
+          {(recoveryDiag.status === "stopped" || recoveryDiag.status === "vault-copy-differs" || recoveryDiag.status === "restore-point-invalid") && <p className="text-red-700">Recovery is NOT possible from here. The gate stays in place and the app stays blocked. Do not open Tsumugi and do not edit the Vault; keep the restore point and your Vault copy and report this screen.</p>}
+          {(recoveryDiag.status === "restorable" || recoveryDiag.status === "intact") && recoveryDiag.restorePoint && (<div className="flex flex-col gap-1">
+            <p className="text-xs">{recoveryDiag.status === "intact" ? "Nothing was changed by the interrupted repair; recovery only verifies this and closes the gate." : "The state differs from the restore point only in ways the interrupted repair explains. Recovery puts everything back exactly as the restore point."} Other Tsumugi tabs must be closed and no other program (for example Obsidian sync) may be changing the Vault.</p>
+            <input className="border px-2 py-1" placeholder={recoveryDiag.restorePoint.confirmPhrase} value={recoveryConfirm} onChange={(e) => setRecoveryConfirm(e.target.value)} />
+            <button disabled={busy || recoveryConfirm !== recoveryDiag.restorePoint.confirmPhrase} onClick={() => void runRecovery()} className="border border-red-700 px-3 py-1">Restore and close the gate</button>
+          </div>)}
+        </div>)}
+        {recoveryReport && (<div>
+          <p className={recoveryReport.status === "recovered" ? "text-emerald-700" : "text-red-700"}>{recoveryReport.status}: {recoveryReport.reason}</p>
+          {recoveryReport.restore && <p className="text-xs">restore: {recoveryReport.restore.status}{recoveryReport.restore.failure ? ` (${recoveryReport.restore.failure})` : ""}; Vault files written {recoveryReport.restore.vaultWritten}, removed {recoveryReport.restore.vaultDeleted}</p>}
+          {recoveryReport.consistency && <p className="text-xs">Vault vs IndexedDB after the restore: {recoveryReport.consistency.mismatched} mismatch(es), {recoveryReport.consistency.unverified} unverified</p>}
+          {recoveryReport.status === "recovered" ? <p className="text-emerald-700">Restored and verified; the gate is closed.</p> : <p className="text-red-700">The gate is STILL IN PLACE and the normal app stays blocked. Do not open Tsumugi. Keep your restore point and Vault copy and report this screen.</p>}
+        </div>)}
       </section>
     </main>
   );
