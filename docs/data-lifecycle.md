@@ -23,6 +23,7 @@ All three ways records are copied from the Vault into IndexedDB now refuse a rec
 2. Vault resync "added" outcomes (`addConversationIfAbsentAndMarkSynced`, `addMemoryObjectIfAbsentAndMarkSynced`, and in `vault.ts` no History row / no registry commit for a tombstoned record);
 3. manual "restore from the Vault" (`restoreConversationIfNotNewer`, `restoreMemoryObjectIfNotNewer`): result `tombstoned`.
 A Memory copied in by any of these paths (including an edited Memory applied by resync) loses a link whose other end is a tombstoned Memory (new `updatedAt`, queued for the Vault in the same transaction, not marked as synced).
+A Conversation copied in the same ways loses references (`memoryObjectIds`) to deleted Memories in the same way. On devices whose Vault is the app's own storage (OPFS) `/data` reads that storage directly.
 If the tombstone store itself is unreadable, every re-insertion is refused (fail closed) and deleting is refused.
 Recovery Apply / legacy cleanup only write to the Vault side and do not insert records into IndexedDB.
 The full-device wipe is unchanged by design: it clears IndexedDB including tombstones, and the Vault files remain.

@@ -667,7 +667,7 @@ test("'keep both as they are' needs proof that the Vault holds a copy: without i
 test("a Conversation copied in from the Vault never keeps a reference to a deleted Memory (import, resync add, edit, restore)", async () => {
   await dbMod.putMemoryObject(fromConversation("cr-gone", "cr-c"));
   await dbMod.deleteMemoryByUser("cr-gone", NOW1);
-  const conv = (id: string) => ({ ...makeConversation(id), memoryObjectIds: ["cr-gone"] });
+  const conv = (id: string) => ({ ...conversation(id), memoryObjectIds: ["cr-gone"] });
   const check = async (id: string, synced: boolean) => {
     const c = (await dbMod.getConversation(id))!;
     assert.deepEqual(c.memoryObjectIds, []);
@@ -681,7 +681,7 @@ test("a Conversation copied in from the Vault never keeps a reference to a delet
   await check("cr-add", false);
   assert.equal(await dbMod.restoreConversationIfNotNewer(conv("cr-restore")), "written");
   await check("cr-restore", false);
-  await dbMod.putConversation(makeConversation("cr-edit"));
+  await dbMod.putConversation(conversation("cr-edit"));
   await dbMod.putConversationAndMarkSynced(conv("cr-edit"), "conversation:cr-edit");
   await check("cr-edit", false);
 });
