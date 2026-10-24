@@ -20,7 +20,7 @@ import {
   type Tombstone,
 } from "./db";
 import { dayFileNameFor } from "./vault";
-import { parseMemoryDayFile } from "./markdown";
+import { parseFrontmatter, parseMemoryDayFile } from "./markdown";
 
 export const PURGE_AFTER_DAYS = 30;
 export type VaultPresence = "absent" | "present" | "unknown";
@@ -59,8 +59,16 @@ function frontmatterBlocks(text: string): string[] {
 }
 
 async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, ownerConversationId?: string): Promise<VaultPresence> {
-  const idLine = new RegExp(`^id:\\s*["']?${escapeRegExp(id)}["']?\\s*$`, "m");
-  const ownerLine = ownerConversationId ? new RegExp(`^conversationId:\\s*["']?${escapeRegExp(ownerConversationId)}["']?\\s*$`, "m") : null;
+  // Presence is decided as generously as the restore parser reads a file: the shared frontmatter parser (trimmed keys, quoted values) OR a tolerant line match
+  // (indented / spaced keys). Over-reporting "present" only keeps a guard longer; under-reporting could let a restorable file come back after the guard is gone.
+  const lineFor = (key: string, value: string) => new RegExp(`^\\s*${key}\\s*:\\s*["']?${escapeRegExp(value)}["']?\\s*$`, "m");
+  const idLine = lineFor("id", id);
+  const ownerLine = ownerConversationId ? lineFor("conversationId", ownerConversationId) : null;
+  const matches = (fm: string): boolean => {
+    if (idLine.test(fm) || (ownerLine !== null && ownerLine.test(fm))) return true;
+    const parsed = parseFrontmatter(`---\n${fm.replace(/^\r?\n/, "").replace(/\r/g, "")}\n---\n`)?.frontmatter;
+    return parsed !== undefined && (parsed.id === id || (ownerConversationId !== undefined && parsed.conversationId === ownerConversationId));
+  };
   let scanned = 0;
   // The WHOLE visible Vault is searched (hidden folders such as .tsumugi are skipped, as the restore scan skips them): the restore scan finds record folders
   // at any depth (e.g. archive/Memories/...), so a narrower look here could report "absent" for a file that a restore would still bring back.
@@ -73,7 +81,7 @@ async function scanVaultForId(root: FileSystemDirectoryHandle, id: string, owner
       } else if (name.toLowerCase().endsWith(".md")) {
         if (++scanned > MAX_FILES_SCANNED) return "unknown";
         const text = await (await (handle as FileSystemFileHandle).getFile()).text();
-        if (frontmatterBlocks(text).some((fm) => idLine.test(fm) || (ownerLine !== null && ownerLine.test(fm)))) return "present";     // pasted YAML in a body, or a mention in another record, does not count
+        if (frontmatterBlocks(text).some(matches)) return "present";     // pasted YAML in a body, or a mention in another record, does not count
       }
     }
     return "absent";

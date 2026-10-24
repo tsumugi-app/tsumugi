@@ -218,3 +218,12 @@ test("a tombstone is bound to the Vault the record was deleted from: another Vau
   assert.equal(await life.verifyTombstone(same.root(), "memory", "bound-mem", "2026-06-01T00:00:00.000Z"), "absent");
   assert.deepEqual((await life.purgeEligibleTombstones(same.root(), "2027-01-01T00:00:00.000Z")).map((x) => x.id), ["bound-mem"]);
 });
+
+test("the presence scan reads frontmatter as generously as the restore parser: spaced / indented keys still count", async () => {
+  const v = new testSupport.FakeVault();
+  v.put("moved/a.md", "---\ntsumugi: true\n  id : spaced-1\n---\nbody\n");
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("conversation", "spaced-1")), "present");
+  const v2 = new testSupport.FakeVault();
+  v2.put("moved/b.md", "---\ntsumugi: true\nid: 'quoted-1'\n---\nbody\n");
+  assert.equal(await life.checkTombstoneInVault(v2.root(), tomb("conversation", "quoted-1")), "present");
+});

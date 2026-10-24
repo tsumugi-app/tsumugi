@@ -697,6 +697,18 @@ test("an ordinary conversation write (a stale chat tab) never brings back a refe
   assert.deepEqual((await dbMod.getConversation("sw-c"))!.memoryObjectIds, ["sw-other"]);
 });
 
+test("a stale Memory snapshot written through the ordinary writer (bootstrap migration) never brings back a link to a deleted Memory", async () => {
+  await dbMod.putMemoryObject(fromConversation("sm-a", "c1"));
+  const snapshot = { ...fromConversation("sm-b", "c1"), links: [testLink("sm-l", "sm-b", "sm-a")] };
+  await dbMod.putMemoryObject(snapshot);
+  await dbMod.deleteMemoryByUser("sm-a", NOW1);                                  // the link is removed from B
+  await dbMod.putMemoryObjectWithOutbox(snapshot);                              // the migration still holds the old snapshot of B
+  const b = (await dbMod.getMemoryObject("sm-b"))!;
+  assert.deepEqual(b.links, []);
+  assert.ok(Date.parse(b.updatedAt) >= Date.parse(NOW1), "a version later than the stored corrected one");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:sm-b"))?.recordUpdatedAt, b.updatedAt);
+});
+
 test("deleting a Memory removes EVERY link that points at it, also a one-sided link whose reciprocal copy is missing", async () => {
   await dbMod.putMemoryObject(fromConversation("os-a", "c1"));
   await dbMod.putMemoryObject({ ...fromConversation("os-b", "c1"), links: [testLink("os-l", "os-b", "os-a")] });   // B points at A; A holds no reciprocal link

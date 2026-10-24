@@ -1290,7 +1290,20 @@ export async function putMemoryObjectWithOutbox(
   now: string = new Date().toISOString()
 ): Promise<VaultOutboxEntry> {
   return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
-    if (memoryBlocked(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), memoryObject)) throw new TombstonedRecordError("memory", memoryObject.id);
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (memoryBlocked(tombs, memoryObject)) throw new TombstonedRecordError("memory", memoryObject.id);
+    // a snapshot taken before the user deleted a linked Memory (another tab, a long-running migration) must not bring the link back: it is dropped, as a NEW version
+    // later than both the snapshot and what is stored now, so the corrected record is what the Vault receives
+    if (!tombs) return;
+    const kept = (memoryObject.links ?? []).filter((l) => {
+      const otherId = l.sourceId === memoryObject.id ? l.targetId : l.sourceId;
+      return otherId === memoryObject.id || !tombs[tombstoneId("memory", otherId)];
+    });
+    if (kept.length === (memoryObject.links ?? []).length) return;
+    const stored = (await tx.objectStore("memoryObjects").get(memoryObject.id)) as MemoryObject | undefined;
+    const base = stored && Date.parse(stored.updatedAt) > Date.parse(memoryObject.updatedAt) ? stored.updatedAt : memoryObject.updatedAt;
+    const at = strictlyLaterInstant(base, now);
+    return { ...memoryObject, links: kept, updatedAt: at, metadata: { ...memoryObject.metadata, updatedAt: at } };
   });
 }
 
