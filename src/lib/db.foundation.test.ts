@@ -686,6 +686,17 @@ test("a Conversation copied in from the Vault never keeps a reference to a delet
   await check("cr-edit", false);
 });
 
+test("an ordinary conversation write (a stale chat tab) never brings back a reference to a deleted Memory", async () => {
+  await dbMod.putMemoryObjectWithOutbox(fromConversation("sw-m", "sw-c"));
+  const stale = { ...conversation("sw-c"), memoryObjectIds: ["sw-m", "sw-other"] };
+  await dbMod.putConversationWithOutbox(stale);
+  await dbMod.deleteMemoryByUser("sw-m", NOW1);
+  await dbMod.putConversationWithOutbox({ ...stale, updatedAt: "2026-10-24T00:00:00.000Z" });         // the stale tab sends another message
+  assert.deepEqual((await dbMod.getConversation("sw-c"))!.memoryObjectIds, ["sw-other"]);
+  await dbMod.putConversation({ ...stale, updatedAt: "2026-10-25T00:00:00.000Z" });
+  assert.deepEqual((await dbMod.getConversation("sw-c"))!.memoryObjectIds, ["sw-other"]);
+});
+
 test("deleting a Memory removes EVERY link that points at it, also a one-sided link whose reciprocal copy is missing", async () => {
   await dbMod.putMemoryObject(fromConversation("os-a", "c1"));
   await dbMod.putMemoryObject({ ...fromConversation("os-b", "c1"), links: [testLink("os-l", "os-b", "os-a")] });   // B points at A; A holds no reciprocal link

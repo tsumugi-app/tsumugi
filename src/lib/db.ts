@@ -219,12 +219,20 @@ export class TombstonedRecordError extends Error {
   constructor(public readonly kind: "memory" | "conversation", public readonly recordId: string) { super("record-is-tombstoned"); this.name = "TombstonedRecordError"; }
 }
 /** Plain conversation write (Capture's persistence). Refuses a conversation the user deleted (an in-flight Capture must not silently undo a deletion). */
+/** A write by the app itself (e.g. a chat tab holding an older snapshot) must not bring back a reference to a Memory the user deleted. The write is the new version, so no version bump is needed. */
+function withoutDeletedMemoryRefs(c: Conversation, map: TombstoneMap | null): Conversation {
+  if (!map) return c;
+  const kept = (c.memoryObjectIds ?? []).filter((id) => !map[tombstoneId("memory", id)]);
+  return kept.length === (c.memoryObjectIds ?? []).length ? c : { ...c, memoryObjectIds: kept };
+}
+
 export async function putConversation(conversation: Conversation) {
   const db = await getDB();
   const tx = db.transaction(["conversations", "settings"], "readwrite");
   try {
-    if (blockedByTombstone(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
-    await tx.objectStore("conversations").put(conversation);
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    await tx.objectStore("conversations").put(withoutDeletedMemoryRefs(conversation, tombs));
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
 }
@@ -1224,14 +1232,15 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   record: CanonicalStoreValueMap[S] & { id: string; updatedAt: string },
   now: string,
   /** checked INSIDE the transaction before anything is written (e.g. the tombstones); a throw writes nothing */
-  guard?: (tx: { objectStore(name: string): any }) => Promise<void>   // eslint-disable-line @typescript-eslint/no-explicit-any
+  guard?: (tx: { objectStore(name: string): any }) => Promise<CanonicalStoreValueMap[S] | void>   // eslint-disable-line @typescript-eslint/no-explicit-any
 ): Promise<VaultOutboxEntry> {
   const db = await getDB();
   const outboxId = vaultOutboxIdFor(recordType, record.id);
   const tx = db.transaction(guard ? [storeName, "vaultOutbox", "settings"] : [storeName, "vaultOutbox"], "readwrite");
   let entry: VaultOutboxEntry;
   try {
-    if (guard) await guard(tx);
+    const replaced = guard ? await guard(tx) : undefined;
+    if (replaced) record = replaced as typeof record;
     const outboxStore = tx.objectStore("vaultOutbox");
     const existing = await outboxStore.get(outboxId);
     if (storeName === "memoryObjects") assertMemoryLineage(await tx.objectStore(storeName).get(record.id) as MemoryObject | undefined, record as unknown as MemoryObject);
@@ -1247,7 +1256,9 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
 export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
   // a conversation the user deleted is never recreated by a stale chat tab / an in-flight request (the check runs inside the same transaction)
   return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
-    if (blockedByTombstone(parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)), "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    return withoutDeletedMemoryRefs(conversation, tombs);
   });
 }
 
