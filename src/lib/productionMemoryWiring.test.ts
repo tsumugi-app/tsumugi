@@ -98,11 +98,10 @@ class FakeVault {
           yield { name: first } as unknown as FileSystemHandle;
         }
       },
-      async *entries() {
+      async *entries() {   // like a real folder: the root lists its sub folders too
         const children = new Map<string, "directory" | "file">();
         for (const p of self.files.keys()) {
           if (prefix && !p.startsWith(`${prefix}/`)) continue;
-          if (!prefix && p.includes("/")) continue;
           const rel = prefix ? p.slice(prefix.length + 1) : p;
           const first = rel.split("/")[0];
           children.set(first, rel.includes("/") ? "directory" : "file");
