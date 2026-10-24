@@ -506,13 +506,11 @@ async function removeMemoryInTx(
   m: MemoryObject, now: string, map: TombstoneMap, result: UserDeleteResult
 ): Promise<void> {
   const memories = tx.objectStore("memoryObjects"), conversations = tx.objectStore("conversations"), outbox = tx.objectStore("vaultOutbox"), ledger = tx.objectStore("vaultSyncState");
-  for (const link of m.links ?? []) {
-    const otherId = link.sourceId === m.id ? link.targetId : link.sourceId;
-    if (otherId === m.id) continue;
-    const other = (await memories.get(otherId)) as MemoryObject | undefined;
-    if (!other) continue;
-    const kept = other.links.filter((l) => l.id !== link.id);
-    if (kept.length === other.links.length) continue;
+  // every Memory that links to this one is corrected, whether or not this Memory holds the reciprocal copy of the link (imports can leave one-sided links)
+  for (const other of (await memories.getAll()) as MemoryObject[]) {
+    if (other.id === m.id) continue;
+    const kept = (other.links ?? []).filter((l) => l.sourceId !== m.id && l.targetId !== m.id);
+    if (kept.length === (other.links ?? []).length) continue;
     const at = strictlyLaterInstant(other.updatedAt, now);
     const next: MemoryObject = { ...other, links: kept, updatedAt: at, metadata: { ...other.metadata, updatedAt: at } };
     await memories.put(next);

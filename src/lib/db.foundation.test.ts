@@ -664,6 +664,14 @@ test("'keep both as they are' needs proof that the Vault holds a copy: without i
   assert.equal("memory:ev-1" in (await dbMod.getAcceptedDivergences()), false);
 });
 
+test("deleting a Memory removes EVERY link that points at it, also a one-sided link whose reciprocal copy is missing", async () => {
+  await dbMod.putMemoryObject(fromConversation("os-a", "c1"));
+  await dbMod.putMemoryObject({ ...fromConversation("os-b", "c1"), links: [testLink("os-l", "os-b", "os-a")] });   // B points at A; A holds no reciprocal link
+  await dbMod.deleteMemoryByUser("os-a", NOW1);
+  assert.deepEqual((await dbMod.getMemoryObject("os-b"))!.links, []);
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:os-b"))?.status, "pending", "queued for the Vault");
+});
+
 test("'keep both as they are' is bound to the entry the user saw: if the entry moved on meanwhile nothing is closed", async () => {
   await dbMod.putMemoryObject(fromConversation("sn-1", "c1"));
   await dbMod.putVaultOutboxEntry({ id: "memory:sn-1", recordType: "memory", recordId: "sn-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "verify-history-mismatch", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);

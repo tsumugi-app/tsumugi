@@ -123,8 +123,7 @@ export async function verifyTombstone(root: FileSystemDirectoryHandle, kind: Tom
   const t = await getTombstone(kind, id);
   if (!t) return "no-tombstone";
   const presence = await checkTombstoneInVault(root, t);
-  if (presence === "absent" && t.vault !== "absent") await setTombstoneVaultStateIfUnchanged(t, "absent", now);
-  else if (presence === "absent") await setTombstoneVaultStateIfUnchanged(t, "absent", now);          // refreshes the check time
+  if (presence === "absent" && t.vault !== "kept") await setTombstoneVaultStateIfUnchanged(t, "absent", now);          // records the verdict / refreshes the check time; "kept" is the user's own decision and is never replaced by a check
   else if (presence === "present" && t.vault === "absent") await setTombstoneVaultStateIfUnchanged(t, "unverified", now);   // it came back into the Vault: the guard must stay
   return presence;
 }

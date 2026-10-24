@@ -191,3 +191,13 @@ test("the presence scan covers the whole visible Vault (record folders nested an
   hidden.put(".tsumugi/recovery/x.md", md.serializeMemoryDayFile([memory("hidden-mem")]));
   assert.equal(await life.checkTombstoneInVault(hidden.root(), tomb("memory", "hidden-mem")), "absent");
 });
+
+test("verifying an empty Vault never replaces the user's 'keep the Vault copy' decision", async () => {
+  await dbm.putMemoryObject(memory("kept-mem"));
+  await dbm.deleteMemoryByUser("kept-mem", "2026-01-01T00:00:00.000Z");
+  const seen = (await dbm.getTombstone("memory", "kept-mem"))!;
+  assert.equal(await life.keepVaultCopy(seen, "2026-01-02T00:00:00.000Z"), true);
+  assert.equal(await life.verifyTombstone(new testSupport.FakeVault().root(), "memory", "kept-mem", "2026-06-01T00:00:00.000Z"), "absent");
+  assert.equal((await dbm.getTombstone("memory", "kept-mem"))!.vault, "kept");
+  assert.deepEqual(await life.purgeEligibleTombstones(new testSupport.FakeVault().root(), "2027-01-01T00:00:00.000Z"), [], "kept is never purged");
+});
