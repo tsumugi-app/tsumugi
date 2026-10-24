@@ -275,6 +275,15 @@ async function locked<T>(root: FileSystemDirectoryHandle, fn: (vaultId: string, 
     return fn(identity.vaultId, epoch);
   })); } finally { clearTimeout(timer); }
 }
+/**
+ * Read-only dry run for the FIRST confirmation screen, before anything has been deleted: builds the plan the engine would run for a record that is about to be
+ * deleted (a prospective tombstone), under the same Vault / permission / world / identity checks, and writes nothing. It throws (and the caller deletes nothing)
+ * when the Vault can not be verified, when ownership is unclear or when the metadata is malformed. The plan that is really executed is rebuilt from the real
+ * tombstone afterwards and must equal this one (see deleteFlow.ts).
+ */
+export async function dryRunVaultDeletion(root: FileSystemDirectoryHandle, prospective: Tombstone): Promise<VaultDeletionPlan> {
+  return locked(root, async (vaultId, epoch) => buildVaultDeletionPlan(await inventory(root), { ...prospective, vaultId }, vaultId, epoch));
+}
 export async function previewVaultDeletion(root: FileSystemDirectoryHandle, seen: Tombstone): Promise<VaultDeletionPlan> {
   return locked(root, async (vaultId, epoch) => {
     const t = await getTombstone(seen.kind, seen.id);

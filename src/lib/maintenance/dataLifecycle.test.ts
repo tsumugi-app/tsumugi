@@ -23,6 +23,7 @@ const life = require(path.join(OUT, "lib/dataLifecycle.js")) as typeof import(".
 const md = require(path.join(OUT, "lib/markdown.js")) as typeof import("../markdown");
 const testSupport = require(path.join(OUT, "lib/maintenance/testSupport.js")) as typeof import("./testSupport");
 const deletion = require(path.join(OUT, "lib/vaultDeletion.js")) as typeof import("../vaultDeletion");
+const flow = require(path.join(OUT, "lib/deleteFlow.js")) as typeof import("../deleteFlow");
 
 const T = "2026-08-20T00:00:00.000Z";
 const meta = { id: "meta", source: "ai-capture" as const, sourceType: "chat" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
@@ -572,4 +573,141 @@ test("a torn write still needs the explicit content review (repair) after a reco
   await deletion.confirmVaultDeletion(root, repair);
   assert.equal((await dbm.getTombstone("memory", w.t.id))!.physicalDeletion, "complete");
   assert.equal(w.v.snapshot()["moved/deep/renamed.MD"], w.kept);
+});
+
+// ---- The single user-facing deletion flow (deleteFlow.ts): prepare -> confirm once -> device + Vault; failure keeps the guard; continue re-verifies -----------
+const conv = (id: string, memoryObjectIds: string[]): any => ({ id, persona: "companion", status: "captured", startedAt: T, createdAt: T, updatedAt: T, turns: [{ role: "user", content: "こんにちは", timestamp: T }], memoryObjectIds, metadata: meta });
+async function flowWorld(tag: string, vaultId = "flow-vault") {
+  testSupport.installFakeLocks();
+  const v = new testSupport.FakeVault(); const root = v.root(); root.isSameEntry = async () => true;
+  const epoch = await dbm.getActiveVaultEpoch();
+  await dbm.markVaultEpochCommitted(epoch); await dbm.markVaultWorldJournalMigrated();
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId, activeVaultEpoch: epoch, registryGeneration: null, pairedAt: T } as never);
+  await dbm.saveVaultHandle(root);
+  const c = `${tag}-conv`, m1 = `${tag}-m1`, m2 = `${tag}-m2`, other = `${tag}-other-conv`;
+  const mem1 = { ...memory(m1), conversationId: c }, mem2 = { ...memory(m2), conversationId: other };
+  await dbm.putConversation(conv(c, [m1])); await dbm.putConversation(conv(other, [m2]));
+  await dbm.putMemoryObject(mem1); await dbm.putMemoryObject(mem2);
+  v.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId }));
+  v.put(".tsumugi/index.json", JSON.stringify({ [c]: "Conversations/c.md", [other]: "Conversations/o.md", [m1]: "Memories/day.md", [m2]: "Memories/day.md" }));
+  v.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, registryGeneration: "g", dirtyOwnerInstanceId: null }));
+  v.put("Conversations/c.md", md.conversationToMarkdown(conv(c, [m1]))); v.put("Conversations/o.md", md.conversationToMarkdown(conv(other, [m2])));
+  v.put("Memories/day.md", md.serializeMemoryDayFile([mem1, mem2]));
+  v.put("private-note.md", "my own note, mentions " + m1);
+  const access = { kind: "ready" as const, root };
+  return { v, root, access, c, m1, m2, other };
+}
+const hasId = (text: string | undefined, id: string) => !!text && new RegExp(`^id: ${id}$`, "m").test(text);
+
+test("delete flow: deleting a memory removes it from this device AND the Vault; the neighbour memory, other conversation and private note are untouched", async () => {
+  const w = await flowWorld("fl1");
+  const review = await flow.prepareDelete({ kind: "memory", id: w.m1 }, w.access);
+  assert.equal(review.blocker, null); assert.ok(review.plan); assert.ok(review.files.includes("Memories/day.md"));
+  const before = w.v.snapshot();
+  assert.deepEqual(w.v.snapshot(), before, "preparing writes nothing");
+  assert.ok(await dbm.getMemoryObject(w.m1), "and deletes nothing yet");
+  const out = await flow.executeDelete(review, w.access);
+  assert.deepEqual(out, { status: "done", vault: "deleted" });
+  assert.equal(await dbm.getMemoryObject(w.m1), undefined);
+  const day = w.v.snapshot()["Memories/day.md"]; assert.ok(!hasId(day, w.m1)); assert.ok(hasId(day, w.m2), "the neighbour in the same Markdown file survives");
+  assert.ok(await dbm.getMemoryObject(w.m2)); assert.equal(w.v.snapshot()["private-note.md"], before["private-note.md"]); assert.ok(w.v.snapshot()["Conversations/o.md"]);
+  assert.equal((await dbm.getTombstone("memory", w.m1))!.physicalDeletion, "complete");
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(w.m1), conversationId: w.c }), "tombstoned", "it can not come back");
+  assert.deepEqual((await flow.listIncompleteDeletions()).filter((t) => t.id === w.m1), [], "a finished deletion is not listed");
+});
+
+test("delete flow: deleting only a conversation keeps its memories (device and Vault); with the option the memories go too", async () => {
+  const a = await flowWorld("fl2");
+  const r1 = await flow.prepareDelete({ kind: "conversation", id: a.c, withMemories: false }, a.access);
+  assert.equal(r1.childMemories, 1); assert.deepEqual(await flow.executeDelete(r1, a.access), { status: "done", vault: "deleted" });
+  assert.equal(await dbm.getConversation(a.c), undefined); assert.ok(await dbm.getMemoryObject(a.m1), "the memory stays on the device");
+  assert.equal(a.v.snapshot()["Conversations/c.md"], undefined); assert.ok(hasId(a.v.snapshot()["Memories/day.md"], a.m1), "and in the Vault");
+  const b = await flowWorld("fl3");
+  const r2 = await flow.prepareDelete({ kind: "conversation", id: b.c, withMemories: true }, b.access);
+  assert.deepEqual(await flow.executeDelete(r2, b.access), { status: "done", vault: "deleted" });
+  assert.equal(await dbm.getConversation(b.c), undefined); assert.equal(await dbm.getMemoryObject(b.m1), undefined);
+  const day = b.v.snapshot()["Memories/day.md"]; assert.ok(!hasId(day, b.m1)); assert.ok(hasId(day, b.m2));
+  assert.ok(await dbm.getConversation(b.other) && await dbm.getMemoryObject(b.m2), "unrelated records are untouched");
+});
+
+test("delete flow: a failure halfway keeps the guard (nothing comes back), is listed as 'continue deleting', and continues only after the user sees the plan again", async () => {
+  const w = await flowWorld("fl4");
+  const review = await flow.prepareDelete({ kind: "memory", id: w.m1 }, w.access);
+  w.v.writeShouldFail.add(".tsumugi/index.json");
+  const out = await flow.executeDelete(review, w.access);
+  assert.equal(out.status, "incomplete"); assert.ok(!/vault-deletion:|simulated/.test((out as { message: string }).message), "no raw code on the screen");
+  w.v.writeShouldFail.clear();
+  const t = (await dbm.getTombstone("memory", w.m1))!;
+  assert.equal(t.physicalDeletion, "pending");
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(w.m1), conversationId: w.c }), "tombstoned");
+  assert.equal(await dbm.addMemoryObjectIfAbsentAndMarkSynced({ ...memory(w.m1), conversationId: w.c }, "memory:" + w.m1), false);
+  assert.deepEqual((await flow.listIncompleteDeletions()).map((x) => x.id), [w.m1]);
+  const stuck = w.v.snapshot();
+  const cont = await flow.continueDelete(t, w.access);                      // re-verifies and shows what would change
+  assert.deepEqual(w.v.snapshot(), stuck, "continuing starts with a read-only review");
+  assert.deepEqual(await flow.finishContinuedDelete(w.access, cont), { status: "done", vault: "deleted" });
+  assert.equal((await dbm.getTombstone("memory", w.m1))!.physicalDeletion, "complete");
+  assert.ok(!hasId(w.v.snapshot()["Memories/day.md"], w.m1)); assert.ok(hasId(w.v.snapshot()["Memories/day.md"], w.m2));
+});
+
+test("delete flow: after reconnecting the same Vault, 'continue' works only through the review (the epoch changed)", async () => {
+  const w = await flowWorld("fl5");
+  const review = await flow.prepareDelete({ kind: "memory", id: w.m1 }, w.access);
+  w.v.writeShouldFail.add(".tsumugi/index.json"); await flow.executeDelete(review, w.access); w.v.writeShouldFail.clear();
+  await connect("flow-vault", w.root);
+  const t = (await dbm.getTombstone("memory", w.m1))!;
+  await assert.rejects(deletion.retryVaultDeletion(w.root, t), /journal-world-mismatch/);
+  assert.match(flow.explainDeletionError(new Error("vault-deletion:journal-world-mismatch")), /削除を続ける/);
+  const cont = await flow.continueDelete(t, w.access);
+  assert.deepEqual(await flow.finishContinuedDelete(w.access, cont), { status: "done", vault: "deleted" });
+});
+
+test("delete flow: another Vault is never touched; the screen explains why and nothing is deleted", async () => {
+  const w = await flowWorld("fl6");
+  w.v.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "somebody-elses-vault" }));
+  const review = await flow.prepareDelete({ kind: "memory", id: w.m1 }, w.access);
+  assert.ok(review.blocker); assert.ok(!/vault-deletion:/.test(review.blocker!)); assert.equal(review.plan, null);
+  const before = w.v.snapshot();
+  assert.equal((await flow.executeDelete(review, w.access)).status, "refused");
+  assert.deepEqual(w.v.snapshot(), before); assert.ok(await dbm.getMemoryObject(w.m1), "nothing was deleted on the device either");
+  assert.equal(await dbm.getTombstone("memory", w.m1), undefined);
+  // an unpaired Vault (no identity record) is refused as well
+  const u = await flowWorld("fl7");
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: null, activeVaultEpoch: null, registryGeneration: null, pairedAt: null } as never);
+  const r = await flow.prepareDelete({ kind: "memory", id: u.m1 }, u.access);
+  assert.ok(r.blocker && /紐づけ/.test(r.blocker)); assert.ok(await dbm.getMemoryObject(u.m1));
+});
+
+test("delete flow: a file edited after the confirmation is not deleted from the Vault; the guard stays and 'continue' shows the new plan", async () => {
+  const w = await flowWorld("fl8");
+  const review = await flow.prepareDelete({ kind: "memory", id: w.m1 }, w.access);
+  w.v.put("Memories/day.md", w.v.snapshot()["Memories/day.md"] + "\n<!-- an outside edit made after the confirmation -->\n");
+  const edited = w.v.snapshot();
+  const out = await flow.executeDelete(review, w.access);
+  assert.equal(out.status, "incomplete"); assert.deepEqual(w.v.snapshot(), edited, "the Vault was not written");
+  assert.equal(await dbm.getMemoryObject(w.m1), undefined, "the record is already off this device");
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(w.m1), conversationId: w.c }), "tombstoned");
+  assert.deepEqual((await flow.listIncompleteDeletions()).map((x) => x.id), [w.m1]);
+  const cont = await flow.continueDelete((await dbm.getTombstone("memory", w.m1))!, w.access);
+  assert.deepEqual(await flow.finishContinuedDelete(w.access, cont), { status: "done", vault: "deleted" });
+  assert.ok(w.v.snapshot()["Memories/day.md"].includes("an outside edit made after the confirmation"), "the outside edit survives");
+});
+
+test("delete flow: without a connected Vault only this device is changed and the screen says so", async () => {
+  const w = await flowWorld("fl9");
+  const review = await flow.prepareDelete({ kind: "memory", id: w.m1 }, { kind: "none" });
+  assert.equal(review.plan, null); assert.equal(review.blocker, null);
+  assert.deepEqual(await flow.executeDelete(review, { kind: "none" }), { status: "done", vault: "not-connected" });
+  assert.equal(await dbm.getMemoryObject(w.m1), undefined);
+});
+
+test("delete flow: every engine error code is explained in Japanese without the raw code", () => {
+  const codes = ["locks-unavailable", "permission-required", "recovery-pending", "incomplete-world", "unpaired-vault", "vault-handle-changed", "vault-identity-mismatch", "parent-deletion-required",
+    "journal-world-mismatch", "journal-missing", "content-review-required:x.md", "content-changed:x.md", "preview-changed", "vault-world-changed", "verification-failed:x", "final-verification-failed:x",
+    "copy-reappeared", "matching-record-not-owned", "scan-too-large", "scan-too-deep", "unsafe-path", "malformed-registry", "ambiguous-reference-field", "registry-path-collision", "missing-id"];
+  for (const code of codes) {
+    const text = flow.explainDeletionError(new Error("vault-deletion:" + code));
+    assert.ok(/[ぁ-ん]/.test(text) && !/vault-deletion|[a-z]+-[a-z]+-/.test(text), `${code}: ${text}`);
+  }
+  assert.ok(/[ぁ-ん]/.test(flow.explainDeletionError(new Error("something unexpected"))));
 });

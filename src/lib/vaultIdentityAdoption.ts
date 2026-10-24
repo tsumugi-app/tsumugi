@@ -123,6 +123,8 @@ export async function loadCanonicalSnapshot(): Promise<CanonicalSnapshot> {
 export type LegacyVaultAdoptionResult =
   | { kind: "safe-to-adopt"; matchedCount: number }
   | { kind: "new-empty-vault" }
+  /** This device has records but the Vault holds NO record file at all (only the app's own skeleton): there is nothing in the Vault that could belong to another world. */
+  | { kind: "vault-has-no-records" }
   | { kind: "conflict"; reason: string }
   | { kind: "unrelated-vault"; reason: string }
   | { kind: "unreadable"; reason: string }
@@ -226,6 +228,7 @@ export async function evaluateLegacyVaultAdoption(root: FileSystemDirectoryHandl
   if (canonicalIsEmpty && !hasVaultData) return { kind: "new-empty-vault" };
   if (unreadableCount > 0) return { kind: "unreadable", reason: "some-vault-records-unreadable" };
   if (!canonicalIsEmpty && hasVaultData) return { kind: "unrelated-vault", reason: "no-common-record-matched" };
+  if (!canonicalIsEmpty && !hasVaultData) return { kind: "vault-has-no-records" };
   return { kind: "insufficient-evidence", reason: "one-side-empty-cannot-prove-same-world" };
 }
 
@@ -330,7 +333,7 @@ export type VaultIdentityDecision =
   | { action: "done"; result: VaultIdentityEnsureResult }
   | { action: "pair-existing"; vaultId: string }
   /** `candidate`がnullなら、実行時に新しいvaultIdを発行する（IndexedDBに確定済みのidがあればそれを再利用）。 */
-  | { action: "establish"; candidate: string | null; why: "pending-resume" | "empty" | "safe-to-adopt" | "new-empty-vault" | "origin-bound-shared-ids" };
+  | { action: "establish"; candidate: string | null; why: "pending-resume" | "empty" | "safe-to-adopt" | "new-empty-vault" | "origin-bound-shared-ids" | "origin-bound-empty-vault" };
 
 export async function decideVaultIdentityAdoption(env: VaultIdentityEnv): Promise<VaultIdentityDecision> {
   const idbIdentity = await getVaultIdentityRecord();
@@ -391,6 +394,13 @@ export async function decideVaultIdentityAdoption(env: VaultIdentityEnv): Promis
         return { action: "establish", candidate: preferredCandidate, why: "origin-bound-shared-ids" };
       }
       return { action: "done", result: { kind: "held", reason: evaluation.reason } };
+    case "vault-has-no-records":
+      // The app creates its own `.tsumugi/` skeleton when it connects a Vault, so a Vault that has only that skeleton is classified "legacy" even though it holds no
+      // record. When this device already has records, that used to hold the identity forever ("one side empty"), and since nothing is projected into an unpaired Vault
+      // the deadlock never resolved. In origin-bound storage (the app's own OPFS area) the Vault can not belong to another world, and with no record file in it there
+      // is nothing to mispair, so a NEW identity is established; the projection then writes this device's records into it. A user-selected folder stays strict.
+      if ((env.storageCapability ?? getVaultStorageCapability()) === "origin-bound") return { action: "establish", candidate: preferredCandidate, why: "origin-bound-empty-vault" };
+      return { action: "done", result: { kind: "held", reason: "one-side-empty-cannot-prove-same-world" } };
     case "unrelated-vault":
       return { action: "done", result: { kind: "unrelated", reason: evaluation.reason } };
     case "unreadable":

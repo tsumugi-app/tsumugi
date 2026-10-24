@@ -2,8 +2,12 @@
 // The /data screen in a real browser: deleting memories and conversations with every reference kept consistent, resolving stuck sync items, the
 // read-only Vault check (OPFS stands in for the Vault folder) and the tombstone list. Fictional data only.
 import { test, expect, type Page } from "@playwright/test";
+import path from "node:path";
 
 const DATA = "http://localhost:3100/data";
+const bundle = path.join(__dirname, ".build/harness.js");
+async function attach(page: Page) { await page.addScriptTag({ path: bundle }); }
+const openAdvanced = async (page: Page) => { await page.getByText("詳細な管理（上級者向け）").click(); await expect(page.getByRole("heading", { name: /確認が必要な項目/ })).toBeVisible(); };
 const T = "2026-08-20T00:00:00.000Z";
 const meta = (id: string) => ({ id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T });
 const mem = (id: string, conversationId: string, summary: string, links: any[] = []) => ({
@@ -23,7 +27,7 @@ const outbox = (recordType: string, recordId: string, status: "pending" | "held"
 const M1 = "e2e-mem-A00001", M2 = "e2e-mem-B00002", M3 = "e2e-mem-C00003", M4 = "e2e-mem-D00004", C1 = "e2e-conv-X00001", C2 = "e2e-conv-Y00002", GHOST = "e2e-mem-G00009";
 
 /** the app's own schema is created by loading the page once; then the fictional records go straight into IndexedDB and the page is reloaded */
-async function openWith(page: Page, withVault = false) {
+async function openWith(page: Page, withVault = false, advanced = false) {
   await page.goto(DATA);
   await expect(page.getByRole("heading", { name: "データの管理" })).toBeVisible();
   await page.evaluate(async ({ rows, withVault }) => {
@@ -49,7 +53,8 @@ async function openWith(page: Page, withVault = false) {
     },
   });
   await page.reload();
-  await expect(page.getByRole("heading", { name: /確認が必要な項目/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "記憶と会話" })).toBeVisible();
+  if (advanced) await openAdvanced(page);
 }
 const read = <T,>(page: Page, store: string, key: string) => page.evaluate(async ({ store, key }) => {
   const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -60,7 +65,7 @@ const read = <T,>(page: Page, store: string, key: string) => page.evaluate(async
 const item = (page: Page, text: string) => page.getByRole("listitem").filter({ hasText: text });
 
 test("stuck sync items: listed (held and long-pending, not ordinary pending), and every one has a way out", async ({ page }) => {
-  await openWith(page, true);
+  await openWith(page, true, true);
   await expect(page.getByRole("heading", { name: "確認が必要な項目 (3)" })).toBeVisible();
   // retry
   await item(page, "A00001").getByRole("button", { name: "再試行" }).click();
@@ -91,14 +96,18 @@ test("deleting a memory: two-step confirmation, then the record, the link on the
   await openWith(page);
   const m3Before = JSON.stringify(await read<any>(page, "memoryObjects", M3));
   // cancelling deletes nothing
-  await item(page, "E2E記憶アルファ").getByRole("button", { name: "削除…" }).click();
-  await expect(page.getByText("この記憶を削除します。リンクも外れます。")).toBeVisible();
-  await page.getByRole("button", { name: "やめる" }).click();
+  const dialog = page.getByRole("dialog");
+  await item(page, "E2E記憶アルファ").getByRole("button", { name: "削除", exact: true }).click();
+  await expect(dialog).toContainText("つながっている記憶 1 件から、この記憶へのリンクが外れます");
+  await dialog.getByRole("button", { name: "やめる" }).click();
+  await expect(dialog).toHaveCount(0);
   expect(await read<any>(page, "memoryObjects", M1)).toBeTruthy();
-  // confirm
-  await item(page, "E2E記憶アルファ").getByRole("button", { name: "削除…" }).click();
-  await page.getByRole("button", { name: "削除する" }).click();
-  await expect(page.getByRole("status")).toContainText("削除しました（つながっていた記憶 1 件のリンクを外しました）");
+  // confirm: one button, then the result is shown in the same place
+  await item(page, "E2E記憶アルファ").getByRole("button", { name: "削除", exact: true }).click();
+  await dialog.getByRole("button", { name: "削除する" }).click();
+  await expect(dialog).toContainText("削除しました");
+  await expect(dialog).toContainText("この端末のデータを削除しました");
+  await dialog.getByRole("button", { name: "閉じる" }).click();
   expect(await read<any>(page, "memoryObjects", M1)).toBeUndefined();
   expect((await read<any>(page, "memoryObjects", M2)).links).toEqual([]);
   expect((await read<any>(page, "conversations", C1)).memoryObjectIds).toEqual([M2]);
@@ -109,21 +118,25 @@ test("deleting a memory: two-step confirmation, then the record, the link on the
   const tombstones = JSON.parse(await read<string>(page, "settings", "tombstones:v1"));
   expect(Object.keys(tombstones)).toEqual([`memory:${M1}`]);
   expect(JSON.stringify(tombstones)).not.toContain("E2E記憶アルファ");                    // no record text in a tombstone
-  await expect(page.getByRole("heading", { name: "削除済みの記録 (1)" })).toBeVisible();
-  await expect(page.getByText("E2E記憶アルファ")).toHaveCount(0);
+  await expect(page.getByText("E2E記憶アルファ")).toHaveCount(0);        // a finished deletion disappears from the ordinary list
 });
 
 test("deleting a conversation: the memories stay by default, or are deleted with it when the user chooses", async ({ page }) => {
   await openWith(page);
-  await item(page, "E2E会話ふたつめ").getByRole("button", { name: "削除…" }).click();
-  await page.getByRole("button", { name: "削除する" }).click();
-  await expect(page.getByRole("status")).toContainText("会話を削除しました（記憶は残しています）");
+  const dialog = page.getByRole("dialog");
+  await item(page, "E2E会話ふたつめ").getByRole("button", { name: "削除", exact: true }).click();
+  await expect(dialog).toContainText("記憶は残します");
+  await dialog.getByRole("button", { name: "削除する" }).click();
+  await expect(dialog).toContainText("削除しました");
+  await dialog.getByRole("button", { name: "閉じる" }).click();
   expect(await read<any>(page, "conversations", C2)).toBeUndefined();
   expect(await read<any>(page, "memoryObjects", M4)).toBeTruthy();
-  await item(page, "E2E会話ひとつめ").getByRole("button", { name: "削除…" }).click();
-  await page.getByLabel("この会話から作られた記憶も削除する").check();
-  await page.getByRole("button", { name: "削除する" }).click();
-  await expect(page.getByRole("status")).toContainText("会話と記憶 2 件を削除しました");
+  await item(page, "E2E会話ひとつめ").getByRole("button", { name: "削除", exact: true }).click();
+  await dialog.getByLabel("この会話から作られた記憶も削除する").check();
+  await expect(dialog).toContainText("それも削除します");
+  await dialog.getByRole("button", { name: "削除する" }).click();
+  await expect(dialog).toContainText("削除しました");
+  await dialog.getByRole("button", { name: "閉じる" }).click();
   expect(await read<any>(page, "conversations", C1)).toBeUndefined();
   expect(await read<any>(page, "memoryObjects", M1)).toBeUndefined();
   expect(await read<any>(page, "memoryObjects", M2)).toBeUndefined();
@@ -133,8 +146,9 @@ test("deleting a conversation: the memories stay by default, or are deleted with
 
 test("deleted records: the Vault copy is checked read-only (OPFS stands in for the Vault); a remaining copy keeps the guard, 'allow back' lifts it", async ({ page }) => {
   await openWith(page, true);
-  await item(page, "E2E会話ひとつめ").getByRole("button", { name: "削除…" }).click();
-  await page.getByRole("button", { name: "削除する" }).click();
+  await attach(page);
+  await page.evaluate(async (id) => (window as any).D.dbm.deleteConversationByUser(id), C1);      // the tombstone management itself is what this test is about
+  await page.reload(); await openAdvanced(page);
   await expect(page.getByRole("heading", { name: "削除済みの記録 (1)" })).toBeVisible();
   // the Vault still holds the conversation file, MOVED into a sub folder by the user: it is found by its id (an index.json key alone would not count)
   await page.evaluate(async (id) => {
