@@ -107,7 +107,19 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of projDiff) assert.ok(/getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l), "unexpected vaultProjection.ts change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
-  for (const l of vaultDiff) assert.ok(/skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
+  // Reviewed storage safety extension: exact lines only, never a blanket exemption.
+  const deletionGuardLines = new Set([
+    'async () => {', '},', 'hasDeletedMemoryReferences,',
+    'if (await hasDeletedMemoryReferences(conversation.memoryObjectIds)) throw new Error("deleted-reference-write-refused");',
+    'if (await hasDeletedMemoryReferences(memoryObject.links.flatMap((l) => [l.sourceId, l.targetId]))) throw new Error("deleted-reference-write-refused");',
+    '() => writeConversationMarkdownImpl(root, conversation, dirHandleCache, options),',
+    '() => writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options),',
+    'if (await isTombstoned("conversation", conversation.id)) throw new Error("deleted-record-write-refused");',
+    'if (await isMemoryBlockedByTombstone(memoryObject)) throw new Error("deleted-record-write-refused");',
+    'await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);',
+    'await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);',
+  ]);
+  for (const l of vaultDiff) assert.ok(deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**

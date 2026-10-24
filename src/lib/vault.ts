@@ -21,6 +21,7 @@ import {
   addMemoryObjectIfAbsentAndMarkSynced,
   isMemoryBlockedByTombstone,
   isTombstoned,
+  hasDeletedMemoryReferences,
   addSourceIfAbsentAndMarkSynced,
   bumpRegistryGenerationEpoch,
   getAllConversations,
@@ -1940,7 +1941,12 @@ export async function writeConversationMarkdown(
   options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeConversationMarkdownImpl(root, conversation, dirHandleCache, options),
+    async () => {
+      // Deletion can finish while this snapshot waits in the save queue.
+      if (await isTombstoned("conversation", conversation.id)) throw new Error("deleted-record-write-refused");
+      if (await hasDeletedMemoryReferences(conversation.memoryObjectIds)) throw new Error("deleted-reference-write-refused");
+      await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);
+    },
     priority,
     vaultSyncKeyFor("conversation", conversation.id)
   );
@@ -2284,7 +2290,12 @@ export async function writeMemoryObjectMarkdown(
   options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options),
+    async () => {
+      // Includes cascade deletion of the owning conversation; checked inside save lock.
+      if (await isMemoryBlockedByTombstone(memoryObject)) throw new Error("deleted-record-write-refused");
+      if (await hasDeletedMemoryReferences(memoryObject.links.flatMap((l) => [l.sourceId, l.targetId]))) throw new Error("deleted-reference-write-refused");
+      await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);
+    },
     priority,
     vaultSyncKeyFor("memory", memoryObject.id)
   );

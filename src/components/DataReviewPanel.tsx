@@ -9,12 +9,13 @@ import {
 import { allowBack, findRecordInVault, keepVaultCopy, purgeDecision, purgeEligibleTombstones, verifyTombstone } from "@/lib/dataLifecycle";
 import { getVaultBackend } from "@/lib/vault";
 import { isRecoveryBlockingNormalWrites } from "@/lib/vaultRecoveryJournal";
+import { previewVaultDeletion, confirmVaultDeletion, retryVaultDeletion, type VaultDeletionPlan } from "@/lib/vaultDeletion";
 import type { Conversation, MemoryObject } from "@/lib/types";
 
 /**
  * データの管理（/data）。ユーザー自身が、記憶・会話を削除し、同期が止まった項目（保留・競合）を解決し、削除済みの記録の後始末をする画面。
  * ChatScreen・Capture・Connect・起動処理は一切動かさない（この画面だけで完結）。何も自動では削除しない：すべてボタン操作（二段階確認つき）。
- * Vaultのファイルはこの画面から削除しない（読み取りの確認だけ）。
+ * Vaultの削除は対象一覧を確認した後の別操作。失敗した操作は削除済み一覧から再試行する。
  */
 const REASONS: Record<string, string> = {
   "vault-identity-mismatch": "保存先が、この端末が使っていた保存先と別のものに見えます",
@@ -37,6 +38,8 @@ export default function DataReviewPanel() {
   const [filter, setFilter] = useState("");
   const [confirming, setConfirming] = useState<string | null>(null);
   const [withMemories, setWithMemories] = useState(false);
+  const [deletionPlan, setDeletionPlan] = useState<VaultDeletionPlan | null>(null);
+  const [editorsStopped, setEditorsStopped] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -47,20 +50,20 @@ export default function DataReviewPanel() {
       setTombstones(await listTombstones());
     } catch (e) { setMessage("読み込めませんでした: " + ((e as Error)?.name ?? "error")); }
   }, []);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void Promise.resolve().then(load); }, [load]);
 
   async function act(fn: () => Promise<string>) {
     if (busy) return;
     setBusy(true); setMessage(null); setConfirming(null);
-    try { setMessage(await fn()); } catch (e) { const n = (e as Error)?.name ?? "error"; setMessage(n === "RecoveryPendingError" ? "メンテナンス中、または復旧が必要な状態のため、今はできません。" : n === "TombstonedRecordError" ? "削除済みの記録のため、できません。" : "できませんでした: " + n); }
+    try { setMessage(await fn()); } catch (e) { const n = (e as Error)?.name ?? "error"; setMessage(n === "RecoveryPendingError" ? "メンテナンス中、または復旧が必要な状態のため、今はできません。" : n === "TombstonedRecordError" ? "削除済みの記録のため、できません。" : "完了していません。接続・権限・ファイルの変更を確認し、対象を再確認してから再試行してください: " + ((e as Error)?.message ?? n)); }
     finally { setBusy(false); await load(); }
   }
-  async function vaultRoot(): Promise<FileSystemDirectoryHandle | null> {
+  async function vaultRoot(mode: "read" | "readwrite" = "read"): Promise<FileSystemDirectoryHandle | null> {
     // the app's own (origin-private) storage is the Vault on devices without a folder picker: its root is not a stored handle
     if (getVaultBackend() === "opfs") { try { return await navigator.storage.getDirectory(); } catch { return null; } }
     const h = await loadVaultHandle();
     if (!h) return null;
-    const p = (await (h as unknown as { requestPermission?: (o: { mode: string }) => Promise<string> }).requestPermission?.({ mode: "read" })) ?? "granted";
+    const p = (await (h as unknown as { requestPermission?: (o: { mode: string }) => Promise<string> }).requestPermission?.({ mode })) ?? "granted";
     return p === "granted" ? h : null;
   }
 
@@ -72,9 +75,23 @@ export default function DataReviewPanel() {
   return (
     <main className="mx-auto flex max-w-2xl flex-col gap-8 px-4 py-8 text-sm text-stone-700 dark:text-stone-200">
       <h1 className="text-lg font-medium">データの管理</h1>
-      <p className="text-xs text-stone-500">ここでの操作は、すべてあなたの操作でだけ行われます。何も自動では削除しません。保存先（Vault）のファイルは、この画面からは削除しません。</p>
+      <p className="text-xs text-stone-500">何も自動では削除しません。端末から削除した後、「削除済みの記録」で保存先（Vault）の削除対象を確認して確定できます。</p>
       {blocked && <p role="alert" className="rounded border border-amber-400 px-3 py-2 text-amber-700">メンテナンス中、または復旧が必要な状態のため、削除と解決はできません。</p>}
       {message && <p role="status" className="rounded border border-stone-300 px-3 py-2">{message}</p>}
+      {deletionPlan && <section role="region" aria-label="保存先の削除確認" className="rounded border border-red-500 p-4">
+        <p>次のファイルから対象の記録を削除し、履歴・索引も更新します。取り消せません。同じファイルの別の記憶は残します。</p>
+        <ul>{deletionPlan.edits.map((e) => <li key={e.path}>{e.path}（{e.after === null ? "ファイルを削除" : "対象箇所を更新"}）</li>)}</ul>
+        <p>対象 {deletionPlan.ids.length} 件。復旧用アーカイブや外部バックアップは残ります。復活を防ぐ記録は保持します。</p>
+        <label><input type="checkbox" checked={editorsStopped} onChange={(e) => setEditorsStopped(e.target.checked)} /> 他のアプリ・端末で、この保存先の編集と同期を停止しました</label>
+        <div className="flex gap-2">
+          <button disabled={busy || blocked || !editorsStopped} className="border border-red-700 px-2 py-1" onClick={() => void act(async () => {
+            const plan = deletionPlan; setDeletionPlan(null);
+            const root = await vaultRoot("readwrite"); if (!root) return "書き込みの許可が必要です。まだ保存先から削除していません。";
+            await confirmVaultDeletion(root, plan); return "保存先の削除と履歴・索引の更新が完了しました。";
+          })}>保存先からも完全に削除する</button>
+          <button disabled={busy} onClick={() => setDeletionPlan(null)}>取り消す</button>
+        </div>
+      </section>}
 
       <section aria-labelledby="attention-h" className="flex flex-col gap-3">
         <h2 id="attention-h" className="font-medium">確認が必要な項目 ({attention.length})</h2>
@@ -146,7 +163,7 @@ export default function DataReviewPanel() {
 
       <section aria-labelledby="tomb-h" className="flex flex-col gap-3">
         <h2 id="tomb-h" className="font-medium">削除済みの記録 ({tombstones.length})</h2>
-        <p className="text-xs text-stone-500">削除した記録は、保存先に残っていても、勝手にこの端末へ戻りません。保存先のファイルが無くなったことを確認でき、30日たつと、この記録も自動的に整理できます。</p>
+        <p className="text-xs text-stone-500">削除した記録は、保存先に残っていても、勝手にこの端末へ戻りません。保存先も削除した場合、この復活防止の記録は自動では整理しません。</p>
         <ul className="flex flex-col gap-2">
           {tombstones.map((t) => {
             const d = purgeDecision(t, now);
@@ -154,14 +171,26 @@ export default function DataReviewPanel() {
               <li key={`${t.kind}:${t.id}`} className="flex flex-col gap-2 rounded border border-stone-300 px-3 py-2">
                 <p>{kindLabel(t.kind)} …{tail(t.id)}（{t.deletedAt.slice(0, 10)}に削除）：{t.vault === "absent" ? "保存先にも見つかりません" : t.vault === "kept" ? "保存先のコピーを残す設定です" : "保存先にコピーが残っている可能性があります"}</p>
                 <div className="flex flex-wrap gap-2">
+                  <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => {
+                    const root = await vaultRoot(); if (!root) return "保存先の読み取りの許可が必要です。";
+                    const plan = await previewVaultDeletion(root, t); setEditorsStopped(false); setDeletionPlan(plan);
+                    return "削除対象を確認してください。まだ保存先のファイルは変更していません。";
+                  })}>保存先の削除対象を確認…</button>
+                  {t.physicalDeletion === "pending" && <>
+                    <span role="alert">保存先の削除は未完了です。復活防止の記録を保持しています。</span>
+                    <button disabled={busy || blocked} className="border px-2 py-1" onClick={() => void act(async () => {
+                      const root = await vaultRoot("readwrite"); if (!root) return "書き込みの許可が必要です。";
+                      await retryVaultDeletion(root, t); return "保存先の削除と履歴・索引の更新が完了しました。";
+                    })}>確定済みの削除を再試行</button>
+                  </>}
                   <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => {
                     const root = await vaultRoot();
                     if (!root) return "保存先を確認できませんでした（接続と読み取りの許可が必要です）。";
                     const p = await verifyTombstone(root, t.kind, t.id);
-                    return p === "absent" ? "保存先にも見つかりませんでした。" : p === "present" ? "保存先にファイルが残っています。この画面からは削除しません。保存先のアプリで削除してから、もう一度確認してください。" : "保存先を確認できませんでした。";
+                    return p === "absent" ? "保存先にも見つかりませんでした。" : p === "present" ? "保存先にファイルが残っています。「保存先の削除対象を確認…」で確認できます。" : "保存先を確認できませんでした。";
                   })}>保存先を確認</button>
-                  {t.vault !== "kept" && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => ((await keepVaultCopy(t)) ? "保存先のコピーを残す設定にしました。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>保存先のコピーは残す</button>}
-                  <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => ((await allowBack(t)) ? "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>戻せるようにする</button>
+                  {t.vault !== "kept" && <button disabled={busy || t.physicalDeletion === "pending"} className="border px-2 py-1" onClick={() => void act(async () => ((await keepVaultCopy(t)) ? "保存先のコピーを残す設定にしました。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>保存先のコピーは残す</button>}
+                  <button disabled={busy || t.physicalDeletion === "pending"} className="border px-2 py-1" onClick={() => void act(async () => ((await allowBack(t)) ? "この記録を、保存先から戻せるようにしました（記録そのものは、戻すまで復元されません）。" : "別の画面で状態が変わりました。もう一度確認してください。"))}>戻せるようにする</button>
                   {d.purgeable && <button disabled={busy} className="border px-2 py-1" onClick={() => void act(async () => {
                     const root = await vaultRoot();
                     if (!root) return "保存先を確認できないため、整理できません（接続と読み取りの許可が必要です）。";

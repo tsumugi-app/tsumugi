@@ -415,6 +415,8 @@ export type TombstoneKind = "memory" | "conversation";
 export type TombstoneVaultState = "unverified" | "absent" | "kept";
 export interface Tombstone {
   v: 1;
+  /** Physical deletion is explicit and resumable. Keep this guard until an explicit allow-back. */
+  physicalDeletion?: "pending" | "complete";
   kind: TombstoneKind;
   id: string;
   deletedAt: string;
@@ -431,6 +433,37 @@ export interface Tombstone {
   vaultId?: string | null;
 }
 export const TOMBSTONES_KEY = "tombstones:v1";
+const deletionJournalKey = (kind: TombstoneKind, id: string) => `physical-deletion:v1:${kind}:${id}`;
+export async function readPhysicalDeletionJournal(kind: TombstoneKind, id: string): Promise<string | undefined> {
+  return (await getDB()).get("settings", deletionJournalKey(kind, id));
+}
+/** The confirmed plan and the non-liftable guard commit together, BEFORE any Vault mutation. */
+export async function beginPhysicalDeletion(expected: Tombstone, journal: string): Promise<void> {
+  const tx = (await getDB()).transaction(["settings"], "readwrite");
+  try {
+    await assertNoPendingRecoveryInTx(tx);
+    const s = tx.objectStore("settings");
+    const map = parseTombstoneMap(await s.get(TOMBSTONES_KEY));
+    if (!map || JSON.stringify(map[tombstoneId(expected.kind, expected.id)]) !== JSON.stringify(expected)) throw new Error("deletion-intent-changed");
+    map[tombstoneId(expected.kind, expected.id)] = { ...expected, physicalDeletion: "pending" };
+    await s.put(JSON.stringify(map), TOMBSTONES_KEY);
+    await s.put(journal, deletionJournalKey(expected.kind, expected.id));
+  } catch (e) { await abortAndSettleTransaction(tx, e); }
+  await tx.done;
+}
+export async function finishPhysicalDeletion(expected: Tombstone): Promise<void> {
+  const tx = (await getDB()).transaction(["settings"], "readwrite");
+  try {
+    const s = tx.objectStore("settings");
+    const map = parseTombstoneMap(await s.get(TOMBSTONES_KEY));
+    const t = map?.[tombstoneId(expected.kind, expected.id)];
+    if (!map || !t || t.deletedAt !== expected.deletedAt || t.physicalDeletion !== "pending") throw new Error("deletion-intent-changed");
+    map[tombstoneId(t.kind, t.id)] = { ...t, physicalDeletion: "complete", vault: "absent" };
+    await s.put(JSON.stringify(map), TOMBSTONES_KEY);
+    await s.delete(deletionJournalKey(t.kind, t.id));
+  } catch (e) { await abortAndSettleTransaction(tx, e); }
+  await tx.done;
+}
 const tombstoneId = (kind: TombstoneKind, id: string) => `${kind}:${id}`;
 type TombstoneMap = Record<string, Tombstone>;
 /** null = the stored value is corrupt (callers must fail closed) */
@@ -470,6 +503,11 @@ export async function isTombstoned(kind: TombstoneKind, id: string): Promise<boo
   const db = await getDB();
   return blockedByTombstone(parseTombstoneMap(await db.get("settings", TOMBSTONES_KEY)), kind, id);
 }
+/** The Vault queue can hold an old snapshot after deletion cleaned the canonical references. */
+export async function hasDeletedMemoryReferences(ids: string[]): Promise<boolean> {
+  const map = parseTombstoneMap(await (await getDB()).get("settings", TOMBSTONES_KEY));
+  return map === null || ids.some((id) => blockedByTombstone(map, "memory", id));
+}
 async function mutateTombstones(fn: (map: TombstoneMap) => void): Promise<void> {
   const db = await getDB();
   const tx = db.transaction(["settings"], "readwrite");
@@ -487,20 +525,20 @@ export async function setTombstoneVaultStateIfUnchanged(expected: Tombstone, vau
   let changed = false;
   await mutateTombstones((map) => {
     const key = tombstoneId(expected.kind, expected.id);
-    if (map[key] && JSON.stringify(map[key]) === JSON.stringify(expected)) { map[key] = { ...expected, vault, vaultCheckedAt: now }; changed = true; }
+    if (map[key] && expected.physicalDeletion !== "pending" && JSON.stringify(map[key]) === JSON.stringify(expected)) { map[key] = { ...expected, vault, vaultCheckedAt: now }; changed = true; }
   });
   return changed;
 }
 export const setTombstoneVaultState = (kind: TombstoneKind, id: string, vault: TombstoneVaultState, now: string = new Date().toISOString()) =>
   mutateTombstones((map) => { const t = map[tombstoneId(kind, id)]; if (t) map[tombstoneId(kind, id)] = { ...t, vault, vaultCheckedAt: now }; });
 /** Removes a tombstone: the record may then be restored from the Vault again ("undelete" - the record itself is NOT recreated here) or, after the purge conditions, forgotten. */
-export const clearTombstone = (kind: TombstoneKind, id: string) => mutateTombstones((map) => { delete map[tombstoneId(kind, id)]; });
+export const clearTombstone = (kind: TombstoneKind, id: string) => mutateTombstones((map) => { if (map[tombstoneId(kind, id)]?.physicalDeletion !== "pending") delete map[tombstoneId(kind, id)]; });
 /** Purge: clears the tombstone ONLY if it is still exactly the one the eligibility decision was made on (another tab may have changed its Vault state meanwhile). */
 export async function clearTombstoneIfUnchanged(expected: Tombstone): Promise<boolean> {
   let cleared = false;
   await mutateTombstones((map) => {
     const cur = map[tombstoneId(expected.kind, expected.id)];
-    if (cur && JSON.stringify(cur) === JSON.stringify(expected)) { delete map[tombstoneId(expected.kind, expected.id)]; cleared = true; }
+    if (cur && cur.physicalDeletion !== "pending" && JSON.stringify(cur) === JSON.stringify(expected)) { delete map[tombstoneId(expected.kind, expected.id)]; cleared = true; }
   });
   return cleared;
 }
@@ -533,9 +571,8 @@ async function removeMemoryInTx(
     await outbox.put(buildOutboxEntryForUpdate(await outbox.get(vaultOutboxIdFor(type, next.id)), type, next.id, at, at));
     result.countersUpdated += 1;
   }
-  if (m.conversationId) {
-    const c = (await conversations.get(m.conversationId)) as Conversation | undefined;
-    if (c && c.memoryObjectIds.includes(m.id)) {
+  for (const c of (await conversations.getAll()) as Conversation[]) {
+    if (c.memoryObjectIds.includes(m.id)) {
       const at = strictlyLaterInstant(c.updatedAt, now);
       const next: Conversation = { ...c, memoryObjectIds: c.memoryObjectIds.filter((id) => id !== m.id), updatedAt: at, metadata: { ...c.metadata, updatedAt: at } };
       await conversations.put(next);
@@ -974,7 +1011,13 @@ export async function getVaultSyncState(key: string): Promise<string | undefined
 
 export async function setVaultSyncState(key: string, updatedAt: string): Promise<void> {
   const db = await getDB();
-  await db.put("vaultSyncState", updatedAt, key);
+  const tx = db.transaction(["vaultSyncState", "settings"], "readwrite");
+  try {
+    const colon = key.indexOf(":"); const kind = key.slice(0, colon); const id = key.slice(colon + 1);
+    const map = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (!(kind === "memory" || kind === "conversation") || !blockedByTombstone(map, kind, id)) await tx.objectStore("vaultSyncState").put(updatedAt, key);
+  } catch (e) { await abortAndSettleTransaction(tx, e); }
+  await tx.done;
 }
 
 /**
@@ -1130,7 +1173,13 @@ export async function getVaultOutboxEntry(id: string): Promise<VaultOutboxEntry 
 
 export async function putVaultOutboxEntry(entry: VaultOutboxEntry): Promise<void> {
   const db = await getDB();
-  await db.put("vaultOutbox", entry);
+  const tx = db.transaction(["vaultOutbox", "settings"], "readwrite");
+  try {
+    const kind: TombstoneKind | null = entry.recordType === "reflection" || entry.recordType === "memory" ? "memory" : entry.recordType === "conversation" ? "conversation" : null;
+    const map = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (!kind || !blockedByTombstone(map, kind, entry.recordId)) await tx.objectStore("vaultOutbox").put(entry);
+  } catch (e) { await abortAndSettleTransaction(tx, e); }
+  await tx.done;
 }
 
 /** `status:"pending"`のentryだけを取得する（起動時reconcileが全record走査をしなくて済むための索引）。 */
@@ -1986,11 +2035,12 @@ export function memoryRepairExpectation(before: MemoryObject, after: MemoryObjec
 /** Do not let an older in-flight Memory projection erase a newer pending task. */
 export async function putMemoryProjectionOutcome(entry: VaultOutboxEntry): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(["memoryObjects", "vaultOutbox"], "readwrite");
+  const tx = db.transaction(["memoryObjects", "vaultOutbox", "settings"], "readwrite");
   try {
     const current = await tx.objectStore("memoryObjects").get(entry.recordId);
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     const existing = await tx.objectStore("vaultOutbox").get(entry.id);
-    if ((!current || current.updatedAt === entry.recordUpdatedAt) &&
+    if (!memoryBlocked(tombs, current ?? { id: entry.recordId }) && (!current || current.updatedAt === entry.recordUpdatedAt) &&
       (!existing || existing.recordUpdatedAt === entry.recordUpdatedAt)) await tx.objectStore("vaultOutbox").put(entry);
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;

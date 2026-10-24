@@ -22,12 +22,170 @@ const dbm = require(path.join(OUT, "lib/db.js")) as typeof import("../db");
 const life = require(path.join(OUT, "lib/dataLifecycle.js")) as typeof import("../dataLifecycle");
 const md = require(path.join(OUT, "lib/markdown.js")) as typeof import("../markdown");
 const testSupport = require(path.join(OUT, "lib/maintenance/testSupport.js")) as typeof import("./testSupport");
+const deletion = require(path.join(OUT, "lib/vaultDeletion.js")) as typeof import("../vaultDeletion");
 
 const T = "2026-08-20T00:00:00.000Z";
 const meta = { id: "meta", source: "ai-capture" as const, sourceType: "chat" as const, schemaVersion: "0.1", createdAt: T, updatedAt: T };
 const memory = (id: string, links: any[] = []): any => ({ id, date: T, types: ["conversation"], conversationId: "c1", content: "本文", summary: "要約", keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links, createdAt: T, updatedAt: T, metadata: meta });
 const tomb = (kind: "memory" | "conversation", id: string, over: Partial<import("../db").Tombstone> = {}): import("../db").Tombstone =>
   ({ v: 1, kind, id, deletedAt: "2026-01-01T00:00:00.000Z", date: T, startedAt: T, vault: "unverified", ...over });
+
+function deletionWorld(id = "erase-me") {
+  const v = new testSupport.FakeVault();
+  const kept = md.memoryObjectToMarkdown(memory("keep-me")) + "\n<!-- external annotation: KEEP EXACTLY -->\n";
+  v.put("moved/deep/renamed.MD", md.memoryObjectToMarkdown(memory(id)) + "\n<!-- tsumugi:entry -->\n\n" + kept);
+  v.put("another/copy.md", md.memoryObjectToMarkdown(memory(id)));
+  v.put(".tsumugi/recovery/backup.md", md.memoryObjectToMarkdown(memory(id)));
+  v.put("private.md", "A handwritten note mentioning " + id);
+  v.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "delete-vault" }));
+  v.put(".tsumugi/index.json", JSON.stringify({ [id]: "moved/deep/renamed.MD", "keep-me": "moved/deep/renamed.MD" }));
+  v.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, registryGeneration: "old-generation", dirtyOwnerInstanceId: null }));
+  v.put(".tsumugi/registry/00.json", JSON.stringify({ schemaVersion: 1, bucket: 0, records: { day: "moved/deep/renamed.MD" }, files: { "moved/deep/renamed.MD": { recordType: "memory-day", contentHash: require(path.join(OUT, "lib/vault.js")).hashVaultText(v.snapshot()["moved/deep/renamed.MD"]), memberIds: [id, "keep-me"], memberHashes: { [id]: "h", "keep-me": "keep-h" }, status: "ok" } } }));
+  v.put(".tsumugi/history/2026-08.json", JSON.stringify({ version: 2, month: "2026-08", days: { "2026-08-20": { conversations: [{ id: "unrelated-conv" }], normalMemories: [{ id }, { id: "keep-me" }], reflections: [] } } }));
+  v.put(".tsumugi/history-meta.json", JSON.stringify({ version: 1, months: { "2026-08": { conversations: 1, memories: 2 } }, totalConversations: 1, totalMemories: 2 }));
+  return { v, kept, t: tomb("memory", id, { vaultId: "delete-vault" }) };
+}
+const planFor = (w: ReturnType<typeof deletionWorld>) => deletion.buildVaultDeletionPlan(new Map(Object.entries(w.v.snapshot())), w.t, "delete-vault", 0);
+
+test("physical deletion: moved/renamed duplicate copies, shared day, History, index and registry converge; unknown bytes and archives survive", async () => {
+  const w = deletionWorld(); const before = w.v.snapshot(); const plan = planFor(w);
+  assert.deepEqual(w.v.snapshot(), before, "preview is read only");
+  await deletion.applyVaultDeletionEdits(w.v.root(), plan);
+  const final = w.v.snapshot();
+  assert.equal(final["moved/deep/renamed.MD"], w.kept);
+  assert.equal(final["another/copy.md"], undefined);
+  assert.equal(final["private.md"], before["private.md"]);
+  assert.equal(final[".tsumugi/recovery/backup.md"], before[".tsumugi/recovery/backup.md"]);
+  assert.deepEqual(JSON.parse(final[".tsumugi/index.json"]), { "keep-me": "moved/deep/renamed.MD" });
+  const row = JSON.parse(final[".tsumugi/registry/00.json"]).files["moved/deep/renamed.MD"];
+  assert.deepEqual(row.memberIds, ["keep-me"]); assert.ok(row.memberHashes["keep-me"]); assert.equal(row.memberHashes["erase-me"], undefined); assert.equal(row.status, "ok");
+  assert.deepEqual(JSON.parse(final[".tsumugi/history/2026-08.json"]).days["2026-08-20"].normalMemories, [{ id: "keep-me" }]);
+  assert.equal(JSON.parse(final[".tsumugi/history-meta.json"]).totalMemories, 1);
+  assert.equal(JSON.parse(final[".tsumugi/registry-meta.json"]).registryGeneration, undefined);
+  await deletion.applyVaultDeletionEdits(w.v.root(), plan); assert.deepEqual(w.v.snapshot(), final, "retry is idempotent");
+});
+
+test("physical deletion: every interrupted prefix resumes safely, including Markdown gone before metadata writes", async () => {
+  const original = deletionWorld(); const plan = planFor(original);
+  for (let n = 0; n <= plan.edits.length; n++) {
+    const v = original.v.copy();
+    await deletion.applyVaultDeletionEdits(v.root(), { ...plan, edits: plan.edits.slice(0, n) });
+    await deletion.applyVaultDeletionEdits(v.root(), plan);
+    assert.equal(v.snapshot()["moved/deep/renamed.MD"], original.kept);
+    assert.equal(JSON.parse(v.snapshot()[".tsumugi/history-meta.json"]).totalMemories, 1);
+  }
+});
+
+test("physical deletion: external edits invalidate confirmation; failure during write preserves other records and retries", async () => {
+  const w = deletionWorld(); const plan = planFor(w);
+  w.v.put("another/copy.md", w.v.snapshot()["another/copy.md"] + "external edit");
+  const before = w.v.snapshot();
+  await assert.rejects(deletion.applyVaultDeletionEdits(w.v.root(), plan), /content-changed/);
+  assert.deepEqual(w.v.snapshot(), before, "preflight catches changes before the first deletion");
+  const w2 = deletionWorld(); const p2 = planFor(w2);
+  w2.v.writeShouldFail.add(".tsumugi/index.json");
+  await assert.rejects(deletion.applyVaultDeletionEdits(w2.v.root(), p2), /simulated write failure/);
+  assert.equal(w2.v.snapshot()["moved/deep/renamed.MD"], w2.kept);
+  w2.v.writeShouldFail.clear(); await deletion.applyVaultDeletionEdits(w2.v.root(), p2);
+  assert.equal(JSON.parse(w2.v.snapshot()[".tsumugi/index.json"])["erase-me"], undefined);
+});
+
+test("physical deletion: a failed file removal stops, preserves the pending suffix, and can be retried", async () => {
+  const w = deletionWorld(); const plan = planFor(w); const root = w.v.root();
+  const getDir = root.getDirectoryHandle.bind(root);
+  root.getDirectoryHandle = async (name: string, options: unknown) => {
+    const dir = await getDir(name, options);
+    if (name === "another") dir.removeEntry = async () => { throw new DOMException("permission lost", "NotAllowedError"); };
+    return dir;
+  };
+  await assert.rejects(deletion.applyVaultDeletionEdits(root, plan), (e: Error) => e.name === "NotAllowedError");
+  assert.ok(w.v.snapshot()["another/copy.md"]);
+  assert.equal(w.v.snapshot()["moved/deep/renamed.MD"], w.kept);
+  await deletion.applyVaultDeletionEdits(w.v.root(), plan);
+  assert.equal(w.v.snapshot()["another/copy.md"], undefined);
+});
+
+test("physical deletion: malformed metadata and ambiguous ownership stop before any mutation", () => {
+  const w = deletionWorld(); w.v.put(".tsumugi/history/2026-08.json", "broken");
+  assert.throws(() => planFor(w));
+  const x = deletionWorld(); x.v.put("foreign.md", "---\nid: erase-me\ndate: 2026-08-20\n---\nuser text");
+  assert.throws(() => planFor(x), /not-owned/);
+});
+
+test("physical deletion removes retained Vault links and conversation references without rewriting their body or unknown fields", async () => {
+  const w = deletionWorld();
+  const linked = memory("keep-linked", [{ id: "l", sourceId: "keep-linked", targetId: w.t.id }]);
+  const body = "\nEXTERNAL TEXT: preserve line breaks\n\n";
+  w.v.put("links.md", md.memoryObjectToMarkdown(linked) + body);
+  w.v.put("talk.md", `---\ntsumugi: true\nid: keep-talk\nstartedAt: ${T}\nmemoryObjectIds: ["${w.t.id}", "keep-linked"]\nunknown: preserve-this\n---\nUser prose\n`);
+  await deletion.applyVaultDeletionEdits(w.v.root(), planFor(w));
+  const result = w.v.snapshot();
+  assert.deepEqual(md.parseMemoryObjectMarkdown(result["links.md"])!.links, []);
+  assert.ok(result["links.md"].endsWith(body));
+  assert.deepEqual(md.parseFrontmatter(result["talk.md"])!.frontmatter.memoryObjectIds, ["keep-linked"]);
+  assert.ok(result["talk.md"].includes("unknown: preserve-this\n---\nUser prose\n"));
+});
+
+test("physical deletion does not bless pre-existing external edits as a safe registry baseline", async () => {
+  const w = deletionWorld();
+  w.v.put("moved/deep/renamed.MD", w.v.snapshot()["moved/deep/renamed.MD"] + "external edit after registry was written\n");
+  await deletion.applyVaultDeletionEdits(w.v.root(), planFor(w));
+  assert.equal(JSON.parse(w.v.snapshot()[".tsumugi/registry/00.json"]).files["moved/deep/renamed.MD"].status, "needs-resync");
+  assert.ok(w.v.snapshot()["moved/deep/renamed.MD"].endsWith("external edit after registry was written\n"));
+});
+
+test("physical deletion: cascade includes Vault-only memories; keeping the conversation's memories is the default", async () => {
+  const v = new testSupport.FakeVault();
+  v.put("moved/talk.md", "---\ntsumugi: true\nid: gone-conversation\nstartedAt: 2026-08-20\n---\nconversation");
+  v.put("moved/mem.md", md.memoryObjectToMarkdown({ ...memory("vault-only"), conversationId: "gone-conversation" }));
+  const files = new Map(Object.entries(v.snapshot()));
+  const plain = deletion.buildVaultDeletionPlan(files, tomb("conversation", "gone-conversation"), "v", 0);
+  assert.deepEqual(plain.ids, ["gone-conversation"]);
+  const cascade = deletion.buildVaultDeletionPlan(files, tomb("conversation", "gone-conversation", { cascade: true }), "v", 0);
+  assert.deepEqual(cascade.ids, ["gone-conversation", "vault-only"]);
+  await deletion.applyVaultDeletionEdits(v.root(), cascade); assert.deepEqual(v.snapshot(), {});
+});
+
+test("physical deletion: durable pending intent cannot be lifted; restart retries the stored plan; complete intent survives purge and restore", async () => {
+  testSupport.installFakeLocks();
+  const w = deletionWorld("durable-delete"); const root = w.v.root(); root.isSameEntry = async () => true;
+  await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated();
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: "delete-vault", activeVaultEpoch: 0, registryGeneration: null, pairedAt: T } as never);
+  await dbm.saveVaultHandle(root);
+  await dbm.putMemoryObject(memory(w.t.id)); await dbm.deleteMemoryByUser(w.t.id, w.t.deletedAt);
+  const seen = (await dbm.getTombstone("memory", w.t.id))!;
+  const plan = await deletion.previewVaultDeletion(root, seen);
+  require(path.join(OUT, "lib/fakeIdb.js")).__failNextPutOn("tsumugi", "settings");
+  const untouched = w.v.snapshot();
+  await assert.rejects(deletion.confirmVaultDeletion(root, plan));
+  assert.deepEqual(w.v.snapshot(), untouched, "a failed intent/journal transaction authorizes no Vault write");
+  assert.equal((await dbm.getTombstone("memory", w.t.id))!.physicalDeletion, undefined);
+  assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), undefined);
+  w.v.writeShouldFail.add(".tsumugi/index.json");
+  await assert.rejects(deletion.confirmVaultDeletion(root, plan), /simulated write failure/);
+  const pending = (await dbm.getTombstone("memory", w.t.id))!;
+  assert.equal(pending.physicalDeletion, "pending"); assert.equal(await life.allowBack(pending), false);
+  assert.ok(await dbm.readPhysicalDeletionJournal("memory", w.t.id));
+  w.v.perm.readwrite = "denied";
+  await assert.rejects(deletion.retryVaultDeletion(root, pending), /permission-required/);
+  w.v.perm.readwrite = "granted"; w.v.writeShouldFail.clear();
+  await deletion.retryVaultDeletion(root, pending);
+  const done = (await dbm.getTombstone("memory", w.t.id))!;
+  assert.equal(done.physicalDeletion, "complete"); assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), undefined);
+  assert.equal(life.purgeDecision(done, "2030-01-01").purgeable, false);
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer(memory(w.t.id)), "tombstoned");
+  assert.equal(await dbm.addMemoryObjectIfAbsentAndMarkSynced(memory(w.t.id), "memory:" + w.t.id), false);
+  assert.equal((await dbm.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [memory(w.t.id)], sources: [] })).insertedMemoryObjects, 0);
+  const vault = require(path.join(OUT, "lib/vault.js")) as typeof import("../vault");
+  const final = w.v.snapshot();
+  await assert.rejects(vault.writeMemoryObjectMarkdown(root, memory(w.t.id)), /deleted-record-write-refused/);
+  await assert.rejects(vault.writeMemoryObjectMarkdown(root, memory("live-old-snapshot", [{ sourceId: "live-old-snapshot", targetId: w.t.id }])), /deleted-reference-write-refused/);
+  await assert.rejects(vault.writeConversationMarkdown(root, { id: "live-conversation", memoryObjectIds: [w.t.id] } as never), /deleted-reference-write-refused/);
+  await dbm.setVaultSyncState("memory:" + w.t.id, "late-success");
+  assert.equal(await dbm.getVaultSyncState("memory:" + w.t.id), undefined);
+  assert.deepEqual(w.v.snapshot(), final, "a delayed Capture snapshot cannot recreate the erased Vault record");
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: null, activeVaultEpoch: null, registryGeneration: null, pairedAt: null } as never);
+});
 
 test("Vault presence: found by id wherever the file was moved to; a mention of the id in another record, or an index.json key alone, is NOT presence", async () => {
   const v = new testSupport.FakeVault();

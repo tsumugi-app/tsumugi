@@ -11,8 +11,8 @@
  *                (3) the user did not choose to keep the Vault copy ("kept" is never purged automatically).
  *              The user can also lift a tombstone explicitly ("allow it back"), which only re-enables restoring it from the Vault.
  *
- * What this does NOT do (explicit, see docs/data-lifecycle.md): it never deletes a Vault file by itself. The Vault copy of a deleted record is removed by the
- * user (or a later, separately reviewed propagation step); until it is verified absent, the tombstone stays as the guard.
+ * Physical Vault deletion lives in vaultDeletion.ts and requires its own preview and explicit confirmation.
+ * This module only verifies/purges ordinary local-deletion guards; physical-deletion guards are retained indefinitely.
  * Nothing here logs or sends anything.
  */
 import {
@@ -124,6 +124,8 @@ export async function findRecordInVault(root: FileSystemDirectoryHandle, id: str
 
 /** Pure. Why a tombstone may or may not be forgotten now. */
 export function purgeDecision(t: Tombstone, now: string, retentionDays: number = PURGE_AFTER_DAYS): { purgeable: boolean; reason: "vault-copy-may-exist" | "kept-by-user" | "too-recent" | "ok" } {
+  // Offline tabs, external copies and recovery archives have no bounded retention time.
+  if (t.physicalDeletion) return { purgeable: false, reason: "vault-copy-may-exist" };
   if (t.vault === "kept") return { purgeable: false, reason: "kept-by-user" };
   if (t.vault !== "absent") return { purgeable: false, reason: "vault-copy-may-exist" };
   const age = Date.parse(now) - Date.parse(t.deletedAt);
