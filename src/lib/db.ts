@@ -971,13 +971,15 @@ export async function putConversationAndMarkSynced(conversation: Conversation, s
 
 export async function putMemoryObjectAndMarkSynced(memoryObject: MemoryObject, syncKey: string, expectedStored?: MemoryObject): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(["memoryObjects", "vaultSyncState"], "readwrite");
+  const tx = db.transaction(["memoryObjects", "vaultSyncState", "settings", "vaultOutbox"], "readwrite");
   try {
     const stored = await tx.objectStore("memoryObjects").get(memoryObject.id);
     assertMemoryLineage(stored, memoryObject);
     if (expectedStored !== undefined && JSON.stringify(stored) !== JSON.stringify(expectedStored)) throw new ConcurrentModificationError(memoryObject.id);
-    await tx.objectStore("memoryObjects").put(memoryObject);
-    await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
+    // an edit that came from the Vault may still link to a Memory the user deleted: the link is dropped and the correction queued instead of marking the copy synced
+    const s = await sanitizeTombstonedLinksInTx(tx, memoryObject, parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY)));
+    await tx.objectStore("memoryObjects").put(s.memory);
+    if (!s.changed) await tx.objectStore("vaultSyncState").put(memoryObject.updatedAt, syncKey);
   } catch (error) {
     await abortAndSettleTransaction(tx, error);
   }

@@ -645,6 +645,9 @@ test("a Memory copied in from the Vault never keeps a link to a deleted Memory: 
   await check("lk-add", false);
   assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(withLink("lk-restore")), "written");
   await check("lk-restore", false);
+  await dbMod.putMemoryObject(fromConversation("lk-edit", "c1"));
+  await dbMod.putMemoryObjectAndMarkSynced(withLink("lk-edit"), "memory:lk-edit");                 // an edit from the Vault that still has the old link
+  await check("lk-edit", false);
   // a link to a Memory that was NOT deleted stays, and the copy is synced as before
   await dbMod.putMemoryObject(fromConversation("lk-live", "c1"));
   assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced({ ...fromConversation("lk-ok", "c1"), links: [testLink("l-ok", "lk-ok", "lk-live")] }, "memory:lk-ok"), true);

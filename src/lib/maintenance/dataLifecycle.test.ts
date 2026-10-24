@@ -181,3 +181,13 @@ test("the Vault copy check for 'keep both' also looks in Sources/", async () => 
   assert.equal(await life.findRecordInVault(v.root(), "src-1"), "present");
   assert.equal(await life.findRecordInVault(v.root(), "src-2"), "absent");
 });
+
+test("the presence scan covers the whole visible Vault (record folders nested anywhere, like the restore scan), but not hidden folders", async () => {
+  const v = new testSupport.FakeVault();
+  v.put("archive/Memories/2026-01-01.md", md.serializeMemoryDayFile([memory("nested-mem")]));
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("memory", "nested-mem")), "present");
+  assert.equal(await life.checkTombstoneInVault(v.root(), tomb("memory", "other")), "absent");
+  const hidden = new testSupport.FakeVault();
+  hidden.put(".tsumugi/recovery/x.md", md.serializeMemoryDayFile([memory("hidden-mem")]));
+  assert.equal(await life.checkTombstoneInVault(hidden.root(), tomb("memory", "hidden-mem")), "absent");
+});
