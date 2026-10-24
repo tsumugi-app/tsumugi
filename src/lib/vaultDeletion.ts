@@ -17,6 +17,8 @@ export interface DeletionEdit { path: string; before: string | null; after: stri
 export interface VaultDeletionPlan {
   version: 1; tombstone: Tombstone; vaultId: string; epoch: number;
   ids: string[]; edits: DeletionEdit[];
+  /** Days (YYYY-MM-DD) whose History counts the plan corrects. Kept in the saved plan so a continuation rebuilt later still corrects them, even after the Markdown that named them is gone. */
+  affectedDays?: string[];
   /** A fresh explicit review can repair a partial Worker write; bound to the saved plan. */
   repairOf?: string;
 }
@@ -107,10 +109,10 @@ function withoutDeletedReferences(entry: Entry, ids: Set<string>): Entry {
 }
 
 /** Pure plan builder used by both browser and fault-injection tests. No file is created. */
-export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone, vaultId: string, epoch: number, priorIds: string[] = []): VaultDeletionPlan {
+export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone, vaultId: string, epoch: number, priorIds: string[] = [], priorDays: string[] = []): VaultDeletionPlan {
   const ids = new Set([t.id, ...priorIds]);
   const edits: DeletionEdit[] = []; const changedPaths = new Map<string, string | null>();
-  const affectedDays = new Set<string>();
+  const affectedDays = new Set<string>(priorDays);
   if (t.date) affectedDays.add(t.date.slice(0, 10));
   const remainingByDay = new Map<string, Set<string>>();
   const remainingPathsByDay = new Map<string, Set<string>>();
@@ -238,7 +240,7 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
     const v = json(before); delete v.registryGeneration; v.dirtyOwnerInstanceId = null;
     edits.unshift({ path: ".tsumugi/registry-meta.json", before, after: encode(v) });
   }
-  return { version: 1, tombstone: t, vaultId, epoch, ids: [...ids], edits };
+  return { version: 1, tombstone: t, vaultId, epoch, ids: [...ids], edits, affectedDays: [...affectedDays].sort() };
 }
 
 /** Exact comparison, not a non-cryptographic hash. Accept before OR after for crash replay. */
@@ -294,7 +296,7 @@ export async function previewVaultDeletion(root: FileSystemDirectoryHandle, seen
     if (saved) validateSavedPlan(saved, t, vaultId, epoch, true);
     if (saved) await assertReplayable(root, saved);
     const priorIds = saved?.ids ?? [];
-    return buildVaultDeletionPlan(await inventory(root), t, vaultId, epoch, priorIds);
+    return buildVaultDeletionPlan(await inventory(root), t, vaultId, epoch, priorIds, saved?.affectedDays ?? []);
   });
 }
 export async function confirmVaultDeletion(root: FileSystemDirectoryHandle, confirmed: VaultDeletionPlan): Promise<void> {
@@ -309,7 +311,7 @@ export async function confirmVaultDeletion(root: FileSystemDirectoryHandle, conf
     }
     const now = confirmed.repairOf
       ? await buildRepairPlan(root, confirmed.tombstone, vaultId, epoch)
-      : buildVaultDeletionPlan(await inventory(root), confirmed.tombstone, vaultId, epoch, confirmed.ids);
+      : buildVaultDeletionPlan(await inventory(root), confirmed.tombstone, vaultId, epoch, confirmed.ids, confirmed.affectedDays ?? []);
     if (JSON.stringify(now) !== JSON.stringify(confirmed)) return fail("preview-changed");
     await beginPhysicalDeletion(confirmed.tombstone, JSON.stringify(confirmed), confirmed.tombstone.kind === "conversation" && confirmed.tombstone.cascade ? confirmed.ids.filter((id) => id !== confirmed.tombstone.id) : []);
     await execute(root, confirmed);

@@ -730,3 +730,36 @@ test("delete flow: a Vault paired by the REAL startup adoption (not a hand-writt
   assert.deepEqual(await flow.executeDelete(review, { kind: "ready", root }), { status: "done", vault: "deleted" });
   assert.ok(!hasId(v.snapshot()["Memories/2026-08-20.md"] ?? "", id));
 });
+
+test("continuing an interrupted CASCADE deletion still corrects the History day counts of the already-erased children (the affected days are kept in the saved plan)", async () => {
+  testSupport.installFakeLocks();
+  const v = new testSupport.FakeVault(); const root = v.root(); root.isSameEntry = async () => true;
+  const epoch = await dbm.getActiveVaultEpoch(); await dbm.markVaultEpochCommitted(epoch); await dbm.markVaultWorldJournalMigrated();
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: "hist-vault", activeVaultEpoch: epoch, registryGeneration: null, pairedAt: T } as never);
+  await dbm.saveVaultHandle(root);
+  const c = "hist-conv", child = "hist-child", keeper = "hist-keeper";
+  const childMem = { ...memory(child), conversationId: c }, keepMem = { ...memory(keeper), conversationId: "hist-other" };
+  await dbm.putConversation(conv(c, [child])); await dbm.putMemoryObject(childMem); await dbm.putMemoryObject(keepMem);
+  v.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "hist-vault" }));
+  v.put(".tsumugi/index.json", JSON.stringify({ [c]: "Conversations/c.md", [child]: "Memories/day.md", [keeper]: "Memories/day.md" }));
+  v.put("Conversations/c.md", md.conversationToMarkdown(conv(c, [child])));
+  v.put("Memories/day.md", md.serializeMemoryDayFile([childMem, keepMem]));
+  v.put(".tsumugi/history/2026-08.json", JSON.stringify({ version: 1, month: "2026-08", days: { "2026-08-20": { conversationIds: [c], reflectionIds: [], normalMemoryCount: 2, memoryCount: 2 } } }));
+  v.put(".tsumugi/history-meta.json", JSON.stringify({ version: 1, months: { "2026-08": { conversations: 1, memories: 2 } }, totalConversations: 1, totalMemories: 2 }));
+  await dbm.deleteConversationWithMemoriesByUser(c);
+  const t = (await dbm.getTombstone("conversation", c))!;
+  const plan = await deletion.previewVaultDeletion(root, t);
+  const countOf = (p: typeof plan) => JSON.parse(p.edits.find((e) => e.path === ".tsumugi/history/2026-08.json")!.after!).days["2026-08-20"].normalMemoryCount;
+  assert.equal(countOf(plan), 1, "the original plan corrects the day count");
+  v.writeShouldFail.add(".tsumugi/history/2026-08.json");                                       // stop after the Markdown is gone, before the History is corrected
+  await assert.rejects(deletion.confirmVaultDeletion(root, plan));
+  v.writeShouldFail.clear();
+  assert.ok(!hasId(v.snapshot()["Memories/day.md"], child), "the child's Markdown is already erased");
+  const pending = (await dbm.getTombstone("conversation", c))!;
+  const again = await deletion.previewVaultDeletion(root, pending);                              // what "continue deleting" shows
+  assert.equal(countOf(again), 1, "the continuation still corrects the History count");
+  await deletion.confirmVaultDeletion(root, again);
+  assert.equal(JSON.parse(v.snapshot()[".tsumugi/history/2026-08.json"]).days["2026-08-20"].normalMemoryCount, 1);
+  assert.equal(JSON.parse(v.snapshot()[".tsumugi/history-meta.json"]).totalMemories, 1);
+  assert.equal((await dbm.getTombstone("conversation", c))!.physicalDeletion, "complete");
+});
