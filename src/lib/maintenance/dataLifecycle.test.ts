@@ -480,3 +480,96 @@ test("a child Memory can not be allowed back while the cascade tombstone of its 
   await dbm.deleteMemoryByUser("solo-mem", "2026-01-01T00:00:00.000Z");
   assert.equal(await life.allowBack((await dbm.getTombstone("memory", "solo-mem"))!), true);
 });
+
+// ---- Resuming a physical deletion after the same Vault was reconnected (the world epoch moved on) -------------------------------------------------------
+async function pairedWorld(id: string) {
+  testSupport.installFakeLocks();
+  const w = deletionWorld(id); const root = w.v.root(); root.isSameEntry = async () => true;
+  const epoch = await dbm.getActiveVaultEpoch();
+  await dbm.markVaultEpochCommitted(epoch); await dbm.markVaultWorldJournalMigrated();
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId: "delete-vault", activeVaultEpoch: epoch, registryGeneration: null, pairedAt: T } as never);
+  await dbm.saveVaultHandle(root);
+  await dbm.putMemoryObject(memory(w.t.id)); await dbm.deleteMemoryByUser(w.t.id, w.t.deletedAt);
+  return { w, root };
+}
+/** the app connects (the same or another) Vault: the world epoch advances and the identity record follows */
+async function connect(vaultId: string, root: FileSystemDirectoryHandle) {
+  const e = await dbm.getActiveVaultEpoch();
+  await dbm.bumpActiveVaultEpoch(e); await dbm.markVaultEpochCommitted(e + 1);
+  await dbm.putVaultIdentityRecord({ id: "current", vaultId, activeVaultEpoch: e + 1, registryGeneration: null, pairedAt: T } as never);
+  await dbm.saveVaultHandle(root);
+}
+async function failHalfway(id: string) {
+  const { w, root } = await pairedWorld(id);
+  const plan = await deletion.previewVaultDeletion(root, (await dbm.getTombstone("memory", w.t.id))!);
+  w.v.writeShouldFail.add(".tsumugi/index.json");
+  await assert.rejects(deletion.confirmVaultDeletion(root, plan), /simulated write failure/);
+  w.v.writeShouldFail.clear();
+  return { w, root, pending: (await dbm.getTombstone("memory", w.t.id))! };
+}
+
+test("a deletion that failed halfway resumes after the SAME Vault was reconnected, but only after the changes are shown again and confirmed (nothing runs by itself)", async () => {
+  const { w, root, pending } = await failHalfway("rebind-same");
+  assert.equal(pending.physicalDeletion, "pending");
+  await connect("delete-vault", root);                                        // reconnecting the same folder advances the epoch
+  const stuck = w.v.snapshot(); const evidence = await dbm.readPhysicalDeletionJournal("memory", w.t.id);
+  await assert.rejects(deletion.retryVaultDeletion(root, pending), /journal-world-mismatch/);        // the one-click retry does NOT resume by itself
+  assert.deepEqual(w.v.snapshot(), stuck, "no file changed"); assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), evidence);
+  assert.equal((await dbm.getTombstone("memory", w.t.id))!.physicalDeletion, "pending", "the guard is kept");
+  const plan = await deletion.previewVaultDeletion(root, pending);              // the review step is allowed
+  assert.equal(plan.epoch, await dbm.getActiveVaultEpoch(), "rebuilt under the current epoch");
+  assert.deepEqual(w.v.snapshot(), stuck, "the preview is read only");
+  await deletion.confirmVaultDeletion(root, plan);                              // explicit confirmation completes it
+  const done = (await dbm.getTombstone("memory", w.t.id))!;
+  assert.equal(done.physicalDeletion, "complete"); assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), undefined);
+  assert.equal(w.v.snapshot()["moved/deep/renamed.MD"], w.kept, "the other record in the shared file survives");
+  assert.equal(w.v.snapshot()["another/copy.md"], undefined);
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer(memory(w.t.id)), "tombstoned");
+});
+
+test("switching to ANOTHER Vault refuses everything and changes nothing; coming back to the original Vault resumes it", async () => {
+  const { w, root, pending } = await failHalfway("rebind-other");
+  const other = new testSupport.FakeVault(); other.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "another-vault" }));
+  other.put("another-note.md", "---\ntsumugi: true\nid: unrelated\n---\n"); const otherRoot = other.root(); otherRoot.isSameEntry = async () => true;
+  await connect("another-vault", otherRoot);
+  const before = w.v.snapshot(), otherBefore = other.snapshot(); const evidence = await dbm.readPhysicalDeletionJournal("memory", w.t.id);
+  await assert.rejects(deletion.previewVaultDeletion(otherRoot, pending)); await assert.rejects(deletion.retryVaultDeletion(otherRoot, pending));
+  await assert.rejects(deletion.previewVaultDeletionRepair(otherRoot, pending));
+  await assert.rejects(deletion.previewVaultDeletion(root, pending), "the original folder is not the connected Vault now");
+  assert.deepEqual(w.v.snapshot(), before); assert.deepEqual(other.snapshot(), otherBefore);
+  const t = (await dbm.getTombstone("memory", w.t.id))!;
+  assert.equal(t.physicalDeletion, "pending"); assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), evidence);
+  assert.equal(await life.allowBack(t), false, "the guard can not be lifted while the deletion is pending");
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer(memory(w.t.id)), "tombstoned");
+  await connect("delete-vault", root);                                          // back to the original Vault (a newer epoch again)
+  await deletion.confirmVaultDeletion(root, await deletion.previewVaultDeletion(root, (await dbm.getTombstone("memory", w.t.id))!));
+  assert.equal((await dbm.getTombstone("memory", w.t.id))!.physicalDeletion, "complete");
+});
+
+test("after a reconnect, an externally changed file is refused (the content must still be exactly the saved before / after state) and nothing is written", async () => {
+  const { w, root, pending } = await failHalfway("rebind-edited");
+  await connect("delete-vault", root);
+  w.v.put("moved/deep/renamed.MD", "someone edited this file by hand after the interruption");
+  const before = w.v.snapshot(); const evidence = await dbm.readPhysicalDeletionJournal("memory", w.t.id);
+  await assert.rejects(deletion.previewVaultDeletion(root, pending), /content-review-required/);
+  await assert.rejects(deletion.retryVaultDeletion(root, pending));
+  assert.deepEqual(w.v.snapshot(), before); assert.equal(await dbm.readPhysicalDeletionJournal("memory", w.t.id), evidence, "the retained evidence is kept");
+  assert.equal((await dbm.getTombstone("memory", w.t.id))!.physicalDeletion, "pending");
+});
+
+test("a torn write still needs the explicit content review (repair) after a reconnect; the ordinary resume never accepts it", async () => {
+  const { w, root, pending } = await failHalfway("rebind-torn");
+  w.v.put("moved/deep/renamed.MD", "torn Worker write after process termination");
+  await connect("delete-vault", root);
+  const torn = w.v.snapshot();
+  await assert.rejects(deletion.previewVaultDeletion(root, pending), /content-review-required/);
+  await assert.rejects(deletion.retryVaultDeletion(root, pending));
+  assert.deepEqual(w.v.snapshot(), torn);
+  const repair = await deletion.previewVaultDeletionRepair(root, pending);     // the existing review-and-repair flow works under the new epoch
+  assert.equal(repair.epoch, await dbm.getActiveVaultEpoch());
+  assert.equal(repair.edits.find((e) => e.path === "moved/deep/renamed.MD")!.before, "torn Worker write after process termination");
+  assert.deepEqual(w.v.snapshot(), torn, "the repair preview is read only");
+  await deletion.confirmVaultDeletion(root, repair);
+  assert.equal((await dbm.getTombstone("memory", w.t.id))!.physicalDeletion, "complete");
+  assert.equal(w.v.snapshot()["moved/deep/renamed.MD"], w.kept);
+});

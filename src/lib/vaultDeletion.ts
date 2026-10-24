@@ -282,7 +282,7 @@ export async function previewVaultDeletion(root: FileSystemDirectoryHandle, seen
     if (t.physicalDeletionParent) return fail("parent-deletion-required");
     const prior = await readPhysicalDeletionJournal(t.kind, t.id);
     const saved: VaultDeletionPlan | null = prior ? JSON.parse(prior) : null;
-    if (saved) validateSavedPlan(saved, t, vaultId, epoch);
+    if (saved) validateSavedPlan(saved, t, vaultId, epoch, true);
     if (saved) await assertReplayable(root, saved);
     const priorIds = saved?.ids ?? [];
     return buildVaultDeletionPlan(await inventory(root), t, vaultId, epoch, priorIds);
@@ -295,7 +295,7 @@ export async function confirmVaultDeletion(root: FileSystemDirectoryHandle, conf
     if (!confirmed.repairOf && confirmed.tombstone.physicalDeletion === "pending") {
       const raw = await readPhysicalDeletionJournal(confirmed.tombstone.kind, confirmed.tombstone.id);
       if (!raw) return fail("journal-missing");
-      const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, confirmed.tombstone, vaultId, epoch);
+      const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, confirmed.tombstone, vaultId, epoch, true);
       await assertReplayable(root, saved);
     }
     const now = confirmed.repairOf
@@ -312,8 +312,14 @@ async function assertReplayable(root: FileSystemDirectoryHandle, saved: VaultDel
     if (current !== e.before && current !== e.after) return fail("content-review-required:" + e.path);
   }
 }
-function validateSavedPlan(plan: VaultDeletionPlan, seen: Tombstone, vaultId: string, epoch: number): void {
-  if (plan.version !== 1 || plan.vaultId !== vaultId || plan.epoch !== epoch || plan.tombstone.deletedAt !== seen.deletedAt || plan.tombstone.id !== seen.id || plan.tombstone.kind !== seen.kind || plan.tombstone.cascade !== seen.cascade) return fail("journal-world-mismatch");
+/**
+ * `rebindEpoch` is true ONLY on the paths where the user reviews and explicitly confirms the changes again (preview, confirmation, repair preview): the saved plan was
+ * made under an older world epoch (the same Vault was reconnected since), and the confirmed plan is rebuilt under the CURRENT epoch. Everything else is unchanged:
+ * the Vault must be the very one the plan was made for (vaultId), the tombstone must be the same one, and (checked by the callers) every file must still be exactly
+ * in its saved before or after state. The one-click retry keeps the strict epoch match, so nothing is resumed automatically after a reconnect.
+ */
+function validateSavedPlan(plan: VaultDeletionPlan, seen: Tombstone, vaultId: string, epoch: number, rebindEpoch = false): void {
+  if (plan.version !== 1 || plan.vaultId !== vaultId || typeof plan.epoch !== "number" || (!rebindEpoch && plan.epoch !== epoch) || plan.tombstone.deletedAt !== seen.deletedAt || plan.tombstone.id !== seen.id || plan.tombstone.kind !== seen.kind || plan.tombstone.cascade !== seen.cascade) return fail("journal-world-mismatch");
   if (!Array.isArray(plan.edits) || !Array.isArray(plan.ids) || plan.ids.some((id) => typeof id !== "string") || plan.edits.some((e) => typeof e.path !== "string" || (e.before !== null && typeof e.before !== "string") || (e.after !== null && typeof e.after !== "string") || !safePath(e.path) || !(e.path.toLowerCase().endsWith(".md") && !e.path.split("/").some((p) => p.startsWith(".")) || /^\.tsumugi\/(index|history-meta|registry-meta)\.json$/.test(e.path) || /^\.tsumugi\/(history\/\d{4}-\d{2}|registry\/[0-9a-f]{2})\.json$/.test(e.path)))) return fail("journal-malformed");
 }
 async function journalDigest(raw: string): Promise<string> {
@@ -324,11 +330,11 @@ async function buildRepairPlan(root: FileSystemDirectoryHandle, seen: Tombstone,
   if (!current || JSON.stringify(current) !== JSON.stringify(seen) || current.physicalDeletion !== "pending") return fail("deletion-intent-changed");
   if (current.physicalDeletionParent) return fail("parent-deletion-required");
   const raw = await readPhysicalDeletionJournal(seen.kind, seen.id); if (!raw) return fail("journal-missing");
-  const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, seen, vaultId, epoch);
+  const saved: VaultDeletionPlan = JSON.parse(raw); validateSavedPlan(saved, seen, vaultId, epoch, true);
   const edits: DeletionEdit[] = [];
   // Preserve the previously confirmed AFTER text. No parsing/reserializing a possibly torn file.
   for (const e of saved.edits) edits.push({ ...e, before: await read(root, e.path) });
-  return { ...saved, tombstone: current, edits, repairOf: await journalDigest(raw) };
+  return { ...saved, epoch, tombstone: current, edits, repairOf: await journalDigest(raw) };
 }
 /** Read-only preview of restoring the already-confirmed results after a torn write.
  * UI must display current/desired text, and confirmation rechecks both journal and files.

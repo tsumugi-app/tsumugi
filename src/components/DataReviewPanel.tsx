@@ -64,7 +64,7 @@ export default function DataReviewPanel() {
   async function act(fn: () => Promise<string>) {
     if (busy) return;
     setBusy(true); setMessage(null); setConfirming(null);
-    try { setMessage(await fn()); } catch (e) { const n = (e as Error)?.name ?? "error"; setMessage(n === "RecoveryPendingError" ? "メンテナンス中、または復旧が必要な状態のため、今はできません。" : n === "TombstonedRecordError" ? "削除済みの記録のため、できません。" : "完了していません。接続・権限・ファイルの変更を確認し、対象を再確認してから再試行してください: " + ((e as Error)?.message ?? n)); }
+    try { setMessage(await fn()); } catch (e) { const n = (e as Error)?.name ?? "error"; setMessage(n === "RecoveryPendingError" ? "メンテナンス中、または復旧が必要な状態のため、今はできません。" : n === "TombstonedRecordError" ? "削除済みの記録のため、できません。" : (/journal-world-mismatch/.test((e as Error)?.message ?? "") ? "保存先に接続し直したため、そのまま再試行はできません。何も変更していません。「保存先の削除対象を確認…」から、内容を確認して再開してください。" : "完了していません。接続・権限・ファイルの変更を確認し、対象を再確認してから再試行してください: " + ((e as Error)?.message ?? n))); }
     finally { setBusy(false); await load(); }
   }
   async function vaultRoot(mode: "read" | "readwrite" = "read"): Promise<FileSystemDirectoryHandle | null> {
