@@ -763,3 +763,84 @@ test("continuing an interrupted CASCADE deletion still corrects the History day 
   assert.equal(JSON.parse(v.snapshot()[".tsumugi/history-meta.json"]).totalMemories, 1);
   assert.equal((await dbm.getTombstone("conversation", c))!.physicalDeletion, "complete");
 });
+
+// ---- Conversation-centred deletion (calendar): ownership decides, never the text ------------------------------------------------------------------------------
+const lk = (id: string, a: string, b: string): any => ({ id, sourceId: a, targetId: b, axis: "theme", reason: "r", contrast: false, strength: 0.5, createdBy: "ai-inference", createdAt: T });
+async function topicWorld(tag: string) {
+  const w = await flowWorld(tag);
+  const c = w.c, other = w.other;
+  const m3 = `${tag}-m3`, refl = `${tag}-refl`, otherRefl = `${tag}-orefl`;
+  // conversation A owns m1, m3 and a Reflection; conversation B (another day) talks about the SAME topic and owns m2 (which links to m1) and its own Reflection
+  const mem1 = { ...memory(w.m1), conversationId: c, summary: "ガンダムの話", keywords: ["ガンダム"] }, mem3 = { ...memory(m3), conversationId: c, summary: "ガンダムの続き", keywords: ["ガンダム"] };
+  const mem2 = { ...memory(w.m2), conversationId: other, summary: "ガンダムの別の日の話", keywords: ["ガンダム"], links: [lk(`${tag}-lk`, w.m2, w.m1)] };
+  const reflA = { ...memory(refl), conversationId: c, metadata: { ...meta, source: "system-generated" as const } }, reflB = { ...memory(otherRefl), conversationId: other, metadata: { ...meta, source: "system-generated" as const } };
+  await dbm.putConversation(conv(c, [w.m1, m3])); await dbm.putConversation(conv(other, [w.m2]));
+  for (const m of [mem1, mem3, mem2, reflA, reflB]) await dbm.putMemoryObject(m);
+  w.v.put("Memories/day.md", md.serializeMemoryDayFile([mem1, mem3, mem2]));
+  w.v.put("Memories/reflection-a.md", md.memoryObjectToMarkdown(reflA)); w.v.put("Memories/reflection-b.md", md.memoryObjectToMarkdown(reflB));
+  w.v.put(".tsumugi/index.json", JSON.stringify({ [c]: "Conversations/c.md", [other]: "Conversations/o.md", [w.m1]: "Memories/day.md", [m3]: "Memories/day.md", [w.m2]: "Memories/day.md", [refl]: "Memories/reflection-a.md", [otherRefl]: "Memories/reflection-b.md" }));
+  return { ...w, m3, refl, otherRefl };
+}
+
+test("calendar deletion: from ONE Memory the whole conversation goes (all its Memories and its Reflection, device and Vault); a different conversation on the same topic stays and only loses its link", async () => {
+  const w = await topicWorld("cv1");
+  const resolved = await flow.resolveConversationOfMemory(w.m3);                            // the user pressed delete on Memory m3
+  assert.deepEqual(resolved, { ok: true, conversationId: w.c });
+  const review = await flow.prepareConversationDelete(w.c, w.access);
+  assert.equal(review.blocker, null); assert.equal(review.memoryCount, 2); assert.equal(review.reflectionCount, 1); assert.equal(review.preview.title, "こんにちは");
+  const before = w.v.snapshot();
+  assert.deepEqual(w.v.snapshot(), before, "preparing writes nothing");
+  assert.ok(await dbm.getConversation(w.c));
+  assert.deepEqual(await flow.executeDelete(review, w.access), { status: "done", vault: "deleted" });
+  // gone from the device
+  for (const id of [w.m1, w.m3, w.refl]) assert.equal(await dbm.getMemoryObject(id), undefined, id);
+  assert.equal(await dbm.getConversation(w.c), undefined);
+  // gone from the Vault (Markdown, day file members, reflection file)
+  const snap = w.v.snapshot();
+  assert.equal(snap["Conversations/c.md"], undefined); assert.equal(snap["Memories/reflection-a.md"], undefined);
+  for (const id of [w.m1, w.m3, w.refl]) assert.ok(!hasId(snap["Memories/day.md"], id) && !Object.values(snap).some((t) => hasId(t, id)), `${id} is nowhere in the Vault`);
+  // the other conversation (same topic) is untouched, except that its link to the deleted Memory is gone
+  assert.ok(await dbm.getConversation(w.other)); assert.ok(await dbm.getMemoryObject(w.otherRefl));
+  const m2 = (await dbm.getMemoryObject(w.m2))!; assert.equal(m2.summary, "ガンダムの別の日の話"); assert.deepEqual(m2.links, []);
+  assert.ok(snap["Conversations/o.md"]); assert.ok(hasId(snap["Memories/day.md"], w.m2)); assert.ok(snap["Memories/reflection-b.md"]);
+  assert.ok(!JSON.parse(snap[".tsumugi/index.json"])[w.m1] && JSON.parse(snap[".tsumugi/index.json"])[w.m2], "the index forgets the deleted records only");
+  // nothing of it comes back
+  for (const id of [w.m1, w.m3, w.refl]) assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(id), conversationId: w.c }), "tombstoned");
+  assert.equal(await dbm.restoreConversationIfNotNewer(conv(w.c, [])), "tombstoned");
+});
+
+test("calendar deletion: a Memory whose origin can not be established is never deleted by guess", async () => {
+  const w = await flowWorld("cv2");
+  await dbm.putMemoryObject({ ...memory("cv2-orphan"), conversationId: undefined });
+  await dbm.putMemoryObject({ ...memory("cv2-source"), conversationId: undefined, sourceId: "some-source" });
+  await dbm.putMemoryObject({ ...memory("cv2-lost"), conversationId: "cv2-conversation-not-on-this-device" });
+  for (const id of ["cv2-orphan", "cv2-source", "cv2-lost", "cv2-not-there"]) {
+    const r = await flow.resolveConversationOfMemory(id);
+    assert.equal(r.ok, false, id); assert.ok(/何も削除していません/.test((r as { message: string }).message), id);
+    assert.ok(await dbm.getMemoryObject(id) || id === "cv2-not-there", "and nothing was deleted");
+  }
+  // a conversation listing a Memory that belongs to another conversation: that Memory is kept (and reported), not deleted
+  await dbm.putConversation(conv(w.c, [w.m1, w.m2]));                                       // m2's lineage is the OTHER conversation
+  const review = await flow.prepareConversationDelete(w.c, w.access);
+  assert.equal(review.keptUnverified, 1);
+  assert.deepEqual(await flow.executeDelete(review, w.access), { status: "done", vault: "deleted" });
+  assert.ok(await dbm.getMemoryObject(w.m2), "the other conversation's Memory survives"); assert.equal(await dbm.getMemoryObject(w.m1), undefined);
+  assert.ok(hasId(w.v.snapshot()["Memories/day.md"], w.m2));
+});
+
+test("calendar deletion: an interrupted deletion keeps the guard and finishes through 'continue'; the conversation is already gone from the lists", async () => {
+  const w = await topicWorld("cv3");
+  const review = await flow.prepareConversationDelete(w.c, w.access);
+  w.v.writeShouldFail.add(".tsumugi/index.json");
+  const out = await flow.executeDelete(review, w.access);
+  assert.equal(out.status, "incomplete"); assert.ok(/削除を続ける/.test((out as { message: string }).message) || !/vault-deletion/.test((out as { message: string }).message));
+  w.v.writeShouldFail.clear();
+  assert.equal(await dbm.getConversation(w.c), undefined, "off the device already");
+  assert.equal(await dbm.restoreMemoryObjectIfNotNewer({ ...memory(w.m1), conversationId: w.c }), "tombstoned");
+  const pending = (await flow.listIncompleteDeletions()).find((t) => t.id === w.c)!;
+  assert.ok(pending, "listed so the settings screen can tell the user that a deletion has to be completed");
+  const cont = await flow.continueDelete(pending, w.access);
+  assert.deepEqual(await flow.finishContinuedDelete(w.access, cont), { status: "done", vault: "deleted" });
+  assert.ok(!Object.values(w.v.snapshot()).some((t) => hasId(t, w.m1) || hasId(t, w.refl)));
+  assert.ok(await dbm.getMemoryObject(w.m2));
+});

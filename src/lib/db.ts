@@ -610,6 +610,7 @@ async function removeMemoryInTx(
     }
   }
   await memories.delete(m.id);
+  await tx.objectStore("connectState").delete(m.id);                         // bookkeeping of the Connect step for this Memory (no content)
   for (const type of ["memory", "reflection"]) await outbox.delete(vaultOutboxIdFor(type, m.id));
   await ledger.delete(`memory:${m.id}`);
   map[tombstoneId("memory", m.id)] = { v: 1, kind: "memory", id: m.id, deletedAt: now, date: m.date, conversationId: m.conversationId, vault: "unverified" };
@@ -726,7 +727,7 @@ async function cleanReferencesToMissingMemoryInTx(tx: { objectStore(name: string
   }
 }
 
-const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings", "vaultIdentity"] as const;
+const LIFECYCLE_STORES = ["memoryObjects", "conversations", "vaultOutbox", "vaultSyncState", "settings", "vaultIdentity", "connectState"] as const;
 
 /** Tombstones created in this transaction remember which Vault this device was paired with. */
 async function stampNewTombstonesInTx(tx: { objectStore(name: string): any }, map: TombstoneMap, now: string): Promise<void> {   // eslint-disable-line @typescript-eslint/no-explicit-any

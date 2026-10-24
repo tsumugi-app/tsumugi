@@ -3,6 +3,7 @@
 // Fictional data only. The OS folder picker and its permission prompts are NOT exercised here (OPFS handles need no prompt).
 import * as dbm from "../../src/lib/db";
 import * as deletion from "../../src/lib/vaultDeletion";
+import * as bootstrap from "../../src/lib/saveFoundationBootstrap";
 import * as markdown from "../../src/lib/markdown";
 import { writeMemoryObjectMarkdown } from "../../src/lib/vault";
 import * as proj from "../../src/lib/vaultProjection";
@@ -17,7 +18,7 @@ import * as recovery from "../../src/lib/maintenance/crashRecovery";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const NOW = "2026-10-10T00:00:00.000Z";
 const g = globalThis as any;
-g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown };
+g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap };
 let DATA: any, vaultRoot: any, backupRoot: any;
 
 async function dirAt(name: string) {

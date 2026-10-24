@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
 import type {
   DataActionFeedback,
@@ -25,6 +25,9 @@ import {
   recoveryAllowsLatest, type RecoveryUserView,
 } from "@/lib/vaultRecoveryUserView";
 import type { VaultStatusView } from "@/lib/vaultStatus";
+import type { Tombstone } from "@/lib/db";
+import { listIncompleteDeletions } from "@/lib/deleteFlow";
+import DeleteConversationDialog, { type DeleteRequest } from "./DeleteConversationDialog";
 
 /**
  * ChatScreen.tsx下部にあった設定領域（APIキー・保存先）を、⚙から開くオーバーレイへ移した表示専用コンポーネント。
@@ -178,6 +181,11 @@ export default function SettingsPanel({
   // `?debugLog=1`のときだけ「詳細（開発者向け）」に表示する（機能・handler・stateは削除していない）。
   const [wipeConfirmOpen, setWipeConfirmOpen] = useState(false);
   const [wipeAcknowledged, setWipeAcknowledged] = useState(false);
+  // 途中で止まった削除（あれば「削除を完了する必要があります」と案内し、ここから続きへ進める）。通常は何も表示しない。
+  const [incompleteDeletions, setIncompleteDeletions] = useState<Tombstone[]>([]);
+  const [deletionDialog, setDeletionDialog] = useState<DeleteRequest | null>(null);
+  const reloadIncompleteDeletions = useCallback(() => { void listIncompleteDeletions().then(setIncompleteDeletions).catch(() => setIncompleteDeletions([])); }, []);
+  useEffect(() => { reloadIncompleteDeletions(); }, [reloadIncompleteDeletions]);
   const [showAdvancedVaultTools] = useState(() => {
     try {
       return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debugLog") === "1";
@@ -1516,9 +1524,21 @@ export default function SettingsPanel({
         <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10">
           <p className="text-sm text-stone-500 dark:text-stone-400">データ</p>
 
-          <a href="/data" className="text-xs text-stone-600 underline underline-offset-2 dark:text-stone-300">
-            データの管理（記憶・会話の削除、同期が止まった項目の確認）
-          </a>
+          {incompleteDeletions.length > 0 && (
+            <div role="alert" className="flex flex-col gap-2 rounded-2xl border border-amber-400/70 p-3 text-xs text-stone-600 dark:text-stone-300">
+              <p>削除を完了する必要があります（{incompleteDeletions.length} 件）。削除が途中で止まっています。データは安全に保護されていて、削除した内容が戻ることはありません。</p>
+              <button
+                type="button"
+                onClick={() => {
+                  const t = incompleteDeletions[0];
+                  setDeletionDialog({ type: "continue", tombstone: t, label: `${t.kind === "conversation" ? "会話" : "記憶"} …${t.id.slice(-6)}（${t.deletedAt.slice(0, 10)}に削除）` });
+                }}
+                className="self-start rounded-full border border-stone-300/70 px-4 py-2 text-sm transition hover:bg-stone-900/5 dark:border-stone-600/70 dark:hover:bg-white/10"
+              >
+                削除を続ける
+              </button>
+            </div>
+          )}
 
           {vaultBackend === "opfs" && (
           <>
@@ -1638,6 +1658,9 @@ export default function SettingsPanel({
             </div>
           </div>
         </div>
+      )}
+      {deletionDialog && (
+        <DeleteConversationDialog request={deletionDialog} onClose={() => { setDeletionDialog(null); reloadIncompleteDeletions(); }} />
       )}
     </div>
   );

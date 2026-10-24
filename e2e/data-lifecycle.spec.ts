@@ -53,7 +53,7 @@ async function openWith(page: Page, withVault = false, advanced = false) {
     },
   });
   await page.reload();
-  await expect(page.getByRole("heading", { name: "記憶と会話" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "削除を完了する" })).toBeVisible();
   if (advanced) await openAdvanced(page);
 }
 const read = <T,>(page: Page, store: string, key: string) => page.evaluate(async ({ store, key }) => {
@@ -90,58 +90,6 @@ test("stuck sync items: listed (held and long-pending, not ordinary pending), an
   await expect(page.getByText("同期が止まっている項目はありません。")).toBeVisible();
   expect(await read<any>(page, "vaultOutbox", `memory:${GHOST}`)).toBeUndefined();
   await expect(page.getByRole("heading", { name: "削除済みの記録 (1)" })).toBeVisible();
-});
-
-test("deleting a memory: two-step confirmation, then the record, the link on the other end, the conversation's reference, the Outbox entry and the ledger are consistent; unrelated records are untouched", async ({ page }) => {
-  await openWith(page);
-  const m3Before = JSON.stringify(await read<any>(page, "memoryObjects", M3));
-  // cancelling deletes nothing
-  const dialog = page.getByRole("dialog");
-  await item(page, "E2E記憶アルファ").getByRole("button", { name: "削除", exact: true }).click();
-  await expect(dialog).toContainText("つながっている記憶 1 件から、この記憶へのリンクが外れます");
-  await dialog.getByRole("button", { name: "やめる" }).click();
-  await expect(dialog).toHaveCount(0);
-  expect(await read<any>(page, "memoryObjects", M1)).toBeTruthy();
-  // confirm: one button, then the result is shown in the same place
-  await item(page, "E2E記憶アルファ").getByRole("button", { name: "削除", exact: true }).click();
-  await dialog.getByRole("button", { name: "削除する" }).click();
-  await expect(dialog).toContainText("削除しました");
-  await expect(dialog).toContainText("この端末のデータを削除しました");
-  await dialog.getByRole("button", { name: "閉じる" }).click();
-  expect(await read<any>(page, "memoryObjects", M1)).toBeUndefined();
-  expect((await read<any>(page, "memoryObjects", M2)).links).toEqual([]);
-  expect((await read<any>(page, "conversations", C1)).memoryObjectIds).toEqual([M2]);
-  expect(await read<any>(page, "vaultOutbox", `memory:${M1}`)).toBeUndefined();
-  const m2Outbox = await read<any>(page, "vaultOutbox", `memory:${M2}`);
-  expect(m2Outbox.status).toBe("pending");                                              // the changed neighbour is queued for the Vault
-  expect(JSON.stringify(await read<any>(page, "memoryObjects", M3))).toBe(m3Before);
-  const tombstones = JSON.parse(await read<string>(page, "settings", "tombstones:v1"));
-  expect(Object.keys(tombstones)).toEqual([`memory:${M1}`]);
-  expect(JSON.stringify(tombstones)).not.toContain("E2E記憶アルファ");                    // no record text in a tombstone
-  await expect(page.getByText("E2E記憶アルファ")).toHaveCount(0);        // a finished deletion disappears from the ordinary list
-});
-
-test("deleting a conversation: the memories stay by default, or are deleted with it when the user chooses", async ({ page }) => {
-  await openWith(page);
-  const dialog = page.getByRole("dialog");
-  await item(page, "E2E会話ふたつめ").getByRole("button", { name: "削除", exact: true }).click();
-  await expect(dialog).toContainText("記憶は残します");
-  await dialog.getByRole("button", { name: "削除する" }).click();
-  await expect(dialog).toContainText("削除しました");
-  await dialog.getByRole("button", { name: "閉じる" }).click();
-  expect(await read<any>(page, "conversations", C2)).toBeUndefined();
-  expect(await read<any>(page, "memoryObjects", M4)).toBeTruthy();
-  await item(page, "E2E会話ひとつめ").getByRole("button", { name: "削除", exact: true }).click();
-  await dialog.getByLabel("この会話から作られた記憶も削除する").check();
-  await expect(dialog).toContainText("それも削除します");
-  await dialog.getByRole("button", { name: "削除する" }).click();
-  await expect(dialog).toContainText("削除しました");
-  await dialog.getByRole("button", { name: "閉じる" }).click();
-  expect(await read<any>(page, "conversations", C1)).toBeUndefined();
-  expect(await read<any>(page, "memoryObjects", M1)).toBeUndefined();
-  expect(await read<any>(page, "memoryObjects", M2)).toBeUndefined();
-  const tombstones = JSON.parse(await read<string>(page, "settings", "tombstones:v1"));
-  expect(Object.keys(tombstones).sort()).toEqual([`conversation:${C1}`, `conversation:${C2}`, `memory:${M1}`, `memory:${M2}`].sort());
 });
 
 test("deleted records: the Vault copy is checked read-only (OPFS stands in for the Vault); a remaining copy keeps the guard, 'allow back' lifts it", async ({ page }) => {

@@ -176,3 +176,53 @@ export async function finishContinuedDelete(access: VaultAccess, review: Continu
   try { await confirmVaultDeletion(access.root, review.plan); return { status: "done", vault: "deleted" }; }
   catch (e) { return { status: "incomplete", message: explainDeletionError(e) }; }
 }
+
+// ---- Conversation-centred deletion: the only deletion the user sees ---------------------------------------------------------------------------------------------
+// What is deleted is decided by OWNERSHIP, never by matching titles or text: the conversation, and every Memory / Reflection whose `conversationId` is that
+// conversation (a Memory's lineage never changes, see db.ts assertMemoryLineage). Other conversations that talk about the same topic are not touched; their
+// Memories that link to a deleted Memory only lose the link (done by the engine). A Memory whose origin can not be established is never deleted by guess.
+
+export interface ConversationPreview { title: string; date: string; excerpt: string }
+export interface ConversationDeleteReview extends DeleteReview {
+  conversationId: string;
+  preview: ConversationPreview;
+  /** normal Memories owned by the conversation (device + Vault-only copies found by the dry run) */
+  memoryCount: number;
+  reflectionCount: number;
+  /** Memories listed by the conversation whose origin is another conversation / unknown: they are kept */
+  keptUnverified: number;
+}
+export type ConversationResolution = { ok: true; conversationId: string } | { ok: false; message: string };
+
+const jstDate = (iso: string): string => { const t = Date.parse(iso); return Number.isFinite(t) ? new Date(t + 9 * 3600_000).toISOString().slice(0, 10) : iso.slice(0, 10); };
+const clip = (text: string, n: number) => (text.length > n ? `${text.slice(0, n)}…` : text);
+
+/** "Delete" was pressed on a Memory (calendar detail): which conversation does it belong to? Unknown origin -> nothing is deleted, with the reason. */
+export async function resolveConversationOfMemory(memoryId: string): Promise<ConversationResolution> {
+  const m = await getMemoryObject(memoryId);
+  if (!m) return { ok: false, message: "この記憶は、この端末にまだ取り込まれていません。同期が終わってから、もう一度お試しください。何も削除していません。" };
+  if (m.sourceId && !m.conversationId) return { ok: false, message: "この記憶は、会話ではなく取り込んだ素材から作られたため、ここからは削除できません。何も削除していません。" };
+  if (!m.conversationId) return { ok: false, message: "この記憶の元の会話を確認できないため、削除する範囲を確定できません。何も削除していません。" };
+  if (!(await getConversation(m.conversationId))) return { ok: false, message: "この記憶の元の会話が、この端末にまだ取り込まれていません。同期が終わってから、もう一度お試しください。何も削除していません。" };
+  return { ok: true, conversationId: m.conversationId };
+}
+
+export async function prepareConversationDelete(conversationId: string, access: VaultAccess, now: string = new Date().toISOString()): Promise<ConversationDeleteReview> {
+  const c = await getConversation(conversationId);
+  const empty: ConversationDeleteReview = {
+    target: { kind: "conversation", id: conversationId, withMemories: true }, linkedMemories: 0, childMemories: 0, plan: null, files: [], metadataFiles: 0, blocker: null,
+    conversationId, preview: { title: "", date: "", excerpt: "" }, memoryCount: 0, reflectionCount: 0, keptUnverified: 0,
+  };
+  if (!c) return { ...empty, blocker: "この会話は、この端末にまだ取り込まれていないか、すでに削除されています。同期が終わってから、もう一度お試しください。何も削除していません。" };
+  const base = await prepareDelete({ kind: "conversation", id: conversationId, withMemories: true }, access, now);
+  const all = await getAllMemoryObjects();
+  const owned = all.filter((m) => m.conversationId === conversationId);
+  const reflections = owned.filter((m) => m.metadata.source === "system-generated").length;
+  let memories = owned.length - reflections;
+  if (base.plan) memories += Math.max(0, base.plan.ids.length - 1 - owned.length);             // copies that exist only in the Vault
+  const byId = new Map(all.map((m) => [m.id, m]));
+  const keptUnverified = (c.memoryObjectIds ?? []).filter((id) => { const m = byId.get(id); return !!m && m.conversationId !== conversationId; }).length;
+  const firstUser = c.turns.find((t) => t.role === "user")?.content ?? "";
+  const excerpt = c.turns.slice(0, 2).map((t) => t.content).join(" / ");
+  return { ...base, conversationId, preview: { title: clip(firstUser || "(発言なし)", 60), date: jstDate(c.startedAt), excerpt: clip(excerpt, 140) }, memoryCount: memories, reflectionCount: reflections, keptUnverified };
+}

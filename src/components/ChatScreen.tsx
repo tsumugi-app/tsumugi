@@ -712,6 +712,28 @@ export default function ChatScreen() {
    */
   const [historyRefreshToken, setHistoryRefreshToken] = useState(0);
   const bumpHistoryRefreshToken = () => setHistoryRefreshToken((token) => token + 1);
+  /**
+   * カレンダー（History）から会話が削除された（途中まで進んだ場合も含む）。削除した会話に由来する表示用のstate（今日のCapture結果・
+   * 直前に終えた会話の記憶）をここで整理し、いま開いている会話そのものだった場合は新しい会話に切り替える（削除済みの会話へ書き込み続けない）。
+   * 一覧はrefreshTokenで読み直す。保存データには触れない（削除そのものは削除エンジンが行う）。
+   */
+  function handleHistoryConversationDeleted(deletedConversationId: string | undefined) {
+    if (deletedConversationId) {
+      setSessionCapturedMemories((prev) => prev.filter((m) => m.conversationId !== deletedConversationId));
+      setMemoryObjects((prev) => prev.filter((m) => m.conversationId !== deletedConversationId));
+      setTopPrompt((prev) => (prev && prev.memory.conversationId === deletedConversationId ? null : prev));       // 「過去からの問いかけ」も、削除した会話の記憶から作られたものは出さない
+      setEndedConversationMemories((prev) => (prev ? prev.filter((m) => m.conversationId !== deletedConversationId) : prev));
+      if (latestConversationRef.current.id === deletedConversationId) {
+        const fresh = createConversation(persona, entryType);
+        setConversation(fresh);
+        latestConversationRef.current = fresh;
+        setStreamingText("");
+        setBusy(false);
+        setSendStatus("idle");
+      }
+    }
+    bumpHistoryRefreshToken();
+  }
   const [greeting] = useState(() => getGreeting());
   /** Beta「過去からの問いかけ」。候補が無い/生成に失敗した場合はnullのままで、トップ画面は従来通りになる。 */
   const [topPrompt, setTopPrompt] = useState<TopPrompt | null>(null);
@@ -5750,6 +5772,7 @@ export default function ChatScreen() {
             initialMemoryId={historyInitialMemoryId}
             refreshToken={historyRefreshToken}
             sessionCapturedMemories={sessionCapturedMemories}
+            onConversationDeleted={handleHistoryConversationDeleted}
             onClose={() => {
               setHistoryOpen(false);
               setHistoryInitialMemoryId(undefined);

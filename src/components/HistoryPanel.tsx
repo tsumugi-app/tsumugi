@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { decodeTime } from "ulid";
+import DeleteConversationDialog, { type DeleteRequest } from "@/components/DeleteConversationDialog";
 import {
   isHistoryDayIndexV2,
   readConversationById,
@@ -260,6 +261,7 @@ export default function HistoryPanel({
   initialMemoryId,
   refreshToken,
   sessionCapturedMemories = [],
+  onConversationDeleted,
 }: {
   onClose: () => void;
   /**
@@ -284,6 +286,8 @@ export default function HistoryPanel({
    * （IndexedDB全件取得は行わない。今日の日付のものだけを対象にidで重複排除する）。
    */
   sessionCapturedMemories?: MemoryObject[];
+  /** 会話の削除が完了した（または途中まで進んだ）とき。ChatScreen側が、保持している表示用の状態を整理し、一覧を読み直させる。 */
+  onConversationDeleted?: (conversationId: string | undefined) => void;
 }) {
   const [viewYear, setViewYear] = useState(() => getJstYearMonth().year);
   const [viewMonth, setViewMonth] = useState(() => getJstYearMonth().month);
@@ -296,6 +300,8 @@ export default function HistoryPanel({
   const lastKnownTodayRef = useRef(todayKey());
   const [selectedMemory, setSelectedMemory] = useState<MemoryObject | null>(null);
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
+  /** 「削除」ダイアログ。削除の対象は常に「その記録の元になった会話全体」（会話単位の削除に一本化）。 */
+  const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
   /**
    * Conversation History（STEP 3、要件10）：Conversation detail内の「会話全文を見る」。
    * trueの間だけraw Conversation（既存のturns＋HistoryTurnBubble表示、Layer 3）を見せる。
@@ -1325,13 +1331,22 @@ export default function HistoryPanel({
                       </div>
                     )}
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setRawConversationView(true)}
-                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
-                  >
-                    会話全文を見る
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setRawConversationView(true)}
+                      className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                    >
+                      会話全文を見る
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteRequest({ type: "delete-conversation", conversationId: selectedConversation.id })}
+                      className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                    >
+                      削除
+                    </button>
+                  </div>
                 </div>
               ) : selectedMemory ? (
                 <div className="flex flex-col gap-3">
@@ -1380,6 +1395,13 @@ export default function HistoryPanel({
                         </p>
                       );
                     })()}
+                  <button
+                    type="button"
+                    onClick={() => setDeleteRequest({ type: "delete-memory", memoryId: selectedMemory.id })}
+                    className="self-start rounded-full border border-stone-300/60 px-4 py-1.5 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:border-stone-600/60 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    削除
+                  </button>
                 </div>
               ) : conversationRows.length === 0 ? (
                 <p className="text-sm text-stone-400 dark:text-stone-500">この日の記録はありません。</p>
@@ -1405,6 +1427,21 @@ export default function HistoryPanel({
           </div>
         )}
       </div>
+      {deleteRequest && (
+        <DeleteConversationDialog
+          request={deleteRequest}
+          onClose={(result) => {
+            setDeleteRequest(null);
+            if (result.changed) {
+              // 詳細画面は閉じる（削除した会話・記憶を表示し続けない）。一覧の読み直しは、ChatScreen側のrefreshTokenで行う。
+              setSelectedMemory(null);
+              setSelectedConversation(null);
+              setRawConversationView(false);
+              onConversationDeleted?.(result.conversationId);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
