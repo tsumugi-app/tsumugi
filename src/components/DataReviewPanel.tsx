@@ -7,6 +7,7 @@ import {
   type AttentionEntry, type Tombstone,
 } from "@/lib/db";
 import { allowBack, findRecordInVault, keepVaultCopy, purgeDecision, purgeEligibleTombstones, verifyTombstone } from "@/lib/dataLifecycle";
+import { getVaultBackend } from "@/lib/vault";
 import { isRecoveryBlockingNormalWrites } from "@/lib/vaultRecoveryJournal";
 import type { Conversation, MemoryObject } from "@/lib/types";
 
@@ -55,6 +56,8 @@ export default function DataReviewPanel() {
     finally { setBusy(false); await load(); }
   }
   async function vaultRoot(): Promise<FileSystemDirectoryHandle | null> {
+    // the app's own (origin-private) storage is the Vault on devices without a folder picker: its root is not a stored handle
+    if (getVaultBackend() === "opfs") { try { return await navigator.storage.getDirectory(); } catch { return null; } }
     const h = await loadVaultHandle();
     if (!h) return null;
     const p = (await (h as unknown as { requestPermission?: (o: { mode: string }) => Promise<string> }).requestPermission?.({ mode: "read" })) ?? "granted";
