@@ -5,6 +5,7 @@ import { scoreMemory, DEFAULT_LIMIT } from "@/lib/retrieval";
 import { buildSynthesisClusters, buildSynthesisSection, selectTimelineForTurn, type SynthesisItem, type SynthesisThemeContext } from "@/lib/memorySynthesis";
 import { FICTIONAL_USERS, REPLY_LABEL_TERMS, type FictionalUser, type SynthesisEvalScenario } from "@/lib/synthesisFictionalData";
 import type { MemoryObject, RetrievedMemory } from "@/lib/types";
+import { putMemoryObject } from "@/lib/db";
 
 /**
  * Preview専用：同じ架空ユーザー・同じ発言について3条件を、それぞれ複数回比較する。
@@ -44,7 +45,7 @@ async function chat(s: SynthesisEvalScenario, retrievedMemories: RetrievedMemory
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ persona: "companion", turns: [{ role: "user", content: s.userText, timestamp: new Date().toISOString() }], retrievedMemories, ...(synthesis && synthesis.length > 0 ? { synthesis } : {}) }),
+    body: JSON.stringify({ persona: "companion", turns: [{ role: "user", content: s.userText, timestamp: new Date().toISOString() }], retrievedMemories, ...(synthesis && synthesis.length > 0 ? { memoryTimeline: synthesis } : {}) }),
   });
   const text = await res.text();
   return { text, ms: Math.round(performance.now() - t0), status: res.status, flags: check(s, text) };
@@ -90,6 +91,14 @@ export default function SynthesisEval() {
     setStatus(`完了（API呼び出し：synthesize 1回＋chat ${out.reduce((n, r) => n + r.replies.A.length + r.replies.B.length + r.replies.C.length, 0)}回）`);
   }
 
+  /** Preview only: puts fictional users' Memories into THIS Preview origin's device storage, so the real chat screen can be tried with them (ids are "syn*") */
+  async function seed(ids: string[]) {
+    setStatus("架空Memoryをこの端末に入れています…");
+    let n = 0;
+    for (const u of FICTIONAL_USERS.filter((x) => ids.includes(x.id))) for (const m of u.memories()) { await putMemoryObject(m); n += 1; }
+    setStatus(`架空Memory ${n}件をこの端末に入れました（ユーザー${ids.join("+")}）。トップページで会話できます。`);
+  }
+
   const user = FICTIONAL_USERS.find((u) => u.id === userId)!;
   return (
     <main className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6 text-sm text-stone-800 dark:text-stone-200">
@@ -97,6 +106,10 @@ export default function SynthesisEval() {
       <p className="text-xs text-stone-500">保存は一切しません。各発言につき A／B／C を{RUNS}回ずつ。</p>
       <div className="flex flex-wrap gap-2">
         {FICTIONAL_USERS.map((u) => <button key={u.id} className={`rounded-full border px-3 py-1 ${u.id === userId ? "border-stone-800" : "border-stone-300"}`} onClick={() => setUserId(u.id)}>{u.label}</button>)}
+      </div>
+      <div className="flex flex-wrap gap-2 text-xs">
+        <button className="rounded-full border border-stone-300 px-3 py-1" onClick={() => seed(["A", "C"])}>会話画面の試験用：AとCをこの端末に入れる</button>
+        <button className="rounded-full border border-stone-300 px-3 py-1" onClick={() => seed(["B"])}>会話画面の試験用：Bをこの端末に入れる</button>
       </div>
       <button className="self-start rounded-full border border-stone-300 px-4 py-2" onClick={() => run(user)}>生成して比較する（{user.id}）</button>
       {status && <p role="status">{status}</p>}
@@ -110,7 +123,7 @@ export default function SynthesisEval() {
         <section key={r.s.id} data-testid={`row-${r.s.id}`} className="flex flex-col gap-2 rounded-xl border border-stone-300 p-3">
           <h2 className="font-medium">{r.s.label}：「{r.s.userText}」 {r.s.cases ? `［${r.s.cases.join("・")}］` : ""}</h2>
           <p className="text-xs">Retrieval: {r.retrievedIds.join(", ") || "なし"}</p>
-          <p className="text-xs">B Timeline: {r.ctxB.length === 0 ? "渡さない" : r.ctxB.map((c) => `${c.theme}（${c.timeline.length}点・今の状態: ${c.timeline.find((p) => p.current)?.summary ?? "-"}）`).join(" / ")} ／ 追加{r.charsB}字</p>
+          <p className="text-xs">B Timeline: {r.ctxB.length === 0 ? "渡さない" : r.ctxB.map((c) => `${c.theme}（${c.timeline.length}点・今の状態: ${c.state.status}${c.state.basisSummary ? `「${c.state.basisSummary}」` : ""}・最後に話した記録: ${c.timeline.find((p) => p.latestSaid)?.summary ?? "-"}）`).join(" / ")} ／ 追加{r.charsB}字</p>
           <p className="text-xs">C 整理: {r.ctxC.flatMap((c) => c.items).length === 0 ? "なし" : r.ctxC.flatMap((c) => c.items).map((i) => `[${i.kind}/${i.support}] ${i.statement}`).join(" / ")} ／ 追加{r.charsC}字</p>
           {(["A", "B", "C"] as Mode[]).map((m) => r.replies[m].map((rep, k) => (
             <div key={`${m}${k}`}><b>{MODE_LABEL[m]} {k + 1}（{rep.ms}ms）[{rep.flags}]</b><p className="whitespace-pre-wrap">{rep.text}</p></div>

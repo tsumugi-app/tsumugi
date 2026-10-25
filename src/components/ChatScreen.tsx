@@ -1,5 +1,7 @@
 "use client";
 
+import { memoryTimelineEnabled } from "@/lib/memoryTimelineFlag";
+import { safeSelectTimelineForTurn, type SynthesisThemeContext } from "@/lib/memorySynthesis";
 import { waitUntilIdle } from "@/lib/waitUntilIdle";
 import { logRecoveryArchiveDiagnostic } from "@/lib/vaultRecoveryArchiveDebug";
 import { requestFullWipe } from "@/lib/dataWipe";
@@ -4618,6 +4620,8 @@ export default function ChatScreen() {
       // Memory Analytics Phase 1：保存済みMemory全体の集計（キーワードランキング）を求める発言のときだけ、code側で集計する。
       // 優先順位は Memory Analytics → Explicit Search → 通常Retrieval。Analyticsが成立した発言は、Explicit Searchとして処理しない。
       let memoryAnalyticsContext: MemoryAnalyticsContext | null = null;
+      // Memory Timeline（試験接続・既定OFF）：関連があり、通常のRetrievalに不足する経緯だけ。同じMemory一覧を再利用（追加のIDB読み込み・API呼び出し・保存は無い）。
+      let memoryTimelineContext: SynthesisThemeContext[] = [];
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
         try {
@@ -4663,6 +4667,13 @@ export default function ChatScreen() {
           }
         } catch (personTopicError) {
           console.error("Failed to build person view / topic timeline context", personTopicError);
+        }
+        if (memoryTimelineEnabled()) {
+          // 失敗しても空配列（会話は通常のRetrievalだけで続く）。今の会話自身のMemoryは、Retrievalと同じく使わない。
+          memoryTimelineContext = safeSelectTimelineForTurn(
+            allMemoriesForTopicContinuity.filter((memory) => memory.conversationId !== baseConversation.id),
+            { userText: text, retrievedMemoryIds: retrievedMemories.map((memory) => memory.id) }
+          );
         }
       } catch (topicError) {
         if (topicError instanceof StaleVaultTabError) throw topicError;
@@ -4726,6 +4737,7 @@ export default function ChatScreen() {
           ...(topicTimelineContext ? { topicTimeline: topicTimelineContext } : {}),
           ...(explicitSearchContext ? { explicitSearch: explicitSearchContext } : {}),
           ...(memoryAnalyticsContext ? { memoryAnalytics: memoryAnalyticsContext } : {}),
+          ...(memoryTimelineContext.length > 0 ? { memoryTimeline: memoryTimelineContext } : {}),
           ...(generationId ? { debugGenerationId: generationId } : {}),
         }),
       });
