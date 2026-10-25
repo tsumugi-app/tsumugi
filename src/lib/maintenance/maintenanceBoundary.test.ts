@@ -157,6 +157,8 @@ test("Memory write surface: only the reviewed production files write Memory reco
   walk(SRC);
   assert.deepEqual(writers, {
     "components/ChatScreen.tsx": ["restoreMemoryObjectIfNotNewer", "updateMemoryRevisitPrompt"],
+    // Preview-only timing page (404 in production builds): writes only its own fictional "perf-*" records; to be removed before this work is merged to main
+    "components/StartupTiming.tsx": ["putMemoryObject"],
     "lib/capture.ts": ["putCapturedMemoryWithOutbox"],
     "lib/connect.ts": ["addMemoryLinkDurably"],
     "lib/topPrompt.ts": ["updateMemoryRevisitPrompt"],
