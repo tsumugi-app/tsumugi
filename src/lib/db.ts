@@ -1337,7 +1337,9 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   record: CanonicalStoreValueMap[S] & { id: string; updatedAt: string },
   now: string,
   /** checked INSIDE the transaction before anything is written (e.g. the tombstones); a throw writes nothing */
-  guard?: (tx: { objectStore(name: string): any }) => Promise<CanonicalStoreValueMap[S] | void>   // eslint-disable-line @typescript-eslint/no-explicit-any
+  guard?: (tx: { objectStore(name: string): any }) => Promise<CanonicalStoreValueMap[S] | void>,   // eslint-disable-line @typescript-eslint/no-explicit-any
+  /** startup re-registration only: when the outbox entry is for this exact version AND the stored record is identical, nothing is written (the guard above still runs) */
+  skipIfUnchanged = false
 ): Promise<VaultOutboxEntry> {
   const db = await getDB();
   const outboxId = vaultOutboxIdFor(recordType, record.id);
@@ -1349,6 +1351,10 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
     const outboxStore = tx.objectStore("vaultOutbox");
     const existing = await outboxStore.get(outboxId);
     if (storeName === "memoryObjects") assertMemoryLineage(await tx.objectStore(storeName).get(record.id) as MemoryObject | undefined, record as unknown as MemoryObject);
+    if (skipIfUnchanged && existing && existing.recordUpdatedAt === record.updatedAt) {
+      const stored = await tx.objectStore(storeName).get(record.id);
+      if (stored !== undefined && JSON.stringify(stored) === JSON.stringify(record)) { entry = existing; await tx.done; return entry; }
+    }
     entry = buildOutboxEntryForUpdate(existing, recordType, record.id, record.updatedAt, now);
     await Promise.all([tx.objectStore(storeName).put(record), outboxStore.put(entry)]);
   } catch (error) {
@@ -1358,13 +1364,13 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   return entry!;
 }
 
-export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
+export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString(), skipIfUnchanged = false): Promise<VaultOutboxEntry> {
   // a conversation the user deleted is never recreated by a stale chat tab / an in-flight request (the check runs inside the same transaction)
   return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
     return withoutDeletedMemoryRefs(conversation, tombs);
-  });
+  }, skipIfUnchanged);
 }
 
 /** `recordType`は既定で`"memory"`（normal Memory）。Reflectionを書く場合は`"reflection"`を渡す。 */
@@ -1378,7 +1384,8 @@ export async function putCapturedMemoryWithOutbox(
   memoryObject: MemoryObject,
   producedByConversationId: string,
   recordType: "memory" | "reflection" = "memory",
-  now: string = new Date().toISOString()
+  now: string = new Date().toISOString(),
+  skipIfUnchanged = false
 ): Promise<VaultOutboxEntry> {
   if (!producedByConversationId || memoryObject.conversationId !== producedByConversationId) throw new MemoryLineageViolationError(memoryObject.id);
   return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
@@ -1418,11 +1425,11 @@ export async function putMemoryObjectWithOutbox(
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (memoryBlocked(tombs, memoryObject)) throw new TombstonedRecordError("memory", memoryObject.id);
     return withoutDeletedLinksInTx(tx, memoryObject, tombs, now);
-  });
+  }, skipIfUnchanged);
 }
 
-export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
-  return putCanonicalRecordWithOutboxInternal("sources", "source", source, now);
+export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString(), skipIfUnchanged = false): Promise<VaultOutboxEntry> {
+  return putCanonicalRecordWithOutboxInternal("sources", "source", source, now, undefined, skipIfUnchanged);
 }
 
 /**

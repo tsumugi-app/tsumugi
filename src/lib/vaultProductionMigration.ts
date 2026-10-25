@@ -551,21 +551,21 @@ function nowOf(env: ProductionMigrationEnv): string {
  * 冪等性テストは既にPhase 3-1で確認済み）。
  */
 async function ensureOutbox(c: Conversation): Promise<void> {
-  await putConversationWithOutbox(c);
+  await putConversationWithOutbox(c, undefined, true);
 }
 
 /** Memory版`ensureOutbox`。1 canonical MemoryObject＝1 outbox entryは変わらない（req 14）。 */
 async function ensureMemoryOutbox(m: MemoryObject): Promise<void> {
-  await putMemoryObjectWithOutbox(m);
+  await putMemoryObjectWithOutbox(m, "memory", undefined, true);
 }
 
 /** Phase 3-7：Reflectionは`memoryObjects`storeを共有するが、`recordType`を明示して`"reflection"`のoutboxを作る。 */
 async function ensureReflectionOutbox(r: MemoryObject): Promise<void> {
-  await putMemoryObjectWithOutbox(r, "reflection");
+  await putMemoryObjectWithOutbox(r, "reflection", undefined, true);
 }
 
 async function ensureSourceOutbox(s: Source): Promise<void> {
-  await putSourceWithOutbox(s);
+  await putSourceWithOutbox(s, undefined, true);
 }
 
 function tally(classifications: ConversationClassification[], vaultOnlyCount: number): ProductionMigrationSummary {
