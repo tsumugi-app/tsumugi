@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/memorySynthesis.test.ts",
+    "src/lib/memorySynthesis.ts",
+    "src/lib/synthesisFictionalData.ts",
+    "src/lib/memoryAnalytics.ts",
+    "src/app/api/chat/route.ts",
+    "src/lib/memorySynthesisPrompt.ts",
+    "src/lib/memoryTimelineFlag.ts",
+    "src/lib/memoryTimelineFlag.test.ts"
+  ]
+}
