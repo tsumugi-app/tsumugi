@@ -1466,8 +1466,8 @@ test("Pass reuse A: 変更の無い完了済み記録の再検証は、Vaultへ�
   assert.equal(JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id))), outboxBefore, "outbox entryは書き換えられない");
   assert.ok(projectionMod.projectionReadStats.idbWritesSkipped >= total, "完了済み・変更なしの結果はIndexedDBへ書かない");
   assert.ok(projectionMod.projectionReadStats.cacheHits > 0);
-  // 共有ファイル（identity/index/history-meta/registry/History月/日別ファイル）は1回ずつ。記録ごとの固有ファイル + 少数の共有ファイルに収まる。
-  assert.ok(vault.readCount <= total + 20, `reads=${vault.readCount}`);
+  // 各ファイルはほぼ1回しか読まれない（記録数ではなくファイル数に比例する）。
+  assert.ok(vault.readCount <= vault.files.size + 10, `reads=${vault.readCount} files=${vault.files.size} records=${total}`);
 });
 
 test("Pass reuse B: 外部で書き換えられた記録は、記憶された読み取りではなく最新の読み取りで判定され、heldになり上書きされない", async () => {
