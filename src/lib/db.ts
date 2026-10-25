@@ -1419,7 +1419,8 @@ async function withoutDeletedLinksInTx(tx: { objectStore(name: string): any }, m
 export async function putMemoryObjectWithOutbox(
   memoryObject: MemoryObject,
   recordType: "memory" | "reflection" = "memory",
-  now: string = new Date().toISOString()
+  now: string = new Date().toISOString(),
+  skipIfUnchanged = false
 ): Promise<VaultOutboxEntry> {
   return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));

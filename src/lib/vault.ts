@@ -8263,7 +8263,6 @@ export const vaultRecoveryPrimitives = {
   updateHistoryIndex,
   upsertVaultRegistryRecord,
   readVaultFileStat,
-  historyIndexUpdateIsNoop,
 };
 
 // ---------------------------------------------------------------------------
@@ -8303,4 +8302,5 @@ export const vaultProjectionPrimitives = {
   updateHistoryIndex,
   upsertVaultRegistryRecord,
   readVaultFileStat,
+  historyIndexUpdateIsNoop,
 };
