@@ -105,6 +105,22 @@ test("a newer status about a different thing of the same theme does not hide the
   assert.ok(section.includes("それより前の別の状態の記録: 実施済み") && section.includes("対象を取り違えない"), section);
 });
 
+test("the user's own recent echo ('迷っている', found by retrieval) does not hide the earlier state (異動は保留): the timeline is still sent", () => {
+  const at = "2026-10-25T16:58:43.000Z";
+  const echo = { ...memories[0], id: "cap-echo", conversationId: "cap-conv-3", types: ["conversation", "emotion", "insight"], summary: "今の会社にこのままでいいのか、仕事の将来について迷っていると話した。", keywords: ["仕事", "将来", "迷い"], statedAt: at, date: at } as MemoryObject;
+  const list = [...memories, echo];
+  const t = buildThemeTimeline("仕事", list);
+  assert.equal(t.state.status, "検討中");
+  assert.ok(t.state.earlier!.some((e) => e.status === "保留"));
+  const ctx = selectTimelineForTurn(list, { userText: "最近また仕事のことで考えちゃって。今の会社、このままでいいのかな", retrievedMemoryIds: [memories[0].id, "cap-echo"] });
+  assert.equal(ctx[0]?.theme, "仕事", "retrieval holds the echo and an old record, but not the 保留 record");
+});
+
+test("generic keywords (週末, 迷い, 予定 ...) do not form themes", () => {
+  const themesA = buildSynthesisClusters(memories, { maxClusters: 12 }).map((c) => c.theme);
+  assert.ok(!themesA.includes("週末"));
+});
+
 test("deleted Memories are not in the timeline and cannot be the state basis", () => {
   const moveDone = userC.find((m) => m.summary.includes("引っ越しが終わり"))!;
   const without = userC.filter((m) => m.id !== moveDone.id);

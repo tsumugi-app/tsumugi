@@ -106,7 +106,7 @@ export interface ThemeState {
    * earlier records of the same theme that state a DIFFERENT status (newest first, at most 2). A theme can hold several things ("車": the repair, then a drive
    * plan): the newest status must not hide that the repair was done.
    */
-  earlier?: { status: TimelineStatus; statedAt: string; summary: string }[];
+  earlier?: { status: TimelineStatus; statedAt: string; summary: string; memoryId?: string }[];
 }
 
 /** what one chat turn receives for one theme */
@@ -172,6 +172,9 @@ function spreadOverTime<T>(sorted: T[], max: number): T[] {
   return [...picked].sort((a, b) => a - b).map((i) => sorted[i]);
 }
 
+/** keywords that tag WHEN or HOW something was said rather than WHAT it is about: they would join unrelated records into one "theme" */
+const GENERIC_THEMES = new Set(["週末", "今日", "昨日", "最近", "夜", "朝", "平日", "予定", "迷い", "悩み", "気持ち", "感情", "内省", "将来", "日常", "生活", "振り返り"]);
+
 /**
  * Code-only selection of what the model may look at: a Memory keyword the user came back to in at least `minConversations` different conversations
  * over at least `minSpanDays`. One evidence item per conversation (its latest Memory on the theme).
@@ -182,7 +185,7 @@ export function buildSynthesisClusters(memories: MemoryObject[], options: { maxC
     if (!isSynthesisSource(m)) continue;
     for (const k of m.keywords ?? []) {
       const key = normalizeAnalyticsKeyword(k);
-      if (!key) continue;
+      if (!key || GENERIC_THEMES.has(key)) continue;
       let g = groups.get(key);
       if (!g) { g = { theme: k.trim(), byConversation: new Map() }; groups.set(key, g); }
       const prev = g.byConversation.get(m.conversationId as string);
@@ -394,7 +397,7 @@ export function buildThemeTimeline(theme: string, memories: MemoryObject[]): The
   const basisRow = rows.find((r) => r.m.id === basis?.id);
   const state: ThemeState = basisRow
     ? { status: basisRow.status!, basisMemoryId: basisRow.m.id, basisStatedAt: basisRow.stated.at, ...(basisRow.m.eventTime ? { basisEventTime: basisRow.m.eventTime } : {}), basisSummary: basisRow.m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength),
-        ...(earlierRows.length > 0 ? { earlier: earlierRows.map((r) => ({ status: r.status!, statedAt: r.stated.at, summary: r.m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength) })) } : {}) }
+        ...(earlierRows.length > 0 ? { earlier: earlierRows.map((r) => ({ status: r.status!, statedAt: r.stated.at, summary: r.m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength), memoryId: r.m.id })) } : {}) }
     : { status: "不明" };
   return { state, points };
 }
@@ -449,8 +452,12 @@ export function selectTimelineForTurn(
     const { state, points } = buildThemeTimeline(theme, memories);
     const covered = points.filter((p) => retrieved.has(p.memoryId)).length;
     const latestSaidId = points.find((p) => p.latestSaid)?.memoryId;
+    // the newest record can be the user's own recent echo of the topic ("今の会社でいいのか迷っている"), which retrieval finds easily: the earlier, different
+    // state ("異動は保留") must not disappear behind it, so a missing earlier state also makes the timeline needed
+    const missingEarlier = (state.earlier ?? []).some((e) => e.memoryId !== undefined && !retrieved.has(e.memoryId));
     const needed = (state.basisMemoryId !== undefined && !retrieved.has(state.basisMemoryId))
       || (latestSaidId !== undefined && !retrieved.has(latestSaidId))
+      || missingEarlier
       || covered < 2;
     if (!needed) continue;
     const items = live.filter((i) => normalizeAnalyticsKeyword(i.theme) === normalizeAnalyticsKeyword(theme)).slice(0, SYNTHESIS_LIMITS.maxItemsPerTheme);
