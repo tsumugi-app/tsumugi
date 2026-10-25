@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { scoreMemory, DEFAULT_LIMIT } from "@/lib/retrieval";
-import { buildSynthesisClusters, selectSynthesisForTurn, type SynthesisItem } from "@/lib/memorySynthesis";
+import { buildSynthesisClusters, selectSynthesisForTurn, withAnchors, type SynthesisItem } from "@/lib/memorySynthesis";
 import { fictionalSynthesisMemories, SYNTHESIS_EVAL_SCENARIOS } from "@/lib/synthesisFictionalData";
 import type { RetrievedMemory } from "@/lib/types";
 
@@ -54,7 +54,7 @@ export default function SynthesisEval() {
     for (const s of SYNTHESIS_EVAL_SCENARIOS) {
       setStatus(`比較中: ${s.label}`);
       const retrieved = retrieve(s.userText);
-      const used = selectSynthesisForTurn(synth, { userText: s.userText, retrievedMemoryIds: retrieved.map((r) => r.id) });
+      const used = withAnchors(selectSynthesisForTurn(synth, { userText: s.userText, retrievedMemoryIds: retrieved.map((r) => r.id) }), memories);
       const baseline = await chat(s.userText, retrieved);
       const withSynthesis = await chat(s.userText, retrieved, used);
       out.push({ id: s.id, label: s.label, userText: s.userText, retrievedIds: retrieved.map((r) => r.id), usedSynthesis: used, baseline, withSynthesis });

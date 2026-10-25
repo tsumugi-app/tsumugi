@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildSynthesisClusters, buildSynthesisSection, dropItemsWithMissingEvidence, renderClustersForModel, sanitizeSynthesisContext,
-  selectSynthesisForTurn, validateSynthesisItems, SYNTHESIS_LIMITS,
+  selectSynthesisForTurn, validateSynthesisItems, withAnchors, SYNTHESIS_LIMITS,
 } from "./memorySynthesis";
 import { fictionalSynthesisMemories } from "./synthesisFictionalData";
 import type { MemoryObject } from "./types";
@@ -91,7 +91,17 @@ test("turn selection: only items related to this turn; an unrelated turn gets no
   ] }, clusters);
   assert.equal(selectSynthesisForTurn(items, { userText: "今日は天気がいい", retrievedMemoryIds: [] }).length, 0);
   assert.equal(selectSynthesisForTurn(items, { userText: "仕事どうしよう", retrievedMemoryIds: [] }).length, 2);
-  assert.equal(selectSynthesisForTurn(items, { userText: "ねえ", retrievedMemoryIds: [ids[3]] })[0].statement, "仕事の別の変化");
+  assert.equal(selectSynthesisForTurn(items, { userText: "ねえ", retrievedMemoryIds: [ids[3]] }).length, 0, "one loosely retrieved Memory is not enough");
+  assert.equal(selectSynthesisForTurn(items, { userText: "ねえ", retrievedMemoryIds: [ids[1], ids[3]] })[0].statement, "仕事の別の変化");
+});
+
+test("anchors: the earliest / middle / latest evidence with its said-date are added for the chat, and survive the chat sanitizer", () => {
+  const items = validateSynthesisItems({ items: [{ kind: "change", statement: "仕事の変化", basis: "hypothesis", evidenceIds: ids }] }, clusters);
+  const [anchored] = withAnchors(items, memories);
+  assert.equal(anchored.anchors!.length, 3);
+  assert.equal(anchored.anchors![0].statedAt, work.evidence[0].statedAt);
+  const section = buildSynthesisSection(sanitizeSynthesisContext([anchored]));
+  assert.ok(section.includes(`${work.evidence[0].statedAt.slice(0, 10)}に話したこと`));
 });
 
 test("chat section: empty without items (prompt unchanged); hypotheses are labelled; tension basis cannot be forced to explicit", () => {

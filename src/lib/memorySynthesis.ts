@@ -49,6 +49,8 @@ export interface SynthesisItem {
   lastStatedAt: string;
   /** for a tension: what differed between the situations (required) */
   situationNote?: string;
+  /** chat only: up to 3 concrete evidence points (when it was said + the record's summary), filled by the client from the Memories that exist now */
+  anchors?: { statedAt: string; summary: string }[];
 }
 
 export const SYNTHESIS_LIMITS = {
@@ -211,6 +213,16 @@ export function dropItemsWithMissingEvidence(items: SynthesisItem[], existingMem
   return items.filter((i) => i.evidenceIds.every((id) => existingMemoryIds.has(id)));
 }
 
+/** adds the earliest, a middle and the latest evidence point (said-date + summary) so that the reply can be concrete instead of repeating an abstract summary */
+export function withAnchors(items: SynthesisItem[], memories: MemoryObject[]): SynthesisItem[] {
+  const byId = new Map(memories.map((m) => [m.id, m]));
+  return items.map((i) => {
+    const ev = i.evidenceIds.map((id) => byId.get(id)).filter((m): m is MemoryObject => !!m);
+    const picks = ev.length <= 3 ? ev : [ev[0], ev[Math.floor(ev.length / 2)], ev[ev.length - 1]];
+    return { ...i, anchors: picks.map((m) => ({ statedAt: statedAtOf(m).at, summary: m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength) })) };
+  });
+}
+
 /**
  * Which items (if any) belong to THIS turn: only those that share evidence with the Memories retrieved for this turn, or whose theme the user just mentioned.
  * Nothing else is sent; most turns get none.
@@ -222,7 +234,8 @@ export function selectSynthesisForTurn(items: SynthesisItem[], turn: { userText:
     .map((i) => {
       const shared = i.evidenceIds.filter((id) => retrieved.has(id)).length;
       const themeHit = i.theme && text.includes(normalizeAnalyticsKeyword(i.theme)) ? 1 : 0;
-      return { i, score: shared * 2 + themeHit };
+      // one shared Memory is not enough (retrieval often returns a loosely related Memory); the user names the theme, or the turn touches 2+ of its Memories
+      return { i, score: themeHit || shared >= 2 ? shared * 2 + themeHit : 0 };
     })
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score);
@@ -250,6 +263,10 @@ export function sanitizeSynthesisContext(raw: unknown): SynthesisItem[] {
       firstStatedAt: i.firstStatedAt,
       lastStatedAt: i.lastStatedAt,
       ...(typeof i.situationNote === "string" && i.situationNote.trim() ? { situationNote: i.situationNote.trim().slice(0, SYNTHESIS_LIMITS.maxStatementLength) } : {}),
+      ...(Array.isArray(i.anchors) ? { anchors: (i.anchors as unknown[])
+        .filter((a): a is { statedAt: string; summary: string } => !!a && typeof a === "object" && typeof (a as { statedAt?: unknown }).statedAt === "string" && typeof (a as { summary?: unknown }).summary === "string")
+        .slice(0, 3)
+        .map((a) => ({ statedAt: a.statedAt.slice(0, 10), summary: a.summary.slice(0, SYNTHESIS_LIMITS.summaryLength) })) } : {}),
     });
     if (out.length >= SYNTHESIS_LIMITS.maxItemsPerTurn) break;
   }
@@ -266,7 +283,8 @@ export function buildSynthesisSection(items: SynthesisItem[]): string {
       const when = i.firstStatedAt.slice(0, 7) === i.lastStatedAt.slice(0, 7) ? i.firstStatedAt.slice(0, 7) : `${i.firstStatedAt.slice(0, 7)}〜${i.lastStatedAt.slice(0, 7)}`;
       const basis = i.basis === "explicit" ? "本人が話した内容のまとめ" : "Tsumugiの仮説";
       const note = i.situationNote ? `\n  状況の違い: ${i.situationNote}` : "";
-      return `- [${KIND_LABEL[i.kind]}・${basis}・${when}に話した内容から] ${i.statement}${note}`;
+      const anchors = (i.anchors ?? []).map((a) => `\n  ・${a.statedAt.slice(0, 10)}に話したこと: ${a.summary}`).join("");
+      return `- [${KIND_LABEL[i.kind]}・${basis}・${when}に話した内容から] ${i.statement}${note}${anchors}`;
     })
     .join("\n");
   return `
@@ -277,6 +295,8 @@ ${lines}
 
 これは、ユーザーが別々の日に話した内容をTsumugiが並べて見たときの整理であり、ユーザーの性格や心理の診断ではない。
 - 今の発言に本当に関係するときだけ、自然に一度生かす。関係が薄ければ触れない。毎回持ち出さない。
+- 生かすときは、まとめの言葉を言い換えるのではなく、上の「〜に話したこと」の具体的な中身（いつ頃、何を話していたか）に触れて、今の発言とつなげる。日付は「5月ごろ」「先月」のように自然に言えばよい。
+- 流れを伝えた後は、今どう感じているのかを本人に尋ねる。Tsumugiの整理を押しつけない。
 - 「Tsumugiの仮説」は事実として断定しない。「前は〜と話していて、最近は〜」のように、本人が話した内容に沿って、確かめるように触れる。
 - 「揺れ」は矛盾の指摘ではない。状況が違えば望みが違うのは自然なこととして扱い、責めたり白黒をつけさせたりしない。
 - 期間は「話した時期」であり、出来事が起きた時期ではない。
