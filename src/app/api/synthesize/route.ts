@@ -83,24 +83,29 @@ export async function POST(request: Request) {
   if (clusters.length === 0) return Response.json({ error: "clusters is required" }, { status: 400 });
 
   const started = Date.now();
-  let text: string;
-  try {
-    const response = await getProvider(providerName).generateStructured({
-      model: resolveModel(providerName),
-      apiKey,
-      systemInstruction: SYSTEM_PROMPT,
-      userContent: renderClustersForModel(clusters),
-      maxOutputTokens: 1600,
-      providerOptions: { gemini: { thinkingBudget: 512 } },
-      schema: SCHEMA,
-    });
-    text = response.text;
-  } catch (error) {
-    console.error("[Tsumugi Synthesize] generateStructured failed:", error);
-    return Response.json({ error: "Failed to generate a synthesis." }, { status: 502 });
+  // one retry only when the model returned no usable JSON object (an empty "items" list is a legitimate answer and is not retried)
+  let parsed: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let text: string;
+    try {
+      const response = await getProvider(providerName).generateStructured({
+        model: resolveModel(providerName),
+        apiKey,
+        systemInstruction: SYSTEM_PROMPT,
+        userContent: renderClustersForModel(clusters),
+        maxOutputTokens: 1600,
+        providerOptions: { gemini: { thinkingBudget: 512 } },
+        schema: SCHEMA,
+      });
+      text = response.text;
+    } catch (error) {
+      console.error("[Tsumugi Synthesize] generateStructured failed:", error);
+      return Response.json({ error: "Failed to generate a synthesis." }, { status: 502 });
+    }
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    if (parsed && typeof parsed === "object" && Array.isArray((parsed as { items?: unknown }).items)) break;
   }
-  let parsed: unknown;
-  try { parsed = JSON.parse(text); } catch { return Response.json({ error: "Failed to parse AI response as JSON." }, { status: 502 }); }
+  if (!parsed || typeof parsed !== "object") return Response.json({ error: "Failed to parse AI response as JSON." }, { status: 502 });
   const items = validateSynthesisItems(parsed, clusters);
   const proposed = parsed && typeof parsed === "object" && Array.isArray((parsed as { items?: unknown }).items) ? (parsed as { items: unknown[] }).items.length : 0;
   return Response.json({ items, proposed }, { headers: { "Server-Timing": `model;dur=${Date.now() - started}` } });

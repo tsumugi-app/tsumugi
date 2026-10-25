@@ -104,6 +104,12 @@ test("anchors: the earliest / middle / latest evidence with its said-date are ad
   assert.ok(section.includes(`${work.evidence[0].statedAt.slice(0, 10)}に話したこと`));
 });
 
+test("anchors: the most recent thing said on the theme is included even if the model did not cite it", () => {
+  const items = validateSynthesisItems({ items: [{ kind: "change", statement: "仕事の変化", basis: "hypothesis", evidenceIds: [ids[0], ids[1]] }] }, clusters);
+  const [anchored] = withAnchors(items, memories);
+  assert.equal(anchored.anchors![anchored.anchors!.length - 1].statedAt, work.evidence[work.evidence.length - 1].statedAt);
+});
+
 test("chat section: empty without items (prompt unchanged); hypotheses are labelled; tension basis cannot be forced to explicit", () => {
   assert.equal(buildSynthesisSection([]), "");
   assert.deepEqual(sanitizeSynthesisContext("x"), []);

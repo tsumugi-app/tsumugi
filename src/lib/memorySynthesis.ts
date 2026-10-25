@@ -216,9 +216,18 @@ export function dropItemsWithMissingEvidence(items: SynthesisItem[], existingMem
 /** adds the earliest, a middle and the latest evidence point (said-date + summary) so that the reply can be concrete instead of repeating an abstract summary */
 export function withAnchors(items: SynthesisItem[], memories: MemoryObject[]): SynthesisItem[] {
   const byId = new Map(memories.map((m) => [m.id, m]));
+  const time = (m: MemoryObject) => Date.parse(statedAtOf(m).at);
   return items.map((i) => {
     const ev = i.evidenceIds.map((id) => byId.get(id)).filter((m): m is MemoryObject => !!m);
-    const picks = ev.length <= 3 ? ev : [ev[0], ev[Math.floor(ev.length / 2)], ev[ev.length - 1]];
+    // the most recent thing the user said on this theme, even when the model did not cite it: the reply must not ask about something the user already answered
+    const theme = normalizeAnalyticsKeyword(i.theme);
+    const latestOnTheme = memories
+      .filter((m) => isSynthesisSource(m) && (m.keywords ?? []).some((k) => normalizeAnalyticsKeyword(k) === theme))
+      .sort((a, b) => time(b) - time(a))[0];
+    const base = ev.length <= 3 ? ev : [ev[0], ev[Math.floor(ev.length / 2)], ev[ev.length - 1]];
+    const picks = latestOnTheme && !base.some((m) => m.id === latestOnTheme.id) && time(latestOnTheme) > time(base[base.length - 1])
+      ? [...base.slice(0, Math.min(base.length, 2)), latestOnTheme]
+      : base;
     return { ...i, anchors: picks.map((m) => ({ statedAt: statedAtOf(m).at, summary: m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength) })) };
   });
 }
