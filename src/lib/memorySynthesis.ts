@@ -267,7 +267,7 @@ export function buildThemeTimeline(theme: string, memories: MemoryObject[]): Syn
   });
 }
 
-const STOP_TERMS = new Set(["今日", "最近", "以前", "前回", "今", "話", "日", "気", "人", "前", "後", "時", "中", "方", "事", "何", "少", "思", "感", "行", "来", "見", "言", "私", "夜", "週末"]);
+const STOP_TERMS = new Set(["今日", "最近", "以前", "前回", "今", "話", "日", "気", "人", "前", "後", "時", "中", "方", "事", "何", "少", "思", "感", "行", "来", "見", "言", "私", "夜", "週末", "時間", "気分", "最新"]);
 
 /**
  * Words that characterise a theme in the user's own records (kanji / katakana runs that occur in at least 40% of the theme's Memories, at least twice).
