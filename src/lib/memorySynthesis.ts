@@ -165,8 +165,12 @@ const KINDS: SynthesisKind[] = ["change", "pattern", "tension"];
  */
 export function validateSynthesisItems(raw: unknown, clusters: SynthesisCluster[]): SynthesisItem[] {
   const list = raw && typeof raw === "object" && Array.isArray((raw as { items?: unknown }).items) ? (raw as { items: unknown[] }).items : [];
-  const evidenceById = new Map<string, { e: SynthesisEvidence; cluster: number }>();
-  clusters.forEach((c, ci) => c.evidence.forEach((e) => evidenceById.set(e.id, { e, cluster: ci })));
+  // one Memory can be evidence in several themes (e.g. "仕事" and "ランニング"): an item is valid when ALL its ids belong to one common theme
+  const evidenceById = new Map<string, { e: SynthesisEvidence; clusters: Set<number> }>();
+  clusters.forEach((c, ci) => c.evidence.forEach((e) => {
+    const known = evidenceById.get(e.id);
+    if (known) known.clusters.add(ci); else evidenceById.set(e.id, { e, clusters: new Set([ci]) });
+  }));
   const out: SynthesisItem[] = [];
   for (const r of list) {
     if (!r || typeof r !== "object") continue;
@@ -177,8 +181,8 @@ export function validateSynthesisItems(raw: unknown, clusters: SynthesisCluster[
     if (!statement || statement.length > SYNTHESIS_LIMITS.maxStatementLength) continue;
     const ids = Array.isArray(item.evidenceIds) ? [...new Set(item.evidenceIds.filter((x): x is string => typeof x === "string" && evidenceById.has(x)))] : [];
     if (ids.length === 0) continue;
-    const clusterIndex = evidenceById.get(ids[0])!.cluster;
-    if (ids.some((id) => evidenceById.get(id)!.cluster !== clusterIndex)) continue;
+    const clusterIndex = [...evidenceById.get(ids[0])!.clusters].find((ci) => ids.every((id) => evidenceById.get(id)!.clusters.has(ci)));
+    if (clusterIndex === undefined) continue;
     const ev = ids.map((id) => evidenceById.get(id)!.e).sort((a, b) => Date.parse(a.statedAt) - Date.parse(b.statedAt));
     const days = new Set(ev.map((e) => e.statedAt.slice(0, 10)));
     const conversations = new Set(ev.map((e) => e.conversationId));

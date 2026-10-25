@@ -69,6 +69,12 @@ test("validate: a tension needs a situation note and is always a hypothesis; mix
   assert.equal(items[0].basis, "hypothesis");
 });
 
+test("validate: a Memory that is evidence in two themes may be used in either", () => {
+  const shared = clusters.find((c) => c.theme === "ランニング")!.evidence.find((e) => ids.includes(e.id))!;
+  const other = ids.find((id) => id !== shared.id && !clusters.find((c) => c.theme === "ランニング")!.evidence.some((e) => e.id === id))!;
+  assert.equal(validateSynthesisItems({ items: [{ kind: "change", statement: "仕事の変化", basis: "hypothesis", evidenceIds: [other, shared.id] }] }, clusters).length, 1);
+});
+
 test("deleted evidence takes the whole item with it; source Memories are not modified", () => {
   const before = JSON.stringify(memories);
   const items = validateSynthesisItems({ items: [{ kind: "change", statement: "変化", basis: "hypothesis", evidenceIds: [ids[0], ids[2]] }] }, clusters);
