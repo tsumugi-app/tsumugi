@@ -66,11 +66,22 @@ export function fictionalSynthesisMemories(): MemoryObject[] {
   });
 }
 
-/** user turns used for the comparison; the last one is unrelated on purpose (Synthesis should stay out of it) */
-export const SYNTHESIS_EVAL_SCENARIOS: { id: string; label: string; userText: string }[] = [
-  { id: "work", label: "仕事の迷い", userText: "最近また仕事のことで考えちゃって。今の会社、このままでいいのかな" },
-  { id: "running", label: "走る気が起きない", userText: "週末走ろうかと思ってたけど、なんか気が乗らないんだよね" },
-  { id: "alone", label: "一人と誰か", userText: "今日は一人でいたい気分なんだけど、夜になると寂しくなるんだよね" },
-  { id: "mother", label: "実家", userText: "年末どうしようかなあ。実家、帰ったほうがいいのかな" },
-  { id: "unrelated", label: "関係のない話題", userText: "今日は天気よくて、洗濯物がよく乾いた" },
+/**
+ * User turns for the comparison, with simple code checks for each reply:
+ *   mustNotAsk    - asking this again means the latest record was ignored (it already has the answer)
+ *   concreteTerms - words of what the user actually said on this theme (a reply that uses some is concrete, not generic)
+ *   pastTerms     - for the unrelated turn only: any of these means a past Memory was brought into a turn it has nothing to do with
+ * The last scenario is unrelated on purpose.
+ */
+export interface SynthesisEvalScenario { id: string; label: string; userText: string; mustNotAsk: string[]; concreteTerms: string[]; pastTerms?: string[] }
+
+export const SYNTHESIS_EVAL_SCENARIOS: SynthesisEvalScenario[] = [
+  { id: "work", label: "仕事の迷い", userText: "最近また仕事のことで考えちゃって。今の会社、このままでいいのかな", mustNotAsk: ["面談はどう", "面談、どう", "面談の結果", "面談を受けて", "異動の面談はいかが"], concreteTerms: ["保留", "異動", "デザイン", "勉強", "転職", "企画", "安定"] },
+  { id: "running", label: "走る気が起きない", userText: "週末走ろうかと思ってたけど、なんか気が乗らないんだよね", mustNotAsk: ["大会はどう", "大会、どう", "大会の結果"], concreteTerms: ["寒", "大会", "完走", "10キロ", "10km", "すっきり", "もやもや", "川沿い"] },
+  { id: "alone", label: "一人と誰か", userText: "今日は一人でいたい気分なんだけど、夜になると寂しくなるんだよね", mustNotAsk: [], concreteTerms: ["人混み", "夕飯", "ご飯", "キャンプ", "一人暮らし", "忙しい", "人に会"] },
+  { id: "mother", label: "実家", userText: "年末どうしようかなあ。実家、帰ったほうがいいのかな", mustNotAsk: [], concreteTerms: ["お母", "母", "通院", "病院", "電話", "ひざ", "安心"] },
+  { id: "unrelated", label: "関係のない話題", userText: "今日は天気よくて、洗濯物がよく乾いた", mustNotAsk: [], concreteTerms: [], pastTerms: ["仕事", "走", "お母", "実家", "異動", "一人", "会社", "大会"] },
 ];
+
+/** words that put a psychological label / motive on the user (checked in every reply) */
+export const REPLY_LABEL_TERMS = ["心を守", "自分を守", "欲求", "求めている", "求めてしまう", "深層", "無意識", "本当は", "防衛", "逃避", "依存", "承認", "性格"];
