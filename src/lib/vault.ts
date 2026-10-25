@@ -8280,10 +8280,27 @@ export const vaultRecoveryPrimitives = {
 // 本番接続時（Phase 3-4以降）には、既存の書き込みと直列化するための統合を検討すること。
 // ---------------------------------------------------------------------------
 
+/**
+ * READ ONLY. Given the already-read contents of the month file and `history-meta.json`, would `updateHistoryIndex(root, update)` write NOTHING?
+ * It uses exactly the helpers `updateHistoryIndex` uses (computeUpdatedDayEntry / isDayIndexEqual / computeMonthAggregate / isMonthAggregateEqual), so the
+ * answer can not drift from the writer. Conservative: anything it can not prove (missing day, malformed shapes) is "would write".
+ * Lets the projection engine skip the read-modify-write (its own lock + two more file reads) for an entry whose History rows are already exact.
+ */
+export function historyIndexUpdateIsNoop(monthIndex: HistoryMonthIndex, meta: HistoryMeta, update: HistoryIndexUpdate): boolean {
+  if (!monthIndex || typeof monthIndex.days !== "object" || monthIndex.days === null) return false;
+  if (!meta || typeof meta.months !== "object" || meta.months === null) return false;
+  const previous = monthIndex.days[update.day];
+  if (!previous) return false;
+  const next = computeUpdatedDayEntry(previous, update);
+  if (!isDayIndexEqual(previous, next)) return false;
+  return isMonthAggregateEqual(meta.months[update.day.slice(0, 7)], computeMonthAggregate(monthIndex));
+}
+
 export const vaultProjectionPrimitives = {
   writeFileInDir,
   updateIndex,
   updateHistoryIndex,
   upsertVaultRegistryRecord,
   readVaultFileStat,
+  historyIndexUpdateIsNoop,
 };

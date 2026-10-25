@@ -1,5 +1,6 @@
 "use client";
 
+import { waitUntilIdle } from "@/lib/waitUntilIdle";
 import { logRecoveryArchiveDiagnostic } from "@/lib/vaultRecoveryArchiveDebug";
 import { requestFullWipe } from "@/lib/dataWipe";
 import { getJstTodayDateString } from "@/lib/jstDate";
@@ -3538,12 +3539,9 @@ export default function ChatScreen() {
     recoveryDetectionRanRef.current = true;
     const generation = vaultGenerationRef.current;
     // 検査は必ず終わる：待機・再試行は有限回で、尽きたら「failed」を表示する（空白のままにしない）。
-    let idle = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      await new Promise((resolve) => window.setTimeout(resolve, attempt === 0 ? 3000 : 20000));
-      if (generation !== vaultGenerationRef.current) return;
-      if (!vaultOperationLockRef.current && !isVaultSwitchingRef.current) { idle = true; break; }
-    }
+    const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, () => generation !== vaultGenerationRef.current);
+    if (waited === "cancelled") return;
+    const idle = waited === "idle";
     if (!idle) { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
     // 既知の異常がある間は「検査中」で上書きしない（隠さない）。
     setRecoveryChecking(true);

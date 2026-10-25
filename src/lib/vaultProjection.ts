@@ -36,7 +36,7 @@ import {
   parseSourceMarkdown,
 } from "./markdown";
 import { validStatedAt } from "./markdown";
-import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives } from "./vault";
+import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives, type HistoryIndexUpdate, type HistoryMeta, type HistoryMonthIndex } from "./vault";
 
 // ---------------------------------------------------------------------------
 // path
@@ -62,7 +62,27 @@ function isNotFoundError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "NotFoundError";
 }
 
-async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
+/**
+ * ONE reconcile pass may remember the files it has already read, so that the SAME small shared file (identity, index.json, a registry shard, a History month,
+ * history-meta, a day file) is not read again for every one of hundreds of records. The memory is deliberately narrow:
+ *   - it exists only inside `reconcileOutboxEntries` (one pass, a few seconds) and is dropped at its end; nothing is remembered between passes or startups;
+ *   - every write the engine makes (or is about to make) clears it;
+ *   - it may only justify "this record is already in order": an entry is first evaluated against remembered reads, and if that evaluation would WRITE anything
+ *     (or end in anything but "done": a conflict, a hold, a retry) the remembered reads are thrown away and the entry is evaluated again from fresh reads,
+ *     exactly as it always was. So no write, hold or conflict is ever decided from remembered content.
+ * Errors are never remembered. Content equality is always decided from the text that was actually read (never from size / modified time).
+ */
+interface PassState { map: Map<string, TextRead>; gen: number; cachedOnly: boolean }
+const passStates = new WeakMap<ProjectionEnv, PassState>();
+const cachedOnlyEntries = new WeakSet<object>();
+/** thrown inside a remembered-reads evaluation the moment it would write or conclude anything other than "done"; the entry is then evaluated again from fresh reads */
+class NeedsFreshRead extends Error {}
+
+/** read counters (file bodies actually read from the Vault / reads answered from the pass memory): for tests and measurement only */
+export const projectionReadStats = { fileReads: 0, cacheHits: 0, idbWritesSkipped: 0 };
+export function resetProjectionReadStats(): void { projectionReadStats.fileReads = 0; projectionReadStats.cacheHits = 0; projectionReadStats.idbWritesSkipped = 0; }
+
+async function readTextFromDisk(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
   const segments = path.split("/");
   try {
     let dir = root;
@@ -75,9 +95,21 @@ async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promis
   }
 }
 
+async function readTextAt(env: ProjectionEnv, path: string): Promise<TextRead> {
+  const pass = passStates.get(env);
+  const hit = pass?.map.get(path);
+  if (hit) { projectionReadStats.cacheHits += 1; return hit; }
+  const generation = pass?.gen;
+  const result = await readTextFromDisk(env.root, path);
+  projectionReadStats.fileReads += 1;
+  // a write that happened while this read was in flight may have made it stale: remember only if nothing was written meanwhile
+  if (pass && result.state !== "error" && pass.gen === generation) pass.map.set(path, result);
+  return result;
+}
+
 /** 0byteファイルは「不在」として扱う（Vault全体で共通の既存の規約）。 */
-async function readJsonAt(root: FileSystemDirectoryHandle, path: string): Promise<JsonRead> {
-  const raw = await readTextAt(root, path);
+async function readJsonAt(env: ProjectionEnv, path: string): Promise<JsonRead> {
+  const raw = await readTextAt(env, path);
   if (raw.state !== "ok") return raw;
   if (raw.text.trim() === "") return { state: "absent" };
   try {
@@ -87,6 +119,14 @@ async function readJsonAt(root: FileSystemDirectoryHandle, path: string): Promis
   } catch {
     return { state: "error" };
   }
+}
+
+/** every write the engine makes goes through here: a remembered-reads evaluation never writes (it is redone from fresh reads), and a write clears the memory */
+async function writing<T>(env: ProjectionEnv, write: () => Promise<T>): Promise<T> {
+  const pass = passStates.get(env);
+  if (pass?.cachedOnly) throw new NeedsFreshRead();
+  try { return await write(); }
+  finally { if (pass) { pass.map.clear(); pass.gen += 1; } }
 }
 
 async function dirAndFileNameFor(root: FileSystemDirectoryHandle, path: string, create: boolean): Promise<{ dir: FileSystemDirectoryHandle; fileName: string }> {
@@ -113,7 +153,7 @@ export interface ProjectionEnv {
 
 async function vaultIdentityMatches(env: ProjectionEnv): Promise<boolean> {
   if (!env.vaultIdentity || !env.vaultIdentity.vaultId) return false;
-  const read = await readJsonAt(env.root, VAULT_IDENTITY_PATH);
+  const read = await readJsonAt(env, VAULT_IDENTITY_PATH);
   if (read.state !== "ok") return false; // 不在／読めない場合も「一致を確認できた」わけではないため、安全側でfalse
   const onDiskVaultId = read.value.vaultId;
   return typeof onDiskVaultId === "string" && onDiskVaultId === env.vaultIdentity.vaultId;
@@ -161,7 +201,7 @@ type MarkdownVerdict =
 async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, registryPath: string | undefined): Promise<MarkdownVerdict> {
   const path = registryPath ?? defaultConversationPath(canonical);
   const expectedContent = conversationToMarkdown(canonical);
-  const read = await readTextAt(env.root, path);
+  const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError("markdown-unreadable");
   if (read.state === "absent") return { kind: "create", path };
   if (read.text === expectedContent) return { kind: "no-op", path };
@@ -175,7 +215,7 @@ async function projectMarkdown(env: ProjectionEnv, canonical: Conversation, verd
   if (verdict.kind === "no-op") return;
   const { dir, fileName } = await dirAndFileNameFor(env.root, verdict.path, true);
   try {
-    await vaultProjectionPrimitives.writeFileInDir(dir, fileName, conversationToMarkdown(canonical), "projection markdown");
+    await writing(env, () => vaultProjectionPrimitives.writeFileInDir(dir, fileName, conversationToMarkdown(canonical), "projection markdown"));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "markdown-write-failed");
   }
@@ -188,7 +228,7 @@ async function projectMarkdown(env: ProjectionEnv, canonical: Conversation, verd
 async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversation, path: string): Promise<void> {
   const bucket = vaultRegistryBucketOf(canonical.id);
   const shardPath = registryShardPath(bucket);
-  const read = await readJsonAt(env.root, shardPath);
+  const read = await readJsonAt(env, shardPath);
   if (read.state === "error") throw new ProjectionConflictError("registry-unreadable");
   const records = read.state === "ok" && isObj(read.value.records) ? (read.value.records as Record<string, unknown>) : {};
   const files = read.state === "ok" && isObj(read.value.files) ? (read.value.files as Record<string, unknown>) : {};
@@ -196,15 +236,8 @@ async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversat
   // 対象外key・対象外pathには一切触れない（`upsertVaultRegistryRecord`自身が
   // read-modify-writeでこのregistryKey分のentryだけを更新するため、他recordの
   // 行は構造的に保護される）。
-  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
-  let stat: { mtime: number; size: number };
-  try {
-    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
-  } catch (error) {
-    throw new ProjectionRetryableError(error instanceof Error ? error.message : "markdown-stat-failed");
-  }
   const content = conversationToMarkdown(canonical);
-  const expected = { recordType: "conversation" as const, mtime: stat.mtime, size: stat.size, contentHash: hashVaultText(content), memberIds: [canonical.id], status: "ok" as const };
+  const expected = { recordType: "conversation" as const, mtime: 0, size: 0, contentHash: hashVaultText(content), memberIds: [canonical.id], status: "ok" as const };
   const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;
   const alreadyCorrect =
     currentPath === path &&
@@ -216,8 +249,17 @@ async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversat
     currentEntry.memberIds.length === 1 &&
     currentEntry.memberIds[0] === canonical.id;
   if (alreadyCorrect) return; // no-op
+  // the file stat is only needed when the Registry row has to be written: an already-correct row is decided without it (one operation less per record)
+  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
+  let stat: { mtime: number; size: number };
   try {
-    await vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey: canonical.id, path, ...expected });
+    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "markdown-stat-failed");
+  }
+  Object.assign(expected, { mtime: stat.mtime, size: stat.size });
+  try {
+    await writing(env, () => vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey: canonical.id, path, ...expected }));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "registry-write-failed");
   }
@@ -228,12 +270,12 @@ async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversat
 // ---------------------------------------------------------------------------
 
 async function decideAndProjectIndex(env: ProjectionEnv, canonical: Conversation, path: string): Promise<void> {
-  const read = await readJsonAt(env.root, INDEX_PATH);
+  const read = await readJsonAt(env, INDEX_PATH);
   if (read.state === "error") throw new ProjectionConflictError("index-unreadable");
   const current = read.state === "ok" ? read.value[canonical.id] : undefined;
   if (current === path) return; // no-op（対象外の他keyには一切触れない——updateIndexも読み込んだ全体をそのまま書き戻すread-modify-writeのため保護される）
   try {
-    await vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path);
+    await writing(env, () => vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "index-write-failed");
   }
@@ -243,6 +285,15 @@ async function decideAndProjectIndex(env: ProjectionEnv, canonical: Conversation
 // Conversation：History判定
 // ---------------------------------------------------------------------------
 
+/**
+ * The History rows (month file + history-meta) were just read OK; if the update the writer would apply changes nothing, the read-modify-write (its own lock and two
+ * more file reads) is skipped. Anything unproven (a missing day / file, an odd shape) still goes to the writer exactly as before.
+ */
+function historyAlreadyExact(monthRead: JsonRead, metaRead: JsonRead, update: HistoryIndexUpdate): boolean {
+  return monthRead.state === "ok" && metaRead.state === "ok"
+    && vaultProjectionPrimitives.historyIndexUpdateIsNoop(monthRead.value as unknown as HistoryMonthIndex, metaRead.value as unknown as HistoryMeta, update);
+}
+
 async function decideAndProjectHistory(env: ProjectionEnv, canonical: Conversation): Promise<void> {
   const day = canonical.startedAt.slice(0, 10);
   const monthPath = historyMonthPath(day);
@@ -251,13 +302,15 @@ async function decideAndProjectHistory(env: ProjectionEnv, canonical: Conversati
   // 巻き込んで消しかねない。読めることさえ確認できれば、以降の実際の更新判断
   // （変化が無ければ書かない）は既存のupdateHistoryIndexの絶対値書き込みに任せてよい
   // ——同じday・同じ入力からは常に同じ結果になるため、他の日・他月には触れない）。
-  const monthRead = await readJsonAt(env.root, monthPath);
+  const monthRead = await readJsonAt(env, monthPath);
   if (monthRead.state === "error") throw new ProjectionConflictError("history-unreadable");
-  const metaRead = await readJsonAt(env.root, HISTORY_META_PATH);
+  const metaRead = await readJsonAt(env, HISTORY_META_PATH);
   if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
   const mode = conversationEntryTypeOf(canonical);
+  const update: HistoryIndexUpdate = { kind: "conversation", id: canonical.id, day, mode, turnCount: canonical.turns.length };
+  if (historyAlreadyExact(monthRead, metaRead, update)) return;
   try {
-    await vaultProjectionPrimitives.updateHistoryIndex(env.root, { kind: "conversation", id: canonical.id, day, mode, turnCount: canonical.turns.length });
+    await writing(env, () => vaultProjectionPrimitives.updateHistoryIndex(env.root, update));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "history-write-failed");
   }
@@ -270,22 +323,22 @@ async function decideAndProjectHistory(env: ProjectionEnv, canonical: Conversati
 
 async function finalVerify(env: ProjectionEnv, canonical: Conversation, path: string): Promise<{ ok: true } | { ok: false; reason: string }> {
   const expectedContent = conversationToMarkdown(canonical);
-  const markdownRead = await readTextAt(env.root, path);
+  const markdownRead = await readTextAt(env, path);
   if (markdownRead.state !== "ok" || markdownRead.text !== expectedContent) return { ok: false, reason: "verify-markdown-mismatch" };
 
   const bucket = vaultRegistryBucketOf(canonical.id);
-  const registryRead = await readJsonAt(env.root, registryShardPath(bucket));
+  const registryRead = await readJsonAt(env, registryShardPath(bucket));
   if (registryRead.state !== "ok") return { ok: false, reason: "verify-registry-missing" };
   const records = isObj(registryRead.value.records) ? registryRead.value.records : {};
   const files = isObj(registryRead.value.files) ? registryRead.value.files : {};
   const entry = records[canonical.id] === path ? files[path] : undefined;
   if (!isObj(entry) || entry.status !== "ok" || entry.contentHash !== hashVaultText(expectedContent)) return { ok: false, reason: "verify-registry-mismatch" };
 
-  const indexRead = await readJsonAt(env.root, INDEX_PATH);
+  const indexRead = await readJsonAt(env, INDEX_PATH);
   if (indexRead.state !== "ok" || indexRead.value[canonical.id] !== path) return { ok: false, reason: "verify-index-mismatch" };
 
   const day = canonical.startedAt.slice(0, 10);
-  const historyRead = await readJsonAt(env.root, historyMonthPath(day));
+  const historyRead = await readJsonAt(env, historyMonthPath(day));
   if (historyRead.state !== "ok") return { ok: false, reason: "verify-history-missing" };
   const days = isObj(historyRead.value.days) ? historyRead.value.days : {};
   const dayEntry = days[day];
@@ -316,9 +369,18 @@ export function registerProjectionDryRun(entry: VaultOutboxEntry, sink: (outcome
   return () => { dryRunSinks.delete(entry); };
 }
 
+const PROJECTION_STEP_NAMES_FOR_COMPARE: ProjectionStepName[] = ["markdown", "registry", "history", "index", "ledger"];
+
 async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionStepName, ProjectionStepState>, status: "done" | "pending" | "held", reason: string | null, now: string): Promise<void> {
   const dryRunSink = dryRunSinks.get(entry);
   if (dryRunSink) { dryRunSink({ steps: { ...steps }, status, reason }); return; }
+  // an evaluation that rests on remembered reads may only conclude "done"; a hold / retry / conflict is always decided again from fresh reads
+  if (cachedOnlyEntries.has(entry) && status !== "done") throw new NeedsFreshRead();
+  // already "done" with exactly these steps: nothing changed, so nothing is written (the record was only re-verified)
+  if (status === "done" && entry.status === "done" && entry.heldReason === null && PROJECTION_STEP_NAMES_FOR_COMPARE.every((name) => entry.steps[name] === steps[name])) {
+    projectionReadStats.idbWritesSkipped += 1;
+    return;
+  }
   const attempt = status === "done" ? entry.attempt : { count: entry.attempt.count + 1, lastError: reason, lastAttemptAt: now };
   const persist = entry.recordType === "memory" || entry.recordType === "reflection" ? putMemoryProjectionOutcome : putVaultOutboxEntry;
   await persist({ ...entry, steps, status, heldReason: status === "held" ? reason : null, attempt, updatedAt: now });
@@ -372,7 +434,7 @@ export async function reconcileConversationOutboxEntry(env: ProjectionEnv, entry
   // 内部で改めてMarkdownの実在を確認し、baselineに頼らずcreate/update/no-op/
   // conflict/heldを決める）。
   const bucket = vaultRegistryBucketOf(canonical.id);
-  const registryPeek = await readJsonAt(env.root, registryShardPath(bucket));
+  const registryPeek = await readJsonAt(env, registryShardPath(bucket));
   const registryPath =
     registryPeek.state === "ok" && isObj(registryPeek.value.records) && typeof registryPeek.value.records[canonical.id] === "string"
       ? (registryPeek.value.records[canonical.id] as string)
@@ -564,7 +626,7 @@ interface MemoryMergeResult {
  * req 4の「常に最新実体を基準にする」を満たす）。
  */
 async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<MemoryMergeResult> {
-  const read = await readTextAt(env.root, path);
+  const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError("memory-dayfile-unreadable");
 
   let existingMembers: MemoryObject[] = [];
@@ -606,7 +668,7 @@ async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObjec
   if (verdict !== "no-op") {
     const { dir, fileName } = await dirAndFileNameFor(env.root, path, true);
     try {
-      await vaultProjectionPrimitives.writeFileInDir(dir, fileName, finalContent, "projection memory day-file");
+      await writing(env, () => vaultProjectionPrimitives.writeFileInDir(dir, fileName, finalContent, "projection memory day-file"));
     } catch (error) {
       throw new ProjectionRetryableError(error instanceof Error ? error.message : "memory-dayfile-write-failed");
     }
@@ -626,22 +688,15 @@ async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, 
   const registryKey = dayFileRegistryKey(day);
   const bucket = vaultRegistryBucketOf(registryKey);
   const shardPath = registryShardPath(bucket);
-  const read = await readJsonAt(env.root, shardPath);
+  const read = await readJsonAt(env, shardPath);
   if (read.state === "error") throw new ProjectionConflictError("registry-unreadable");
   const records = read.state === "ok" && isObj(read.value.records) ? (read.value.records as Record<string, unknown>) : {};
   const files = read.state === "ok" && isObj(read.value.files) ? (read.value.files as Record<string, unknown>) : {};
   const currentPath = records[registryKey];
 
-  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
-  let stat: { mtime: number; size: number };
-  try {
-    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
-  } catch (error) {
-    throw new ProjectionRetryableError(error instanceof Error ? error.message : "memory-dayfile-stat-failed");
-  }
   const memberIds = finalMembers.map((m) => m.id);
   const memberHashes = Object.fromEntries(finalMembers.map((m) => [m.id, hashVaultText(memoryEntryMarkdown(m))]));
-  const expected = { recordType: "memory-day" as const, mtime: stat.mtime, size: stat.size, contentHash: hashVaultText(finalContent), memberIds, memberHashes, status: "ok" as const };
+  const expected = { recordType: "memory-day" as const, mtime: 0, size: 0, contentHash: hashVaultText(finalContent), memberIds, memberHashes, status: "ok" as const };
 
   const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;
   const alreadyCorrect =
@@ -655,9 +710,18 @@ async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, 
     isObj(currentEntry.memberHashes) &&
     memberIds.every((id) => (currentEntry.memberHashes as Obj)[id] === memberHashes[id]);
   if (alreadyCorrect) return;
+  // the file stat is only needed when the Registry row has to be written: an already-correct row is decided without it (one operation less per record)
+  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
+  let stat: { mtime: number; size: number };
+  try {
+    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : "memory-dayfile-stat-failed");
+  }
+  Object.assign(expected, { mtime: stat.mtime, size: stat.size });
 
   try {
-    await vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey, path, ...expected });
+    await writing(env, () => vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey, path, ...expected }));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "registry-write-failed");
   }
@@ -683,12 +747,12 @@ function sameStringArray(a: unknown, b: unknown[]): boolean {
 // ---------------------------------------------------------------------------
 
 async function decideAndProjectMemoryIndex(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<void> {
-  const read = await readJsonAt(env.root, INDEX_PATH);
+  const read = await readJsonAt(env, INDEX_PATH);
   if (read.state === "error") throw new ProjectionConflictError("index-unreadable");
   const current = read.state === "ok" ? read.value[canonical.id] : undefined;
   if (current === path) return;
   try {
-    await vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path);
+    await writing(env, () => vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "index-write-failed");
   }
@@ -704,9 +768,9 @@ async function decideAndProjectMemoryIndex(env: ProjectionEnv, canonical: Memory
 
 async function decideAndProjectMemoryHistory(env: ProjectionEnv, day: string, finalMembers: MemoryObject[]): Promise<void> {
   const monthPath = historyMonthPath(day);
-  const monthRead = await readJsonAt(env.root, monthPath);
+  const monthRead = await readJsonAt(env, monthPath);
   if (monthRead.state === "error") throw new ProjectionConflictError("history-unreadable");
-  const metaRead = await readJsonAt(env.root, HISTORY_META_PATH);
+  const metaRead = await readJsonAt(env, HISTORY_META_PATH);
   if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
   // `date`は日付部分だけをMarkdown frontmatterへ書く（`memoryObjectToMarkdown`）ため、
   // day-fileから再読み込みしたmember（`mergeMemoryIntoDayFile`がparse経由で返す既存member）
@@ -720,8 +784,10 @@ async function decideAndProjectMemoryHistory(env: ProjectionEnv, day: string, fi
   // 呼び出し元の由来に関わらず、ここで一律に日付部分だけへ正規化することで、
   // 常に同じ値へ収束させる（真の冪等性。Invariant 3）。
   const rows = finalMembers.map((m) => ({ id: m.id, types: m.types, preview: truncateHistoryPreview(m.summary), createdAt: m.createdAt, date: `${m.date.slice(0, 10)}T00:00:00.000Z` }));
+  const update: HistoryIndexUpdate = { kind: "memory", day, normalMemories: rows };
+  if (historyAlreadyExact(monthRead, metaRead, update)) return;
   try {
-    await vaultProjectionPrimitives.updateHistoryIndex(env.root, { kind: "memory", day, normalMemories: rows });
+    await writing(env, () => vaultProjectionPrimitives.updateHistoryIndex(env.root, update));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "history-write-failed");
   }
@@ -733,7 +799,7 @@ async function decideAndProjectMemoryHistory(env: ProjectionEnv, day: string, fi
 // ---------------------------------------------------------------------------
 
 async function finalVerifyMemory(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const dayRead = await readTextAt(env.root, path);
+  const dayRead = await readTextAt(env, path);
   if (dayRead.state !== "ok") return { ok: false, reason: "verify-memory-dayfile-missing" };
   const members = parseMemoryDayFile(dayRead.text);
   const member = members.find((m) => m.id === canonical.id);
@@ -742,7 +808,7 @@ async function finalVerifyMemory(env: ProjectionEnv, canonical: MemoryObject, pa
   const day = canonical.date.slice(0, 10);
   const registryKey = dayFileRegistryKey(day);
   const bucket = vaultRegistryBucketOf(registryKey);
-  const registryRead = await readJsonAt(env.root, registryShardPath(bucket));
+  const registryRead = await readJsonAt(env, registryShardPath(bucket));
   if (registryRead.state !== "ok") return { ok: false, reason: "verify-registry-missing" };
   const records = isObj(registryRead.value.records) ? registryRead.value.records : {};
   const files = isObj(registryRead.value.files) ? registryRead.value.files : {};
@@ -751,10 +817,10 @@ async function finalVerifyMemory(env: ProjectionEnv, canonical: MemoryObject, pa
     return { ok: false, reason: "verify-registry-mismatch" };
   }
 
-  const indexRead = await readJsonAt(env.root, INDEX_PATH);
+  const indexRead = await readJsonAt(env, INDEX_PATH);
   if (indexRead.state !== "ok" || indexRead.value[canonical.id] !== path) return { ok: false, reason: "verify-index-mismatch" };
 
-  const historyRead = await readJsonAt(env.root, historyMonthPath(day));
+  const historyRead = await readJsonAt(env, historyMonthPath(day));
   if (historyRead.state !== "ok") return { ok: false, reason: "verify-history-missing" };
   const days = isObj(historyRead.value.days) ? historyRead.value.days : {};
   const dayEntry = days[day];
@@ -891,7 +957,7 @@ async function decideSingleFileMarkdown<T extends { id: string; createdAt: strin
 ): Promise<SingleFileMarkdownVerdict<T>> {
   const path = registryPath ?? config.pathFor(canonical);
   const expectedContent = config.toMarkdown(canonical);
-  const read = await readTextAt(env.root, path);
+  const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);
   if (read.state === "absent") return { kind: "create", path };
   const parsed = config.parseMarkdown(read.text);
@@ -910,7 +976,7 @@ async function projectSingleFileMarkdown<T extends { id: string; createdAt: stri
   if (verdict.kind === "no-op") return;
   const { dir, fileName } = await dirAndFileNameFor(env.root, verdict.path, true);
   try {
-    await vaultProjectionPrimitives.writeFileInDir(dir, fileName, config.toMarkdown(canonical), `projection ${config.recordType}`);
+    await writing(env, () => vaultProjectionPrimitives.writeFileInDir(dir, fileName, config.toMarkdown(canonical), `projection ${config.recordType}`));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : `${config.recordType}-write-failed`);
   }
@@ -925,20 +991,13 @@ async function decideAndProjectSingleFileRegistry<T extends { id: string; create
   const registryKey = config.registryKeyFor(canonical);
   const bucket = vaultRegistryBucketOf(registryKey);
   const shardPath = registryShardPath(bucket);
-  const read = await readJsonAt(env.root, shardPath);
+  const read = await readJsonAt(env, shardPath);
   if (read.state === "error") throw new ProjectionConflictError("registry-unreadable");
   const records = read.state === "ok" && isObj(read.value.records) ? (read.value.records as Record<string, unknown>) : {};
   const files = read.state === "ok" && isObj(read.value.files) ? (read.value.files as Record<string, unknown>) : {};
   const currentPath = records[registryKey];
-  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
-  let stat: { mtime: number; size: number };
-  try {
-    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
-  } catch (error) {
-    throw new ProjectionRetryableError(error instanceof Error ? error.message : `${config.recordType}-stat-failed`);
-  }
   const content = config.toMarkdown(canonical);
-  const expected = { recordType: config.recordType, mtime: stat.mtime, size: stat.size, contentHash: hashVaultText(content), memberIds: [registryKey], status: "ok" as const };
+  const expected = { recordType: config.recordType, mtime: 0, size: 0, contentHash: hashVaultText(content), memberIds: [registryKey], status: "ok" as const };
   const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;
   const alreadyCorrect =
     currentPath === path &&
@@ -950,20 +1009,29 @@ async function decideAndProjectSingleFileRegistry<T extends { id: string; create
     currentEntry.memberIds.length === 1 &&
     currentEntry.memberIds[0] === registryKey;
   if (alreadyCorrect) return;
+  // the file stat is only needed when the Registry row has to be written
+  const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
+  let stat: { mtime: number; size: number };
   try {
-    await vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey, path, ...expected });
+    stat = await vaultProjectionPrimitives.readVaultFileStat(dir, fileName);
+  } catch (error) {
+    throw new ProjectionRetryableError(error instanceof Error ? error.message : `${config.recordType}-stat-failed`);
+  }
+  Object.assign(expected, { mtime: stat.mtime, size: stat.size });
+  try {
+    await writing(env, () => vaultProjectionPrimitives.upsertVaultRegistryRecord(env.root, { registryKey, path, ...expected }));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "registry-write-failed");
   }
 }
 
 async function decideAndProjectSingleFileIndex<T extends { id: string }>(env: ProjectionEnv, canonical: T, path: string): Promise<void> {
-  const read = await readJsonAt(env.root, INDEX_PATH);
+  const read = await readJsonAt(env, INDEX_PATH);
   if (read.state === "error") throw new ProjectionConflictError("index-unreadable");
   const current = read.state === "ok" ? read.value[canonical.id] : undefined;
   if (current === path) return;
   try {
-    await vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path);
+    await writing(env, () => vaultProjectionPrimitives.updateIndex(env.root, canonical.id, path));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "index-write-failed");
   }
@@ -977,12 +1045,14 @@ async function decideAndProjectSingleFileHistory<T extends { id: string; created
 ): Promise<void> {
   const row = config.historyRowFor!(canonical);
   const monthPath = historyMonthPath(row.day);
-  const monthRead = await readJsonAt(env.root, monthPath);
+  const monthRead = await readJsonAt(env, monthPath);
   if (monthRead.state === "error") throw new ProjectionConflictError("history-unreadable");
-  const metaRead = await readJsonAt(env.root, HISTORY_META_PATH);
+  const metaRead = await readJsonAt(env, HISTORY_META_PATH);
   if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
+  const update: HistoryIndexUpdate = { kind: "reflection", id: canonical.id, day: row.day, preview: row.preview, createdAt: row.createdAt };
+  if (historyAlreadyExact(monthRead, metaRead, update)) return;
   try {
-    await vaultProjectionPrimitives.updateHistoryIndex(env.root, { kind: "reflection", id: canonical.id, day: row.day, preview: row.preview, createdAt: row.createdAt });
+    await writing(env, () => vaultProjectionPrimitives.updateHistoryIndex(env.root, update));
   } catch (error) {
     throw new ProjectionRetryableError(error instanceof Error ? error.message : "history-write-failed");
   }
@@ -995,24 +1065,24 @@ async function finalVerifySingleFile<T extends { id: string; createdAt: string; 
   config: SingleFileRecordConfig<T>
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const expectedContent = config.toMarkdown(canonical);
-  const markdownRead = await readTextAt(env.root, path);
+  const markdownRead = await readTextAt(env, path);
   if (markdownRead.state !== "ok" || markdownRead.text !== expectedContent) return { ok: false, reason: `verify-${config.recordType}-markdown-mismatch` };
 
   const registryKey = config.registryKeyFor(canonical);
   const bucket = vaultRegistryBucketOf(registryKey);
-  const registryRead = await readJsonAt(env.root, registryShardPath(bucket));
+  const registryRead = await readJsonAt(env, registryShardPath(bucket));
   if (registryRead.state !== "ok") return { ok: false, reason: "verify-registry-missing" };
   const records = isObj(registryRead.value.records) ? registryRead.value.records : {};
   const files = isObj(registryRead.value.files) ? registryRead.value.files : {};
   const entry = records[registryKey] === path ? files[path] : undefined;
   if (!isObj(entry) || entry.status !== "ok" || entry.contentHash !== hashVaultText(expectedContent)) return { ok: false, reason: "verify-registry-mismatch" };
 
-  const indexRead = await readJsonAt(env.root, INDEX_PATH);
+  const indexRead = await readJsonAt(env, INDEX_PATH);
   if (indexRead.state !== "ok" || indexRead.value[canonical.id] !== path) return { ok: false, reason: "verify-index-mismatch" };
 
   if (config.historyRowFor) {
     const row = config.historyRowFor(canonical);
-    const historyRead = await readJsonAt(env.root, historyMonthPath(row.day));
+    const historyRead = await readJsonAt(env, historyMonthPath(row.day));
     if (historyRead.state !== "ok") return { ok: false, reason: "verify-history-missing" };
     const days = isObj(historyRead.value.days) ? historyRead.value.days : {};
     const dayEntry = days[row.day];
@@ -1048,7 +1118,7 @@ async function reconcileSingleFileOutboxEntry<T extends { id: string; createdAt:
 
   const registryKey = config.registryKeyFor(canonical);
   const bucket = vaultRegistryBucketOf(registryKey);
-  const registryPeek = await readJsonAt(env.root, registryShardPath(bucket));
+  const registryPeek = await readJsonAt(env, registryShardPath(bucket));
   const registryPath =
     registryPeek.state === "ok" && isObj(registryPeek.value.records) && typeof registryPeek.value.records[registryKey] === "string"
       ? (registryPeek.value.records[registryKey] as string)
@@ -1201,37 +1271,92 @@ function bumpRecordTypeTally(result: ReconcileAllRecordTypesResult, recordType: 
  * 共通実装（`reconcilePendingVaultOutbox`・`reconcileDoneVaultOutboxIntegrity`の
  * どちらも、対象entryの集め方が違うだけで、処理自体はこの1つを共有する）。
  */
-async function reconcileOutboxEntries(env: ProjectionEnv, entries: VaultOutboxEntry[]): Promise<ReconcileAllRecordTypesResult> {
-  const result = emptyReconcileAllRecordTypesResult();
+async function dispatchEntry(env: ProjectionEnv, entry: VaultOutboxEntry): Promise<ReconcileConversationResult> {
+  switch (entry.recordType) {
+    case "conversation":
+      return reconcileConversationOutboxEntry(env, entry);
+    case "memory":
+      return reconcileMemoryOutboxEntry(env, entry);
+    case "reflection":
+      return reconcileReflectionOutboxEntry(env, entry);
+    case "source":
+      return reconcileSourceOutboxEntry(env, entry);
+    default:
+      // 未知record type（将来のPerson/Topic等がoutboxへ紛れ込んだ場合の防御）。
+      // このEngineはまだ対応していないrecord typeを黙って処理済み扱いにはしない。
+      return { status: "held", reason: `unknown-record-type:${entry.recordType}` };
+  }
+}
+
+/**
+ * One entry inside a pass. An entry that is already "done" is first re-verified against the reads this pass has remembered (cheap: nothing is read twice, nothing
+ * is written); the moment that evaluation would write, or would end in anything but "done", it is thrown away and the entry is evaluated again with the remembered
+ * reads cleared, i.e. from fresh reads, exactly as before. Every other entry (new / changed / held / retry) starts from cleared memory.
+ */
+async function reconcileEntryInPass(env: ProjectionEnv, entry: VaultOutboxEntry): Promise<ReconcileConversationResult> {
+  const pass = passStates.get(env);
+  if (!pass) return dispatchEntry(env, entry);
+  if (entry.status === "done") {
+    pass.cachedOnly = true;
+    cachedOnlyEntries.add(entry);
+    try { return await dispatchEntry(env, entry); }
+    catch (error) { if (!(error instanceof NeedsFreshRead)) throw error; }
+    finally { pass.cachedOnly = false; cachedOnlyEntries.delete(entry); }
+  }
+  pass.map.clear();
+  pass.gen += 1;
+  return dispatchEntry(env, entry);
+}
+
+const PREFETCH_CONCURRENCY = 6;
+const PREFETCH_MIN_ENTRIES = 8;
+
+/**
+ * READ ONLY read-ahead for a re-verification pass: the files every entry is going to read anyway (identity, index, history-meta, and per record the day file / conversation
+ * file, the registry shard and the History month) are read ONCE, a few at a time in parallel (no writes, bounded concurrency), instead of one after the other in the
+ * per-record loop. The set is derived from the records themselves; nothing else in the Vault is scanned. A read that fails is simply not remembered (the entry reads it
+ * itself, as before).
+ */
+async function prefetchPassReads(env: ProjectionEnv, entries: VaultOutboxEntry[]): Promise<void> {
+  if (!passStates.get(env) || entries.length < PREFETCH_MIN_ENTRIES) return;
+  const paths = new Set<string>([VAULT_IDENTITY_PATH, INDEX_PATH, HISTORY_META_PATH]);
   for (const entry of entries) {
-    result.processed += 1;
     try {
-      let outcome: ReconcileConversationResult;
-      switch (entry.recordType) {
-        case "conversation":
-          outcome = await reconcileConversationOutboxEntry(env, entry);
-          break;
-        case "memory":
-          outcome = await reconcileMemoryOutboxEntry(env, entry);
-          break;
-        case "reflection":
-          outcome = await reconcileReflectionOutboxEntry(env, entry);
-          break;
-        case "source":
-          outcome = await reconcileSourceOutboxEntry(env, entry);
-          break;
-        default:
-          // 未知record type（将来のPerson/Topic等がoutboxへ紛れ込んだ場合の防御）。
-          // このEngineはまだ対応していないrecord typeを黙って処理済み扱いにはしない。
-          outcome = { status: "held", reason: `unknown-record-type:${entry.recordType}` };
+      if (entry.recordType === "memory") {
+        const m = await getMemoryObject(entry.recordId);
+        if (m) { const day = m.date.slice(0, 10); paths.add(memoryDayFilePath(m)); paths.add(registryShardPath(vaultRegistryBucketOf(dayFileRegistryKey(day)))); paths.add(historyMonthPath(day)); }
+      } else if (entry.recordType === "conversation") {
+        const c = await getConversation(entry.recordId);
+        if (c) { paths.add(defaultConversationPath(c)); paths.add(registryShardPath(vaultRegistryBucketOf(c.id))); paths.add(historyMonthPath(c.startedAt.slice(0, 10))); }
       }
-      result[outcome.status] += 1;
-      bumpRecordTypeTally(result, entry.recordType, outcome.status);
-    } catch (error) {
-      result.failed += 1;
-      bumpRecordTypeTally(result, entry.recordType, "failed");
-      console.error(`[Tsumugi] reconcileOutboxEntries: unexpected error for ${entry.recordType}:${entry.recordId}, continuing with other records:`, error);
+    } catch { /* the entry will read what it needs itself */ }
+  }
+  const list = [...paths];
+  let next = 0;
+  const worker = async () => { while (next < list.length) { const path = list[next++]; try { await readTextAt(env, path); } catch { /* not remembered */ } } };
+  await Promise.all(Array.from({ length: Math.min(PREFETCH_CONCURRENCY, list.length) }, worker));
+}
+
+async function reconcileOutboxEntries(env: ProjectionEnv, entries: VaultOutboxEntry[], options: { prefetch?: boolean } = {}): Promise<ReconcileAllRecordTypesResult> {
+  const result = emptyReconcileAllRecordTypesResult();
+  const ownsPass = !passStates.has(env);
+  if (ownsPass) passStates.set(env, { map: new Map(), gen: 0, cachedOnly: false });
+  try {
+    if (options.prefetch) await prefetchPassReads(env, entries);
+    for (const entry of entries) {
+      result.processed += 1;
+      try {
+        const outcome = await reconcileEntryInPass(env, entry);
+        result[outcome.status] += 1;
+        bumpRecordTypeTally(result, entry.recordType, outcome.status);
+      } catch (error) {
+        result.failed += 1;
+        bumpRecordTypeTally(result, entry.recordType, "failed");
+        console.error(`[Tsumugi] reconcileOutboxEntries: unexpected error for ${entry.recordType}:${entry.recordId}, continuing with other records:`, error);
+      }
     }
+  } finally {
+    if (ownsPass) passStates.delete(env);
   }
   return result;
 }
@@ -1305,5 +1430,5 @@ export async function reconcileDoneVaultOutboxIntegrity(env: ProjectionEnv): Pro
     if (accepted[e.id] !== e.recordUpdatedAt) { entries.push(e); continue; }
     if ((await findRecordInVault(env.root, e.recordId)) === "absent") entries.push(e);
   }
-  return reconcileOutboxEntries(env, entries);
+  return reconcileOutboxEntries(env, entries, { prefetch: true });
 }

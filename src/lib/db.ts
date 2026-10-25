@@ -1337,7 +1337,9 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   record: CanonicalStoreValueMap[S] & { id: string; updatedAt: string },
   now: string,
   /** checked INSIDE the transaction before anything is written (e.g. the tombstones); a throw writes nothing */
-  guard?: (tx: { objectStore(name: string): any }) => Promise<CanonicalStoreValueMap[S] | void>   // eslint-disable-line @typescript-eslint/no-explicit-any
+  guard?: (tx: { objectStore(name: string): any }) => Promise<CanonicalStoreValueMap[S] | void>,   // eslint-disable-line @typescript-eslint/no-explicit-any
+  /** startup re-registration only: when the outbox entry is for this exact version AND the stored record is identical, nothing is written (the guard above still runs) */
+  skipIfUnchanged = false
 ): Promise<VaultOutboxEntry> {
   const db = await getDB();
   const outboxId = vaultOutboxIdFor(recordType, record.id);
@@ -1349,6 +1351,10 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
     const outboxStore = tx.objectStore("vaultOutbox");
     const existing = await outboxStore.get(outboxId);
     if (storeName === "memoryObjects") assertMemoryLineage(await tx.objectStore(storeName).get(record.id) as MemoryObject | undefined, record as unknown as MemoryObject);
+    if (skipIfUnchanged && existing && existing.recordUpdatedAt === record.updatedAt) {
+      const stored = await tx.objectStore(storeName).get(record.id);
+      if (stored !== undefined && JSON.stringify(stored) === JSON.stringify(record)) { entry = existing; await tx.done; return entry; }
+    }
     entry = buildOutboxEntryForUpdate(existing, recordType, record.id, record.updatedAt, now);
     await Promise.all([tx.objectStore(storeName).put(record), outboxStore.put(entry)]);
   } catch (error) {
@@ -1358,13 +1364,13 @@ async function putCanonicalRecordWithOutboxInternal<S extends keyof CanonicalSto
   return entry!;
 }
 
-export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
+export async function putConversationWithOutbox(conversation: Conversation, now: string = new Date().toISOString(), skipIfUnchanged = false): Promise<VaultOutboxEntry> {
   // a conversation the user deleted is never recreated by a stale chat tab / an in-flight request (the check runs inside the same transaction)
   return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
     return withoutDeletedMemoryRefs(conversation, tombs);
-  });
+  }, skipIfUnchanged);
 }
 
 /** `recordType`は既定で`"memory"`（normal Memory）。Reflectionを書く場合は`"reflection"`を渡す。 */
@@ -1378,7 +1384,8 @@ export async function putCapturedMemoryWithOutbox(
   memoryObject: MemoryObject,
   producedByConversationId: string,
   recordType: "memory" | "reflection" = "memory",
-  now: string = new Date().toISOString()
+  now: string = new Date().toISOString(),
+  skipIfUnchanged = false
 ): Promise<VaultOutboxEntry> {
   if (!producedByConversationId || memoryObject.conversationId !== producedByConversationId) throw new MemoryLineageViolationError(memoryObject.id);
   return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
@@ -1412,17 +1419,62 @@ async function withoutDeletedLinksInTx(tx: { objectStore(name: string): any }, m
 export async function putMemoryObjectWithOutbox(
   memoryObject: MemoryObject,
   recordType: "memory" | "reflection" = "memory",
-  now: string = new Date().toISOString()
+  now: string = new Date().toISOString(),
+  skipIfUnchanged = false
 ): Promise<VaultOutboxEntry> {
   return putCanonicalRecordWithOutboxInternal("memoryObjects", recordType, memoryObject, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (memoryBlocked(tombs, memoryObject)) throw new TombstonedRecordError("memory", memoryObject.id);
     return withoutDeletedLinksInTx(tx, memoryObject, tombs, now);
-  });
+  }, skipIfUnchanged);
 }
 
-export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString()): Promise<VaultOutboxEntry> {
-  return putCanonicalRecordWithOutboxInternal("sources", "source", source, now);
+/**
+ * READ ONLY (one transaction for the whole batch). The startup re-registration (`put*WithOutbox(..., skipIfUnchanged)`) opens one read-write transaction per record even when
+ * it ends up writing nothing. This answers, for a whole list at once, which records would end up writing NOTHING: the outbox entry is for exactly this version, the stored
+ * record is identical, no tombstone blocks it, and the deleted-reference / deleted-link guard would not change it. Everything else (changed, new, blocked, lineage problem, any
+ * doubt) is NOT in the returned set and goes through the normal read-write path unchanged. A record that changes right after this check is simply written by the normal path
+ * that changed it (every change goes through its own put-with-outbox).
+ */
+export async function findUnchangedRegistrations(kind: "conversation" | "memory" | "reflection" | "source", records: Array<Conversation | MemoryObject | Source>): Promise<Set<string>> {
+  const unchanged: string[] = [];
+  if (records.length === 0) return new Set();
+  const storeName = kind === "conversation" ? "conversations" : kind === "source" ? "sources" : "memoryObjects";
+  const db = await getDB();
+  const tx = db.transaction([storeName, "vaultOutbox", "settings"], "readonly");
+  const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+  const [storedAll, outboxAll] = await Promise.all([
+    tx.objectStore(storeName).getAll() as Promise<Array<{ id: string }>>,
+    tx.objectStore("vaultOutbox").getAll() as Promise<VaultOutboxEntry[]>,
+  ]);
+  await tx.done;
+  const stored = new Map(storedAll.map((r) => [r.id, r]));
+  const outbox = new Map(outboxAll.map((e) => [e.id, e]));
+  for (const record of records) {
+    try {
+      const entry = outbox.get(vaultOutboxIdFor(kind, record.id));
+      const current = stored.get(record.id);
+      if (!entry || !current || entry.recordUpdatedAt !== record.updatedAt) continue;
+      if (kind === "conversation") {
+        if (blockedByTombstone(tombs, "conversation", record.id)) continue;
+        if (withoutDeletedMemoryRefs(record as Conversation, tombs) !== record) continue;
+      } else if (kind === "memory" || kind === "reflection") {
+        if (memoryBlocked(tombs, record as MemoryObject)) continue;
+        // the link guard returns the record itself ("nothing to remove") only when none of its links points at a deleted Memory
+        if (tombs && ((record as MemoryObject).links ?? []).some((l) => {
+          const otherId = l.sourceId === record.id ? l.targetId : l.sourceId;
+          return otherId !== record.id && !!tombs[tombstoneId("memory", otherId)];
+        })) continue;
+      }
+      if (JSON.stringify(current) !== JSON.stringify(record)) continue;
+      unchanged.push(record.id);
+    } catch { /* any doubt: the normal path decides */ }
+  }
+  return new Set(unchanged);
+}
+
+export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString(), skipIfUnchanged = false): Promise<VaultOutboxEntry> {
+  return putCanonicalRecordWithOutboxInternal("sources", "source", source, now, undefined, skipIfUnchanged);
 }
 
 /**

@@ -73,6 +73,7 @@ class FakeVault {
   private clock = 1;
   writeShouldFail = new Set<string>();
   writeCount = 0;
+  readCount = 0;
   /**
    * テスト専用（Phase 3-6 Memory Projection G：lost update検証）：指定pathの
    * lookup（`getDirectoryHandle`/`getFileHandle`）が呼ばれた際に、意図的に1 macrotask
@@ -135,7 +136,7 @@ class FakeVault {
       async getFile() {
         const f = self.files.get(p);
         if (!f) throw new DOMException("no such file", "NotFoundError");
-        return { size: f.content.length, lastModified: f.mtime, async text() { return f.content; } } as unknown as File;
+        return { size: f.content.length, lastModified: f.mtime, async text() { self.readCount += 1; return f.content; } } as unknown as File;
       },
       async createWritable() {
         let pending = "";
@@ -1426,4 +1427,158 @@ test("Restored Vault Link version survives done outbox startup reconciliation wi
   const done = (await dbMod.getVaultOutboxEntry(entry.id))!;
   assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault),done)).status,"done");
   assert.equal(vault.get(path),raw); assert.deepEqual((await dbMod.getMemoryObject(before.id))!.links,[link]);
+});
+
+
+// ===========================================================================
+// 起動時の再検証（reconcileDoneVaultOutboxIntegrity）：変更の無い記録に対する不要なI/Oを減らす
+// ===========================================================================
+
+async function seedDoneVault(vault: FakeVault, conversations: number, memories: number) {
+  seedVaultIdentityFile(vault);
+  const convs: Conversation[] = [];
+  for (let i = 0; i < conversations; i++) convs.push(conversation(`pass-c-${i}`, { startedAt: `2026-05-${String(1 + (i % 3)).padStart(2, "0")}T09:00:00.000Z` }));
+  for (const c of convs) await seedCanonical(c);
+  const mems: MemoryObject[] = [];
+  for (let i = 0; i < memories; i++) mems.push(memory(`pass-m-${i}`, `2026-06-${String(1 + (i % 3)).padStart(2, "0")}`));
+  for (const m of mems) await seedMemoryCanonical(m);
+  // the fake IndexedDB is shared by every test in this file: records other tests left behind are settled into this Vault too, so the totals below are measured, not assumed
+  await projectionMod.reconcilePendingVaultOutbox(makeEnv(vault));
+  await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  const total = (await dbMod.getDoneVaultOutboxEntries()).length;
+  assert.ok(total >= conversations + memories);
+  return { convs, mems, total };
+}
+
+test("Pass reuse A: 変更の無い完了済み記録の再検証は、Vaultへ書かず、IndexedDBへも書かず、共有ファイルを重複して読まない", async () => {
+  const vault = new FakeVault();
+  const N = 12;
+  const { total } = await seedDoneVault(vault, N, N);
+  const files = new Map([...vault.files].map(([k, f]) => [k, f.content]));
+  const outboxBefore = JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id)));
+  vault.writeCount = 0; vault.readCount = 0;
+  projectionMod.resetProjectionReadStats();
+  const result = await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(result.done, total);
+  assert.equal(result.failed + result.held + result.pending, 0);
+  assert.equal(vault.writeCount, 0, "Vaultへ1byteも書かない");
+  assert.deepEqual([...vault.files].map(([k, f]) => [k, f.content]), [...files], "Vaultの内容は変わらない");
+  assert.equal(JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id))), outboxBefore, "outbox entryは書き換えられない");
+  assert.ok(projectionMod.projectionReadStats.idbWritesSkipped >= total, "完了済み・変更なしの結果はIndexedDBへ書かない");
+  assert.ok(projectionMod.projectionReadStats.cacheHits > 0);
+  // 各ファイルはほぼ1回しか読まれない（記録数ではなくファイル数に比例する）。
+  assert.ok(vault.readCount <= vault.files.size + 10, `reads=${vault.readCount} files=${vault.files.size} records=${total}`);
+});
+
+test("Pass reuse B: 外部で書き換えられた記録は、記憶された読み取りではなく最新の読み取りで判定され、heldになり上書きされない", async () => {
+  const vault = new FakeVault();
+  const { convs, total } = await seedDoneVault(vault, 10, 10);
+  const target = convs[4];
+  const path = `Conversations/${vaultMod.fileNameFor(target.id, target.startedAt)}`;
+  const edited = markdownMod.conversationToMarkdown({ ...target, turns: [{ role: "user", content: "外部で書き換えられた", timestamp: T }] });
+  vault.put(path, edited);
+  const result = await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(result.held, 1);
+  assert.equal(result.done, total - 1);
+  assert.equal(vault.get(path), edited, "外部の内容は上書きしない");
+});
+
+test("Pass reuse C: Vaultから消えた記録は、再検証で再生成される（他の記録は書き換えない）", async () => {
+  const vault = new FakeVault();
+  const { convs, total } = await seedDoneVault(vault, 10, 10);
+  const target = convs[7];
+  const path = `Conversations/${vaultMod.fileNameFor(target.id, target.startedAt)}`;
+  const original = vault.get(path)!;
+  vault.delete(path);
+  vault.writeCount = 0;
+  const result = await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(result.done, total);
+  assert.equal(vault.get(path), original);
+  assert.ok(vault.writeCount >= 1 && vault.writeCount <= 3, `writes=${vault.writeCount}`);
+});
+
+test("Pass reuse D: Registryが壊れた／欠けた記録は、記憶された読み取りで「正常」と誤判定されず修復される", async () => {
+  const vault = new FakeVault();
+  const { convs, total } = await seedDoneVault(vault, 10, 10);
+  const target = convs[2];
+  vault.delete(shardPath(target.id));
+  const result = await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(result.done, total);
+  const shard = JSON.parse(vault.get(shardPath(target.id))!);
+  assert.ok(shard.records[target.id], "Registryが復元されている");
+});
+
+test("Pass reuse E: 途中の記録の書き込みが失敗しても、他の記録の判定は続き、失敗した記録はpendingのまま残る（doneにしない）", async () => {
+  const vault = new FakeVault();
+  const { convs, total } = await seedDoneVault(vault, 10, 10);
+  const target = convs[3];
+  const path = `Conversations/${vaultMod.fileNameFor(target.id, target.startedAt)}`;
+  vault.delete(path);
+  vault.writeShouldFail.add(path);
+  const result = await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(result.done, total - 1);
+  assert.equal(result.done + result.pending + result.held + result.failed, total);
+  assert.equal(vault.get(path), undefined);
+  vault.writeShouldFail.clear();
+  const retry = await projectionMod.reconcilePendingVaultOutbox(makeEnv(vault));
+  assert.equal(retry.done, 1);
+  assert.ok(vault.get(path));
+});
+
+test("Pass reuse F: 記録が1件追加されても、追加分だけが新規処理され、既存分は書き換えられない", async () => {
+  const vault = new FakeVault();
+  const { total } = await seedDoneVault(vault, 10, 10);
+  await seedCanonical(conversation("pass-c-new", { startedAt: "2026-05-02T09:00:00.000Z" }));
+  vault.writeCount = 0;
+  const pending = await projectionMod.reconcilePendingVaultOutbox(makeEnv(vault));
+  assert.equal(pending.done, 1);
+  const again = await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(again.done, total + 1);
+  const writes = vault.writeCount;
+  await projectionMod.reconcileDoneVaultOutboxIntegrity(makeEnv(vault));
+  assert.equal(vault.writeCount, writes, "2回目の再検証では何も書かない");
+});
+
+test("Migration no-op: 変更の無い記録を起動時に再登録しても、record・outbox entryを書き換えない。変更された記録は通常どおり更新される", async () => {
+  const c = conversation("mig-noop-1");
+  const first = await dbMod.putConversationWithOutbox(c, "2026-03-01T10:00:00.000Z");
+  const same = await dbMod.putConversationWithOutbox(c, "2026-03-02T10:00:00.000Z", true);
+  assert.equal(same.updatedAt, first.updatedAt, "同一版・同一内容なら書き込まない");
+  const touched = await dbMod.putConversationWithOutbox(c, "2026-03-03T10:00:00.000Z");
+  assert.equal(touched.updatedAt, "2026-03-03T10:00:00.000Z", "従来の呼び出し（skipなし）は従来どおり");
+  const next = { ...c, updatedAt: "2026-03-04T09:00:00.000Z" };
+  const changed = await dbMod.putConversationWithOutbox(next, "2026-03-05T10:00:00.000Z", true);
+  assert.equal(changed.recordUpdatedAt, next.updatedAt, "新しい版は通常どおり登録される");
+  assert.equal(changed.status, "pending");
+});
+
+test("Migration reads: 変更の無い2回目の分類は、各Markdownを1回だけ読み、IndexedDBの読み書きトランザクションを開かない", async () => {
+  const vault = new FakeVault();
+  await seedDoneVault(vault, 10, 10);
+  const env = { root: vault.root(), now: () => T };
+  await migrationMod.runProductionBootstrapMigration(env);   // settles the registration of everything in this shared test database
+  const mdFiles = [...vault.files.keys()].filter((k) => k.endsWith(".md")).length;
+  vault.readCount = 0; vault.writeCount = 0;
+  const outboxBefore = JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id)));
+  const result = await migrationMod.runProductionBootstrapMigration(env);
+  assert.equal(result.phase, "done");
+  assert.ok(vault.readCount <= mdFiles, `reads=${vault.readCount} md files=${mdFiles}`);
+  assert.equal(vault.writeCount, 0);
+  assert.equal(JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id))), outboxBefore, "outbox entries are not rewritten");
+});
+
+test("findUnchangedRegistrations: 同一版・同一内容だけを返し、変更・未登録・保存内容の食い違いは通常経路に任せる", async () => {
+  const same = conversation("reg-same-1");
+  const changed = conversation("reg-changed-1");
+  const edited = conversation("reg-edited-1");
+  const unregistered = conversation("reg-new-1");
+  await dbMod.putConversationWithOutbox(same);
+  await dbMod.putConversationWithOutbox(changed);
+  await dbMod.putConversationWithOutbox(edited);
+  await dbMod.putConversation(unregistered);
+  const newer = { ...changed, updatedAt: "2026-03-02T09:00:00.000Z" };
+  const storedDiffers = { ...edited, turns: [{ role: "user" as const, content: "別の内容", timestamp: T }] };
+  await dbMod.putConversation(storedDiffers);
+  const found = await dbMod.findUnchangedRegistrations("conversation", [same, newer, edited, unregistered]);
+  assert.deepEqual([...found].sort(), ["reg-same-1"]);
 });

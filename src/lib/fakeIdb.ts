@@ -182,12 +182,12 @@ class FakeIDBPDatabase {
     return [...store.committed.values()].filter((v) => (v as Record<string, unknown>)[kp] === query);
   }
   transaction(storeNames: string | string[], mode: "readonly" | "readwrite") {
-    void mode; // フェイクではreadonly/readwriteを区別しない（テスト用途に十分なため）
+    // readonly/readwriteは区別しない（書き込みの可否は見ない）が、失敗の仕込みを消費できるのはreadwriteだけ：readonlyのtransactionはputを行えないため、仕込みを消費して「効かなかった」ことにしない。
     const names = Array.isArray(storeNames) ? storeNames : [storeNames];
     // 一発だけ有効：失敗を仕込んだstoreを含む「次のtransaction」だけが対象。そのstoreを含まないtransaction（例：別storeだけを触る設定確認用のtransaction）は
     // 仕込みを消費せず、持ち越す（transactionの数え方という実装詳細にテストが依存しないため）。
     const failOnPut = new Set<string>();
-    for (const n of names) if (this.db.failOnPutForNextTransaction.delete(n)) failOnPut.add(n);
+    if (mode === "readwrite") for (const n of names) if (this.db.failOnPutForNextTransaction.delete(n)) failOnPut.add(n);
     return new FakeTransaction(this.db, names, failOnPut);
   }
 }
