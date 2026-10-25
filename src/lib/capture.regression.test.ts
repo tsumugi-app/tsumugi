@@ -18,6 +18,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import Module from "node:module";
 
@@ -523,10 +524,10 @@ test("Capture Debug: observes IndexedDB success/failure and Vault success/held/f
     const db = stubs["./db"] as Record<string, unknown>;
     const vault = stubs["./vault"] as Record<string, unknown>;
     // 新保存基盤 Phase 3-9：capture.tsのcanonical writeが`db.putMemoryObject`から
-    // `db.putMemoryObjectWithOutbox`（canonical + vaultOutboxのatomic commit）へ
+    // `db.putCapturedMemoryWithOutbox`（canonical + vaultOutboxのatomic commit）へ
     // 切り替わったため、stub対象もそれに合わせる（呼び出し側の引数はrecordType等が
     // 増えるが、このstub自体は件数・成否だけを模すため、シグネチャは変えずそのまま使える）。
-    const oldPut = db.putMemoryObjectWithOutbox;
+    const oldPut = db.putCapturedMemoryWithOutbox;
     const oldWrite = vault.writeMemoryObjectMarkdown;
     const oldConversationWrite = vault.writeConversationMarkdown;
     vault.writeConversationMarkdown = async () => {};
@@ -534,7 +535,7 @@ test("Capture Debug: observes IndexedDB success/failure and Vault success/held/f
     try {
       for (const mode of ["success", "held", "failed", "deferred", "idb-failed"]) {
         captureDebug.clearCaptureDebug();
-        db.putMemoryObjectWithOutbox = async () => { if (mode === "idb-failed") throw new Error("test IDB failure"); };
+        db.putCapturedMemoryWithOutbox = async () => { if (mode === "idb-failed") throw new Error("test IDB failure"); };
         vault.writeMemoryObjectMarkdown = async () => {
           if (mode === "held") { const e = new Error("test hold"); e.name = "VaultRecordNeedsResyncError"; throw e; }
           if (mode === "failed") throw new Error("test Vault failure");
@@ -549,7 +550,7 @@ test("Capture Debug: observes IndexedDB success/failure and Vault success/held/f
         assert.equal(memory.vault, mode === "idb-failed" ? "not-attempted: canonical commit failed" : mode === "deferred" ? "deferred: no connected vault" : mode === "held" ? "held" : mode === "failed" ? "failed (write or sync bookkeeping)" : "success");
         assert.equal(saved.failedMemoryIds.length, mode === "idb-failed" ? 1 : 0);
       }
-    } finally { db.putMemoryObjectWithOutbox = oldPut; vault.writeMemoryObjectMarkdown = oldWrite; vault.writeConversationMarkdown = oldConversationWrite; }
+    } finally { db.putCapturedMemoryWithOutbox = oldPut; vault.writeMemoryObjectMarkdown = oldWrite; vault.writeConversationMarkdown = oldConversationWrite; }
   });
 });
 
@@ -619,14 +620,14 @@ test("cross-turn regression: [3,4] produces two original Evidence quotes and per
     assert.deepEqual(JSON.parse(encodedUsers), messages.map((content, index) => ({ index, content })));
     const db = stubs["./db"] as Record<string, unknown>;
     // 新保存基盤 Phase 3-9：上のstubと同じ理由でstub対象を`putMemoryObjectWithOutbox`へ変更。
-    const oldPut = db.putMemoryObjectWithOutbox;
+    const oldPut = db.putCapturedMemoryWithOutbox;
     const saved: unknown[] = [];
-    db.putMemoryObjectWithOutbox = async (m: unknown) => { saved.push(m); };
+    db.putCapturedMemoryWithOutbox = async (m: unknown) => { saved.push(m); };
     try {
       const persist = (captureClient as unknown as { persistCapture: (h: null, c: unknown, m: unknown[]) => Promise<unknown> }).persistCapture;
       await persist(null, out.conversation, out.memoryObjects);
       assert.deepEqual((saved[0] as Json).evidenceQuotes, messages.slice(3));
-    } finally { db.putMemoryObjectWithOutbox = oldPut; }
+    } finally { db.putCapturedMemoryWithOutbox = oldPut; }
     const entry = debugEntry(await captureDebug.getCaptureDebugText());
     const server = entry.server as { userMessages: string[]; attempts: Array<{ validation: Json[] }>; finalized: Json[] };
     assert.deepEqual(server.userMessages, messages);
@@ -802,12 +803,12 @@ test("StatedAt E22: the captured Memory's statedAt reaches IndexedDB (putMemoryO
   const turns = [userAt("昨日、黄金湯に行った", TS.t1000), aiAt("いいですね", TS.t1020)];
   const { out } = await runCapture(turns, [{ ...STATED_BASE, evidenceUserMessageIndexes: [0] }]);
   const db = stubs["./db"] as Record<string, unknown>;
-  const oldPut = db.putMemoryObjectWithOutbox; const saved: Json[] = [];
-  db.putMemoryObjectWithOutbox = async (m: Json) => { saved.push(m); };
+  const oldPut = db.putCapturedMemoryWithOutbox; const saved: Json[] = [];
+  db.putCapturedMemoryWithOutbox = async (m: Json) => { saved.push(m); };
   try {
     const persist = (captureClient as unknown as { persistCapture: (h: null, c: unknown, m: unknown[]) => Promise<unknown> }).persistCapture;
     await persist(null, out.conversation, out.memoryObjects);
-  } finally { db.putMemoryObjectWithOutbox = oldPut; }
+  } finally { db.putCapturedMemoryWithOutbox = oldPut; }
   assert.equal(saved[0].statedAt, TS.t1000, "IndexedDB / Outbox write receives statedAt");
   const md = markdownMod.memoryObjectToMarkdown(out.memoryObjects[0] as never);
   assert.ok(md.includes(`statedAt: "${TS.t1000}"`));
@@ -1098,4 +1099,55 @@ test("Boundary 4-5: no new drop / trim / retry — a candidate whose keywords ma
   // an invalid evidence reference is still dropped exactly as before
   const bad = await runCapture([user(FILO_USER), ai("…")], [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }], { allMemories: [FILO_RELATED()], script: [{ memories: [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }] }, { memories: [{ ...FILO_OUT(kws), evidenceUserMessageIndexes: [9] }] }] });
   assert.equal(bad.out.outcome.kind, "all-dropped"); assert.equal(bad.out.memoryObjects.length, 0);
+});
+
+// ===========================================================================
+// M1+：契約の強制（existingMemoryObjectsは、このConversation自身のMemoryだけ）と、敵対的なAI応答
+// ===========================================================================
+test("M1+: 呼び出し側が誤って別Conversation由来のMemoryをexistingとして渡しても、UPDATEされず新規Memoryとして保存される（契約の強制）", async () => {
+  const foreign = pastMemory({ content: "別の会話で話した内容。", summary: "別の会話の要約", keywords: ["別"], conversationId: "CONV-A" });
+  const before = clone(foreign);
+  const { out } = await runCapture(
+    [user("今日は新しいことを話した。"), ai("…")],
+    [{ ...BASE, existingMemoryId: foreign.id, topicDecision: "uncertain", summary: "新しい話", content: "今日は新しいことを話した。", keywords: ["新しい"], evidenceUserMessageIndexes: [0] }],
+    { existing: [foreign], allMemories: [foreign] }
+  );
+  assert.deepEqual(foreign, before, "別Conversation由来のMemoryは不変");
+  assert.equal(out.memoryObjects.length, 1);
+  assert.notEqual(out.memoryObjects[0].id, foreign.id);
+  assert.equal(out.memoryObjects[0].conversationId, "CONV-B");
+  assert.deepEqual(out.conversation.memoryObjectIds, [out.memoryObjects[0].id]);
+});
+
+test("M1+: 敵対的なAI応答（他Conversation・Reflection・存在しないid・自Conversationのid・topic参照の併用）でも、更新されるのはこのConversation自身のMemoryだけ。出力は全てCONV-B", async () => {
+  const foreign = pastMemory({ id: "01FOREIGNFOREIGNFOREIGNFO", content: "別の会話の内容。", summary: "別の会話の要約", keywords: ["別"], conversationId: "CONV-A", topicId: "TOPIC-X" });
+  const reflection = pastMemory({ id: "01REFLECTREFLECTREFLECT01", content: "振り返り", summary: "振り返りの要約", keywords: ["振り返り"], conversationId: "CONV-A" });
+  (reflection.metadata as Json).source = "system-generated";
+  const own = pastMemory({ id: "01OWNOWNOWNOWNOWNOWNOWNOW1", content: "この会話の最初のメモ。", summary: "この会話の最初のメモ", keywords: ["メモ"], conversationId: "CONV-B" });
+  const snapshots = clone([foreign, reflection]);
+  const item = (n: number, extra: Json): Json => ({ ...BASE, topicDecision: "uncertain", summary: `要約${n}`, content: `内容${n}`, keywords: [`語${n}`], evidenceUserMessageIndexes: [0], ...extra });
+  const llm = [
+    item(1, { existingMemoryId: foreign.id }),
+    item(2, { existingMemoryId: reflection.id }),
+    item(3, { existingMemoryId: "01NOSUCHNOSUCHNOSUCHNOSU" }),
+    item(4, { existingMemoryId: own.id }),
+    item(5, { existingMemoryId: foreign.id, topicDecision: "sameTopic", sameTopicMemoryId: foreign.id }),
+  ];
+  const { out } = await runCapture([user("今日の出来事を話した。"), ai("…")], llm, { existing: [own], allMemories: [foreign, reflection, own] });
+  assert.deepEqual([foreign, reflection], snapshots, "他Conversation由来のMemoryとReflectionは不変");
+  assert.ok(out.memoryObjects.length > 0);
+  const ids = out.memoryObjects.map((m) => m.id);
+  assert.ok(!ids.includes(foreign.id) && !ids.includes(reflection.id), "他Conversation由来のMemory・Reflectionは保存対象に含まれない");
+  assert.ok(ids.filter((id) => id === own.id).length <= 1, "自Conversationのidが指された場合だけ、1件がUPDATEとして扱われる");
+  for (const m of out.memoryObjects) assert.equal(m.conversationId, "CONV-B", "出力は全てこのConversation由来");
+  assert.equal(new Set(out.conversation.memoryObjectIds).has(foreign.id), false);
+});
+
+test("M1+: 会話境界のCaptureは、このConversation自身のMemoryが無い前提（existingは空）で呼ばれる。この前提を変える変更は、ここで検出されレビューされる", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
+  const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");   // コメント中の言及は数えない
+  const all = (src.match(/\bcaptureConversation\(\s*[^)\s]/g) ?? []).length;
+  const emptyExisting = (src.match(/\bcaptureConversation\(\s*[\w.]+\s*,\s*\[\]\s*\)/g) ?? []).length;
+  assert.ok(all >= 1, "呼び出し元が存在する");
+  assert.equal(emptyExisting, all, "captureConversationの全呼び出しで、既存Memory引数は空配列（UPDATE対象が構造的に存在しない）");
 });

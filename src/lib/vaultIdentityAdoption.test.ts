@@ -277,6 +277,67 @@ test("Identity F-OPFS: origin-bound＋共通IDあり＋内容が食い違う →
   assert.equal(vault.get(path), differing, "食い違ったVault側recordは変更されない");
 });
 
+test("Identity OPFS-empty: origin-bound, this device has records, the Vault holds only the app's own skeleton (no record file) -> a NEW identity is established; nothing in the Vault is overwritten", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  await seedIdbConversation(conversation("id-opfs-empty-idb"));
+  vault.put(".tsumugi/schema-version.json", JSON.stringify({ schemaVersion: "0.1" }));        // what ensureVaultSkeleton creates when the Vault is connected
+  vault.put(".tsumugi/index.json", "{}");
+  const env = makeEnv(vault, { storageCapability: "origin-bound" });
+  assert.equal((await adoptionMod.previewVaultIdentityAdoption(env)).adoption, "would-establish:origin-bound-empty-vault");
+  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined, "the preview writes nothing");
+  const before = { schema: vault.get(".tsumugi/schema-version.json"), index: vault.get(".tsumugi/index.json") };
+  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(env);
+  assert.equal(result.kind, "newly-paired");
+  assert.ok(vault.get(".tsumugi/vault-identity.json"), "the identity file now exists");
+  assert.deepEqual({ schema: vault.get(".tsumugi/schema-version.json"), index: vault.get(".tsumugi/index.json") }, before, "the existing skeleton files are untouched");
+  assert.equal((await dbMod.getVaultIdentityRecord())?.vaultId, (result as { vaultId: string }).vaultId);
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(env)).kind, "identified", "idempotent");
+});
+
+test("Identity FSA-empty: a user-selected folder (user-selectable) with only the skeleton and records on this device stays HELD, as before", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  await seedIdbConversation(conversation("id-fsa-empty-idb"));
+  vault.put(".tsumugi/schema-version.json", JSON.stringify({ schemaVersion: "0.1" }));
+  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault, { storageCapability: "user-selectable" }));
+  assert.deepEqual(result, { kind: "held", reason: "one-side-empty-cannot-prove-same-world" });
+  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined);
+});
+
+test("Identity OPFS-empty: any record file in the Vault (even unrelated) still prevents the new rule", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  await seedIdbConversation(conversation("id-opfs-guard-idb"));
+  vault.put("Conversations/other.md", "---\nid: some-other-record\ntsumugi: true\n---\n# other\n");
+  const result = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault, { storageCapability: "origin-bound" }));
+  assert.equal(result.kind, "unrelated");
+  assert.equal(vault.get(".tsumugi/vault-identity.json"), undefined);
+});
+
+test("Identity epoch: the pairing records the world epoch it was verified under; a later startup refreshes it (and never refreshes a mismatching identity)", async () => {
+  const vault = new FakeVault();
+  await resetIdbIdentity();
+  const first = await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault));          // empty Vault -> new identity
+  assert.equal(first.kind, "newly-paired");
+  const epoch = await dbMod.getActiveVaultEpoch();
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch, "bound to the active epoch");
+  // the world moves on (the same Vault is reconnected): the next startup verifies the identity again and follows the epoch
+  await dbMod.bumpActiveVaultEpoch(epoch); await dbMod.markVaultEpochCommitted(epoch + 1);
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch);
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault))).kind, "identified");
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch + 1);
+  // a records from before this fix (paired, but no epoch) are refreshed too
+  await dbMod.putVaultIdentityRecord({ ...(await dbMod.getVaultIdentityRecord())!, activeVaultEpoch: null });
+  assert.equal((await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(vault))).kind, "identified");
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, epoch + 1);
+  // another Vault: held, and the record is NOT touched
+  const other = new FakeVault(); other.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "someone-else" }));
+  await dbMod.putVaultIdentityRecord({ ...(await dbMod.getVaultIdentityRecord())!, activeVaultEpoch: 0 });
+  assert.deepEqual(await adoptionMod.ensureVaultIdentityForCurrentWorld(makeEnv(other)), { kind: "held", reason: "identity-mismatch" });
+  assert.equal((await dbMod.getVaultIdentityRecord())!.activeVaultEpoch, 0);
+});
+
 test("Identity G-OPFS: origin-bound＋共通IDが無い → unrelated（HOLD。identityを作らない）", async () => {
   const vault = new FakeVault();
   await resetIdbIdentity();

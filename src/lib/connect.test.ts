@@ -319,8 +319,10 @@ test("ChatScreen.tsx：revisitPrompt生成後の保存はtransaction内の最新
   assert.ok(body.includes("updateMemoryRevisitPrompt(memory.id, revisitPrompt)"));
   assert.ok(!body.includes("putMemoryObject("), "revisitPrompt経路でMemory全体をputしない");
   assert.ok(!body.includes("{ ...memory, revisitPrompt }"), "古いsnapshot全体を作らない");
-  // 手動restore（ユーザーが明示的に「復元する」を押した場合の既存仕様）だけが、引き続き無条件putを使う。
-  assert.ok(src.includes("await putMemoryObject(memoryObject);"));
+  // 手動restore（ユーザーが明示的に「復元する」を押した場合）は、Vault側が古い場合にローカルの新しいMemoryを黙って上書きしない
+  // 「restoreMemoryObjectIfNotNewer」を使い、無条件putはもう使わない（保存基盤の不変条件、db.foundation.test.ts参照）。
+  assert.ok(src.includes("await restoreMemoryObjectIfNotNewer(memoryObject);"));
+  assert.ok(!src.includes("await putMemoryObject(memoryObject);"), "無条件putは残さない");
 });
 
 test("connect.ts：Memory全体のputMemoryObjectを使わず、canonical+outbox確定後にVaultへ書く", () => {

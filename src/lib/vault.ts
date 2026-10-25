@@ -19,6 +19,9 @@
 import {
   addConversationIfAbsentAndMarkSynced,
   addMemoryObjectIfAbsentAndMarkSynced,
+  isMemoryBlockedByTombstone,
+  isTombstoned,
+  hasDeletedMemoryReferences,
   addSourceIfAbsentAndMarkSynced,
   bumpRegistryGenerationEpoch,
   getAllConversations,
@@ -1938,7 +1941,12 @@ export async function writeConversationMarkdown(
   options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeConversationMarkdownImpl(root, conversation, dirHandleCache, options),
+    async () => {
+      // Deletion can finish while this snapshot waits in the save queue.
+      if (await isTombstoned("conversation", conversation.id)) throw new Error("deleted-record-write-refused");
+      if (await hasDeletedMemoryReferences(conversation.memoryObjectIds)) throw new Error("deleted-reference-write-refused");
+      await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);
+    },
     priority,
     vaultSyncKeyFor("conversation", conversation.id)
   );
@@ -2282,7 +2290,12 @@ export async function writeMemoryObjectMarkdown(
   options?: VaultWriteOptions
 ): Promise<void> {
   await enqueueVaultWrite(
-    () => writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options),
+    async () => {
+      // Includes cascade deletion of the owning conversation; checked inside save lock.
+      if (await isMemoryBlockedByTombstone(memoryObject)) throw new Error("deleted-record-write-refused");
+      if (await hasDeletedMemoryReferences(memoryObject.links.flatMap((l) => [l.sourceId, l.targetId]))) throw new Error("deleted-reference-write-refused");
+      await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);
+    },
     priority,
     vaultSyncKeyFor("memory", memoryObject.id)
   );
@@ -6094,13 +6107,20 @@ async function applySingleRecordAdded(
   } else {
     // 真の新規import（E節）：Markdown非往復fieldはparserの既定値のまま取り込む
     // （Beta仕様として許容）。
+    // ユーザーが削除した記録（tombstone）は取り込まない（History行も作らない）。
+    if (kind === "conversation" && (await isTombstoned("conversation", record.registryKey))) return;
+    if (kind === "reflection" && (await isMemoryBlockedByTombstone(record.parsed as MemoryObject))) return;
+    let inserted = true;
     if (kind === "conversation") {
-      await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
+      inserted = await addConversationIfAbsentAndMarkSynced(record.parsed as Conversation, syncKey);
     } else if (kind === "source") {
       await addSourceIfAbsentAndMarkSynced(record.parsed as Source, syncKey);
     } else {
-      await addMemoryObjectIfAbsentAndMarkSynced(record.parsed as MemoryObject, syncKey);
+      inserted = await addMemoryObjectIfAbsentAndMarkSynced(record.parsed as MemoryObject, syncKey);
     }
+    // ユーザーが削除した記録（tombstone）が直前に作られていた場合：履歴行もRegistryも更新しない
+    if (!inserted && kind === "conversation" && (await isTombstoned("conversation", record.registryKey))) return;
+    if (!inserted && kind === "reflection" && (await isMemoryBlockedByTombstone(record.parsed as MemoryObject))) return;
     if (kind !== "source") {
       await updateHistoryIndexForSingleRecord(root, kind, record.parsed);
     }
@@ -6176,7 +6196,7 @@ async function applySingleRecordEdited(
       return { outcome: "conflict", anchorCommit };
     }
     const syncKey = vaultSyncKeyFor("conversation", record.registryKey);
-    await putConversationAndMarkSynced(merged, syncKey);
+    await putConversationAndMarkSynced(merged, syncKey, existing);
     await updateHistoryIndexForSingleRecord(root, kind, merged);
     await commitVaultRegistrySingleRecordOk(
       root,
@@ -6203,7 +6223,7 @@ async function applySingleRecordEdited(
     return { outcome: "conflict", anchorCommit };
   }
   const syncKey = vaultSyncKeyFor("memory", record.registryKey);
-  await putMemoryObjectAndMarkSynced(merged, syncKey);
+  await putMemoryObjectAndMarkSynced(merged, syncKey, existing);
   await updateHistoryIndexForSingleRecord(root, kind, merged);
   await commitVaultRegistrySingleRecordOk(
     root,
@@ -6312,8 +6332,12 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
             throw new Error(`legacy-equivalent member ${member.id} disappeared from IndexedDB during apply`);
           }
           await setVaultSyncState(syncKey, existingUpdatedAt);
-        } else {
-          await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey);
+        } else if (await isMemoryBlockedByTombstone(member.parsed)) {
+          // ユーザーが削除した記録（tombstone）は取り込まない。取り込めなかったので、このdayをappliedとしてRegistryへcommitしない
+          // （後で「戻せるようにする」を選んだとき、hashが変わらず取り込まれなくなるのを防ぐ）
+          allSucceeded = false;
+        } else if (!(await addMemoryObjectIfAbsentAndMarkSynced(member.parsed, syncKey)) && (await isMemoryBlockedByTombstone(member.parsed))) {
+          allSucceeded = false;       // the user deleted it between the check and the guarded insert
         }
       } else if (member.outcome === "edited") {
         const existing = await getMemoryObject(member.id);
@@ -6327,7 +6351,7 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
           allSucceeded = false;
           continue;
         }
-        await putMemoryObjectAndMarkSynced(merged, syncKey);
+        await putMemoryObjectAndMarkSynced(merged, syncKey, existing);
       } else if (member.outcome === "ledger-repair") {
         // classifyResyncMembers側で既にnormalized semantic equalityを確認済み
         // （Vault側・IndexedDB側の内容が完全に一致している）。そのため"edited"とは

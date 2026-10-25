@@ -30,6 +30,7 @@ mod._load = function (request, parent, isMain) {
 };
 
 const dbMod = require(path.join(OUT, "lib/db.js")) as typeof import("./db");
+const ev = async (id: string) => ({ vaultCopyVerified: true as const, seenOutboxUpdatedAt: (await dbMod.getVaultOutboxEntry(id))!.updatedAt });
 const fakeIdbMod = require(path.join(OUT, "lib/fakeIdb.js")) as { __failNextPutOn: (dbName: string, storeName: string) => void };
 
 type Conversation = import("./types").Conversation;
@@ -365,4 +366,503 @@ test("memoryRepairScopeOk: links/updatedAt, plus metadata.sourceType only when a
   assert.equal(dbMod.memoryRepairScopeOk({ ...legacy, metadata: { ...legacy.metadata, sourceType: "manual" } } as MemoryObject, { ...links, metadata: { ...legacy.metadata, sourceType: "chat" } } as MemoryObject), false, "an explicit value is never overwritten");
   assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, metadata: { ...legacy.metadata, sourceType: "chat", confidence: 0.1 } } as MemoryObject), false, "no other metadata");
   assert.equal(dbMod.memoryRepairScopeOk(legacy, { ...links, summary: "x" }), false);
+});
+
+
+// ===========================================================================
+// Storage-layer invariants (root cause of the 2026 Memory contamination: an AI-chosen id overwrote another conversation's Memory).
+// ===========================================================================
+const fromConversation = (id: string, conversationId: string, updatedAt: string = T): MemoryObject => ({ ...memory(id, updatedAt), conversationId });
+
+test("lineage invariant: NO writer can replace a stored Memory with one from another conversation (the original corruption), and nothing at all is written", async () => {
+  await dbMod.putMemoryObject(fromConversation("lin-1", "conv-A"));
+  const stolen = { ...fromConversation("lin-1", "conv-B", "2026-02-01T00:00:00.000Z"), content: "another conversation's content", summary: "another summary" };
+  await assert.rejects(() => dbMod.putMemoryObject(stolen), (e: Error) => e.name === "MemoryLineageViolationError");
+  await assert.rejects(() => dbMod.putMemoryObjectWithOutbox(stolen), (e: Error) => e.name === "MemoryLineageViolationError");
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced(stolen, "memory:lin-1"), (e: Error) => e.name === "MemoryLineageViolationError");
+  await assert.rejects(() => dbMod.restoreMemoryObjectIfNotNewer(stolen), (e: Error) => e.name === "MemoryLineageViolationError");
+  const kept = await dbMod.getMemoryObject("lin-1");
+  assert.equal(kept?.conversationId, "conv-A"); assert.equal(kept?.content, "内容"); assert.equal(kept?.summary, "要約");
+  assert.equal(await dbMod.getVaultOutboxEntry("memory:lin-1"), undefined, "the atomic Outbox entry was rolled back with the refused record");
+  assert.equal(await dbMod.getVaultSyncState("memory:lin-1"), undefined, "no sync ledger was written for the refused record");
+  // a Memory that drops its lineage can not replace one that has it either
+  await assert.rejects(() => dbMod.putMemoryObject({ ...memory("lin-1", "2026-03-01T00:00:00.000Z"), conversationId: undefined } as unknown as MemoryObject), (e: Error) => e.name === "MemoryLineageViolationError");
+  // the legitimate rewrite (same conversation) and a first write are untouched
+  await dbMod.putMemoryObject({ ...fromConversation("lin-1", "conv-A", "2026-04-01T00:00:00.000Z"), content: "edited in its own conversation" });
+  assert.equal((await dbMod.getMemoryObject("lin-1"))?.content, "edited in its own conversation");
+  await dbMod.putMemoryObjectWithOutbox(fromConversation("lin-2", "conv-B"));
+  assert.equal((await dbMod.getMemoryObject("lin-2"))?.conversationId, "conv-B");
+});
+
+test("restore from the Vault replaces a stored record only with a strictly newer version IN TIME; older, equal-but-different and unparseable versions keep the local record (conversation, Memory, Source)", async () => {
+  const newer = "2026-09-01T00:00:00.000Z", older = "2026-01-01T00:00:00.000Z";
+  await dbMod.putConversationWithOutbox({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "local newer", timestamp: newer }] } as Conversation);
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-1", older)), "kept-local");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "local newer");
+  // same version, different content: a local-only change must survive (kept), never be overwritten
+  assert.equal(await dbMod.restoreConversationIfNotNewer({ ...conversation("rc-1", newer), turns: [{ role: "user", content: "same version, other content", timestamp: newer }] } as Conversation), "kept-local");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "local newer");
+  assert.equal(await dbMod.restoreConversationIfNotNewer({ ...conversation("rc-1", "2027-01-01T00:00:00.000Z"), turns: [{ role: "user", content: "strictly newer", timestamp: newer }] } as Conversation), "written");
+  assert.equal((await dbMod.getConversation("rc-1"))?.turns[0].content, "strictly newer");
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-new", older)), "written");   // nothing stored: written
+  // timestamps with different UTC offsets are ordered as instants, not as strings
+  await dbMod.putConversationWithOutbox(conversation("rc-tz", "2025-12-31T23:30:00-02:00"));          // = 2026-01-01T01:30Z
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-tz", "2026-01-01T00:00:00Z")), "kept-local", "00:00Z is OLDER than 01:30Z");
+  assert.equal((await dbMod.getConversation("rc-tz"))?.updatedAt, "2025-12-31T23:30:00-02:00");
+  // an unparseable timestamp fails closed
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conversation("rc-tz", "not-a-time")), "kept-local");
+  assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-01-01T00:00:00Z" }, { updatedAt: "garbage" }), false);
+
+  await dbMod.putMemoryObject({ ...fromConversation("rm-1", "c1", newer), content: "local newer memory" });
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", older)), "kept-local");
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer({ ...fromConversation("rm-1", "c1", newer), revisitPrompt: undefined, content: "stale vault copy" }), "kept-local", "equal version, different content");
+  assert.equal((await dbMod.getMemoryObject("rm-1"))?.content, "local newer memory");
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(fromConversation("rm-1", "c1", "2026-12-01T00:00:00.000Z")), "written");
+
+  await dbMod.saveSource({ ...source("rs-1", newer), content: "local newer source" } as Source);
+  assert.equal(await dbMod.restoreSourceIfNotNewer(source("rs-1", older)), "kept-local");
+  assert.equal((await dbMod.getSource("rs-1"))?.content, "local newer source");
+});
+
+test("lost-update protection: an apply computed from an earlier read is refused (nothing written) when the stored record changed meanwhile - even when only a local-only field changed and updatedAt did not", async () => {
+  const v1 = fromConversation("cas-1", "c1", "2026-05-01T00:00:00.000Z");
+  await dbMod.putMemoryObject(v1);
+  const merged = { ...fromConversation("cas-1", "c1", "2026-05-02T00:00:00.000Z"), content: "merged from the Vault" };
+  // somebody (a link, a revisit prompt, Capture) changes the record after the merge was computed from v1
+  await dbMod.putMemoryObject({ ...v1, updatedAt: "2026-05-03T00:00:00.000Z", content: "changed meanwhile" });
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", v1), (e: Error) => e.name === "ConcurrentModificationError");
+  assert.equal((await dbMod.getMemoryObject("cas-1"))?.content, "changed meanwhile");
+  assert.equal(await dbMod.getVaultSyncState("memory:cas-1"), undefined);
+  const v2 = (await dbMod.getMemoryObject("cas-1"))!;
+  await dbMod.putMemoryObjectAndMarkSynced(merged, "memory:cas-1", v2);     // matches the stored snapshot exactly: written
+  assert.equal((await dbMod.getMemoryObject("cas-1"))?.content, "merged from the Vault");
+  assert.equal(await dbMod.getVaultSyncState("memory:cas-1"), merged.updatedAt);
+
+  // the revisit-prompt case: the field is added WITHOUT advancing updatedAt, so a version-only check would not notice
+  const base = fromConversation("cas-2", "c1", "2026-06-01T00:00:00.000Z");
+  await dbMod.putMemoryObject(base);
+  const snapshot = (await dbMod.getMemoryObject("cas-2"))!;
+  await dbMod.updateMemoryRevisitPrompt("cas-2", "a prompt generated meanwhile");
+  assert.equal((await dbMod.getMemoryObject("cas-2"))?.updatedAt, base.updatedAt, "the prompt does not advance updatedAt");
+  await assert.rejects(() => dbMod.putMemoryObjectAndMarkSynced({ ...snapshot, content: "stale merge" }, "memory:cas-2", snapshot), (e: Error) => e.name === "ConcurrentModificationError");
+  assert.equal((await dbMod.getMemoryObject("cas-2"))?.revisitPrompt, "a prompt generated meanwhile", "the prompt was not lost");
+
+  await dbMod.putConversation(conversation("cas-c", "2026-05-01T00:00:00.000Z"));
+  const c1 = (await dbMod.getConversation("cas-c"))!;
+  await dbMod.putConversation({ ...conversation("cas-c", "2026-05-03T00:00:00.000Z") });
+  await assert.rejects(() => dbMod.putConversationAndMarkSynced(conversation("cas-c", "2026-05-02T00:00:00.000Z"), "conversation:cas-c", c1), (e: Error) => e.name === "ConcurrentModificationError");
+  assert.equal((await dbMod.getConversation("cas-c"))?.updatedAt, "2026-05-03T00:00:00.000Z");
+});
+
+test("restore ordering uses strict ISO timestamps: impossible calendar dates, bad clocks and loose formats are not orderable (fail closed)", () => {
+  assert.equal(dbMod.strictInstantOf("2026-02-30T00:00:00.000Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-13-01T00:00:00Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01T24:00:00Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01 00:00:00Z"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01"), null);
+  assert.equal(dbMod.strictInstantOf("2026-01-01T00:00:00"), null, "no offset: ambiguous");
+  assert.equal(dbMod.strictInstantOf("2026-01-01T00:00:00+25:00"), null);
+  assert.equal(dbMod.strictInstantOf("2028-02-29T12:00:00.5+09:00"), Date.parse("2028-02-29T12:00:00.5+09:00"));       // real leap day
+  assert.equal(dbMod.strictInstantOf("2027-02-29T12:00:00Z"), null, "2027 is not a leap year");
+  assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-03-01T00:00:00Z" }, { updatedAt: "2026-02-30T00:00:00.000Z" }), false);
+  assert.equal(dbMod.isStrictlyNewerVersion({ updatedAt: "2026-01-01T00:00:00Z" }, { updatedAt: "2026-01-01T00:00:01Z" }), true);
+});
+
+test("the historical Capture bug at the storage API: content produced by conversation B, built by spreading a stored Memory of conversation A (so the copied lineage still says A), is refused", async () => {
+  await dbMod.putCapturedMemoryWithOutbox(fromConversation("hist-1", "conv-A"), "conv-A");                  // A's own Memory, saved by A's Capture
+  const original = (await dbMod.getMemoryObject("hist-1"))!;
+  // what the buggy code effectively did in conversation B: spread the stored Memory, replace the content with text derived from B
+  const overwrite = { ...original, content: "text derived from conversation B", summary: "summary from B", keywords: ["B"], updatedAt: "2026-02-01T00:00:00.000Z" };
+  await assert.rejects(() => dbMod.putCapturedMemoryWithOutbox(overwrite, "conv-B"), (e: Error) => e.name === "MemoryLineageViolationError");
+  const kept = (await dbMod.getMemoryObject("hist-1"))!;
+  assert.equal(kept.content, original.content); assert.equal(kept.summary, original.summary); assert.equal(kept.conversationId, "conv-A");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:hist-1"))?.recordUpdatedAt, original.updatedAt, "the Outbox entry was not replaced either");
+  // the legitimate paths: A updates its own Memory; B saves a NEW Memory under its own lineage
+  await dbMod.putCapturedMemoryWithOutbox({ ...original, content: "A edited its own", updatedAt: "2026-03-01T00:00:00.000Z" }, "conv-A");
+  assert.equal((await dbMod.getMemoryObject("hist-1"))?.content, "A edited its own");
+  await dbMod.putCapturedMemoryWithOutbox(fromConversation("hist-2", "conv-B"), "conv-B");
+  assert.equal((await dbMod.getMemoryObject("hist-2"))?.conversationId, "conv-B");
+  // a record whose lineage does not match the producing conversation can not be saved at all
+  await assert.rejects(() => dbMod.putCapturedMemoryWithOutbox(fromConversation("hist-3", "conv-A"), "conv-B"), (e: Error) => e.name === "MemoryLineageViolationError");
+  assert.equal(await dbMod.getMemoryObject("hist-3"), undefined);
+});
+
+// ===========================================================================
+// Data lifecycle: user deletion, tombstones, resurrection guards, stuck-entry resolution.
+// ===========================================================================
+const mkLink = (id: string, a: string, b: string) => ({ id, sourceId: a, targetId: b, axis: "theme", reason: "r", contrast: false, strength: 0.5, createdBy: "ai-inference", createdAt: T }) as unknown as MemoryObject["links"][number];
+async function seedWorldForDelete(prefix: string) {
+  const A = `${prefix}-A`, B = `${prefix}-B`, C = `${prefix}-C`, D = `${prefix}-D`, conv = `${prefix}-conv`;
+  const l1 = mkLink(`${prefix}-l1`, A, B), l2 = mkLink(`${prefix}-l2`, C, A), l3 = mkLink(`${prefix}-l3`, B, D);
+  await dbMod.putConversationWithOutbox({ ...conversation(conv), memoryObjectIds: [A, D] } as Conversation);
+  await dbMod.putMemoryObjectWithOutbox({ ...fromConversation(A, conv), links: [l1, l2] });
+  await dbMod.putMemoryObjectWithOutbox({ ...fromConversation(B, "other-conv"), links: [l1, l3] });
+  await dbMod.putMemoryObjectWithOutbox({ ...fromConversation(C, "other-conv"), links: [l2] });
+  await dbMod.putMemoryObjectWithOutbox({ ...fromConversation(D, conv), links: [l3] });
+  await dbMod.setVaultSyncState(`memory:${A}`, T);
+  return { A, B, C, D, conv };
+}
+const NOW1 = "2026-10-23T00:00:00.000Z";
+
+test("user deletion of a Memory: the record, the link on the other end of each of its links, the owning conversation's reference, its Outbox entry and sync ledger are removed in one transaction; unrelated records are untouched; a tombstone records the intent", async () => {
+  const w = await seedWorldForDelete("del1");
+  const dBefore = JSON.stringify(await dbMod.getMemoryObject(w.D)), dOutbox = JSON.stringify(await dbMod.getVaultOutboxEntry(`memory:${w.D}`));
+  const r = await dbMod.deleteMemoryByUser(w.A, NOW1);
+  assert.deepEqual(r, { status: "deleted", countersUpdated: 2, conversationUpdated: true });
+  assert.equal(await dbMod.getMemoryObject(w.A), undefined);
+  assert.deepEqual((await dbMod.getMemoryObject(w.B))!.links.map((l) => l.id), ["del1-l3"], "the link to the deleted Memory is gone from B, B's other link stays");
+  assert.deepEqual((await dbMod.getMemoryObject(w.C))!.links, []);
+  assert.deepEqual((await dbMod.getConversation(w.conv))!.memoryObjectIds, [w.D]);
+  for (const id of [w.B, w.C]) {
+    const e = (await dbMod.getVaultOutboxEntry(`memory:${id}`))!;
+    assert.equal(e.status, "pending"); assert.equal(e.recordUpdatedAt, NOW1, "the changed neighbour is queued for the Vault");
+  }
+  assert.equal((await dbMod.getVaultOutboxEntry(`conversation:${w.conv}`))!.recordUpdatedAt, NOW1);
+  assert.equal(await dbMod.getVaultOutboxEntry(`memory:${w.A}`), undefined, "no Outbox task for the deleted Memory");
+  assert.equal(await dbMod.getVaultSyncState(`memory:${w.A}`), undefined);
+  const t = await dbMod.getTombstone("memory", w.A);
+  assert.ok(t); assert.equal(t!.vault, "unverified"); assert.equal(t!.date, T); assert.equal(t!.deletedAt, NOW1);
+  assert.equal(JSON.stringify(t).includes("内容"), false, "a tombstone holds no record text");
+  assert.equal(JSON.stringify(await dbMod.getMemoryObject(w.D)), dBefore, "an unrelated Memory is byte-identical");
+  assert.equal(JSON.stringify(await dbMod.getVaultOutboxEntry(`memory:${w.D}`)), dOutbox);
+  assert.deepEqual(await dbMod.deleteMemoryByUser(w.A, NOW1), { status: "not-found", countersUpdated: 0, conversationUpdated: false }, "idempotent");
+});
+
+test("user deletion is atomic: a failure anywhere in the transaction changes nothing", async () => {
+  const w = await seedWorldForDelete("del2");
+  const snapshot = async () => JSON.stringify([await dbMod.getMemoryObject(w.A), await dbMod.getMemoryObject(w.B), await dbMod.getConversation(w.conv), await dbMod.getVaultOutboxEntry(`memory:${w.B}`), await dbMod.listTombstones()]);
+  const before = await snapshot();
+  fakeIdbMod.__failNextPutOn("tsumugi", "settings");              // the tombstone write fails
+  await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1));
+  assert.equal(await snapshot(), before, "nothing was deleted, no link removed, no tombstone");
+});
+
+test("resurrection guards: a tombstoned record is NOT re-inserted by auto import, resync add or manual restore; lifting the tombstone re-enables restoring; a corrupt tombstone store fails closed", async () => {
+  const w = await seedWorldForDelete("del3");
+  const gone = fromConversation(w.A, w.conv);
+  const goneConv = conversation(w.conv);
+  await dbMod.deleteMemoryByUser(w.A, NOW1);
+  await dbMod.deleteConversationByUser(w.conv, NOW1);
+  const imp = await dbMod.importMissingRecordsIfAbsent({ conversations: [goneConv], memoryObjects: [gone], sources: [] });
+  assert.equal(imp.insertedMemoryObjects, 0); assert.equal(imp.insertedConversations, 0); assert.equal(imp.skippedMemoryObjects, 1); assert.equal(imp.skippedConversations, 1);
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(gone, `memory:${w.A}`), false);
+  assert.equal(await dbMod.addConversationIfAbsentAndMarkSynced(goneConv, `conversation:${w.conv}`), false);
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(gone), "tombstoned");
+  assert.equal(await dbMod.restoreConversationIfNotNewer(goneConv), "tombstoned");
+  assert.equal(await dbMod.getMemoryObject(w.A), undefined); assert.equal(await dbMod.getConversation(w.conv), undefined);
+  assert.equal(await dbMod.getVaultSyncState(`memory:${w.A}`), undefined, "no ledger without a record");
+  // "allow it back": only now can the Vault copy be restored
+  await dbMod.clearTombstone("memory", w.A);
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(gone), "written");
+  assert.ok(await dbMod.getMemoryObject(w.A));
+  // a corrupt tombstone store blocks every re-insertion and every deletion (fail closed) instead of silently disabling the guard
+  const setTombstoneStore = async (target: string) => {
+    const cur = (await dbMod.readMemoryRepairSettings([dbMod.TOMBSTONES_KEY]))[dbMod.TOMBSTONES_KEY] ?? null;
+    await dbMod.commitMaintenanceRestore({ memories: [], conversations: [], outbox: [], syncLedger: [], settings: [{ key: dbMod.TOMBSTONES_KEY, expectCurrent: cur, target }] });
+  };
+  await setTombstoneStore("{not json");
+  assert.equal(await dbMod.isTombstoned("memory", "anything"), true);
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(fromConversation("fresh-x", "c"), "memory:fresh-x"), false);
+  await assert.rejects(() => dbMod.deleteMemoryByUser(w.D, NOW1), (e: Error) => e.name === "TombstoneStoreCorruptError");
+  assert.ok(await dbMod.getMemoryObject(w.D), "nothing was deleted");
+  await setTombstoneStore("{}");                                   // reset for the other tests
+});
+
+test("deleting a conversation with its Memories (the user's choice) leaves no dangling reference; deleting only the conversation keeps its Memories", async () => {
+  const w = await seedWorldForDelete("del4");
+  const only = await dbMod.deleteConversationByUser(`${w.conv}`, NOW1);
+  assert.equal(only.status, "deleted"); assert.deepEqual(only.memoryIds.sort(), [w.A, w.D].sort());
+  assert.ok(await dbMod.getMemoryObject(w.A), "the Memories are untouched when only the conversation is deleted");
+  const w2 = await seedWorldForDelete("del5");
+  const both = await dbMod.deleteConversationWithMemoriesByUser(w2.conv, NOW1);
+  assert.equal(both.memoriesDeleted, 2); assert.equal(both.conversation.status, "deleted");
+  assert.equal(await dbMod.getMemoryObject(w2.A), undefined); assert.equal(await dbMod.getMemoryObject(w2.D), undefined);
+  assert.deepEqual((await dbMod.getMemoryObject(w2.B))!.links, [], "the neighbours lost their links to the deleted Memories");
+  assert.deepEqual((await dbMod.getMemoryObject(w2.C))!.links, []);
+  assert.equal(await dbMod.getConversation(w2.conv), undefined);
+});
+
+test("stuck Outbox entries: listed, and each can be resolved by the user (retry, keep both, remove an orphan, delete) - no state without a way out", async () => {
+  const hold = async (id: string, recordType: string, recordId: string, status: "held" | "pending", attempts: number, reason: string | null) =>
+    dbMod.putVaultOutboxEntry({ id, recordType, recordId, recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: attempts, lastError: reason, lastAttemptAt: T }, status, heldReason: status === "held" ? reason : null, createdAt: T, updatedAt: T } as never);
+  await dbMod.putMemoryObject(fromConversation("st-1", "c1"));
+  await dbMod.putMemoryObject(fromConversation("st-2", "c1"));
+  await hold("memory:st-1", "memory", "st-1", "held", 1, "conflict");
+  await hold("memory:st-2", "memory", "st-2", "pending", 40, "verify-history-mismatch");
+  await hold("memory:st-ghost", "memory", "st-ghost", "held", 0, "canonical-record-missing");
+  await hold("memory:st-fresh", "memory", "st-fresh", "pending", 2, null);          // an ordinary pending entry is NOT listed
+  const list = await dbMod.listOutboxNeedingAttention();
+  assert.deepEqual(list.map((e) => e.id).sort(), ["memory:st-1", "memory:st-2", "memory:st-ghost"]);
+  assert.equal(list.find((e) => e.id === "memory:st-ghost")!.recordExists, false);
+  assert.equal(list.find((e) => e.id === "memory:st-1")!.recordExists, true);
+  // retry
+  assert.equal(await dbMod.retryOutboxEntry("memory:st-1", NOW1), "retried");
+  const retried = (await dbMod.getVaultOutboxEntry("memory:st-1"))!;
+  assert.equal(retried.status, "pending"); assert.equal(retried.heldReason, null); assert.equal(retried.attempt.count, 0);
+  assert.equal(await dbMod.retryOutboxEntry("memory:nope"), "not-found");
+  // keep both as they are
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:st-2", await ev("memory:st-2"), NOW1), "accepted");
+  const accepted = (await dbMod.getVaultOutboxEntry("memory:st-2"))!;
+  assert.equal(accepted.status, "done"); assert.equal(await dbMod.getVaultSyncState("memory:st-2"), (await dbMod.getMemoryObject("st-2"))!.updatedAt);
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:st-ghost", await ev("memory:st-ghost")), "record-missing");
+  // orphan: removable only when the record really is missing
+  assert.equal(await dbMod.removeOrphanOutboxEntry("memory:st-1"), "record-exists");
+  assert.equal(await dbMod.removeOrphanOutboxEntry("memory:st-ghost", { tombstone: true }, NOW1), "removed");
+  assert.equal(await dbMod.getVaultOutboxEntry("memory:st-ghost"), undefined);
+  assert.ok(await dbMod.getTombstone("memory", "st-ghost"), "the user's deletion intent is kept so the Vault copy can not come back");
+  assert.deepEqual((await dbMod.listOutboxNeedingAttention()).map((e) => e.id), [], "nothing is left without an outcome");
+});
+
+test("deleting a conversation together with its Memories is ONE transaction: an interruption commits nothing; a Memory added meanwhile is covered because the Memories are read inside the transaction", async () => {
+  const w = await seedWorldForDelete("del6");
+  const snapshot = async () => JSON.stringify([await dbMod.getMemoryObject(w.A), await dbMod.getMemoryObject(w.B), await dbMod.getMemoryObject(w.D), await dbMod.getConversation(w.conv), await dbMod.getVaultOutboxEntry(`memory:${w.B}`), await dbMod.getVaultOutboxEntry(`conversation:${w.conv}`), await dbMod.listTombstones()]);
+  const before = await snapshot();
+  fakeIdbMod.__failNextPutOn("tsumugi", "settings");                 // the tombstone write at the END fails
+  await assert.rejects(() => dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1));
+  assert.equal(await snapshot(), before, "no Memory, link, reference or conversation changed");
+  // a third Memory of the conversation that exists when the transaction runs is deleted too (nothing dangles)
+  await dbMod.putMemoryObjectWithOutbox(fromConversation(`${w.conv}-late`, w.conv));
+  const r = await dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1);
+  assert.equal(r.memoriesDeleted, 3);
+  assert.equal(await dbMod.getMemoryObject(`${w.conv}-late`), undefined);
+  assert.equal(await dbMod.getConversation(w.conv), undefined);
+});
+
+test("a Memory copied in from the Vault never keeps a link to a deleted Memory: the link is dropped and the copy is queued for the Vault (import, resync add, restore)", async () => {
+  await dbMod.putMemoryObject(fromConversation("lk-gone", "c1"));
+  await dbMod.deleteMemoryByUser("lk-gone", NOW1);
+  const withLink = (id: string) => ({ ...fromConversation(id, "c1"), links: [testLink(`l-${id}`, id, "lk-gone")] });
+  const check = async (id: string, markedSynced: boolean) => {
+    const m = (await dbMod.getMemoryObject(id))!;
+    assert.deepEqual(m.links, [], "no link to the deleted Memory");
+    assert.ok(m.updatedAt > T, "the copy is a new version");
+    assert.equal((await dbMod.getVaultOutboxEntry(`memory:${id}`))?.status, "pending", "queued for the Vault in the same transaction");
+    assert.equal(await dbMod.getVaultSyncState(`memory:${id}`) !== undefined, markedSynced);
+  };
+  await dbMod.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [withLink("lk-import")], sources: [] });
+  await check("lk-import", false);
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(withLink("lk-add"), "memory:lk-add"), true);
+  await check("lk-add", false);
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(withLink("lk-restore")), "written");
+  await check("lk-restore", false);
+  await dbMod.putMemoryObject(fromConversation("lk-edit", "c1"));
+  await dbMod.putMemoryObjectAndMarkSynced(withLink("lk-edit"), "memory:lk-edit");                 // an edit from the Vault that still has the old link
+  await check("lk-edit", false);
+  // a link to a Memory that was NOT deleted stays, and the copy is synced as before
+  await dbMod.putMemoryObject(fromConversation("lk-live", "c1"));
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced({ ...fromConversation("lk-ok", "c1"), links: [testLink("l-ok", "lk-ok", "lk-live")] }, "memory:lk-ok"), true);
+  assert.equal((await dbMod.getMemoryObject("lk-ok"))!.links.length, 1);
+  assert.equal(await dbMod.getVaultSyncState("memory:lk-ok"), T);
+});
+
+test("'keep both as they are' needs proof that the Vault holds a copy: without it nothing is closed", async () => {
+  await dbMod.putMemoryObject(fromConversation("ev-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:ev-1", recordType: "memory", recordId: "ev-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending" }, status: "held", heldReason: "verify-history-mismatch", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  await assert.rejects(() => dbMod.acceptOutboxDivergence("memory:ev-1", {} as never, NOW1), /vault-copy-not-verified/);
+  await assert.rejects(() => dbMod.acceptOutboxDivergence("memory:ev-1", undefined as never, NOW1), /vault-copy-not-verified/);
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:ev-1"))!.status, "held", "the entry is still held: the local record is not declared 'saved'");
+  assert.equal("memory:ev-1" in (await dbMod.getAcceptedDivergences()), false);
+});
+
+test("a Conversation copied in from the Vault never keeps a reference to a deleted Memory (import, resync add, edit, restore)", async () => {
+  await dbMod.putMemoryObject(fromConversation("cr-gone", "cr-c"));
+  await dbMod.deleteMemoryByUser("cr-gone", NOW1);
+  const conv = (id: string) => ({ ...conversation(id), memoryObjectIds: ["cr-gone"] });
+  const check = async (id: string, synced: boolean) => {
+    const c = (await dbMod.getConversation(id))!;
+    assert.deepEqual(c.memoryObjectIds, []);
+    assert.ok(c.updatedAt > T);
+    assert.equal((await dbMod.getVaultOutboxEntry(`conversation:${id}`))?.status, "pending");
+    assert.equal(await dbMod.getVaultSyncState(`conversation:${id}`) !== undefined, synced);
+  };
+  await dbMod.importMissingRecordsIfAbsent({ conversations: [conv("cr-import")], memoryObjects: [], sources: [] });
+  await check("cr-import", false);
+  assert.equal(await dbMod.addConversationIfAbsentAndMarkSynced(conv("cr-add"), "conversation:cr-add"), true);
+  await check("cr-add", false);
+  assert.equal(await dbMod.restoreConversationIfNotNewer(conv("cr-restore")), "written");
+  await check("cr-restore", false);
+  await dbMod.putConversation(conversation("cr-edit"));
+  await dbMod.putConversationAndMarkSynced(conv("cr-edit"), "conversation:cr-edit");
+  await check("cr-edit", false);
+});
+
+test("an ordinary conversation write (a stale chat tab) never brings back a reference to a deleted Memory", async () => {
+  await dbMod.putMemoryObjectWithOutbox(fromConversation("sw-m", "sw-c"));
+  const stale = { ...conversation("sw-c"), memoryObjectIds: ["sw-m", "sw-other"] };
+  await dbMod.putConversationWithOutbox(stale);
+  await dbMod.deleteMemoryByUser("sw-m", NOW1);
+  await dbMod.putConversationWithOutbox({ ...stale, updatedAt: "2026-10-24T00:00:00.000Z" });         // the stale tab sends another message
+  assert.deepEqual((await dbMod.getConversation("sw-c"))!.memoryObjectIds, ["sw-other"]);
+  await dbMod.putConversation({ ...stale, updatedAt: "2026-10-25T00:00:00.000Z" });
+  assert.deepEqual((await dbMod.getConversation("sw-c"))!.memoryObjectIds, ["sw-other"]);
+});
+
+test("a Capture that read Memory B before the AI call can not bring back a link to Memory A the user deleted while it ran; content and valid links are kept", async () => {
+  await dbMod.putMemoryObject(fromConversation("cp-a", "cp-conv"));
+  await dbMod.putMemoryObject(fromConversation("cp-c", "cp-conv"));
+  const snapshotOfB = { ...fromConversation("cp-b", "cp-conv"), links: [testLink("cp-l1", "cp-b", "cp-a"), testLink("cp-l2", "cp-b", "cp-c")] };
+  await dbMod.putMemoryObject(snapshotOfB);                                       // Capture's UPDATE branch snapshot (before the AI call)
+  await dbMod.deleteMemoryByUser("cp-a", NOW1);                                    // the user deletes A while the AI request is running
+  assert.deepEqual((await dbMod.getMemoryObject("cp-b"))!.links.map((l) => l.id), ["cp-l2"]);
+  const updated = { ...snapshotOfB, summary: "Captureが更新した要約", content: "Captureが更新した本文", updatedAt: "2026-10-23T12:00:00.000Z" };
+  await dbMod.putCapturedMemoryWithOutbox(updated, "cp-conv");                     // ...and Capture saves its update from the old snapshot
+  const b = (await dbMod.getMemoryObject("cp-b"))!;
+  assert.deepEqual(b.links.map((l) => l.id), ["cp-l2"], "no link to the deleted Memory; the valid one stays");
+  assert.equal(b.summary, "Captureが更新した要約");
+  assert.equal(b.content, "Captureが更新した本文");
+  assert.ok(Date.parse(b.updatedAt) > Date.parse("2026-10-23T12:00:00.000Z"), "a new version, so the corrected record is what the Vault receives");
+  const entry = (await dbMod.getVaultOutboxEntry("memory:cp-b"))!;
+  assert.equal(entry.recordUpdatedAt, b.updatedAt, "the Outbox entry matches the stored record");
+  assert.equal(entry.status, "pending");
+  assert.equal(await dbMod.hasDeletedMemoryReferences(b.links.flatMap((l) => [l.sourceId, l.targetId]).filter((id) => id !== "cp-b")), false, "nothing references a deleted Memory any more");
+});
+
+test("a stale Memory snapshot written through the ordinary writer (bootstrap migration) never brings back a link to a deleted Memory", async () => {
+  await dbMod.putMemoryObject(fromConversation("sm-a", "c1"));
+  const snapshot = { ...fromConversation("sm-b", "c1"), links: [testLink("sm-l", "sm-b", "sm-a")] };
+  await dbMod.putMemoryObject(snapshot);
+  await dbMod.deleteMemoryByUser("sm-a", NOW1);                                  // the link is removed from B
+  await dbMod.putMemoryObjectWithOutbox(snapshot);                              // the migration still holds the old snapshot of B
+  const b = (await dbMod.getMemoryObject("sm-b"))!;
+  assert.deepEqual(b.links, []);
+  assert.ok(Date.parse(b.updatedAt) >= Date.parse(NOW1), "a version later than the stored corrected one");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:sm-b"))?.recordUpdatedAt, b.updatedAt);
+});
+
+test("tidying an orphan Outbox entry as a deletion cleans the surviving references like an ordinary deletion, atomically, and deletes nothing else", async () => {
+  await dbMod.putMemoryObject({ ...fromConversation("or-keep", "or-c"), links: [testLink("or-l", "or-keep", "or-ghost")] });
+  await dbMod.putMemoryObject(fromConversation("or-other", "or-c"));
+  await dbMod.putConversation({ ...conversation("or-c"), memoryObjectIds: ["or-keep", "or-ghost", "or-other"] });
+  await dbMod.putVaultOutboxEntry({ id: "memory:or-ghost", recordType: "memory", recordId: "or-ghost", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "canonical-record-missing", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  const otherBefore = JSON.stringify(await dbMod.getMemoryObject("or-other"));
+  // an interruption (the tombstone write at the end fails) commits nothing
+  const snap = async () => JSON.stringify([await dbMod.getMemoryObject("or-keep"), await dbMod.getConversation("or-c"), await dbMod.getVaultOutboxEntry("memory:or-ghost"), await dbMod.getVaultOutboxEntry("memory:or-keep")]);
+  const before = await snap();
+  fakeIdbMod.__failNextPutOn("tsumugi", "settings");
+  await assert.rejects(() => dbMod.removeOrphanOutboxEntry("memory:or-ghost", { tombstone: true }, NOW1));
+  assert.equal(await snap(), before, "all or nothing");
+  assert.equal(await dbMod.removeOrphanOutboxEntry("memory:or-ghost", { tombstone: true }, NOW1), "removed");
+  assert.deepEqual((await dbMod.getMemoryObject("or-keep"))!.links, [], "the link to the missing Memory is gone");
+  assert.deepEqual((await dbMod.getConversation("or-c"))!.memoryObjectIds, ["or-keep", "or-other"]);
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:or-keep"))?.status, "pending", "the corrected Memory is queued for the Vault");
+  assert.equal((await dbMod.getVaultOutboxEntry("conversation:or-c"))?.status, "pending", "and so is the Conversation");
+  assert.equal(JSON.stringify(await dbMod.getMemoryObject("or-other")), otherBefore, "an unrelated Memory is untouched");
+  assert.ok(await dbMod.getMemoryObject("or-keep") && await dbMod.getConversation("or-c"), "nothing was deleted");
+  assert.ok(await dbMod.getTombstone("memory", "or-ghost"));
+  // a plain tidy-up (no deletion intent) changes no record
+  await dbMod.putVaultOutboxEntry({ id: "memory:or-ghost2", recordType: "memory", recordId: "or-ghost2", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "canonical-record-missing", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  const kBefore = JSON.stringify(await dbMod.getMemoryObject("or-keep"));
+  assert.equal(await dbMod.removeOrphanOutboxEntry("memory:or-ghost2", {}, NOW1), "removed");
+  assert.equal(JSON.stringify(await dbMod.getMemoryObject("or-keep")), kBefore);
+});
+
+test("deleting a Memory removes EVERY link that points at it, also a one-sided link whose reciprocal copy is missing", async () => {
+  await dbMod.putMemoryObject(fromConversation("os-a", "c1"));
+  await dbMod.putMemoryObject({ ...fromConversation("os-b", "c1"), links: [testLink("os-l", "os-b", "os-a")] });   // B points at A; A holds no reciprocal link
+  await dbMod.deleteMemoryByUser("os-a", NOW1);
+  assert.deepEqual((await dbMod.getMemoryObject("os-b"))!.links, []);
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:os-b"))?.status, "pending", "queued for the Vault");
+});
+
+test("'keep both as they are' is bound to the entry the user saw: if the entry moved on meanwhile nothing is closed", async () => {
+  await dbMod.putMemoryObject(fromConversation("sn-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:sn-1", recordType: "memory", recordId: "sn-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, status: "held", heldReason: "verify-history-mismatch", attempt: { count: 0, lastError: null, lastAttemptAt: null }, createdAt: T, updatedAt: T } as never);
+  const seen = await ev("memory:sn-1");
+  await dbMod.putVaultOutboxEntry({ ...(await dbMod.getVaultOutboxEntry("memory:sn-1"))!, status: "pending", heldReason: null, updatedAt: NOW1 } as never);   // another tab queued a newer version
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:sn-1", seen, NOW1), "changed");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:sn-1"))!.status, "pending");
+  assert.equal("memory:sn-1" in (await dbMod.getAcceptedDivergences()), false);
+});
+
+test("deleting a Memory never moves a neighbour's / the conversation's version backwards (future or offset timestamps)", async () => {
+  const FUTURE = "2999-01-01T00:00:00.000Z";
+  const w = await seedWorldForDelete("fut1");
+  const nb = (await dbMod.getMemoryObject(w.B))!;
+  await dbMod.putMemoryObject({ ...nb, updatedAt: FUTURE, metadata: { ...nb.metadata, updatedAt: FUTURE } });
+  await dbMod.deleteMemoryByUser(w.A, NOW1);
+  assert.ok(Date.parse((await dbMod.getMemoryObject(w.B))!.updatedAt) > Date.parse(FUTURE), "strictly later than the previous version");
+});
+
+test("'keep both as they are' is durable: the divergence marker is stored for that record version only, is dropped by a retry and with the record", async () => {
+  await dbMod.putMemoryObject(fromConversation("dv-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:dv-1", recordType: "memory", recordId: "dv-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 3, lastError: "conflict", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:dv-1", await ev("memory:dv-1"), NOW1), "accepted");
+  assert.equal((await dbMod.getAcceptedDivergences())["memory:dv-1"], T);
+  assert.equal(await dbMod.retryOutboxEntry("memory:dv-1"), "not-found", "an accepted (done) entry is not retried; a new canonical version re-queues it normally");
+  await dbMod.deleteMemoryByUser("dv-1", NOW1);
+  assert.equal("memory:dv-1" in (await dbMod.getAcceptedDivergences()), false, "the marker is dropped with the record");
+  // a Source orphan can not get a deletion tombstone (no guard exists for Sources): nothing changes
+  await dbMod.putVaultOutboxEntry({ id: "source:ghost", recordType: "source", recordId: "ghost", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 0, lastError: null, lastAttemptAt: null }, status: "held", heldReason: "canonical-record-missing", createdAt: T, updatedAt: T } as never);
+  await assert.rejects(() => dbMod.removeOrphanOutboxEntry("source:ghost", { tombstone: true }, NOW1), /tombstone-unsupported/);
+  assert.ok(await dbMod.getVaultOutboxEntry("source:ghost"), "the entry is still there");
+  assert.equal(await dbMod.removeOrphanOutboxEntry("source:ghost", {}, NOW1), "removed", "plain tidy-up without a promise is allowed");
+});
+
+test("every lifecycle mutation re-checks the durable maintenance gate INSIDE its transaction: while a recovery / maintenance is in progress nothing is deleted, retried, accepted or tidied", async () => {
+  const w = await seedWorldForDelete("gate1");
+  await dbMod.putVaultOutboxEntry({ id: `memory:${w.B}`, recordType: "memory", recordId: w.B, recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 1, lastError: "x", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
+  const before = async () => JSON.stringify([await dbMod.getMemoryObject(w.A), await dbMod.getMemoryObject(w.B), await dbMod.getConversation(w.conv), await dbMod.getVaultOutboxEntry(`memory:${w.B}`), await dbMod.getAcceptedDivergences(), await dbMod.listTombstones()]);
+  const snap = await before();
+  const journal = (status: string, epoch: number) => JSON.stringify({ version: dbMod.GATE_JOURNAL_VERSION, operationId: "op", status, createdAt: T, updatedAt: T, world: { activeVaultEpoch: epoch, committedVaultEpoch: null, registryGenerationEpoch: 0, journalVersion: "current", backend: null }, baselineAtStart: { status: "x", value: null }, managedBefore: {}, ops: [], held: [], result: null, unresolvedMetadata: false });
+  await dbMod.writeRecoveryJournalRaw(journal("in-progress", 0));     // the CURRENT Vault world (active epoch 0)
+  try {
+    const blocked = (e: Error) => e.name === "RecoveryPendingError";
+    await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
+    await assert.rejects(() => dbMod.deleteConversationByUser(w.conv, NOW1), blocked);
+    await assert.rejects(() => dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1), blocked);
+    await assert.rejects(() => dbMod.retryOutboxEntry(`memory:${w.B}`, NOW1), blocked);
+    await assert.rejects(async () => dbMod.acceptOutboxDivergence(`memory:${w.B}`, await ev(`memory:${w.B}`), NOW1), blocked);
+    await assert.rejects(() => dbMod.removeOrphanOutboxEntry(`memory:${w.B}`, {}, NOW1), blocked);
+    assert.equal(await before(), snap, "nothing changed while the gate was in place");
+    await dbMod.writeRecoveryJournalRaw("{ not json");                                  // an unreadable journal also refuses (fail closed)
+    await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
+    assert.equal(await before(), snap);
+    await dbMod.writeRecoveryJournalRaw(JSON.stringify({ version: 1, status: "in-progress" }));   // malformed (no world): refuses too
+    await assert.rejects(() => dbMod.deleteMemoryByUser(w.A, NOW1), blocked);
+    // an unfinished journal of an OLDER Vault world (the Vault was switched since) no longer concerns this Vault: allowed (same rule as the app-wide gate)
+    await dbMod.writeRecoveryJournalRaw(journal("in-progress", 7));
+    assert.equal(await dbMod.retryOutboxEntry("memory:nope"), "not-found", "not blocked");
+  } finally {
+    await dbMod.writeRecoveryJournalRaw(journal("completed", 0));   // a finished journal does not block
+  }
+  assert.equal((await dbMod.deleteMemoryByUser(w.A, NOW1)).status, "deleted");
+});
+
+test("every conversation / Memory writer refuses a tombstoned record: a stale chat tab or an in-flight request can not recreate a deleted conversation (and its pending projection)", async () => {
+  await dbMod.putConversationWithOutbox(conversation("tb-conv"));
+  await dbMod.deleteConversationByUser("tb-conv", NOW1);
+  await assert.rejects(() => dbMod.putConversationWithOutbox(conversation("tb-conv", "2026-12-01T00:00:00.000Z")), (e: Error) => e.name === "TombstonedRecordError");
+  assert.equal(await dbMod.getConversation("tb-conv"), undefined);
+  assert.equal(await dbMod.getVaultOutboxEntry("conversation:tb-conv"), undefined, "no pending projection either");
+  await dbMod.putMemoryObjectWithOutbox(fromConversation("tb-mem", "c9"));
+  await dbMod.deleteMemoryByUser("tb-mem", NOW1);
+  await assert.rejects(() => dbMod.putMemoryObjectWithOutbox(fromConversation("tb-mem", "c9", "2026-12-01T00:00:00.000Z")), (e: Error) => e.name === "TombstonedRecordError");
+  assert.equal(await dbMod.getMemoryObject("tb-mem"), undefined);
+});
+
+test("cascade intent: after 'delete the conversation with its Memories', a Memory of that conversation that was not on this device is NOT imported either; deleting only the conversation does not block them", async () => {
+  const w = await seedWorldForDelete("cas7");
+  await dbMod.deleteConversationWithMemoriesByUser(w.conv, NOW1);
+  const vaultOnly = fromConversation("cas7-vault-only", w.conv);                  // a Memory of the conversation that exists only in the Vault
+  const imp = await dbMod.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [vaultOnly], sources: [] });
+  assert.equal(imp.insertedMemoryObjects, 0); assert.equal(imp.skippedMemoryObjects, 1);
+  assert.equal(await dbMod.addMemoryObjectIfAbsentAndMarkSynced(vaultOnly, "memory:cas7-vault-only"), false);
+  assert.equal(await dbMod.restoreMemoryObjectIfNotNewer(vaultOnly), "tombstoned");
+  assert.equal(await dbMod.isMemoryBlockedByTombstone(vaultOnly), true);
+  assert.equal(await dbMod.isMemoryBlockedByTombstone(fromConversation("cas7-unrelated", "other-conv")), false);
+  // conversation-only deletion: no cascade, the Memories of that conversation remain importable
+  const w2 = await seedWorldForDelete("cas8");
+  await dbMod.deleteConversationByUser(w2.conv, NOW1);
+  const keep = fromConversation("cas8-vault-only", w2.conv);
+  assert.equal(await dbMod.isMemoryBlockedByTombstone(keep), false);
+  assert.equal((await dbMod.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [keep], sources: [] })).insertedMemoryObjects, 1);
+});
+
+test("retry that loses a race with 'keep both' does not erase the accepted-divergence marker", async () => {
+  await dbMod.putMemoryObject(fromConversation("rr-1", "c1"));
+  await dbMod.putVaultOutboxEntry({ id: "memory:rr-1", recordType: "memory", recordId: "rr-1", recordUpdatedAt: T, steps: { markdown: "pending", registry: "pending", history: "pending", index: "pending", ledger: "pending" }, attempt: { count: 2, lastError: "c", lastAttemptAt: T }, status: "held", heldReason: "conflict", createdAt: T, updatedAt: T } as never);
+  assert.equal(await dbMod.acceptOutboxDivergence("memory:rr-1", await ev("memory:rr-1"), NOW1), "accepted");          // the other tab
+  assert.equal(await dbMod.retryOutboxEntry("memory:rr-1", NOW1), "not-found");                // this tab's stale click
+  assert.equal((await dbMod.getAcceptedDivergences())["memory:rr-1"], T, "the marker survived");
+  assert.equal((await dbMod.getVaultOutboxEntry("memory:rr-1"))!.status, "done");
 });

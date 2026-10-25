@@ -1,0 +1,11 @@
+{
+ "format": "tsumugi-repair-decisions",
+ "schema": 1,
+ "held": [
+  "R7"
+ ],
+ "excluded": [
+  "B1",
+  "B2"
+ ]
+}

@@ -8,7 +8,7 @@
 
 import { beginCaptureDebug, bindCaptureDebug, captureDebugId, observeCapture, observeCaptureSave, type CaptureDebugServer } from "./captureDebug";
 import { ulid } from "ulid";
-import { getAllMemoryObjects, loadApiKey, putConversation, putMemoryObjectWithOutbox } from "./db";
+import { getAllMemoryObjects, loadApiKey, putConversation, putCapturedMemoryWithOutbox } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
 import { isReflectionSummary, writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import type { ConversationEntryKind } from "./conversationEntryKind";
@@ -450,9 +450,13 @@ export async function captureConversation(
 
 async function captureConversationImpl(
   conversation: Conversation,
-  existingMemoryObjects: MemoryObject[],
+  existingMemoryObjectsArg: MemoryObject[],
   debugId?: string
 ): Promise<CaptureResult> {
+  // 契約の強制（M1の三重目の防御）：existingMemoryObjectsは「このConversation自身から既に生成済みのMemory」だけ。
+  // 現在の唯一の呼び出し元は空配列を渡す（会話境界のCaptureは1回だけ）ため通常は何も除外されないが、将来の呼び出し元が
+  // 別Conversation由来のMemoryを誤って渡しても、UPDATE対象にもLLMへの「更新可能」提示にもならないよう、ここで必ず絞る。
+  const existingMemoryObjects = existingMemoryObjectsArg.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
   const relatedMemoryObjects = await findRelatedMemoriesFromOtherConversations(conversation, existingMemoryObjects);
   const { memories: extracted, diagnostics } = await extractMemories(
     conversation.persona,
@@ -868,6 +872,8 @@ async function persistConversationImpl(
   try {
     await putConversation(conversation);
   } catch (error) {
+    // ユーザーが削除した会話（tombstone）は作り直さず、Vaultにも書かない（実行中のCaptureが削除を黙って取り消さない）
+    if ((error as Error)?.name === "TombstonedRecordError") return { conversationFailed: true, startBackgroundSync: null };
     console.error("[Tsumugi] conversation IndexedDB write failed:", error);
     conversationFailed = true;
   }
@@ -970,14 +976,14 @@ async function persistCaptureImpl(
   for (const memoryObject of memoryObjects) {
     try {
       // 新保存基盤 Phase 3-9：canonical writeと同一IndexedDB transactionでvaultOutboxを
-      // upsertする（`putMemoryObjectWithOutbox`、Invariant 1/2。Conversation Phase 3-2と
+      // upsertする（`putCapturedMemoryWithOutbox`、Invariant 1/2。Conversation Phase 3-2と
       // 同じ原則）。これにより、この後のVault write（下の`writeMemoryObjectMarkdown`、
       // 既存のlegacy経路。まだ削除しない）が失敗しても、次回startup bootstrap
       // （`runSaveFoundationBootstrap`→`reconcilePendingVaultOutbox`）がこのMemoryを
       // 自己修復できる。`recordType`は"reflection"（`isReflectionSummary`）と"memory"を
       // 区別する——Phase 3-7で確立した、Reflectionをnormal Memory day-file logicへ
       // 混入させない規約をここでも維持する。
-      await putMemoryObjectWithOutbox(memoryObject, isReflectionSummary(memoryObject) ? "reflection" : "memory");
+      await putCapturedMemoryWithOutbox(memoryObject, conversation.id, isReflectionSummary(memoryObject) ? "reflection" : "memory");
       observeCaptureSave(debugId, memoryObject.id, "indexedDB", "success");
     } catch (error) {
       console.error(`[Tsumugi Capture] memory IndexedDB write failed for ${memoryObject.id}:`, error);

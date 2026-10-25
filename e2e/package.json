@@ -1,0 +1,12 @@
+{
+  "name": "tsumugi-e2e",
+  "private": true,
+  "description": "Browser E2E tooling kept apart from the app's dependencies",
+  "devDependencies": {
+    "@playwright/test": "1.49.1",
+    "esbuild": "0.21.5"
+  },
+  "scripts": {
+    "build:harness": "esbuild harness/entry.ts --bundle --format=iife --platform=browser --target=es2022 --outfile=.build/harness.js --tsconfig=../tsconfig.json --log-level=warning"
+  }
+}
