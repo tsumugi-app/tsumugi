@@ -15,6 +15,7 @@ import { LATEST_TEXT, NOT_LATEST_TEXTS, latestShownTooEarly, renderTimingText, r
  */
 const COUNT = 120;
 const RUNS_KEY = "tsumugi-startup-timing-runs";
+const RESET_KEY = "tsumugi-startup-timing-reset";
 const TIMEOUT_MS = 240_000;
 const BUILD = process.env.NEXT_PUBLIC_APP_BUILD ?? "dev";
 
@@ -53,11 +54,52 @@ export default function StartupTiming() {
   async function refreshCounts() {
     try { setCounts({ c: (await getAllConversations()).length, m: (await getAllMemoryObjects()).length }); } catch { setCounts(null); }
   }
-  useEffect(() => { setRuns(readRuns()); void refreshCounts(); }, []);
+  useEffect(() => {
+    void (async () => {
+      // "reset" reloads the page first so that nothing of this page holds the database open while it is deleted
+      let pending = false;
+      try { pending = sessionStorage.getItem(RESET_KEY) === "1"; sessionStorage.removeItem(RESET_KEY); } catch { /* no reset */ }
+      if (pending) await wipeThisOrigin();
+      setRuns(readRuns());
+      await refreshCounts();
+    })();
+  }, []);
+
+  async function wipeThisOrigin() {
+    try {
+      await new Promise<void>((resolve) => { const r = indexedDB.deleteDatabase("tsumugi"); r.onsuccess = r.onerror = r.onblocked = () => resolve(); });
+      const root = await navigator.storage.getDirectory();
+      for await (const name of (root as unknown as { keys(): AsyncIterable<string> }).keys()) await root.removeEntry(name, { recursive: true });
+      localStorage.removeItem(RUNS_KEY);
+      setMessage("この端末の計測用データを消しました。最初からやり直せます。");
+    } catch (e) { setMessage("消せませんでした: " + ((e as Error)?.name ?? "error")); }
+  }
+
+  function reset() {
+    try { sessionStorage.setItem(RESET_KEY, "1"); } catch { /* the reset simply does nothing */ }
+    window.location.reload();
+  }
+
+  /** starts the app once on an EMPTY database so that the storage place (Vault) is created first, exactly like a normal first launch; the data comes after */
+  async function prepareEmptyApp() {
+    const frame = document.createElement("iframe");
+    frame.src = "/"; frame.setAttribute("aria-hidden", "true");
+    frame.style.cssText = "position:fixed;left:-9999px;top:0;width:375px;height:700px;border:0";
+    document.body.appendChild(frame);
+    const until = async (ok: () => boolean, ms: number) => { const t = performance.now(); while (performance.now() - t < ms) { try { if (ok()) return true; } catch { /* not ready */ } await new Promise((r) => setTimeout(r, 100)); } return false; };
+    try {
+      await until(() => !!frame.contentDocument?.querySelector('button[aria-label="tsumugiを開く"]'), 30_000);
+      frame.contentDocument?.querySelector<HTMLButtonElement>('button[aria-label="tsumugiを開く"]')?.click();
+      await until(() => (frame.contentDocument?.body?.innerText ?? "").includes("今日は"), 30_000);
+      await new Promise((r) => setTimeout(r, 8000));
+    } finally { frame.remove(); }
+  }
 
   async function seed() {
-    setMessage("架空データを作っています…");
+    setMessage("準備しています（アプリを一度だけ空の状態で起動します。約10秒）…");
     try {
+      await prepareEmptyApp();
+      setMessage("架空データを作っています…");
       const { conversations, memories } = fictionalData();
       for (const c of conversations) await putConversation(c);
       for (const m of memories) await putMemoryObject(m);
@@ -139,6 +181,7 @@ export default function StartupTiming() {
       <div className="flex flex-wrap gap-2">
         <button className={BTN} onClick={seed} disabled={running}>架空データを作る</button>
         <button className={BTN} onClick={start} disabled={running || !counts || counts.c === 0}>計測して起動（{runLabel(runs.length + 1)}）</button>
+        <button className={BTN} onClick={reset} disabled={running}>最初からやり直す（このページの計測用データを消す）</button>
       </div>
       {message && <p role="status">{message}</p>}
       {frameKey > 0 && <iframe key={frameKey} ref={frameRef} src="/" title="Tsumugi" className="h-[480px] w-full rounded-xl border border-stone-300 dark:border-stone-600" />}
