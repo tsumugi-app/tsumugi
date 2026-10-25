@@ -95,8 +95,8 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   const changed = git("diff", "--name-only", ...range).split("\n").filter(Boolean);
   const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts"];
   for (const f of untouchable) assert.ok(!changed.includes(f), `${f} must not be modified`);
-  // Reviewed exception (Memory Timeline / Synthesis, experimental): a new read-only /api/synthesize route, and the chat route may only gain the optional memoryTimeline section
-  const synthesisApi = new Set(["src/app/api/synthesize/route.ts", "src/app/api/chat/route.ts"]);
+  // Reviewed exception (Memory Timeline trial): the chat route may only gain the optional memoryTimeline section
+  const synthesisApi = new Set(["src/app/api/chat/route.ts"]);
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/") && !synthesisApi.has(f)), "API routes must not be modified");
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   for (const l of chatRouteDiff) assert.ok(/synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l), "unexpected chat route change: " + l);
@@ -163,8 +163,6 @@ test("Memory write surface: only the reviewed production files write Memory reco
   walk(SRC);
   assert.deepEqual(writers, {
     "components/ChatScreen.tsx": ["restoreMemoryObjectIfNotNewer", "updateMemoryRevisitPrompt"],
-    // Preview-only comparison page (404 in production builds): writes only its own fictional "syn*" records; to be removed before this work is merged
-    "components/SynthesisEval.tsx": ["putMemoryObject"],
     "lib/capture.ts": ["putCapturedMemoryWithOutbox"],
     "lib/connect.ts": ["addMemoryLinkDurably"],
     "lib/topPrompt.ts": ["updateMemoryRevisitPrompt"],

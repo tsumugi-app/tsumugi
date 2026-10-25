@@ -16,7 +16,9 @@
     "src/lib/memorySynthesis.ts",
     "src/lib/synthesisFictionalData.ts",
     "src/lib/memoryAnalytics.ts",
-    "src/app/api/synthesize/route.ts",
-    "src/app/api/chat/route.ts"
+    "src/app/api/chat/route.ts",
+    "src/lib/memorySynthesisPrompt.ts",
+    "src/lib/memoryTimelineFlag.ts",
+    "src/lib/memoryTimelineFlag.test.ts"
   ]
 }

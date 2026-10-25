@@ -188,6 +188,8 @@ test("with Synthesis (experimental): items only on selected themes; deleted evid
 test("chat section: empty without themes; state, latest statement and history are separate; '不明' is shown as such; a state without its basis point is refused", () => {
   assert.equal(buildSynthesisSection([]), "");
   assert.deepEqual(sanitizeSynthesisContext("x"), []);
+  // Timeline OFF: the chat screen sends no memoryTimeline field; the chat route then adds nothing (the prompt is byte-for-byte what it was before)
+  assert.equal(buildSynthesisSection(sanitizeSynthesisContext(undefined)), "");
   const move = selectTimelineForTurn(userC, { userText: "引っ越してから通勤が楽", retrievedMemoryIds: [] });
   const section = buildSynthesisSection(sanitizeSynthesisContext(JSON.parse(JSON.stringify(move))));
   assert.ok(section.includes("今の状態（記録の言葉から）: 実施済み（根拠: 2026-08-01に話した「引っ越しが終わり"), section);
