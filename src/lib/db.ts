@@ -1437,8 +1437,8 @@ export async function putMemoryObjectWithOutbox(
  * that changed it (every change goes through its own put-with-outbox).
  */
 export async function findUnchangedRegistrations(kind: "conversation" | "memory" | "reflection" | "source", records: Array<Conversation | MemoryObject | Source>): Promise<Set<string>> {
-  const unchanged = new Set<string>();
-  if (records.length === 0) return unchanged;
+  const unchanged: string[] = [];
+  if (records.length === 0) return new Set();
   const storeName = kind === "conversation" ? "conversations" : kind === "source" ? "sources" : "memoryObjects";
   const db = await getDB();
   const tx = db.transaction([storeName, "vaultOutbox", "settings"], "readonly");
@@ -1467,10 +1467,10 @@ export async function findUnchangedRegistrations(kind: "conversation" | "memory"
         })) continue;
       }
       if (JSON.stringify(current) !== JSON.stringify(record)) continue;
-      unchanged.add(record.id);
+      unchanged.push(record.id);
     } catch { /* any doubt: the normal path decides */ }
   }
-  return unchanged;
+  return new Set(unchanged);
 }
 
 export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString(), skipIfUnchanged = false): Promise<VaultOutboxEntry> {
