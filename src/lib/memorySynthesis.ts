@@ -87,6 +87,8 @@ export interface SynthesisTimelinePoint {
   latestEvent: boolean;
   /** the point the theme's current state is taken from */
   stateBasis: boolean;
+  /** an earlier record that states a different status (see ThemeState.earlier) */
+  earlierState?: boolean;
 }
 
 /**
@@ -100,6 +102,11 @@ export interface ThemeState {
   basisEventTime?: string;
   /** the record the state is taken from (so that it is clear WHAT is done / on hold: "10kmの大会を完走した" is about the race, not the habit) */
   basisSummary?: string;
+  /**
+   * earlier records of the same theme that state a DIFFERENT status (newest first, at most 2). A theme can hold several things ("車": the repair, then a drive
+   * plan): the newest status must not hide that the repair was done.
+   */
+  earlier?: { status: TimelineStatus; statedAt: string; summary: string }[];
 }
 
 /** what one chat turn receives for one theme */
@@ -131,10 +138,10 @@ function statedAtOf(m: MemoryObject): { at: string; isRecordDate: boolean } {
 }
 const timeOf = (m: MemoryObject) => Date.parse(statedAtOf(m).at);
 
-/** Memories a synthesis may use: the user's own conversations, not Tsumugi's own reflections / insights */
+/** Memories a synthesis may use: the user's own conversations, not Tsumugi's own reflections (those are "system-generated"; Capture also tags ordinary
+ *  conversation Memories with the type "insight", so the type alone must not exclude them) */
 export function isSynthesisSource(m: MemoryObject): boolean {
   if (m.metadata?.source === "system-generated") return false;
-  if ((m.types ?? []).includes("insight")) return false;
   return typeof m.conversationId === "string" && m.conversationId.length > 0 && typeof m.summary === "string" && m.summary.trim().length > 0;
 }
 
@@ -364,8 +371,14 @@ export function buildThemeTimeline(theme: string, memories: MemoryObject[]): The
     return { m, stated, raw: rawPoint(m.id, stated.at, m.eventTime, status), status };
   });
   const { latestSaid, latestEvent, basis } = classifyPoints(rows.map((r) => r.raw));
+  const earlierRows: typeof rows = [];
+  for (const r of [...rows].filter((x) => !x.raw.retrospective && x.status && x.m.id !== basis?.id).sort((a, b) => b.raw.said - a.raw.said)) {
+    if (r.status === basis?.status || earlierRows.some((e) => e.status === r.status)) continue;
+    earlierRows.push(r);
+    if (earlierRows.length >= 2) break;
+  }
   const ordered = [...rows].sort((a, b) => a.raw.eventKey - b.raw.eventKey || a.raw.said - b.raw.said);
-  const keep = new Set<string>([basis?.id, latestSaid?.id, latestEvent?.id, ordered[0].m.id].filter((x): x is string => !!x));
+  const keep = new Set<string>([basis?.id, latestSaid?.id, latestEvent?.id, ...earlierRows.map((r) => r.m.id), ordered[0].m.id].filter((x): x is string => !!x));
   for (const r of spreadOverTime(ordered, SYNTHESIS_LIMITS.maxTimelinePoints)) { if (keep.size >= SYNTHESIS_LIMITS.maxTimelinePoints) break; keep.add(r.m.id); }
   const points = ordered.filter((r) => keep.has(r.m.id)).map((r) => ({
     memoryId: r.m.id, statedAt: r.stated.at, statedAtIsRecordDate: r.stated.isRecordDate,
@@ -376,14 +389,17 @@ export function buildThemeTimeline(theme: string, memories: MemoryObject[]): The
     latestSaid: r.m.id === latestSaid?.id,
     latestEvent: r.m.id === latestEvent?.id,
     stateBasis: r.m.id === basis?.id,
+    ...(earlierRows.some((e) => e.m.id === r.m.id) ? { earlierState: true } : {}),
   }));
   const basisRow = rows.find((r) => r.m.id === basis?.id);
   const state: ThemeState = basisRow
-    ? { status: basisRow.status!, basisMemoryId: basisRow.m.id, basisStatedAt: basisRow.stated.at, ...(basisRow.m.eventTime ? { basisEventTime: basisRow.m.eventTime } : {}), basisSummary: basisRow.m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength) }
+    ? { status: basisRow.status!, basisMemoryId: basisRow.m.id, basisStatedAt: basisRow.stated.at, ...(basisRow.m.eventTime ? { basisEventTime: basisRow.m.eventTime } : {}), basisSummary: basisRow.m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength),
+        ...(earlierRows.length > 0 ? { earlier: earlierRows.map((r) => ({ status: r.status!, statedAt: r.stated.at, summary: r.m.summary.trim().slice(0, SYNTHESIS_LIMITS.summaryLength) })) } : {}) }
     : { status: "不明" };
   return { state, points };
 }
 
+const SINGLE_KANJI_STOP = new Set(["近", "屋", "間", "分", "度", "目", "上", "下", "年", "月", "会", "物", "家", "所", "場", "生", "大", "小", "新", "高", "長", "出", "入", "手", "体", "心", "朝", "昼"]);
 const STOP_TERMS = new Set(["今日", "最近", "以前", "前回", "今", "話", "日", "気", "人", "前", "後", "時", "中", "方", "事", "何", "少", "思", "感", "行", "来", "見", "言", "私", "夜", "週末", "時間", "気分", "最新"]);
 
 /**
@@ -395,9 +411,10 @@ export function themeTerms(theme: string, memories: MemoryObject[]): string[] {
   if (docs.length === 0) return [];
   const runs = new Set<string>();
   for (const d of docs) for (const r of d.match(/[一-鿿々]+|[ァ-ヺー]{2,}/g) ?? []) runs.add(r);
-  const terms = [...runs].filter((t) => !STOP_TERMS.has(t)).filter((t) => {
+  // a single kanji also matches inside unrelated words (近 in 最近, 屋 in 部屋), so it must be far more characteristic of the theme than a longer term
+  const terms = [...runs].filter((t) => !STOP_TERMS.has(t) && !(t.length === 1 && SINGLE_KANJI_STOP.has(t))).filter((t) => {
     const df = docs.filter((d) => d.includes(t)).length;
-    return df >= 2 && df / docs.length >= 0.4;
+    return df >= 2 && df / docs.length >= (t.length === 1 ? 0.6 : 0.4);
   });
   return [...new Set([theme.trim(), ...terms])];
 }
@@ -483,12 +500,14 @@ export function sanitizeSynthesisContext(raw: unknown): SynthesisThemeContext[] 
         latestSaid: p.latestSaid === true,
         latestEvent: p.latestEvent === true,
         stateBasis: p.stateBasis === true,
+        ...(p.earlierState === true ? { earlierState: true } : {}),
       }));
     const rawState = (ctx.state && typeof ctx.state === "object" ? ctx.state : {}) as Record<string, unknown>;
     const basisPoint = timeline.find((p) => p.stateBasis);
     // the state is only accepted together with the timeline point it is taken from; anything else is "不明"
     const state: ThemeState = isStatus(rawState.status) && basisPoint && basisPoint.status === rawState.status
-      ? { status: rawState.status, basisMemoryId: basisPoint.memoryId, basisStatedAt: basisPoint.statedAt, ...(basisPoint.eventTime ? { basisEventTime: basisPoint.eventTime } : {}), basisSummary: basisPoint.summary }
+      ? { status: rawState.status, basisMemoryId: basisPoint.memoryId, basisStatedAt: basisPoint.statedAt, ...(basisPoint.eventTime ? { basisEventTime: basisPoint.eventTime } : {}), basisSummary: basisPoint.summary,
+        ...(timeline.some((p) => p.earlierState && p.status) ? { earlier: timeline.filter((p) => p.earlierState && p.status).slice(-2).reverse().map((p) => ({ status: p.status!, statedAt: p.statedAt, summary: p.summary })) } : {}) }
       : { status: "不明" };
     const items: SynthesisItem[] = [];
     for (const x of Array.isArray(ctx.items) ? ctx.items : []) {
@@ -539,7 +558,7 @@ export function buildSynthesisSection(contexts: SynthesisThemeContext[]): string
         .join("\n");
       const stateLine = c.state.status === "不明"
         ? " 今の状態: 不明（記録から判断できない。推測で決めない）"
-        : ` 今の状態（記録の言葉から）: ${c.state.status}（根拠: ${c.state.basisStatedAt?.slice(0, 10)}に話した「${c.state.basisSummary ?? ""}」${c.state.basisEventTime ? `、出来事の時期 ${c.state.basisEventTime}` : ""}。この状態はこの記録の対象についてのもの）`;
+        : ` 今の状態（記録の言葉から）: ${c.state.status}（根拠: ${c.state.basisStatedAt?.slice(0, 10)}に話した「${c.state.basisSummary ?? ""}」${c.state.basisEventTime ? `、出来事の時期 ${c.state.basisEventTime}` : ""}。この状態はこの記録の対象についてのもの）${(c.state.earlier ?? []).map((e) => `\n それより前の別の状態の記録: ${e.status}（${e.statedAt.slice(0, 10)}に話した「${e.summary}」。対象が違う可能性がある）`).join("")}`;
       const understanding = c.items
         .map((i) => `  - [${KIND_LABEL[i.kind]}・${SUPPORT_LABEL[i.support]}] ${i.statement}${i.situationNote ? `（状況の違い: ${i.situationNote}）` : ""}`)
         .join("\n");
@@ -555,6 +574,7 @@ ${blocks}
 使い方：
 - 「今の状態」が、このテーマの今の状態。「最後に話した記録」は今の状態を表すとは限らない（引っ越しの後にパン屋の話をしても、引っ越しが済んだことは変わらない）。「以前の出来事を後から話したもの」は過去のことで、今の状態を上書きしない。
 - 今の状態が「不明」のときは、状態を推測で決めない。必要なら本人に確かめる。
+- 状態は、根拠の記録が話している対象についてのもの。「それより前の別の状態の記録」は別の対象のことかもしれない（例：車の修理は済み、その後ドライブを検討中）。対象を取り違えない。
 - 予定・検討中・保留・中止・実施済みを混同しない（中止や保留になった予定を、これからの予定や済んだこととして話さない）。
 - 最新の記録で結果や答えがすでに出ていることを、改めて尋ねない（例：「保留になった」と記録されている予定について「どうでしたか」と聞かない）。聞くなら、その後のことや、今どう感じているかを聞く。
 - 今の発言に本当に関係するときだけ、自然に一度生かす。関係が薄ければ触れない。毎回持ち出さない。

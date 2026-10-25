@@ -78,6 +78,33 @@ test("state: '不明' when no record of the theme states one (nothing is guessed
   assert.ok(t.points.every((p) => !p.stateBasis));
 });
 
+test("theme terms: a single kanji that sits inside common words (近 in 最近) does not make a turn related; '走ろう' still finds running", () => {
+  assert.ok(!selectTimelineForTurn(userC, { userText: "最近また仕事のことで考えちゃって。今の会社、このままでいいのかな", retrievedMemoryIds: [] }).some((c) => c.theme === "引っ越し"));
+  assert.ok(!themeTerms("引っ越し", userC).includes("近") && !themeTerms("引っ越し", userC).includes("屋"));
+  assert.ok(themeTerms("ランニング", memories).includes("走"));
+});
+
+test("Capture's ordinary Memories tagged 'insight' are the user's own records and are used; Tsumugi's reflections (system-generated) are not", () => {
+  const at = "2026-10-25T16:58:30.000Z";
+  const captured = { ...userC[0], id: "cap-1", conversationId: "cap-conv", types: ["conversation", "insight"], summary: "引っ越し後、以前よりも通勤が楽になったと感じている", keywords: ["引っ越し", "通勤"], statedAt: at, date: at } as MemoryObject;
+  const t = buildThemeTimeline("引っ越し", [...userC, captured]);
+  assert.ok(t.points.find((p) => p.latestSaid)!.memoryId === "cap-1");
+  assert.equal(t.state.status, "実施済み", "still the move, from the record that states it");
+  const reflection = { ...captured, id: "refl-2", types: ["insight"], metadata: { ...captured.metadata, source: "system-generated" } } as MemoryObject;
+  assert.ok(buildThemeTimeline("引っ越し", [...userC, reflection]).points.every((p) => p.memoryId !== "refl-2"));
+});
+
+test("a newer status about a different thing of the same theme does not hide the earlier one (car: repair done, then a drive being considered)", () => {
+  const at = "2026-10-25T16:57:57.000Z";
+  const drive = { ...userC[0], id: "cap-drive", conversationId: "cap-conv-2", types: ["conversation", "idea"], summary: "週末に車でドライブに行くことを検討している。", keywords: ["ドライブ", "車", "週末"], statedAt: at, date: at } as MemoryObject;
+  const t = buildThemeTimeline("車", [...userC, drive]);
+  assert.equal(t.state.status, "検討中");
+  assert.deepEqual(t.state.earlier!.map((e) => e.status), ["実施済み"]);
+  assert.ok(t.state.earlier![0].summary.includes("戻ってきた"));
+  const section = buildSynthesisSection(sanitizeSynthesisContext(JSON.parse(JSON.stringify(selectTimelineForTurn([...userC, drive], { userText: "車でドライブ行こうかな", retrievedMemoryIds: [] })))));
+  assert.ok(section.includes("それより前の別の状態の記録: 実施済み") && section.includes("対象を取り違えない"), section);
+});
+
 test("deleted Memories are not in the timeline and cannot be the state basis", () => {
   const moveDone = userC.find((m) => m.summary.includes("引っ越しが終わり"))!;
   const without = userC.filter((m) => m.id !== moveDone.id);
