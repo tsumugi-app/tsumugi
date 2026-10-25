@@ -1429,6 +1429,50 @@ export async function putMemoryObjectWithOutbox(
   }, skipIfUnchanged);
 }
 
+/**
+ * READ ONLY (one transaction for the whole batch). The startup re-registration (`put*WithOutbox(..., skipIfUnchanged)`) opens one read-write transaction per record even when
+ * it ends up writing nothing. This answers, for a whole list at once, which records would end up writing NOTHING: the outbox entry is for exactly this version, the stored
+ * record is identical, no tombstone blocks it, and the deleted-reference / deleted-link guard would not change it. Everything else (changed, new, blocked, lineage problem, any
+ * doubt) is NOT in the returned set and goes through the normal read-write path unchanged. A record that changes right after this check is simply written by the normal path
+ * that changed it (every change goes through its own put-with-outbox).
+ */
+export async function findUnchangedRegistrations(kind: "conversation" | "memory" | "reflection" | "source", records: Array<Conversation | MemoryObject | Source>): Promise<Set<string>> {
+  const unchanged = new Set<string>();
+  if (records.length === 0) return unchanged;
+  const storeName = kind === "conversation" ? "conversations" : kind === "source" ? "sources" : "memoryObjects";
+  const db = await getDB();
+  const tx = db.transaction([storeName, "vaultOutbox", "settings"], "readonly");
+  const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+  const [storedAll, outboxAll] = await Promise.all([
+    tx.objectStore(storeName).getAll() as Promise<Array<{ id: string }>>,
+    tx.objectStore("vaultOutbox").getAll() as Promise<VaultOutboxEntry[]>,
+  ]);
+  await tx.done;
+  const stored = new Map(storedAll.map((r) => [r.id, r]));
+  const outbox = new Map(outboxAll.map((e) => [e.id, e]));
+  for (const record of records) {
+    try {
+      const entry = outbox.get(vaultOutboxIdFor(kind, record.id));
+      const current = stored.get(record.id);
+      if (!entry || !current || entry.recordUpdatedAt !== record.updatedAt) continue;
+      if (kind === "conversation") {
+        if (blockedByTombstone(tombs, "conversation", record.id)) continue;
+        if (withoutDeletedMemoryRefs(record as Conversation, tombs) !== record) continue;
+      } else if (kind === "memory" || kind === "reflection") {
+        if (memoryBlocked(tombs, record as MemoryObject)) continue;
+        // the link guard returns the record itself ("nothing to remove") only when none of its links points at a deleted Memory
+        if (tombs && ((record as MemoryObject).links ?? []).some((l) => {
+          const otherId = l.sourceId === record.id ? l.targetId : l.sourceId;
+          return otherId !== record.id && !!tombs[tombstoneId("memory", otherId)];
+        })) continue;
+      }
+      if (JSON.stringify(current) !== JSON.stringify(record)) continue;
+      unchanged.add(record.id);
+    } catch { /* any doubt: the normal path decides */ }
+  }
+  return unchanged;
+}
+
 export async function putSourceWithOutbox(source: Source, now: string = new Date().toISOString(), skipIfUnchanged = false): Promise<VaultOutboxEntry> {
   return putCanonicalRecordWithOutboxInternal("sources", "source", source, now, undefined, skipIfUnchanged);
 }

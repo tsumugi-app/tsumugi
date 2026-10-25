@@ -1551,3 +1551,34 @@ test("Migration no-op: 変更の無い記録を起動時に再登録しても、
   assert.equal(changed.recordUpdatedAt, next.updatedAt, "新しい版は通常どおり登録される");
   assert.equal(changed.status, "pending");
 });
+
+test("Migration reads: 変更の無い2回目の分類は、各Markdownを1回だけ読み、IndexedDBの読み書きトランザクションを開かない", async () => {
+  const vault = new FakeVault();
+  await seedDoneVault(vault, 10, 10);
+  const env = { root: vault.root(), now: () => T };
+  await migrationMod.runProductionBootstrapMigration(env);   // settles the registration of everything in this shared test database
+  const mdFiles = [...vault.files.keys()].filter((k) => k.endsWith(".md")).length;
+  vault.readCount = 0; vault.writeCount = 0;
+  const outboxBefore = JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id)));
+  const result = await migrationMod.runProductionBootstrapMigration(env);
+  assert.equal(result.phase, "done");
+  assert.ok(vault.readCount <= mdFiles, `reads=${vault.readCount} md files=${mdFiles}`);
+  assert.equal(vault.writeCount, 0);
+  assert.equal(JSON.stringify((await dbMod.getDoneVaultOutboxEntries()).sort((a, b) => a.id.localeCompare(b.id))), outboxBefore, "outbox entries are not rewritten");
+});
+
+test("findUnchangedRegistrations: 同一版・同一内容だけを返し、変更・未登録・保存内容の食い違いは通常経路に任せる", async () => {
+  const same = conversation("reg-same-1");
+  const changed = conversation("reg-changed-1");
+  const edited = conversation("reg-edited-1");
+  const unregistered = conversation("reg-new-1");
+  await dbMod.putConversationWithOutbox(same);
+  await dbMod.putConversationWithOutbox(changed);
+  await dbMod.putConversationWithOutbox(edited);
+  await dbMod.putConversation(unregistered);
+  const newer = { ...changed, updatedAt: "2026-03-02T09:00:00.000Z" };
+  const storedDiffers = { ...edited, turns: [{ role: "user" as const, content: "別の内容", timestamp: T }] };
+  await dbMod.putConversation(storedDiffers);
+  const found = await dbMod.findUnchangedRegistrations("conversation", [same, newer, edited, unregistered]);
+  assert.deepEqual([...found].sort(), ["reg-same-1"]);
+});

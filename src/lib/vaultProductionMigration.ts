@@ -21,6 +21,7 @@ import {
   getAllMemoryObjects,
   getAllSources,
   putConversationWithOutbox,
+  findUnchangedRegistrations,
   putMemoryObjectWithOutbox,
   putSourceWithOutbox,
   readProductionMigrationStateRaw,
@@ -79,7 +80,17 @@ function isNotFoundError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "NotFoundError";
 }
 
-async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
+/**
+ * The text of every Markdown file of one folder, read ONCE for the current classification pass (the vault-only scan has to read all of them anyway). The per-record
+ * classification then looks its file up here instead of reading it a second time. Nothing in this module writes to the Vault, and the memory lives for one pass
+ * (the rescan at the end of a pass starts from empty), so it can not hide a change that happened between passes. A file that is not in it (or a folder that could
+ * not be listed) is read directly, exactly as before.
+ */
+type PassFiles = Map<string, string>;
+
+async function readTextAt(root: FileSystemDirectoryHandle, path: string, passFiles?: PassFiles): Promise<TextRead> {
+  const remembered = passFiles?.get(path);
+  if (remembered !== undefined) return { state: "ok", text: remembered };
   const segments = path.split("/");
   try {
     let dir = root;
@@ -124,9 +135,9 @@ export interface ConversationClassification {
  * （Projection Engineは実行のたびに必ず実体を検証するため、baseline等の判断材料に
  * 頼らず安全に収束できる。Phase 3-3のtest群で既に確認済み）。
  */
-export async function classifyConversation(root: FileSystemDirectoryHandle, canonical: Conversation): Promise<ConversationClassification> {
+export async function classifyConversation(root: FileSystemDirectoryHandle, canonical: Conversation, passFiles?: PassFiles): Promise<ConversationClassification> {
   const path = `Conversations/${fileNameFor(canonical.id, canonical.startedAt)}`;
-  const read = await readTextAt(root, path);
+  const read = await readTextAt(root, path, passFiles);
   if (read.state === "error") return { kind: "unreadable", recordId: canonical.id, reason: "markdown-unreadable" };
   if (read.state === "absent") return { kind: "idb-only", recordId: canonical.id };
   if (read.text === conversationToMarkdown(canonical)) return { kind: "both-same", recordId: canonical.id };
@@ -143,15 +154,22 @@ export async function classifyConversation(root: FileSystemDirectoryHandle, cano
  * （parse不能なファイルも、既知のcanonicalに対応付けられない以上vault-onlyとして扱い、
  * 保全する——安全側に倒す）。
  */
-async function findVaultOnlyConversationPaths(root: FileSystemDirectoryHandle, canonicalConversations: Conversation[]): Promise<string[]> {
-  const canonicalIds = new Set(canonicalConversations.map((c) => c.id));
-  let files: VaultFileEntry[];
+async function collectFolder(root: FileSystemDirectoryHandle, dirName: string): Promise<VaultFileEntry[] | null> {
   try {
-    const dir = await root.getDirectoryHandle("Conversations", { create: false });
-    files = await collectAllMarkdownFiles(dir, "Conversations");
+    const dir = await root.getDirectoryHandle(dirName, { create: false });
+    return await collectAllMarkdownFiles(dir, dirName);
   } catch {
-    return [];
+    return null;
   }
+}
+
+function rememberFiles(passFiles: PassFiles, files: VaultFileEntry[] | null): void {
+  if (files) for (const f of files) passFiles.set(f.path, f.content);
+}
+
+function findVaultOnlyConversationPaths(files: VaultFileEntry[] | null, canonicalConversations: Conversation[]): string[] {
+  const canonicalIds = new Set(canonicalConversations.map((c) => c.id));
+  if (!files) return [];
   const vaultOnly: string[] = [];
   for (const f of files) {
     const parsed = parseConversationMarkdown(f.content);
@@ -193,9 +211,9 @@ export interface MemoryVaultOnlyMember {
  * そのまま再利用する（Conversationの`isLegitimatePredecessor`と同じく、
  * 二重実装しない）。
  */
-export async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: string, canonicalMembers: MemoryObject[]): Promise<MemoryMemberClassification[]> {
+export async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: string, canonicalMembers: MemoryObject[], passFiles?: PassFiles): Promise<MemoryMemberClassification[]> {
   const path = `Memories/${dayFileNameFor(day)}`;
-  const read = await readTextAt(root, path);
+  const read = await readTextAt(root, path, passFiles);
   if (read.state === "error") {
     return canonicalMembers.map((m) => ({ kind: "unreadable-dayfile" as const, recordId: m.id, day, reason: "dayfile-unreadable" }));
   }
@@ -229,15 +247,9 @@ export async function classifyMemoryDay(root: FileSystemDirectoryHandle, day: st
  * 現れない。ただしこの関数はVault側のファイルを一切書き換えないため、実体としての
  * 保全（delete/overwriteしない）は常に満たされている——欠けるのは集計上の可視性のみ。
  */
-async function findVaultOnlyMemoryMembers(root: FileSystemDirectoryHandle, canonicalMemories: MemoryObject[]): Promise<MemoryVaultOnlyMember[]> {
+function findVaultOnlyMemoryMembers(files: VaultFileEntry[] | null, canonicalMemories: MemoryObject[]): MemoryVaultOnlyMember[] {
   const canonicalIds = new Set(canonicalMemories.map((m) => m.id));
-  let files: VaultFileEntry[];
-  try {
-    const dir = await root.getDirectoryHandle("Memories", { create: false });
-    files = await collectAllMarkdownFiles(dir, "Memories");
-  } catch {
-    return [];
-  }
+  if (!files) return [];
   const vaultOnly: MemoryVaultOnlyMember[] = [];
   for (const f of files) {
     if (!isDayFilePath(f.path)) continue; // Reflectionファイル（1record1file）はここでは扱わない
@@ -287,10 +299,11 @@ interface SingleFileMigrationConfig<T extends { id: string }> {
 export async function classifySingleFileRecord<T extends { id: string }>(
   root: FileSystemDirectoryHandle,
   canonical: T,
-  config: SingleFileMigrationConfig<T>
+  config: SingleFileMigrationConfig<T>,
+  passFiles?: PassFiles
 ): Promise<SingleFileClassification> {
   const path = config.pathFor(canonical);
-  const read = await readTextAt(root, path);
+  const read = await readTextAt(root, path, passFiles);
   if (read.state === "error") return { kind: "unreadable", recordId: canonical.id, reason: "markdown-unreadable" };
   if (read.state === "absent") return { kind: "idb-only", recordId: canonical.id };
   if (read.text === config.toMarkdown(canonical)) return { kind: "both-same", recordId: canonical.id };
@@ -304,21 +317,14 @@ export async function classifySingleFileRecord<T extends { id: string }>(
  * `pathFilter`はReflection専用（`Memories/`はnormal Memoryのday-fileと共有する
  * フォルダのため、day-file形式のファイル名は対象から除く。`isDayFilePath`参照）。
  */
-async function findVaultOnlySingleFileRecords<T extends { id: string }>(
-  root: FileSystemDirectoryHandle,
-  dirName: string,
+function findVaultOnlySingleFileRecords<T extends { id: string }>(
+  files: VaultFileEntry[] | null,
   canonicalRecords: T[],
   parseMarkdown: (text: string) => T | null,
   pathFilter?: (path: string) => boolean
-): Promise<string[]> {
+): string[] {
   const canonicalIds = new Set(canonicalRecords.map((c) => c.id));
-  let files: VaultFileEntry[];
-  try {
-    const dir = await root.getDirectoryHandle(dirName, { create: false });
-    files = await collectAllMarkdownFiles(dir, dirName);
-  } catch {
-    return [];
-  }
+  if (!files) return [];
   const vaultOnly: string[] = [];
   for (const f of files) {
     if (pathFilter && !pathFilter(f.path)) continue;
@@ -633,35 +639,50 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
     const knownNormalMemories = onlyNormalMemories(knownMemoriesRaw);
     const knownReflections = onlyReflections(knownMemoriesRaw);
 
-    classifications = await Promise.all(knownConversations.map((c) => classifyConversation(env.root, c)));
-    vaultOnlyPaths = await findVaultOnlyConversationPaths(env.root, knownConversations);
+    // each folder is listed and read ONCE for this pass; the per-record classification below looks its file up in what was read
+    const passFiles: PassFiles = new Map();
+    const conversationFiles = await collectFolder(env.root, "Conversations");
+    const memoryFiles = await collectFolder(env.root, "Memories");
+    const sourceFiles = await collectFolder(env.root, "Sources");
+    rememberFiles(passFiles, conversationFiles);
+    rememberFiles(passFiles, memoryFiles);
+    rememberFiles(passFiles, sourceFiles);
+
+    classifications = await Promise.all(knownConversations.map((c) => classifyConversation(env.root, c, passFiles)));
+    vaultOnlyPaths = findVaultOnlyConversationPaths(conversationFiles, knownConversations);
 
     // Phase 3-6：Memoryはday単位でまとめてclassifyする（day-fileの重複読み込みを避ける）。
     // Reflectionは混ぜない（`onlyNormalMemories`参照）。
     const memoriesByDay = groupMemoriesByDay(knownNormalMemories);
     const memoryClassificationLists = await Promise.all(
-      [...memoriesByDay.entries()].map(([day, members]) => classifyMemoryDay(env.root, day, members))
+      [...memoriesByDay.entries()].map(([day, members]) => classifyMemoryDay(env.root, day, members, passFiles))
     );
     memoryClassifications = memoryClassificationLists.flat();
-    memoryVaultOnlyMembers = await findVaultOnlyMemoryMembers(env.root, knownNormalMemories);
+    memoryVaultOnlyMembers = findVaultOnlyMemoryMembers(memoryFiles, knownNormalMemories);
 
     // Phase 3-7：Reflection（1record1file、`Memories/`配下だがday-file形式は除く）。
-    reflectionClassifications = await Promise.all(knownReflections.map((r) => classifySingleFileRecord(env.root, r, reflectionMigrationConfig)));
-    reflectionVaultOnlyPaths = await findVaultOnlySingleFileRecords(env.root, "Memories", knownReflections, parseMemoryObjectMarkdownSafe, (p) => !isDayFilePath(p));
+    reflectionClassifications = await Promise.all(knownReflections.map((r) => classifySingleFileRecord(env.root, r, reflectionMigrationConfig, passFiles)));
+    reflectionVaultOnlyPaths = findVaultOnlySingleFileRecords(memoryFiles, knownReflections, parseMemoryObjectMarkdownSafe, (p) => !isDayFilePath(p));
 
     // Phase 3-7：Source（1record1file、`Sources/`配下）。
-    sourceClassifications = await Promise.all(knownSources.map((s) => classifySingleFileRecord(env.root, s, sourceMigrationConfig)));
-    sourceVaultOnlyPaths = await findVaultOnlySingleFileRecords(env.root, "Sources", knownSources, parseSourceMarkdownSafe);
+    sourceClassifications = await Promise.all(knownSources.map((s) => classifySingleFileRecord(env.root, s, sourceMigrationConfig, passFiles)));
+    sourceVaultOnlyPaths = findVaultOnlySingleFileRecords(sourceFiles, knownSources, parseSourceMarkdownSafe);
 
     state = { ...state, phase: "enqueue-safe-records", updatedAt: nowOf(env) };
     await persistState(state);
+
+    // records whose outbox entry and stored copy are already exactly current are found with ONE read-only transaction per kind; only the others open a read-write one
+    const unchangedConversations = await findUnchangedRegistrations("conversation", knownConversations);
+    const unchangedMemories = await findUnchangedRegistrations("memory", knownNormalMemories);
+    const unchangedReflections = await findUnchangedRegistrations("reflection", knownReflections);
+    const unchangedSources = await findUnchangedRegistrations("source", knownSources);
 
     let ensuredThisPass = 0;
     for (const classification of classifications) {
       if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
         const canonical = knownConversations.find((c) => c.id === classification.recordId);
         if (!canonical) continue; // 理論上到達しない（防御的）
-        await ensureOutbox(canonical);
+        if (!unchangedConversations.has(canonical.id)) await ensureOutbox(canonical);
         ensuredThisPass += 1;
       }
     }
@@ -671,7 +692,7 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
         const canonical = knownNormalMemories.find((m) => m.id === classification.recordId);
         if (!canonical) continue; // 理論上到達しない（防御的）
-        await ensureMemoryOutbox(canonical);
+        if (!unchangedMemories.has(canonical.id)) await ensureMemoryOutbox(canonical);
         memoryEnsuredThisPass += 1;
       }
     }
@@ -681,7 +702,7 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
         const canonical = knownReflections.find((r) => r.id === classification.recordId);
         if (!canonical) continue; // 理論上到達しない（防御的）
-        await ensureReflectionOutbox(canonical);
+        if (!unchangedReflections.has(canonical.id)) await ensureReflectionOutbox(canonical);
         reflectionEnsuredThisPass += 1;
       }
     }
@@ -691,7 +712,7 @@ export async function runProductionBootstrapMigration(env: ProductionMigrationEn
       if (classification.kind === "idb-only" || classification.kind === "both-same" || classification.kind === "legitimate-successor") {
         const canonical = knownSources.find((s) => s.id === classification.recordId);
         if (!canonical) continue; // 理論上到達しない（防御的）
-        await ensureSourceOutbox(canonical);
+        if (!unchangedSources.has(canonical.id)) await ensureSourceOutbox(canonical);
         sourceEnsuredThisPass += 1;
       }
     }
