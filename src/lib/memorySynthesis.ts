@@ -356,7 +356,7 @@ export function timelineThemes(memories: MemoryObject[]): string[] {
 
 /**
  * Which themes (if any) this chat turn receives. The TIMELINE does not depend on Synthesis: a theme qualifies when
- *   related - the user's words contain one of the theme's own terms, or the normal retrieval returned 2+ of its Memories;
+ *   related - the user's words contain one of the theme's own terms (retrieval overlap alone is not enough);
  *   needed  - the normal retrieval does not already show the history: it misses the theme's CURRENT point, or holds fewer than 2 points of the timeline.
  * Synthesis items (optional) are attached only to themes that qualified this way; without items the turn still gets the facts.
  * Unrelated turns get nothing; the normal retrieval is never replaced.
@@ -372,8 +372,9 @@ export function selectTimelineForTurn(
   for (const theme of timelineThemes(memories)) {
     const themeIds = memories.filter((m) => isSynthesisSource(m) && hasTheme(m, theme)).map((m) => m.id);
     const shared = themeIds.filter((id) => retrieved.has(id)).length;
+    // related only through the user's own words: retrieval overlap alone is not enough (retrieval can return loosely matching Memories for an unrelated turn)
     const termHit = themeTerms(theme, memories).some((t) => turn.userText.includes(t));
-    if (!termHit && shared < 2) continue;
+    if (!termHit) continue;
     const timeline = buildThemeTimeline(theme, memories);
     const currentId = timeline.find((p) => p.current)?.memoryId;
     const covered = timeline.filter((p) => retrieved.has(p.memoryId)).length;

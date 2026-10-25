@@ -114,7 +114,7 @@ test("theme terms: '走ろう' finds running through the user's own words; unrel
 });
 
 test("timeline selection does not need Synthesis; it is passed only when related AND retrieval does not already show the history", () => {
-  assert.deepEqual(selectTimelineForTurn(memories, { userText: "今日は天気よくて、洗濯物がよく乾いた", retrievedMemoryIds: [ids[0]] }), []);
+  assert.deepEqual(selectTimelineForTurn(memories, { userText: "今日は天気よくて、洗濯物がよく乾いた", retrievedMemoryIds: [ids[0], ids[2]] }), [], "two loosely retrieved work Memories do not make an unrelated turn related");
   const run = selectTimelineForTurn(memories, { userText: "週末走ろうかと思ってたけど、なんか気が乗らない", retrievedMemoryIds: [] });
   assert.deepEqual(run.map((c) => c.theme), ["ランニング"]);
   assert.deepEqual(run[0].items, [], "no Synthesis given: facts only");
