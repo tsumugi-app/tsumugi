@@ -42,16 +42,16 @@ const ROWS: Row[] = [
   { day: "2026-10-22", conv: 24, keywords: ["ランニング", "寒さ"], summary: "寒くなってきて最近走れていないと話した。", quote: "寒くなって、最近ぜんぜん走ってない" },
 ];
 
-export function fictionalSynthesisMemories(): MemoryObject[] {
-  return ROWS.map((r, i) => {
+function toMemories(rows: Row[], prefix: string): MemoryObject[] {
+  return rows.map((r, i) => {
     const at = `${r.day}T12:00:00.000Z`;
-    const id = `syn-mem-${String(i + 1).padStart(2, "0")}`;
+    const id = `${prefix}-mem-${String(i + 1).padStart(2, "0")}`;
     return {
       id,
       date: at,
       statedAt: at,
       types: ["conversation"],
-      conversationId: `syn-conv-${String(r.conv).padStart(2, "0")}`,
+      conversationId: `${prefix}-conv-${String(r.conv).padStart(2, "0")}`,
       content: r.summary,
       summary: r.summary,
       keywords: r.keywords,
@@ -66,6 +66,58 @@ export function fictionalSynthesisMemories(): MemoryObject[] {
   });
 }
 
+/** user A (work / running / time alone vs. with others / mother) */
+export function fictionalSynthesisMemories(): MemoryObject[] {
+  return toMemories(ROWS, "syn");
+}
+
+/** user B: a parent working shorter hours. Career goal changes, a monthly pottery class, mixed feelings about her sister, a trip planned -> cancelled -> rebooked,
+ *  and a memory of an old setback told only recently (it must not be read as her present situation). */
+const ROWS_B: Row[] = [
+  { day: "2026-04-05", conv: 1, keywords: ["仕事", "管理職"], summary: "来年は管理職の試験を受けたいと話した。", quote: "来年こそ管理職の試験受けたい" },
+  { day: "2026-04-12", conv: 2, keywords: ["陶芸"], summary: "月に一度の陶芸教室で湯のみを作ったと話した。", quote: "陶芸教室で湯のみ作った" },
+  { day: "2026-04-20", conv: 3, keywords: ["姉"], summary: "姉に子どものことを相談して助かったと話した。", quote: "姉に相談したら助かった" },
+  { day: "2026-05-03", conv: 4, keywords: ["旅行", "沖縄"], summary: "夏休みの家族の沖縄旅行を予約したと話した。", quote: "8月に沖縄、予約した！", eventTime: "2026-08", eventTimePrecision: "month" },
+  { day: "2026-05-17", conv: 5, keywords: ["陶芸"], summary: "陶芸教室でろくろが少し上達したと話した。", quote: "ろくろ、ちょっとうまくなった" },
+  { day: "2026-05-30", conv: 6, keywords: ["仕事", "子育て"], summary: "子どもの送り迎えで残業ができず、仕事との両立が大変だと話した。", quote: "お迎えがあるから残業できなくて、両立きつい" },
+  { day: "2026-06-01", conv: 7, keywords: ["ドラマ"], summary: "話題の医療ドラマを一気に見たと話した。", quote: "あのドラマ一気見しちゃった" },
+  { day: "2026-06-14", conv: 8, keywords: ["姉"], summary: "姉に子育てのことを口出しされて、少しいらっとしたと話した。", quote: "姉にまた口出しされて、ちょっといらっとした" },
+  { day: "2026-06-21", conv: 9, keywords: ["陶芸", "作品展"], summary: "陶芸教室の作品展に出す皿を作り始めたと話した。", quote: "作品展用のお皿、作り始めた" },
+  { day: "2026-07-05", conv: 10, keywords: ["仕事", "時短勤務"], summary: "管理職試験は見送り、時短勤務に切り替えることを考えていると話した。", quote: "試験は見送って、時短にしようかなって" },
+  { day: "2026-08-02", conv: 11, keywords: ["旅行", "沖縄", "台風"], summary: "台風で家族の沖縄旅行が中止になったと話した。", quote: "台風で沖縄、中止になっちゃった", eventTime: "2026-08-01", eventTimePrecision: "day" },
+  { day: "2026-08-09", conv: 12, keywords: ["陶芸", "作品展"], summary: "陶芸の作品展に皿を出したと話した。", quote: "作品展にお皿出した！", eventTime: "2026-08-08", eventTimePrecision: "day" },
+  { day: "2026-08-23", conv: 13, keywords: ["姉"], summary: "姉が子どもを一日預かってくれて、ありがたかったと話した。", quote: "姉が一日預かってくれて、ほんと助かった" },
+  { day: "2026-09-06", conv: 14, keywords: ["仕事", "時短勤務"], summary: "9月から時短勤務になったと話した。", quote: "9月から時短になった", eventTime: "2026-09", eventTimePrecision: "month" },
+  { day: "2026-10-04", conv: 15, keywords: ["旅行", "沖縄"], summary: "沖縄旅行は来年の春に行き直すことにしたと話した。", quote: "沖縄は来年の春にリベンジする", eventTime: "2027-03", eventTimePrecision: "month" },
+  { day: "2026-10-11", conv: 16, keywords: ["仕事", "管理職"], summary: "新卒の頃に管理職候補から外されて悔しかったことを話した。", quote: "新卒のとき、候補から外されてすごく悔しかった", eventTime: "2019", eventTimePrecision: "year" },
+  { day: "2026-10-18", conv: 17, keywords: ["姉"], summary: "姉とは距離をとりたい時もあるが、頼りにもしていると話した。", quote: "姉とは距離置きたいときもあるけど、頼ってもいる" },
+  { day: "2026-10-20", conv: 18, keywords: ["陶芸"], summary: "最近忙しくて陶芸教室を2回休んだと話した。", quote: "忙しくて陶芸2回休んじゃった" },
+];
+
+/** user C: a man who moved, waited for a car repair, keeps restarting English study, and is unsure about an old friend. The car is pure facts
+ *  (nothing to interpret: Synthesis may well be empty there, but the timeline alone tells that the repair is done). */
+const ROWS_C: Row[] = [
+  { day: "2026-05-02", conv: 1, keywords: ["引っ越し"], summary: "職場に近い部屋への引っ越しを考え始めたと話した。", quote: "職場の近くに引っ越そうかな" },
+  { day: "2026-05-09", conv: 2, keywords: ["英語"], summary: "毎朝15分、英語のアプリで勉強していると話した。", quote: "毎朝15分、英語アプリやってる" },
+  { day: "2026-05-23", conv: 3, keywords: ["友人", "拓也"], summary: "学生時代の友人の拓也からの連絡が減って寂しいと話した。", quote: "拓也から最近連絡なくて、ちょっと寂しい" },
+  { day: "2026-06-06", conv: 4, keywords: ["引っ越し", "内見"], summary: "週末に部屋を2件内見したと話した。", quote: "週末に2件内見してきた" },
+  { day: "2026-06-20", conv: 5, keywords: ["英語"], summary: "英語アプリが50日連続になったと話した。", quote: "英語アプリ、50日連続！" },
+  { day: "2026-07-04", conv: 6, keywords: ["引っ越し", "契約"], summary: "駅に近い部屋を契約したと話した。", quote: "駅近の部屋、契約した" },
+  { day: "2026-07-11", conv: 7, keywords: ["車", "点検"], summary: "車から異音がして、点検を予約したと話した。", quote: "車から変な音がして、点検予約した" },
+  { day: "2026-07-18", conv: 8, keywords: ["友人", "拓也"], summary: "拓也に自分から連絡するのは負担に感じると話した。", quote: "自分から拓也に連絡するの、なんか重い" },
+  { day: "2026-07-25", conv: 9, keywords: ["車", "修理"], summary: "点検で部品交換が必要と言われ、部品待ちだと話した。", quote: "部品交換が必要で、部品待ち" },
+  { day: "2026-08-01", conv: 10, keywords: ["引っ越し", "通勤"], summary: "引っ越しが終わり、通勤が20分になったと話した。", quote: "引っ越し終わった。通勤20分！", eventTime: "2026-07-27", eventTimePrecision: "day" },
+  { day: "2026-08-08", conv: 11, keywords: ["英語", "引っ越し"], summary: "引っ越しの忙しさで英語の習慣が途切れたと話した。", quote: "引っ越しバタバタで英語止まっちゃった" },
+  { day: "2026-08-22", conv: 12, keywords: ["車", "修理"], summary: "部品が届かず、車の修理がまだ終わらないと話した。", quote: "部品まだ来なくて、修理終わらない" },
+  { day: "2026-09-05", conv: 13, keywords: ["英語"], summary: "英語の勉強を朝から夜に変えて再開したと話した。", quote: "英語、夜にやることにして再開した" },
+  { day: "2026-09-12", conv: 14, keywords: ["引っ越し", "近所"], summary: "新しい家の近所のパン屋が気に入ったと話した。", quote: "近所のパン屋が当たりだった" },
+  { day: "2026-09-19", conv: 15, keywords: ["車", "修理"], summary: "車の修理が終わって戻ってきたと話した。", quote: "やっと車戻ってきた", eventTime: "2026-09-18", eventTimePrecision: "day" },
+  { day: "2026-09-26", conv: 16, keywords: ["友人", "拓也"], summary: "拓也と久しぶりに飲みに行って楽しかったと話した。", quote: "拓也と久々に飲んだ、楽しかった" },
+  { day: "2026-10-10", conv: 17, keywords: ["映画"], summary: "一人で映画館に行ったと話した。", quote: "一人で映画行ってきた" },
+  { day: "2026-10-17", conv: 18, keywords: ["英語", "オンライン英会話"], summary: "オンライン英会話の体験レッスンを受けたと話した。", quote: "オンライン英会話、体験してみた" },
+  { day: "2026-10-21", conv: 19, keywords: ["友人", "拓也"], summary: "拓也をまた誘いたいが、断られるのが少し怖いと話した。", quote: "また誘いたいけど、断られたらって思うとちょっと怖い" },
+];
+
 /**
  * User turns for the comparison, with simple code checks for each reply:
  *   mustNotAsk    - asking this again means the latest record was ignored (it already has the answer)
@@ -73,15 +125,49 @@ export function fictionalSynthesisMemories(): MemoryObject[] {
  *   pastTerms     - for the unrelated turn only: any of these means a past Memory was brought into a turn it has nothing to do with
  * The last scenario is unrelated on purpose.
  */
-export interface SynthesisEvalScenario { id: string; label: string; userText: string; mustNotAsk: string[]; concreteTerms: string[]; pastTerms?: string[] }
+export interface SynthesisEvalScenario {
+  id: string; label: string; userText: string; mustNotAsk: string[]; concreteTerms: string[]; pastTerms?: string[];
+  /** words showing the reply knows the CURRENT state of the theme */
+  currentTerms?: string[];
+  /** statements that would contradict the current state (e.g. talking about a cancelled plan as still on) */
+  mustNotClaim?: string[];
+  /** which required case this scenario covers */
+  cases?: string[];
+}
 
 export const SYNTHESIS_EVAL_SCENARIOS: SynthesisEvalScenario[] = [
-  { id: "work", label: "仕事の迷い", userText: "最近また仕事のことで考えちゃって。今の会社、このままでいいのかな", mustNotAsk: ["面談はどう", "面談、どう", "面談の結果", "面談を受けて", "異動の面談はいかが"], concreteTerms: ["保留", "異動", "デザイン", "勉強", "転職", "企画", "安定"] },
-  { id: "running", label: "走る気が起きない", userText: "週末走ろうかと思ってたけど、なんか気が乗らないんだよね", mustNotAsk: ["大会はどう", "大会、どう", "大会の結果"], concreteTerms: ["寒", "大会", "完走", "10キロ", "10km", "すっきり", "もやもや", "川沿い"] },
-  { id: "alone", label: "一人と誰か", userText: "今日は一人でいたい気分なんだけど、夜になると寂しくなるんだよね", mustNotAsk: [], concreteTerms: ["人混み", "夕飯", "ご飯", "キャンプ", "一人暮らし", "忙しい", "人に会"] },
+  { id: "work", label: "仕事の迷い", userText: "最近また仕事のことで考えちゃって。今の会社、このままでいいのかな", mustNotAsk: ["面談はどう", "面談、どう", "面談の結果", "面談を受けて", "異動の面談はいかが"], concreteTerms: ["保留", "異動", "デザイン", "勉強", "転職", "企画", "安定"], currentTerms: ["保留", "勉強"], cases: ["仕事の変化", "予定→保留"] },
+  { id: "running", label: "走る気が起きない", userText: "週末走ろうかと思ってたけど、なんか気が乗らないんだよね", mustNotAsk: ["大会はどう", "大会、どう", "大会の結果"], concreteTerms: ["寒", "大会", "完走", "10キロ", "10km", "すっきり", "もやもや", "川沿い"], currentTerms: ["寒"], cases: ["習慣の繰り返し", "予定→実施済み"] },
+  { id: "alone", label: "一人と誰か", userText: "今日は一人でいたい気分なんだけど、夜になると寂しくなるんだよね", mustNotAsk: [], concreteTerms: ["人混み", "夕飯", "ご飯", "キャンプ", "一人暮らし", "忙しい", "人に会"], cases: ["気持ちの揺れ"] },
   { id: "mother", label: "実家", userText: "年末どうしようかなあ。実家、帰ったほうがいいのかな", mustNotAsk: [], concreteTerms: ["お母", "母", "通院", "病院", "電話", "ひざ", "安心"] },
-  { id: "unrelated", label: "関係のない話題", userText: "今日は天気よくて、洗濯物がよく乾いた", mustNotAsk: [], concreteTerms: [], pastTerms: ["仕事", "走", "お母", "実家", "異動", "一人", "会社", "大会"] },
+  { id: "unrelated", label: "関係のない話題", userText: "今日は天気よくて、洗濯物がよく乾いた", mustNotAsk: [], concreteTerms: [], pastTerms: ["仕事", "走", "お母", "実家", "異動", "一人", "会社", "大会"], cases: ["無関係"] },
 ];
 
 /** words that put a psychological label / motive on the user (checked in every reply) */
 export const REPLY_LABEL_TERMS = ["心を守", "自分を守", "欲求", "求めている", "求めてしまう", "深層", "無意識", "本当は", "防衛", "逃避", "依存", "承認", "性格"];
+
+export interface FictionalUser { id: string; label: string; memories: () => MemoryObject[]; scenarios: SynthesisEvalScenario[] }
+
+export const FICTIONAL_USERS: FictionalUser[] = [
+  { id: "A", label: "A：会社員（仕事・ランニング・一人の時間・母）", memories: fictionalSynthesisMemories, scenarios: SYNTHESIS_EVAL_SCENARIOS },
+  {
+    id: "B", label: "B：時短勤務の親（仕事・陶芸・姉・旅行）", memories: () => toMemories(ROWS_B, "synb"),
+    scenarios: [
+      { id: "b-work", label: "管理職の話", userText: "職場の人に、そろそろ管理職どう？って聞かれてさ", mustNotAsk: ["試験の準備", "試験はどう", "試験、どう"], mustNotClaim: ["試験を受ける予定", "試験に向けて"], concreteTerms: ["時短", "送り迎え", "両立", "見送", "新卒", "悔し"], currentTerms: ["時短"], cases: ["仕事の変化", "過去の出来事を最近話す"] },
+      { id: "b-trip", label: "春休みの旅行", userText: "春休み、家族でどこか旅行したいなあ", mustNotAsk: ["沖縄はどうだった", "沖縄旅行はどう", "楽しかった"], mustNotClaim: ["夏の沖縄"], concreteTerms: ["沖縄", "台風", "中止", "春", "リベンジ", "行き直"], currentTerms: ["沖縄", "春"], cases: ["予定→中止→延期"] },
+      { id: "b-sister", label: "姉からの電話", userText: "姉からまた電話があって、ちょっと疲れた", mustNotAsk: [], concreteTerms: ["口出し", "預か", "頼", "距離", "相談"], cases: ["気持ちの揺れ"] },
+      { id: "b-pottery", label: "陶芸を休んだ", userText: "今月も陶芸行けなかったな", mustNotAsk: ["作品展はどう"], concreteTerms: ["2回", "作品展", "皿", "お皿", "湯のみ", "ろくろ", "忙し"], currentTerms: ["休", "忙し"], cases: ["習慣の繰り返し"] },
+      { id: "b-unrelated", label: "関係のない話題", userText: "新しいシャンプーにしたら、髪がさらさらになった", mustNotAsk: [], concreteTerms: [], pastTerms: ["仕事", "陶芸", "姉", "沖縄", "旅行", "時短", "管理職"], cases: ["無関係"] },
+    ],
+  },
+  {
+    id: "C", label: "C：引っ越した会社員（引っ越し・車・英語・友人）", memories: () => toMemories(ROWS_C, "sync"),
+    scenarios: [
+      { id: "c-car", label: "車でドライブ", userText: "週末、久しぶりに車でドライブでも行こうかな", mustNotAsk: ["修理はまだ", "部品は届", "修理は終わ", "修理、終わ"], mustNotClaim: ["修理中", "部品待ち"], concreteTerms: ["修理", "戻って", "部品", "異音", "点検"], currentTerms: ["戻って", "修理が終わ", "直っ"], cases: ["Synthesis0件でもTimeline", "予定→実施済み"] },
+      { id: "c-move", label: "通勤が楽", userText: "引っ越してから、通勤が前より楽になった気がする", mustNotAsk: ["引っ越しはいつ", "内見はどう", "契約はどう"], concreteTerms: ["20分", "引っ越", "駅", "パン屋", "近所"], currentTerms: ["20分", "引っ越"], cases: ["予定→実施済み"] },
+      { id: "c-english", label: "英語が続かない", userText: "英語、また続かなくなりそうなんだよね", mustNotAsk: [], concreteTerms: ["50日", "朝", "夜", "オンライン", "体験", "途切", "アプリ"], currentTerms: ["オンライン", "体験", "夜"], cases: ["習慣の繰り返し"] },
+      { id: "c-friend", label: "友人に連絡", userText: "拓也にまた連絡しようか迷ってる", mustNotAsk: [], concreteTerms: ["飲み", "怖", "負担", "重", "久しぶり", "楽しかった", "寂し"], currentTerms: ["怖", "飲"], cases: ["気持ちの揺れ"] },
+      { id: "c-unrelated", label: "関係のない話題", userText: "コンビニの新作アイス、当たりだった", mustNotAsk: [], concreteTerms: [], pastTerms: ["車", "英語", "拓也", "引っ越", "修理", "パン屋"], cases: ["無関係"] },
+    ],
+  },
+];
