@@ -46,8 +46,10 @@ export default function SynthesisEval() {
     const clusters = buildSynthesisClusters(memories);
     const t0 = performance.now();
     const res = await fetch("/api/synthesize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clusters }) });
-    const data = (await res.json()) as { items?: SynthesisItem[]; proposed?: number; error?: string };
-    const synth = data.items ?? [];
+    const data = (await res.json().catch(() => ({}))) as { items?: SynthesisItem[]; proposed?: number; error?: string };
+    // a failed generation is not "zero items": stop instead of comparing two columns that were both made without synthesis
+    if (!res.ok || !Array.isArray(data.items)) { setStatus(`Synthesisの生成に失敗しました（${res.status}${data.error ? `: ${data.error}` : ""}）。比較は行いません。`); return; }
+    const synth = data.items;
     setItems(synth);
     setSynthMeta({ ms: Math.round(performance.now() - t0), proposed: data.proposed ?? 0, clusters: clusters.length, evidence: new Set(clusters.flatMap((c) => c.evidence.map((e) => e.id))).size });
     const out: Row[] = [];
