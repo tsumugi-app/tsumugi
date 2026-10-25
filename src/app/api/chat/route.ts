@@ -1,3 +1,4 @@
+import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
 import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
@@ -940,7 +941,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, synthesis, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -956,6 +957,8 @@ export async function POST(request: Request) {
     explicitSearch?: ExplicitSearchContext;
     /** Memory Analytics Phase 1（optional）。ユーザーが保存済みMemory全体の集計（キーワードランキング）を求める発言のときだけ、クライアントがcodeで集計して渡す。 */
     memoryAnalytics?: MemoryAnalyticsContext;
+    /** Memory Synthesis Phase 1（experimental, optional）。今回の話題に関係する整理だけ（最大2件）。無ければ従来とバイト単位で同じプロンプト。 */
+    synthesis?: unknown;
     /**
      * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
      * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
@@ -1087,6 +1090,8 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   // Person Memory v1をここで初めてChat Contextへ接続する（今までは保存されるだけだった）。
   const sanitizedPersonView = sanitizePersonViewContext(personView);
   const personViewSection = buildPersonViewSection(sanitizedPersonView);
+  // Memory Synthesis Phase 1（experimental）：複数の会話をまたいだ整理（変化・繰り返し・揺れ）。今回の話題に関係するものだけがクライアントから届く。
+  const synthesisSection = buildSynthesisSection(sanitizeSynthesisContext(synthesis));
 
   const sanitizedProfile = sanitizeProfileContext(profile);
   const profileSection = buildProfileSection(sanitizedProfile);
@@ -1094,7 +1099,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
   const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
