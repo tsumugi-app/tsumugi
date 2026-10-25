@@ -99,7 +99,7 @@ test("a newer status about a different thing of the same theme does not hide the
   const drive = { ...userC[0], id: "cap-drive", conversationId: "cap-conv-2", types: ["conversation", "idea"], summary: "週末に車でドライブに行くことを検討している。", keywords: ["ドライブ", "車", "週末"], statedAt: at, date: at } as MemoryObject;
   const t = buildThemeTimeline("車", [...userC, drive]);
   assert.equal(t.state.status, "検討中");
-  assert.deepEqual(t.state.earlier!.map((e) => e.status), ["実施済み"]);
+  assert.deepEqual(t.state.earlier!.map((e) => e.status), ["実施済み", "予定"], "newest first: the repair done, then the inspection booking");
   assert.ok(t.state.earlier![0].summary.includes("戻ってきた"));
   const section = buildSynthesisSection(sanitizeSynthesisContext(JSON.parse(JSON.stringify(selectTimelineForTurn([...userC, drive], { userText: "車でドライブ行こうかな", retrievedMemoryIds: [] })))));
   assert.ok(section.includes("それより前の別の状態の記録: 実施済み") && section.includes("対象を取り違えない"), section);
