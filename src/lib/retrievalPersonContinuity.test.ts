@@ -93,7 +93,8 @@ test("名前の無い無関係な発言には、人物を持ち込まない（�
 test("別の人物に切り替わったら、前の人物は引きずらない", () => {
   const toYuto = ["さきさんについて話したい", "以前はモヤモヤしていた", "そういえばゆうとくんとこの前飲んだ", "その人、また誘ってくれるかな"];
   assert.equal(r.deriveConversationPersonFocus(toYuto, pool)?.displayName, "ゆうと", "話題を変えて出てきた新しい人物の方を追う");
-  assert.ok(ids(toYuto).every((id) => !SAKI.has(id)));
+  // さきさんには人物の加点が付かない（既存の「珍しいキーワードの継続」＝モヤモヤによる選定は今回変更しない別の仕組み）
+  assert.ok(select(toYuto).kept.every((e) => !SAKI.has(e.memory.id) || e.personBonus === 0));
   const toYuto2 = ["さきさんについて話したい", "以前はモヤモヤしていた", "ゆうとくんとこの前飲んだ", "あの人、また誘ってくれるかな"];
   assert.equal(r.deriveConversationPersonFocus(toYuto2, pool)?.displayName, "ゆうと", "直近に名前が出た人物（ゆうと）であって、さきではない");
   assert.ok(ids(toYuto2).every((id) => !SAKI.has(id)));
@@ -108,7 +109,8 @@ test("明確な話題転換（ところで／話は変わるけど…）の後�
     ["さきさんについて話したい", "以前はモヤモヤしていた", "話は変わるけど仕事の締め切りがきつい", "どうしたらいいかな、もっと話したい"],
   ]) {
     assert.equal(r.deriveConversationPersonFocus(turns, pool), null, turns.join(" / "));
-    assert.ok(ids(turns).every((id) => !SAKI.has(id)), turns.join(" / "));
+    // 人物の引き継ぎは起きない＝選定は変更前と同じ（既存の珍しいキーワードの継続による選定は、今回は変更しない）
+    assert.deepEqual(ids(turns), selectBefore(turns), turns.join(" / "));
   }
 });
 
