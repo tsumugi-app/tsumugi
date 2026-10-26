@@ -447,7 +447,13 @@ const mentionsOf = (text: string, names: string[]) => {
   const normalized = text.normalize("NFKC").replace(/\s+/g, "");
   return names.filter((name) => normalized.includes(name));
 };
-const mentionsGenericPerson = (text: string) => GENERIC_PERSON_WORDS.some((word) => text.includes(word));
+/** 続柄の言葉が「人」として出ているか。1文字の続柄（母・夫・妻…）は、前後が漢字のとき（大丈夫・母国・稲妻…）は別の語の一部なので数えない。 */
+const isKanji = (ch: string | undefined) => ch !== undefined && /[\u4E00-\u9FFF々]/.test(ch);
+const mentionsGenericPerson = (text: string) => GENERIC_PERSON_WORDS.some((word) => {
+  if (Array.from(word).length > 1) return text.includes(word);
+  const chars = Array.from(text);
+  return chars.some((ch, k) => ch === word && !isKanji(chars[k - 1]) && !isKanji(chars[k + 1]));
+});
 const switchesTopic = (text: string) => TOPIC_SWITCH_PHRASES.some((phrase) => text.includes(phrase));
 
 /**
@@ -476,12 +482,17 @@ export function deriveConversationPersonFocus(recentUserTurnsTexts: string[], po
     if (PERSON_REFERENCE_CUES.some((cue) => latest.includes(cue))) return { displayName: person, turnsSinceMention: distance };
     const latestWords = contentWords(latest);
     if (latestWords.size === 0) return null;
-    const context = [
-      ...recentUserTurnsTexts.slice(i, recentUserTurnsTexts.length - 1),
-      ...pool.filter((m) => (m.personMentions ?? []).some((pm) => personNameKey(pm.displayName ?? "") === person)).map((m) => `${m.summary} ${(m.keywords ?? []).join(" ")}`),
-    ];
-    const contextWords = new Set(context.flatMap((t) => [...contentWords(t)]));
-    return [...latestWords].some((w) => contextWords.has(w)) ? { displayName: person, turnsSinceMention: distance } : null;
+    // 根拠にする語：名前が出た発言とその人物のMemory、そして間の発言のうち、それ自体がその人物の話につながっているものだけ
+    // （人を指す言い方を含む、または既につながっている語を共有する）。つながっていない間の発言（別の話題）は根拠に入れない。
+    const connected = new Set<string>([
+      ...contentWords(text),
+      ...pool.filter((m) => (m.personMentions ?? []).some((pm) => personNameKey(pm.displayName ?? "") === person)).flatMap((m) => [...contentWords(`${m.summary} ${(m.keywords ?? []).join(" ")}`)]),
+    ]);
+    for (const between of recentUserTurnsTexts.slice(i + 1, recentUserTurnsTexts.length - 1)) {
+      const words = contentWords(between);
+      if (PERSON_REFERENCE_CUES.some((cue) => between.includes(cue)) || [...words].some((w) => connected.has(w))) for (const w of words) connected.add(w);
+    }
+    return [...latestWords].some((w) => connected.has(w)) ? { displayName: person, turnsSinceMention: distance } : null;
   }
   return null;
 }

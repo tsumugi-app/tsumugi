@@ -128,6 +128,19 @@ test("引き継ぎには上限がある：名前が出てから長く経った�
   assert.equal(r.deriveConversationPersonFocus(long, pool), null);
 });
 
+test("Codex指摘：1文字の続柄が別の語の一部（大丈夫の「夫」・母国の「母」）でも、別の人とはみなさない", () => {
+  assert.equal(r.deriveConversationPersonFocus(["さきさんについて話したい", "彼女は大丈夫かな"], pool)?.displayName, "さき");
+  assert.equal(r.deriveConversationPersonFocus(["さきさんについて話したい", "大丈夫って言ってたけど", "彼女は本当に平気なのかな"], pool)?.displayName, "さき");
+  assert.equal(r.deriveConversationPersonFocus(["さきさんについて話したい", "夫が帰ってきた", "なんだか疲れた"], pool), null, "単独の「夫」は別の人");
+});
+
+test("Codex指摘：その人物につながっていない間の発言（別の話題）は、続きの根拠にしない", () => {
+  assert.equal(r.deriveConversationPersonFocus(["さきさんについて話したい", "コンビニの新作アイス、当たりだった", "アイスをまた買いたい"], pool), null);
+  assert.ok(ids(["さきさんについて話したい", "コンビニの新作アイス、当たりだった", "アイスをまた買いたい"]).every((id) => !SAKI.has(id)));
+  // 人物につながっている間の発言は、引き続き根拠になる（モヤモヤはさきさんのMemoryと共有 → 次の発言の「距離」もつながる）
+  assert.equal(r.deriveConversationPersonFocus(["さきさんについて話したい", "以前はモヤモヤしていて距離もあった", "距離を縮めたい"], pool)?.displayName, "さき");
+});
+
 test("呼び方の揺れ（さき／さきさん）は同じ人物として扱う", () => {
   assert.equal(r.deriveConversationPersonFocus(["さきのこと話したい", "彼女は自分にとってどういう存在なんだろう"], pool)?.displayName, "さき");
 });
