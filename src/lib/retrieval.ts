@@ -381,6 +381,117 @@ function conversationAnchorScore(memory: MemoryObject, anchors: ConversationTopi
   return score;
 }
 
+/**
+ * Person continuity（会話入口の人物の継続）。直近の同じ会話で名前を出した人物の話が、名前を省いたまま続いているとき
+ * （「さきさんについて話したい」→「以前はモヤモヤしていた」→「最近はもっと話したい」→「彼女は自分にとってどういう存在なんだろう」）、
+ * その人物の記録を持つMemoryに補助の加点をする。AIは呼ばない。人物の語彙は、既存MemoryにCaptureが付けた
+ * `personMentions[].displayName`だけ（新しい人物抽出はしない）。
+ *
+ * 引き継ぐのは、次をすべて満たすときだけ（曖昧なら引き継がない＝無理に人物を特定しない）：
+ *   - 最新発言より前で、最後に既知の人物名が出た発言に、その人物が1人だけ出ている（2人以上なら曖昧）
+ *   - そこから最新発言までのどの発言にも、別の既知の人物名・一般的な続柄（母・上司・友達…）・話題転換の言い回しが無い
+ *   - 最新発言自身が人物名を出していない（出していれば通常の検索に任せる＝従来どおり）
+ *   - 名前が出た発言から、最新発言までが PERSON_CARRY_MAX_TURNS 以内
+ *   - 最新発言が「続き」らしい：その人を指す言い方（彼女・彼・その人・あの人・あの子・二人・相手…）を含む、または
+ *     名前が出てからの発言かその人物のMemoryと、内容語（2文字以上の漢字・カタカナ語。一般語は除く）を共有している
+ *     （名前の無い無関係な発言＝「コンビニの新作アイス、当たりだった」に人物を持ち込まないため）
+ * 名前の省略が何ターン続いても、上の条件を満たす限り引き継ぐ（直近1〜2発言に名前があることは要求しない）。
+ * 一般的な続柄や1文字の呼び方は、誤一致しやすいため引き継ぎ対象にしない（通常の検索では従来どおり扱われる）。
+ */
+export const PERSON_CARRY_MAX_TURNS = 8;
+/** 引き継いだ人物の記録を持つMemoryへの加点。最低点（CONVERSATION_MIN_SCORE）を単独で超える大きさ。 */
+export const PERSON_CARRY_WEIGHT = CONVERSATION_ANCHOR_WEIGHT;
+/** 誰のことか特定できない続柄・一般名詞。引き継ぎの対象にせず、最新発言などに出たら「別の人の話」とみなす。 */
+const GENERIC_PERSON_WORDS = [
+  "母", "父", "両親", "妻", "夫", "姉", "兄", "弟", "妹", "祖母", "祖父", "おばあちゃん", "おじいちゃん", "家族", "息子", "娘", "子ども", "子供",
+  "上司", "部下", "同僚", "先輩", "後輩", "先生", "友達", "友人", "彼氏", "恋人", "親友", "知人", "社長", "店長",
+];
+/** 名前を省いて同じ人を指すときの言い方（あれば「続き」とみなす根拠になる） */
+const PERSON_REFERENCE_CUES = ["彼女", "彼は", "彼が", "彼と", "彼に", "彼の", "その人", "あの人", "あの子", "その子", "二人", "ふたり", "相手", "あいつ", "あちら"];
+/** 内容語として数えない一般語 */
+const GENERIC_CONTENT_WORDS = new Set(["最近", "以前", "今日", "昨日", "自分", "時間", "今回", "前回", "本当", "気持", "感じ", "結局", "一緒", "存在", "関係"]);
+const contentWords = (text: string): Set<string> =>
+  new Set((text.normalize("NFKC").match(/[\u4E00-\u9FFF々]{2,}|[\u30A1-\u30FAー]{2,}/g) ?? []).filter((w) => !GENERIC_CONTENT_WORDS.has(w)));
+
+/** 話題を明確に切り替える言い回し */
+const TOPIC_SWITCH_PHRASES = ["ところで", "話は変わる", "話変わる", "それはそうと", "全然関係ない", "関係ないけど", "別の話", "違う話", "それより", "そういえば"];
+
+export interface ConversationPersonFocus {
+  displayName: string;
+  /** 名前が出た発言から最新発言までのuser turn数（1＝直前の発言） */
+  turnsSinceMention: number;
+}
+
+/** 表記ゆれを吸収した人物名のkey：NFKC・空白除去・末尾の敬称（さん/ちゃん/くん/様/氏）を外す（外した残りが2文字以上のときだけ）。 */
+function personNameKey(name: string): string {
+  const base = name.normalize("NFKC").replace(/\s+/g, "").trim();
+  const stripped = base.replace(/(さん|ちゃん|くん|君|様|氏)$/, "");
+  return Array.from(stripped).length >= 2 ? stripped : base;
+}
+
+/** 既知の人物名（既存MemoryのpersonMentions由来）。続柄・1文字の呼び方は引き継ぎ対象から外す。 */
+function carriablePersonNames(pool: MemoryObject[]): string[] {
+  const names = new Set<string>();
+  for (const memory of pool) {
+    for (const mention of memory.personMentions ?? []) {
+      const name = personNameKey(mention.displayName ?? "");
+      if (Array.from(name).length < 2) continue;
+      if (GENERIC_PERSON_WORDS.includes(name)) continue;
+      names.add(name);
+    }
+  }
+  return [...names];
+}
+
+const mentionsOf = (text: string, names: string[]) => {
+  const normalized = text.normalize("NFKC").replace(/\s+/g, "");
+  return names.filter((name) => normalized.includes(name));
+};
+const mentionsGenericPerson = (text: string) => GENERIC_PERSON_WORDS.some((word) => text.includes(word));
+const switchesTopic = (text: string) => TOPIC_SWITCH_PHRASES.some((phrase) => text.includes(phrase));
+
+/**
+ * 直近の同じ会話のuser turns（最新発言を末尾に含む）から、名前を省いたまま続いている人物を求める。
+ * 引き継がない場合はnull（上のコメントの条件参照）。
+ */
+export function deriveConversationPersonFocus(recentUserTurnsTexts: string[], pool: MemoryObject[]): ConversationPersonFocus | null {
+  if (recentUserTurnsTexts.length < 2) return null;
+  const names = carriablePersonNames(pool);
+  if (names.length === 0) return null;
+  const latest = recentUserTurnsTexts[recentUserTurnsTexts.length - 1];
+  // 最新発言が人物（既知の名前・続柄）を出している、または話題を切り替えている：引き継がない
+  if (mentionsOf(latest, names).length > 0 || mentionsGenericPerson(latest) || switchesTopic(latest)) return null;
+  for (let i = recentUserTurnsTexts.length - 2, distance = 1; i >= 0 && distance <= PERSON_CARRY_MAX_TURNS; i--, distance++) {
+    const text = recentUserTurnsTexts[i];
+    const mentioned = mentionsOf(text, names);
+    if (mentioned.length === 0) {
+      // 名前の出ていない発言：別の人・話題転換が出ていれば、それより前の人物は引き継がない
+      if (mentionsGenericPerson(text) || switchesTopic(text)) return null;
+      continue;
+    }
+    // 最後に名前が出た発言。1人だけなら候補（2人以上、または続柄の人も同じ発言に出ていれば、誰の話か特定しない）
+    if (mentioned.length > 1 || mentionsGenericPerson(text)) return null;
+    const person = mentioned[0];
+    // 最新発言が「続き」らしいか：人を指す言い方、または名前が出てからの発言／その人物のMemoryとの内容語の共有
+    if (PERSON_REFERENCE_CUES.some((cue) => latest.includes(cue))) return { displayName: person, turnsSinceMention: distance };
+    const latestWords = contentWords(latest);
+    if (latestWords.size === 0) return null;
+    const context = [
+      ...recentUserTurnsTexts.slice(i, recentUserTurnsTexts.length - 1),
+      ...pool.filter((m) => (m.personMentions ?? []).some((pm) => personNameKey(pm.displayName ?? "") === person)).map((m) => `${m.summary} ${(m.keywords ?? []).join(" ")}`),
+    ];
+    const contextWords = new Set(context.flatMap((t) => [...contentWords(t)]));
+    return [...latestWords].some((w) => contextWords.has(w)) ? { displayName: person, turnsSinceMention: distance } : null;
+  }
+  return null;
+}
+
+/** 引き継いだ人物の記録（personMentions）を持つMemoryへの加点。人物が無ければ0。 */
+function personCarryScore(memory: MemoryObject, focus: ConversationPersonFocus | null): number {
+  if (!focus) return 0;
+  return (memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === focus.displayName) ? PERSON_CARRY_WEIGHT : 0;
+}
+
 export interface ConversationCandidateScore {
   memory: MemoryObject;
   /** 既存scoreMemory()の生値（未補正）。 */
@@ -389,7 +500,9 @@ export interface ConversationCandidateScore {
   genericPenalty: number;
   /** 直近turnsでの継続によるボーナス（加点）。 */
   anchorBonus: number;
-  /** queryScore - genericPenalty + anchorBonus。実際の順位付け・floor判定に使う値。 */
+  /** 名前を省いたまま続いている人物（Person continuity）の記録を持つMemoryへの加点。引き継ぎが無ければ0。 */
+  personBonus: number;
+  /** queryScore - genericPenalty + anchorBonus + personBonus。実際の順位付け・floor判定に使う値。 */
   conversationScore: number;
 }
 
@@ -402,18 +515,22 @@ export function scoreConversationCandidates(
   pool: MemoryObject[],
   trimmed: string,
   anchors: ConversationTopicAnchor[],
-  keywordFrequency: Map<string, number>
+  keywordFrequency: Map<string, number>,
+  personFocus: ConversationPersonFocus | null = null
 ): ConversationCandidateScore[] {
   return pool.map((memory) => {
     const queryScore = scoreMemory(memory, trimmed);
     const genericPenalty = genericKeywordPenalty(memory, trimmed, keywordFrequency);
     const anchorBonus = conversationAnchorScore(memory, anchors);
-    return { memory, queryScore, genericPenalty, anchorBonus, conversationScore: queryScore - genericPenalty + anchorBonus };
+    const personBonus = personCarryScore(memory, personFocus);
+    return { memory, queryScore, genericPenalty, anchorBonus, personBonus, conversationScore: queryScore - genericPenalty + anchorBonus + personBonus };
   });
 }
 
 export interface ConversationDirectSelection {
   anchors: ConversationTopicAnchor[];
+  /** 名前を省いたまま続いている人物（引き継がない場合null）。 */
+  personFocus: ConversationPersonFocus | null;
   /** floor判定前の全候補数（デバッグ表示用）。 */
   consideredCount: number;
   kept: ConversationCandidateScore[];
@@ -438,7 +555,8 @@ export function selectConversationDirectMatches(
   limit: number
 ): ConversationDirectSelection {
   const anchors = deriveConversationTopicAnchors(recentUserTurnsTexts, keywordFrequency);
-  const allScored = scoreConversationCandidates(pool, trimmed, anchors, keywordFrequency);
+  const personFocus = deriveConversationPersonFocus(recentUserTurnsTexts, pool);
+  const allScored = scoreConversationCandidates(pool, trimmed, anchors, keywordFrequency, personFocus);
 
   const aboveFloor = allScored.filter((entry) => entry.conversationScore >= CONVERSATION_MIN_SCORE);
   const droppedByFloor = allScored
@@ -452,7 +570,7 @@ export function selectConversationDirectMatches(
   const kept = sorted.filter((entry) => keptIds.has(entry.memory.id));
   const droppedByRelativeStrength = sorted.filter((entry) => !keptIds.has(entry.memory.id));
 
-  return { anchors, consideredCount: allScored.length, kept, droppedByFloor, droppedByRelativeStrength };
+  return { anchors, personFocus, consideredCount: allScored.length, kept, droppedByFloor, droppedByRelativeStrength };
 }
 
 /**
