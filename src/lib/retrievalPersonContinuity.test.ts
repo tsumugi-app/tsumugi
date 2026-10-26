@@ -97,10 +97,11 @@ test("別の人物に切り替わったら、前の人物は引きずらない",
   assert.ok(select(toYuto).kept.every((e) => !SAKI.has(e.memory.id) || e.personBonus === 0));
   const toYuto2 = ["さきさんについて話したい", "以前はモヤモヤしていた", "ゆうとくんとこの前飲んだ", "あの人、また誘ってくれるかな"];
   assert.equal(r.deriveConversationPersonFocus(toYuto2, pool)?.displayName, "ゆうと", "直近に名前が出た人物（ゆうと）であって、さきではない");
-  assert.ok(ids(toYuto2).every((id) => !SAKI.has(id)));
+  assert.ok(select(toYuto2).kept.every((e) => !SAKI.has(e.memory.id) || e.personBonus === 0));
+  assert.ok(select(toYuto2).kept.some((e) => YUTO.has(e.memory.id)), "ゆうとくんのMemoryが選ばれる");
   const toMother = ["さきさんについて話したい", "以前はモヤモヤしていた", "母から電話があって", "なんだか疲れた"];
   assert.equal(r.deriveConversationPersonFocus(toMother, pool), null, "続柄の人（母）が出たら、さきさんは引き継がない");
-  assert.ok(ids(toMother).every((id) => !SAKI.has(id)));
+  assert.deepEqual(ids(toMother), selectBefore(toMother), "人物の引き継ぎは起きず、選定は変更前と同じ");
 });
 
 test("明確な話題転換（ところで／話は変わるけど…）の後は、前の人物を引きずらない", () => {
