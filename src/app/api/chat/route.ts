@@ -1,3 +1,4 @@
+import { conversationVoice, resolveVoiceVariant } from "@/lib/conversationVoice";
 import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
@@ -941,7 +942,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, evalVariant, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -959,6 +960,8 @@ export async function POST(request: Request) {
     memoryAnalytics?: MemoryAnalyticsContext;
     /** Memory Timeline（試験接続・既定OFF、optional）。今回の話題に関係し、通常のRetrievalに不足する経緯だけ（最大2テーマ）。無ければ従来とバイト単位で同じプロンプト。Synthesis（実験）の整理も同じ形で載せられる。 */
     memoryTimeline?: unknown;
+    /** Conversation voice comparison (Preview only; ignored in production builds; to be removed before merge). */
+    evalVariant?: unknown;
     /**
      * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
      * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
@@ -1015,6 +1018,8 @@ export async function POST(request: Request) {
       );
 
   const retrievedMemoriesSection = buildRetrievedMemoriesSection(memoriesForContext);
+  // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。本番ビルドでは常に"improved"。evalVariantはPreviewの比較専用。
+  const voice = conversationVoice(resolveVoiceVariant(evalVariant, process.env.VERCEL_ENV === "production"));
   const memoriesSectionForPersona =
     persona === "analyst" && retrievedMemoriesSection
       ? `
@@ -1027,7 +1032,7 @@ export async function POST(request: Request) {
 ここに存在しない過去情報を会話履歴から補完しない。
 === CURRENT RETRIEVED MEMORIES ===${retrievedMemoriesSection}
 === END CURRENT RETRIEVED MEMORIES ===
-${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、明示的な検索結果やMemory Analytics Resultsがある場合は、その結果を使って回答する。" : sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、Memory Analytics Resultsがある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}`
+${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、明示的な検索結果やMemory Analytics Resultsがある場合は、その結果を使って回答する。" : sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、Memory Analytics Resultsがある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}${voice.analystMemoryNote}`
       : retrievedMemoriesSection;
 
   const webSearchInstruction = searchNeeded
@@ -1099,7 +1104,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
   const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
@@ -1108,11 +1113,11 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   // 同じ基準で最低budgetを保証する（persona別の特別扱いは今回追加しない）。Recent
   // Conversation・Topic Continuity Contextがあるターンも、Memoryがあるターンと同様に
   // 「継続の理解」に思考予算が要るため floor 512 とする。
-  const thinkingBudget = computeThinkingBudget(latestUserMessage, {
+  const thinkingBudget = voice.adjustThinkingBudget(computeThinkingBudget(latestUserMessage, {
     hasRetrievedMemories: retrievedMemoriesSection.length > 0 || explicitSearchSection.length > 0 || memoryAnalyticsSection.length > 0,
     hasRecentConversation: recentConversationSection.length > 0,
     hasTopicContext: topicContinuitySection.length > 0,
-  });
+  }), latestUserMessage, synthesisSection.length + personViewSection.length + profileSection.length + topicTimelineSection.length > 0);
 
   // Test 13：記録形式のAIターンがあった場合、そのターンの実本文（Markdown記録）を
   // Geminiへ渡さない点はTest 12と同じだが、単純に除外するのではなく、同じ位置に
