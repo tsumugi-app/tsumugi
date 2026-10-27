@@ -1,6 +1,8 @@
 "use client";
 
 import { memoryTimelineEnabled } from "@/lib/memoryTimelineFlag";
+import { memorySynthesisEnabled } from "@/lib/memorySynthesisFlag";
+import { recordSynthesisShown, runSynthesisAfterSession, synthesisContextForTurn } from "@/lib/synthesisChat";
 import { safeSelectTimelineForTurn, type SynthesisThemeContext } from "@/lib/memorySynthesis";
 import { waitUntilIdle } from "@/lib/waitUntilIdle";
 import { logRecoveryArchiveDiagnostic } from "@/lib/vaultRecoveryArchiveDebug";
@@ -4324,6 +4326,8 @@ export default function ChatScreen() {
         // そのまま再利用。失敗してもReflection自体は成功しているためreflectionStatusには
         // 影響させない。未Connectのまま残っても次回起動時のキャッチアップで再試行される）。
         connectConversationBoundary(Promise.resolve([insightMemory]));
+        // Memory Synthesis S1（試験・既定OFF）：必要なテーマだけ裏で生成（1日1回まで。待たない・失敗しても何も変えない）
+        runSynthesisAfterSession();
       } catch (error) {
         if (handleStaleVaultTabError(error)) {
           setReflectionStatus("error");
@@ -4420,6 +4424,8 @@ export default function ChatScreen() {
       // （日記）専用の経路になっていたため、「この会話を終える」直後にHistoryPanelを開くと
       // 通常会話由来のMemoryだけがまだ見えない、という非対称があった。
       setSessionCapturedMemories(latestMemoryObjects);
+      // Memory Synthesis S1（試験・既定OFF）：必要なテーマだけ裏で生成（1日1回まで。待たない・失敗しても何も変えない）
+      runSynthesisAfterSession();
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to end conversation", error);
@@ -4668,7 +4674,15 @@ export default function ChatScreen() {
         } catch (personTopicError) {
           console.error("Failed to build person view / topic timeline context", personTopicError);
         }
-        if (memoryTimelineEnabled()) {
+        if (memorySynthesisEnabled()) {
+          // Memory Synthesis S1（試験・既定OFF）：経緯に、そのテーマのTsumugiの仮説（端末内キャッシュ）を添える。AI呼び出しは無い。失敗時は経緯だけ（synthesisChat.ts）。
+          const synthesisTurn = await synthesisContextForTurn(
+            allMemoriesForTopicContinuity.filter((memory) => memory.conversationId !== baseConversation.id),
+            { userText: text, retrievedMemoryIds: retrievedMemories.map((memory) => memory.id) }
+          );
+          memoryTimelineContext = synthesisTurn.contexts;
+          recordSynthesisShown(synthesisTurn.shownIds, baseConversation.id);
+        } else if (memoryTimelineEnabled()) {
           // 失敗しても空配列（会話は通常のRetrievalだけで続く）。今の会話自身のMemoryは、Retrievalと同じく使わない。
           memoryTimelineContext = safeSelectTimelineForTurn(
             allMemoriesForTopicContinuity.filter((memory) => memory.conversationId !== baseConversation.id),
