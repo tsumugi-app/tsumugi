@@ -393,7 +393,7 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
 
         const fmt = (entry: ConversationCandidateScore) =>
           `id=${entry.memory.id} conversationScore=${entry.conversationScore.toFixed(2)} ` +
-          `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)}) ` +
+          `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)} personBonus=+${entry.personBonus.toFixed(2)}) ` +
           `summary="${entry.memory.summary}"`;
 
         conversationRetrievalLines = [

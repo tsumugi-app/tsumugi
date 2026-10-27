@@ -10,6 +10,7 @@
     "test:stated-at": "tsc -p tsconfig.stated-at.json && node --test .test-out/lib/memoryStatedAt.test.js",
     "test:stated-at-projection": "tsc -p tsconfig.stated-at-projection.json && node --test .test-out/lib/memoryStatedAtProjection.test.js",
     "test:memory-analytics": "tsc -p tsconfig.memory-analytics.json && node --test .test-out/lib/memoryAnalytics.test.js",
+    "test:retrieval-person": "tsc -p tsconfig.retrieval-person.json && node --test .test-out/lib/retrievalPersonContinuity.test.js",
     "test:memory-synthesis": "tsc -p tsconfig.memory-synthesis.json && node --test .test-out/lib/memorySynthesis.test.js .test-out/lib/memoryTimelineFlag.test.js",
     "test:memory-search": "tsc -p tsconfig.memory-search.json && node --test .test-out/lib/memorySearch.test.js",
     "test:capture": "tsc -p tsconfig.test.json && node --test .test-out/lib/capture.regression.test.js",
