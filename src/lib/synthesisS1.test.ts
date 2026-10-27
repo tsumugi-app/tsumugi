@@ -109,8 +109,11 @@ test("a successful run stores hypotheses as an AI cache (never Memories); the Me
   }
   assert.equal(s.reactions.length, 0);
   assert.equal(JSON.stringify(memories), before, "Memories are only read");
-  const again = await runSynthesisOnce(deps(store, memories, api.callApi, NOW + H));
-  assert.equal(again.status, "cooldown");
+  // nothing changed: nothing to do; something changed but within 24h of the attempt: cooldown. Neither calls the AI.
+  assert.equal((await runSynthesisOnce(deps(store, memories, api.callApi, NOW + H))).status, "nothing-to-do");
+  const at = "2026-10-27T12:30:00.000Z";
+  const more = [1, 2].map((i) => ({ ...memories[0], id: `m-new-${i}`, conversationId: `c-new-${i}`, statedAt: at, date: at, createdAt: at, updatedAt: at, keywords: ["仕事"], summary: `仕事の話をした${i}`, evidenceQuotes: [`仕事の話${i}`] }) as MemoryObject);
+  assert.equal((await runSynthesisOnce(deps(store, [...memories, ...more], api.callApi, NOW + H))).status, "cooldown");
   assert.equal(api.calls.length, 1);
 });
 
