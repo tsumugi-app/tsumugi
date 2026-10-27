@@ -1,3 +1,4 @@
+import { conversationVoice } from "@/lib/conversationVoice";
 import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
@@ -1015,6 +1016,8 @@ export async function POST(request: Request) {
       );
 
   const retrievedMemoriesSection = buildRetrievedMemoriesSection(memoriesForContext);
+  // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。プロンプトのみで、取得・保存・AI呼び出し回数・thinking budgetは変えない。
+  const voice = conversationVoice();
   const memoriesSectionForPersona =
     persona === "analyst" && retrievedMemoriesSection
       ? `
@@ -1027,7 +1030,7 @@ export async function POST(request: Request) {
 ここに存在しない過去情報を会話履歴から補完しない。
 === CURRENT RETRIEVED MEMORIES ===${retrievedMemoriesSection}
 === END CURRENT RETRIEVED MEMORIES ===
-${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、明示的な検索結果やMemory Analytics Resultsがある場合は、その結果を使って回答する。" : sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、Memory Analytics Resultsがある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}`
+${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、明示的な検索結果やMemory Analytics Resultsがある場合は、その結果を使って回答する。" : sanitizedExplicitSearch ? "このセクションに関連するMemoryが無くても、明示的な検索結果がある場合は、その結果を使って回答する。" : sanitizedMemoryAnalytics ? "このセクションに関連するMemoryが無くても、Memory Analytics Resultsがある場合は、その結果を使って回答する。" : "関連するMemoryがここに無ければ、Memoryを使わず現在の相談内容だけで回答する。"}${voice.analystMemoryNote}`
       : retrievedMemoriesSection;
 
   const webSearchInstruction = searchNeeded
@@ -1099,7 +1102,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
   const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
