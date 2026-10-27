@@ -18,6 +18,8 @@ import {
   failureChanges,
   gateS1Items,
   planGeneration,
+  addExposure,
+  mergeShown,
   rejectedForPrompt,
   SYNTHESIS_S1_LIMITS,
   SYNTHESIS_SCHEMA_VERSION,
@@ -83,8 +85,11 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
 }
 
 /** an in-memory store with the same all-or-nothing commit semantics (tests and the Preview comparison; never the device's data) */
-export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): SynthesisStorePort & { snapshot(): SynthesisState } {
-  let state: SynthesisState = { hypotheses: [], reactions: [], themeStates: [], meta: null, ...initial };
+export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): SynthesisStorePort & {
+  snapshot(): SynthesisState;
+  markShown(hypothesisIds: string[], conversationId: string, at: string): Promise<void>;
+} {
+  let state: SynthesisState = { hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null, ...initial };
   const copy = (s: SynthesisState): SynthesisState => JSON.parse(JSON.stringify(s)) as SynthesisState;
   return {
     async load() {
@@ -94,15 +99,30 @@ export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): S
       const next = copy(state);
       const del = new Set(changes.deleteHypothesisIds ?? []);
       const hyps = new Map(next.hypotheses.filter((h) => !del.has(h.id)).map((h) => [h.id, h] as const));
-      for (const h of changes.putHypotheses ?? []) hyps.set(h.id, h);
+      for (const h of changes.putHypotheses ?? []) {
+        const stored = hyps.get(h.id);
+        hyps.set(h.id, stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn) } : h);
+      }
       const themes = new Map(next.themeStates.map((t) => [t.themeId, t] as const));
       for (const t of changes.putThemeStates ?? []) themes.set(t.themeId, t);
       state = {
         hypotheses: [...hyps.values()],
         reactions: [...next.reactions, ...(changes.addReactions ?? []).filter((r) => !next.reactions.some((x) => x.id === r.id))],
+        exposures: next.exposures,
         themeStates: [...themes.values()],
         meta: changes.meta ?? next.meta,
       };
+    },
+    async markShown(hypothesisIds: string[], conversationId: string, at: string) {
+      const next = copy(state);
+      for (const h of next.hypotheses) {
+        if (!hypothesisIds.includes(h.id)) continue;
+        h.shownIn = mergeShown(h.shownIn, [{ conversationId, at }]);
+        const i = next.exposures.findIndex((e) => e.conversationId === conversationId);
+        const updated = addExposure(i >= 0 ? next.exposures[i] : undefined, conversationId, h.themeId, at);
+        if (i >= 0) next.exposures[i] = updated; else next.exposures.push(updated);
+      }
+      state = next;
     },
     async claimRun(at, minHours) {
       const last = state.meta?.lastAttemptAt ? Date.parse(state.meta.lastAttemptAt) : NaN;

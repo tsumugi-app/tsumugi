@@ -160,7 +160,7 @@ export default function SynthesisEval() {
           { role: "user", content: answer, timestamp: new Date(shownAt + 2000).toISOString() },
         ],
       } as unknown as Conversation;
-      await st.commit({ putHypotheses: state0.hypotheses.filter((h) => shownIds.includes(h.id)).map((h) => ({ ...h, shownIn: [{ conversationId: conv.id, at: new Date(shownAt).toISOString() }] })) });
+      await st.markShown(shownIds, conv.id, new Date(shownAt).toISOString());
       // an agreement turned into a Memory by Capture (no substantive words) must not become evidence
       const extra = name === "相づち" ? [{ ...pool[0], id: "eval-agree", conversationId: conv.id, keywords: ["姉"], summary: "そうかもしれないと話した。", content: "そうかも", evidenceQuotes: ["そうかも"], statedAt: new Date(shownAt).toISOString(), date: new Date(shownAt).toISOString(), createdAt: new Date(shownAt).toISOString(), updatedAt: new Date(shownAt).toISOString() } as MemoryObject] : [];
       const later = shownAt + 25 * 3_600_000;

@@ -4,6 +4,8 @@
  * Three kinds of data, kept apart all the way:
  *   - StoredHypothesis  : Tsumugi's readings (AI-generated, validated by code). A regenerable CACHE: it may be cleared and built again.
  *   - UserReaction      : the user's clear rejection / correction of a hypothesis. USER DATA: never regenerated, never cleared together with the cache.
+ *   - HypothesisExposure: the conversations in which a hypothesis was used. Provenance: kept apart from the cache, so clearing or regenerating the
+ *                         hypotheses never makes an agreement captured in such a conversation look like independent evidence.
  *   - ThemeGenerationState / SynthesisRunMeta : bookkeeping for when a theme needs to be generated again. Regenerable.
  * None of it is a Memory: it lives in its own IndexedDB database (synthesisStore.ts), never in the Memory store, the Vault, the Outbox or sync.
  *
@@ -125,9 +127,18 @@ export interface SynthesisRunMeta {
   lastResult?: "ok" | "failed" | "nothing-to-do";
 }
 
+/** a conversation in which a hypothesis was used (kept when the hypothesis cache is cleared or regenerated) */
+export interface HypothesisExposure {
+  schemaVersion: typeof SYNTHESIS_SCHEMA_VERSION;
+  conversationId: string;
+  themeIds: string[];
+  firstAt: string;
+}
+
 export interface SynthesisState {
   hypotheses: StoredHypothesis[];
   reactions: UserReaction[];
+  exposures: HypothesisExposure[];
   themeStates: ThemeGenerationState[];
   meta: SynthesisRunMeta | null;
 }
@@ -140,6 +151,30 @@ export interface SynthesisChanges {
   addReactions?: UserReaction[];
   putThemeStates?: ThemeGenerationState[];
   meta?: SynthesisRunMeta;
+}
+
+/** uses recorded while a run was waiting for the AI must survive the run's commit: the stored and the committed use lists are merged, never replaced */
+export function mergeShown(stored: StoredHypothesis["shownIn"], incoming: StoredHypothesis["shownIn"]): StoredHypothesis["shownIn"] {
+  const seen = new Set<string>();
+  return [...stored, ...incoming]
+    .filter((s) => {
+      const key = `${s.conversationId}@${s.at}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.at.localeCompare(b.at))
+    .slice(-20);
+}
+
+/** the exposure record after a hypothesis of `themeId` was used in `conversationId` */
+export function addExposure(existing: HypothesisExposure | undefined, conversationId: string, themeId: string, at: string): HypothesisExposure {
+  return {
+    schemaVersion: SYNTHESIS_SCHEMA_VERSION,
+    conversationId,
+    themeIds: [...new Set([...(existing?.themeIds ?? []), themeId])],
+    firstAt: existing?.firstAt ?? at,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -293,8 +328,8 @@ export const AGREEMENT_ONLY = /^(うん|うーん|ええ|はい|そう|そうか
  * A Memory made from a conversation in which a hypothesis was shown, that keeps no substantive words of the user, is not evidence:
  * otherwise "そうかも" would come back as "the user said so" and harden Tsumugi's own reading.
  */
-export function eligibleEvidenceMemories(memories: MemoryObject[], hypotheses: StoredHypothesis[]): MemoryObject[] {
-  const shownConversations = new Set(hypotheses.flatMap((h) => h.shownIn.map((s) => s.conversationId)));
+export function eligibleEvidenceMemories(memories: MemoryObject[], state: Pick<SynthesisState, "hypotheses" | "exposures">): MemoryObject[] {
+  const shownConversations = new Set([...state.exposures.map((e) => e.conversationId), ...state.hypotheses.flatMap((h) => h.shownIn.map((s) => s.conversationId))]);
   return memories.filter((m) => {
     if (!isSynthesisSource(m)) return false;
     if (!shownConversations.has(m.conversationId as string)) return true;
@@ -332,7 +367,7 @@ function pendingShown(h: StoredHypothesis): { conversationId: string; at: string
 export function planGeneration(state: SynthesisState, memories: MemoryObject[], now: number): SynthesisPlan {
   const last = state.meta?.lastAttemptAt ? Date.parse(state.meta.lastAttemptAt) : NaN;
   const cooldown = Number.isFinite(last) && now - last < SYNTHESIS_S1_LIMITS.minHoursBetweenRuns * 3_600_000;
-  const eligible = eligibleEvidenceMemories(memories, state.hypotheses);
+  const eligible = eligibleEvidenceMemories(memories, state);
   const candidates = buildSynthesisClusters(eligible, { maxClusters: 50 });
   const byId = new Map(memories.map((m) => [m.id, m] as const));
   const themeStates = new Map(state.themeStates.map((t) => [t.themeId, t] as const));

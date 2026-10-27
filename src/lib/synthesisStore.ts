@@ -6,6 +6,7 @@
  * Stores (schema version 1, recorded in every record and in the "meta" store, for a later export / device move):
  *   hypotheses  - Tsumugi's readings: a regenerable cache
  *   reactions   - the user's clear rejections / corrections: user data, removed only by "すべて初期化" or the full device wipe
+ *   exposures   - conversations in which a hypothesis was used (provenance; kept like the reactions, so that an agreement captured there is never evidence)
  *   themeStates - per theme generation bookkeeping (regenerable)
  *   meta        - run bookkeeping + the schema record (regenerable)
  * While the full device wipe is pending, nothing opens this database (the wipe deletes it; see dataWipe.ts).
@@ -13,10 +14,13 @@
 import { openDB, type IDBPDatabase } from "idb";
 import { isWipePending, WipeInProgressError } from "./wipeState";
 import {
+  addExposure,
+  mergeShown,
   SYNTHESIS_DB_NAME,
   SYNTHESIS_SCHEMA_VERSION,
   type StoredHypothesis,
   type SynthesisChanges,
+  type HypothesisExposure,
   type SynthesisRunMeta,
   type SynthesisState,
   type ThemeGenerationState,
@@ -24,8 +28,8 @@ import {
 } from "./synthesisModel";
 import type { SynthesisStorePort } from "./synthesisRunner";
 
-const DB_VERSION = 1;
-const STORES = ["hypotheses", "reactions", "themeStates", "meta"] as const;
+const DB_VERSION = 2;
+const STORES = ["hypotheses", "reactions", "exposures", "themeStates", "meta"] as const;
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 
@@ -36,6 +40,7 @@ function getSynthesisDB(): Promise<IDBPDatabase> {
       upgrade(db) {
         if (!db.objectStoreNames.contains("hypotheses")) db.createObjectStore("hypotheses", { keyPath: "id" });
         if (!db.objectStoreNames.contains("reactions")) db.createObjectStore("reactions", { keyPath: "id" });
+        if (!db.objectStoreNames.contains("exposures")) db.createObjectStore("exposures", { keyPath: "conversationId" });
         if (!db.objectStoreNames.contains("themeStates")) db.createObjectStore("themeStates", { keyPath: "themeId" });
         if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "key" });
       },
@@ -64,14 +69,15 @@ export const synthesisStore: SynthesisStorePort & {
   async load(): Promise<SynthesisState> {
     const db = await getSynthesisDB();
     const tx = db.transaction([...STORES], "readonly");
-    const [hypotheses, reactions, themeStates, meta] = await Promise.all([
+    const [hypotheses, reactions, exposures, themeStates, meta] = await Promise.all([
       tx.objectStore("hypotheses").getAll() as Promise<StoredHypothesis[]>,
       tx.objectStore("reactions").getAll() as Promise<UserReaction[]>,
+      tx.objectStore("exposures").getAll() as Promise<HypothesisExposure[]>,
       tx.objectStore("themeStates").getAll() as Promise<ThemeGenerationState[]>,
       tx.objectStore("meta").get("run") as Promise<SynthesisRunMeta | undefined>,
     ]);
     await tx.done;
-    return { hypotheses, reactions, themeStates, meta: meta ?? null };
+    return { hypotheses, reactions, exposures, themeStates, meta: meta ?? null };
   },
 
   /** all changes of a run in ONE transaction: an interrupted run leaves the previous data as it was */
@@ -80,7 +86,11 @@ export const synthesisStore: SynthesisStorePort & {
     const tx = db.transaction([...STORES], "readwrite");
     const hyp = tx.objectStore("hypotheses");
     for (const id of changes.deleteHypothesisIds ?? []) void hyp.delete(id);
-    for (const h of changes.putHypotheses ?? []) void hyp.put(h);
+    // merge, never replace, the uses: a chat turn may have recorded a use while this run was waiting for the AI
+    for (const h of changes.putHypotheses ?? []) {
+      const stored = (await hyp.get(h.id)) as StoredHypothesis | undefined;
+      void hyp.put(stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn) } : h);
+    }
     const reactions = tx.objectStore("reactions");
     // reactions are only added (add() never overwrites an existing one)
     for (const r of changes.addReactions ?? []) if ((await reactions.getKey(r.id)) === undefined) void reactions.add(r);
@@ -111,16 +121,19 @@ export const synthesisStore: SynthesisStorePort & {
   async markShown(hypothesisIds: string[], conversationId: string, at: string): Promise<void> {
     if (hypothesisIds.length === 0) return;
     const db = await getSynthesisDB();
-    const tx = db.transaction("hypotheses", "readwrite");
+    const tx = db.transaction(["hypotheses", "exposures"], "readwrite");
+    const hyp = tx.objectStore("hypotheses");
+    const exp = tx.objectStore("exposures");
     for (const id of hypothesisIds) {
-      const h = (await tx.store.get(id)) as StoredHypothesis | undefined;
+      const h = (await hyp.get(id)) as StoredHypothesis | undefined;
       if (!h) continue;
-      void tx.store.put({ ...h, shownIn: [...h.shownIn, { conversationId, at }].slice(-20) });
+      void hyp.put({ ...h, shownIn: mergeShown(h.shownIn, [{ conversationId, at }]) });
+      void exp.put(addExposure((await exp.get(conversationId)) as HypothesisExposure | undefined, conversationId, h.themeId, at));
     }
     await tx.done;
   },
 
-  /** clears Tsumugi's hypotheses and the bookkeeping; the user's rejections / corrections stay */
+  /** clears Tsumugi's hypotheses and the bookkeeping; the user's rejections / corrections and the record of where hypotheses were used stay */
   async clearCache(): Promise<void> {
     const db = await getSynthesisDB();
     const tx = db.transaction(["hypotheses", "themeStates", "meta"], "readwrite");

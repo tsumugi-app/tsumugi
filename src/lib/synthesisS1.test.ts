@@ -33,7 +33,7 @@ import type { Conversation, MemoryObject } from "./types";
 
 const NOW = Date.parse("2026-10-27T12:00:00.000Z");
 const H = 3_600_000;
-const empty = (): SynthesisState => ({ hypotheses: [], reactions: [], themeStates: [], meta: null });
+const empty = (): SynthesisState => ({ hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null });
 
 /** a fake /api/synthesize: for the "仕事" cluster, one change item over its first and last evidence (+ whatever extra the test asks for) */
 function fakeApi(opts: { extraItems?: (c: SynthesisCluster) => unknown[]; reactions?: unknown[]; fail?: boolean } = {}) {
@@ -231,6 +231,23 @@ test("only examined uses are marked as judged: beyond the per-run limit they sta
   assert.ok(planGeneration({ ...store.snapshot(), meta: null }, memories, NOW + 60 * H).themes.some((t) => t.themeId === target.themeId && t.reasons.includes("reaction-check")));
 });
 
+test("a use recorded while a run waits for the AI survives the run's commit, and the exposure record survives clearing the cache", async () => {
+  const { memories, store } = await firstRun();
+  const target = store.snapshot().hypotheses[0];
+  const shownAt = NOW + 1 * H;
+  await store.markShown([target.id], "c-x", new Date(shownAt).toISOString());
+  const api = fakeApi();
+  const lateUse = new Date(NOW + 30 * H + 5000).toISOString();
+  const slowApi: SynthesisRunDeps["callApi"] = async (payload) => {
+    await store.markShown([target.id], "c-late", lateUse); // the user starts another conversation meanwhile
+    return api.callApi(payload);
+  };
+  await runSynthesisOnce(deps(store, memories, slowApi, NOW + 30 * H, [shownConversation("c-x", shownAt, "うーん、どうだろう")]));
+  const after = store.snapshot();
+  assert.ok(after.hypotheses.find((h) => h.id === target.id)?.shownIn.some((s) => s.conversationId === "c-late"), "the later use is kept");
+  assert.deepEqual(after.exposures.map((e) => e.conversationId).sort(), ["c-late", "c-x"]);
+});
+
 test("two tabs ending a session at the same time: only one generation call", async () => {
   const memories = fictionalSynthesisMemories();
   const store = createMemorySynthesisStore();
@@ -247,9 +264,12 @@ test("an agreement captured from a conversation where a hypothesis was used is n
   const agree = mk("m-agree", "そうかも");
   const said = mk("m-said", "デザインは仕事じゃなくて趣味として続けたい");
   const hyp = { shownIn: [{ conversationId: "c-shown", at }] } as unknown as StoredHypothesis;
-  const eligible = eligibleEvidenceMemories([...memories, agree, said], [hyp]).map((m) => m.id);
+  const eligible = eligibleEvidenceMemories([...memories, agree, said], { hypotheses: [hyp], exposures: [] }).map((m) => m.id);
   assert.ok(!eligible.includes("m-agree"));
   assert.ok(eligible.includes("m-said"));
+  // the hypothesis cache cleared or regenerated: the exposure record still keeps the agreement out
+  const afterClear = eligibleEvidenceMemories([...memories, agree, said], { hypotheses: [], exposures: [{ schemaVersion: 1, conversationId: "c-shown", themeIds: ["kw:仕事"], firstAt: at }] }).map((m) => m.id);
+  assert.ok(!afterClear.includes("m-agree"));
 });
 
 test("read time: a deleted or edited evidence Memory, a changed theme state, old evidence or a resemblance to a reaction makes a hypothesis unusable", async () => {

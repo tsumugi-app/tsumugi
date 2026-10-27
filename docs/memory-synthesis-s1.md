@@ -8,11 +8,12 @@ With `?memorySynthesis=1` (per browser, kept in localStorage; `?memorySynthesis=
   are attached too, labelled as Tsumugi's readings. No AI call is added to the chat.
 - OFF: nothing is generated or read; the chat request is exactly what it was before.
 
-## Data (device only, IndexedDB `tsumugi-synthesis`, schema version 1)
+## Data (device only, IndexedDB `tsumugi-synthesis`, record schema version 1, database version 2)
 | store | content | kind |
 |---|---|---|
 | hypotheses | Tsumugi's readings, with evidence Memory ids + versions, the theme state they were made in, where they were used | regenerable cache |
 | reactions | the user's clear rejections / corrections (verbatim quote) | user data |
+| exposures | conversations in which a hypothesis was used | provenance (kept with the reactions) |
 | themeStates, meta | generation bookkeeping | regenerable |
 Not a Memory: never in the `tsumugi` database, the Vault, the Outbox or sync. Theme ids are `kw:<keyword>` (S1); `person:<groupingKey>` is reserved for S2.
 
@@ -26,6 +27,6 @@ its newest evidence is older than 180 days, or it resembles something the user r
 - A failed or interrupted run changes only the bookkeeping; hypotheses and reactions stay as they were (one transaction per run).
 
 ## Deleting
-- `/synthesis-data`: "仮説を消す" (cache only; reactions stay) / "すべて初期化" (reactions too). Both need a confirmation.
+- `/synthesis-data`: "仮説を消す" (cache only; reactions and exposures stay) / "すべて初期化" (reactions too). Both need a confirmation.
 - The full device wipe deletes `tsumugi-synthesis` (also listed by name for browsers without `indexedDB.databases()`).
 - Deleting a Memory removes the hypotheses that used it (at read time).
