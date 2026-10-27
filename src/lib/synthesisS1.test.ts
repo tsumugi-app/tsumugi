@@ -12,6 +12,7 @@ import Module from "node:module";
 import { fictionalSynthesisMemories } from "./synthesisFictionalData";
 import {
   AGREEMENT_ONLY,
+  attachCorrections,
   eligibleEvidenceMemories,
   mergeShown,
   gateS1Items,
@@ -29,7 +30,8 @@ import {
 import { createMemorySynthesisStore, runSynthesisOnce, type SynthesisRunDeps } from "./synthesisRunner";
 import { memorySynthesisEnabled, MEMORY_SYNTHESIS_FLAG_KEY } from "./memorySynthesisFlag";
 import { runPendingWipe } from "./dataWipe";
-import type { SynthesisCluster } from "./memorySynthesis";
+import { buildSynthesisSection, sanitizeSynthesisContext, type SynthesisCluster, type SynthesisThemeContext } from "./memorySynthesis";
+import { SYNTHESIS_S1_INSTRUCTIONS } from "./memorySynthesisPrompt";
 import type { Conversation, MemoryObject } from "./types";
 
 const NOW = Date.parse("2026-10-27T12:00:00.000Z");
@@ -285,6 +287,35 @@ test("the use history never drops a use that has not been judged yet", () => {
   const merged = mergeShown(uses.slice(0, 25), uses.slice(25), uses[19].at);
   assert.ok(merged.some((s) => s.at === uses[20].at) && merged.some((s) => s.at === uses[29].at), "every unjudged use is kept");
   assert.equal(merged.filter((s) => s.at <= uses[19].at).length, 10, "judged ones are trimmed");
+});
+
+test("the user's correction goes to the chat with its own theme only, as the user's words with date and the reading it answered; nothing changes without one", () => {
+  const ctx = (theme: string): SynthesisThemeContext => ({ theme, state: { status: "不明" }, timeline: [{ memoryId: `m-${theme}`, statedAt: "2026-10-18", statedAtIsRecordDate: false, summary: `${theme}の話をした。`, retrospective: false, latestSaid: true, latestEvent: true, stateBasis: false }], items: [] });
+  const reaction = { schemaVersion: 1 as const, origin: "user-reaction" as const, id: "r1", themeId: keywordThemeId("姉"), themeKind: "keyword" as const, themeLabel: "姉", kind: "corrected" as const, hypothesisStatement: "姉に対して複雑な感情を抱いている。", hypothesisEvidenceIds: ["m-姉"], userQuote: "複雑ってほどじゃないよ。姉には普通に感謝してる", conversationId: "c-1", saidAt: "2026-10-27T10:00:00.000Z", recordedAt: "2026-10-28T00:00:00.000Z" };
+  const attached = attachCorrections([ctx("姉"), ctx("仕事")], [reaction]);
+  assert.equal(attached[0].corrections?.length, 1);
+  assert.equal(attached[1].corrections, undefined, "never applied to another theme");
+  const section = buildSynthesisSection(attached);
+  assert.ok(section.includes("2026-10-27に、Tsumugiの「姉に対して複雑な感情を抱いている。」という見方に対して、ユーザー自身が「複雑ってほどじゃないよ。姉には普通に感謝してる」と訂正した"));
+  assert.ok(section.includes("Tsumugiの読みではない") && section.includes("過去の出来事を消したり書き換えたりしない") && section.includes("後で変わることもある"));
+  // the route accepts it as sent (and nothing else)
+  const roundTrip = sanitizeSynthesisContext(JSON.parse(JSON.stringify(attached)));
+  assert.equal(roundTrip[0].corrections?.[0].userQuote, reaction.userQuote);
+  assert.equal(roundTrip[1].corrections, undefined);
+  // without a correction (Synthesis OFF, Timeline only, or no reaction): byte-for-byte what it was before
+  const plain = [ctx("姉"), ctx("仕事")];
+  assert.equal(buildSynthesisSection(attachCorrections(plain, [])), buildSynthesisSection(plain));
+  assert.ok(!buildSynthesisSection(plain).includes("ユーザー自身の訂正"));
+  // malformed corrections are dropped by the route
+  const bad = sanitizeSynthesisContext([{ ...ctx("姉"), corrections: [{ kind: "maybe", userQuote: "x", saidAt: "2026-10-27" }, { kind: "corrected", userQuote: "", saidAt: "2026-10-27" }] }]);
+  assert.equal(bad[0].corrections, undefined);
+});
+
+test("generation instructions: a correction updates the present view and never rewrites the past", () => {
+  assert.ok(SYNTHESIS_S1_INSTRUCTIONS.includes("過去の出来事を消したり書き換えたりするものではない"));
+  assert.ok(SYNTHESIS_S1_INSTRUCTIONS.includes("「今は気にしていない」から「以前から一度も気にしていなかった」と推論しない"));
+  assert.ok(SYNTHESIS_S1_INSTRUCTIONS.includes("「一貫して感謝してきた」"));
+  assert.ok(SYNTHESIS_S1_INSTRUCTIONS.includes("変化として書くか、断定を避ける"));
 });
 
 test("two tabs ending a session at the same time: only one generation call", async () => {

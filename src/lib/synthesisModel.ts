@@ -25,7 +25,9 @@ import {
   HEDGE,
   isSynthesisSource,
   type SynthesisCluster,
+  type SynthesisCorrection,
   type SynthesisItem,
+  type SynthesisThemeContext,
   type SynthesisKind,
   type SynthesisSupport,
 } from "./memorySynthesis";
@@ -661,4 +663,20 @@ export function rejectedForPrompt(state: SynthesisState, plan: SynthesisPlan): {
     .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))
     .slice(0, SYNTHESIS_S1_LIMITS.maxRejectedSent)
     .map((r) => ({ theme: r.themeLabel, statement: r.hypothesisStatement, userQuote: r.userQuote }));
+}
+
+/**
+ * The user's own corrections, attached to the chat context of the SAME theme only (matched by theme id; never to another theme or person).
+ * Newest first, at most 2. Only stored reactions are used: they exist only for clear, verbatim denials (validateReactions).
+ */
+export function attachCorrections(contexts: SynthesisThemeContext[], reactions: UserReaction[]): SynthesisThemeContext[] {
+  return contexts.map((c) => {
+    const id = keywordThemeId(c.theme);
+    const corrections: SynthesisCorrection[] = reactions
+      .filter((r) => r.themeId === id)
+      .sort((a, b) => b.saidAt.localeCompare(a.saidAt))
+      .slice(0, 2)
+      .map((r) => ({ kind: r.kind, saidAt: r.saidAt.slice(0, 10), userQuote: r.userQuote, aboutReading: r.hypothesisStatement }));
+    return corrections.length > 0 ? { ...c, corrections } : c;
+  });
 }

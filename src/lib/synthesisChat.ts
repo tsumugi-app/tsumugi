@@ -11,7 +11,7 @@ import { withVaultWorldRead } from "./vaultWorldLock";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
 import { memorySynthesisEnabled } from "./memorySynthesisFlag";
 import { safeSelectTimelineForTurn, selectSynthesisForTurn, type SynthesisThemeContext } from "./memorySynthesis";
-import { usableItemsForChat } from "./synthesisModel";
+import { attachCorrections, usableItemsForChat } from "./synthesisModel";
 import { runSynthesisOnce } from "./synthesisRunner";
 import { synthesisStore } from "./synthesisStore";
 import type { MemoryObject } from "./types";
@@ -23,7 +23,8 @@ export async function synthesisContextForTurn(
   try {
     const state = await synthesisStore.load();
     const { items, hypothesisIdByItem } = usableItemsForChat(state, memories, Date.now());
-    const contexts = selectSynthesisForTurn(items, turn, memories);
+    // the user's own corrections go with the same theme only (only themes the timeline selected; nothing is added for any other theme)
+    const contexts = attachCorrections(selectSynthesisForTurn(items, turn, memories), state.reactions);
     const shownIds = contexts.flatMap((c) => c.items.map((i) => hypothesisIdByItem.get(i)).filter((id): id is string => Boolean(id)));
     return { contexts, shownIds };
   } catch (error) {

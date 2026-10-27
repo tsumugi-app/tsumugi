@@ -4,7 +4,7 @@ import { useState } from "react";
 import { computeKeywordFrequency, DEFAULT_LIMIT, scoreMemory, selectConversationDirectMatches } from "@/lib/retrieval";
 import { FICTIONAL_USERS } from "@/lib/synthesisFictionalData";
 import { safeSelectTimelineForTurn, selectSynthesisForTurn, type SynthesisThemeContext } from "@/lib/memorySynthesis";
-import { textSimilarity, usableItemsForChat, unusableReason, themeSnapshot, type SynthesisState } from "@/lib/synthesisModel";
+import { attachCorrections, textSimilarity, usableItemsForChat, unusableReason, themeSnapshot, type SynthesisState } from "@/lib/synthesisModel";
 import { createMemorySynthesisStore, runSynthesisOnce, type SynthesisRunDeps } from "@/lib/synthesisRunner";
 import { loadApiKey } from "@/lib/db";
 import { GEMINI_API_KEY_HEADER } from "@/lib/apiKeyHeader";
@@ -52,7 +52,7 @@ function contextsFor(cond: Cond, pool: MemoryObject[], s: Scenario, retrieved: R
   if (cond === "off") return { contexts: [], shownIds: [] };
   if (cond === "timeline" || !state) return { contexts: safeSelectTimelineForTurn(pool, turn), shownIds: [] };
   const { items, hypothesisIdByItem } = usableItemsForChat(state, pool, Date.now());
-  const contexts = selectSynthesisForTurn(items, turn, pool);
+  const contexts = attachCorrections(selectSynthesisForTurn(items, turn, pool), state.reactions);
   return { contexts, shownIds: contexts.flatMap((c) => c.items.map((i) => hypothesisIdByItem.get(i) ?? "")).filter(Boolean) };
 }
 
@@ -68,7 +68,7 @@ async function chat(s: Scenario, retrieved: RetrievedMemory[], contexts: Synthes
 
 function describeContexts(contexts: SynthesisThemeContext[]): string {
   if (contexts.length === 0) return "（経緯なし）";
-  return contexts.map((c) => `テーマ「${c.theme}」状態:${c.state.status}${c.items.length ? ` 仮説:${c.items.map((i) => `[${i.kind}/${i.support}] ${i.statement}`).join(" ／ ")}` : " 仮説なし"}`).join("\n");
+  return contexts.map((c) => `テーマ「${c.theme}」状態:${c.state.status}${c.items.length ? ` 仮説:${c.items.map((i) => `[${i.kind}/${i.support}] ${i.statement}`).join(" ／ ")}` : " 仮説なし"}${c.corrections?.length ? ` 訂正:${c.corrections.map((x) => `${x.saidAt}「${x.userQuote}」`).join(" ／ ")}` : " 訂正なし"}`).join("\n");
 }
 
 const store = (s: SynthesisState) => createMemorySynthesisStore(JSON.parse(JSON.stringify(s)) as SynthesisState);
@@ -167,11 +167,19 @@ export default function SynthesisEval() {
       const out = await runSynthesisOnce(deps(st, [...pool, ...extra], later, [conv], add));
       const after = st.snapshot();
       add(`## 訂正の流れ（${name}）ユーザー：「${answer}」\n使った仮説: ${state0.hypotheses.filter((h) => shownIds.includes(h.id)).map((h) => h.statement).join(" ／ ")}\nTsumugiの返答: ${reply.text}\n再生成: ${JSON.stringify(out)}\n記録された反応: ${after.reactions.map((r) => `[${r.kind}] 「${r.userQuote}」→ ${r.hypothesisStatement}`).join(" ／ ") || "なし"}\n仮説の状態: ${after.hypotheses.map((h) => `${h.status}:${h.statement}`).join(" ／ ")}\n「eval-agree」が根拠に使われたか: ${after.hypotheses.some((h) => h.evidence.some((e) => e.memoryId === "eval-agree")) ? "使われた（NG）" : "使われていない"}`);
+      const OVER = /一貫|ずっと|最初から|一度も|以前から|常に/;
+      add(`再生成した仮説の過剰な一般化: ${after.hypotheses.filter((h) => h.status === "active" && h.themeLabel === "姉" && OVER.test(h.statement)).map((h) => h.statement).join(" ／ ") || "なし"}`);
+      const other = SCENARIOS.find((x) => x.id === "b-work")!;
+      const otherRetrieved = retrieve(pool, other);
+      const otherCtx = contextsFor("synthesis", [...pool, ...extra], other, otherRetrieved, after);
+      const leaked = otherCtx.contexts.some((c) => (c.corrections ?? []).length > 0);
+      const otherReply = await chat(other, otherRetrieved, otherCtx.contexts);
+      add(`#### 別テーマ（${other.label}）への混入: ${leaked ? "あり（NG）" : "なし"} 渡した内容: ${describeContexts(otherCtx.contexts)}\n${otherReply.text}`);
       for (let k = 1; k <= RUNS; k++) {
         const next = contextsFor("synthesis", [...pool, ...extra], s, retrieved, after);
         const reappeared = after.reactions.some((r) => next.contexts.some((c) => c.items.some((i) => textSimilarity(i.statement, r.hypothesisStatement) >= 0.35)));
         const r = await chat(s, retrieved, next.contexts);
-        add(`#### 訂正後の会話 ${k}（${r.ms}ms）渡した仮説: ${next.contexts.flatMap((c) => c.items.map((i) => i.statement)).join(" ／ ") || "なし"}／否定した見方の再提示: ${reappeared ? "あり（NG）" : "なし"}\n${r.text}`);
+        add(`#### 訂正後の会話 ${k}（${r.ms}ms）渡した内容: ${describeContexts(next.contexts)}／否定した見方の再提示: ${reappeared ? "あり（NG）" : "なし"}\n${r.text}`);
       }
     }
   }

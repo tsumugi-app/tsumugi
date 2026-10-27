@@ -110,11 +110,25 @@ export interface ThemeState {
 }
 
 /** what one chat turn receives for one theme */
+/** Memory Synthesis S1: what the user clearly said when a reading of Tsumugi's was used on this theme (the user's own words, not a reading) */
+export interface SynthesisCorrection {
+  kind: "rejected" | "corrected";
+  /** the date the user said it (YYYY-MM-DD) */
+  saidAt: string;
+  /** the user's words, verbatim */
+  userQuote: string;
+  /** the reading of Tsumugi's the user answered to */
+  aboutReading: string;
+}
+
+/** what one chat turn receives for one theme */
 export interface SynthesisThemeContext {
   theme: string;
   state: ThemeState;
   timeline: SynthesisTimelinePoint[];
   items: SynthesisItem[];
+  /** S1 only (absent otherwise): the user's corrections on this very theme, newest first */
+  corrections?: SynthesisCorrection[];
 }
 
 export const SYNTHESIS_LIMITS = {
@@ -538,7 +552,22 @@ export function sanitizeSynthesisContext(raw: unknown): SynthesisThemeContext[] 
       });
       if (items.length >= SYNTHESIS_LIMITS.maxItemsPerTheme) break;
     }
-    if (timeline.length > 0 || items.length > 0) out.push({ theme: ctx.theme.slice(0, 40), state, timeline, items });
+    const corrections: SynthesisCorrection[] = [];
+    for (const x of Array.isArray((r as { corrections?: unknown }).corrections) ? (r as { corrections: unknown[] }).corrections : []) {
+      if (!x || typeof x !== "object") continue;
+      const c = x as Record<string, unknown>;
+      if ((c.kind !== "rejected" && c.kind !== "corrected") || typeof c.userQuote !== "string" || !c.userQuote.trim() || typeof c.saidAt !== "string" || !Number.isFinite(Date.parse(c.saidAt))) continue;
+      corrections.push({
+        kind: c.kind,
+        saidAt: c.saidAt.slice(0, 10),
+        userQuote: c.userQuote.trim().slice(0, 300),
+        aboutReading: typeof c.aboutReading === "string" ? c.aboutReading.trim().slice(0, SYNTHESIS_LIMITS.maxStatementLength) : "",
+      });
+      if (corrections.length >= 2) break;
+    }
+    if (timeline.length > 0 || items.length > 0 || corrections.length > 0) {
+      out.push({ theme: ctx.theme.slice(0, 40), state, timeline, items, ...(corrections.length > 0 ? { corrections } : {}) });
+    }
   }
   return out;
 }
@@ -569,7 +598,10 @@ export function buildSynthesisSection(contexts: SynthesisThemeContext[]): string
       const understanding = c.items
         .map((i) => `  - [${KIND_LABEL[i.kind]}・${SUPPORT_LABEL[i.support]}] ${i.statement}${i.situationNote ? `（状況の違い: ${i.situationNote}）` : ""}`)
         .join("\n");
-      return `テーマ「${c.theme}」\n${stateLine}\n 記録された経緯（日付はシステムが記録から確定したもの。要約はAIによる記録）:\n${facts}${understanding ? `\n Tsumugiの整理:\n${understanding}` : ""}`;
+      const corrections = (c.corrections ?? [])
+        .map((x) => `  - ${x.saidAt}に、${x.aboutReading ? `Tsumugiの「${x.aboutReading}」という見方に対して、` : ""}ユーザー自身が「${x.userQuote}」と${x.kind === "corrected" ? "訂正した" : "否定した"}`)
+        .join("\n");
+      return `テーマ「${c.theme}」\n${stateLine}\n 記録された経緯（日付はシステムが記録から確定したもの。要約はAIによる記録）:\n${facts}${corrections ? `\n ユーザー自身の訂正（その時点でユーザーがはっきり述べた考え。Tsumugiの読みではない）:\n${corrections}` : ""}${understanding ? `\n Tsumugiの整理:\n${understanding}` : ""}`;
     })
     .join("\n\n");
   return `
@@ -589,5 +621,12 @@ ${blocks}
 - 「Tsumugiの仮説」「複数の発言を並べると見えること」は事実として断定しない。確かめるように触れる。
 - 「揺れ」は矛盾の指摘ではない。状況が違えば望みが違うのは自然なこととして扱う。
 - 話した日付は出来事の日付ではない。
-- 記録に無い動機・目的・心理を付け足さない。性格や心理のラベル（「〜な人」「〜を求めている」「心を守る」等）を付けない。`;
+- 記録に無い動機・目的・心理を付け足さない。性格や心理のラベル（「〜な人」「〜を求めている」「心を守る」等）を付けない。${contexts.some((c) => (c.corrections ?? []).length > 0) ? CORRECTION_USAGE : ""}`;
 }
+
+/** added only when a theme carries a correction (otherwise the section is exactly what it was before) */
+const CORRECTION_USAGE = `
+- 「ユーザー自身の訂正」は、その日にユーザーがはっきり述べた考え。そのテーマについては、Tsumugiの整理や以前の見方より優先し、訂正・否定された見方を繰り返さない。
+- 訂正は今の考えを更新するもの。記録された過去の出来事を消したり書き換えたりしない（「今は気にしていない」を「前から気にしていなかった」にしない。「今は感謝している」を「ずっと感謝してきた」にしない）。過去と今が違うなら、変化として扱う。
+- 訂正はその時点の考えであり、後で変わることもある。今の会話でユーザーが違うことを言えば、今の発言を優先する。
+- 訂正は、そのテーマについてだけ使う。別の話題や別の人に当てはめない。`;
