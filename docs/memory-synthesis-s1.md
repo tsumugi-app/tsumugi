@@ -25,8 +25,11 @@ its newest evidence is older than 180 days, or it resembles something the user r
 - Rejected readings are sent to the model as "do not propose" and filtered again by code (route and client).
 - A Memory captured from a conversation where a hypothesis was used, without substantive words of the user, is not evidence.
 - A failed or interrupted run changes only the bookkeeping; hypotheses and reactions stay as they were (one transaction per run).
+- A use in a conversation that is still open and unanswered stays pending; a replaced hypothesis whose uses are not all checked is kept as
+  "retired" (never used in chat) until they are. Uses recorded while a run waits are merged into its commit, never overwritten.
 
 ## Deleting
-- `/synthesis-data`: "仮説を消す" (cache only; reactions and exposures stay) / "すべて初期化" (reactions too). Both need a confirmation.
+- `/synthesis-data`: "仮説を消す" (cache only; reactions and exposures stay) / "すべて初期化" (reactions too). Both need a confirmation and move the
+  database to a new reset epoch, so a run that was waiting for the AI cannot write its result afterwards (checked in the commit transaction, any tab).
 - The full device wipe deletes `tsumugi-synthesis` (also listed by name for browsers without `indexedDB.databases()`).
 - Deleting a Memory removes the hypotheses that used it (at read time).

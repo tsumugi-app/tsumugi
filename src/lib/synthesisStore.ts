@@ -8,7 +8,7 @@
  *   reactions   - the user's clear rejections / corrections: user data, removed only by "すべて初期化" or the full device wipe
  *   exposures   - conversations in which a hypothesis was used (provenance; kept like the reactions, so that an agreement captured there is never evidence)
  *   themeStates - per theme generation bookkeeping (regenerable)
- *   meta        - run bookkeeping + the schema record (regenerable)
+ *   meta        - run bookkeeping, the schema record and the reset epoch
  * While the full device wipe is pending, nothing opens this database (the wipe deletes it; see dataWipe.ts).
  */
 import { openDB, type IDBPDatabase } from "idb";
@@ -16,6 +16,7 @@ import { isWipePending, WipeInProgressError } from "./wipeState";
 import {
   addExposure,
   mergeShown,
+  removalOutcome,
   SYNTHESIS_DB_NAME,
   SYNTHESIS_SCHEMA_VERSION,
   type StoredHypothesis,
@@ -26,7 +27,7 @@ import {
   type ThemeGenerationState,
   type UserReaction,
 } from "./synthesisModel";
-import type { SynthesisStorePort } from "./synthesisRunner";
+import { SynthesisResetError, type SynthesisStorePort } from "./synthesisRunner";
 
 const DB_VERSION = 2;
 const STORES = ["hypotheses", "reactions", "exposures", "themeStates", "meta"] as const;
@@ -60,6 +61,18 @@ function getSynthesisDB(): Promise<IDBPDatabase> {
   return dbPromise;
 }
 
+/** clears the given stores and the run bookkeeping, and moves to a new epoch, in one transaction (an in-flight run then cannot write back) */
+async function resetStores(names: ("hypotheses" | "reactions" | "exposures" | "themeStates")[]): Promise<void> {
+  const db = await getSynthesisDB();
+  const tx = db.transaction([...names, "meta"], "readwrite");
+  for (const name of names) void tx.objectStore(name).clear();
+  const meta = tx.objectStore("meta");
+  const epoch = (await meta.get("epoch")) as { value?: string } | undefined;
+  void meta.delete("run");
+  void meta.put({ key: "epoch", value: String(Number(epoch?.value ?? "0") + 1) });
+  await tx.done;
+}
+
 export const synthesisStore: SynthesisStorePort & {
   markShown(hypothesisIds: string[], conversationId: string, at: string): Promise<void>;
   clearCache(): Promise<void>;
@@ -76,16 +89,31 @@ export const synthesisStore: SynthesisStorePort & {
       tx.objectStore("themeStates").getAll() as Promise<ThemeGenerationState[]>,
       tx.objectStore("meta").get("run") as Promise<SynthesisRunMeta | undefined>,
     ]);
+    const epoch = (await tx.objectStore("meta").get("epoch")) as { value?: string } | undefined;
     await tx.done;
-    return { hypotheses, reactions, exposures, themeStates, meta: meta ?? null };
+    return { hypotheses, reactions, exposures, themeStates, meta: meta ?? null, epoch: epoch?.value ?? "0" };
   },
 
   /** all changes of a run in ONE transaction: an interrupted run leaves the previous data as it was */
   async commit(changes: SynthesisChanges): Promise<void> {
     const db = await getSynthesisDB();
     const tx = db.transaction([...STORES], "readwrite");
+    // a reset ("仮説を消す" / "すべて初期化", any tab) since the run started: write nothing (checked inside the same transaction)
+    if (changes.expectedEpoch !== undefined) {
+      const epoch = (await tx.objectStore("meta").get("epoch")) as { value?: string } | undefined;
+      if ((epoch?.value ?? "0") !== changes.expectedEpoch) {
+        tx.abort();
+        await tx.done.catch(() => undefined);
+        throw new SynthesisResetError();
+      }
+    }
     const hyp = tx.objectStore("hypotheses");
-    for (const id of changes.deleteHypothesisIds ?? []) void hyp.delete(id);
+    for (const r of changes.removeHypotheses ?? []) {
+      const stored = (await hyp.get(r.id)) as StoredHypothesis | undefined;
+      if (!stored) continue;
+      const outcome = removalOutcome(stored, r.checkedThrough);
+      void (outcome === "delete" ? hyp.delete(r.id) : hyp.put(outcome));
+    }
     // merge, never replace, the uses: a chat turn may have recorded a use while this run was waiting for the AI
     for (const h of changes.putHypotheses ?? []) {
       const stored = (await hyp.get(h.id)) as StoredHypothesis | undefined;
@@ -135,22 +163,12 @@ export const synthesisStore: SynthesisStorePort & {
 
   /** clears Tsumugi's hypotheses and the bookkeeping; the user's rejections / corrections and the record of where hypotheses were used stay */
   async clearCache(): Promise<void> {
-    const db = await getSynthesisDB();
-    const tx = db.transaction(["hypotheses", "themeStates", "meta"], "readwrite");
-    await Promise.all([tx.objectStore("hypotheses").clear(), tx.objectStore("themeStates").clear(), tx.objectStore("meta").clear()]);
-    await tx.done;
+    await resetStores(["hypotheses", "themeStates"]);
   },
 
-  /** deletes the whole Synthesis database, the user's rejections / corrections included (explicit user action only) */
+  /** clears everything, the user's rejections / corrections included (explicit user action only). The full device wipe deletes the database itself. */
   async clearAll(): Promise<void> {
-    const open = dbPromise;
-    dbPromise = null;
-    if (open) (await open.catch(() => null))?.close();
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(SYNTHESIS_DB_NAME);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error ?? new Error("deleteDatabase failed"));
-    });
+    await resetStores(["hypotheses", "reactions", "exposures", "themeStates"]);
   },
 
   async counts() {

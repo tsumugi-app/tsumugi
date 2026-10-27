@@ -20,6 +20,7 @@ import {
   planGeneration,
   addExposure,
   mergeShown,
+  removalOutcome,
   rejectedForPrompt,
   SYNTHESIS_S1_LIMITS,
   SYNTHESIS_SCHEMA_VERSION,
@@ -51,6 +52,14 @@ export type SynthesisRunOutcome =
   | { status: "failed"; error: string }
   | { status: "done"; themes: string[]; added: number; reactions: number; kept: number };
 
+/** the Synthesis data was reset while this run was in flight: the run writes nothing */
+export class SynthesisResetError extends Error {
+  constructor() {
+    super("synthesis data was reset during the run");
+    this.name = "SynthesisResetError";
+  }
+}
+
 export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<SynthesisRunOutcome> {
   const state = await deps.store.load();
   const memories = await deps.readMemories();
@@ -66,7 +75,7 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
   try {
     response = await deps.callApi({ clusters: plan.clusters, rejected: rejectedForPrompt(state, plan), checks });
   } catch (error) {
-    await deps.store.commit(failureChanges(state, plan, now));
+    await deps.store.commit(failureChanges(state, plan, now)).catch(() => undefined);
     return { status: "failed", error: error instanceof Error ? error.message : String(error) };
   }
   // the route already gated the result; gate it again against what THIS device sent (a response is never trusted as is)
@@ -74,13 +83,18 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
   const reactions = validateReactions({ reactions: response.reactions }, checks);
   const generationId = deps.newId();
   const changes = applyGenerationResult(state, plan, { items, reactions }, memories, now, generationId, examinedThrough);
-  await deps.store.commit(changes);
+  try {
+    await deps.store.commit(changes);
+  } catch (error) {
+    if (error instanceof SynthesisResetError) return { status: "failed", error: error.message };
+    throw error;
+  }
   return {
     status: "done",
     themes: plan.themes.map((t) => t.themeLabel),
     added: (changes.putHypotheses ?? []).filter((h) => h.generationId === generationId).length,
     reactions: (changes.addReactions ?? []).length,
-    kept: state.hypotheses.length - (changes.deleteHypothesisIds ?? []).length,
+    kept: state.hypotheses.length - (changes.removeHypotheses ?? []).length,
   };
 }
 
@@ -88,17 +102,24 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
 export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): SynthesisStorePort & {
   snapshot(): SynthesisState;
   markShown(hypothesisIds: string[], conversationId: string, at: string): Promise<void>;
+  resetAll(): Promise<void>;
 } {
-  let state: SynthesisState = { hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null, ...initial };
+  let state: SynthesisState = { hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null, epoch: "0", ...initial };
   const copy = (s: SynthesisState): SynthesisState => JSON.parse(JSON.stringify(s)) as SynthesisState;
   return {
     async load() {
       return copy(state);
     },
     async commit(changes) {
+      if (changes.expectedEpoch !== undefined && changes.expectedEpoch !== state.epoch) throw new SynthesisResetError();
       const next = copy(state);
-      const del = new Set(changes.deleteHypothesisIds ?? []);
-      const hyps = new Map(next.hypotheses.filter((h) => !del.has(h.id)).map((h) => [h.id, h] as const));
+      const hyps = new Map(next.hypotheses.map((h) => [h.id, h] as const));
+      for (const r of changes.removeHypotheses ?? []) {
+        const stored = hyps.get(r.id);
+        if (!stored) continue;
+        const outcome = removalOutcome(stored, r.checkedThrough);
+        if (outcome === "delete") hyps.delete(r.id); else hyps.set(r.id, outcome);
+      }
       for (const h of changes.putHypotheses ?? []) {
         const stored = hyps.get(h.id);
         hyps.set(h.id, stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn) } : h);
@@ -109,6 +130,7 @@ export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): S
         hypotheses: [...hyps.values()],
         reactions: [...next.reactions, ...(changes.addReactions ?? []).filter((r) => !next.reactions.some((x) => x.id === r.id))],
         exposures: next.exposures,
+        epoch: next.epoch,
         themeStates: [...themes.values()],
         meta: changes.meta ?? next.meta,
       };
@@ -129,6 +151,10 @@ export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): S
       if (Number.isFinite(last) && Date.parse(at) - last < minHours * 3_600_000) return false;
       state = { ...copy(state), meta: { ...(state.meta ?? { schemaVersion: SYNTHESIS_SCHEMA_VERSION, key: "run" }), lastAttemptAt: at } };
       return true;
+    },
+    /** "すべて初期化" of the in-memory store: everything goes and the epoch changes (tests) */
+    async resetAll() {
+      state = { hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null, epoch: String(Number(state.epoch) + 1) };
     },
     snapshot() {
       return copy(state);

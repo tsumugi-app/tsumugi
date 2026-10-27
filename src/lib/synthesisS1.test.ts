@@ -33,7 +33,7 @@ import type { Conversation, MemoryObject } from "./types";
 
 const NOW = Date.parse("2026-10-27T12:00:00.000Z");
 const H = 3_600_000;
-const empty = (): SynthesisState => ({ hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null });
+const empty = (): SynthesisState => ({ hypotheses: [], reactions: [], exposures: [], themeStates: [], meta: null, epoch: "0" });
 
 /** a fake /api/synthesize: for the "仕事" cluster, one change item over its first and last evidence (+ whatever extra the test asks for) */
 function fakeApi(opts: { extraItems?: (c: SynthesisCluster) => unknown[]; reactions?: unknown[]; fail?: boolean } = {}) {
@@ -246,6 +246,36 @@ test("a use recorded while a run waits for the AI survives the run's commit, and
   const after = store.snapshot();
   assert.ok(after.hypotheses.find((h) => h.id === target.id)?.shownIn.some((s) => s.conversationId === "c-late"), "the later use is kept");
   assert.deepEqual(after.exposures.map((e) => e.conversationId).sort(), ["c-late", "c-x"]);
+});
+
+test("a use in a conversation that is still open and unanswered stays pending; a replaced hypothesis with unchecked uses is retired, not deleted", async () => {
+  const { memories, store } = await firstRun();
+  const target = store.snapshot().hypotheses[0];
+  const openConv = { ...shownConversation("c-open", NOW + 1 * H, "x"), turns: shownConversation("c-open", NOW + 1 * H, "x").turns.slice(0, 2) } as Conversation; // no answer yet, not ended
+  await store.markShown([target.id], "c-open", new Date(NOW + 1 * H).toISOString());
+  // two new Memories on the theme: the theme is regenerated in the same run
+  const at = "2026-10-27T12:30:00.000Z";
+  const more = [1, 2].map((i) => ({ ...memories[0], id: `m-r-${i}`, conversationId: `c-r-${i}`, statedAt: at, date: at, createdAt: at, updatedAt: at, keywords: ["仕事"], summary: `仕事の話をした${i}`, evidenceQuotes: [`仕事の話${i}`] }) as MemoryObject);
+  await runSynthesisOnce(deps(store, [...memories, ...more], fakeApi().callApi, NOW + 30 * H, [openConv]));
+  const kept = store.snapshot().hypotheses.find((h) => h.id === target.id);
+  assert.equal(kept?.status, "retired", "kept for the pending check");
+  assert.equal(kept?.reactionsCheckedThrough, undefined, "the open, unanswered use was not marked as judged");
+  const { hypothesisIdByItem } = usableItemsForChat(store.snapshot(), [...memories, ...more], NOW + 31 * H);
+  assert.ok(![...hypothesisIdByItem.values()].includes(target.id), "a retired hypothesis never reaches a chat turn");
+});
+
+test("a reset while a run waits for the AI: the run writes nothing afterwards", async () => {
+  const memories = fictionalSynthesisMemories();
+  const store = createMemorySynthesisStore();
+  const api = fakeApi();
+  const resettingApi: SynthesisRunDeps["callApi"] = async (payload) => {
+    await store.resetAll(); // the user confirms "すべて初期化" meanwhile
+    return api.callApi(payload);
+  };
+  const out = await runSynthesisOnce(deps(store, memories, resettingApi, NOW));
+  assert.equal(out.status, "failed");
+  const s = store.snapshot();
+  assert.deepEqual([s.hypotheses.length, s.reactions.length, s.themeStates.length], [0, 0, 0]);
 });
 
 test("two tabs ending a session at the same time: only one generation call", async () => {

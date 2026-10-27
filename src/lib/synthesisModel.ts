@@ -56,7 +56,8 @@ export function keywordThemeId(theme: string): string {
   return `kw:${normalizeAnalyticsKeyword(theme)}`;
 }
 
-export type HypothesisStatus = "active" | "rejected" | "corrected";
+/** "retired": replaced by a newer generation but some of its uses still wait for a reaction check; never used in a chat turn */
+export type HypothesisStatus = "active" | "retired" | "rejected" | "corrected";
 
 export interface StoredHypothesis {
   schemaVersion: typeof SYNTHESIS_SCHEMA_VERSION;
@@ -141,12 +142,20 @@ export interface SynthesisState {
   exposures: HypothesisExposure[];
   themeStates: ThemeGenerationState[];
   meta: SynthesisRunMeta | null;
+  /** changes on every reset ("仮説を消す" / "すべて初期化"): a run that started before a reset cannot write afterwards */
+  epoch: string;
 }
 
 /** one write unit, applied in ONE IndexedDB transaction by the store (all or nothing) */
 export interface SynthesisChanges {
   putHypotheses?: StoredHypothesis[];
-  deleteHypothesisIds?: string[];
+  /**
+   * hypotheses to remove: the store removes one only when none of its stored uses (including uses recorded while the run was waiting) is later than
+   * `checkedThrough`; otherwise it keeps it as "retired" so that those uses are still checked for a reaction
+   */
+  removeHypotheses?: { id: string; checkedThrough?: string }[];
+  /** the epoch the run started in; the store refuses the whole commit when a reset happened since */
+  expectedEpoch?: string;
   /** reactions are only ever added here; nothing in the generation path removes one */
   addReactions?: UserReaction[];
   putThemeStates?: ThemeGenerationState[];
@@ -165,6 +174,13 @@ export function mergeShown(stored: StoredHypothesis["shownIn"], incoming: Stored
     })
     .sort((a, b) => a.at.localeCompare(b.at))
     .slice(-20);
+}
+
+/** the store's decision for one entry of `removeHypotheses`, given what is stored now */
+export function removalOutcome(stored: StoredHypothesis, checkedThrough: string | undefined): "delete" | StoredHypothesis {
+  const pending = stored.shownIn.some((s) => checkedThrough === undefined || s.at > checkedThrough);
+  if (!pending) return "delete";
+  return { ...stored, status: stored.status === "active" || stored.status === "retired" ? "retired" : stored.status, reactionsCheckedThrough: checkedThrough };
 }
 
 /** the exposure record after a hypothesis of `themeId` was used in `conversationId` */
@@ -377,7 +393,7 @@ export function planGeneration(state: SynthesisState, memories: MemoryObject[], 
     const prev = themeStates.get(snapshot.themeId);
     const own = state.hypotheses.filter((h) => h.themeId === snapshot.themeId);
     const reasons: ThemeReason[] = [];
-    if (own.some((h) => h.status === "active" && pendingShown(h).length > 0)) reasons.push("reaction-check");
+    if (own.some((h) => (h.status === "active" || h.status === "retired") && pendingShown(h).length > 0)) reasons.push("reaction-check");
     if (!prev?.generatedAt) {
       reasons.push("first");
     } else {
@@ -425,19 +441,27 @@ export function buildReactionChecks(plan: SynthesisPlan, state: SynthesisState, 
   const checks: ReactionCheck[] = [];
   const examinedThrough: Record<string, string> = {};
   for (const h of state.hypotheses) {
-    if (h.status !== "active" || !planned.has(h.themeId)) continue;
+    if ((h.status !== "active" && h.status !== "retired") || !planned.has(h.themeId)) continue;
     for (const shown of pendingShown(h)) {
       if (checks.length >= SYNTHESIS_S1_LIMITS.maxReactionChecks) return { checks, examinedThrough };
-      examinedThrough[h.id] = shown.at;
       const conv = convById.get(shown.conversationId);
-      if (!conv) continue;
+      if (!conv) {
+        examinedThrough[h.id] = shown.at; // the conversation was deleted: nothing left to judge
+        continue;
+      }
       const after = conv.turns.filter((t) => Date.parse(t.timestamp) >= Date.parse(shown.at));
       const reply = after.find((t) => t.role === "ai");
       const userTurns = after
         .filter((t) => t.role === "user" && (!reply || Date.parse(t.timestamp) >= Date.parse(reply.timestamp)))
         .slice(0, SYNTHESIS_S1_LIMITS.maxUserTurnsPerCheck)
         .map((t) => ({ text: t.content.slice(0, SYNTHESIS_S1_LIMITS.userTurnLength), at: t.timestamp }));
-      if (!reply || userTurns.length === 0) continue;
+      if (!reply || userTurns.length === 0) {
+        // not answered yet: while the conversation is still open, this use (and the later ones) stay pending
+        if (!conv.endedAt) break;
+        examinedThrough[h.id] = shown.at;
+        continue;
+      }
+      examinedThrough[h.id] = shown.at;
       checks.push({ hypothesisId: h.id, theme: h.themeLabel, statement: h.statement, conversationId: conv.id, shownAt: shown.at, tsumugiReply: reply.content.slice(0, SYNTHESIS_S1_LIMITS.tsumugiReplyLength), userTurns });
     }
   }
@@ -538,7 +562,7 @@ export function applyGenerationResult(
   }
   const allReactions = [...state.reactions, ...newReactions];
   const putHypotheses: StoredHypothesis[] = [];
-  const deleteHypothesisIds: string[] = [];
+  const removeHypotheses: { id: string; checkedThrough?: string }[] = [];
   const putThemeStates: ThemeGenerationState[] = [];
   const prevThemeStates = new Map(state.themeStates.map((t) => [t.themeId, t] as const));
   let n = 0;
@@ -551,7 +575,8 @@ export function applyGenerationResult(
       // only the uses that were actually examined count as judged; later ones stay pending for the next run
       const checkedThrough = examinedThrough[h.id] ?? h.reactionsCheckedThrough;
       if (kind) putHypotheses.push({ ...h, status: kind, reactionsCheckedThrough: checkedThrough });
-      else if (regenerate && h.status === "active") deleteHypothesisIds.push(h.id);
+      // replaced (or retired and now fully checked): the store removes it, or keeps it "retired" while some of its uses still wait for a check
+      else if ((regenerate && h.status === "active") || h.status === "retired") removeHypotheses.push({ id: h.id, checkedThrough });
       else if (checkedThrough !== h.reactionsCheckedThrough) putHypotheses.push({ ...h, reactionsCheckedThrough: checkedThrough });
     }
     if (regenerate) {
@@ -600,7 +625,8 @@ export function applyGenerationResult(
   }
   return {
     putHypotheses,
-    deleteHypothesisIds,
+    removeHypotheses,
+    expectedEpoch: state.epoch,
     addReactions: newReactions,
     putThemeStates,
     meta: { schemaVersion: SYNTHESIS_SCHEMA_VERSION, key: "run", lastAttemptAt: at, lastSuccessAt: at, lastResult: "ok" },
@@ -612,6 +638,7 @@ export function failureChanges(state: SynthesisState, plan: SynthesisPlan, now: 
   const at = new Date(now).toISOString();
   const prev = new Map(state.themeStates.map((t) => [t.themeId, t] as const));
   return {
+    expectedEpoch: state.epoch,
     putThemeStates: plan.themes.map((t) => {
       const p = prev.get(t.themeId);
       return p
