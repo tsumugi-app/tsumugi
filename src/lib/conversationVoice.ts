@@ -3,9 +3,7 @@
  * Prompt text only — it does not change what is retrieved (Retrieval / Timeline / Capture / Connect / Synthesis are untouched), adds no AI call,
  * leaves the thinking budget as it is and keeps the Evidence Boundary: facts about the user still come only from what the user said;
  * a view or a hypothesis is offered as Tsumugi's own.
- *
- * `VoiceVariant` exists only for the Preview comparison of PR "conversation voice" (current prompt / improved prompt).
- * Production always uses "improved" (`resolveVoiceVariant` ignores the request field in production builds). To be simplified before merge.
+ * Chosen by comparing the previous prompt and this one on Preview with fictional Memories (opinion requests, ordinary turns, diary, record mode).
  */
 
 /** A. shared: how to move a conversation forward (all personas; record mode keeps its own stricter rules) */
@@ -51,10 +49,7 @@ export const NO_PAST_CONTEXT_NOTE = `
 ## このターンの過去の情報
 このターンには、この人の過去についての情報（記憶・過去の会話・プロフィールなど）が渡されていない。この会話の中で話したこと以外の、この人の過去・これまでの話・以前の様子には触れない（「以前も」「これまでのお話でも」などを使わない）。今の発言だけから、具体的な見解を述べる。`;
 
-export type VoiceVariant = "legacy" | "improved";
-
 export interface ConversationVoice {
-  variant: VoiceVariant;
   /** persona prompt overrides (undefined: keep the route's own text) */
   persona: Partial<Record<"companion" | "coach" | "analyst", string>>;
   section: string;
@@ -63,20 +58,12 @@ export interface ConversationVoice {
   noPastContextNote(hasNoPastContext: boolean): string;
 }
 
-export function conversationVoice(variant: VoiceVariant): ConversationVoice {
-  if (variant === "legacy") return { variant, persona: {}, section: "", evidenceNote: "", analystMemoryNote: "", noPastContextNote: () => "" };
+export function conversationVoice(): ConversationVoice {
   return {
-    variant,
     persona: { analyst: ANALYST_PERSONA_PROMPT, companion: COMPANION_PERSONA_PROMPT },
     section: CONVERSATION_VOICE_SECTION,
     evidenceNote: EVIDENCE_TOPIC_REFERENCE_NOTE,
     analystMemoryNote: ANALYST_MEMORY_USE_NOTE,
     noPastContextNote: (hasNoPastContext) => (hasNoPastContext ? NO_PAST_CONTEXT_NOTE : ""),
   };
-}
-
-/** production: always "improved". The request field is honoured only outside production builds, for the Preview comparison. */
-export function resolveVoiceVariant(requested: unknown, isProduction: boolean): VoiceVariant {
-  if (isProduction) return "improved";
-  return requested === "legacy" ? "legacy" : "improved";
 }

@@ -1,4 +1,4 @@
-import { conversationVoice, resolveVoiceVariant } from "@/lib/conversationVoice";
+import { conversationVoice } from "@/lib/conversationVoice";
 import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
@@ -942,7 +942,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, evalVariant, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -960,8 +960,6 @@ export async function POST(request: Request) {
     memoryAnalytics?: MemoryAnalyticsContext;
     /** Memory Timeline（試験接続・既定OFF、optional）。今回の話題に関係し、通常のRetrievalに不足する経緯だけ（最大2テーマ）。無ければ従来とバイト単位で同じプロンプト。Synthesis（実験）の整理も同じ形で載せられる。 */
     memoryTimeline?: unknown;
-    /** Conversation voice comparison (Preview only; ignored in production builds; to be removed before merge). */
-    evalVariant?: unknown;
     /**
      * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
      * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
@@ -1018,8 +1016,8 @@ export async function POST(request: Request) {
       );
 
   const retrievedMemoriesSection = buildRetrievedMemoriesSection(memoriesForContext);
-  // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。本番ビルドでは常に"improved"。evalVariantはPreviewの比較専用。
-  const voice = conversationVoice(resolveVoiceVariant(evalVariant, process.env.VERCEL_ENV === "production"));
+  // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。プロンプトのみで、取得・保存・AI呼び出し回数・thinking budgetは変えない。
+  const voice = conversationVoice();
   const memoriesSectionForPersona =
     persona === "analyst" && retrievedMemoriesSection
       ? `

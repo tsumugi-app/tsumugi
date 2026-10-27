@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 /**
  * Conversation voice（意見・気づき・記憶の使い方の指示）のテスト。プロンプトの中身ではなく、組み込まれ方と安全条件を確認する：
- * 本番ビルドは常に"improved"（リクエストで変えられない）、legacyは従来とバイト単位で同じ、記録モードの優先、thinking budgetは変えない。
+ * 全personaのsystemInstructionに入ること、記録モードの優先、thinking budgetは変えないこと、過去の情報が無いターンの扱い。
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -44,24 +44,19 @@ async function call(body: Record<string, unknown>) {
 const T = "2026-10-27T03:00:00.000Z";
 const turn = (content: string) => ({ persona: "analyst", turns: [{ role: "user", content, timestamp: T }] });
 
-test("production build: always the improved prompt, the request field cannot change it, thinking budget unchanged", async () => {
-  const prev = process.env.VERCEL_ENV;
-  process.env.VERCEL_ENV = "production";
-  try {
-    const a = await call({ ...turn("どう思う？"), evalVariant: "legacy" });
-    assert.ok(a.systemInstruction.includes("## 会話の進め方"), "improved even though legacy was requested");
-    assert.ok(a.systemInstruction.includes(voice.ANALYST_PERSONA_PROMPT));
-    assert.equal(a.thinkingBudget, 128, "short turn without context: the thinking budget is not changed");
-  } finally { if (prev === undefined) delete process.env.VERCEL_ENV; else process.env.VERCEL_ENV = prev; }
+test("every persona gets the voice section and the evidence note; analyst and companion get the new persona text", async () => {
+  for (const persona of ["analyst", "companion", "coach"]) {
+    const r = await call({ persona, turns: [{ role: "user", content: "どう思う？", timestamp: T }] });
+    assert.ok(r.systemInstruction.includes(voice.CONVERSATION_VOICE_SECTION), persona);
+    assert.ok(r.systemInstruction.includes(voice.EVIDENCE_TOPIC_REFERENCE_NOTE), persona);
+  }
+  assert.ok((await call(turn("どう思う？"))).systemInstruction.includes(voice.ANALYST_PERSONA_PROMPT));
+  assert.ok((await call({ persona: "companion", turns: [{ role: "user", content: "今日は走った", timestamp: T }] })).systemInstruction.includes(voice.COMPANION_PERSONA_PROMPT));
 });
 
-test("legacy variant (Preview comparison only) is the previous prompt byte for byte", async () => {
-  const legacy = await call({ ...turn("どう思う？"), evalVariant: "legacy" });
-  assert.ok(!legacy.systemInstruction.includes("## 会話の進め方"));
-  assert.ok(!legacy.systemInstruction.includes(voice.EVIDENCE_TOPIC_REFERENCE_NOTE.trim()));
-  assert.ok(legacy.systemInstruction.includes("相談やアイデア出しでは、必要に応じて自分の考えや意見も返してください。"));
-  const improved = await call({ ...turn("どう思う？"), evalVariant: "improved" });
-  assert.ok(improved.systemInstruction.includes(voice.CONVERSATION_VOICE_SECTION) && improved.systemInstruction.includes(voice.EVIDENCE_TOPIC_REFERENCE_NOTE));
+test("a request field cannot switch the prompt back (no comparison switch left in the route)", async () => {
+  const r = await call({ ...turn("どう思う？"), evalVariant: "legacy" });
+  assert.ok(r.systemInstruction.includes(voice.CONVERSATION_VOICE_SECTION));
 });
 
 test("the voice section defers to record mode, and keeps the evidence rules (facts vs views)", () => {
@@ -71,11 +66,9 @@ test("the voice section defers to record mode, and keeps the evidence rules (fac
   assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("毎回分析や仮説を出さなくてよい"));
 });
 
-test("the thinking budget is not changed by the voice (both variants)", async () => {
-  for (const evalVariant of ["legacy", "improved"]) {
-    assert.equal((await call({ ...turn("どう思う？"), evalVariant })).thinkingBudget, 128, evalVariant);
-    assert.equal((await call({ ...turn("今日は走って気持ちよかった"), evalVariant })).thinkingBudget, 128, evalVariant);
-  }
+test("the thinking budget is not changed by the voice", async () => {
+  assert.equal((await call(turn("どう思う？"))).thinkingBudget, 128);
+  assert.equal((await call(turn("今日は走って気持ちよかった"))).thinkingBudget, 128);
 });
 
 test("no invented past, grounded hypotheses only, a choice when asked to choose", () => {
@@ -87,11 +80,11 @@ test("no invented past, grounded hypotheses only, a choice when asked to choose"
   assert.ok(!/仮説を(言わない|述べない|出さない)/.test(all), "hypotheses are not banned outright");
 });
 
-test("a turn without any past context says so; a turn with Memories does not; legacy never does", async () => {
-  const none = await call({ ...turn("姉は私にとってどういう存在なんだろう"), evalVariant: "improved" });
-  assert.ok(none.systemInstruction.includes(voice.NO_PAST_CONTEXT_NOTE));
-  const withMemory = await call({ ...turn("姉は私にとってどういう存在なんだろう"), evalVariant: "improved", retrievedMemories: [{ id: "m1", date: T, summary: "姉に相談した", keywords: ["姉"], source: "ai-capture" }] });
-  assert.ok(!withMemory.systemInstruction.includes(voice.NO_PAST_CONTEXT_NOTE));
-  const legacy = await call({ ...turn("姉は私にとってどういう存在なんだろう"), evalVariant: "legacy" });
-  assert.ok(!legacy.systemInstruction.includes("## このターンの過去の情報"));
+test("a turn without any past context says so; a turn with Memories or a recent conversation does not", async () => {
+  assert.ok((await call(turn("姉は私にとってどういう存在なんだろう"))).systemInstruction.includes(voice.NO_PAST_CONTEXT_NOTE));
+  const withMemory = await call({ ...turn("姉は私にとってどういう存在なんだろう"), retrievedMemories: [{ id: "m1", date: T, summary: "姉に相談した", keywords: ["姉"], source: "ai-capture" }] });
+  assert.ok(!withMemory.systemInstruction.includes("## このターンの過去の情報"));
+  const withRecent = await call({ ...turn("姉は私にとってどういう存在なんだろう"), recentConversation: { elapsedMs: 600000, turns: [{ role: "user", content: "姉と出かけた", timestamp: T }] } });
+  assert.ok(withRecent.systemInstruction.includes("姉と出かけた"), "the recent conversation reached the prompt");
+  assert.ok(!withRecent.systemInstruction.includes("## このターンの過去の情報"));
 });

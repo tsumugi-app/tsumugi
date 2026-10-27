@@ -100,7 +100,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/") && !synthesisApi.has(f)), "API routes must not be modified");
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (conversation voice): prompt text lives in lib/conversationVoice.ts; the route only resolves it, appends it, and may raise the thinking floor
-  const conversationVoiceLine = /conversationVoice|resolveVoiceVariant|voice\.|evalVariant|Conversation voice|^-\$\{sanitizedExplicitSearch && sanitizedMemoryAnalytics \?/;
+  const conversationVoiceLine = /conversationVoice|voice\.|Conversation voice|^-\$\{sanitizedExplicitSearch && sanitizedMemoryAnalytics \?/;
   for (const l of chatRouteDiff) assert.ok(/synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
