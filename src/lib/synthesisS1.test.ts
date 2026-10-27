@@ -183,7 +183,10 @@ test("validateReactions: only a verbatim, clear denial of the user survives", ()
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "そうかも" }] }, [check]).length, 0, "agreement");
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "全然違う" }] }, [check]).length, 0, "not the user's words");
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "confirmed", userQuote: "趣味で続けたいだけ" }] }, [check]).length, 0, "confirmed is never stored");
-  assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "趣味で続けたいだけ" }] }, [check]).length, 0, "no clear denial word");
+  assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "corrected", userQuote: "趣味で続けたいだけ" }] }, [check]).length, 1, "the corrected part of an answer that denies");
+  const soft: ReactionCheck = { ...check, userTurns: [{ text: "趣味で続けたいだけ", at: "2026-10-27T00:00:00.000Z" }, { text: "いや、複雑ってほどじゃないよ。口出しも別に気にしてないし", at: "2026-10-27T00:02:00.000Z" }] };
+  assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "趣味で続けたいだけ" }] }, [soft]).length, 0, "no denial in that answer");
+  assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "corrected", userQuote: "口出しも別に気にしてないし" }] }, [soft]).length, 1);
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "other", reaction: "rejected", userQuote: "それは違うと思う" }] }, [check]).length, 0, "unknown hypothesis");
   assert.ok(AGREEMENT_ONLY.test("そうかも。") && AGREEMENT_ONLY.test("たしかに") && !AGREEMENT_ONLY.test("そうかも、でも仕事にはしたくない"));
 });

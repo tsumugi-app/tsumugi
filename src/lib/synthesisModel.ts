@@ -400,7 +400,7 @@ export function buildReactionChecks(plan: SynthesisPlan, state: SynthesisState, 
 }
 
 /** words that make a quote a clear denial / correction (an agreement or a "どうだろう" never matches) */
-export const DENIAL_CUE = /違う|ちがう|違います|違った|そうじゃな|そうではな|そんなことな|そういうわけじゃ|わけじゃな|わけではな|じゃなくて|ではなくて|じゃない(?![かよね]?[？?]|か|の)|ではない|間違|訂正|むしろ|というより|本当は|実は|勘違い|当たってな|外れて/;
+export const DENIAL_CUE = /違う|ちがう|違います|違った|そうじゃな|そうではな|そんなことな|そういうわけじゃ|わけじゃな|わけではな|わけでもな|じゃなくて|ではなくて|じゃない(?![かよね]?[？?]|か|の)|ではない|でもない|ほどじゃな|ほどでもな|ほどではな|気にしてな|思ってな|感じてな|間違|訂正|むしろ|というより|本当は|実は|勘違い|当たってな|外れて/;
 
 export interface JudgedReaction {
   hypothesisId: string;
@@ -410,7 +410,7 @@ export interface JudgedReaction {
 }
 
 /**
- * Server-side gate for the model's reaction judgments. Only "rejected" / "corrected" with a verbatim quote from the user's turns that contains a clear
+ * Server-side gate for the model's reaction judgments. Only "rejected" / "corrected" with a verbatim quote from a user turn that contains a clear
  * denial survive. Everything else ("confirmed", "unclear", a quote that is not the user's, a "そうかも") is dropped: it changes nothing.
  */
 export function validateReactions(raw: unknown, checks: ReactionCheck[]): JudgedReaction[] {
@@ -425,8 +425,9 @@ export function validateReactions(raw: unknown, checks: ReactionCheck[]): Judged
     const kind = x.reaction === "rejected" || x.reaction === "corrected" ? x.reaction : null;
     const quote = typeof x.userQuote === "string" ? x.userQuote.trim() : "";
     if (!check || !kind || quote.length < 2 || seen.has(check.hypothesisId)) continue;
+    // the quote must be the user's own words, and the user's answer must contain a clear denial (the model may quote the corrected part only)
     const turn = check.userTurns.find((t) => t.text.includes(quote));
-    if (!turn || !DENIAL_CUE.test(quote) || AGREEMENT_ONLY.test(quote)) continue;
+    if (!turn || !DENIAL_CUE.test(turn.text) || AGREEMENT_ONLY.test(turn.text.trim()) || AGREEMENT_ONLY.test(quote)) continue;
     seen.add(check.hypothesisId);
     out.push({ hypothesisId: check.hypothesisId, kind, userQuote: quote, saidAt: turn.at });
   }

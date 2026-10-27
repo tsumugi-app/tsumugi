@@ -72,7 +72,7 @@ function describeContexts(contexts: SynthesisThemeContext[]): string {
 }
 
 const store = (s: SynthesisState) => createMemorySynthesisStore(JSON.parse(JSON.stringify(s)) as SynthesisState);
-function deps(st: ReturnType<typeof createMemorySynthesisStore>, memories: MemoryObject[], now: number, conversations: Conversation[] = []): SynthesisRunDeps {
+function deps(st: ReturnType<typeof createMemorySynthesisStore>, memories: MemoryObject[], now: number, conversations: Conversation[] = [], onRaw?: (line: string) => void): SynthesisRunDeps {
   let n = 0;
   return {
     store: st,
@@ -81,7 +81,9 @@ function deps(st: ReturnType<typeof createMemorySynthesisStore>, memories: Memor
     callApi: async (payload) => {
       const res = await fetch("/api/synthesize", { method: "POST", headers: await headers(), body: JSON.stringify(payload) });
       if (!res.ok) throw new Error(`synthesize ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      return (await res.json()) as { items?: unknown; reactions?: unknown };
+      const body = (await res.json()) as { items?: unknown; reactions?: unknown; dropped?: unknown };
+      onRaw?.(`API: 判定を求めた反応 ${(payload.checks ?? []).length}件 → 通過した反応 ${JSON.stringify(body.reactions)} ／ 落とした項目 ${JSON.stringify(body.dropped)}`);
+      return body;
     },
     now: () => now,
     newId: () => `eval${++n}-${now}`,
@@ -99,7 +101,7 @@ export default function SynthesisEval() {
       setStatus(`生成 ${u}`);
       const st = createMemorySynthesisStore();
       const t0 = performance.now();
-      const out = await runSynthesisOnce(deps(st, MEM[u](), Date.now()));
+      const out = await runSynthesisOnce(deps(st, MEM[u](), Date.now(), [], add));
       const ms = Math.round(performance.now() - t0);
       states[u] = st.snapshot();
       const pool = MEM[u]();
@@ -162,7 +164,7 @@ export default function SynthesisEval() {
       // an agreement turned into a Memory by Capture (no substantive words) must not become evidence
       const extra = name === "相づち" ? [{ ...pool[0], id: "eval-agree", conversationId: conv.id, keywords: ["姉"], summary: "そうかもしれないと話した。", content: "そうかも", evidenceQuotes: ["そうかも"], statedAt: new Date(shownAt).toISOString(), date: new Date(shownAt).toISOString(), createdAt: new Date(shownAt).toISOString(), updatedAt: new Date(shownAt).toISOString() } as MemoryObject] : [];
       const later = shownAt + 25 * 3_600_000;
-      const out = await runSynthesisOnce(deps(st, [...pool, ...extra], later, [conv]));
+      const out = await runSynthesisOnce(deps(st, [...pool, ...extra], later, [conv], add));
       const after = st.snapshot();
       add(`## 訂正の流れ（${name}）ユーザー：「${answer}」\n使った仮説: ${state0.hypotheses.filter((h) => shownIds.includes(h.id)).map((h) => h.statement).join(" ／ ")}\nTsumugiの返答: ${reply.text}\n再生成: ${JSON.stringify(out)}\n記録された反応: ${after.reactions.map((r) => `[${r.kind}] 「${r.userQuote}」→ ${r.hypothesisStatement}`).join(" ／ ") || "なし"}\n仮説の状態: ${after.hypotheses.map((h) => `${h.status}:${h.statement}`).join(" ／ ")}\n「eval-agree」が根拠に使われたか: ${after.hypotheses.some((h) => h.evidence.some((e) => e.memoryId === "eval-agree")) ? "使われた（NG）" : "使われていない"}`);
       for (let k = 1; k <= RUNS; k++) {
@@ -201,10 +203,21 @@ export default function SynthesisEval() {
     }
   }
 
+  async function correctionOnly() {
+    setLog([]);
+    try {
+      await generate();
+      await correction();
+      setStatus("完了");
+    } catch (e) {
+      setStatus(`失敗: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   return (
     <main className="mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-6 text-sm">
       <h1 className="text-lg font-medium">Memory Synthesis S1 比較（Preview専用・架空データ・保存なし）</h1>
-      <button className="self-start rounded-full border px-3 py-1" onClick={() => void all()}>全部実行</button>
+      <div className="flex gap-2"><button className="rounded-full border px-3 py-1" onClick={() => void all()}>全部実行</button><button className="rounded-full border px-3 py-1" onClick={() => void correctionOnly()}>生成と訂正のみ</button></div>
       {status && <p role="status">{status}</p>}
       <pre data-testid="synthesis-eval-log" className="whitespace-pre-wrap text-xs">{log.join("\n\n")}</pre>
     </main>
