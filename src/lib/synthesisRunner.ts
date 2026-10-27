@@ -16,6 +16,7 @@ import {
   applyGenerationResult,
   buildReactionChecks,
   failureChanges,
+  gateS1Items,
   planGeneration,
   rejectedForPrompt,
   SYNTHESIS_SCHEMA_VERSION,
@@ -64,7 +65,7 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
     return { status: "failed", error: error instanceof Error ? error.message : String(error) };
   }
   // the route already gated the result; gate it again against what THIS device sent (a response is never trusted as is)
-  const items: SynthesisItem[] = validateSynthesisItems({ items: response.items }, plan.clusters).items;
+  const items: SynthesisItem[] = gateS1Items(validateSynthesisItems({ items: response.items }, plan.clusters).items, plan.clusters).items;
   const reactions = validateReactions({ reactions: response.reactions }, checks);
   const generationId = deps.newId();
   const changes = applyGenerationResult(state, plan, { items, reactions }, memories, now, generationId);

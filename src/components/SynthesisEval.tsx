@@ -131,13 +131,13 @@ export default function SynthesisEval() {
 
   /** a hypothesis used in a conversation, then the user's answer: a clear correction / an unclear answer / an agreement */
   async function correction() {
-    const base = states.A;
+    const base = states.B;
     if (!base) { add("先に生成してください"); return; }
-    const pool = MEM.A();
-    const s = SCENARIOS[0];
+    const pool = MEM.B();
+    const s = SCENARIOS.find((x) => x.id === "b-sister")!;
     const retrieved = retrieve(pool, s);
     const variants: [string, string][] = [
-      ["明確な訂正", "いや、デザインは趣味みたいなもので、仕事にしたいわけじゃないよ"],
+      ["明確な訂正", "いや、複雑ってほどじゃないよ。口出しも別に気にしてないし、姉には普通に感謝してる"],
       ["曖昧", "うーん、どうだろうね"],
       ["相づち", "そうかも"],
     ];
@@ -160,7 +160,7 @@ export default function SynthesisEval() {
       } as unknown as Conversation;
       await st.commit({ putHypotheses: state0.hypotheses.filter((h) => shownIds.includes(h.id)).map((h) => ({ ...h, shownIn: [{ conversationId: conv.id, at: new Date(shownAt).toISOString() }] })) });
       // an agreement turned into a Memory by Capture (no substantive words) must not become evidence
-      const extra = name === "相づち" ? [{ ...pool[0], id: "eval-agree", conversationId: conv.id, keywords: ["仕事"], summary: "そうかもしれないと話した。", content: "そうかも", evidenceQuotes: ["そうかも"], statedAt: new Date(shownAt).toISOString(), date: new Date(shownAt).toISOString(), createdAt: new Date(shownAt).toISOString(), updatedAt: new Date(shownAt).toISOString() } as MemoryObject] : [];
+      const extra = name === "相づち" ? [{ ...pool[0], id: "eval-agree", conversationId: conv.id, keywords: ["姉"], summary: "そうかもしれないと話した。", content: "そうかも", evidenceQuotes: ["そうかも"], statedAt: new Date(shownAt).toISOString(), date: new Date(shownAt).toISOString(), createdAt: new Date(shownAt).toISOString(), updatedAt: new Date(shownAt).toISOString() } as MemoryObject] : [];
       const later = shownAt + 25 * 3_600_000;
       const out = await runSynthesisOnce(deps(st, [...pool, ...extra], later, [conv]));
       const after = st.snapshot();

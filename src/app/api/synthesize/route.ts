@@ -1,7 +1,7 @@
 import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
 import { renderClustersForModel, SYNTHESIS_LIMITS, validateSynthesisItems, type SynthesisCluster, type SynthesisEvidence } from "@/lib/memorySynthesis";
 import { renderReactionChecksForModel, renderRejectedForModel, SYNTHESIS_S1_INSTRUCTIONS, SYNTHESIS_S1_SCHEMA, SYNTHESIS_SYSTEM_PROMPT } from "@/lib/memorySynthesisPrompt";
-import { keywordThemeId, SYNTHESIS_S1_LIMITS, textSimilarity, validateReactions, type ReactionCheck } from "@/lib/synthesisModel";
+import { gateS1Items, keywordThemeId, SYNTHESIS_S1_LIMITS, textSimilarity, validateReactions, type ReactionCheck } from "@/lib/synthesisModel";
 
 export const runtime = "nodejs";
 
@@ -121,9 +121,14 @@ export async function POST(request: Request) {
     return Response.json({ error: "Failed to parse AI response as JSON." }, { status: 502 });
   }
   const validation = validateSynthesisItems(parsed, clusters);
-  const items = validation.items.filter(
+  const gated = gateS1Items(validation.items, clusters);
+  const items = gated.items.filter(
     (item) => !rejected.some((r) => keywordThemeId(r.theme) === keywordThemeId(item.theme) && textSimilarity(item.statement, r.statement) >= 0.35)
   );
-  const dropped = { ...validation.dropped, ...(items.length < validation.items.length ? { "resembles-rejected": validation.items.length - items.length } : {}) };
+  const dropped = {
+    ...validation.dropped,
+    ...(gated.dropped > 0 ? { "unhedged-cause": gated.dropped } : {}),
+    ...(items.length < gated.items.length ? { "resembles-rejected": gated.items.length - items.length } : {}),
+  };
   return Response.json({ items, reactions: validateReactions(parsed, checks), proposed: validation.proposed, dropped });
 }

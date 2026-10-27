@@ -20,6 +20,7 @@ import { normalizeAnalyticsKeyword } from "./memoryAnalytics";
 import {
   buildSynthesisClusters,
   buildThemeTimeline,
+  HEDGE,
   isSynthesisSource,
   type SynthesisCluster,
   type SynthesisItem,
@@ -207,6 +208,34 @@ export function resemblesReaction(item: { themeId: string; statement: string; ev
   const ev = new Set(reaction.hypothesisEvidenceIds);
   const overlap = item.evidenceIds.filter((id) => ev.has(id)).length / Math.max(1, Math.min(item.evidenceIds.length, ev.size));
   return overlap >= 0.5 && sim >= 0.2;
+}
+
+// ---------------------------------------------------------------------------
+// S1 gate on top of validateSynthesisItems (route and client both apply it)
+// ---------------------------------------------------------------------------
+
+/** a cause or a purpose joining the records ("〜するために", "〜を機に") is Tsumugi's reading unless the user said it */
+const CAUSAL_READING = /ために|ため、|を機に|をきっかけ|がきっかけ|きっかけで|影響で|ことから|せいで|おかげで/;
+
+/**
+ * - An item that joins several records is never "stated" (the user did not say the joined sentence): it is at most "derived".
+ * - A cause / purpose that the user's own records do not contain must be worded as a possibility, or the item is dropped.
+ */
+export function gateS1Items(items: SynthesisItem[], clusters: SynthesisCluster[]): { items: SynthesisItem[]; dropped: number } {
+  const out: SynthesisItem[] = [];
+  let dropped = 0;
+  for (const item of items) {
+    const cluster = clusters.find((c) => normalizeAnalyticsKeyword(c.theme) === normalizeAnalyticsKeyword(item.theme));
+    const own = (cluster?.evidence ?? []).filter((e) => item.evidenceIds.includes(e.id)).map((e) => `${e.summary} ${e.quote ?? ""}`).join(" ");
+    const text = `${item.statement} ${item.situationNote ?? ""}`;
+    const causal = text.match(CAUSAL_READING)?.[0];
+    if (causal && !own.includes(causal.replace(/、$/, "")) && !HEDGE.test(text)) {
+      dropped += 1;
+      continue;
+    }
+    out.push(item.support === "stated" && item.evidenceIds.length >= 2 ? { ...item, support: "derived" } : causal && !own.includes(causal.replace(/、$/, "")) ? { ...item, support: "hypothesis" } : item);
+  }
+  return { items: out, dropped };
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import { fictionalSynthesisMemories } from "./synthesisFictionalData";
 import {
   AGREEMENT_ONLY,
   eligibleEvidenceMemories,
+  gateS1Items,
   keywordThemeId,
   planGeneration,
   SYNTHESIS_DB_NAME,
@@ -185,6 +186,21 @@ test("validateReactions: only a verbatim, clear denial of the user survives", ()
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "趣味で続けたいだけ" }] }, [check]).length, 0, "no clear denial word");
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "other", reaction: "rejected", userQuote: "それは違うと思う" }] }, [check]).length, 0, "unknown hypothesis");
   assert.ok(AGREEMENT_ONLY.test("そうかも。") && AGREEMENT_ONLY.test("たしかに") && !AGREEMENT_ONLY.test("そうかも、でも仕事にはしたくない"));
+});
+
+test("gateS1Items: a joined sentence is never 'stated'; an unspoken cause must be a possibility or the item is dropped", () => {
+  const cluster: SynthesisCluster = { theme: "仕事", evidence: [
+    { id: "e1", conversationId: "c1", statedAt: "2026-04-05T12:00:00.000Z", statedAtIsRecordDate: false, summary: "来年は管理職の試験を受けたいと話した。" },
+    { id: "e2", conversationId: "c2", statedAt: "2026-09-06T12:00:00.000Z", statedAtIsRecordDate: false, summary: "9月から時短勤務になったと話した。" },
+  ] };
+  const base = { kind: "change" as const, theme: "仕事", evidenceIds: ["e1", "e2"], firstStatedAt: "2026-04-05T12:00:00.000Z", lastStatedAt: "2026-09-06T12:00:00.000Z" };
+  const plain = gateS1Items([{ ...base, statement: "管理職の試験を受けたいと話していたが、9月から時短勤務になったと話している。", support: "stated" }], [cluster]);
+  assert.equal(plain.items[0].support, "derived");
+  const cause = gateS1Items([{ ...base, statement: "家庭を優先するために試験を見送り、時短勤務になった。", support: "stated" }], [cluster]);
+  assert.equal(cause.items.length, 0);
+  assert.equal(cause.dropped, 1);
+  const hedged = gateS1Items([{ ...base, statement: "家庭を優先するために、試験より時短勤務を選んだのかもしれない。", support: "derived" }], [cluster]);
+  assert.equal(hedged.items[0].support, "hypothesis");
 });
 
 test("an agreement captured from a conversation where a hypothesis was used is not evidence; the user's substantive words still are", () => {
