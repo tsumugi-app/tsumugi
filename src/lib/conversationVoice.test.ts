@@ -86,3 +86,12 @@ test("no invented past, grounded hypotheses only, a choice when asked to choose"
   assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("一つを選んで理由を言う"));
   assert.ok(!/仮説を(言わない|述べない|出さない)/.test(all), "hypotheses are not banned outright");
 });
+
+test("a turn without any past context says so; a turn with Memories does not; legacy never does", async () => {
+  const none = await call({ ...turn("姉は私にとってどういう存在なんだろう"), evalVariant: "improved" });
+  assert.ok(none.systemInstruction.includes(voice.NO_PAST_CONTEXT_NOTE));
+  const withMemory = await call({ ...turn("姉は私にとってどういう存在なんだろう"), evalVariant: "improved", retrievedMemories: [{ id: "m1", date: T, summary: "姉に相談した", keywords: ["姉"], source: "ai-capture" }] });
+  assert.ok(!withMemory.systemInstruction.includes(voice.NO_PAST_CONTEXT_NOTE));
+  const legacy = await call({ ...turn("姉は私にとってどういう存在なんだろう"), evalVariant: "legacy" });
+  assert.ok(!legacy.systemInstruction.includes("## このターンの過去の情報"));
+});

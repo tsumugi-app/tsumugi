@@ -38,11 +38,18 @@ export const COMPANION_PERSONA_PROMPT = `あなたはTsumugiという個人向�
 
 /** D. evidence boundary: what IS allowed (the prohibitions above it are unchanged) */
 export const EVIDENCE_TOPIC_REFERENCE_NOTE = `
-ただし、渡された記憶や今の会話にある話題について、話題の単位で過去に触れることはよい（例：「前に〜の話をしていたよね」「〜のことがあったからこそ」）。避けるのは、記録の要約を本人の言葉そのもののように引用すること、記録や会話に無い過去の出来事・様子を作ること。`;
+ただし、渡された記憶や今の会話にある話題について、話題の単位で過去に触れることはよい（例：「前に〜の話をしていたよね」「〜のことがあったからこそ」）。避けるのは、記録の要約を本人の言葉そのもののように引用すること、記録や会話に無い過去の出来事・様子を作ること、記録にある一度の話を「よく」「いつも」のように膨らませること。`;
 
 /** E. analyst Memory section: how to use the Memories when there are some */
 export const ANALYST_MEMORY_USE_NOTE = `
 関連するMemoryがあるときは、今の発言の意味を理解するために使い、見解の根拠として必要なものを具体的に挙げてよい（件数は決めない。必要が無ければ挙げない）。`;
+
+/** a turn that carries nothing about the user's past (no Memories, no earlier conversations, no Profile / Person View / Timeline / search):
+ * say so explicitly, because a model asked for a grounded view otherwise tends to invent "これまでのお話" */
+export const NO_PAST_CONTEXT_NOTE = `
+
+## このターンの過去の情報
+このターンには、この人の過去についての情報（記憶・過去の会話・プロフィールなど）が渡されていない。この会話の中で話したこと以外の、この人の過去・これまでの話・以前の様子には触れない（「以前も」「これまでのお話でも」などを使わない）。今の発言だけから、具体的な見解を述べる。`;
 
 export type VoiceVariant = "legacy" | "improved";
 
@@ -53,16 +60,18 @@ export interface ConversationVoice {
   section: string;
   evidenceNote: string;
   analystMemoryNote: string;
+  noPastContextNote(hasNoPastContext: boolean): string;
 }
 
 export function conversationVoice(variant: VoiceVariant): ConversationVoice {
-  if (variant === "legacy") return { variant, persona: {}, section: "", evidenceNote: "", analystMemoryNote: "" };
+  if (variant === "legacy") return { variant, persona: {}, section: "", evidenceNote: "", analystMemoryNote: "", noPastContextNote: () => "" };
   return {
     variant,
     persona: { analyst: ANALYST_PERSONA_PROMPT, companion: COMPANION_PERSONA_PROMPT },
     section: CONVERSATION_VOICE_SECTION,
     evidenceNote: EVIDENCE_TOPIC_REFERENCE_NOTE,
     analystMemoryNote: ANALYST_MEMORY_USE_NOTE,
+    noPastContextNote: (hasNoPastContext) => (hasNoPastContext ? NO_PAST_CONTEXT_NOTE : ""),
   };
 }
 
