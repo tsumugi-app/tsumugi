@@ -26,6 +26,8 @@
 import { WIPE_MARKER_KEY } from "./wipeState";
 
 const DB_NAME = "tsumugi";
+/** Memory Synthesis S1 has its own database (synthesisStore.ts). Listed by name so that it is deleted even where indexedDB.databases() is unavailable. */
+const SYNTHESIS_DB_NAME = "tsumugi-synthesis";
 const RETRIES = 3;
 
 export interface StorageLike {
@@ -94,7 +96,7 @@ const isTsumugiKey = (key: string) => key.toLowerCase().startsWith("tsumugi");
 // ---------------------------------------------------------------------------
 
 async function listDatabaseNames(factory: IDBFactory): Promise<string[]> {
-  const names = new Set<string>([DB_NAME]);
+  const names = new Set<string>([DB_NAME, SYNTHESIS_DB_NAME]);
   try {
     if (typeof factory.databases === "function") {
       for (const info of await factory.databases()) if (info.name) names.add(info.name);

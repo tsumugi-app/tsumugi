@@ -1,9 +1,9 @@
 /**
- * Memory Synthesis (experimental, not connected to any screen or API route yet): the instructions and output schema that were verified in the Preview
- * comparisons of PR #6. Kept here so that a later, reviewed trigger (not per chat turn) can reuse them; nothing imports this in production code today.
- * The model output must always go through `validateSynthesisItems` (memorySynthesis.ts) before use.
+ * Memory Synthesis: the instructions and output schema verified in the Preview comparisons of PR #6, used by the S1 generation route (/api/synthesize),
+ * which runs after a session ends (never per chat turn) and only while the `?memorySynthesis=1` trial is on.
+ * The model output must always go through `validateSynthesisItems` (memorySynthesis.ts) and `validateReactions` (synthesisModel.ts) before use.
  */
-import type { AISchema } from "./ai/schema";
+import type { AISchema, AISchemaObject } from "./ai/schema";
 
 export const SYNTHESIS_SYSTEM_PROMPT = `あなたはTsumugiという「Personal Memory OS」の一部です。
 同じユーザーが、別々の日に話した内容の記録（Memory）が、テーマごとに話した順に与えられます。「このテーマの今の状態の根拠」と印のある記録が、そのテーマの今の状態を表す記録です（それより後に話した記録が、別の対象のことを話している場合もあります）。「以前の出来事を後から話したもの」は過去の出来事であり、今の状態ではありません。「記録の言葉では「保留」」などは、記録に書かれた言葉から機械的に付けた印です。
@@ -50,3 +50,52 @@ export const SYNTHESIS_SCHEMA: AISchema = {
   },
   required: ["items"],
 };
+
+/**
+ * Memory Synthesis S1: the extra instructions for one generation call (/api/synthesize). The same call also judges how the user answered when a hypothesis
+ * was used in a conversation, so judging reactions adds no AI call. The output still goes through code gates (validateSynthesisItems / validateReactions).
+ */
+export const SYNTHESIS_S1_INSTRUCTIONS = `
+
+## ユーザーが否定・訂正した見方
+「ユーザーが否定・訂正した見方」が与えられたら、それと同じ趣旨の整理を出さない。言い回しを変えて同じことを書くのも不可。ユーザーの言葉と矛盾する整理も出さない。
+
+## 反応の判定（reactions）
+「会話で使った整理と、その後のユーザーの発言」が与えられたら、それぞれについて、ユーザーがその整理をどう受け止めたかを判定する。
+- "rejected"：ユーザーが、その見方をはっきり否定している（例：「それは違う」「そういうわけじゃない」）。
+- "corrected"：ユーザーが、はっきり否定したうえで、別の事実や考えを述べている（例：「仕事にしたいわけじゃなくて、趣味として続けたい」）。
+- "confirmed"：ユーザーが、その見方をはっきり認めている。
+- "unclear"：上のどれとも言い切れない。相づち（「うん」「そうかも」「たしかに」）、迷い（「どうだろう」「うーん」）、話題が変わった、などは必ず"unclear"。
+迷ったら"unclear"にする。"rejected"と"corrected"のときは、userQuoteに、否定している部分のユーザーの発言をそのまま（一字一句変えずに）書く。`;
+
+export const SYNTHESIS_S1_SCHEMA: AISchema = {
+  type: "object",
+  properties: {
+    items: (SYNTHESIS_SCHEMA as AISchemaObject).properties.items,
+    reactions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          hypothesisId: { type: "string" },
+          reaction: { type: "string", enum: ["rejected", "corrected", "confirmed", "unclear"] },
+          userQuote: { type: "string", description: "rejected / corrected のとき、否定しているユーザーの発言（そのまま）" },
+        },
+        required: ["hypothesisId", "reaction"],
+      },
+    },
+  },
+  required: ["items", "reactions"],
+};
+
+export function renderRejectedForModel(rejected: { theme: string; statement: string; userQuote: string }[]): string {
+  if (rejected.length === 0) return "";
+  return `\n\n## ユーザーが否定・訂正した見方（同じ趣旨を出さない）\n${rejected.map((r) => `- テーマ「${r.theme}」: ${r.statement}\n  ユーザーの言葉:「${r.userQuote}」`).join("\n")}`;
+}
+
+export function renderReactionChecksForModel(checks: { hypothesisId: string; theme: string; statement: string; tsumugiReply: string; userTurns: { text: string }[] }[]): string {
+  if (checks.length === 0) return "";
+  return `\n\n## 会話で使った整理と、その後のユーザーの発言（reactionsで判定する）\n${checks
+    .map((c) => `- hypothesisId=${c.hypothesisId}（テーマ「${c.theme}」）\n  整理: ${c.statement}\n  Tsumugiの返答: ${c.tsumugiReply}\n${c.userTurns.map((t) => `  ユーザー:「${t.text}」`).join("\n")}`)
+    .join("\n")}`;
+}

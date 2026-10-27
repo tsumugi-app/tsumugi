@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/synthesisS1.test.ts",
+    "src/lib/synthesisModel.ts",
+    "src/lib/synthesisRunner.ts",
+    "src/lib/memorySynthesisFlag.ts",
+    "src/lib/dataWipe.ts",
+    "src/app/api/synthesize/route.ts"
+  ]
+}
