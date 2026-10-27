@@ -105,7 +105,7 @@ export async function POST(request: Request) {
       apiKey,
       systemInstruction: `${SYNTHESIS_SYSTEM_PROMPT}${SYNTHESIS_S1_INSTRUCTIONS}`,
       userContent: `${renderClustersForModel(clusters)}${renderRejectedForModel(rejected)}${renderReactionChecksForModel(checks)}`,
-      maxOutputTokens: 2000,
+      maxOutputTokens: 4000,
       providerOptions: { gemini: { thinkingBudget: 512 } },
       schema: SYNTHESIS_S1_SCHEMA,
     });
