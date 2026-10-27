@@ -130,5 +130,7 @@ export async function POST(request: Request) {
     ...(gated.dropped > 0 ? { "unhedged-cause": gated.dropped } : {}),
     ...(items.length < gated.items.length ? { "resembles-rejected": gated.items.length - items.length } : {}),
   };
-  return Response.json({ items, reactions: validateReactions(parsed, checks), proposed: validation.proposed, dropped });
+  // returned in the model's own shape, so that the client can (and does) run the same gate again against what it sent
+  const reactions = validateReactions(parsed, checks).map((r) => ({ hypothesisId: r.hypothesisId, reaction: r.kind, userQuote: r.userQuote }));
+  return Response.json({ items, reactions, proposed: validation.proposed, dropped });
 }

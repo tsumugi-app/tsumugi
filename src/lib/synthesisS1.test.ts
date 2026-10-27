@@ -302,6 +302,8 @@ test("route: only real evidence, nothing resembling a rejected reading, and only
   assert.equal(out.dropped["unknown-evidence"], 1);
   assert.equal(out.dropped["resembles-rejected"], 1);
   assert.deepEqual(out.reactions.map((r) => r.hypothesisId), ["h1"]);
+  // what the route returns passes the client's own gate unchanged (the client re-checks every response)
+  assert.equal(validateReactions({ reactions: out.reactions }, checks).length, 1);
 });
 
 // ---------------------------------------------------------------------------
