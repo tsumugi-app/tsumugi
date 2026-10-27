@@ -1,10 +1,11 @@
 /**
  * Conversation voice: how Tsumugi uses what it knows about the user when it answers (opinions, noticing changes, using past Memories).
- * Prompt text only — it does not change what is retrieved (Retrieval / Timeline / Capture / Connect / Synthesis are untouched), adds no AI call and
- * keeps the Evidence Boundary: facts about the user still come only from what the user said; a view is offered as Tsumugi's own view.
+ * Prompt text only — it does not change what is retrieved (Retrieval / Timeline / Capture / Connect / Synthesis are untouched), adds no AI call,
+ * leaves the thinking budget as it is and keeps the Evidence Boundary: facts about the user still come only from what the user said;
+ * a view or a hypothesis is offered as Tsumugi's own.
  *
- * `VoiceVariant` exists only for the Preview comparison of PR "conversation voice" (legacy prompt / improved prompt / improved prompt + thinking budget).
- * Production always uses the variant chosen in `resolveVoiceVariant` (a request field is ignored in production builds). To be simplified before merge.
+ * `VoiceVariant` exists only for the Preview comparison of PR "conversation voice" (current prompt / improved prompt).
+ * Production always uses "improved" (`resolveVoiceVariant` ignores the request field in production builds). To be simplified before merge.
  */
 
 /** A. shared: how to move a conversation forward (all personas; record mode keeps its own stricter rules) */
@@ -12,9 +13,13 @@ export const CONVERSATION_VOICE_SECTION = `
 
 ## 会話の進め方（記録モードには適用しない。記録モードは上の記録モードの指示だけに従う）
 - ユーザーが意見や見方を求めているとき（「どう思う？」「どう感じる？」「どういう存在なんだろう」「どうすればいい？」「〜するべきかな」など）は、共感や言い換え、質問だけで返さず、自分の見解を具体的に返す。見解は返答の早いうちに示す。
-- 確かでないことは、不確かさを認めたうえで、根拠のある範囲で一番有力だと思う見方を選んで述べる。可能性を並べるだけで終えない。根拠は、この人が話してきた経緯や考え方。一般論（「人それぞれ」「自分の気持ちが大切」など）だけで答えない。
+- 「どちらがいい？」「どうすべき？」のように判断を求められたら、選択肢を並べて終えず、一つを選んで理由を言う。材料が足りないときも、「〜ならこちら」のように条件を付けて具体的に勧める。
+- 確かでないことは、不確かさを認めたうえで、一番有力だと思う見方を選んで述べる。可能性を並べるだけで終えない。
+- 見解は、今の発言と、関連する記憶（この人が話してきた経緯や考え方）を中心に組み立てる。この人の相談に関係の薄い一般論や世の中の動向（市場、統計、「人それぞれ」など）で返答を膨らませない。必要な説明は省かない。
+- この人の気持ちや動機について仮説を言ってよい。ただし、この人が話したことや行動に裏付けがある仮説にとどめ、どの発言や出来事からそう思うのかが伝わるように言う。仮説は確かめた事実のように断定しない。「無意識に」「本当は〜を求めている」のような、裏付けにくい深い内面の推測は、はっきりした根拠があるときだけにする。
 - 意見を求められていない普段の会話では、毎回分析や仮説を出さなくてよい。大事な変化や、今の話と過去のつながりに気づいたときに、自然に伝える。
 - 渡された過去の記憶は、今の発言を理解するために使う。使わなくてよい場面では使わない。一つで足りれば一つ、いくつかの出来事を結び付けることに意味があれば複数使ってよい。過去を紹介すること自体を目的にせず、今の会話に意味を加えるときに、具体的な出来事を自然に交える。
+- 過去の出来事に触れてよいのは、渡された記憶・この会話・明示的に渡された文脈にあるものだけ。それ以外の過去（「以前は〜だった」「前にも〜していた」など）を作らない。過去の記憶が無くても、今の発言から具体的な意見は言える。
 - 質問は、本当に聞きたいことがあるときだけにする。毎回質問で終えなくてよい。意見を求められたターンでは、まず自分の見解を返す。
 - 返答の形や長さは場面に合わせて変える。毎回同じ書き出し（「私は〜と思う」「本心は分からないけれど」など）や同じ構成にしない。短く返すのが自然なときは短くてよい。
 - 事実と見方を分ける。ユーザーが話していない出来事や心理を事実として述べない。見方は自分の見方として述べる（言い回しは自由）。`;
@@ -33,20 +38,13 @@ export const COMPANION_PERSONA_PROMPT = `あなたはTsumugiという個人向�
 
 /** D. evidence boundary: what IS allowed (the prohibitions above it are unchanged) */
 export const EVIDENCE_TOPIC_REFERENCE_NOTE = `
-ただし、話題の単位で過去に触れることはよい（例：「前に〜の話をしていたよね」「〜のことがあったからこそ」）。避けるのは、記録の要約を本人の言葉そのもののように引用することと、記録に無い出来事を作ることだけ。`;
+ただし、渡された記憶や今の会話にある話題について、話題の単位で過去に触れることはよい（例：「前に〜の話をしていたよね」「〜のことがあったからこそ」）。避けるのは、記録の要約を本人の言葉そのもののように引用すること、記録や会話に無い過去の出来事・様子を作ること。`;
 
 /** E. analyst Memory section: how to use the Memories when there are some */
 export const ANALYST_MEMORY_USE_NOTE = `
 関連するMemoryがあるときは、今の発言の意味を理解するために使い、見解の根拠として必要なものを具体的に挙げてよい（件数は決めない。必要が無ければ挙げない）。`;
 
-/** F. thinking budget: an opinion request (or personal context other than Memories) gets the same floor as a turn with Memories */
-const OPINION_REQUEST = /どう思う|どう感じ|どう見え|どういう存在|どうすれば|どうしたら|どうしよう|べきかな|べきだと思|べき？|意見|アドバイス|どっちがいい|どちらがいい|どう考え|なんだろう[？?]?$/;
-export function isOpinionRequest(text: string): boolean {
-  return OPINION_REQUEST.test(text.trim());
-}
-export const THINKING_FLOOR = 512;
-
-export type VoiceVariant = "legacy" | "improved" | "improved-budget";
+export type VoiceVariant = "legacy" | "improved";
 
 export interface ConversationVoice {
   variant: VoiceVariant;
@@ -55,26 +53,21 @@ export interface ConversationVoice {
   section: string;
   evidenceNote: string;
   analystMemoryNote: string;
-  adjustThinkingBudget(base: number, latestUserMessage: string, hasOtherPersonalContext: boolean): number;
 }
 
 export function conversationVoice(variant: VoiceVariant): ConversationVoice {
-  if (variant === "legacy") {
-    return { variant, persona: {}, section: "", evidenceNote: "", analystMemoryNote: "", adjustThinkingBudget: (base) => base };
-  }
+  if (variant === "legacy") return { variant, persona: {}, section: "", evidenceNote: "", analystMemoryNote: "" };
   return {
     variant,
     persona: { analyst: ANALYST_PERSONA_PROMPT, companion: COMPANION_PERSONA_PROMPT },
     section: CONVERSATION_VOICE_SECTION,
     evidenceNote: EVIDENCE_TOPIC_REFERENCE_NOTE,
     analystMemoryNote: ANALYST_MEMORY_USE_NOTE,
-    adjustThinkingBudget: (base, latest, hasOtherPersonalContext) =>
-      variant === "improved-budget" && (isOpinionRequest(latest) || hasOtherPersonalContext) ? Math.max(base, THINKING_FLOOR) : base,
   };
 }
 
-/** production: always "improved" (prompts A–E, current thinking budget). The request field is honoured only outside production builds, for the Preview comparison. */
+/** production: always "improved". The request field is honoured only outside production builds, for the Preview comparison. */
 export function resolveVoiceVariant(requested: unknown, isProduction: boolean): VoiceVariant {
   if (isProduction) return "improved";
-  return requested === "legacy" || requested === "improved-budget" ? requested : "improved";
+  return requested === "legacy" ? "legacy" : "improved";
 }

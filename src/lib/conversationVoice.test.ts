@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 /**
  * Conversation voice（意見・気づき・記憶の使い方の指示）のテスト。プロンプトの中身ではなく、組み込まれ方と安全条件を確認する：
- * 本番ビルドは常に"improved"（リクエストで変えられない）、legacyは従来とバイト単位で同じ、記録モードの優先、thinking budgetの扱い。
+ * 本番ビルドは常に"improved"（リクエストで変えられない）、legacyは従来とバイト単位で同じ、記録モードの優先、thinking budgetは変えない。
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -44,11 +44,6 @@ async function call(body: Record<string, unknown>) {
 const T = "2026-10-27T03:00:00.000Z";
 const turn = (content: string) => ({ persona: "analyst", turns: [{ role: "user", content, timestamp: T }] });
 
-test("isOpinionRequest: opinion requests vs ordinary talk", () => {
-  for (const t of ["彼女は自分にとってどういう存在なんだろう", "今の会社、このままでいいと思う？どう思う？", "連絡するべきかな", "どっちがいいと思う？", "どうすればいいんだろう"]) assert.ok(voice.isOpinionRequest(t), t);
-  for (const t of ["今日は走って気持ちよかった", "最近また夜に英語をやれてる", "ここまでの話を記録して"]) assert.ok(!voice.isOpinionRequest(t), t);
-});
-
 test("production build: always the improved prompt, the request field cannot change it, thinking budget unchanged", async () => {
   const prev = process.env.VERCEL_ENV;
   process.env.VERCEL_ENV = "production";
@@ -56,9 +51,7 @@ test("production build: always the improved prompt, the request field cannot cha
     const a = await call({ ...turn("どう思う？"), evalVariant: "legacy" });
     assert.ok(a.systemInstruction.includes("## 会話の進め方"), "improved even though legacy was requested");
     assert.ok(a.systemInstruction.includes(voice.ANALYST_PERSONA_PROMPT));
-    assert.equal(a.thinkingBudget, 128, "short turn without context: the current budget (the budget change is not in production)");
-    const b = await call({ ...turn("どう思う？"), evalVariant: "improved-budget" });
-    assert.equal(b.thinkingBudget, 128);
+    assert.equal(a.thinkingBudget, 128, "short turn without context: the thinking budget is not changed");
   } finally { if (prev === undefined) delete process.env.VERCEL_ENV; else process.env.VERCEL_ENV = prev; }
 });
 
@@ -78,8 +71,18 @@ test("the voice section defers to record mode, and keeps the evidence rules (fac
   assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("毎回分析や仮説を出さなくてよい"));
 });
 
-test("thinking budget variant (comparison only): an opinion request or other personal context raises a short turn to 512; otherwise unchanged", async () => {
-  assert.equal((await call({ ...turn("どう思う？"), evalVariant: "improved-budget" })).thinkingBudget, voice.THINKING_FLOOR);
-  assert.equal((await call({ ...turn("今日は走って気持ちよかった"), evalVariant: "improved-budget" })).thinkingBudget, 128);
-  assert.equal((await call({ ...turn("どう思う？"), evalVariant: "improved" })).thinkingBudget, 128);
+test("the thinking budget is not changed by the voice (both variants)", async () => {
+  for (const evalVariant of ["legacy", "improved"]) {
+    assert.equal((await call({ ...turn("どう思う？"), evalVariant })).thinkingBudget, 128, evalVariant);
+    assert.equal((await call({ ...turn("今日は走って気持ちよかった"), evalVariant })).thinkingBudget, 128, evalVariant);
+  }
+});
+
+test("no invented past, grounded hypotheses only, a choice when asked to choose", () => {
+  const all = voice.CONVERSATION_VOICE_SECTION + voice.EVIDENCE_TOPIC_REFERENCE_NOTE;
+  assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("それ以外の過去（「以前は〜だった」「前にも〜していた」など）を作らない"));
+  assert.ok(voice.EVIDENCE_TOPIC_REFERENCE_NOTE.includes("記録や会話に無い過去の出来事・様子を作ること"));
+  assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("裏付けがある仮説にとどめ") && voice.CONVERSATION_VOICE_SECTION.includes("断定しない"));
+  assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("一つを選んで理由を言う"));
+  assert.ok(!/仮説を(言わない|述べない|出さない)/.test(all), "hypotheses are not banned outright");
 });

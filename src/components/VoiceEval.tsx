@@ -6,13 +6,13 @@ import { FICTIONAL_USERS } from "@/lib/synthesisFictionalData";
 import type { MemoryObject, RetrievedMemory } from "@/lib/types";
 
 /**
- * Preview専用：同じ架空Memory・同じ発言で、3条件（現行プロンプト / 改善プロンプト / 改善プロンプト＋thinking budget）を複数回比較する。
+ * Preview専用：同じ架空Memory・同じ発言で、2条件（現行プロンプト / 改善プロンプト。thinking budgetはどちらも現行）を複数回比較する。
  * Retrievalは本番と同じ関数（会話＝selectConversationDirectMatches、日記＝scoreMemory上位3件）を架空Memoryに適用する。保存は一切しない。
  */
-type Variant = "legacy" | "improved" | "improved-budget";
-const VARIANTS: Variant[] = ["legacy", "improved", "improved-budget"];
-const LABEL: Record<Variant, string> = { legacy: "現行", improved: "改善プロンプト", "improved-budget": "改善＋thinking" };
-const RUNS = 3;
+type Variant = "legacy" | "improved";
+const VARIANTS: Variant[] = ["legacy", "improved"];
+const LABEL: Record<Variant, string> = { legacy: "現行", improved: "改善プロンプト" };
+const RUNS = 4;
 
 const at = (d: string) => `${d}T12:00:00.000Z`;
 function sakiMemories(): MemoryObject[] {
@@ -96,7 +96,7 @@ export default function VoiceEval() {
     const out: Row[] = [];
     for (const s of SCENARIOS.filter((x) => ids.includes(x.id))) {
       const retrieved = retrieve(s);
-      const row: Row = { s, retrieved, replies: { legacy: [], improved: [], "improved-budget": [] } };
+      const row: Row = { s, retrieved, replies: { legacy: [], improved: [] } };
       for (let k = 0; k < RUNS; k++) for (const v of VARIANTS) { setStatus(`${s.label}：${LABEL[v]} ${k + 1}/${RUNS}`); row.replies[v].push(await chat(s, retrieved, v)); }
       out.push(row); setRows([...out]);
     }

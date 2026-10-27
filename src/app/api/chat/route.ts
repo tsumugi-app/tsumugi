@@ -1113,11 +1113,11 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   // 同じ基準で最低budgetを保証する（persona別の特別扱いは今回追加しない）。Recent
   // Conversation・Topic Continuity Contextがあるターンも、Memoryがあるターンと同様に
   // 「継続の理解」に思考予算が要るため floor 512 とする。
-  const thinkingBudget = voice.adjustThinkingBudget(computeThinkingBudget(latestUserMessage, {
+  const thinkingBudget = computeThinkingBudget(latestUserMessage, {
     hasRetrievedMemories: retrievedMemoriesSection.length > 0 || explicitSearchSection.length > 0 || memoryAnalyticsSection.length > 0,
     hasRecentConversation: recentConversationSection.length > 0,
     hasTopicContext: topicContinuitySection.length > 0,
-  }), latestUserMessage, synthesisSection.length + personViewSection.length + profileSection.length + topicTimelineSection.length > 0);
+  });
 
   // Test 13：記録形式のAIターンがあった場合、そのターンの実本文（Markdown記録）を
   // Geminiへ渡さない点はTest 12と同じだが、単純に除外するのではなく、同じ位置に
