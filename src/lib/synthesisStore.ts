@@ -92,6 +92,21 @@ export const synthesisStore: SynthesisStorePort & {
     await tx.done;
   },
 
+  /** one IndexedDB readwrite transaction (serialized across tabs): two tabs ending a session together cannot both claim the day's attempt */
+  async claimRun(at: string, minHours: number): Promise<boolean> {
+    const db = await getSynthesisDB();
+    const tx = db.transaction("meta", "readwrite");
+    const meta = (await tx.store.get("run")) as SynthesisRunMeta | undefined;
+    const last = meta?.lastAttemptAt ? Date.parse(meta.lastAttemptAt) : NaN;
+    if (Number.isFinite(last) && Date.parse(at) - last < minHours * 3_600_000) {
+      await tx.done;
+      return false;
+    }
+    await tx.store.put({ ...(meta ?? { schemaVersion: SYNTHESIS_SCHEMA_VERSION, key: "run" }), lastAttemptAt: at });
+    await tx.done;
+    return true;
+  },
+
   /** a chat turn used these hypotheses (so that the next run can see how the user answered) */
   async markShown(hypothesisIds: string[], conversationId: string, at: string): Promise<void> {
     if (hypothesisIds.length === 0) return;

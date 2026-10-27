@@ -19,6 +19,7 @@ import {
   gateS1Items,
   planGeneration,
   rejectedForPrompt,
+  SYNTHESIS_S1_LIMITS,
   SYNTHESIS_SCHEMA_VERSION,
   validateReactions,
   type ReactionCheck,
@@ -29,6 +30,8 @@ import {
 export interface SynthesisStorePort {
   load(): Promise<SynthesisState>;
   commit(changes: SynthesisChanges): Promise<void>;
+  /** atomically: false when an attempt was recorded less than `minHours` before `at`; otherwise records `at` as the attempt and returns true */
+  claimRun(at: string, minHours: number): Promise<boolean>;
 }
 
 export interface SynthesisRunDeps {
@@ -53,10 +56,10 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
   const plan = planGeneration(state, memories, now);
   if (!plan.due) return { status: plan.why === "cooldown" ? "cooldown" : "nothing-to-do" };
 
-  const at = new Date(now).toISOString();
-  await deps.store.commit({ meta: { ...(state.meta ?? { schemaVersion: SYNTHESIS_SCHEMA_VERSION, key: "run" }), lastAttemptAt: at } });
+  // one attempt per device per day, also across tabs: the claim is a single read-and-write of the store
+  if (!(await deps.store.claimRun(new Date(now).toISOString(), SYNTHESIS_S1_LIMITS.minHoursBetweenRuns))) return { status: "cooldown" };
 
-  const checks = buildReactionChecks(plan, state, await deps.readConversations());
+  const { checks, examinedThrough } = buildReactionChecks(plan, state, await deps.readConversations());
   let response: { items?: unknown; reactions?: unknown };
   try {
     response = await deps.callApi({ clusters: plan.clusters, rejected: rejectedForPrompt(state, plan), checks });
@@ -68,7 +71,7 @@ export async function runSynthesisOnce(deps: SynthesisRunDeps): Promise<Synthesi
   const items: SynthesisItem[] = gateS1Items(validateSynthesisItems({ items: response.items }, plan.clusters).items, plan.clusters).items;
   const reactions = validateReactions({ reactions: response.reactions }, checks);
   const generationId = deps.newId();
-  const changes = applyGenerationResult(state, plan, { items, reactions }, memories, now, generationId);
+  const changes = applyGenerationResult(state, plan, { items, reactions }, memories, now, generationId, examinedThrough);
   await deps.store.commit(changes);
   return {
     status: "done",
@@ -100,6 +103,12 @@ export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): S
         themeStates: [...themes.values()],
         meta: changes.meta ?? next.meta,
       };
+    },
+    async claimRun(at, minHours) {
+      const last = state.meta?.lastAttemptAt ? Date.parse(state.meta.lastAttemptAt) : NaN;
+      if (Number.isFinite(last) && Date.parse(at) - last < minHours * 3_600_000) return false;
+      state = { ...copy(state), meta: { ...(state.meta ?? { schemaVersion: SYNTHESIS_SCHEMA_VERSION, key: "run" }), lastAttemptAt: at } };
+      return true;
     },
     snapshot() {
       return copy(state);

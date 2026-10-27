@@ -371,18 +371,29 @@ export interface ReactionCheck {
   theme: string;
   statement: string;
   conversationId: string;
+  /** when the hypothesis was used in that conversation */
+  shownAt: string;
   /** Tsumugi's reply right after the hypothesis was used (so the model can see what the user answered to) */
   tsumugiReply: string;
   userTurns: { text: string; at: string }[];
 }
 
-export function buildReactionChecks(plan: SynthesisPlan, state: SynthesisState, conversations: Conversation[]): ReactionCheck[] {
+export interface ReactionChecks {
+  checks: ReactionCheck[];
+  /** per hypothesis: the latest use that was examined (sent for judging, or found to have no answer to judge). Later uses stay pending. */
+  examinedThrough: Record<string, string>;
+}
+
+export function buildReactionChecks(plan: SynthesisPlan, state: SynthesisState, conversations: Conversation[]): ReactionChecks {
   const planned = new Set(plan.themes.filter((t) => t.reasons.includes("reaction-check")).map((t) => t.themeId));
   const convById = new Map(conversations.map((c) => [c.id, c] as const));
   const checks: ReactionCheck[] = [];
+  const examinedThrough: Record<string, string> = {};
   for (const h of state.hypotheses) {
     if (h.status !== "active" || !planned.has(h.themeId)) continue;
     for (const shown of pendingShown(h)) {
+      if (checks.length >= SYNTHESIS_S1_LIMITS.maxReactionChecks) return { checks, examinedThrough };
+      examinedThrough[h.id] = shown.at;
       const conv = convById.get(shown.conversationId);
       if (!conv) continue;
       const after = conv.turns.filter((t) => Date.parse(t.timestamp) >= Date.parse(shown.at));
@@ -392,11 +403,10 @@ export function buildReactionChecks(plan: SynthesisPlan, state: SynthesisState, 
         .slice(0, SYNTHESIS_S1_LIMITS.maxUserTurnsPerCheck)
         .map((t) => ({ text: t.content.slice(0, SYNTHESIS_S1_LIMITS.userTurnLength), at: t.timestamp }));
       if (!reply || userTurns.length === 0) continue;
-      checks.push({ hypothesisId: h.id, theme: h.themeLabel, statement: h.statement, conversationId: conv.id, tsumugiReply: reply.content.slice(0, SYNTHESIS_S1_LIMITS.tsumugiReplyLength), userTurns });
-      if (checks.length >= SYNTHESIS_S1_LIMITS.maxReactionChecks) return checks;
+      checks.push({ hypothesisId: h.id, theme: h.themeLabel, statement: h.statement, conversationId: conv.id, shownAt: shown.at, tsumugiReply: reply.content.slice(0, SYNTHESIS_S1_LIMITS.tsumugiReplyLength), userTurns });
     }
   }
-  return checks;
+  return { checks, examinedThrough };
 }
 
 /** words that make a quote a clear denial / correction (an agreement or a "どうだろう" never matches) */
@@ -407,6 +417,8 @@ export interface JudgedReaction {
   kind: ReactionKind;
   userQuote: string;
   saidAt: string;
+  /** the conversation whose answer the quote comes from */
+  conversationId: string;
 }
 
 /**
@@ -415,21 +427,25 @@ export interface JudgedReaction {
  */
 export function validateReactions(raw: unknown, checks: ReactionCheck[]): JudgedReaction[] {
   const list = raw && typeof raw === "object" && Array.isArray((raw as { reactions?: unknown }).reactions) ? (raw as { reactions: unknown[] }).reactions : [];
-  const byId = new Map(checks.map((c) => [c.hypothesisId, c] as const));
   const out: JudgedReaction[] = [];
   const seen = new Set<string>();
   for (const r of list) {
     if (!r || typeof r !== "object") continue;
     const x = r as Record<string, unknown>;
-    const check = typeof x.hypothesisId === "string" ? byId.get(x.hypothesisId) : undefined;
+    const id = typeof x.hypothesisId === "string" ? x.hypothesisId : "";
     const kind = x.reaction === "rejected" || x.reaction === "corrected" ? x.reaction : null;
     const quote = typeof x.userQuote === "string" ? x.userQuote.trim() : "";
-    if (!check || !kind || quote.length < 2 || seen.has(check.hypothesisId)) continue;
-    // the quote must be the user's own words, and the user's answer must contain a clear denial (the model may quote the corrected part only)
-    const turn = check.userTurns.find((t) => t.text.includes(quote));
-    if (!turn || !DENIAL_CUE.test(turn.text) || AGREEMENT_ONLY.test(turn.text.trim()) || AGREEMENT_ONLY.test(quote)) continue;
-    seen.add(check.hypothesisId);
-    out.push({ hypothesisId: check.hypothesisId, kind, userQuote: quote, saidAt: turn.at });
+    if (!id || !kind || quote.length < 2 || seen.has(id) || AGREEMENT_ONLY.test(quote)) continue;
+    // a hypothesis may have been used in several conversations: the quote must be the user's own words in one of them, and that answer must contain a
+    // clear denial (the model may quote the corrected part only)
+    for (const check of checks) {
+      if (check.hypothesisId !== id) continue;
+      const turn = check.userTurns.find((t) => t.text.includes(quote) && DENIAL_CUE.test(t.text) && !AGREEMENT_ONLY.test(t.text.trim()));
+      if (!turn) continue;
+      seen.add(id);
+      out.push({ hypothesisId: id, kind, userQuote: quote, saidAt: turn.at, conversationId: check.conversationId });
+      break;
+    }
   }
   return out;
 }
@@ -451,7 +467,15 @@ export interface GenerationResult {
  *   - new items that resemble anything the user rejected / corrected on the theme are dropped.
  * Reactions are never removed here.
  */
-export function applyGenerationResult(state: SynthesisState, plan: SynthesisPlan, result: GenerationResult, memories: MemoryObject[], now: number, generationId: string): SynthesisChanges {
+export function applyGenerationResult(
+  state: SynthesisState,
+  plan: SynthesisPlan,
+  result: GenerationResult,
+  memories: MemoryObject[],
+  now: number,
+  generationId: string,
+  examinedThrough: Record<string, string> = {}
+): SynthesisChanges {
   const at = new Date(now).toISOString();
   const byId = new Map(memories.map((m) => [m.id, m] as const));
   const hypById = new Map(state.hypotheses.map((h) => [h.id, h] as const));
@@ -461,7 +485,6 @@ export function applyGenerationResult(state: SynthesisState, plan: SynthesisPlan
     const h = hypById.get(r.hypothesisId);
     if (!h) continue;
     reactedIds.set(h.id, r.kind);
-    const conv = h.shownIn.find((s) => Date.parse(s.at) <= Date.parse(r.saidAt)) ?? h.shownIn[h.shownIn.length - 1];
     newReactions.push({
       schemaVersion: SYNTHESIS_SCHEMA_VERSION,
       origin: "user-reaction",
@@ -473,7 +496,7 @@ export function applyGenerationResult(state: SynthesisState, plan: SynthesisPlan
       hypothesisStatement: h.statement,
       hypothesisEvidenceIds: h.evidence.map((e) => e.memoryId),
       userQuote: r.userQuote,
-      conversationId: conv?.conversationId ?? "",
+      conversationId: r.conversationId,
       saidAt: r.saidAt,
       recordedAt: at,
     });
@@ -490,7 +513,8 @@ export function applyGenerationResult(state: SynthesisState, plan: SynthesisPlan
     const regenerate = reacted || theme.reasons.some((r) => r !== "reaction-check");
     for (const h of own) {
       const kind = reactedIds.get(h.id);
-      const checkedThrough = h.shownIn.length > 0 ? h.shownIn.map((s) => s.at).sort().slice(-1)[0] : h.reactionsCheckedThrough;
+      // only the uses that were actually examined count as judged; later ones stay pending for the next run
+      const checkedThrough = examinedThrough[h.id] ?? h.reactionsCheckedThrough;
       if (kind) putHypotheses.push({ ...h, status: kind, reactionsCheckedThrough: checkedThrough });
       else if (regenerate && h.status === "active") deleteHypothesisIds.push(h.id);
       else if (checkedThrough !== h.reactionsCheckedThrough) putHypotheses.push({ ...h, reactionsCheckedThrough: checkedThrough });

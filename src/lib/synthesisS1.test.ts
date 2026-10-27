@@ -178,7 +178,7 @@ test("an unclear answer, an agreement or a quote that is not the user's changes 
 });
 
 test("validateReactions: only a verbatim, clear denial of the user survives", () => {
-  const check: ReactionCheck = { hypothesisId: "h1", theme: "仕事", statement: "x", conversationId: "c", tsumugiReply: "y", userTurns: [{ text: "いや、それは違うと思う。趣味で続けたいだけ", at: "2026-10-27T00:00:00.000Z" }, { text: "そうかも", at: "2026-10-27T00:01:00.000Z" }] };
+  const check: ReactionCheck = { hypothesisId: "h1", theme: "仕事", statement: "x", conversationId: "c", shownAt: "2026-10-26T23:59:00.000Z", tsumugiReply: "y", userTurns: [{ text: "いや、それは違うと思う。趣味で続けたいだけ", at: "2026-10-27T00:00:00.000Z" }, { text: "そうかも", at: "2026-10-27T00:01:00.000Z" }] };
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "corrected", userQuote: "それは違うと思う" }] }, [check]).length, 1);
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "そうかも" }] }, [check]).length, 0, "agreement");
   assert.equal(validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "全然違う" }] }, [check]).length, 0, "not the user's words");
@@ -204,6 +204,40 @@ test("gateS1Items: a joined sentence is never 'stated'; an unspoken cause must b
   assert.equal(cause.dropped, 1);
   const hedged = gateS1Items([{ ...base, statement: "家庭を優先するために、試験より時短勤務を選んだのかもしれない。", support: "derived" }], [cluster]);
   assert.equal(hedged.items[0].support, "hypothesis");
+});
+
+test("a hypothesis used in several conversations: a denial in an earlier one counts, and the reaction keeps that conversation", () => {
+  const base = { hypothesisId: "h1", theme: "姉", statement: "x", tsumugiReply: "r" };
+  const checks: ReactionCheck[] = [
+    { ...base, conversationId: "c-early", shownAt: "2026-10-20T00:00:00.000Z", userTurns: [{ text: "それは違うよ", at: "2026-10-20T00:01:00.000Z" }] },
+    { ...base, conversationId: "c-late", shownAt: "2026-10-25T00:00:00.000Z", userTurns: [{ text: "そうかも", at: "2026-10-25T00:01:00.000Z" }] },
+  ];
+  const judged = validateReactions({ reactions: [{ hypothesisId: "h1", reaction: "rejected", userQuote: "それは違う" }] }, checks);
+  assert.equal(judged.length, 1);
+  assert.equal(judged[0].conversationId, "c-early");
+});
+
+test("only examined uses are marked as judged: beyond the per-run limit they stay pending for the next run", async () => {
+  const { memories, store } = await firstRun();
+  const target = store.snapshot().hypotheses[0];
+  const uses = Array.from({ length: 10 }, (_, i) => ({ conversationId: `c-${i}`, at: new Date(NOW + (i + 1) * 60_000).toISOString() }));
+  await store.commit({ putHypotheses: [{ ...target, shownIn: uses }] });
+  const conversations = uses.map((u, i) => shownConversation(u.conversationId, Date.parse(u.at), i === 9 ? "いや、それは違うよ" : "うーん、どうだろう"));
+  const api = fakeApi();
+  await runSynthesisOnce(deps(store, memories, api.callApi, NOW + 30 * H, conversations));
+  assert.equal(api.calls[0].checks.length, 8);
+  const after = store.snapshot().hypotheses.find((h) => h.id === target.id)!;
+  assert.equal(after.reactionsCheckedThrough, uses[7].at, "the 9th and 10th uses are still waiting");
+  assert.ok(planGeneration({ ...store.snapshot(), meta: null }, memories, NOW + 60 * H).themes.some((t) => t.themeId === target.themeId && t.reasons.includes("reaction-check")));
+});
+
+test("two tabs ending a session at the same time: only one generation call", async () => {
+  const memories = fictionalSynthesisMemories();
+  const store = createMemorySynthesisStore();
+  const api = fakeApi();
+  const [a, b] = await Promise.all([runSynthesisOnce(deps(store, memories, api.callApi, NOW)), runSynthesisOnce(deps(store, memories, api.callApi, NOW))]);
+  assert.equal(api.calls.length, 1);
+  assert.deepEqual([a.status, b.status].sort(), ["cooldown", "done"]);
 });
 
 test("an agreement captured from a conversation where a hypothesis was used is not evidence; the user's substantive words still are", () => {
@@ -293,8 +327,8 @@ test("route: only real evidence, nothing resembling a rejected reading, and only
     ],
   });
   const checks = [
-    { hypothesisId: "h1", theme: "仕事", statement: "a", conversationId: "c", tsumugiReply: "r", userTurns: [{ text: "デザインは趣味で、仕事にしたいわけじゃない", at: "2026-10-27T00:00:00.000Z" }] },
-    { hypothesisId: "h2", theme: "仕事", statement: "b", conversationId: "c", tsumugiReply: "r", userTurns: [{ text: "うーん、どうだろう", at: "2026-10-27T00:00:00.000Z" }] },
+    { hypothesisId: "h1", theme: "仕事", statement: "a", conversationId: "c", shownAt: "2026-10-26T00:00:00.000Z", tsumugiReply: "r", userTurns: [{ text: "デザインは趣味で、仕事にしたいわけじゃない", at: "2026-10-27T00:00:00.000Z" }] },
+    { hypothesisId: "h2", theme: "仕事", statement: "b", conversationId: "c", shownAt: "2026-10-26T00:00:00.000Z", tsumugiReply: "r", userTurns: [{ text: "うーん、どうだろう", at: "2026-10-27T00:00:00.000Z" }] },
   ];
   const res = await route.POST(new Request("http://x/api/synthesize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clusters: plan.clusters, rejected: [{ theme: "仕事", statement: "仕事より家族を優先したいと考えるようになったと話している。", userQuote: "違う" }], checks }) }));
   const out = (await res.json()) as { items: { statement: string }[]; reactions: { hypothesisId: string }[]; dropped: Record<string, number> };

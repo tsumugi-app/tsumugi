@@ -63,6 +63,7 @@ function sanitizeChecks(raw: unknown): ReactionCheck[] {
       theme: str(x.theme, 40),
       statement: str(x.statement, SYNTHESIS_LIMITS.maxStatementLength),
       conversationId: str(x.conversationId, 80),
+      shownAt: str(x.shownAt, 40),
       tsumugiReply: str(x.tsumugiReply, SYNTHESIS_S1_LIMITS.tsumugiReplyLength),
       userTurns,
     };
