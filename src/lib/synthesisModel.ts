@@ -162,18 +162,22 @@ export interface SynthesisChanges {
   meta?: SynthesisRunMeta;
 }
 
-/** uses recorded while a run was waiting for the AI must survive the run's commit: the stored and the committed use lists are merged, never replaced */
-export function mergeShown(stored: StoredHypothesis["shownIn"], incoming: StoredHypothesis["shownIn"]): StoredHypothesis["shownIn"] {
+/**
+ * Uses recorded while a run was waiting for the AI must survive the run's commit: the stored and the committed use lists are merged, never replaced.
+ * Uses not yet judged (later than `checkedThrough`) are always kept; only already judged ones are trimmed (to the latest 10).
+ */
+export function mergeShown(stored: StoredHypothesis["shownIn"], incoming: StoredHypothesis["shownIn"], checkedThrough?: string): StoredHypothesis["shownIn"] {
   const seen = new Set<string>();
-  return [...stored, ...incoming]
+  const all = [...stored, ...incoming]
     .filter((s) => {
       const key = `${s.conversationId}@${s.at}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     })
-    .sort((a, b) => a.at.localeCompare(b.at))
-    .slice(-20);
+    .sort((a, b) => a.at.localeCompare(b.at));
+  const judged = all.filter((s) => checkedThrough !== undefined && s.at <= checkedThrough);
+  return [...judged.slice(-10), ...all.filter((s) => checkedThrough === undefined || s.at > checkedThrough)];
 }
 
 /** the store's decision for one entry of `removeHypotheses`, given what is stored now */

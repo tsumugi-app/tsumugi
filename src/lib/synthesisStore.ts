@@ -117,7 +117,7 @@ export const synthesisStore: SynthesisStorePort & {
     // merge, never replace, the uses: a chat turn may have recorded a use while this run was waiting for the AI
     for (const h of changes.putHypotheses ?? []) {
       const stored = (await hyp.get(h.id)) as StoredHypothesis | undefined;
-      void hyp.put(stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn) } : h);
+      void hyp.put(stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn, h.reactionsCheckedThrough) } : h);
     }
     const reactions = tx.objectStore("reactions");
     // reactions are only added (add() never overwrites an existing one)
@@ -155,7 +155,7 @@ export const synthesisStore: SynthesisStorePort & {
     for (const id of hypothesisIds) {
       const h = (await hyp.get(id)) as StoredHypothesis | undefined;
       if (!h) continue;
-      void hyp.put({ ...h, shownIn: mergeShown(h.shownIn, [{ conversationId, at }]) });
+      void hyp.put({ ...h, shownIn: mergeShown(h.shownIn, [{ conversationId, at }], h.reactionsCheckedThrough) });
       void exp.put(addExposure((await exp.get(conversationId)) as HypothesisExposure | undefined, conversationId, h.themeId, at));
     }
     await tx.done;

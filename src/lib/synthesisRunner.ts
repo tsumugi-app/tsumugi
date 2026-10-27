@@ -122,7 +122,7 @@ export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): S
       }
       for (const h of changes.putHypotheses ?? []) {
         const stored = hyps.get(h.id);
-        hyps.set(h.id, stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn) } : h);
+        hyps.set(h.id, stored ? { ...h, shownIn: mergeShown(stored.shownIn, h.shownIn, h.reactionsCheckedThrough) } : h);
       }
       const themes = new Map(next.themeStates.map((t) => [t.themeId, t] as const));
       for (const t of changes.putThemeStates ?? []) themes.set(t.themeId, t);
@@ -139,7 +139,7 @@ export function createMemorySynthesisStore(initial?: Partial<SynthesisState>): S
       const next = copy(state);
       for (const h of next.hypotheses) {
         if (!hypothesisIds.includes(h.id)) continue;
-        h.shownIn = mergeShown(h.shownIn, [{ conversationId, at }]);
+        h.shownIn = mergeShown(h.shownIn, [{ conversationId, at }], h.reactionsCheckedThrough);
         const i = next.exposures.findIndex((e) => e.conversationId === conversationId);
         const updated = addExposure(i >= 0 ? next.exposures[i] : undefined, conversationId, h.themeId, at);
         if (i >= 0) next.exposures[i] = updated; else next.exposures.push(updated);

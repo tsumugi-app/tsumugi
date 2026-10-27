@@ -13,6 +13,7 @@ import { fictionalSynthesisMemories } from "./synthesisFictionalData";
 import {
   AGREEMENT_ONLY,
   eligibleEvidenceMemories,
+  mergeShown,
   gateS1Items,
   keywordThemeId,
   planGeneration,
@@ -276,6 +277,14 @@ test("a reset while a run waits for the AI: the run writes nothing afterwards", 
   assert.equal(out.status, "failed");
   const s = store.snapshot();
   assert.deepEqual([s.hypotheses.length, s.reactions.length, s.themeStates.length], [0, 0, 0]);
+});
+
+test("the use history never drops a use that has not been judged yet", () => {
+  const uses = Array.from({ length: 30 }, (_, i) => ({ conversationId: "c-long", at: new Date(NOW + i * 60_000).toISOString() }));
+  assert.equal(mergeShown([], uses).length, 30, "nothing judged yet: all kept");
+  const merged = mergeShown(uses.slice(0, 25), uses.slice(25), uses[19].at);
+  assert.ok(merged.some((s) => s.at === uses[20].at) && merged.some((s) => s.at === uses[29].at), "every unjudged use is kept");
+  assert.equal(merged.filter((s) => s.at <= uses[19].at).length, 10, "judged ones are trimmed");
 });
 
 test("two tabs ending a session at the same time: only one generation call", async () => {
