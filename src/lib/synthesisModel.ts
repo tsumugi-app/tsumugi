@@ -19,6 +19,7 @@
  */
 import type { Conversation, MemoryObject } from "./types";
 import { normalizeAnalyticsKeyword } from "./memoryAnalytics";
+import { jstDateOf } from "./dateModel";
 import {
   buildSynthesisClusters,
   buildThemeTimeline,
@@ -676,7 +677,8 @@ export function attachCorrections(contexts: SynthesisThemeContext[], reactions: 
       .filter((r) => r.themeId === id)
       .sort((a, b) => b.saidAt.localeCompare(a.saidAt))
       .slice(0, 2)
-      .map((r) => ({ kind: r.kind, saidAt: r.saidAt.slice(0, 10), userQuote: r.userQuote, aboutReading: r.hypothesisStatement }));
+      // the user's calendar day (JST), not the UTC date: a correction made just now must not read as "yesterday"
+      .map((r) => ({ kind: r.kind, saidAt: jstDateOf(r.saidAt) ?? r.saidAt.slice(0, 10), userQuote: r.userQuote, aboutReading: r.hypothesisStatement }));
     return corrections.length > 0 ? { ...c, corrections } : c;
   });
 }

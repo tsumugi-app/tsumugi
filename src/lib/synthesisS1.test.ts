@@ -299,6 +299,8 @@ test("the user's correction goes to the chat with its own theme only, as the use
   assert.ok(section.includes("2026-10-27に、Tsumugiの「姉に対して複雑な感情を抱いている。」という見方に対して、ユーザー自身が「複雑ってほどじゃないよ。姉には普通に感謝してる」と訂正した"));
   assert.ok(section.includes("Tsumugiの読みではない") && section.includes("過去の出来事を消したり書き換えたりしない") && section.includes("後で変わることもある"));
   // the route accepts it as sent (and nothing else)
+  // the date is the user's (JST) day: 2026-10-27T17:00Z is already 10-28 in Japan
+  assert.equal(attachCorrections([ctx("姉")], [{ ...reaction, saidAt: "2026-10-27T17:00:00.000Z" }])[0].corrections?.[0].saidAt, "2026-10-28");
   const roundTrip = sanitizeSynthesisContext(JSON.parse(JSON.stringify(attached)));
   assert.equal(roundTrip[0].corrections?.[0].userQuote, reaction.userQuote);
   assert.equal(roundTrip[1].corrections, undefined);
