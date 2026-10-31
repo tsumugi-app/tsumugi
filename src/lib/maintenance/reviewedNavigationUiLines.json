@@ -1,5 +1,5 @@
 {
- "review": "Navigation UI (bottom bar order, history icon, home button, draft kept across screen moves). Exact +/- lines of ChatScreen.tsx; no Memory / Vault / Outbox / sync / AI change.",
+ "review": "Navigation UI (bottom bar order, history icon, home button, draft kept across screen moves and cleared when the Vault changes). Exact +/- lines of ChatScreen.tsx; no Memory / Vault / Outbox / sync / AI change.",
  "lines": [
   "+",
   "+);",
@@ -19,6 +19,7 @@
   "+/** 再マウント時に復元する書きかけの文章（ChatScreenのdraftRef） */",
   "+/** 履歴アイコン：時計＋反時計回りの矢印（リロードの「↻」と見分けやすい形） */",
   "+// Vault境界の安全性：切替処理中はSource保存（Import）を新規に開始させない。",
+  "+// 保存先（Memory World）が変わる境界では、書きかけの文章も前の保存先のものとして捨てる（新しい保存先の会話へ持ち越さない）",
   "+</button>",
   "+</div>",
   "+</nav>",
@@ -62,6 +63,7 @@
   "+const el = logoRef.current;",
   "+const logoRef = useRef<HTMLDivElement>(null);",
   "+const observer = new IntersectionObserver(([entry]) => setLogoVisible(entry.isIntersecting));",
+  "+draftRef.current = \"\";",
   "+draftRef.current = text;",
   "+function HistoryIcon() {",
   "+function HomeIcon() {",

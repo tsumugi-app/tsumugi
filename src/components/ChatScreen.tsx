@@ -1456,6 +1456,8 @@ export default function ChatScreen() {
     setImportOpen(false);
     setLaunchTreeSignals(null);
     setEntryConfirmed(false);
+    // 保存先（Memory World）が変わる境界では、書きかけの文章も前の保存先のものとして捨てる（新しい保存先の会話へ持ち越さない）
+    draftRef.current = "";
     setInputResetKey((key) => key + 1);
     // 安全性レビュー対応（H2）：Vault世代が変わる際、旧Vaultに対する軽量「外部の変更」
     // 検知の状態（discovery/classification結果を含む）を必ず初期化する。
