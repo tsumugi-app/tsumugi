@@ -777,12 +777,6 @@ export default function ChatScreen() {
    */
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
-  /**
-   * 未送信の下書き（表示専用のref）。ChatInputは1文字ごとにここへ書くだけで、ChatScreenを再レンダリングしない。
-   * ホーム（トップ画面）へ戻る・ペルソナを切り替える際にChatInputは再マウントされるが、
-   * 再マウント時の初期値としてここから復元するため、書きかけの文章は失われない（送信に成功した時だけ空になる）。
-   */
-  const draftRef = useRef("");
   /** 会話領域の先頭のロゴ。画面内に見えていない間だけ、会話領域の左上にホームボタンを出す（ロゴが見えている間はロゴ自体がホームへの導線）。 */
   const logoRef = useRef<HTMLDivElement>(null);
   const [logoVisible, setLogoVisible] = useState(true);
@@ -1456,8 +1450,6 @@ export default function ChatScreen() {
     setImportOpen(false);
     setLaunchTreeSignals(null);
     setEntryConfirmed(false);
-    // 保存先（Memory World）が変わる境界では、書きかけの文章も前の保存先のものとして捨てる（新しい保存先の会話へ持ち越さない）
-    draftRef.current = "";
     setInputResetKey((key) => key + 1);
     // 安全性レビュー対応（H2）：Vault世代が変わる際、旧Vaultに対する軽量「外部の変更」
     // 検知の状態（discovery/classification結果を含む）を必ず初期化する。
@@ -5134,7 +5126,25 @@ export default function ChatScreen() {
         一定の余白が効くよう、keyboardVisibleでは分岐させない（今回の追加は
         ごく小さい固定値のため、キーボード表示時の高さへの影響は軽微）。
       */}
-      <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pt-8 pb-12 sm:pb-8">
+      {/*
+        スマホの会話中だけのコンパクトなヘッダー：左上に「家のアイコン＋ホーム」を常に出す（スクロール位置に関係なく押せる）。
+        スクロール領域（main）の外のshrink-0の行なので、本文や入力欄に重ならない。上端はセーフエリアの分だけ下げる。
+        動作はロゴタップと同じhandleGoToTop。履歴ボタン（画面下部の左）とは離して置く。
+      */}
+      {!showEntryScreen && (
+        <header className="flex shrink-0 items-center px-3 pt-[max(0.25rem,env(safe-area-inset-top))] sm:hidden">
+          <button
+            type="button"
+            onClick={handleGoToTop}
+            aria-label="ホームへ戻る"
+            className="flex h-11 items-center gap-1.5 rounded-full px-3 text-sm text-stone-500 transition hover:bg-stone-900/5 hover:text-stone-700 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+          >
+            <HomeIcon />
+            <span>ホーム</span>
+          </button>
+        </header>
+      )}
+      <main className={`mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pb-12 sm:pt-8 sm:pb-8 ${showEntryScreen ? "pt-8" : "pt-2"}`}>
         {/*
           ロゴ（header）とneeds-permissionカードは、以前はroot直下・main（スクロール
           コンテナ）の外にあり、会話をスクロールしても画面上部に残り続けていた。
@@ -5150,29 +5160,31 @@ export default function ChatScreen() {
           ロゴ画像自体（img・button）のクラスは一切変更していない。
         */}
         {/*
-          ホームへ戻るボタン：長い会話でも一番上までスクロールせずにトップ画面へ戻れるよう、
-          ロゴが画面外にある間だけ会話領域の左上に出す。動作はロゴタップと同じhandleGoToTop
-          （画面遷移のみ。リロードしない・会話を削除しない。書きかけの文章はdraftRefで保持）。
+          PCのホームへ戻るボタン：長い会話でも一番上までスクロールせずにトップ画面へ戻れるよう、
+          ロゴが画面外にある間だけ会話領域の左上に出す（ロゴが見えている間はロゴ自体がホームへの導線なので、両方は同時に出ない）。
+          動作はロゴタップと同じhandleGoToTop（今の会話を区切って保存し、トップへ画面遷移。リロードしない・下書きは捨てる）。
           sticky top-0のゼロ高さ要素に載せて本文の高さを変えず、flex-colのgap-6は-mb-6で打ち消す。
+          スマホは会話中ロゴを出さず、画面上部のコンパクトなヘッダーにホームボタンを常に出す（下記header）。
         */}
         {!showEntryScreen && (
-          <div className="sticky top-0 z-10 -mb-6 h-0">
+          <div className="sticky top-0 z-10 -mb-6 hidden h-0 sm:block">
             <button
               type="button"
               onClick={handleGoToTop}
               aria-label="ホームへ戻る"
               tabIndex={logoVisible ? -1 : 0}
               aria-hidden={logoVisible}
-              className={`absolute -left-2 top-2 flex h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border border-stone-300/70 bg-white/85 px-2.5 text-stone-500 shadow-sm backdrop-blur transition hover:text-stone-700 dark:border-stone-700/70 dark:bg-stone-900/85 dark:text-stone-400 dark:hover:text-stone-200 sm:-left-1 sm:px-3 ${
+              className={`absolute -left-1 top-2 flex h-10 items-center justify-center gap-1.5 rounded-full border border-stone-300/70 bg-white/85 px-3 text-stone-500 shadow-sm backdrop-blur transition hover:text-stone-700 dark:border-stone-700/70 dark:bg-stone-900/85 dark:text-stone-400 dark:hover:text-stone-200 ${
                 logoVisible ? "pointer-events-none opacity-0" : "opacity-100"
               }`}
             >
               <HomeIcon />
-              <span className="hidden text-xs sm:inline">ホーム</span>
+              <span className="text-xs">ホーム</span>
             </button>
           </div>
         )}
-        <div ref={logoRef} className="flex items-center justify-center">
+        {/* スマホの会話中はロゴを出さない（表示領域を広げる。ホームへはヘッダーのボタンで戻る）。トップ画面とPCは従来どおり */}
+        <div ref={logoRef} className={`items-center justify-center ${showEntryScreen ? "flex" : "hidden sm:flex"}`}>
           <button
             type="button"
             onClick={handleGoToTop}
@@ -5641,8 +5653,9 @@ export default function ChatScreen() {
             いる。理由・詳細はChatInpu本体のコメントを参照（iPad ChromeでBackspace
             長押しが連続削除にならない問題の調査を踏まえ、1文字ごとのsetStateで
             ChatScreen全体が再レンダリングされないようにするため）。
-            key={inputResetKey}：ペルソナ切替・トップへ戻る際にChatInputごと再マウントさせる。
-            書きかけの文章は再マウント時にdraftRefから復元する（以前はここで下書きをクリアしていた）。
+            key={inputResetKey}：ペルソナ切替・トップへ戻る際に「入力中の下書きを
+            クリアする」という既存仕様を、ChatInputのローカルstateへ外部から
+            触れずに実現するため、keyを変えてChatInputごと再マウントさせている。
             履歴・読み込むボタンは画面下部のナビゲーション（スマホ・PC共通）へ移した。
           */}
           <ChatInput
@@ -5652,10 +5665,6 @@ export default function ChatScreen() {
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
             onSend={(text) => void handleSend(text)}
-            initialValue={draftRef.current}
-            onDraftChange={(text) => {
-              draftRef.current = text;
-            }}
           />
         </div>
 
@@ -6037,9 +6046,11 @@ function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null;
  * 既存のoverrideText引数をそのまま使えるため、ロジック自体は変更していない）。
  * 送信後はこのコンポーネント自身がローカルstateを空文字へ戻す。
  *
- * ペルソナ切替・トップへ戻る際は、親（ChatScreen）がこのコンポーネントに渡す`key`を変えて
- * 丸ごと再マウントさせる。書きかけの文章は失わない：入力のたびにonDraftChangeで親のrefへ
- * 写しておき、再マウント時はinitialValueとして受け取って復元する（親は再レンダリングしない）。
+ * 「ペルソナ切替・トップへ戻る際に入力中の下書きをクリアする」という既存仕様は、
+ * 親（ChatScreen）がこのコンポーネントに渡す`key`を変えることで実現する
+ * （keyが変わるとReactはこのコンポーネントを丸ごと再マウントし、ローカルstateは
+ * 初期値の空文字に戻る。ChatScreen側からローカルstateへ直接触る手段は持たせない）。
+ * 履歴は会話の上に重ねて表示するだけでこのコンポーネントを外さないため、履歴を見て戻っても下書きは残る。
  *
  * 履歴・Import（＋）ボタンは、スマホ・PCで位置と順序を揃えるため画面下部のナビゲーションへ移した。
  *
@@ -6053,22 +6064,12 @@ function ChatInput({
   disabled,
   placeholder,
   onSend,
-  initialValue,
-  onDraftChange,
 }: {
   disabled: boolean;
   placeholder: string;
   onSend: (text: string) => void;
-  /** 再マウント時に復元する書きかけの文章（ChatScreenのdraftRef） */
-  initialValue: string;
-  /** 入力のたびに呼ぶ。ChatScreen側はrefへ書くだけで再レンダリングしない */
-  onDraftChange: (text: string) => void;
 }) {
-  const [value, setValue] = useState(initialValue);
-
-  useEffect(() => {
-    onDraftChange(value);
-  }, [value, onDraftChange]);
+  const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {

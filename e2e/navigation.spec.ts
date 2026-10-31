@@ -21,18 +21,23 @@ async function seed(page: Page) {
   });
 }
 
-/** fictional AI: a long streamed reply for the chat, and a plain failure for everything else (capture, prompts, …), which the app already tolerates */
-async function fakeApi(page: Page) {
+/** fictional AI: a long streamed reply for the chat, and a plain failure for everything else (capture, prompts, …), which the app already tolerates.
+ *  Returns the request bodies sent to /api/capture (the conversation boundary). */
+async function fakeApi(page: Page): Promise<string[]> {
   let n = 0;
+  const captures: string[] = [];
   await page.route("**/api/**", async (route) => {
-    if (route.request().url().includes("/api/chat")) {
+    const url = route.request().url();
+    if (url.includes("/api/chat")) {
       n += 1;
       const lines = Array.from({ length: 30 }, (_, i) => `返答${n}の${i + 1}行目。架空の長い返答です。`);
       await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: `${lines.join("\n")}\n返答${n}の終わり` });
     } else {
+      if (url.includes("/api/capture")) captures.push(route.request().postData() ?? "");
       await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
     }
   });
+  return captures;
 }
 
 async function openApp(page: Page) {
@@ -56,11 +61,15 @@ const VIEWPORTS = [
 ] as const;
 
 for (const [name, size, phone] of VIEWPORTS) {
-  test(`navigation (${name}): bottom bar order and size, home from a long conversation without scrolling, draft kept, history returns to the same place`, async ({ page }) => {
+  test(`navigation (${name}): bottom bar, the home button (ends the conversation, drops the draft), the history (keeps the conversation, the place and the draft)`, async ({ page }) => {
     await page.setViewportSize(size);
     await seed(page);
-    await fakeApi(page);
+    const captures = await fakeApi(page);
     await openApp(page);
+    const logo = page.getByRole("button", { name: "トップ画面へ戻る" });
+    const home = page.getByRole("button", { name: "ホームへ戻る" });
+    await expect(logo).toBeVisible();                                         // the top page keeps its logo on every width
+    await expect(home).toHaveCount(0);
 
     // the bottom bar: history, ＋, settings — in this order; icon only on phones (44px targets), icon + label on PCs
     const nav = page.getByRole("navigation", { name: "メインナビゲーション" });
@@ -83,10 +92,22 @@ for (const [name, size, phone] of VIEWPORTS) {
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);   // no sideways scroll
 
-    // a long conversation
+    // a conversation starts: phones swap the big logo for a compact header with the home button at the top left; PCs keep the logo (home appears only when it is out of view)
     await page.getByRole("button", { name: "会話", exact: true }).click();
     const footer = page.locator("footer");
     const input = footer.locator("textarea");
+    const main = page.locator("main");
+    if (phone) {
+      await expect(logo).toBeHidden();
+      await expect(home).toBeVisible();
+      await expect(home).toContainText("ホーム");
+      const hb = (await home.boundingBox())!, mb = (await main.boundingBox())!;
+      expect(hb.x).toBeLessThan(40); expect(hb.y).toBeLessThan(20); expect(hb.height).toBeGreaterThanOrEqual(44);
+      expect(hb.y + hb.height).toBeLessThanOrEqual(mb.y + 1);                 // the header sits above the conversation, never over it
+    } else {
+      await expect(logo).toBeInViewport();
+      await expect(home).toHaveCount(0);                                      // not shown next to a visible logo
+    }
     for (let i = 1; i <= 4; i++) {
       await input.fill(`メッセージ${i}（架空）`);
       await footer.getByRole("button", { name: "送る" }).click();
@@ -98,19 +119,24 @@ for (const [name, size, phone] of VIEWPORTS) {
     expect(navBox.y + navBox.height).toBeLessThanOrEqual(size.height + 1);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
-    // the logo is far above; the home button is shown instead
-    const main = page.locator("main");
-    await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
-    await expect(page.getByRole("button", { name: "トップ画面へ戻る" })).not.toBeInViewport();
-    const home = page.getByRole("button", { name: "ホームへ戻る" });
-    await expect(home).toBeInViewport();
-    const homeBox = (await home.boundingBox())!;
-    expect(homeBox.y + homeBox.height).toBeLessThanOrEqual(inputBox.y);       // nowhere near the input or the bar
+    // whatever the scroll position, the home button can be pressed without scrolling up (PC: the logo is out of view, so home is shown instead; never both)
+    for (const where of ["bottom", "middle"] as const) {
+      await main.evaluate((el, where) => el.scrollTo({ top: where === "bottom" ? el.scrollHeight : el.scrollHeight / 2 }), where);
+      await expect(home).toBeInViewport();
+      if (!phone) await expect(logo).not.toBeInViewport();
+      const hb = (await home.boundingBox())!;
+      expect(hb.y + hb.height).toBeLessThanOrEqual(inputBox.y);
+      const hist = (await history.boundingBox())!;
+      expect(Math.hypot(hist.x - hb.x, hist.y - hb.y)).toBeGreaterThan(200);  // home and history are far apart
+    }
+    if (!phone) {
+      await main.evaluate((el) => el.scrollTo({ top: 0 }));
+      await expect(logo).toBeInViewport();
+      await expect(home).toHaveCount(0);
+    }
 
-    // an unsent draft
+    // the history opens over the conversation and closes back to the same conversation, place and draft
     await input.fill("書きかけの文章（架空）");
-
-    // the history opens over the conversation and closes back to the same place
     await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight / 2 }));
     const scrolledTo = await main.evaluate((el) => el.scrollTop);
     await history.click();
@@ -119,30 +145,35 @@ for (const [name, size, phone] of VIEWPORTS) {
     await expect(page.getByText("返答4の終わり")).toBeAttached();
     expect(Math.abs((await main.evaluate((el) => el.scrollTop)) - scrolledTo)).toBeLessThanOrEqual(2);
     await expect(input).toHaveValue("書きかけの文章（架空）");
+    expect(captures.length).toBe(0);                                          // the history did not end the conversation
 
-    // home: a screen change, not a reload; the conversation is not deleted; the draft comes back with the next conversation
-    await page.evaluate(() => { (window as any).__noReload = true; });
-    await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
-    await home.click();
-    await expect(page.getByText("今日は、どう話そう？")).toBeVisible();
-    expect(await page.evaluate(() => (window as any).__noReload)).toBe(true);
-    await expect.poll(() => conversationsWith(page, "メッセージ1（架空）")).toBeGreaterThanOrEqual(1);
-    await page.getByRole("button", { name: "会話", exact: true }).click();
-    await expect(page.locator("footer textarea")).toHaveValue("書きかけの文章（架空）");
-
-    // a sent message clears the draft for good
-    await page.locator("footer textarea").fill("送る文章（架空）");
-    await page.locator("footer").getByRole("button", { name: "送る" }).click();
-    await expect(page.getByText("返答5の終わり")).toBeVisible({ timeout: 30_000 });
-    await expect(page.locator("footer textarea")).toHaveValue("");
-
-    // ＋ and settings still open their screens
+    // ＋ and settings still open their screens and come back to the same conversation
     await importButton.click();
     await expect(page.getByText("Import", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "閉じる" }).click();
     await settings.click();
     await expect(page.getByRole("button", { name: "閉じる" }).first()).toBeVisible();
     await page.getByRole("button", { name: "閉じる" }).first().click();
-    await expect(page.locator("footer textarea")).toBeVisible();
+    await expect(input).toHaveValue("書きかけの文章（架空）");
+
+    // home: ends the conversation (the usual boundary: the conversation is handed to Capture and stays on the device), a screen change (no reload), the draft is dropped
+    await page.evaluate(() => { (window as any).__noReload = true; });
+    await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
+    await home.click();
+    await expect(page.getByText("今日は、どう話そう？")).toBeVisible();
+    await expect(logo).toBeVisible();
+    expect(await page.evaluate(() => (window as any).__noReload)).toBe(true);
+    await expect.poll(() => captures.length).toBe(1);
+    expect(captures[0]).toContain("メッセージ4（架空）");
+    await expect.poll(() => conversationsWith(page, "メッセージ1（架空）")).toBe(1);
+    // the next talk is a new conversation with an empty input
+    await page.getByRole("button", { name: "会話", exact: true }).click();
+    await expect(page.locator("footer textarea")).toHaveValue("");
+    await expect(page.getByText("返答4の終わり")).toHaveCount(0);
+    await page.locator("footer textarea").fill("新しい会話（架空）");
+    await page.locator("footer").getByRole("button", { name: "送る" }).click();
+    await expect(page.getByText("返答5の終わり")).toBeVisible({ timeout: 30_000 });
+    await expect.poll(() => conversationsWith(page, "新しい会話（架空）")).toBe(1);
+    expect(await page.evaluate(() => (window as any).__noReload)).toBe(true);
   });
 }
