@@ -101,11 +101,17 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
   const query = keys.reduce((q, k) => q.split(k).join(" "), nfkc(turns.join(" ")).replace(/(さん|ちゃん|くん|君|様|氏)/g, " "));
   const newest = [...candidates].sort((a, b) => timeOf(b) - timeOf(a))[0];
   if (newest) added.push({ id: newest.id, why: "この人物の最新の記録" });
+  // a record "overlaps" only when one of its own keywords (not the person's name) appears in the conversation; text similarity only breaks ties
   const overlap = candidates
     .filter((m) => m !== newest)
-    .map((m) => ({ m, score: scoreMemory({ ...m, keywords: (m.keywords ?? []).filter((k) => !keys.includes(personKey(k))), summary: keys.reduce((t, k) => t.split(k).join(" "), m.summary), content: "" }, query) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score || timeOf(b.m) - timeOf(a.m))[0];
+    .map((m) => {
+      const ownKeywords = (m.keywords ?? []).filter((k) => !keys.includes(personKey(k)));
+      const hits = ownKeywords.filter((k) => query.includes(nfkc(k))).length;
+      const tie = scoreMemory({ ...m, keywords: [], summary: keys.reduce((t, k) => t.split(k).join(" "), m.summary), content: "" }, query);
+      return { m, hits, tie };
+    })
+    .filter((x) => x.hits > 0)
+    .sort((a, b) => b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m))[0];
   if (overlap) added.push({ id: overlap.m.id, why: "会話の内容と最も重なる記録" });
   const extra = added.slice(0, PERSON_EXTRA_LIMIT).map((a) => pool.find((m) => m.id === a.id)!);
   return { memories: [...kept, ...extra], target, added: added.slice(0, PERSON_EXTRA_LIMIT), dropped };
