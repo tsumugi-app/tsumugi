@@ -1,4 +1,4 @@
-import { conversationVoice } from "@/lib/conversationVoice";
+import { conversationVoice, evalVoiceNote } from "@/lib/conversationVoice";
 import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
@@ -942,7 +942,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, evalVoiceVariant, debugGenerationId } = (await request.json()) as {
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -968,6 +968,8 @@ export async function POST(request: Request) {
      * 完全に同一（バイト単位で変化しない）。
      */
     debugGenerationId?: string;
+    /** EXPERIMENT (Preview only, ignored in production builds): emotional-understanding comparison, condition D */
+    evalVoiceVariant?: unknown;
   };
 
   if (!turns || turns.length === 0) {
@@ -1102,7 +1104,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
   const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${evalVoiceNote(evalVoiceVariant, process.env.VERCEL_ENV === "production")}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
