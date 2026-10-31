@@ -55,14 +55,13 @@ const A3 = "そうだったんですね。さきさんを大切に思ってき�
 const U4 = "さきさんも距離取りたいのかもしれないからちょうどいいんじゃない？";
 interface Scenario { id: string; label: string; prior: [string, string][]; latest: string; relevant: string[]; variant?: "neg" | "oneoff" }
 const SCENARIOS: Scenario[] = [
-  { id: "neg-t4", label: "最新が否定的（10/29 腹が立って距離を置きたい）：「距離取りたいならちょうどいい」", prior: [[U1, A1], [U2, A2], [U3, A3]], latest: U4, relevant: SAKI, variant: "neg" },
-  { id: "neg-t2", label: "最新が否定的：「2人だけの空気感」", prior: [[U1, A1]], latest: U2, relevant: SAKI, variant: "neg" },
   { id: "oneoff-t2", label: "最新は一時的な苛立ち、「大切」が繰り返されている：「2人だけの空気感」", prior: [[U1, A1]], latest: U2, relevant: SAKI, variant: "oneoff" },
 ];
 const VARIANT_ROWS: Record<"neg" | "oneoff", Row[]> = {
   neg: [{ id: "t-14", day: "2026-10-29", keywords: ["さきさん", "怒り"], summary: "さきさんに腹が立って、少し距離を置きたいと話した。", quote: "さきさんにちょっと腹立った。少し距離置きたい", emotion: true }],
   oneoff: [
     { id: "t-16", day: "2026-09-10", keywords: ["さきさん", "大切"], summary: "さきさんのことをやっぱり大切に思うと話した。", quote: "やっぱりさきさんのこと大切なんだと思う", emotion: true },
+    { id: "t-17", day: "2026-10-12", keywords: ["さきさん", "大切"], summary: "さきさんはやっぱり大切な存在だと改めて話した。", quote: "さきさんはやっぱり大切", emotion: true },
     { id: "t-15", day: "2026-10-29", keywords: ["さきさん", "苛立ち"], summary: "さきさんの一言に少しイラッとしたと話した。", quote: "さきさんの一言、ちょっとイラッとした", emotion: true },
   ],
 };

@@ -198,7 +198,21 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
             pick = newestFeeling;
             reason = "関連が判断できないため、この人物の最新の気持ちの記録";
           } else if (newestFeeling) {
-            reason = "この人物の最新の気持ちの記録はすでに含まれている";
+            // the newest feeling is there; a feeling that keeps coming back (the same keyword in 2+ of the person's feelings records) and is
+            // missing from the selection is added instead, so that a one-off mood does not stand alone for the relationship
+            const counts = new Map<string, number>();
+            for (const x of eligible) for (const k of new Set((x.m.keywords ?? []).filter((k) => !keys.includes(personKey(k))))) counts.set(k, (counts.get(k) ?? 0) + 1);
+            const recurring = [...counts.entries()].filter(([, n]) => n >= 2).map(([k]) => k);
+            const recurringPick = eligible
+              .filter((x) => !already.has(x.m.id) && (x.m.keywords ?? []).some((k) => recurring.includes(k)))
+              .filter((x) => !eligible.some((y) => already.has(y.m.id) && (y.m.keywords ?? []).some((k) => recurring.includes(k) && (x.m.keywords ?? []).includes(k))))
+              .sort((a, b) => timeOf(b.m) - timeOf(a.m))[0];
+            if (recurringPick) {
+              pick = recurringPick;
+              reason = `最新の気持ちの記録はすでに含まれているため、繰り返し話している気持ちの最新の記録（${(recurringPick.m.keywords ?? []).filter((k) => recurring.includes(k)).join("・")}）`;
+            } else {
+              reason = "この人物の最新の気持ちの記録はすでに含まれている";
+            }
           }
         }
       }

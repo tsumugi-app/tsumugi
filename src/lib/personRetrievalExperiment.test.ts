@@ -139,7 +139,7 @@ test("bias 3: feelings changed quickly -> the latest of them is passed", () => {
   assert.ok(ids(r).includes("f3"));
 });
 
-test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> the one-off is what is guaranteed (known limit)", () => {
+test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> the recurring feeling is added next to it", () => {
   const r = pickFor([
     ...workBase,
     feelMem("f1", "2026-06-01", ["さきさん", "大切"], "さきさんが大切だと話した。"),
@@ -148,6 +148,8 @@ test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> 
     feelMem("f4", "2026-10-28", ["さきさん", "苛立ち"], "さきさんの一言に少しイラッとしたと話した。"),
   ]);
   assert.ok(ids(r).includes("f4"));
+  assert.ok(ids(r).includes("f3"), "the latest record of the recurring 大切");
+  assert.ok(r.feeling?.added === "f3");
 });
 
 test("bias 5: an old feelings record or one shared with another person is never added by the feelings slot", () => {
