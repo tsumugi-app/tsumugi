@@ -777,7 +777,7 @@ export default function ChatScreen() {
    */
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
-  /** 会話領域の先頭のロゴ。画面内に見えていない間だけ、会話領域の左上にホームボタンを出す（ロゴが見えている間はロゴ自体がホームへの導線）。 */
+  /** 会話領域の先頭のロゴ。見えていない間だけヘッダーのホームボタンを出す（PCでロゴが見えている間はロゴ自体がホームへの導線。スマホの会話中はロゴを出さないので常に出る）。 */
   const logoRef = useRef<HTMLDivElement>(null);
   const [logoVisible, setLogoVisible] = useState(true);
   useEffect(() => {
@@ -5127,24 +5127,31 @@ export default function ChatScreen() {
         ごく小さい固定値のため、キーボード表示時の高さへの影響は軽微）。
       */}
       {/*
-        スマホの会話中だけのコンパクトなヘッダー：左上に「家のアイコン＋ホーム」を常に出す（スクロール位置に関係なく押せる）。
-        スクロール領域（main）の外のshrink-0の行なので、本文や入力欄に重ならない。上端はセーフエリアの分だけ下げる。
-        動作はロゴタップと同じhandleGoToTop。履歴ボタン（画面下部の左）とは離して置く。
+        会話中のコンパクトなヘッダー（ホームボタン）。スクロール領域（main）の外のshrink-0の行なので、会話本文や入力欄に重ならない。
+        動作はロゴタップと同じhandleGoToTop（今の会話を区切って保存し、トップへ画面遷移。リロードしない・下書きは捨てる）。
+        履歴ボタン（画面下部の左）とは離して置く。
+        - スマホ：会話中はロゴを出さず、左上に「家のアイコン＋ホーム」を常に出す（スクロール位置に関係なく押せる）。上端はセーフエリアの分だけ下げる。
+        - PC：ロゴを従来どおり出し、ロゴが見えている間はロゴ自体がホームへの導線。ロゴが画面外にある間だけこのボタンを出す（両方は同時に出ない）。
+          行の高さ（h-8）は会話中のmainの上余白（従来のpt-8）の代わりなので、ロゴの位置は変わらず、ボタンの表示・非表示でレイアウトも動かない。
       */}
       {!showEntryScreen && (
-        <header className="flex shrink-0 items-center px-3 pt-[max(0.25rem,env(safe-area-inset-top))] sm:hidden">
+        <header className="mx-auto flex w-full max-w-2xl shrink-0 items-center px-3 pt-[max(0.25rem,env(safe-area-inset-top))] sm:h-8 sm:px-4 sm:pt-0">
           <button
             type="button"
             onClick={handleGoToTop}
             aria-label="ホームへ戻る"
-            className="flex h-11 items-center gap-1.5 rounded-full px-3 text-sm text-stone-500 transition hover:bg-stone-900/5 hover:text-stone-700 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+            tabIndex={logoVisible ? -1 : 0}
+            aria-hidden={logoVisible}
+            className={`flex h-11 items-center gap-1.5 rounded-full px-3 text-sm text-stone-500 transition hover:bg-stone-900/5 hover:text-stone-700 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200 sm:h-8 sm:text-xs ${
+              logoVisible ? "pointer-events-none opacity-0" : "opacity-100"
+            }`}
           >
             <HomeIcon />
             <span>ホーム</span>
           </button>
         </header>
       )}
-      <main className={`mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pb-12 sm:pt-8 sm:pb-8 ${showEntryScreen ? "pt-8" : "pt-2"}`}>
+      <main className={`mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 overflow-y-auto px-5 pb-12 sm:pb-8 ${showEntryScreen ? "pt-8" : "pt-2 sm:pt-0"}`}>
         {/*
           ロゴ（header）とneeds-permissionカードは、以前はroot直下・main（スクロール
           コンテナ）の外にあり、会話をスクロールしても画面上部に残り続けていた。
@@ -5159,30 +5166,6 @@ export default function ChatScreen() {
           自体を変更せずmain内部へ移動したことによる自然な帰結であり、意図的な調整。
           ロゴ画像自体（img・button）のクラスは一切変更していない。
         */}
-        {/*
-          PCのホームへ戻るボタン：長い会話でも一番上までスクロールせずにトップ画面へ戻れるよう、
-          ロゴが画面外にある間だけ会話領域の左上に出す（ロゴが見えている間はロゴ自体がホームへの導線なので、両方は同時に出ない）。
-          動作はロゴタップと同じhandleGoToTop（今の会話を区切って保存し、トップへ画面遷移。リロードしない・下書きは捨てる）。
-          sticky top-0のゼロ高さ要素に載せて本文の高さを変えず、flex-colのgap-6は-mb-6で打ち消す。
-          スマホは会話中ロゴを出さず、画面上部のコンパクトなヘッダーにホームボタンを常に出す（下記header）。
-        */}
-        {!showEntryScreen && (
-          <div className="sticky top-0 z-10 -mb-6 hidden h-0 sm:block">
-            <button
-              type="button"
-              onClick={handleGoToTop}
-              aria-label="ホームへ戻る"
-              tabIndex={logoVisible ? -1 : 0}
-              aria-hidden={logoVisible}
-              className={`absolute -left-1 top-2 flex h-10 items-center justify-center gap-1.5 rounded-full border border-stone-300/70 bg-white/85 px-3 text-stone-500 shadow-sm backdrop-blur transition hover:text-stone-700 dark:border-stone-700/70 dark:bg-stone-900/85 dark:text-stone-400 dark:hover:text-stone-200 ${
-                logoVisible ? "pointer-events-none opacity-0" : "opacity-100"
-              }`}
-            >
-              <HomeIcon />
-              <span className="text-xs">ホーム</span>
-            </button>
-          </div>
-        )}
         {/* スマホの会話中はロゴを出さない（表示領域を広げる。ホームへはヘッダーのボタンで戻る）。トップ画面とPCは従来どおり */}
         <div ref={logoRef} className={`items-center justify-center ${showEntryScreen ? "flex" : "hidden sm:flex"}`}>
           <button

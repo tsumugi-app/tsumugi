@@ -93,6 +93,7 @@ for (const [name, size, phone] of VIEWPORTS) {
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);   // no sideways scroll
 
     // a conversation starts: phones swap the big logo for a compact header with the home button at the top left; PCs keep the logo (home appears only when it is out of view)
+    const logoTop = (await logo.boundingBox())!.y;
     await page.getByRole("button", { name: "会話", exact: true }).click();
     const footer = page.locator("footer");
     const input = footer.locator("textarea");
@@ -106,6 +107,7 @@ for (const [name, size, phone] of VIEWPORTS) {
       expect(hb.y + hb.height).toBeLessThanOrEqual(mb.y + 1);                 // the header sits above the conversation, never over it
     } else {
       await expect(logo).toBeInViewport();
+      expect(Math.abs((await logo.boundingBox())!.y - logoTop)).toBeLessThanOrEqual(1);   // the logo does not move when the conversation starts
       await expect(home).toHaveCount(0);                                      // not shown next to a visible logo
     }
     for (let i = 1; i <= 4; i++) {
@@ -125,7 +127,7 @@ for (const [name, size, phone] of VIEWPORTS) {
       await expect(home).toBeInViewport();
       if (!phone) await expect(logo).not.toBeInViewport();
       const hb = (await home.boundingBox())!;
-      expect(hb.y + hb.height).toBeLessThanOrEqual(inputBox.y);
+      expect(hb.y + hb.height).toBeLessThanOrEqual((await main.boundingBox())!.y + 1);   // above the scrolling conversation: never over its text
       const hist = (await history.boundingBox())!;
       expect(Math.hypot(hist.x - hb.x, hist.y - hb.y)).toBeGreaterThan(200);  // home and history are far apart
     }
