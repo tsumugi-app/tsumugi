@@ -97,3 +97,15 @@ test("R3: a feelings record only when the turn is about the relationship; plain 
   assert.equal(none.target, null, "no person: nothing is added");
   assert.ok(r3.memories.length <= DEFAULT_LIMIT + PERSON_EXTRA_LIMIT + 1);
 });
+
+test("R3n / R3x: no guess from text similarity; R3n falls back to the newest feelings record, R3x adds nothing", () => {
+  const turns = ["さきさんとは今まで2人で仕事してきたけど、今回はもう一人入ってる", "そもそも2人だけの空気感でいたいんだよほんとは"];
+  const n = selectWithPersonRetrieval(POOL, turns[1], turns, { feelingSlot: true, feelingPick: "newest" });
+  const x = selectWithPersonRetrieval(POOL, turns[1], turns, { feelingSlot: true, feelingPick: "none" });
+  const already = new Set([...n.memories.map((m) => m.id)]);
+  assert.ok(n.feeling?.added === null || already.has(n.feeling!.added!));
+  if (n.feeling?.added) assert.ok(n.feeling.why.includes("最新") || n.feeling.why.includes("キーワード"));
+  assert.ok(x.feeling?.added === null || x.feeling!.why.includes("キーワード"), "R3x only adds a keyword-matched record");
+  const work = "さきさんと来週の企画のプレゼン、どっちが話すか決めないと";
+  for (const pick of ["newest", "none"] as const) assert.equal(selectWithPersonRetrieval(POOL, work, [work], { feelingSlot: true, feelingPick: pick }).feeling?.added, null);
+});

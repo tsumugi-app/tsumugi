@@ -97,6 +97,13 @@ export function relationTalk(latest: string, previousUserTurn?: string): { yes: 
 export interface PersonRetrievalOptions {
   /** R3: add at most one feelings record of the person when the turn is about the relationship */
   feelingSlot?: boolean;
+  /**
+   * how the feelings record is chosen:
+   *   "tie"    (R3 as compared before): keyword match, then text similarity, then recency
+   *   "newest" (R3n): a record whose own keyword appears in the conversation; otherwise the person's newest feelings record
+   *   "none"   (R3x): a record whose own keyword appears in the conversation; otherwise nothing
+   */
+  feelingPick?: "tie" | "newest" | "none";
 }
 
 export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, userTurns: string[], options: PersonRetrievalOptions = {}): PersonRetrievalResult {
@@ -166,9 +173,14 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
           const tie = scoreMemory({ ...m, keywords: [], summary: keys.reduce((t, k) => t.split(k).join(" "), m.summary), content: "" }, query);
           return { m, hits, tie };
         })
-        .sort((a, b) => b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m))[0];
+        .filter((x) => (options.feelingPick ?? "tie") === "tie" || x.hits > 0 || options.feelingPick === "newest")
+        .sort((a, b) =>
+          (options.feelingPick ?? "tie") === "tie"
+            ? b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m)
+            : b.hits - a.hits || timeOf(b.m) - timeOf(a.m) // R3n / R3x: no text-similarity guess
+        )[0];
       if (!pick) feeling = { added: null, why: `追加なし：${hasFeelingAlready ? "気持ちの記録はすでに含まれている" : "この人物の気持ちの記録が無い"}（${talk.why}）` };
-      else feeling = { added: pick.m.id, why: `${talk.why}が関係・気持ちの話。${pick.hits > 0 ? "会話と重なる気持ちの記録" : pick.tie > 0 ? "会話と言葉が近い気持ちの記録" : "この人物の最新の気持ちの記録"}` };
+      else feeling = { added: pick.m.id, why: `${talk.why}が関係・気持ちの話。${pick.hits > 0 ? `会話とキーワードが一致する気持ちの記録（${(pick.m.keywords ?? []).filter((k) => !keys.includes(personKey(k)) && query.includes(nfkc(k))).join("・")}）` : options.feelingPick === "newest" || pick.tie <= 0 ? "関連が判断できないため、この人物の最新の気持ちの記録" : "会話と言葉が近い気持ちの記録"}` };
     }
   }
   const extra = [...chosen.map((a) => pool.find((m) => m.id === a.id)!), ...(feeling?.added ? [pool.find((m) => m.id === feeling!.added)!] : [])];

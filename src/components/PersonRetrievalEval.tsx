@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { computeKeywordFrequency, DEFAULT_LIMIT, selectConversationDirectMatches } from "@/lib/retrieval";
 import { selectWithPersonRetrieval } from "@/lib/personRetrievalExperiment";
 import { loadApiKey } from "@/lib/db";
 import { GEMINI_API_KEY_HEADER } from "@/lib/apiKeyHeader";
@@ -9,14 +8,15 @@ import type { MemoryObject, RetrievedMemory } from "@/lib/types";
 
 /**
  * Preview専用：人物Retrievalの比較（架空データのみ・保存なし・端末のデータに触れない）。マージ前に削除する。
- *   A  : 現在のRetrieval
  *   R2 : 人物Retrievalの改善案（personRetrievalExperiment.ts。本番のRetrievalは変更していない）
  *   R3 : R2＋関係・気持ちの話のときだけ、その人物の気持ちの記録を最大1件
+ *   R3n: R3の改良（キーワードが一致する気持ちの記録。無ければこの人物の最新の気持ちの記録）
+ *   R3x: R3の改良（キーワードが一致する気持ちの記録。無ければ追加しない）
  *   B  : 関連Memoryを手で渡す参考条件
  * 会話プロンプトは3条件とも現在のまま。
  */
-type Cond = "A" | "R2" | "R3" | "B";
-const CONDS: Cond[] = ["A", "R2", "R3", "B"];
+type Cond = "R2" | "R3" | "R3n" | "R3x" | "B";
+const CONDS: Cond[] = ["R2", "R3", "R3n", "R3x", "B"];
 const RUNS = 3;
 
 const at = (d: string) => `${d}T12:00:00.000Z`;
@@ -57,12 +57,10 @@ interface Scenario { id: string; label: string; prior: [string, string][]; lates
 const SCENARIOS: Scenario[] = [
   { id: "t2", label: "さき：「2人だけの空気感」", prior: [[U1, A1]], latest: U2, relevant: SAKI },
   { id: "t4", label: "さき：「距離取りたいならちょうどいい」", prior: [[U1, A1], [U2, A2], [U3, A3]], latest: U4, relevant: SAKI },
+  { id: "omit", label: "さき：「前みたいに話せて安心した」（名前省略）", prior: [["さきさんと久しぶりにランチに行った", "いいですね。どんな話をしたんですか？"]], latest: "彼女と前みたいに話せて、ちょっと安心した", relevant: SAKI },
   { id: "work", label: "さきさんとの通常の仕事相談", prior: [], latest: "さきさんと来週の企画のプレゼン、どっちが話すか決めないと。どう思う？", relevant: ["t-01", "t-05", "t-13"] },
-  { id: "work2", label: "さきさんと無関係な仕事相談", prior: [], latest: "締め切りが重なってて、タスクの優先順位どうしよう", relevant: ["t-08", "t-09"] },
   { id: "other", label: "別人物（渡邊さん）の相談", prior: [], latest: "渡邊さん、最近ちょっと距離置きたそうなんだよね。どうしたらいいかな", relevant: ["t-10"] },
-  { id: "omit", label: "人物名を省略した会話", prior: [["さきさんと久しぶりにランチに行った", "いいですね。どんな話をしたんですか？"]], latest: "彼女と前みたいに話せて、ちょっと安心した", relevant: SAKI },
-  { id: "switch", label: "人物を切り替えた会話", prior: [[U1, A1]], latest: "そういえば渡邊さんも最近なんか距離ある感じなんだよね", relevant: ["t-10"] },
-  { id: "collision", label: "名前の重なり（まさきさん）", prior: [], latest: "まさきさんから見積もりの返事が来ないんだけど、催促していいかな", relevant: ["t-11"] },
+  { id: "daily", label: "無関係な話題", prior: [], latest: "今日は雨で洗濯物が乾かないんだよね", relevant: [] },
 ];
 
 const LABELS = ["欲求", "深層", "無意識", "本当は", "依存", "承認欲", "心を守", "自分を守", "防衛", "言い聞かせ"];
@@ -101,18 +99,14 @@ export default function PersonRetrievalEval() {
         for (const c of CONDS) {
           let retrieved: MemoryObject[];
           let note = "";
-          if (c === "A") {
-            const t0 = performance.now();
-            retrieved = selectConversationDirectMatches(pool, s.latest, userTurns, computeKeywordFrequency(pool), DEFAULT_LIMIT).kept.map((e) => e.memory);
-            note = `選定 ${(performance.now() - t0).toFixed(1)}ms`;
-          } else if (c === "R2" || c === "R3") {
-            const t0 = performance.now();
-            const r = selectWithPersonRetrieval(pool, s.latest, userTurns, { feelingSlot: c === "R3" });
-            retrieved = r.memories;
-            note = `選定 ${(performance.now() - t0).toFixed(1)}ms／対象人物: ${r.target ? `${r.target.key}（${r.target.how === "named" ? "名前あり" : "引き継ぎ"}）` : "なし"}／追加: ${r.added.map((a) => `${a.id}（${a.why}）`).join("、") || "なし"}／除外: ${r.dropped.map((d) => `${d.id}（${d.why}）`).join("、") || "なし"}${c === "R3" ? `／気持ちの記録: ${r.feeling ? (r.feeling.added ? `${r.feeling.added}（${r.feeling.why}）` : r.feeling.why) : "対象人物なし"}` : ""}`;
-          } else {
+          if (c === "B") {
             retrieved = pool.filter((m) => s.relevant.includes(m.id)).sort((a, b) => a.date.localeCompare(b.date));
             note = "手渡し";
+          } else if (c === "R2" || c === "R3" || c === "R3n" || c === "R3x") {
+            const t0 = performance.now();
+            const r = selectWithPersonRetrieval(pool, s.latest, userTurns, { feelingSlot: c !== "R2", feelingPick: c === "R3n" ? "newest" : c === "R3x" ? "none" : "tie" });
+            retrieved = r.memories;
+            note = `選定 ${(performance.now() - t0).toFixed(1)}ms／対象人物: ${r.target ? `${r.target.key}（${r.target.how === "named" ? "名前あり" : "引き継ぎ"}）` : "なし"}／追加: ${r.added.map((a) => `${a.id}（${a.why}）`).join("、") || "なし"}／除外: ${r.dropped.map((d) => `${d.id}（${d.why}）`).join("、") || "なし"}${c !== "R2" ? `／気持ちの記録: ${r.feeling ? (r.feeling.added ? `${r.feeling.added}（${r.feeling.why}）` : r.feeling.why) : "対象人物なし"}` : ""}`;
           }
           add(`## ${c}\n渡したMemory（${retrieved.length}件）: ${retrieved.map((m) => `[${m.id}] ${m.summary}`).join(" ／ ") || "なし"}\n${note}`);
           for (let k = 1; k <= RUNS; k++) {
