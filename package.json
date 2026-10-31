@@ -14,6 +14,7 @@
     "test:conversation-voice": "tsc -p tsconfig.conversation-voice.json && node --test .test-out/lib/conversationVoice.test.js",
     "test:memory-synthesis": "tsc -p tsconfig.memory-synthesis.json && node --test .test-out/lib/memorySynthesis.test.js .test-out/lib/memoryTimelineFlag.test.js",
     "test:synthesis-s1": "tsc -p tsconfig.synthesis-s1.json && node --test .test-out/lib/synthesisS1.test.js",
+    "test:person-retrieval-exp": "tsc -p tsconfig.person-retrieval-exp.json && node --test .test-out/lib/personRetrievalExperiment.test.js",
     "test:memory-search": "tsc -p tsconfig.memory-search.json && node --test .test-out/lib/memorySearch.test.js",
     "test:capture": "tsc -p tsconfig.test.json && node --test .test-out/lib/capture.regression.test.js",
     "test:recovery-diagnostic": "tsc -p tsconfig.recovery-diagnostic.json && node --test .test-out/lib/vaultRecovery.test.js",
