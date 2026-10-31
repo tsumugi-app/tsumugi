@@ -16,8 +16,8 @@ import type { MemoryObject, RetrievedMemory } from "@/lib/types";
  * 会話プロンプトは3条件とも現在のまま。
  */
 type Cond = "R2" | "R3" | "R3n" | "R3x" | "B";
-const CONDS: Cond[] = ["R2", "R3", "R3n", "R3x", "B"];
-const RUNS = 3;
+const CONDS: Cond[] = ["R2", "R3n"];
+const RUNS = 2;
 
 const at = (d: string) => `${d}T12:00:00.000Z`;
 interface Row { id: string; day: string; keywords: string[]; summary: string; quote: string; person?: string; emotion?: boolean }
@@ -36,8 +36,8 @@ const ROWS: Row[] = [
   { id: "t-11", day: "2026-09-10", keywords: ["まさきさん", "取引先"], summary: "取引先のまさきさんに見積もりを出したと話した。", quote: "まさきさんに見積もり出した", person: "まさきさん" },
   { id: "t-12", day: "2026-08-05", keywords: ["旅行", "行き先"], summary: "夏休みの行き先を決めたと話した。", quote: "夏休みの行き先決めた" },
 ];
-function memories(): MemoryObject[] {
-  return ROWS.map((r, i) => ({
+function memories(variant?: "neg" | "oneoff"): MemoryObject[] {
+  return [...ROWS, ...(variant ? VARIANT_ROWS[variant] : [])].map((r, i) => ({
     id: r.id, date: at(r.day), statedAt: at(r.day), types: r.emotion ? ["conversation", "emotion"] : ["conversation"], conversationId: `t-conv-${i + 1}`, content: r.summary, summary: r.summary, keywords: r.keywords,
     themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [r.quote],
     ...(r.person ? { personMentions: [{ id: `pm-${r.id}`, groupingKey: r.person, displayName: r.person, assertion: "mention", stated: "explicit", quote: r.quote, statedAt: at(r.day), sourceConversationId: `t-conv-${i + 1}` }] } : {}),
@@ -53,15 +53,19 @@ const A2 = "効率の面では、慣れた2人の方が速いこともありま�
 const U3 = "違う。彼女を大切に思ってきたからそう思ってるんだよ";
 const A3 = "そうだったんですね。さきさんを大切に思ってきたからこそ、2人の時間を守りたいと感じているんですね。";
 const U4 = "さきさんも距離取りたいのかもしれないからちょうどいいんじゃない？";
-interface Scenario { id: string; label: string; prior: [string, string][]; latest: string; relevant: string[] }
+interface Scenario { id: string; label: string; prior: [string, string][]; latest: string; relevant: string[]; variant?: "neg" | "oneoff" }
 const SCENARIOS: Scenario[] = [
-  { id: "t2", label: "さき：「2人だけの空気感」", prior: [[U1, A1]], latest: U2, relevant: SAKI },
-  { id: "t4", label: "さき：「距離取りたいならちょうどいい」", prior: [[U1, A1], [U2, A2], [U3, A3]], latest: U4, relevant: SAKI },
-  { id: "omit", label: "さき：「前みたいに話せて安心した」（名前省略）", prior: [["さきさんと久しぶりにランチに行った", "いいですね。どんな話をしたんですか？"]], latest: "彼女と前みたいに話せて、ちょっと安心した", relevant: SAKI },
-  { id: "work", label: "さきさんとの通常の仕事相談", prior: [], latest: "さきさんと来週の企画のプレゼン、どっちが話すか決めないと。どう思う？", relevant: ["t-01", "t-05", "t-13"] },
-  { id: "other", label: "別人物（渡邊さん）の相談", prior: [], latest: "渡邊さん、最近ちょっと距離置きたそうなんだよね。どうしたらいいかな", relevant: ["t-10"] },
-  { id: "daily", label: "無関係な話題", prior: [], latest: "今日は雨で洗濯物が乾かないんだよね", relevant: [] },
+  { id: "neg-t4", label: "最新が否定的（10/29 腹が立って距離を置きたい）：「距離取りたいならちょうどいい」", prior: [[U1, A1], [U2, A2], [U3, A3]], latest: U4, relevant: SAKI, variant: "neg" },
+  { id: "neg-t2", label: "最新が否定的：「2人だけの空気感」", prior: [[U1, A1]], latest: U2, relevant: SAKI, variant: "neg" },
+  { id: "oneoff-t2", label: "最新は一時的な苛立ち、「大切」が繰り返されている：「2人だけの空気感」", prior: [[U1, A1]], latest: U2, relevant: SAKI, variant: "oneoff" },
 ];
+const VARIANT_ROWS: Record<"neg" | "oneoff", Row[]> = {
+  neg: [{ id: "t-14", day: "2026-10-29", keywords: ["さきさん", "怒り"], summary: "さきさんに腹が立って、少し距離を置きたいと話した。", quote: "さきさんにちょっと腹立った。少し距離置きたい", emotion: true }],
+  oneoff: [
+    { id: "t-16", day: "2026-09-10", keywords: ["さきさん", "大切"], summary: "さきさんのことをやっぱり大切に思うと話した。", quote: "やっぱりさきさんのこと大切なんだと思う", emotion: true },
+    { id: "t-15", day: "2026-10-29", keywords: ["さきさん", "苛立ち"], summary: "さきさんの一言に少しイラッとしたと話した。", quote: "さきさんの一言、ちょっとイラッとした", emotion: true },
+  ],
+};
 
 const LABELS = ["欲求", "深層", "無意識", "本当は", "依存", "承認欲", "心を守", "自分を守", "防衛", "言い聞かせ"];
 function flags(s: Scenario, text: string): string {
@@ -92,8 +96,8 @@ export default function PersonRetrievalEval() {
   async function run() {
     setLog([]);
     try {
-      const pool = memories();
       for (const s of SCENARIOS) {
+        const pool = memories(s.variant);
         const userTurns = [...s.prior.map(([u]) => u), s.latest];
         add(`# ${s.label}\nユーザー：「${s.latest}」`);
         for (const c of CONDS) {
@@ -104,7 +108,7 @@ export default function PersonRetrievalEval() {
             note = "手渡し";
           } else {
             const t0 = performance.now();
-            const r = selectWithPersonRetrieval(pool, s.latest, userTurns, { feelingSlot: c !== "R2", feelingPick: c === "R3n" ? "newest" : c === "R3x" ? "none" : "tie" });
+            const r = selectWithPersonRetrieval(pool, s.latest, userTurns, { feelingSlot: c !== "R2", feelingPick: c === "R3n" ? "newest" : c === "R3x" ? "none" : "tie", now: Date.parse("2026-11-01T12:00:00.000Z") });
             retrieved = r.memories;
             note = `選定 ${(performance.now() - t0).toFixed(1)}ms／対象人物: ${r.target ? `${r.target.key}（${r.target.how === "named" ? "名前あり" : "引き継ぎ"}）` : "なし"}／追加: ${r.added.map((a) => `${a.id}（${a.why}）`).join("、") || "なし"}／除外: ${r.dropped.map((d) => `${d.id}（${d.why}）`).join("、") || "なし"}${c !== "R2" ? `／気持ちの記録: ${r.feeling ? (r.feeling.added ? `${r.feeling.added}（${r.feeling.why}）` : r.feeling.why) : "対象人物なし"}` : ""}`;
           }
