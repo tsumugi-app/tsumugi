@@ -13,6 +13,7 @@
   "include": [],
   "files": [
     "src/lib/retrievalPersonContinuity.test.ts",
+    "src/lib/personRetrieval.test.ts",
     "src/lib/retrieval.ts"
   ]
 }

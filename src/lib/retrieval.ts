@@ -584,6 +584,181 @@ export function selectConversationDirectMatches(
   return { anchors, personFocus, consideredCount: allScored.length, kept, droppedByFloor, droppedByRelativeStrength };
 }
 
+// ---------------------------------------------------------------------------
+// Person-aware conversation retrieval（会話＝analystのRetrieval）。
+// 架空Memoryによる比較（R2＋R3n、2026-10-31〜11-01）を経た仕様。上のselectConversationDirectMatchesはそのまま呼び出し、その結果に対して
+// 「このターンが一人の人物の話であるとき」だけ、次を行う：
+//   1. その人物の記録 = personMentionsにその人物がある、またはキーワードがその人物の名前と完全に一致する記録（部分一致は使わない。
+//      発言中の名前は長いものから照合し、照合した部分を伏せるので「まさきさん」の中の「さき」は数えない）。
+//   2. 選定結果から、別の人物だけの記録を外す（「距離」のような共通語で別の人物の記録が入るのを防ぐ）。
+//   3. その人物の他の記録を最大PERSON_EXTRA_LIMIT件足す：最新の記録、名前以外のキーワードが会話に出てくる記録。
+//   4. 関係や気持ちの話のとき（業務の進め方の話ではないとき）だけ、その人物の気持ちの記録を最大1件足す：キーワードが会話に出てくるもの。
+//      無ければ最新の気持ちの記録（既に入っていれば、繰り返し話している気持ちの最新の記録）。FEELING_MAX_AGE_DAYSより古いもの、
+//      別の人物にも関わるものは足さない。記録は日付つきのまま渡り、その人への今の気持ちのすべてとしては扱わない（会話プロンプト側の扱いは変えない）。
+// 「2人」「２人」はRetrievalの中だけ「二人」として扱う。人物が出てこない、または発言に二人以上の名前が出るターンは、従来の選定そのまま。
+// ---------------------------------------------------------------------------
+export const PERSON_EXTRA_LIMIT = 2;
+export const FEELING_MAX_AGE_DAYS = 180;
+const DAY_MS_RETRIEVAL = 86_400_000;
+
+export const normalizeTwoPeople = (text: string) => text.replace(/2人|２人/g, "二人");
+const nfkcCompact = (text: string) => text.normalize("NFKC").replace(/\s+/g, "");
+
+function knownPersonKeys(pool: MemoryObject[]): string[] {
+  const keys = new Set<string>();
+  for (const memory of pool) {
+    for (const mention of memory.personMentions ?? []) {
+      const key = personNameKey(mention.displayName ?? mention.groupingKey ?? "");
+      if (Array.from(key).length >= 2 && !GENERIC_PERSON_WORDS.includes(key)) keys.add(key);
+    }
+  }
+  return [...keys];
+}
+
+/** 発言に出てくる既知の人物（長い名前から照合し、照合した部分を伏せる） */
+export function personKeysInText(text: string, keys: string[]): string[] {
+  let rest = nfkcCompact(text);
+  const found: string[] = [];
+  for (const key of [...keys].sort((a, b) => Array.from(b).length - Array.from(a).length)) {
+    if (!rest.includes(key)) continue;
+    found.push(key);
+    rest = rest.split(key).join("\u25A0".repeat(Array.from(key).length));
+  }
+  return found;
+}
+
+export function isAboutPerson(memory: MemoryObject, key: string): boolean {
+  if ((memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? mention.groupingKey ?? "") === key)) return true;
+  return (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key);
+}
+
+const FEELING_WORDS = /寂し|さみし|嫉妬|妬|大切|大事|好き|嫌い|不安|辛い|つらい|悲し|嬉し|うれし|安心|ほっと|モヤモヤ|もやもや|葛藤|信頼|傷つ|怖|距離|気持ち|会いたい|恋し|怒|腹が立|イラ|苛立/;
+export function isFeelingRecord(memory: MemoryObject): boolean {
+  if ((memory.types ?? []).includes("emotion")) return true;
+  return FEELING_WORDS.test(`${(memory.keywords ?? []).join(" ")} ${memory.summary}`);
+}
+
+const RELATION_CUES = /寂し|さみし|嫉妬|妬|大切|大事|好き|嫌い|嫌われ|不安|辛い|つらい|悲し|嬉し|うれし|安心|ほっと|モヤモヤ|もやもや|傷つ|怖|気持ち|会いたい|話したい|一緒にいたい|二人だけ|二人でいたい|二人の時間|距離|空気感|関係|存在|避け|冷た|そっけな|離れ|ほんとは|本当は|本音/;
+const WORK_CUES = /プレゼン|資料|締め切り|締切|会議|打ち合わせ|見積|タスク|分担|スケジュール|進め方|段取り|納期|作業|手順|報告|担当/;
+
+/** 関係や気持ちの話か（業務の進め方の話ではないか）。今の発言を優先し、今の発言が中立なら直前の発言を見る。 */
+export function isRelationshipTalk(latest: string, previousUserTurn?: string): boolean {
+  const lat = normalizeTwoPeople(nfkcCompact(latest));
+  if (RELATION_CUES.test(lat)) return true;
+  if (WORK_CUES.test(lat)) return false;
+  return previousUserTurn !== undefined && RELATION_CUES.test(normalizeTwoPeople(nfkcCompact(previousUserTurn)));
+}
+
+const memoryTime = (memory: MemoryObject) => Date.parse(memory.statedAt ?? memory.date);
+
+export interface PersonAwareSelection {
+  memories: MemoryObject[];
+  /** このターンの人物（無ければnull＝従来の選定そのまま） */
+  person: { key: string; how: "named" | "carried" } | null;
+  added: string[];
+  dropped: string[];
+  feeling: string | null;
+}
+
+export function selectConversationWithPersons(
+  pool: MemoryObject[],
+  trimmed: string,
+  recentUserTurnsTexts: string[],
+  keywordFrequency: Map<string, number>,
+  limit: number,
+  now: number
+): PersonAwareSelection {
+  const latest = normalizeTwoPeople(trimmed);
+  const turns = recentUserTurnsTexts.map(normalizeTwoPeople);
+  const base = selectConversationDirectMatches(pool, latest, turns, keywordFrequency, limit).kept.map((entry) => entry.memory);
+  const none: PersonAwareSelection = { memories: base, person: null, added: [], dropped: [], feeling: null };
+  const keys = knownPersonKeys(pool);
+  if (keys.length === 0) return none;
+
+  const named = personKeysInText(trimmed, keys);
+  let person: PersonAwareSelection["person"] = null;
+  if (named.length === 1) {
+    person = { key: named[0], how: "named" };
+  } else if (named.length === 0) {
+    // 従来の人物継続を、キーワードが名前と一致する記録もその人物の記録として扱った写しの上で使う
+    const linked = pool.map((memory) => {
+      const extra = keys.filter((key) => !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key));
+      return extra.length === 0 ? memory : ({ ...memory, personMentions: [...(memory.personMentions ?? []), ...extra.map((key) => ({ displayName: key, groupingKey: key }))] } as unknown as MemoryObject);
+    });
+    const focus = deriveConversationPersonFocus(turns, linked);
+    if (focus) person = { key: personNameKey(focus.displayName), how: "carried" };
+  }
+  if (!person) return none;
+  const target = person.key;
+  const aboutOther = (memory: MemoryObject) => keys.some((key) => key !== target && isAboutPerson(memory, key));
+
+  const dropped: string[] = [];
+  const kept = base.filter((memory) => {
+    if (aboutOther(memory) && !isAboutPerson(memory, target)) {
+      dropped.push(memory.id);
+      return false;
+    }
+    return true;
+  });
+
+  // 名前を除いた会話（名前だけで「重なる」としないため）
+  const query = keys.reduce((text, key) => text.split(key).join(" "), nfkcCompact((turns.length > 0 ? turns : [latest]).join(" ")).replace(/(さん|ちゃん|くん|君|様|氏)/g, " "));
+  const ownKeywordHits = (memory: MemoryObject) => (memory.keywords ?? []).filter((keyword) => !keys.includes(personNameKey(keyword)) && query.includes(nfkcCompact(keyword))).length;
+
+  const included = new Set(kept.map((memory) => memory.id));
+  const candidates = pool.filter((memory) => isAboutPerson(memory, target) && !included.has(memory.id));
+  const added: MemoryObject[] = [];
+  const newest = [...candidates].sort((a, b) => memoryTime(b) - memoryTime(a))[0];
+  if (newest) added.push(newest);
+  const overlap = candidates
+    .filter((memory) => memory !== newest)
+    .map((memory) => ({ memory, hits: ownKeywordHits(memory) }))
+    .filter((entry) => entry.hits > 0)
+    .sort((a, b) => b.hits - a.hits || memoryTime(b.memory) - memoryTime(a.memory))[0];
+  if (overlap) added.push(overlap.memory);
+  const extra = added.slice(0, PERSON_EXTRA_LIMIT);
+  for (const memory of extra) included.add(memory.id);
+
+  let feeling: MemoryObject | undefined;
+  if (isRelationshipTalk(trimmed, turns.length >= 2 ? turns[turns.length - 2] : undefined)) {
+    const eligible = pool
+      .filter((memory) => isAboutPerson(memory, target) && isFeelingRecord(memory) && !aboutOther(memory))
+      .filter((memory) => now - memoryTime(memory) <= FEELING_MAX_AGE_DAYS * DAY_MS_RETRIEVAL);
+    const matched = eligible
+      .filter((memory) => !included.has(memory.id))
+      .map((memory) => ({ memory, hits: ownKeywordHits(memory) }))
+      .filter((entry) => entry.hits > 0)
+      .sort((a, b) => b.hits - a.hits || memoryTime(b.memory) - memoryTime(a.memory))[0];
+    if (matched) {
+      feeling = matched.memory;
+    } else {
+      const newestFeeling = [...eligible].sort((a, b) => memoryTime(b) - memoryTime(a))[0];
+      if (newestFeeling && !included.has(newestFeeling.id)) {
+        feeling = newestFeeling;
+      } else if (newestFeeling) {
+        // 最新の気持ちは既にある：繰り返し話している気持ち（名前以外の同じキーワードを持つ気持ちの記録が2件以上）が入っていなければ、その最新の記録
+        const counts = new Map<string, number>();
+        for (const memory of eligible) for (const keyword of new Set((memory.keywords ?? []).filter((k) => !keys.includes(personNameKey(k))))) counts.set(keyword, (counts.get(keyword) ?? 0) + 1);
+        const recurring = [...counts.entries()].filter(([, n]) => n >= 2).map(([keyword]) => keyword);
+        const hasRecurring = (memory: MemoryObject, keyword: string) => (memory.keywords ?? []).includes(keyword);
+        feeling = eligible
+          .filter((memory) => !included.has(memory.id))
+          .filter((memory) => recurring.some((keyword) => hasRecurring(memory, keyword) && !eligible.some((other) => included.has(other.id) && hasRecurring(other, keyword))))
+          .sort((a, b) => memoryTime(b) - memoryTime(a))[0];
+      }
+    }
+  }
+
+  return {
+    memories: [...kept, ...extra, ...(feeling ? [feeling] : [])],
+    person,
+    added: extra.map((memory) => memory.id),
+    dropped,
+    feeling: feeling?.id ?? null,
+  };
+}
+
+
 /**
  * クリエイト（analyst）専用のMemory取得。companion/coachが使う既存のretrieveRelevantMemoriesの
  * スコアリング・件数ロジックには一切影響しない（別関数として完全に分離）。
@@ -618,14 +793,15 @@ async function retrieveCreativeMemories(
   const pool = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
   const keywordFrequency = computeKeywordFrequency(all);
 
-  const { kept } = selectConversationDirectMatches(
+  // 人物が話題のターンだけ、その人物の記録を整える（selectConversationWithPersons。人物が出てこないターンは従来の選定そのまま）
+  const directMatches = selectConversationWithPersons(
     pool,
     trimmed,
     options.recentUserTurnsTexts ?? [],
     keywordFrequency,
-    directLimit
-  );
-  const directMatches = kept.map((entry) => entry.memory);
+    directLimit,
+    Date.now()
+  ).memories;
 
   let divergentMatches: MemoryObject[] = [];
   if (options.includeDivergent) {
