@@ -9,7 +9,7 @@
  *   2. drops, from the production selection, Memories that are about a DIFFERENT known person and not this one (a shared word such as 「距離」
  *      must not bring another person's record);
  *   3. adds at most PERSON_EXTRA_LIMIT of the person's other Memories: the most recent one (the present), and the one that overlaps the
- *      conversation most (which may be an older feeling or relationship record). Never all of them.
+ *      conversation most, the person's name left out of the comparison (which may be an older feeling or relationship record). Never all of them.
  * 「2人」「２人」 are read as 「二人」 for retrieval only. No person, or two people named in the message: the production selection as it is.
  * Pure function: no IndexedDB, no AI call.
  */
@@ -97,12 +97,13 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
 
   const candidates = pool.filter((m) => isAboutPerson(m, target!.key) && !kept.includes(m));
   const added: PersonRetrievalResult["added"] = [];
-  const query = turns.join(" ");
+  // overlap is measured WITHOUT the person's names (the name alone would make every record of the person look related)
+  const query = keys.reduce((q, k) => q.split(k).join(" "), nfkc(turns.join(" ")).replace(/(さん|ちゃん|くん|君|様|氏)/g, " "));
   const newest = [...candidates].sort((a, b) => timeOf(b) - timeOf(a))[0];
   if (newest) added.push({ id: newest.id, why: "この人物の最新の記録" });
   const overlap = candidates
     .filter((m) => m !== newest)
-    .map((m) => ({ m, score: scoreMemory(m, query) }))
+    .map((m) => ({ m, score: scoreMemory({ ...m, keywords: (m.keywords ?? []).filter((k) => !keys.includes(personKey(k))), summary: keys.reduce((t, k) => t.split(k).join(" "), m.summary), content: "" }, query) }))
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || timeOf(b.m) - timeOf(a.m))[0];
   if (overlap) added.push({ id: overlap.m.id, why: "会話の内容と最も重なる記録" });

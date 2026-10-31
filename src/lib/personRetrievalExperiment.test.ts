@@ -72,3 +72,9 @@ test("two people named in one message: no person augmentation (the production se
   const r = selectWithPersonRetrieval(POOL, latest, [latest]);
   assert.equal(r.target, null);
 });
+
+test("the person's name alone never makes a record 'overlap': a work question does not pull in a feelings record", () => {
+  const latest = "さきさんと来週の企画のプレゼン、どっちが話すか決めないと";
+  const r = selectWithPersonRetrieval(POOL, latest, [latest]);
+  assert.ok(!r.added.some((a) => a.id === "s4" && a.why.includes("重なる")), "距離・寂しい is not chosen for overlapping the name");
+});
