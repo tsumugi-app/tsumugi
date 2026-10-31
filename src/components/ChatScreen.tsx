@@ -5715,13 +5715,13 @@ export default function ChatScreen() {
       */}
       {/*
         画面下部のナビゲーション（スマホ・PC共通で「履歴・＋（読み込む）・設定」の順）。
-        スマホはアイコンのみ（タップ領域44px）、PCはアイコン＋文字ラベル。以前PCでは履歴・＋が
+        スマホはアイコンのみ（タップ領域44px。上は従来どおり-mt-3で行を詰め、下は-mb-2で画面下端からはみ出さない）、PCはアイコン＋文字ラベル。以前PCでは履歴・＋が
         入力欄の中にあったが、スマホと同じ位置・順序に揃えた（機能は従来どおり：履歴＝これまでの記憶、
         ＋＝読み込む、設定）。flex-colの通常フロー内に置いているため、会話本文や入力欄には重ならない。
         PCのAI・保存先の表示は、ボタン行の下の1行にまとめた。
       */}
       <nav aria-label="メインナビゲーション" className="mx-auto flex w-full max-w-2xl flex-col items-center px-5 text-xs text-stone-400 dark:text-stone-500">
-        <div className="-my-3 flex items-center justify-center gap-1.5 sm:my-0 sm:gap-3">
+        <div className="-mt-3 -mb-2 flex items-center justify-center gap-1.5 sm:my-0 sm:gap-3">
           <button
             type="button"
             onClick={() => setHistoryOpen(true)}
