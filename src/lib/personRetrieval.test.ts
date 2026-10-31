@@ -114,3 +114,24 @@ test("bias: a feelings record older than the age limit, or shared with another p
   const s = select([...base, mem("w-b", "2026-09-01", ["渡邊さん"], "渡邊さんと打ち合わせした。", "渡邊さん"), shared], rel[1], rel);
   assert.equal(s.feeling, null);
 });
+
+test("review fixes: shared records are never extras; a keyword-only name hides a shorter one; no-person turns keep the original input; work 「大事」 is not relationship talk", () => {
+  // 1. a newer record about さきさん AND 渡邊さん is never added as an extra
+  const shared = { ...mem("sh", "2026-10-30", ["さきさん", "渡邊さん", "食事"], "さきさんと渡邊さんと食事したと話した。"), personMentions: [{ displayName: "さきさん", groupingKey: "さきさん" }, { displayName: "渡邊さん", groupingKey: "渡邊さん" }] } as unknown as MemoryObject;
+  const r1 = select([...POOL, shared], "さきさんとプレゼンの資料を作りたい");
+  assert.ok(!ids(r1).includes("sh") || selectConversationDirectMatches([...POOL, shared], "さきさんとプレゼンの資料を作りたい", ["さきさんとプレゼンの資料を作りたい"], computeKeywordFrequency([...POOL, shared]), DEFAULT_LIMIT).kept.some((e) => e.memory.id === "sh"));
+  assert.ok(!r1.added.includes("sh"));
+  // 2. まさきさん only as a keyword: still a different person from さきさん
+  const pool2 = [mem("s1", "2026-04-10", ["さきさん", "仕事"], "さきさんと仕事をしたと話した。", "さきさん"), mem("mk", "2026-09-10", ["まさきさん", "見積"], "まさきさんに見積を出したと話した。")];
+  const r2 = select(pool2, "まさきさんに見積を出したい");
+  assert.notEqual(r2.person?.key, "さき");
+  assert.ok(!ids(r2).includes("s1") || selectConversationDirectMatches(pool2, "まさきさんに見積を出したい", ["まさきさんに見積を出したい"], computeKeywordFrequency(pool2), DEFAULT_LIMIT).kept.some((e) => e.memory.id === "s1"));
+  // 3. no person: 「2人」 is not read as 「二人」, the previous selection exactly
+  const pool3 = [mem("tr", "2026-08-01", ["2人", "旅行"], "旅行の計画を立てた。")];
+  const before = selectConversationDirectMatches(pool3, "2人で行く", ["2人で行く"], computeKeywordFrequency(pool3), DEFAULT_LIMIT).kept.map((e) => e.memory.id);
+  assert.deepEqual(ids(select(pool3, "2人で行く")), before);
+  // 4. work talk with 大事 is not relationship talk; a clear feeling word still is
+  assert.equal(isRelationshipTalk("さきさんとプレゼン資料の大事な点を確認したい"), false);
+  assert.equal(isRelationshipTalk("打ち合わせのあと、さきさんと距離を感じて寂しかった"), true);
+  assert.equal(isRelationshipTalk("さきさんは大切な存在だと思う"), true);
+});
