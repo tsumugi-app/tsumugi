@@ -120,23 +120,26 @@ const turnsRel = ["さきさんとは今まで2人で仕事してきたけど、
 const pickFor = (pool: MemoryObject[]) => selectWithPersonRetrieval(pool, turnsRel[1], turnsRel, { feelingSlot: true, feelingPick: "newest", now: NOW });
 const workBase = [mem("w-a", "2026-04-10", ["さきさん", "仕事", "二人"], "さきさんと二人で企画を進めてきたと話した。", "さきさん")];
 
-test("bias 1: the newest feelings record is positive -> that one", () => {
+const ids = (r: ReturnType<typeof pickFor>) => r.memories.map((m) => m.id);
+
+test("bias 1: the newest feelings record is positive -> it is passed (once), no older feeling stacked on top", () => {
   const r = pickFor([...workBase, feelMem("f1", "2026-06-01", ["さきさん", "寂しい"], "さきさんと距離ができて寂しいと話した。"), feelMem("f2", "2026-10-20", ["さきさん", "大切"], "さきさんがやっぱり大切だと感じたと話した。")]);
-  assert.equal(r.feeling?.added, "f2");
+  assert.ok(ids(r).includes("f2"));
+  assert.ok(r.feeling?.added === null || r.feeling?.added === "f2");
 });
 
-test("bias 2: the newest is negative -> it is chosen, with its date (it is passed as a dated record, not as the whole present feeling)", () => {
+test("bias 2: the newest is negative -> it is passed with its date (as a dated record, not as the whole present feeling)", () => {
   const r = pickFor([...workBase, feelMem("f1", "2026-08-01", ["さきさん", "大切"], "さきさんが大切だと話した。"), feelMem("f2", "2026-10-25", ["さきさん", "怒り"], "さきさんに腹が立って、少し距離を置きたいと話した。")]);
-  assert.equal(r.feeling?.added, "f2");
+  assert.ok(ids(r).includes("f2"));
   assert.ok(r.memories.find((m) => m.id === "f2")!.date.startsWith("2026-10-25"), "the record keeps its date");
 });
 
-test("bias 3: feelings changed quickly -> the latest of them", () => {
+test("bias 3: feelings changed quickly -> the latest of them is passed", () => {
   const r = pickFor([...workBase, feelMem("f1", "2026-09-01", ["さきさん", "大切"], "さきさんが大切だと話した。"), feelMem("f2", "2026-10-01", ["さきさん", "怒り"], "さきさんに腹が立ったと話した。"), feelMem("f3", "2026-10-20", ["さきさん", "安心"], "さきさんと仲直りして安心したと話した。")]);
-  assert.equal(r.feeling?.added, "f3");
+  assert.ok(ids(r).includes("f3"));
 });
 
-test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> R3n still takes the newest (reported as a known limit)", () => {
+test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> the one-off is what is guaranteed (known limit)", () => {
   const r = pickFor([
     ...workBase,
     feelMem("f1", "2026-06-01", ["さきさん", "大切"], "さきさんが大切だと話した。"),
@@ -144,14 +147,26 @@ test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> 
     feelMem("f3", "2026-10-01", ["さきさん", "大切"], "さきさんが大切な存在だと改めて話した。"),
     feelMem("f4", "2026-10-28", ["さきさん", "苛立ち"], "さきさんの一言に少しイラッとしたと話した。"),
   ]);
-  assert.equal(r.feeling?.added, "f4");
+  assert.ok(ids(r).includes("f4"));
 });
 
-test("bias 5: an old feelings record or one shared with another person is never added", () => {
+test("bias 5: an old feelings record or one shared with another person is never added by the feelings slot", () => {
   const old = pickFor([...workBase, feelMem("f1", "2025-12-01", ["さきさん", "大切"], "さきさんが大切だと話した。")]);
   assert.equal(old.feeling?.added, null, "older than the age limit");
   const shared = pickFor([...workBase, mem("w-b", "2026-09-01", ["渡邊さん"], "渡邊さんと打ち合わせした。", "渡邊さん"), { ...feelMem("f1", "2026-10-20", ["さきさん", "渡邊さん", "嫉妬"], "さきさんと渡邊さんが親しげで嫉妬したと話した。"), personMentions: [{ displayName: "さきさん", groupingKey: "さきさん" }, { displayName: "渡邊さん", groupingKey: "渡邊さん" }] } as unknown as MemoryObject]);
   assert.equal(shared.feeling?.added, null, "a feelings record that is also about another person");
+});
+
+test("the newest feelings record missing (only an older sad one present) -> the newest is added", () => {
+  const turns = ["さきさんと最近距離がある", "さきさんも距離取りたいのかもしれないからちょうどいいんじゃない？"];
+  const pool = [
+    ...workBase,
+    feelMem("f1", "2026-07-25", ["さきさん", "距離"], "さきさんと距離ができて寂しいと話した。"),
+    mem("w-c", "2026-10-28", ["さきさん", "仕事"], "さきさんと三人で打ち合わせしたと話した。", "さきさん"),
+    feelMem("f2", "2026-10-20", ["さきさん", "会話"], "さきさんと話せて、やっぱり大切だと感じたと話した。"),
+  ];
+  const r = selectWithPersonRetrieval(pool, turns[1], turns, { feelingSlot: true, feelingPick: "newest", now: NOW });
+  assert.ok(ids(r).includes("f2"), "the present 'やっぱり大切' joins the past 'さみしい'");
 });
 
 test("a keyword-matched feelings record wins over the newest one", () => {

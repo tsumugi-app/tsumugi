@@ -168,8 +168,8 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
       feeling = { added: null, why: `追加なし：${talk.why}` };
     } else {
       // only this person's records (never another person's), relevance to the conversation first, then recency
-      const pick = pool
-        .filter((m) => isAboutPerson(m, target!.key) && !already.has(m.id) && isFeelingRecord(m))
+      const eligible = pool
+        .filter((m) => isAboutPerson(m, target!.key) && isFeelingRecord(m))
         .filter((m) => !keys.some((k) => k !== target!.key && isAboutPerson(m, k)))
         // a feelings record older than FEELING_MAX_AGE_DAYS says little about now: never added
         .filter((m) => (options.now ?? Date.now()) - timeOf(m) <= FEELING_MAX_AGE_DAYS * 86_400_000)
@@ -178,15 +178,32 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
           const hits = ownKeywords.filter((k) => query.includes(nfkc(k))).length;
           const tie = scoreMemory({ ...m, keywords: [], summary: keys.reduce((t, k) => t.split(k).join(" "), m.summary), content: "" }, query);
           return { m, hits, tie };
-        })
-        .filter((x) => (options.feelingPick ?? "tie") === "tie" || x.hits > 0 || options.feelingPick === "newest")
-        .sort((a, b) =>
-          (options.feelingPick ?? "tie") === "tie"
-            ? b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m)
-            : b.hits - a.hits || timeOf(b.m) - timeOf(a.m) // R3n / R3x: no text-similarity guess
-        )[0];
-      if (!pick) feeling = { added: null, why: `追加なし：${hasFeelingAlready ? "気持ちの記録はすでに含まれている" : "この人物の気持ちの記録が無い"}（${talk.why}）` };
-      else feeling = { added: pick.m.id, why: `${talk.why}が関係・気持ちの話。${pick.hits > 0 ? `会話とキーワードが一致する気持ちの記録（${(pick.m.keywords ?? []).filter((k) => !keys.includes(personKey(k)) && query.includes(nfkc(k))).join("・")}）` : options.feelingPick === "newest" || pick.tie <= 0 ? "関連が判断できないため、この人物の最新の気持ちの記録" : "会話と言葉が近い気持ちの記録"}` };
+        });
+      const mode = options.feelingPick ?? "tie";
+      let pick: (typeof eligible)[number] | undefined;
+      let reason = "";
+      if (mode === "tie") {
+        pick = eligible.filter((x) => !already.has(x.m.id)).sort((a, b) => b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m))[0];
+        reason = pick ? (pick.hits > 0 ? "会話とキーワードが一致する気持ちの記録" : pick.tie > 0 ? "会話と言葉が近い気持ちの記録" : "この人物の最新の気持ちの記録") : "";
+      } else {
+        // R3n / R3x: no text-similarity guess. A keyword-matched feelings record first; otherwise (R3n) make sure the person's NEWEST feelings
+        // record is there — when it already is, nothing more is added (no older feelings stacked on top)
+        const matched = eligible.filter((x) => x.hits > 0 && !already.has(x.m.id)).sort((a, b) => b.hits - a.hits || timeOf(b.m) - timeOf(a.m))[0];
+        if (matched) {
+          pick = matched;
+          reason = `会話とキーワードが一致する気持ちの記録（${(matched.m.keywords ?? []).filter((k) => !keys.includes(personKey(k)) && query.includes(nfkc(k))).join("・")}）`;
+        } else if (mode === "newest") {
+          const newestFeeling = [...eligible].sort((a, b) => timeOf(b.m) - timeOf(a.m))[0];
+          if (newestFeeling && !already.has(newestFeeling.m.id)) {
+            pick = newestFeeling;
+            reason = "関連が判断できないため、この人物の最新の気持ちの記録";
+          } else if (newestFeeling) {
+            reason = "この人物の最新の気持ちの記録はすでに含まれている";
+          }
+        }
+      }
+      if (!pick) feeling = { added: null, why: `追加なし：${reason || (hasFeelingAlready ? "気持ちの記録はすでに含まれている" : eligible.length === 0 ? "対象になる気持ちの記録が無い（古い・別の人物と共通）" : "会話とキーワードが一致する気持ちの記録が無い")}（${talk.why}）` };
+      else feeling = { added: pick.m.id, why: `${talk.why}が関係・気持ちの話。${reason}` };
     }
   }
   const extra = [...chosen.map((a) => pool.find((m) => m.id === a.id)!), ...(feeling?.added ? [pool.find((m) => m.id === feeling!.added)!] : [])];
