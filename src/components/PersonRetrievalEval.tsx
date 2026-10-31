@@ -102,7 +102,7 @@ export default function PersonRetrievalEval() {
           if (c === "B") {
             retrieved = pool.filter((m) => s.relevant.includes(m.id)).sort((a, b) => a.date.localeCompare(b.date));
             note = "手渡し";
-          } else if (c === "R2" || c === "R3" || c === "R3n" || c === "R3x") {
+          } else {
             const t0 = performance.now();
             const r = selectWithPersonRetrieval(pool, s.latest, userTurns, { feelingSlot: c !== "R2", feelingPick: c === "R3n" ? "newest" : c === "R3x" ? "none" : "tie" });
             retrieved = r.memories;
