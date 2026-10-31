@@ -777,6 +777,22 @@ export default function ChatScreen() {
    */
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
+  /**
+   * 未送信の下書き（表示専用のref）。ChatInputは1文字ごとにここへ書くだけで、ChatScreenを再レンダリングしない。
+   * ホーム（トップ画面）へ戻る・ペルソナを切り替える際にChatInputは再マウントされるが、
+   * 再マウント時の初期値としてここから復元するため、書きかけの文章は失われない（送信に成功した時だけ空になる）。
+   */
+  const draftRef = useRef("");
+  /** 会話領域の先頭のロゴ。画面内に見えていない間だけ、会話領域の左上にホームボタンを出す（ロゴが見えている間はロゴ自体がホームへの導線）。 */
+  const logoRef = useRef<HTMLDivElement>(null);
+  const [logoVisible, setLogoVisible] = useState(true);
+  useEffect(() => {
+    const el = logoRef.current;
+    if (showLaunchTree || !el || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(([entry]) => setLogoVisible(entry.isIntersecting));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [showLaunchTree]);
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
@@ -5131,7 +5147,30 @@ export default function ChatScreen() {
           自体を変更せずmain内部へ移動したことによる自然な帰結であり、意図的な調整。
           ロゴ画像自体（img・button）のクラスは一切変更していない。
         */}
-        <div className="flex items-center justify-center">
+        {/*
+          ホームへ戻るボタン：長い会話でも一番上までスクロールせずにトップ画面へ戻れるよう、
+          ロゴが画面外にある間だけ会話領域の左上に出す。動作はロゴタップと同じhandleGoToTop
+          （画面遷移のみ。リロードしない・会話を削除しない。書きかけの文章はdraftRefで保持）。
+          sticky top-0のゼロ高さ要素に載せて本文の高さを変えず、flex-colのgap-6は-mb-6で打ち消す。
+        */}
+        {!showEntryScreen && (
+          <div className="sticky top-0 z-10 -mb-6 h-0">
+            <button
+              type="button"
+              onClick={handleGoToTop}
+              aria-label="ホームへ戻る"
+              tabIndex={logoVisible ? -1 : 0}
+              aria-hidden={logoVisible}
+              className={`absolute -left-2 top-2 flex h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border border-stone-300/70 bg-white/85 px-2.5 text-stone-500 shadow-sm backdrop-blur transition hover:text-stone-700 dark:border-stone-700/70 dark:bg-stone-900/85 dark:text-stone-400 dark:hover:text-stone-200 sm:-left-1 sm:px-3 ${
+                logoVisible ? "pointer-events-none opacity-0" : "opacity-100"
+              }`}
+            >
+              <HomeIcon />
+              <span className="hidden text-xs sm:inline">ホーム</span>
+            </button>
+          </div>
+        )}
+        <div ref={logoRef} className="flex items-center justify-center">
           <button
             type="button"
             onClick={handleGoToTop}
@@ -5600,9 +5639,9 @@ export default function ChatScreen() {
             いる。理由・詳細はChatInpu本体のコメントを参照（iPad ChromeでBackspace
             長押しが連続削除にならない問題の調査を踏まえ、1文字ごとのsetStateで
             ChatScreen全体が再レンダリングされないようにするため）。
-            key={inputResetKey}：ペルソナ切替・トップへ戻る際に「入力中の下書きを
-            クリアする」という既存仕様を、ChatInputのローカルstateへ外部から
-            触れずに実現するため、keyを変えてChatInputごと再マウントさせている。
+            key={inputResetKey}：ペルソナ切替・トップへ戻る際にChatInputごと再マウントさせる。
+            書きかけの文章は再マウント時にdraftRefから復元する（以前はここで下書きをクリアしていた）。
+            履歴・読み込むボタンは画面下部のナビゲーション（スマホ・PC共通）へ移した。
           */}
           <ChatInput
             key={inputResetKey}
@@ -5611,11 +5650,9 @@ export default function ChatScreen() {
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
             onSend={(text) => void handleSend(text)}
-            onOpenHistory={() => setHistoryOpen(true)}
-            onOpenImport={() => {
-              // Vault境界の安全性：切替処理中はSource保存（Import）を新規に開始させない。
-              if (isVaultSwitchingRef.current || crossTabStale) return;
-              setImportOpen(true);
+            initialValue={draftRef.current}
+            onDraftChange={(text) => {
+              draftRef.current = text;
             }}
           />
         </div>
@@ -5676,36 +5713,53 @@ export default function ChatScreen() {
         pt/pbはもう持たない（footerとの間隔・画面下端との間隔は、この行を包む
         bottomUIラッパー側のgap/pbに一本化した。上のコメント参照）。
       */}
-      <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-1.5 px-5 text-xs text-stone-400 dark:text-stone-500">
-        <span className="hidden sm:inline">{PROVIDER_LABEL[chatProvider]}</span>
-        <span aria-hidden="true" className="hidden sm:inline">・</span>
-        <span className="hidden sm:inline">{vaultStatusLabel}</span>
-        <span aria-hidden="true" className="hidden sm:inline">・</span>
-        <button
-          type="button"
-          onClick={() => setHistoryOpen(true)}
-          aria-label="これまでの記憶を見る"
-          className="-my-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:hidden"
-        >
-          ↺
-        </button>
-        <button
-          type="button"
-          onClick={() => setImportOpen(true)}
-          aria-label="読み込む"
-          className="-my-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:hidden"
-        >
-          ＋
-        </button>
-        <button
-          type="button"
-          onClick={() => setSettingsOpen(true)}
-          aria-label="設定"
-          className="-my-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300"
-        >
-          ⚙
-        </button>
-      </div>
+      {/*
+        画面下部のナビゲーション（スマホ・PC共通で「履歴・＋（読み込む）・設定」の順）。
+        スマホはアイコンのみ（タップ領域44px）、PCはアイコン＋文字ラベル。以前PCでは履歴・＋が
+        入力欄の中にあったが、スマホと同じ位置・順序に揃えた（機能は従来どおり：履歴＝これまでの記憶、
+        ＋＝読み込む、設定）。flex-colの通常フロー内に置いているため、会話本文や入力欄には重ならない。
+        PCのAI・保存先の表示は、ボタン行の下の1行にまとめた。
+      */}
+      <nav aria-label="メインナビゲーション" className="mx-auto flex w-full max-w-2xl flex-col items-center px-5 text-xs text-stone-400 dark:text-stone-500">
+        <div className="-my-3 flex items-center justify-center gap-1.5 sm:my-0 sm:gap-3">
+          <button
+            type="button"
+            onClick={() => setHistoryOpen(true)}
+            aria-label="これまでの記憶を見る"
+            className="flex h-11 min-w-11 shrink-0 items-center justify-center gap-1.5 rounded-full text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:h-10 sm:px-3"
+          >
+            <HistoryIcon />
+            <span className="hidden text-xs sm:inline">履歴</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              // Vault境界の安全性：切替処理中はSource保存（Import）を新規に開始させない。
+              if (isVaultSwitchingRef.current || crossTabStale) return;
+              setImportOpen(true);
+            }}
+            aria-label="読み込む"
+            className="flex h-11 min-w-11 shrink-0 items-center justify-center gap-1.5 rounded-full text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:h-10 sm:px-3"
+          >
+            <span aria-hidden="true" className="text-lg leading-none">＋</span>
+            <span className="hidden text-xs sm:inline">読み込む</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="設定"
+            className="flex h-11 min-w-11 shrink-0 items-center justify-center gap-1.5 rounded-full text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:h-10 sm:px-3"
+          >
+            <span aria-hidden="true" className="text-lg leading-none">⚙</span>
+            <span className="hidden text-xs sm:inline">設定</span>
+          </button>
+        </div>
+        <p className="mt-1 hidden items-center gap-1.5 sm:flex">
+          <span>{PROVIDER_LABEL[chatProvider]}</span>
+          <span aria-hidden="true">・</span>
+          <span>{vaultStatusLabel}</span>
+        </p>
+      </nav>
       </div>
 
       {settingsOpen && (
@@ -5981,16 +6035,11 @@ function LaunchTreeScreen({ signals, onProceed }: { signals: TreeSignals | null;
  * 既存のoverrideText引数をそのまま使えるため、ロジック自体は変更していない）。
  * 送信後はこのコンポーネント自身がローカルstateを空文字へ戻す。
  *
- * 「ペルソナ切替・トップへ戻る際に入力中の下書きをクリアする」という既存仕様は、
- * 親（ChatScreen）がこのコンポーネントに渡す`key`を変えることで実現する
- * （keyが変わるとReactはこのコンポーネントを丸ごと再マウントし、ローカルstateは
- * 初期値の空文字に戻る。ChatScreen側からローカルstateへ直接触る手段は持たせない）。
+ * ペルソナ切替・トップへ戻る際は、親（ChatScreen）がこのコンポーネントに渡す`key`を変えて
+ * 丸ごと再マウントさせる。書きかけの文章は失わない：入力のたびにonDraftChangeで親のrefへ
+ * 写しておき、再マウント時はinitialValueとして受け取って復元する（親は再レンダリングしない）。
  *
- * 履歴（↺）・Import（＋）ボタンも、DOM上の見た目の並び順（textarea→↺→＋→送る）を
- * 崩さずに済むよう、そのままこのコンポーネント内に含めている。ただし
- * historyOpen/importOpenのstate自体は従来どおりChatScreen側が持っており、
- * このコンポーネントはonOpenHistory/onOpenImportコールバックを呼ぶだけ
- * （表示の委譲のみで、状態のオーナーシップは変更していない）。
+ * 履歴・Import（＋）ボタンは、スマホ・PCで位置と順序を揃えるため画面下部のナビゲーションへ移した。
  *
  * textareaのauto-resize処理（iPad向け強制リフロー削減の最適化を含む）は、
  * 元のChatScreen側のuseEffectから処理内容を変更せずそのまま移設している。
@@ -6002,16 +6051,22 @@ function ChatInput({
   disabled,
   placeholder,
   onSend,
-  onOpenHistory,
-  onOpenImport,
+  initialValue,
+  onDraftChange,
 }: {
   disabled: boolean;
   placeholder: string;
   onSend: (text: string) => void;
-  onOpenHistory: () => void;
-  onOpenImport: () => void;
+  /** 再マウント時に復元する書きかけの文章（ChatScreenのdraftRef） */
+  initialValue: string;
+  /** 入力のたびに呼ぶ。ChatScreen側はrefへ書くだけで再レンダリングしない */
+  onDraftChange: (text: string) => void;
 }) {
-  const [value, setValue] = useState("");
+  const [value, setValue] = useState(initialValue);
+
+  useEffect(() => {
+    onDraftChange(value);
+  }, [value, onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -6052,22 +6107,6 @@ function ChatInput({
         className="min-h-10 max-h-24 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-2 text-base outline-none placeholder:text-stone-400 disabled:opacity-60 sm:min-h-24 sm:max-h-64 sm:text-sm"
       />
       <button
-        type="button"
-        onClick={onOpenHistory}
-        aria-label="これまでの記憶を見る"
-        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
-      >
-        ↺
-      </button>
-      <button
-        type="button"
-        onClick={onOpenImport}
-        aria-label="読み込む"
-        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg leading-none text-stone-400 transition hover:bg-stone-900/5 hover:text-stone-600 dark:text-stone-500 dark:hover:bg-white/5 dark:hover:text-stone-300 sm:flex"
-      >
-        ＋
-      </button>
-      <button
         onClick={handleSendClick}
         disabled={disabled || !value.trim()}
         className="shrink-0 rounded-xl bg-stone-800 px-4 py-2 text-sm text-stone-50 transition disabled:opacity-40 dark:bg-stone-200 dark:text-stone-900"
@@ -6075,6 +6114,26 @@ function ChatInput({
         送る
       </button>
     </>
+  );
+}
+
+/** 履歴アイコン：時計＋反時計回りの矢印（リロードの「↻」と見分けやすい形） */
+function HistoryIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.5" />
+      <path d="M3.5 3.5v5h5" />
+      <path d="M12 7.5V12l3 2" />
+    </svg>
+  );
+}
+
+function HomeIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3.5 11 12 4l8.5 7" />
+      <path d="M5.5 9.5V20h4.5v-5.5h4V20h4.5V9.5" />
+    </svg>
   );
 }
 
