@@ -619,13 +619,25 @@ function knownPersonKeys(pool: MemoryObject[]): string[] {
 }
 
 /** 発言に出てくる既知の人物（長い名前から照合し、照合した部分を伏せる） */
+const NAME_FOLLOWERS = /^(さん|ちゃん|くん|君|様|氏|先輩|先生|部長|課長|社長|は|が|を|に|と|の|も|へ|で|や|から|まで|って|とか|より|だ|じゃ|[\s、。，．！？!?・「」『』（）()\u25A0]|$)/;
+const scriptOf = (char: string) => (/[\u3040-\u309F]/.test(char) ? "hira" : /[\u30A0-\u30FF]/.test(char) ? "kata" : /[\u4E00-\u9FFF々]/.test(char) ? "kanji" : "other");
+/** 名前として読める出現か：直後が敬称・助詞・区切りか、名前の最後の文字と違う種類の文字なら名前とみなす（「さきほど」の「さき」は名前ではない） */
+function isNameOccurrence(text: string, index: number, key: string): boolean {
+  const after = text.slice(index + key.length);
+  if (NAME_FOLLOWERS.test(after)) return true;
+  const last = Array.from(key).pop() ?? "";
+  return scriptOf(Array.from(after)[0] ?? "") !== scriptOf(last);
+}
+
 export function personKeysInText(text: string, keys: string[]): string[] {
   let rest = nfkcCompact(text);
   const found: string[] = [];
   for (const key of [...keys].sort((a, b) => Array.from(b).length - Array.from(a).length)) {
-    if (!rest.includes(key)) continue;
-    found.push(key);
-    rest = rest.split(key).join("\u25A0".repeat(Array.from(key).length));
+    let named = false;
+    for (let index = rest.indexOf(key); index !== -1; index = rest.indexOf(key, index + key.length)) if (isNameOccurrence(rest, index, key)) named = true;
+    if (named) found.push(key);
+    // 長い名前の中の短い名前を拾わないよう、名前として読めなくても長い順に伏せる
+    rest = rest.split(key).join("\u25A0".repeat(key.length));
   }
   return found;
 }

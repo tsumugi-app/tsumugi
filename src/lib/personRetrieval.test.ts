@@ -135,3 +135,17 @@ test("review fixes: shared records are never extras; a keyword-only name hides a
   assert.equal(isRelationshipTalk("打ち合わせのあと、さきさんと距離を感じて寂しかった"), true);
   assert.equal(isRelationshipTalk("さきさんは大切な存在だと思う"), true);
 });
+
+test("a name inside an ordinary word is not a person; a name with a particle or honorific is", () => {
+  assert.deepEqual(personKeysInText("さきほどの資料を確認したい", ["さき"]), []);
+  assert.deepEqual(personKeysInText("さきがそう言った", ["さき"]), ["さき"]);
+  assert.deepEqual(personKeysInText("さきさんと話した", ["さき"]), ["さき"]);
+  assert.deepEqual(personKeysInText("さき、元気かな", ["さき"]), ["さき"]);
+  assert.deepEqual(personKeysInText("田中部長に相談した", ["田中"]), ["田中"]);
+  const pool = [mem("s1", "2026-09-10", ["さきさん", "食事"], "さきさんと食事したと話した。", "さきさん")];
+  const q = "さきほどの資料を確認したい";
+  const before = selectConversationDirectMatches(pool, q, [q], computeKeywordFrequency(pool), DEFAULT_LIMIT).kept.map((e) => e.memory.id);
+  const r = select(pool, q);
+  assert.equal(r.person, null);
+  assert.deepEqual(ids(r), before);
+});
