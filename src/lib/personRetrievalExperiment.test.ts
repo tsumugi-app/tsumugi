@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { computeKeywordFrequency, DEFAULT_LIMIT, selectConversationDirectMatches } from "./retrieval";
-import { isAboutPerson, knownPersonKeys, normalizeTwoPeople, PERSON_EXTRA_LIMIT, personKeysInText, selectWithPersonRetrieval } from "./personRetrievalExperiment";
+import { isAboutPerson, knownPersonKeys, normalizeTwoPeople, PERSON_EXTRA_LIMIT, personKeysInText, relationTalk, selectWithPersonRetrieval } from "./personRetrievalExperiment";
 import type { MemoryObject } from "./types";
 
 const at = (d: string) => `${d}T12:00:00.000Z`;
@@ -77,4 +77,23 @@ test("the person's name alone never makes a record 'overlap': a work question do
   const latest = "さきさんと来週の企画のプレゼン、どっちが話すか決めないと";
   const r = selectWithPersonRetrieval(POOL, latest, [latest]);
   assert.ok(!r.added.some((a) => a.id === "s4" && a.why.includes("重なる")), "距離・寂しい is not chosen for overlapping the name");
+});
+
+test("R3: a feelings record only when the turn is about the relationship; plain work talk gets none; never another person's", () => {
+  assert.equal(relationTalk("さきさんと来週の企画のプレゼン、どっちが話すか決めないと").yes, false);
+  assert.equal(relationTalk("そもそも2人だけの空気感でいたいんだよほんとは").yes, true);
+  assert.equal(relationTalk("今日は雨で洗濯物が乾かない").yes, false);
+  const turns = ["さきさんとは今まで2人で仕事してきたけど、今回はもう一人入ってる", "そもそも2人だけの空気感でいたいんだよほんとは"];
+  const r3 = selectWithPersonRetrieval(POOL, turns[1], turns, { feelingSlot: true });
+  assert.ok(r3.feeling?.added, "a feelings record is added for the relationship turn");
+  assert.ok(isAboutPerson(POOL.find((m) => m.id === r3.feeling!.added)!, "さき"));
+  const work = "さきさんと来週の企画のプレゼン、どっちが話すか決めないと";
+  const w = selectWithPersonRetrieval(POOL, work, [work], { feelingSlot: true });
+  assert.equal(w.feeling?.added, null, "no feelings record for plain work");
+  const other = "渡邊さん、最近ちょっと距離置きたそうで寂しい";
+  const o = selectWithPersonRetrieval(POOL, other, [other], { feelingSlot: true });
+  assert.ok(!o.memories.some((m) => m.id.startsWith("s")), "never さきさん's feelings for 渡邊さん");
+  const none = selectWithPersonRetrieval(POOL, "今日は雨で寂しい", ["今日は雨で寂しい"], { feelingSlot: true });
+  assert.equal(none.target, null, "no person: nothing is added");
+  assert.ok(r3.memories.length <= DEFAULT_LIMIT + PERSON_EXTRA_LIMIT + 1);
 });

@@ -11,6 +11,8 @@
  *   3. adds at most PERSON_EXTRA_LIMIT of the person's other Memories: the most recent one (the present), and the one that overlaps the
  *      conversation most, the person's name left out of the comparison (which may be an older feeling or relationship record). Never all of them.
  * 「2人」「２人」 are read as 「二人」 for retrieval only. No person, or two people named in the message: the production selection as it is.
+ * R3 (options.feelingSlot): additionally at most ONE feelings record of the same person, only when the turn is about the relationship or
+ * feelings (not plain work progress), the most related to the conversation first, then the newest; none when nothing fits.
  * Pure function: no IndexedDB, no AI call.
  */
 import { computeKeywordFrequency, DEFAULT_LIMIT, deriveConversationPersonFocus, scoreMemory, selectConversationDirectMatches } from "./retrieval";
@@ -63,9 +65,41 @@ export interface PersonRetrievalResult {
   target: { key: string; how: "named" | "carried" } | null;
   added: { id: string; why: string }[];
   dropped: { id: string; why: string }[];
+  /** R3 only: the feelings record added (or why none was) */
+  feeling?: { added: string | null; why: string };
 }
 
-export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, userTurns: string[]): PersonRetrievalResult {
+// ---------------------------------------------------------------------------
+// R3: at most one feelings record of the person, only when the turn is about the relationship / feelings
+// ---------------------------------------------------------------------------
+
+/** words of feelings in a record (its keywords or summary); a record whose types include "emotion" counts too */
+const FEELING_WORDS = /寂し|さみし|嫉妬|妬|大切|大事|好き|嫌い|不安|辛い|つらい|悲し|嬉し|うれし|安心|ほっと|モヤモヤ|もやもや|葛藤|信頼|傷つ|怖|距離|気持ち|会いたい|恋し/;
+export function isFeelingRecord(m: MemoryObject): boolean {
+  if ((m.types ?? []).includes("emotion" as never)) return true;
+  return FEELING_WORDS.test(`${(m.keywords ?? []).join(" ")} ${m.summary}`);
+}
+
+/** the user talks about feelings, or about what the relationship means ("二人だけでいたい", "距離", "空気感", "ほんとは〜したい") */
+const RELATION_CUES = /寂し|さみし|嫉妬|妬|大切|大事|好き|嫌い|嫌われ|不安|辛い|つらい|悲し|嬉し|うれし|安心|ほっと|モヤモヤ|もやもや|傷つ|怖|気持ち|会いたい|話したい|一緒にいたい|二人だけ|二人でいたい|二人の時間|距離|空気感|関係|存在|避け|冷た|そっけな|離れ|ほんとは|本当は|本音/;
+/** plain work progress / task talk */
+const WORK_CUES = /プレゼン|資料|締め切り|締切|会議|打ち合わせ|見積|タスク|分担|スケジュール|進め方|段取り|納期|作業|手順|報告|担当/;
+
+export function relationTalk(latest: string, previousUserTurn?: string): { yes: boolean; why: string } {
+  const lat = normalizeTwoPeople(nfkc(latest));
+  if (RELATION_CUES.test(lat)) return { yes: true, why: `今の発言（「${lat.match(RELATION_CUES)?.[0]}」）` };
+  if (WORK_CUES.test(lat)) return { yes: false, why: `今の発言は業務の話（「${lat.match(WORK_CUES)?.[0]}」）` };
+  const prev = previousUserTurn ? normalizeTwoPeople(nfkc(previousUserTurn)) : "";
+  if (prev && RELATION_CUES.test(prev)) return { yes: true, why: `直前の発言（「${prev.match(RELATION_CUES)?.[0]}」）` };
+  return { yes: false, why: "関係や気持ちの話ではない" };
+}
+
+export interface PersonRetrievalOptions {
+  /** R3: add at most one feelings record of the person when the turn is about the relationship */
+  feelingSlot?: boolean;
+}
+
+export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, userTurns: string[], options: PersonRetrievalOptions = {}): PersonRetrievalResult {
   const lat = normalizeTwoPeople(latest);
   const turns = userTurns.map(normalizeTwoPeople);
   const base = selectConversationDirectMatches(pool, lat, turns, computeKeywordFrequency(pool), DEFAULT_LIMIT).kept.map((e) => e.memory);
@@ -113,6 +147,30 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
     .filter((x) => x.hits > 0)
     .sort((a, b) => b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m))[0];
   if (overlap) added.push({ id: overlap.m.id, why: "会話の内容と最も重なる記録" });
-  const extra = added.slice(0, PERSON_EXTRA_LIMIT).map((a) => pool.find((m) => m.id === a.id)!);
-  return { memories: [...kept, ...extra], target, added: added.slice(0, PERSON_EXTRA_LIMIT), dropped };
+  const chosen = added.slice(0, PERSON_EXTRA_LIMIT);
+  let feeling: PersonRetrievalResult["feeling"];
+  if (options.feelingSlot) {
+    const talk = relationTalk(latest, turns.length >= 2 ? turns[turns.length - 2] : undefined);
+    const already = new Set([...kept.map((m) => m.id), ...chosen.map((a) => a.id)]);
+    const hasFeelingAlready = [...kept, ...chosen.map((a) => pool.find((m) => m.id === a.id)!)].some((m) => isFeelingRecord(m) && isAboutPerson(m, target!.key));
+    if (!talk.yes) {
+      feeling = { added: null, why: `追加なし：${talk.why}` };
+    } else {
+      // only this person's records (never another person's), relevance to the conversation first, then recency
+      const pick = pool
+        .filter((m) => isAboutPerson(m, target!.key) && !already.has(m.id) && isFeelingRecord(m))
+        .filter((m) => !keys.some((k) => k !== target!.key && isAboutPerson(m, k)))
+        .map((m) => {
+          const ownKeywords = (m.keywords ?? []).filter((k) => !keys.includes(personKey(k)));
+          const hits = ownKeywords.filter((k) => query.includes(nfkc(k))).length;
+          const tie = scoreMemory({ ...m, keywords: [], summary: keys.reduce((t, k) => t.split(k).join(" "), m.summary), content: "" }, query);
+          return { m, hits, tie };
+        })
+        .sort((a, b) => b.hits - a.hits || b.tie - a.tie || timeOf(b.m) - timeOf(a.m))[0];
+      if (!pick) feeling = { added: null, why: `追加なし：${hasFeelingAlready ? "気持ちの記録はすでに含まれている" : "この人物の気持ちの記録が無い"}（${talk.why}）` };
+      else feeling = { added: pick.m.id, why: `${talk.why}が関係・気持ちの話。${pick.hits > 0 ? "会話と重なる気持ちの記録" : pick.tie > 0 ? "会話と言葉が近い気持ちの記録" : "この人物の最新の気持ちの記録"}` };
+    }
+  }
+  const extra = [...chosen.map((a) => pool.find((m) => m.id === a.id)!), ...(feeling?.added ? [pool.find((m) => m.id === feeling!.added)!] : [])];
+  return { memories: [...kept, ...extra], target, added: chosen, dropped, ...(feeling ? { feeling } : {}) };
 }
