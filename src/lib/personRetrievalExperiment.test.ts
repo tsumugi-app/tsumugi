@@ -109,3 +109,53 @@ test("R3n / R3x: no guess from text similarity; R3n falls back to the newest fee
   const work = "さきさんと来週の企画のプレゼン、どっちが話すか決めないと";
   for (const pick of ["newest", "none"] as const) assert.equal(selectWithPersonRetrieval(POOL, work, [work], { feelingSlot: true, feelingPick: pick }).feeling?.added, null);
 });
+
+// --- bias of "the newest feelings record" (R3n) ---
+function feelMem(id: string, day: string, keywords: string[], summary: string, person = "さきさん"): MemoryObject {
+  const m = mem(id, day, keywords, summary, person);
+  return { ...m, types: ["conversation", "emotion"] } as unknown as MemoryObject;
+}
+const NOW = Date.parse("2026-11-01T12:00:00.000Z");
+const turnsRel = ["さきさんとは今まで2人で仕事してきたけど、今回はもう一人入ってる", "そもそも2人だけの空気感でいたいんだよほんとは"];
+const pickFor = (pool: MemoryObject[]) => selectWithPersonRetrieval(pool, turnsRel[1], turnsRel, { feelingSlot: true, feelingPick: "newest", now: NOW });
+const workBase = [mem("w-a", "2026-04-10", ["さきさん", "仕事", "二人"], "さきさんと二人で企画を進めてきたと話した。", "さきさん")];
+
+test("bias 1: the newest feelings record is positive -> that one", () => {
+  const r = pickFor([...workBase, feelMem("f1", "2026-06-01", ["さきさん", "寂しい"], "さきさんと距離ができて寂しいと話した。"), feelMem("f2", "2026-10-20", ["さきさん", "大切"], "さきさんがやっぱり大切だと感じたと話した。")]);
+  assert.equal(r.feeling?.added, "f2");
+});
+
+test("bias 2: the newest is negative -> it is chosen, with its date (it is passed as a dated record, not as the whole present feeling)", () => {
+  const r = pickFor([...workBase, feelMem("f1", "2026-08-01", ["さきさん", "大切"], "さきさんが大切だと話した。"), feelMem("f2", "2026-10-25", ["さきさん", "怒り"], "さきさんに腹が立って、少し距離を置きたいと話した。")]);
+  assert.equal(r.feeling?.added, "f2");
+  assert.ok(r.memories.find((m) => m.id === "f2")!.date.startsWith("2026-10-25"), "the record keeps its date");
+});
+
+test("bias 3: feelings changed quickly -> the latest of them", () => {
+  const r = pickFor([...workBase, feelMem("f1", "2026-09-01", ["さきさん", "大切"], "さきさんが大切だと話した。"), feelMem("f2", "2026-10-01", ["さきさん", "怒り"], "さきさんに腹が立ったと話した。"), feelMem("f3", "2026-10-20", ["さきさん", "安心"], "さきさんと仲直りして安心したと話した。")]);
+  assert.equal(r.feeling?.added, "f3");
+});
+
+test("bias 4: a one-off newest feeling over a feeling that keeps coming back -> R3n still takes the newest (reported as a known limit)", () => {
+  const r = pickFor([
+    ...workBase,
+    feelMem("f1", "2026-06-01", ["さきさん", "大切"], "さきさんが大切だと話した。"),
+    feelMem("f2", "2026-08-01", ["さきさん", "大切"], "さきさんのことをやっぱり大切に思うと話した。"),
+    feelMem("f3", "2026-10-01", ["さきさん", "大切"], "さきさんが大切な存在だと改めて話した。"),
+    feelMem("f4", "2026-10-28", ["さきさん", "苛立ち"], "さきさんの一言に少しイラッとしたと話した。"),
+  ]);
+  assert.equal(r.feeling?.added, "f4");
+});
+
+test("bias 5: an old feelings record or one shared with another person is never added", () => {
+  const old = pickFor([...workBase, feelMem("f1", "2025-12-01", ["さきさん", "大切"], "さきさんが大切だと話した。")]);
+  assert.equal(old.feeling?.added, null, "older than the age limit");
+  const shared = pickFor([...workBase, mem("w-b", "2026-09-01", ["渡邊さん"], "渡邊さんと打ち合わせした。", "渡邊さん"), { ...feelMem("f1", "2026-10-20", ["さきさん", "渡邊さん", "嫉妬"], "さきさんと渡邊さんが親しげで嫉妬したと話した。"), personMentions: [{ displayName: "さきさん", groupingKey: "さきさん" }, { displayName: "渡邊さん", groupingKey: "渡邊さん" }] } as unknown as MemoryObject]);
+  assert.equal(shared.feeling?.added, null, "a feelings record that is also about another person");
+});
+
+test("a keyword-matched feelings record wins over the newest one", () => {
+  const turns = ["さきさんと最近距離がある気がする", "距離取りたいのかもしれないね"];
+  const r = selectWithPersonRetrieval([...workBase, feelMem("f1", "2026-07-01", ["さきさん", "距離"], "さきさんと距離ができて寂しいと話した。"), feelMem("f2", "2026-10-20", ["さきさん", "大切"], "さきさんが大切だと話した。")], turns[1], turns, { feelingSlot: true, feelingPick: "newest", now: NOW });
+  assert.ok(r.memories.some((m) => m.id === "f1"));
+});

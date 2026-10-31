@@ -94,6 +94,8 @@ export function relationTalk(latest: string, previousUserTurn?: string): { yes: 
   return { yes: false, why: "関係や気持ちの話ではない" };
 }
 
+export const FEELING_MAX_AGE_DAYS = 180;
+
 export interface PersonRetrievalOptions {
   /** R3: add at most one feelings record of the person when the turn is about the relationship */
   feelingSlot?: boolean;
@@ -104,6 +106,8 @@ export interface PersonRetrievalOptions {
    *   "none"   (R3x): a record whose own keyword appears in the conversation; otherwise nothing
    */
   feelingPick?: "tie" | "newest" | "none";
+  /** "now" for the age limit of a feelings record (default: Date.now()) */
+  now?: number;
 }
 
 export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, userTurns: string[], options: PersonRetrievalOptions = {}): PersonRetrievalResult {
@@ -167,6 +171,8 @@ export function selectWithPersonRetrieval(pool: MemoryObject[], latest: string, 
       const pick = pool
         .filter((m) => isAboutPerson(m, target!.key) && !already.has(m.id) && isFeelingRecord(m))
         .filter((m) => !keys.some((k) => k !== target!.key && isAboutPerson(m, k)))
+        // a feelings record older than FEELING_MAX_AGE_DAYS says little about now: never added
+        .filter((m) => (options.now ?? Date.now()) - timeOf(m) <= FEELING_MAX_AGE_DAYS * 86_400_000)
         .map((m) => {
           const ownKeywords = (m.keywords ?? []).filter((k) => !keys.includes(personKey(k)));
           const hits = ownKeywords.filter((k) => query.includes(nfkc(k))).length;
