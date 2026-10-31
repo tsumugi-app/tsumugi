@@ -88,3 +88,15 @@ test("a turn without any past context says so; a turn with Memories or a recent 
   assert.ok(withRecent.systemInstruction.includes("姉と出かけた"), "the recent conversation reached the prompt");
   assert.ok(!withRecent.systemInstruction.includes("## このターンの過去の情報"));
 });
+
+test("EXPERIMENT condition D: the coexistence note is added only outside production builds, and only when asked", async () => {
+  const preview = await call({ ...turn("ちょうどいいんじゃない？"), evalVoiceVariant: "emotion-coexistence" });
+  assert.ok(preview.systemInstruction.includes(voice.EMOTION_COEXISTENCE_NOTE));
+  assert.ok(!(await call(turn("ちょうどいいんじゃない？"))).systemInstruction.includes("気持ちは新しい発言で上書きされるものではなく"));
+  const prev = process.env.VERCEL_ENV;
+  process.env.VERCEL_ENV = "production";
+  try {
+    const prod = await call({ ...turn("ちょうどいいんじゃない？"), evalVoiceVariant: "emotion-coexistence" });
+    assert.ok(!prod.systemInstruction.includes("気持ちは新しい発言で上書きされるものではなく"), "production ignores the field");
+  } finally { if (prev === undefined) delete process.env.VERCEL_ENV; else process.env.VERCEL_ENV = prev; }
+});

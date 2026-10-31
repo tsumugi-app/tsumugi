@@ -18,6 +18,7 @@
     "src/lib/memorySynthesisFlag.ts",
     "src/lib/dataWipe.ts",
     "src/app/api/synthesize/route.ts",
+    "src/app/api/diagnostics/person-synthesis/route.ts",
     "src/lib/memorySynthesisPrompt.ts"
   ]
 }

@@ -499,3 +499,13 @@ test("static boundary: Synthesis code reads Memories / Conversations only, never
   assert.ok(/isWipePending\(\)/.test(store), "never opened while the device wipe is pending");
   assert.ok(/"tsumugi-synthesis"/.test(src("lib/dataWipe.ts")), "the full wipe knows the database by name");
 });
+
+test("EXPERIMENT person-synthesis route: 404 in production builds", async () => {
+  const route = require(path.join(ROOT, "app/api/diagnostics/person-synthesis/route.js")) as { POST: (r: Request) => Promise<Response> };
+  const prev = process.env.VERCEL_ENV;
+  process.env.VERCEL_ENV = "production";
+  try {
+    const res = await route.POST(new Request("http://x/api/diagnostics/person-synthesis", { method: "POST", body: "{}" }));
+    assert.equal(res.status, 404);
+  } finally { if (prev === undefined) delete process.env.VERCEL_ENV; else process.env.VERCEL_ENV = prev; }
+});

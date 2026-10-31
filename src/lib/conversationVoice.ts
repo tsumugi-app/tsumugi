@@ -67,3 +67,16 @@ export function conversationVoice(): ConversationVoice {
     noPastContextNote: (hasNoPastContext) => (hasNoPastContext ? NO_PAST_CONTEXT_NOTE : ""),
   };
 }
+
+/**
+ * EXPERIMENT (Preview comparison of emotional understanding, condition D) — not used in production builds; to be removed with the comparison page.
+ * A minimal note on coexisting feelings, appended only when a Preview request asks for it.
+ */
+export const EMOTION_COEXISTENCE_NOTE = `
+- 「今の発言を優先する」は、事実や予定を新しくするときの決まり。気持ちは新しい発言で上書きされるものではなく、いくつかが同時にあってよい。
+- この会話や記憶でユーザーが述べた気持ちと食い違って見える発言（自分を納得させるような言い方など）には、すぐに同意せず、以前の気持ちも踏まえた見方を、決めつけずに示す。
+- 話の表面（仕事の進め方など）の奥に、人への気持ちがありそうなときは、それにも触れてよい。断定はしない。`;
+
+export function evalVoiceNote(requested: unknown, isProduction: boolean): string {
+  return !isProduction && requested === "emotion-coexistence" ? EMOTION_COEXISTENCE_NOTE : "";
+}
