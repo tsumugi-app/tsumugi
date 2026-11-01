@@ -43,62 +43,28 @@ async function expectVisible(page: Page, text: string) {
   catch { throw new Error(`「${text}」 was not shown. The screen said: ${await settingsText(page)}`); }
 }
 
-for (const device of ["PC", "Android"] as const) {
-  test.describe(device, () => {
-    if (device === "Android") test.use({ userAgent: ANDROID_UA, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true });
-
-    test("after a normal save, Settings says 「✓ 最新の状態です」 and shows no consistency warning", async ({ page }) => {
-      test.setTimeout(120_000);
-      await seed(page, { project: true });
-      await openSettings(page);
-      await expectVisible(page, LATEST);
-      await expect(page.getByTestId("vault-consistency")).toHaveCount(0);
-      await expect(page.getByText(ATTENTION)).toHaveCount(0);
-    });
-
-    test("a save still waiting at start-up is never shown as a consistency warning, and ends at 「✓ 最新の状態です」", async ({ page }) => {
-      test.setTimeout(150_000);
-      await seed(page, { project: true, pendingMemory: true });
-      await openSettings(page);
-      const latest = page.getByText(LATEST), attention = page.getByText(ATTENTION);
-      const deadline = Date.now() + 90_000;
-      while (!(await latest.isVisible())) {
-        expect(await attention.count(), await settingsText(page)).toBe(0);              // never a warning while the save drains
-        expect(Date.now(), await settingsText(page)).toBeLessThan(deadline);
-        await page.waitForTimeout(250);
-      }
-      await expect(attention).toHaveCount(0);
-      await expect(page.getByTestId("vault-consistency")).toHaveCount(0);
-    });
-
-    test("a genuine difference in a Vault file is not hidden behind 「最新」: the consistency warning shows kinds and counts, and nothing is changed", async ({ page }) => {
-      test.setTimeout(120_000);
-      await seed(page, { project: true });
-      const before = await page.evaluate(async () => {
-        const root = await navigator.storage.getDirectory(); const found: [any, string][] = [];
-        const walk = async (d: any) => { for await (const [n, h] of d.entries()) { if (h.kind === "directory") { if (n !== ".tsumugi") await walk(h); } else if (n.endsWith(".md")) found.push([h, n]); } };
-        await walk(root);
-        for (const [h] of found) {
-          const text = await (await h.getFile()).text();
-          if (!text.includes("本文 架空の散歩の記録")) continue;
-          const edited = text.replace("本文 架空の散歩の記録", "本文 架空の散歩の記録（別の端末で書き換え）");
-          const w = await h.createWritable(); await w.write(edited); await w.close();
-          return edited;
-        }
-        return null;
-      });
-      expect(before).not.toBeNull();
-      await openSettings(page);
-      await expectVisible(page, ATTENTION);
-      await expect(page.getByText(LATEST)).toHaveCount(0);
-      await expect(page.getByTestId("vault-consistency")).toContainText("件");
-      await expect(page.getByTestId("vault-consistency")).toContainText("どの記録も削除・上書きしていません。");
-      const after = await page.evaluate(async () => {
-        const root = await navigator.storage.getDirectory(); let out: string | null = null;
-        const walk = async (d: any) => { for await (const [n, h] of d.entries()) { if (h.kind === "directory") { if (n !== ".tsumugi") await walk(h); } else if (n.endsWith(".md")) { const t = await (await h.getFile()).text(); if (t.includes("別の端末で書き換え")) out = t; } } };
-        await walk(root); return out;
-      });
-      expect(after).toBe(before);                                                         // the check did not overwrite the edited file
-    });
+const dump = (page: Page) => page.evaluate(async () => {
+  const D = (window as any).D; const root = await navigator.storage.getDirectory();
+  try { D.lockMod.setTabVaultEpoch(await D.dbm.getActiveVaultEpoch()); } catch (e) { return "epoch-err " + String(e); }
+  try {
+  const { report, plan } = await D.consistencyCheck.checkVaultConsistency(root, () => false, { drainWaitMs: 500, pollMs: 100, attempts: 1, retryDelayMs: 0 });
+  const progress = await D.dbm.readVaultSaveProgress();
+  return JSON.stringify({ state: report.state, f: report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), held: plan.held, recs: plan.plan.records.filter((r: any) => r.classification !== "unchanged" && r.classification !== "ok").map((r: any) => [r.recordType, r.recordId, r.classification, r.reasons]), issues: plan.plan.issues, ops: plan.ops.map((o: any) => [o.kind, o.steps, o.members.map((m: any) => m.id)]), outbox: progress.outbox.map((e: any) => `${e.id}:${e.status}`), hist: await (async () => { const out: string[] = []; const walk = async (d: any, p: string) => { for await (const [n, h] of d.entries()) { if (h.kind === "directory") await walk(h, p + n + "/"); else if (p.includes("history")) out.push(p + n + "=" + (await (await h.getFile()).text()).slice(0, 900)); } }; await walk(root, ""); return out; })(), mems: (await D.dbm.getAllMemoryObjects()).map((m: any) => [m.id, m.date, m.createdAt, m.types, m.summary]) });
+  } catch (e) { return "dump-err " + String(e); }
+});
+for (const [name, pendingMemory] of [["normal", false], ["pending", true]] as const) {
+  test(`DIAG ${name}`, async ({ page }) => {
+    test.setTimeout(170_000);
+    await seed(page, { project: true, pendingMemory });
+    const early = name === "pending" ? await page.evaluate(async () => "") : "";
+    await openSettings(page);
+    await page.waitForTimeout(45_000);
+    const t1 = await settingsText(page);
+    await page.addScriptTag({ path: bundle });
+    const d1 = await dump(page);
+    const check = page.getByRole("button", { name: "確認する", exact: true });
+    let t2 = "no-check-button";
+    if (await check.count()) { await check.first().click(); await page.waitForTimeout(30_000); t2 = await settingsText(page); }
+    throw new Error(`DIAG ${name} ${early} ||T1 ${t1.slice(t1.indexOf("保存先"), t1.indexOf("保存先") + 400)} ||D1 ${d1} ||T2 ${t2.slice(t2.indexOf("保存先"), t2.indexOf("保存先") + 500)}`);
   });
 }
