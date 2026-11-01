@@ -23,7 +23,7 @@ async function setup(page: Page) {
       const w = await (await dir.getFileHandle(parts.at(-1)!, { create: true })).createWritable(); await w.write(text); await w.close();
     };
     await write(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "fictional-consistency", createdAt: T }));
-    await write(".tsumugi/registry-meta.json", JSON.stringify({ baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
+    await write(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, updatedAt: T, lastFullResyncAt: null, baselineEstablishedAt: "2026-01-01T00:00:00.000Z" }));
     const ident = { id: "current", vaultId: "fictional-consistency", activeVaultEpoch: 0, registryGeneration: "g", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
     await dbm.putVaultIdentityRecord(ident); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated(); lockMod.setTabVaultEpoch(0);
     (window as any).__root = root; (window as any).__env = { root, vaultIdentity: ident, now: () => T };
@@ -39,8 +39,8 @@ async function setup(page: Page) {
 /** the production check (vaultConsistencyCheck.checkVaultConsistency) with short, bounded waits */
 const check = (page: Page) => page.evaluate(async () => {
   const { consistencyCheck } = (window as any).D; const started = Date.now();
-  const { report } = await consistencyCheck.checkVaultConsistency((window as any).__root, () => false, { drainWaitMs: 1500, pollMs: 100, attempts: 3, retryDelayMs: 100 });
-  return { state: report.state, counts: report.counts, categories: report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), ms: Date.now() - started };
+  const { report, plan } = await consistencyCheck.checkVaultConsistency((window as any).__root, () => false, { drainWaitMs: 1500, pollMs: 100, attempts: 3, retryDelayMs: 100 });
+  return { state: report.state, counts: report.counts, categories: [...report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), ...plan.plan.issues.map((i: any) => `issue ${i.path}:${i.status}:${i.error ?? ""}`)], ms: Date.now() - started };
 });
 /** everything the check could have changed: the OPFS "Vault" files and the save progress (Outbox + ledger) */
 const fingerprint = (page: Page) => page.evaluate(async () => {
@@ -136,7 +136,7 @@ for (const device of ["desktop", "android"] as const) {
       expect(["clean", "saving", "unsettled"], JSON.stringify(r.categories)).toContain(r.state);
       await other.evaluate(async () => { (window as any).__stop = true; await (window as any).__loop; });
       await flush(page);
-      expect((await check(page)).state).toBe("clean");
+      const after = await check(page); expect(after.state, JSON.stringify(after.categories)).toBe("clean");
     });
   });
 }
