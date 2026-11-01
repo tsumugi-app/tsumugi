@@ -2586,62 +2586,114 @@ test("sourceType 6b: canonical changing before the compare-and-set stops without
 });
 
 // ---------------------------------------------------------------------------
-// User-facing "修復する" (no debugLog gate; a new repair needs the all-PASS pre-repair check)
+// User-facing "修復する": the 2026-10-03 narrow repair is never STARTED from the normal UI; it only resumes an interrupted journal
 // ---------------------------------------------------------------------------
-const userView = (require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView")).deriveRecoveryUserView;
-const detect = async (w: Wired) => { const p = await w.confirmedNow(); return p.heldCount > 0 || p.recoverableCount > 0 ? { kind: "plan", applyPlan: p } : { kind: "clean" }; };
-const userRepair = (w: Wired, confirmed: import("./vaultRecoveryApply").RecoveryApplyPlan | null) => withProductionGlobals(() => narrow.runNarrowRepairForUser(w.root, confirmed, { apply: w.apply }));
-test("User repair: anomaly shown -> 修復する -> repaired -> re-detection is clean -> Recovery display gone", async () => {
-  const w = await wiredFixture();
-  assert.equal(userView(await detect(w)).kind, "attention");
-  assert.deepEqual(await userRepair(w, w.confirmed), { status: "repaired" });
-  const after = await detect(w); assert.equal(after.kind, "clean"); assert.deepEqual(userView(after), { kind: "none" });
-  assert.equal((await applyMod.planRecoveryApply(w.apply)).heldCount, 0);
-});
-test("User repair: a failed pre-repair check changes nothing and keeps the anomaly display (never 'latest')", async () => {
-  const w = await wiredFixture();
-  const key = vaultMod.dayFileRegistryKey("2026-09-22"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, file = `Memories/${vaultMod.dayFileNameFor("2026-09-22")}`;
-  const shard = readShard(w.vault.get(sp)!); (shard.files[file].memberHashes as Record<string, string>)["r-0"] = "deadbeef"; w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
-  const confirmed = await w.confirmedNow(), before = await fullState(w);
-  assert.deepEqual(await userRepair(w, confirmed), { status: "not-repairable" });
+const uv = require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView");
+const consistency = require("./vaultConsistency") as typeof import("./vaultConsistency");
+const bg = require("./recoveryBackgroundCheck") as typeof import("./recoveryBackgroundCheck");
+const userResume = (w: Wired) => withProductionGlobals(() => narrow.resumeNarrowRepairForUser(w.root, { apply: w.apply }));
+/** The production consistency check on the wired fixture: real save progress (fake IndexedDB) + the RAW plan. No real waiting. */
+const checkOf = (w: Wired, plan: () => ReturnType<typeof applyMod.planRecoveryApply> = () => applyMod.planRecoveryApply(w.apply)) =>
+  consistency.runConsistencyCheck({ readProgress: repairDb.readVaultSaveProgress, plan, sleep: async () => {}, isCancelled: () => false }, { drainWaitMs: 3, pollMs: 1, attempts: 2, retryDelayMs: 0 });
+/** The developer-only explicit repair (debugLog=1), used here only to reach a clean world. */
+const developerRepair = async (w: Wired) => assert.equal((await narrow.executeNarrowMemoryRepair(wiredEnv(w), await w.confirmedNow())).status, "complete");
+const pendingIds = async () => new Set((await repairDb.readVaultSaveProgress()).outbox.filter(e => e.status === "pending").map(e => e.id));
+test("User repair: without an interrupted narrow-repair journal, 修復する never runs the narrow repair and writes nothing", async () => {
+  const w = await wiredFixture(), before = await fullState(w);
+  assert.deepEqual(await userResume(w), { status: "not-repairable" });
   assert.equal(await fullState(w), before, "no journal, nothing written");
-  const status = await detect(w); const view = userView(status, { incomplete: true });
-  assert.equal(view.kind, "attention"); assert.equal(view.kind === "attention" && view.incomplete, true);
+  assert.ok((await applyMod.planRecoveryApply(w.apply)).heldCount > 0, "the held records are kept as they were");
 });
 test("User repair: an interrupted narrow repair is resumed to completion (state kept, then clean)", async () => {
   const w = await wiredFixture(), env = wiredEnv(w), commit = env.commit; let once = true;
   env.commit = async (...args) => { await commit(...args); if (once && !args[3]) { once = false; throw new Error("page kill after canonical"); } };
   assert.equal((await narrow.executeNarrowMemoryRepair(env, w.confirmed)).status, "held");
-  assert.equal(userView({ kind: "interrupted" }).kind, "attention");
-  assert.deepEqual(await userRepair(w, null), { status: "repaired" });
-  assert.equal((await detect(w)).kind, "clean");
-});
-test("User repair: nothing to do is not repairable (no plan) and writes nothing", async () => {
-  const w = await wiredFixture(); const before = await fullState(w);
-  assert.deepEqual(await userRepair(w, null), { status: "not-repairable" }); assert.equal(await fullState(w), before);
+  assert.equal(uv.deriveRecoveryUserView({ kind: "interrupted" }, null).kind, "interrupted");
+  assert.deepEqual(await userResume(w), { status: "repaired" });
+  assert.equal((await checkOf(w)).report.state, "clean");
 });
 
 // ---------------------------------------------------------------------------
-// Background Recovery check: once per (build x Vault), persisted, never tied to Settings, never mis-claims "latest"
+// Consistency check on the production-shaped world (READ ONLY): saving is never corruption, genuine issues are found
 // ---------------------------------------------------------------------------
-const bg = require("./recoveryBackgroundCheck") as typeof import("./recoveryBackgroundCheck");
+test("Consistency (wired): the genuine 10/03 records are 'attention'; records with a pending Outbox entry are 'saving', never a conflict", async () => {
+  const w = await wiredFixture(), before = await fullState(w), pending = await pendingIds();
+  const { report } = await checkOf(w);
+  assert.equal(report.state, "attention"); assert.equal(report.settled, true);
+  for (const f of report.findings) if (f.recordId && pending.has(`${f.recordType === "reflection" ? "memory" : f.recordType}:${f.recordId}`)) assert.ok(f.category === "saving" || f.category === "retryable", `${f.recordId}: ${f.category}`);
+  assert.ok(report.findings.some(f => f.category !== "saving"), "the registry mismatch is still reported");
+  assert.equal(await fullState(w), before, "the check is read-only");
+  const view = uv.deriveRecoveryUserView({ kind: "plan" }, report); assert.equal(view.kind, "attention"); assert.equal(uv.recoveryAllowsLatest(view), false);
+});
+test("Consistency (wired): once the pending saves are done, the re-check classifies the same records by their content", async () => {
+  const w = await wiredFixture();
+  for (const e of await repairDb.getPendingVaultOutboxEntries()) await repairDb.putVaultOutboxEntry({ ...e, status: "done" });
+  const { report } = await checkOf(w);
+  assert.equal(report.state, "attention"); assert.equal(report.counts.saving, 0);
+  assert.ok(report.counts.needsChoice + report.counts.repairLater + report.counts.unknown > 0);
+});
+test("Consistency (wired): a healthy world is 'clean'; a new save in progress is 'saving' (not latest, not an anomaly)", async () => {
+  const w = await wiredFixture(); await developerRepair(w);
+  assert.equal((await checkOf(w)).report.state, "clean");
+  const m = (await repairDb.getMemoryObject("c-0"))!; await repairDb.putMemoryObjectWithOutbox({ ...m, summary: "edited (fictional)", updatedAt: "2026-11-01T00:00:00.000Z" }, "memory", "2026-11-01T00:00:00.000Z");
+  const { report } = await checkOf(w);
+  assert.equal(report.state, "saving"); assert.ok(report.counts.saving >= 1);
+  const view = uv.deriveRecoveryUserView({ kind: "plan" }, report); assert.equal(view.kind, "saving"); assert.equal(uv.recoveryAllowsLatest(view), false);
+});
+test("Consistency (wired): another tab saving during the scan makes the result unsettled/saving, never a recorded anomaly", async () => {
+  const w = await wiredFixture(); await developerRepair(w);
+  let n = 0;
+  const { report } = await checkOf(w, async () => {
+    const plan = await applyMod.planRecoveryApply(w.apply);
+    const m = (await repairDb.getMemoryObject("c-1"))!, at = `2026-11-01T00:00:0${n++}.000Z`; // the other tab commits canonical + Outbox while this tab scans
+    await repairDb.putMemoryObjectWithOutbox({ ...m, summary: `other tab ${n}`, updatedAt: at }, "memory", at);
+    return plan;
+  });
+  assert.ok(report.state === "unsettled" || report.state === "saving", report.state);
+  assert.equal(bg.reportIsRecordable(report), false, "a scan that overlapped saving is never recorded");
+});
+
+// ---------------------------------------------------------------------------
+// Background check: a clean verdict is remembered per (build x Vault); an anomaly is re-checked on the next start
+// ---------------------------------------------------------------------------
 async function bgCheck(w: Wired, build: string, counter: { scans: number }, fail = false) {
-  return bg.runBackgroundRecoveryCheck(bg.productionRecoveryBackgroundDeps(async () => { counter.scans++; if (fail) throw new Error("scan failed"); return applyMod.planRecoveryApply(w.apply); }, build)); // the raw plan, never the archive-excluded one
+  return bg.runBackgroundRecoveryCheck(bg.productionRecoveryBackgroundDeps(async () => { counter.scans++; if (fail) throw new Error("scan failed"); return checkOf(w); }, build)); // the raw plan, never the archive-excluded one
 }
-const uiOf = (result: Awaited<ReturnType<typeof bgCheck>>) => { const st = bg.recoveryStatusFromCheck(result); return st ? userView(st) : userView({ kind: "idle" }, { detectionFailed: true }); };
-test("Background A/B: the same build and Vault scan once; a restart does not scan again (persisted)", async () => {
-  const w = await wiredFixture(), n = { scans: 0 }, build = `b-${Math.random()}`;
-  const first = await bgCheck(w, build, n); assert.equal(first.kind, "scanned"); assert.equal(n.scans, 1);
-  for (let i = 0; i < 3; i++) { const again = await bgCheck(w, build, n); assert.equal(again.kind, "skipped"); } // "restarts": nothing but IndexedDB persists
+const uiOf = (result: Awaited<ReturnType<typeof bgCheck>>) =>
+  result.kind === "checked" ? uv.deriveRecoveryUserView({ kind: "plan" }, result.report) : result.kind === "skipped" ? uv.deriveRecoveryUserView({ kind: "clean" }, null) : uv.deriveRecoveryUserView({ kind: "idle" }, null, { detectionFailed: true });
+test("Background A/B: a clean world is checked once per build and Vault; a restart does not scan again (persisted)", async () => {
+  const w = await wiredFixture(); await developerRepair(w); const n = { scans: 0 }, build = `b-${Math.random()}`;
+  const first = await bgCheck(w, build, n); assert.equal(first.kind === "checked" && first.report.state, "clean"); assert.equal(n.scans, 1);
+  for (let i = 0; i < 3; i++) assert.equal((await bgCheck(w, build, n)).kind, "skipped"); // "restarts": nothing but IndexedDB persists
   assert.equal(n.scans, 1, "no repeated full scan");
 });
+test("Background: an old anomaly verdict is re-checked on every start (never shown for the whole build without re-checking)", async () => {
+  const w = await wiredFixture(), n = { scans: 0 }, build = `r-${Math.random()}`;
+  const first = await bgCheck(w, build, n); assert.equal(first.kind === "checked" && first.report.state, "attention");
+  assert.deepEqual(await repairDb.getRecoveryCheckMarker("fixture-identity"), { build, clean: false });
+  await developerRepair(w); // fixed elsewhere (e.g. another device or a later version)
+  const again = await bgCheck(w, build, n); assert.equal(n.scans, 2); assert.equal(again.kind === "checked" && again.report.state, "clean");
+  assert.deepEqual(await repairDb.getRecoveryCheckMarker("fixture-identity"), { build, clean: true });
+  assert.equal((await bgCheck(w, build, n)).kind, "skipped"); assert.equal(n.scans, 2);
+});
+test("Background: a saving-only result is not recorded (checked again next time)", async () => {
+  const w = await wiredFixture(); await developerRepair(w); const n = { scans: 0 }, build = `s-${Math.random()}`;
+  const markerBefore = await repairDb.getRecoveryCheckMarker("fixture-identity"); // the fake IndexedDB is shared by the whole file
+  const m = (await repairDb.getMemoryObject("c-2"))!; await repairDb.putMemoryObjectWithOutbox({ ...m, summary: "pending (fictional)", updatedAt: "2026-11-01T01:00:00.000Z" }, "memory", "2026-11-01T01:00:00.000Z");
+  const first = await bgCheck(w, build, n); assert.equal(first.kind === "checked" && first.report.state, "saving");
+  assert.equal(uiOf(first).kind, "saving");
+  assert.deepEqual(await repairDb.getRecoveryCheckMarker("fixture-identity"), markerBefore, "nothing recorded");
+  for (const e of await repairDb.getPendingVaultOutboxEntries()) await repairDb.putVaultOutboxEntry({ ...e, status: "done" });
+  await repairDb.setVaultSyncState("memory:c-2", "2026-11-01T01:00:00.000Z");
+  const second = await bgCheck(w, build, n); assert.equal(n.scans, 2); assert.equal(second.kind, "checked");
+});
 test("Background C: a new app build scans once more", async () => {
-  const w = await wiredFixture(), n = { scans: 0 }, v1 = `v1-${Math.random()}`, v2 = `v2-${Math.random()}`;
+  const w = await wiredFixture(); await developerRepair(w); const n = { scans: 0 }, v1 = `v1-${Math.random()}`, v2 = `v2-${Math.random()}`;
   await bgCheck(w, v1, n); await bgCheck(w, v1, n); assert.equal(n.scans, 1);
   await bgCheck(w, v2, n); await bgCheck(w, v2, n); assert.equal(n.scans, 2);
 });
 test("Background D: another Vault is scanned once for that Vault", async () => {
-  const w = await wiredFixture(), n = { scans: 0 }, build = `d-${Math.random()}`; await bgCheck(w, build, n);
+  const w = await wiredFixture(); await developerRepair(w); const n = { scans: 0 }, build = `d-${Math.random()}`; await bgCheck(w, build, n);
   const id = (await repairDb.getVaultIdentityRecord())!;
   await repairDb.putVaultIdentityRecord({ ...id, vaultId: `other-${Math.random()}` });
   await bgCheck(w, build, n); await bgCheck(w, build, n); assert.equal(n.scans, 2, "once per Vault");
@@ -2651,9 +2703,9 @@ test("Background H: a failed or impossible check stores nothing, claims neither 
   const w = await wiredFixture(), n = { scans: 0 }, build = `h-${Math.random()}`, vaultId = `h-vault-${Math.random()}`;
   await repairDb.putVaultIdentityRecord({ ...(await repairDb.getVaultIdentityRecord())!, vaultId });
   const failed = await bgCheck(w, build, n, true); assert.equal(failed.kind, "failed");
-  const view = uiOf(failed); assert.deepEqual(view, { kind: "unknown" }); assert.equal(recoveryAllowsLatestFn(view), false);
+  const view = uiOf(failed); assert.deepEqual(view, { kind: "unknown" }); assert.equal(uv.recoveryAllowsLatest(view), false);
   assert.equal(await repairDb.getRecoveryCheckMarker(vaultId), undefined, "nothing recorded");
-  assert.equal((await bgCheck(w, build, n)).kind, "scanned", "retried and succeeded");
+  assert.equal((await bgCheck(w, build, n)).kind, "checked", "retried and succeeded");
 });
 test("Phase 0: the check key does not depend on identity (world key); an unidentified world is still checked and recorded", async () => {
   const w = await wiredFixture(), n = { scans: 0 }, build = `w-${Math.random()}`;
@@ -2662,9 +2714,9 @@ test("Phase 0: the check key does not depend on identity (world key); an unident
     await repairDb.putVaultIdentityRecord({ ...id, vaultId: "" as string });
     const key = await repairDb.getRecoveryCheckWorldKey();
     assert.match(key, /^world:\d+$/, "no identity -> origin-bound world key");
-    const first = await bgCheck(w, build, n); assert.equal(first.kind, "scanned"); assert.equal(first.kind === "scanned" && first.clean, false);
+    const first = await bgCheck(w, build, n); assert.equal(first.kind === "checked" && first.report.state, "attention");
     assert.deepEqual(await repairDb.getRecoveryCheckMarker(key), { build, clean: false });
-    assert.equal((await bgCheck(w, build, n)).kind, "skipped"); assert.equal(n.scans, 1);
+    assert.equal((await bgCheck(w, build, n)).kind, "checked", "an anomaly is re-checked"); assert.equal(n.scans, 2);
   } finally { await repairDb.putVaultIdentityRecord(id); }
   assert.equal(await repairDb.getRecoveryCheckWorldKey(), "fixture-identity", "identity present -> vaultId");
 });
@@ -2680,50 +2732,37 @@ test("Phase 0: clean only from the RAW plan (archived records are never 'clean';
   assert.equal(bg.isRecoveryClean({ ...base, ops: [{}] }), false);
   assert.equal(bg.isRecoveryClean({ ...base, heldCount: 1 }), false);
 });
-test("Phase 0: states — checking keeps a known issue visible; failed is never blank; texts", () => {
-  const uv = require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView");
-  assert.equal(uv.deriveRecoveryUserView({ kind: "idle" }, { checking: true }).kind, "checking");
-  assert.equal(uv.deriveRecoveryUserView({ kind: "known-issue" }, { checking: true }).kind, "attention");
-  assert.equal(uv.deriveRecoveryUserView({ kind: "idle" }, { detectionFailed: true }).kind, "unknown");
+test("Phase 0: states — checking keeps a known issue visible; failed is never blank; texts", async () => {
+  const w = await wiredFixture(); const { report } = await checkOf(w);
+  assert.equal(uv.deriveRecoveryUserView({ kind: "idle" }, null, { checking: true }).kind, "checking");
+  const checking = uv.deriveRecoveryUserView({ kind: "plan" }, report, { checking: true }); assert.ok(checking.kind === "attention" && checking.checking);
+  assert.equal(uv.deriveRecoveryUserView({ kind: "idle" }, null, { detectionFailed: true }).kind, "unknown");
   assert.ok(uv.RECOVERY_FAILED_TEXT.length > 0);
   assert.equal(uv.RECOVERY_REPAIRING_TEXT, "保存先を修復しています…");
-  assert.equal(uv.RECOVERY_INCOMPLETE_TEXT, "一部の記録を安全に修復できませんでした。データは保持されています。");
+  assert.equal(uv.RECOVERY_DATA_KEPT_TEXT, "どの記録も削除・上書きしていません。");
 });
-const recoveryAllowsLatestFn = (require("./vaultRecoveryUserView") as typeof import("./vaultRecoveryUserView")).recoveryAllowsLatest;
-test("Background E: a healthy Vault shows only 'latest' (no Recovery UI)", async () => {
-  const w = await wiredFixture(); assert.equal((await userRepair(w, w.confirmed)).status, "repaired");
-  const n = { scans: 0 }, result = await bgCheck(w, `e-${Math.random()}`, n);
-  assert.deepEqual(result, { kind: "scanned", clean: true }); const view = uiOf(result); assert.deepEqual(view, { kind: "none" }); assert.equal(recoveryAllowsLatestFn(view), true);
-});
-test("Production flow: anomaly -> background scan -> 修復する -> clean/latest -> restart does not rescan", async () => {
+test("Production flow: anomaly -> attention (no narrow repair from 修復する) -> fixed -> re-check clean/latest -> restart does not rescan", async () => {
   const w = await wiredFixture(), n = { scans: 0 }, build = `p-${Math.random()}`;
-  // anomaly detected by the one background scan; the UI shows 修復する and never 'latest'
-  const found = await bgCheck(w, build, n); assert.equal(found.kind, "scanned"); assert.equal(found.kind === "scanned" && found.clean, false);
-  const view1 = uiOf(found); assert.equal(view1.kind, "attention"); assert.equal(recoveryAllowsLatestFn(view1), false);
-  assert.deepEqual(await repairDb.getRecoveryCheckMarker("fixture-identity"), { build, clean: false });
-  // restart: the known anomaly is shown without scanning again
-  const restarted = await bgCheck(w, build, n); assert.deepEqual(restarted, { kind: "skipped", clean: false }); assert.equal(n.scans, 1);
-  assert.equal(uiOf(restarted).kind, "attention");
-  // 修復する (the click re-checks the current state, then runs the repair with every guard)
-  const plan = await w.confirmedNow(); assert.ok(plan.heldCount > 0);
-  assert.deepEqual(await userRepair(w, plan), { status: "repaired" });
+  const found = await bgCheck(w, build, n); assert.equal(found.kind, "checked");
+  const view1 = uiOf(found); assert.equal(view1.kind, "attention"); assert.equal(uv.recoveryAllowsLatest(view1), false);
+  assert.ok(view1.kind === "attention" && view1.sections.length > 0 && view1.sections.every(s => s.count > 0 && s.lines.length > 0), "counts, kinds and reasons are shown");
+  const before = await fullState(w); assert.deepEqual(await userResume(w), { status: "not-repairable" }); assert.equal(await fullState(w), before);
+  await developerRepair(w);
   const raw = await applyMod.planRecoveryApply(w.apply); assert.equal(raw.heldCount, 0); assert.equal(raw.plan.issues.length, 0);
-  const after = await w.confirmedNow(); assert.equal(bg.hasRecoveryAnomaly(after), false);
-  await bg.recordRecoveryCheck(true, build); // what the UI does after re-detection
-  // restart again: latest is kept, no unnecessary full scan
-  const again = await bgCheck(w, build, n); assert.deepEqual(again, { kind: "skipped", clean: true }); assert.equal(n.scans, 1);
-  const view2 = uiOf(again); assert.deepEqual(view2, { kind: "none" }); assert.equal(recoveryAllowsLatestFn(view2), true);
+  const rechecked = await bgCheck(w, build, n); assert.equal(rechecked.kind === "checked" && rechecked.report.state, "clean");
+  const again = await bgCheck(w, build, n); assert.deepEqual(again, { kind: "skipped" }); assert.equal(n.scans, 2);
+  const view2 = uiOf(again); assert.deepEqual(view2, { kind: "none" }); assert.equal(uv.recoveryAllowsLatest(view2), true);
 });
-test("Background G: a repair that does not reach a clean re-detection keeps the anomaly (never recorded clean)", async () => {
+test("Background G: records the current version cannot fix stay an anomaly (never recorded clean) and nothing is deleted", async () => {
   const w = await wiredFixture(), build = `g-${Math.random()}`;
   const key = vaultMod.dayFileRegistryKey("2026-09-22"), sp = `.tsumugi/registry/${vaultMod.vaultRegistryBucketOf(key).toString(16).padStart(2, "0")}.json`, file = `Memories/${vaultMod.dayFileNameFor("2026-09-22")}`;
   const shard = readShard(w.vault.get(sp)!); (shard.files[file].memberHashes as Record<string, string>)["r-0"] = "deadbeef"; w.vault.put(sp, vaultMod.serializeVaultRegistryShard(shard));
-  const n = { scans: 0 }; const found = await bgCheck(w, build, n); assert.equal(found.kind === "scanned" && found.clean, false);
-  const plan = await w.confirmedNow(); assert.deepEqual(await userRepair(w, plan), { status: "not-repairable" });
-  const after = await w.confirmedNow(); assert.equal(bg.hasRecoveryAnomaly(after), true, "still an anomaly");
-  await bg.recordRecoveryCheck(!bg.hasRecoveryAnomaly(after), build);
+  const before = await fullState(w), n = { scans: 0 };
+  const found = await bgCheck(w, build, n); assert.equal(found.kind === "checked" && found.report.state, "attention");
+  assert.deepEqual(await userResume(w), { status: "not-repairable" });
+  assert.equal(await fullState(w), before, "nothing changed or deleted");
   assert.deepEqual(await repairDb.getRecoveryCheckMarker("fixture-identity"), { build, clean: false });
-  const view = userView({ kind: "plan", applyPlan: after }, { incomplete: true }); assert.equal(view.kind, "attention"); assert.equal(recoveryAllowsLatestFn(view), false);
+  const view = uiOf(found); assert.equal(view.kind, "attention"); assert.equal(uv.recoveryAllowsLatest(view), false);
 });
 test("Background: build id and persistence details", () => {
   assert.equal(typeof bg.APP_BUILD_ID, "string");
@@ -3216,4 +3255,36 @@ test("DryRun D2 (keep last): once the rule version is recorded, a held outbox is
   await repairDb.setProjectionHeldReevaluationMarker(projMod.PROJECTION_HELD_RULE_VERSION, DRY_NOW);
   const { report } = await dryRun(db, vault, heldHistory(m.id));
   assert.equal(report.heldReevaluation.alreadyDone, true); assert.equal(report.notReachedBreakdown.byReason["outbox:existing-held-outbox"], 1); assert.equal(report.notReachedBreakdown.byType.memory, 1);
+});
+
+test("a Memory saved normally (Outbox) with a time-of-day date is clean whether its History row holds the day-normalized (projection) or the time-of-day (bootstrap) date; another day still differs", async () => {
+  const db = new FakeDb(), vault = new FakeVault();
+  const m = memory(`mt-${uid()}`, { date: "2025-06-14T15:42:10.000Z", createdAt: "2025-06-14T15:42:10.000Z", updatedAt: "2025-06-14T15:42:10.000Z" });
+  db.memories.set(m.id, m); await repairDb.putMemoryObject(m);
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "dry-run-identity" }));
+  const env = { root: vault.root(), now: () => DRY_NOW, vaultIdentity: { vaultId: "dry-run-identity" } } as unknown as import("./vaultProjection").ProjectionEnv;
+  assert.equal((await projMod.reconcileMemoryOutboxEntry(env, await repairDb.putMemoryObjectWithOutbox(m, "memory", DRY_NOW))).status, "done");
+  vault.files.delete(".tsumugi/vault-identity.json");
+  const hp = `.tsumugi/history/${m.date.slice(0, 7)}.json`;
+  assert.equal(JSON.parse(vault.get(hp)!).days["2025-06-14"].normalMemories[0].date, "2025-06-14T00:00:00.000Z", "the projection writes the day-normalized date");
+  const plan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.equal(plan.held.filter((h) => h.recordId === m.id).length, 0, "not held as history-row-differs");
+  const all = await repairDb.readVaultSaveProgress();
+  const progress = { outbox: all.outbox.filter((e) => e.id === `memory:${m.id}`), ledger: {} };   // the shared fake IndexedDB also holds other tests' entries
+  assert.equal(progress.outbox[0]?.status, "done");
+  assert.equal(consistency.classifyConsistency(plan, progress, progress).state, "clean");
+  // the startup bootstrap / legacy writer stores the canonical, time-of-day date in the same row: also the same row
+  const raw = JSON.parse(vault.get(hp)!); raw.days["2025-06-14"].normalMemories[0].date = m.date; vault.put(hp, JSON.stringify(raw));
+  const rawPlan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.equal(rawPlan.held.filter((h) => h.recordId === m.id).length, 0, "a time-of-day date in the row is not a difference either");
+  assert.equal(consistency.classifyConsistency(rawPlan, progress, progress).state, "clean");
+  // another time on the same day is a real difference (History shows a row by its timestamp's JST date: 18:42Z is the next day)
+  const moved = JSON.parse(vault.get(hp)!); moved.days["2025-06-14"].normalMemories[0].date = "2025-06-14T18:42:10.000Z"; vault.put(hp, JSON.stringify(moved));
+  const movedPlan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.ok(movedPlan.held.some((h) => h.recordId === m.id && h.reason === "history-row-differs"), "only the canonical timestamp or its day-normalized form is accepted");
+  // a row with a different day is still a genuine difference
+  const hist = JSON.parse(vault.get(hp)!); hist.days["2025-06-14"].normalMemories[0].date = "2025-06-13T00:00:00.000Z"; vault.put(hp, JSON.stringify(hist));
+  const tampered = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.ok(tampered.held.some((h) => h.recordId === m.id && h.reason === "history-row-differs"));
+  assert.equal(consistency.classifyConsistency(tampered, progress, progress).state, "attention");
 });

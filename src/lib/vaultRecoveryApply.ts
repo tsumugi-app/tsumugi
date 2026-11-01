@@ -295,6 +295,23 @@ function rowEquals(existing: unknown, expected: Obj): boolean {
 }
 
 /**
+ * Memoryの History rowの`date`として正しい値：canonical（IndexedDB）の値そのもの（bootstrap・旧経路が書く。Captureでは
+ * 会話の開始時刻のため時刻付き）と、その日の`T00:00:00.000Z`（Outboxの保存経路 vaultProjection.ts
+ * `decideAndProjectMemoryHistory`が書く）。比較の基準のmemberはday-fileから読んだ値（Markdownは日付部分だけなので
+ * 読むと`T00:00:00.000Z`）のこともあるため、canonicalを読み直して両方を許す。それ以外の時刻は、同じ日付でも別の行
+ * （Historyは行の時刻のJSTの日付で表示するため、表示される日が変わりうる）として扱う。
+ */
+async function memoryHistoryRowMatches(env: RecoveryApplyEnv, row: unknown, member: MemoryObject): Promise<boolean> {
+  if (!isObj(row) || !rowEquals(row, { id: member.id, types: member.types, preview: truncateHistoryPreview(member.summary), createdAt: member.createdAt })) return false;
+  if (row.date === undefined || row.date === member.date) return true;
+  const day = member.date.slice(0, 10);
+  const allowed = new Set([member.date, `${day}T00:00:00.000Z`]);
+  const canonical = (await env.readRecord("memory", member.id)) as MemoryObject | undefined;
+  if (canonical && typeof canonical.date === "string" && canonical.date.slice(0, 10) === day) allowed.add(canonical.date);
+  return typeof row.date === "string" && allowed.has(row.date);
+}
+
+/**
  * Codexレビュー指摘H2-1（History verification不足）対応：月History本体（rows）と、
  * history-meta.json（月ごとの集計）は別々のファイルであり、片方の書き込みだけが先に成功しうる
  * （`updateHistoryIndex`が2つの独立したファイルを順に書くため）。以前はrowsだけを見て
@@ -424,7 +441,7 @@ async function inspectHistoryRows(env: RecoveryApplyEnv, op: RecoveryJournalOp, 
   const missing = members.filter((m) => !rows.some((r) => isObj(r) && r.id === m.id));
   for (const m of members) {
     const row = rows.find((r) => isObj(r) && r.id === m.id);
-    if (row && !rowEquals(row, memoryHistoryRow(m))) return conflict("history-row-differs");
+    if (row && !(await memoryHistoryRowMatches(env, row, m))) return conflict("history-row-differs");
   }
   if (missing.length === 0) return SATISFIED;
   // Codexレビュー再指摘M3：既存の複数member day-file自体は、対象行の一部だけが不足している場合でも

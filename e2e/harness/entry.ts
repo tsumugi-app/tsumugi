@@ -14,11 +14,12 @@ import * as gateMod from "../../src/lib/maintenance/maintenanceGate";
 import * as journal from "../../src/lib/vaultRecoveryJournal";
 import * as sync from "../../src/lib/maintenance/scopedVaultSync";
 import * as recovery from "../../src/lib/maintenance/crashRecovery";
+import * as consistencyCheck from "../../src/lib/vaultConsistencyCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const NOW = "2026-10-10T00:00:00.000Z";
 const g = globalThis as any;
-g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap };
+g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap, proj, lockMod, consistencyCheck };
 let DATA: any, vaultRoot: any, backupRoot: any;
 
 async function dirAt(name: string) {

@@ -51,6 +51,8 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled, cl
   }
   async function repairExplicitly() {
     if (disabled || busy || repairRunning.current) return;
+    // Developer-only, one past case: an explicit confirmation on top of the ?debugLog=1 gate, so it is never run by mistake.
+    if (typeof window === "undefined" || !window.confirm("開発者向けの限定修復です（2026-10-03の事例専用。通常の修復ではありません）。実行しますか？")) return;
     repairRunning.current = true; setBusy(true);
     try { setRepair(await runExplicitMemoryRepair(root, plan)); }
     catch { setRepair({ status: "held", failure: { phase: "start", code: "unexpected-error" } }); }
@@ -78,7 +80,7 @@ export default function RecoveryMemoryDiagnosticPanel({ plan, root, disabled, cl
       </div>}
       <button disabled={disabled || busy} onClick={() => void diagnoseMarkdown()}>Markdown差分診断（READ ONLY）</button>
       {mismatch && <pre>{JSON.stringify(mismatch, null, 2)}</pre>}
-      <p>以下はREAD ONLY診断とは別の、明示実行する限定修復です。全条件を再検証してから変更します。</p>
+      <p>以下はREAD ONLY診断とは別の、開発者向けの限定修復です（2026-10-03の事例専用。通常ユーザー向けの「修復する」からは実行されません）。全条件を再検証してから変更します。</p>
       <button disabled={disabled || busy || repair?.status === "complete"} onClick={() => void repairExplicitly()}>
         {plan ? "検証済み10件を修復" : "限定修復を再検証して再開"}
       </button>
