@@ -20,10 +20,14 @@ async function seed(page: Page, { project, pendingMemory }: { project: boolean; 
     const meta = (id: string) => ({ id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T });
     const mem = (id: string, summary: string) => ({ id, date: T, types: ["conversation"], conversationId: "app-cons-conv", content: `本文 ${summary}`, summary, keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T, metadata: meta(id) });
     await dbm.saveVaultHandle(root); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated();
-    await dbm.putConversationWithOutbox({ id: "app-cons-conv", persona: "companion", status: "captured", startedAt: T, endedAt: T, createdAt: T, updatedAt: T, turns: [{ role: "user", content: "架空の散歩の話", timestamp: T }, { role: "ai", content: "そうでしたか。", timestamp: T }], memoryObjectIds: ["app-cons-mem-1"], metadata: meta("app-cons-conv") });
+    const conv = (ids: string[], updatedAt: string) => ({ id: "app-cons-conv", persona: "companion", status: "captured", startedAt: T, endedAt: T, createdAt: T, updatedAt, turns: [{ role: "user", content: "架空の散歩の話", timestamp: T }, { role: "ai", content: "そうでしたか。", timestamp: T }], memoryObjectIds: ids, metadata: meta("app-cons-conv") });
+    await dbm.putConversationWithOutbox(conv(["app-cons-mem-1"], T));
     await dbm.putMemoryObjectWithOutbox(mem("app-cons-mem-1", "架空の散歩の記録"));
     if (project) await bootstrap.runSaveFoundationBootstrap({ root });
-    if (pendingMemory) await dbm.putMemoryObjectWithOutbox(mem("app-cons-mem-2", "架空の保存待ちの記録"));   // saved on the device, not yet written to the Vault
+    if (pendingMemory) {   // a second Memory of the same conversation, saved on the device but not yet written to the Vault (as a capture leaves it)
+      await dbm.putMemoryObjectWithOutbox(mem("app-cons-mem-2", "架空の保存待ちの記録"));
+      await dbm.putConversationWithOutbox(conv(["app-cons-mem-1", "app-cons-mem-2"], new Date().toISOString()));
+    }
   }, { project, pendingMemory: !!pendingMemory });
 }
 async function openSettings(page: Page) {
@@ -33,6 +37,11 @@ async function openSettings(page: Page) {
 }
 /** what the Settings Vault section says, for failure messages */
 const settingsText = (page: Page) => page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 1500));
+/** waits for a text; on failure, reports what the screen said at that moment (not before the wait) */
+async function expectVisible(page: Page, text: string) {
+  try { await expect(page.getByText(text)).toBeVisible({ timeout: 60_000 }); }
+  catch { throw new Error(`「${text}」 was not shown. The screen said: ${await settingsText(page)}`); }
+}
 
 for (const device of ["PC", "Android"] as const) {
   test.describe(device, () => {
@@ -42,7 +51,7 @@ for (const device of ["PC", "Android"] as const) {
       test.setTimeout(120_000);
       await seed(page, { project: true });
       await openSettings(page);
-      await expect(page.getByText(LATEST), await settingsText(page)).toBeVisible({ timeout: 60_000 });
+      await expectVisible(page, LATEST);
       await expect(page.getByTestId("vault-consistency")).toHaveCount(0);
       await expect(page.getByText(ATTENTION)).toHaveCount(0);
     });
@@ -80,7 +89,7 @@ for (const device of ["PC", "Android"] as const) {
       });
       expect(before).not.toBeNull();
       await openSettings(page);
-      await expect(page.getByText(ATTENTION), await settingsText(page)).toBeVisible({ timeout: 60_000 });
+      await expectVisible(page, ATTENTION);
       await expect(page.getByText(LATEST)).toHaveCount(0);
       await expect(page.getByTestId("vault-consistency")).toContainText("件");
       await expect(page.getByTestId("vault-consistency")).toContainText("どの記録も削除・上書きしていません。");

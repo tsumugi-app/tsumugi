@@ -27,7 +27,7 @@ async function setup(page: Page) {
     const ident = { id: "current", vaultId: "fictional-consistency", activeVaultEpoch: 0, registryGeneration: "g", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
     await dbm.putVaultIdentityRecord(ident); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated(); lockMod.setTabVaultEpoch(0);
     (window as any).__root = root; (window as any).__env = { root, vaultIdentity: ident, now: () => T };
-    const mem = (id: string, summary: string) => ({ id, date: T, types: ["conversation"], conversationId: "fictional-conv", content: `本文 ${summary}`, summary, keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], createdAt: T, updatedAt: T, metadata: { id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
+    const mem = (id: string, summary: string) => ({ id, date: "2026-10-20T09:15:00.000Z", types: ["conversation"], conversationId: "fictional-conv", content: `本文 ${summary}`, summary, keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], createdAt: T, updatedAt: T, metadata: { id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
     (window as any).__mem = mem;
     for (const m of [mem("cons-mem-1", "架空の記録ひとつ"), mem("cons-mem-2", "架空の記録ふたつ")]) {
       const entry = await dbm.putMemoryObjectWithOutbox(m, "memory");

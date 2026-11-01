@@ -3256,3 +3256,26 @@ test("DryRun D2 (keep last): once the rule version is recorded, a held outbox is
   const { report } = await dryRun(db, vault, heldHistory(m.id));
   assert.equal(report.heldReevaluation.alreadyDone, true); assert.equal(report.notReachedBreakdown.byReason["outbox:existing-held-outbox"], 1); assert.equal(report.notReachedBreakdown.byType.memory, 1);
 });
+
+test("a Memory saved normally (Outbox) with a time-of-day date is clean: the History row's day-normalized date is the projection's own format, not a difference; another day still differs", async () => {
+  const db = new FakeDb(), vault = new FakeVault();
+  const m = memory(`mt-${uid()}`, { date: "2025-06-14T15:42:10.000Z", createdAt: "2025-06-14T15:42:10.000Z", updatedAt: "2025-06-14T15:42:10.000Z" });
+  db.memories.set(m.id, m); await repairDb.putMemoryObject(m);
+  vault.put(".tsumugi/vault-identity.json", JSON.stringify({ vaultId: "dry-run-identity" }));
+  const env = { root: vault.root(), now: () => DRY_NOW, vaultIdentity: { vaultId: "dry-run-identity" } } as unknown as import("./vaultProjection").ProjectionEnv;
+  assert.equal((await projMod.reconcileMemoryOutboxEntry(env, await repairDb.putMemoryObjectWithOutbox(m, "memory", DRY_NOW))).status, "done");
+  vault.files.delete(".tsumugi/vault-identity.json");
+  const hp = `.tsumugi/history/${m.date.slice(0, 7)}.json`;
+  assert.equal(JSON.parse(vault.get(hp)!).days["2025-06-14"].normalMemories[0].date, "2025-06-14T00:00:00.000Z", "the projection writes the day-normalized date");
+  const plan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.equal(plan.held.filter((h) => h.recordId === m.id).length, 0, "not held as history-row-differs");
+  const all = await repairDb.readVaultSaveProgress();
+  const progress = { outbox: all.outbox.filter((e) => e.id === `memory:${m.id}`), ledger: {} };   // the shared fake IndexedDB also holds other tests' entries
+  assert.equal(progress.outbox[0]?.status, "done");
+  assert.equal(consistency.classifyConsistency(plan, progress, progress).state, "clean");
+  // a row with a different day is still a genuine difference
+  const hist = JSON.parse(vault.get(hp)!); hist.days["2025-06-14"].normalMemories[0].date = "2025-06-13T00:00:00.000Z"; vault.put(hp, JSON.stringify(hist));
+  const tampered = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.ok(tampered.held.some((h) => h.recordId === m.id && h.reason === "history-row-differs"));
+  assert.equal(consistency.classifyConsistency(tampered, progress, progress).state, "attention");
+});

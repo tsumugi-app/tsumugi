@@ -290,8 +290,16 @@ async function inspectIndex(env: RecoveryApplyEnv, op: RecoveryJournalOp): Promi
   return needed ? NEEDED : SATISFIED;
 }
 
+/**
+ * History rowの`date`は、旧経路（vault.ts）がcanonicalの値をそのまま、Outboxの保存経路（vaultProjection.ts
+ * `decideAndProjectMemoryHistory`）が同じ日の`T00:00:00.000Z`へ正規化して書く。どちらも正しい行なので両方を一致とみなす
+ * （日付が違う行は従来どおり不一致）。これが無いと、時刻付きの`date`を持つ通常保存済みのMemoryがすべて
+ * `history-row-differs`で保留になる。
+ */
 function rowEquals(existing: unknown, expected: Obj): boolean {
-  return isObj(existing) && Object.entries(expected).every(([k, v]) => k === "date" ? existing.date === undefined || existing.date === v : JSON.stringify(existing[k]) === JSON.stringify(v));
+  return isObj(existing) && Object.entries(expected).every(([k, v]) => k === "date"
+    ? existing.date === undefined || existing.date === v || (typeof v === "string" && existing.date === `${v.slice(0, 10)}T00:00:00.000Z`)
+    : JSON.stringify(existing[k]) === JSON.stringify(v));
 }
 
 /**
