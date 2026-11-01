@@ -139,13 +139,23 @@ for (const device of ["desktop", "android"] as const) {
         const text = await (await fh.getFile()).text();
         const w = await fh.createWritable(); await w.write(text.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")); await w.close();
       }, DAY_FILE);
+      // another held save on another day passes the checks: saving it must write only that record, never the skipped one
+      await page.evaluate(async () => {
+        const { dbm } = (window as any).D;
+        const entry = await dbm.putMemoryObjectWithOutbox({ ...(window as any).__mem("repair-mem-4", "架空の別の日の記録", "2026-10-21T03:00:00.000Z"), date: "2026-10-21T09:15:00.000Z" }, "memory");
+        await dbm.putVaultOutboxEntry({ ...entry, status: "held", heldReason: "memory-dayfile-unreadable", attempt: { count: 1, lastError: "memory-dayfile-unreadable", lastAttemptAt: entry.updatedAt } });
+      });
       const before = await files(page);
       const r = await repair(page);
       expect(r.kind, JSON.stringify(r)).toBe("ran");
       expect(r.skipped).toEqual([{ reason: "day-file-not-mergeable", recordType: "memory", count: 1 }]);
+      expect(r.repaired).toBe(1);
       expect(r.view.clean).toBe(false);
-      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);
+      const after = await files(page);
+      expect(after[DAY_FILE]).toBe(before[DAY_FILE]);
+      expect(after["Memories/2026-10-21.md"]).toContain("架空の別の日の記録");
       expect(await outboxOf(page, "memory:repair-mem-3")).toBe("held");
+      expect(await outboxOf(page, "memory:repair-mem-4")).toBe("done");
     });
 
     test("interrupted after the re-queue (the tab closed before the saves ran): nothing is lost, the normal save finishes it, and pressing again does nothing", async ({ page }) => {

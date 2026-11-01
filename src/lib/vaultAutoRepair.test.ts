@@ -105,7 +105,7 @@ function env(w: World, opts: {
     },
     async applyRecovery(ids) { assert.ok(inLock, "apply only inside the exclusive section"); w.log.push(`apply:${ids.join(",")}`); return { status: opts.applyStatus ?? "completed", recovered: ids.length, failed: 0 }; },
     async requeue(t, version) { assert.ok(inLock, "requeue only inside the exclusive section"); w.log.push(`requeue:${t.recordId}@${version}`); return opts.requeue ?? "queued"; },
-    async settleSaves() { w.log.push("settle"); },
+    async settleSaves(ts) { w.log.push(`settle:${ts.map((t) => t.recordId).join(",")}`); },
     isCancelled: () => false,
   };
 }
@@ -122,7 +122,7 @@ test("順序：確認→バックアップ→排他区間（直前の再照合�
   w.inspect.set("m2", { paths: ["Memories/2026-10-20.md"] });
   const targets = [target("apply", "conversation", "c1"), target("resave", "memory", "m2")];
   const outcome = await repair.runVaultAutoRepair(env(w, { reports: [report(targets), CLEAN] }));
-  assert.deepEqual(w.log, ["check", "backup", "lock", "apply:c1", `requeue:m2@${T}`, "unlock", "settle", "check"]);
+  assert.deepEqual(w.log, ["check", "backup", "lock", "apply:c1", `requeue:m2@${T}`, "unlock", "settle:m2", "check"]);
   assert.equal(outcome.kind, "ran");
   if (outcome.kind !== "ran") return;
   assert.equal(outcome.attempted, 2); assert.equal(outcome.repaired, 2); assert.deepEqual(outcome.skipped, []);
@@ -203,7 +203,7 @@ test("新旧・安全性を規則で決められない記録は対象にしな�
   const outcome = await repair.runVaultAutoRepair(env(w, { reports: [report(targets)] }));
   assert.ok(outcome.kind === "ran");
   if (outcome.kind !== "ran") return;
-  assert.ok(!w.log.some((l) => l.startsWith("apply") || l.startsWith("requeue") || l === "settle"), "nothing written, no save run");
+  assert.ok(!w.log.some((l) => l.startsWith("apply") || l.startsWith("requeue") || l.startsWith("settle")), "nothing written, no save run");
   assert.deepEqual(outcome.skipped.map((s) => s.reason).sort(), ["day-file-not-mergeable", "record-missing", "unreadable"]);
   assert.equal(outcome.repaired, 0);
   assert.equal(repair.autoRepairOutcomeView(outcome, null).clean, false);
@@ -239,7 +239,7 @@ test("冪等：直った後にもう一度押すと何もしない。途中の�
   const w3 = world({}, { "memory:m2": T });
   const changed = await repair.runVaultAutoRepair(env(w3, { reports: [report([target("resave", "memory", "m2")])], requeue: "changed" }));
   assert.ok(changed.kind === "ran" && changed.attempted === 0 && changed.skipped[0].reason === "changed-since-backup");
-  assert.ok(!w3.log.includes("settle"), "no save run when nothing was re-queued");
+  assert.ok(!w3.log.some((l) => l.startsWith("settle")), "no save run when nothing was re-queued");
 });
 
 test("同じ日のファイルへの追加：通常の保存の書き直しで何も失われないファイルだけ（それ以外は追加で内容が失われうる）", () => {

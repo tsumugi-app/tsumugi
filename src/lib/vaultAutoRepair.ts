@@ -55,8 +55,8 @@ export interface AutoRepairEnv {
   applyRecovery(recordIds: string[]): Promise<{ status: string; recovered: number; failed: number }>;
   /** 記録は変えず、その版をOutboxの保存待ちにする（`requeueRecordForVault`） */
   requeue(target: RepairTarget, expectedVersion: string): Promise<RequeueResult>;
-  /** 通常の保存処理を1回流し、終わるまで（上限つきで）待つ */
-  settleSaves(): Promise<void>;
+  /** 保存待ちに戻した記録だけを、通常の保存と同じ処理・同じロックで保存先へ書き出す（他の記録は書かない：飛ばした記録を書き出さないため） */
+  settleSaves(targets: RepairTarget[]): Promise<void>;
   isCancelled(): boolean;
 }
 
@@ -171,7 +171,7 @@ export async function runVaultAutoRepair(env: AutoRepairEnv): Promise<AutoRepair
   if (!backup.ok) return { kind: "not-started", reason: "backup-failed", backupFailure: backup.reason, after: before };
   if (env.isCancelled()) return { kind: "not-started", reason: "cancelled", after: before };
 
-  type Ran = { kind: "ran"; attempted: RepairTarget[]; skipped: AutoRepairSkipped[]; resaved: number } | { kind: "backup-unverified" } | { kind: "cancelled" };
+  type Ran = { kind: "ran"; attempted: RepairTarget[]; skipped: AutoRepairSkipped[]; resaved: RepairTarget[] } | { kind: "backup-unverified" } | { kind: "cancelled" };
   const locked = await env.withExclusive<Ran>(async () => {
     const verified = await reverifyBackup((p) => env.readVaultFile(p), backup);
     if (!verified.ok) return { kind: "backup-unverified" };
@@ -201,10 +201,10 @@ export async function runVaultAutoRepair(env: AutoRepairEnv): Promise<AutoRepair
       if (result.status === "completed" || result.status === "nothing-to-do") attempted.push(...apply.map((a) => a.target));
       else for (const a of apply) addSkip(skipped, result.status === "interrupted" ? "repair-in-progress" : "apply-failed", a.target.recordType);
     }
-    let resaved = 0;
+    const resaved: RepairTarget[] = [];
     for (const r of resave) {
       const result = await env.requeue(r.target, r.version);
-      if (result === "queued" || result === "already-pending") { attempted.push(r.target); resaved++; }
+      if (result === "queued" || result === "already-pending") { attempted.push(r.target); resaved.push(r.target); }
       else addSkip(skipped, result === "changed" ? "changed-since-backup" : result, r.target.recordType);
     }
     return { kind: "ran", attempted, skipped, resaved };
@@ -215,7 +215,7 @@ export async function runVaultAutoRepair(env: AutoRepairEnv): Promise<AutoRepair
   if (ran.kind === "cancelled") return { kind: "not-started", reason: "cancelled", after: before };
 
   // resaveの書き込みは通常の保存処理が行う（排他区間の外。通常の保存と同じロック・同じ確認）
-  if (ran.resaved > 0) await env.settleSaves();
+  if (ran.resaved.length > 0) await env.settleSaves(ran.resaved);
   const after = await env.check();
   const remaining = new Set(after.findings.filter((f) => f.recordId !== undefined).map((f) => targetKey({ recordType: f.recordType, recordId: f.recordId as string })));
   const repaired = ran.attempted.filter((t) => !remaining.has(targetKey(t))).length;

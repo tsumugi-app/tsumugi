@@ -2,15 +2,15 @@
  * 自動修復（vaultAutoRepair.ts）の本番の配線：実際のIndexedDB・保存先・ロック・既存の復旧・通常の保存処理を渡すだけ。
  * 規則と順序はvaultAutoRepair.tsにある。
  */
-import { getConversation, getMemoryObject, getPendingVaultOutboxEntries, getSource, readBackupDeviceSnapshot, requeueRecordForVault, RecoveryPendingError } from "./db";
+import { getConversation, getMemoryObject, getSource, getVaultIdentityRecord, getVaultOutboxEntry, readBackupDeviceSnapshot, requeueRecordForVault, RecoveryPendingError } from "./db";
 import { isReflectionSummary } from "./vault";
 import { dayFileRoundTrips, runVaultAutoRepair, type AutoRepairEnv, type AutoRepairOutcome, type AutoRepairTargetInspection } from "./vaultAutoRepair";
 import { createVaultBackup } from "./vaultBackup";
 import { checkVaultConsistency } from "./vaultConsistencyCheck";
 import type { ConsistencyCheckOptions, RepairTarget } from "./vaultConsistency";
-import { runProductionBootstrapOnce } from "./productionBootstrap";
 import type { MemoryObject } from "./types";
-import { memoryDayFilePath } from "./vaultProjection";
+import { memoryDayFilePath, reconcileConversationOutboxEntry, reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry, reconcileSourceOutboxEntry, type ProjectionEnv } from "./vaultProjection";
+import { withVaultSaveLock } from "./vaultSaveLock";
 import { applyRecovery, createRecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
 import { runVaultWorldExclusive, withVaultWorldRead } from "./vaultWorldLock";
 
@@ -34,8 +34,8 @@ export interface ProductionAutoRepairOptions {
   /** バックアップに記録するアプリのビルド識別子（ChatScreenがrecoveryBackgroundCheckのAPP_BUILD_IDを渡す。ここでは読み込まない：process.envを参照するため） */
   build: string;
   isCancelled(): boolean;
-  /** 通常の保存処理を1回流して終わるまで待つ。既定は起動時と同じ保存処理（Outboxの保存待ちを保存先へ反映する。world lockの共有モード） */
-  settleSaves?(): Promise<void>;
+  /** 保存待ちに戻した記録だけを書き出す。既定は通常の保存と同じ処理（reconcile*OutboxEntry）を、同じロック（world lockの共有モード＋保存ロック）で */
+  settleSaves?(targets: RepairTarget[]): Promise<void>;
   /** 確認の待ち時間・やり直し回数（テスト用。既定はvaultConsistency.tsの既定値） */
   checkOptions?: ConsistencyCheckOptions;
 }
@@ -102,11 +102,18 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
         throw error;
       }
     },
-    settleSaves: options.settleSaves ?? (async () => {
-      // 起動時の保存処理がまだ動いていれば、それは保存待ちに戻す前に始まったもの：終わるのを待ち、まだ保存待ちが残っていればもう1回だけ流す（有限）
-      await withVaultWorldRead(() => runProductionBootstrapOnce(root));
-      if ((await getPendingVaultOutboxEntries()).length > 0) await withVaultWorldRead(() => runProductionBootstrapOnce(root));
-    }),
+    // 起動時の保存処理（移行・全件の確認）は使わない：飛ばした記録まで書き出しうるため。保存待ちに戻した記録のOutboxだけを処理する。
+    // 書き出せなければ（競合・読めない）保存処理がheldに戻す・保存待ちのまま残す。どちらも直後の再確認に残る
+    settleSaves: options.settleSaves ?? ((targets) => withVaultWorldRead(() => withVaultSaveLock(async () => {
+      const env: ProjectionEnv = { root, vaultIdentity: (await getVaultIdentityRecord()) ?? null };
+      for (const t of targets) {
+        const entry = await getVaultOutboxEntry(`${t.recordType}:${t.recordId}`);
+        if (!entry || entry.status !== "pending") continue;
+        const reconcile = entry.recordType === "conversation" ? reconcileConversationOutboxEntry : entry.recordType === "memory" ? reconcileMemoryOutboxEntry : entry.recordType === "reflection" ? reconcileReflectionOutboxEntry : entry.recordType === "source" ? reconcileSourceOutboxEntry : null;
+        if (!reconcile) continue;
+        try { await reconcile(env, entry); } catch (error) { console.error("[Tsumugi] auto repair: save of a requeued record failed; it stays in the Outbox", error); }
+      }
+    }))),
     isCancelled: options.isCancelled,
   };
 }
