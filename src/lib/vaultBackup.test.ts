@@ -239,6 +239,18 @@ test("an unreadable file means NO backup (never a partial one), and nothing is w
   assert.deepEqual(vault.written, []);
 });
 
+test("a file caught mid-write (vanished after the listing, unreadable once) is read again; a browser swap file is never backed up", async () => {
+  const vault = new MemVault({ ...VAULT_FILES, ".tsumugi/registry/0a.json.crswap": "途中" });
+  vault.unreadable.add(".tsumugi/history/2026-10.json");
+  let reads = 0;
+  const r = await backup.createVaultBackup(env(vault, () => { if (++reads === 2) vault.unreadable.clear(); return device(); }), { attempts: 3 });
+  assert.equal(r.ok, true, JSON.stringify(r)); if (!r.ok) return;
+  assert.equal(reads, 4, "read again once");
+  const paths = zip.readZipEntries(r.zip).map((e) => e.path);
+  assert.ok(paths.includes("vault/.tsumugi/history/2026-10.json"));
+  assert.ok(!paths.some((p) => p.endsWith(".crswap")));
+});
+
 test("saves that keep running: re-read until settled (bounded); never settled → 'busy', nothing written; the backup never waits on or blocks a save", async () => {
   let n = 0;
   const moving = () => { n++; return device({ vaultOutbox: [{ key: "memory:mem-2", value: outbox("memory", "mem-2", "pending", `2026-10-2${n % 10}T00:00:00.000Z`) }] } as never); };

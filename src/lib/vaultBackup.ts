@@ -113,42 +113,47 @@ export function isBackedUpVaultPath(path: string): boolean {
   return !path.split("/").some((part) => part.startsWith(".")) && path.toLowerCase().endsWith(".md");
 }
 
-/** 保存先のファイルをバイト単位で読む。読めないファイルがあれば件数を付けて失敗（一部だけのバックアップは作らない） */
-async function readVaultFiles(root: FileSystemDirectoryHandle, isCancelled: () => boolean): Promise<{ path: string; data: Uint8Array }[]> {
+/** ブラウザが書き込みの途中に作る一時ファイル（Chromeの`*.crswap`）。記録ではなく、書き込みが終われば消える */
+const isBrowserSwapFile = (name: string) => name.endsWith(".crswap");
+
+/**
+ * 保存先のファイルをバイト単位で読む。読めなかったファイル（一覧の後で消えた・書き込みの途中で読めなかった等）や一覧できなかったフォルダは
+ * 数だけを返す。その回の読み取りは「落ち着いていない」として読み直し、最後まで読めなければ失敗にする（一部だけのバックアップは作らない）
+ */
+async function readVaultFiles(root: FileSystemDirectoryHandle, isCancelled: () => boolean): Promise<{ files: { path: string; data: Uint8Array }[]; unreadable: number }> {
   const files: { path: string; data: Uint8Array }[] = [];
   let unreadable = 0;
   const walk = async (dir: FileSystemDirectoryHandle, prefix: string, depth: number): Promise<void> => {
     if (depth > MAX_DEPTH) throw new BackupError("too-large", false);
-    for await (const [name, handle] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
-      if (isCancelled()) throw new BackupError("cancelled", true);
-      const path = prefix ? `${prefix}/${name}` : name;
-      if (handle.kind === "directory") {
-        // 自分のバックアップ置き場には入らない。Tsumugiの隠しフォルダ（`.tsumugi/`・`.tsumugi-archive/`）の中は、隠しフォルダも含めて全部入る。
-        // それ以外の隠しフォルダ（.obsidian・.trash等、Tsumugiのものではない）には入らない
-        if (path === BACKUP_DIR) continue;
-        const insideTsumugi = path.startsWith(".tsumugi/") || path.startsWith(".tsumugi-archive/");
-        if (name.startsWith(".") && !insideTsumugi && !(prefix === "" && (name === ".tsumugi" || name === ".tsumugi-archive"))) continue;
-        await walk(handle as FileSystemDirectoryHandle, path, depth + 1);
-        continue;
+    try {
+      for await (const [name, handle] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
+        if (isCancelled()) throw new BackupError("cancelled", true);
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (handle.kind === "directory") {
+          // 自分のバックアップ置き場には入らない。Tsumugiの隠しフォルダ（`.tsumugi/`・`.tsumugi-archive/`）の中は、隠しフォルダも含めて全部入る。
+          // それ以外の隠しフォルダ（.obsidian・.trash等、Tsumugiのものではない）には入らない
+          if (path === BACKUP_DIR) continue;
+          const insideTsumugi = path.startsWith(".tsumugi/") || path.startsWith(".tsumugi-archive/");
+          if (name.startsWith(".") && !insideTsumugi && !(prefix === "" && (name === ".tsumugi" || name === ".tsumugi-archive"))) continue;
+          await walk(handle as FileSystemDirectoryHandle, path, depth + 1);
+          continue;
+        }
+        if (isBrowserSwapFile(name) || !isBackedUpVaultPath(path)) continue;
+        if (files.length + unreadable >= MAX_FILES) throw new BackupError("too-large", false);
+        try {
+          const file = await (handle as FileSystemFileHandle).getFile();
+          files.push({ path, data: new Uint8Array(await file.arrayBuffer()) });
+        } catch {
+          unreadable++;
+        }
       }
-      if (!isBackedUpVaultPath(path)) continue;
-      if (files.length + unreadable >= MAX_FILES) throw new BackupError("too-large", false);
-      try {
-        const file = await (handle as FileSystemFileHandle).getFile();
-        files.push({ path, data: new Uint8Array(await file.arrayBuffer()) });
-      } catch {
-        unreadable++;
-      }
+    } catch (error) {
+      if (error instanceof BackupError) throw error;
+      unreadable++;   // フォルダを最後まで一覧できなかった（その中は数えられないため1件として扱う）
     }
   };
-  try {
-    await walk(root, "", 0);
-  } catch (error) {
-    if (error instanceof BackupError) throw error;
-    throw new BackupError("unreadable", true, unreadable + 1);   // フォルダ自体を一覧できなかった
-  }
-  if (unreadable > 0) throw new BackupError("unreadable", true, unreadable);
-  return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  await walk(root, "", 0);
+  return { files: files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)), unreadable };
 }
 
 /** IndexedDBの値をJSONへ。JSONで表せない値（Date・Blob・関数・循環等）があれば失敗（黙って欠けたバックアップを作らない） */
@@ -308,6 +313,7 @@ async function writeNewFile(dir: FileSystemDirectoryHandle, name: string, data: 
 /** 落ち着いた状態の端末データと保存先のファイルを読む（保存を止めずに、前後の保存の進行状況が同じになるまで有限回読み直す） */
 async function readSettledSnapshot(env: VaultBackupEnv, options: Required<BackupOptions>) {
   const isCancelled = () => env.isCancelled?.() === true;
+  let lastUnreadable = 0;
   for (let attempt = 0; attempt < options.attempts; attempt++) {
     if (attempt > 0) await env.sleep(options.retryDelayMs);
     if (isCancelled()) throw new BackupError("cancelled", true);
@@ -316,10 +322,13 @@ async function readSettledSnapshot(env: VaultBackupEnv, options: Required<Backup
       const before = await env.readDevice();
       const vault = await readVaultFiles(env.root, isCancelled);
       const after = await env.readDevice();
-      return saveProgressKey(before) === saveProgressKey(after) ? { device: after, vault } : null;
+      return { settled: saveProgressKey(before) === saveProgressKey(after), device: after, vault };
     });
-    if (read) return read;
+    lastUnreadable = read.vault.unreadable;
+    // 読めないファイルがあった回も、保存が動いた回と同じく読み直す（書き込みの途中・一覧の後で消えたファイルは、次の回には落ち着いている）
+    if (read.settled && read.vault.unreadable === 0) return { device: read.device, vault: read.vault.files };
   }
+  if (lastUnreadable > 0) throw new BackupError("unreadable", true, lastUnreadable);
   throw new BackupError("busy", true);
 }
 
