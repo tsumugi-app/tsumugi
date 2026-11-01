@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/vaultBackup.test.ts",
+    "src/lib/vaultBackup.ts",
+    "src/lib/zip.ts",
+    "src/lib/vaultWriter.ts",
+    "src/lib/db.ts",
+    "src/lib/fakeIdb.ts"
+  ]
+}

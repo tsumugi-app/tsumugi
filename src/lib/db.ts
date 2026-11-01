@@ -1271,6 +1271,43 @@ export async function readVaultSaveProgress(): Promise<import("./vaultConsistenc
   };
 }
 
+/** バックアップの対象にするIndexedDBのstore（`handles`は保存先フォルダのhandleで、JSONにできないため名前だけを残す）。 */
+export const BACKUP_DEVICE_STORES = ["conversations", "memoryObjects", "sources", "vaultOutbox", "vaultSyncState", "vaultIdentity", "migrationJournal", "connectState", "settings"] as const;
+export type BackupDeviceStore = (typeof BACKUP_DEVICE_STORES)[number];
+/** Outboxの`recordType`→そのcanonical recordが入っているstore（保存待ちの記録が退避されたことの確認に使う） */
+export const BACKUP_STORE_OF_RECORD_TYPE: Record<string, BackupDeviceStore> = { conversation: "conversations", memory: "memoryObjects", reflection: "memoryObjects", source: "sources" };
+/** 認証情報（APIキー等）はバックアップに含めない。名前が認証情報らしいsettingsのキーも、念のため除く。 */
+export function isCredentialSettingKey(key: unknown): boolean {
+  return Object.values(API_KEY_STORAGE_KEY).includes(String(key)) || /api.?key|secret|token|password|credential/i.test(String(key));
+}
+export interface BackupDeviceSnapshot {
+  stores: Record<BackupDeviceStore, { key: IDBValidKey; value: unknown }[]>;
+  /** バックアップから除いた認証情報のキーの数（キー名も値も残さない） */
+  excludedCredentialKeys: number;
+  /** `handles`のキー（保存先フォルダのhandle自体はJSONにできないため、名前だけ） */
+  handleKeys: string[];
+}
+/**
+ * バックアップ用に、端末のデータ（会話・Memory・Source・Outbox・ledger・Vault identity・migration journal・settings）を
+ * 1つのreadonly transactionで読む（同じ瞬間の一貫した内容。保存処理とは並行に動き、何も書かない・止めない）。認証情報は読み出した時点で除く。
+ */
+export async function readBackupDeviceSnapshot(): Promise<BackupDeviceSnapshot> {
+  const db = await getDB();
+  const tx = db.transaction([...BACKUP_DEVICE_STORES, "handles"], "readonly");
+  const read = async (name: BackupDeviceStore | "handles") => {
+    const store = tx.objectStore(name);
+    const [keys, values] = await Promise.all([store.getAllKeys(), store.getAll()]);
+    return keys.map((key, i) => ({ key, value: values[i] as unknown }));
+  };
+  const rows = await Promise.all([...BACKUP_DEVICE_STORES.map((name) => read(name)), tx.objectStore("handles").getAllKeys()]);
+  await tx.done;
+  const stores = {} as BackupDeviceSnapshot["stores"];
+  BACKUP_DEVICE_STORES.forEach((name, i) => { stores[name] = rows[i] as { key: IDBValidKey; value: unknown }[]; });
+  const excludedCredentialKeys = stores.settings.filter((row) => isCredentialSettingKey(row.key)).length;
+  stores.settings = stores.settings.filter((row) => !isCredentialSettingKey(row.key));
+  return { stores, excludedCredentialKeys, handleKeys: (rows[BACKUP_DEVICE_STORES.length] as IDBValidKey[]).map(String) };
+}
+
 /**
  * Projectionの比較ルールのversionごとに「held outboxを再評価済みか」を記録する（settingsの1キー。DB schema変更なし）。
  * ルールが変わらない限り、heldは毎起動では再試行されない。
