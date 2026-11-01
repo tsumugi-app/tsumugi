@@ -35,6 +35,21 @@ test("正常な保存完了後：保留も復旧対象も無く、保存待ち�
   const view = deriveRecoveryUserView({ kind: "plan" }, r); assert.deepEqual(view, { kind: "none" }); assert.equal(recoveryAllowsLatest(view), true);
 });
 
+test("Outboxで保存済み（done・同じ版）の記録に、旧経路の台帳（sync ledger）だけが無いのは不整合ではない → clean", () => {
+  const T = "2026-10-01T00:00:00.000Z";
+  const notNeeded = { markdown: "not-needed", index: "not-needed", history: "not-needed", registry: "not-needed" };
+  const ledgerOnly = { kind: "repair", members: [{ id: "m1", recordType: "memory", updatedAt: T }], steps: { ...notNeeded, ledger: "pending" } };
+  const done = progress([entry("memory:m1", "done", { recordUpdatedAt: T })]);
+  assert.equal(classifyConsistency(plan({ records: [rec("memory", "m1", "equivalent-existing")], ops: [ledgerOnly] }), done, done).state, "clean");
+  // 版が違う・Outbox entryが無い・台帳以外の管理情報も不足 → これまでどおり「自動で直せる記録」
+  const older = progress([entry("memory:m1", "done", { recordUpdatedAt: "2026-09-01T00:00:00.000Z" })]);
+  assert.equal(classifyConsistency(plan({ ops: [ledgerOnly] }), older, older).counts.repairable, 1);
+  assert.equal(classifyConsistency(plan({ ops: [ledgerOnly] }), progress(), progress()).counts.repairable, 1);
+  const registryToo = { ...ledgerOnly, steps: { ...notNeeded, registry: "pending", ledger: "pending" } };
+  assert.equal(classifyConsistency(plan({ ops: [registryToo] }), done, done).counts.repairable, 1);
+  assert.equal(classifyConsistency(plan({ ops: [{ ...ledgerOnly, kind: "create" }] }), done, done).counts.repairable, 1);
+});
+
 test("Outboxに保存待ちがある記録の差分は、破損ではなく保存待ち（conflict / 日付ファイル統合 / 保存先に無い記録のどれでも）", () => {
   const pending = progress([entry("memory:m1", "pending"), entry("memory:m2", "pending"), entry("conversation:c1", "pending")]);
   const r = classifyConsistency(plan({

@@ -40,7 +40,7 @@ export interface ConsistencyPlanLike {
       syncState: { savedUpdatedAt: string | null; matchesLocal: boolean | null };
     }[];
   };
-  ops: readonly { kind: string; members: readonly { id: string }[] }[];
+  ops: readonly { kind: string; members: readonly { id: string; recordType?: string; updatedAt?: string }[]; steps?: Readonly<Record<string, string>> }[];
   held: readonly { recordType: string; recordId: string; reason: string }[];
 }
 
@@ -146,6 +146,23 @@ function saveStateOf(
   return "settled";
 }
 
+/**
+ * Outboxの保存経路はsync ledger（旧経路の台帳）を書かない（projectionの`ledger`は"not-needed"）。そのため既存のRecovery planは、
+ * Outboxで保存済みの記録にも「台帳だけ不足（repair）」を出す。保存先のファイル・管理情報がすべて揃い（台帳以外のstepが不要）、
+ * その版のOutbox entryが完了（done）していれば、保存は完了している（不整合ではない）。何も書かない判定だけ。
+ */
+function ledgerOnlyProvenByOutbox(op: ConsistencyPlanLike["ops"][number], outbox: Map<string, SaveProgressEntry>): boolean {
+  if (op.kind !== "repair" || !op.steps) return false;
+  const steps = Object.entries(op.steps);
+  if (!steps.some(([name, state]) => name === "ledger" && state !== "not-needed")) return false;
+  if (!steps.every(([name, state]) => name === "ledger" || state === "not-needed")) return false;
+  return op.members.length > 0 && op.members.every((m) => {
+    if (!m.updatedAt) return false;
+    const ids = m.recordType ? outboxIdsFor(m.recordType, m.id) : [`memory:${m.id}`, `reflection:${m.id}`, `conversation:${m.id}`, `source:${m.id}`];
+    return ids.some((id) => { const e = outbox.get(id); return !!e && e.status === "done" && e.recordUpdatedAt === m.updatedAt; });
+  });
+}
+
 const asRecordType = (t: string): ConsistencyRecordType =>
   t === "conversation" || t === "memory" || t === "reflection" || t === "source" ? t : "memory";
 
@@ -178,6 +195,7 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
 
   // 既存の復旧（applyRecovery）で直せる記録：保存先に無い記録の書き出し、管理情報の更新
   for (const op of plan.ops) {
+    if (ledgerOnlyProvenByOutbox(op, oa)) continue;
     for (const m of op.members) {
       const r = recordById.get(m.id);
       const type = asRecordType(r?.recordType ?? "memory");
