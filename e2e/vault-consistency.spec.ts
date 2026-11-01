@@ -40,7 +40,7 @@ async function setup(page: Page) {
 const check = (page: Page) => page.evaluate(async () => {
   const { consistencyCheck } = (window as any).D; const started = Date.now();
   const { report, plan } = await consistencyCheck.checkVaultConsistency((window as any).__root, () => false, { drainWaitMs: 1500, pollMs: 100, attempts: 3, retryDelayMs: 100 });
-  return { state: report.state, counts: report.counts, categories: [...report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), ...plan.plan.issues.map((i: any) => `issue ${i.path}:${i.status}:${i.error ?? ""}`)], ms: Date.now() - started };
+  return { state: report.state, counts: report.counts, categories: [...report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), ...plan.plan.issues.map((i: any) => `issue ${i.path}:${i.status}:${i.error ?? ""}`), ...plan.ops.map((o: any) => `op ${o.kind}:${o.path}:${JSON.stringify(o.steps)}`)], ms: Date.now() - started };
 });
 /** everything the check could have changed: the OPFS "Vault" files and the save progress (Outbox + ledger) */
 const fingerprint = (page: Page) => page.evaluate(async () => {

@@ -98,3 +98,10 @@ test("通常UIの再確認は読み取りだけの「もう一度確認する」
   const recheck = chat.slice(chat.indexOf("function handleRecheckRecovery()"), chat.indexOf("async function handleUserRepair()"));
   assert.ok(recheck.includes("startRecoveryBackgroundCheck(vaultHandle)") && !/applyRecovery|handleExecuteRecoveryApply|resumeNarrow/.test(recheck), "read-only re-check");
 });
+test("「もう一度確認する」は、前回の確認が終わっていれば（要確認・保存待ち・未確定のどれでも）必ずもう一度確認する。実行中の確認とは重ねない", () => {
+  const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
+  const recheck = chat.slice(chat.indexOf("function handleRecheckRecovery()"), chat.indexOf("async function handleUserRepair()"));
+  assert.ok(/if \(!vaultHandle \|\| recoveryCheckInFlightRef\.current === vaultGenerationRef\.current\) return;\s+recoveryDetectionRanRef\.current = false;/.test(recheck), "only an in-flight check blocks a manual re-check");
+  const start = chat.slice(chat.indexOf("async function startRecoveryBackgroundCheck("), chat.indexOf("async function runRecoveryBackgroundCheckOnce("));
+  assert.ok(start.includes("recoveryCheckInFlightRef.current = generation;") && /finally \{\s+if \(recoveryCheckInFlightRef\.current === generation\) recoveryCheckInFlightRef\.current = null;/.test(start), "the in-flight mark is always cleared");
+});

@@ -797,6 +797,8 @@ export default function ChatScreen() {
   const startupRecoveryCheckRanRef = useRef(false);
   /** 保存先の整合性の背景確認（読み取りだけ）。ビルド × Vaultごとに、正常と確定するまで。Settingsを開くこととは無関係。 */
   const recoveryDetectionRanRef = useRef(false);
+  /** 実行中の確認があるVault世代（無ければnull）。手動の再確認と自動の再確認を重ねない。世代が変われば古い確認は止まる。 */
+  const recoveryCheckInFlightRef = useRef<number | null>(null);
   const [recoveryDetectionFailed, setRecoveryDetectionFailed] = useState(false);
   const [recoveryChecking, setRecoveryChecking] = useState(false);
   /** 直近の確定した（または保存中で未確定の）整合性確認の結果。種類・件数・理由の表示と、「修復する」の対象に使う。 */
@@ -3556,9 +3558,18 @@ export default function ChatScreen() {
    * 保存待ち・未確定のときは、少し後に有限回だけ自動で確認し直す。何も修復しない。
    */
   async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle) {
-    if (recoveryDetectionRanRef.current) return;
-    recoveryDetectionRanRef.current = true;
     const generation = vaultGenerationRef.current;
+    if (recoveryDetectionRanRef.current || recoveryCheckInFlightRef.current === generation) return;
+    recoveryDetectionRanRef.current = true;
+    recoveryCheckInFlightRef.current = generation;
+    try {
+      await runRecoveryBackgroundCheckOnce(handle, generation);
+    } finally {
+      if (recoveryCheckInFlightRef.current === generation) recoveryCheckInFlightRef.current = null;
+    }
+  }
+
+  async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number) {
     const cancelled = () => generation !== vaultGenerationRef.current;
     // 確認は必ず終わる：待機・やり直しは有限回で、尽きたら「確認できませんでした」を表示する（空白のままにしない）。
     const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, cancelled);
@@ -3599,7 +3610,9 @@ export default function ChatScreen() {
 
   /** 「もう一度確認する」（READ ONLY）。確認中は何もしない。自動の再確認の回数も数え直す。 */
   function handleRecheckRecovery() {
-    if (!vaultHandle || recoveryChecking || recoveryDetectionRanRef.current) return;
+    if (!vaultHandle || recoveryCheckInFlightRef.current === vaultGenerationRef.current) return;
+    // 前回の確認が終わっていれば（要確認・保存待ち・未確定のどれでも）、もう一度確認できる。
+    recoveryDetectionRanRef.current = false;
     recoveryRecheckCountRef.current = 0;
     setRecoveryStatus((current) => (current.kind === "error" || current.kind === "done" ? { kind: "idle" } : current));
     void startRecoveryBackgroundCheck(vaultHandle);
