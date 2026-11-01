@@ -131,13 +131,13 @@ for (const device of ["desktop", "android"] as const) {
       expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);                           // the edited day file is untouched
     });
 
-    test("a day file that can not be rewritten exactly (a hand-written note) is not merged into; the held save stays held", async ({ page }) => {
+    test("a day file whose rewrite would drop content (an unknown frontmatter key) is not merged into; the held save stays held", async ({ page }) => {
       test.setTimeout(120_000);
       await setup(page); await addHeldMemory(page);
       await page.evaluate(async (DAY_FILE) => {
         const root = (window as any).__root; const dir = await root.getDirectoryHandle("Memories"); const fh = await dir.getFileHandle(DAY_FILE.split("/")[1]);
         const text = await (await fh.getFile()).text();
-        const w = await fh.createWritable(); await w.write(text + "\n\n手で書き足した架空のメモ\n"); await w.close();
+        const w = await fh.createWritable(); await w.write(text.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")); await w.close();
       }, DAY_FILE);
       const before = await files(page);
       const r = await repair(page);

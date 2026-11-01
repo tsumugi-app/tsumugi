@@ -16,7 +16,7 @@
  *   - 対象にしなかった記録・直せなかった記録は、理由ごとの件数と、次に取れる操作として返す。
  */
 import { readZipEntries } from "./zip";
-import { parseMemoryDayFile, serializeMemoryDayFile } from "./markdown";
+import { MEMORY_ENTRY_SEPARATOR, memoryObjectToMarkdown, parseMemoryObjectMarkdown } from "./markdown";
 import { BACKUP_DIR, sha256Hex, verifyBackupZip, type BackupFailureReason, type BackupResult } from "./vaultBackup";
 import type { ConsistencyCategory, ConsistencyReport, RepairTarget } from "./vaultConsistency";
 
@@ -133,14 +133,25 @@ export async function reverifyBackup(
 }
 
 /**
- * 同じ日のファイルへ記録を足してよいか：今のファイルを読み、通常の保存と同じ形（作成日時の順）で書き直したときに一字一句同じになること。
- * 同じにならない（読めない部分・別の書式がある）ファイルに足すと、書き直しで他の内容が失われうるため、足さない。
+ * 同じ日のファイルへ記録を足してよいか：通常の保存は、今のファイルの記録を読み直して書き直す（作成日時の順）。
+ * そのとき何も失われないこと＝(1) 区切りごとのどの部分も記録として読めること（読めない部分は書き直しで消える）、
+ * (2) 各記録を書き直した結果に、元の行がすべて残ること（知らない項目・見出しの外の文章などは書き直しで消える）。
+ * 並び順が変わる・既定の項目が書き足される、は失われないので許す。1つでも満たさなければ足さない。
  */
 export function dayFileRoundTrips(text: string): boolean {
-  const members = parseMemoryDayFile(text);
-  if (members.length === 0) return text.trim().length === 0;
-  const sorted = [...members].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  return serializeMemoryDayFile(sorted) === text;
+  const entries = text.split(MEMORY_ENTRY_SEPARATOR).map((e) => e.trim()).filter((e) => e.length > 0);
+  for (const entry of entries) {
+    const parsed = parseMemoryObjectMarkdown(entry);
+    if (!parsed) return false;
+    const rewritten = new Map<string, number>();
+    for (const line of memoryObjectToMarkdown(parsed).split("\n")) rewritten.set(line.trimEnd(), (rewritten.get(line.trimEnd()) ?? 0) + 1);
+    for (const line of entry.split("\n")) {
+      const left = rewritten.get(line.trimEnd()) ?? 0;
+      if (left === 0) return false;
+      rewritten.set(line.trimEnd(), left - 1);
+    }
+  }
+  return true;
 }
 
 const addSkip = (list: AutoRepairSkipped[], reason: AutoRepairSkipReason, recordType: RepairTarget["recordType"], count = 1) => {

@@ -242,14 +242,16 @@ test("冪等：直った後にもう一度押すと何もしない。途中の�
   assert.ok(!w3.log.includes("settle"), "no save run when nothing was re-queued");
 });
 
-test("同じ日のファイルへの追加：通常の保存の形で一字一句読み書きし直せるファイルだけ（それ以外は追加で内容が失われうる）", () => {
+test("同じ日のファイルへの追加：通常の保存の書き直しで何も失われないファイルだけ（それ以外は追加で内容が失われうる）", () => {
   const a = memory("m1", { createdAt: "2026-10-20T08:00:00.000Z" }), b = memory("m2", { createdAt: "2026-10-20T09:00:00.000Z" });
   const normal = markdown.serializeMemoryDayFile([a, b]);
   assert.equal(repair.dayFileRoundTrips(normal), true);
   assert.equal(repair.dayFileRoundTrips(""), true);
-  assert.equal(repair.dayFileRoundTrips(normal + "\n\n手で書き足した架空のメモ\n"), false, "text outside the entries would be lost");
-  assert.equal(repair.dayFileRoundTrips(markdown.serializeMemoryDayFile([b, a])), false, "a different order would be rewritten");
-  assert.equal(repair.dayFileRoundTrips("---\ntitle: 架空\n---\n本文"), false, "an unparseable entry would be dropped");
+  assert.equal(repair.dayFileRoundTrips(markdown.serializeMemoryDayFile([b, a])), true, "a different order loses nothing");
+  assert.equal(repair.dayFileRoundTrips(normal.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")), false, "an unknown frontmatter key would be dropped");
+  assert.equal(repair.dayFileRoundTrips(normal.replace("## Summary", "手で書き足した架空のメモ\n\n## Summary")), false, "text outside the summary would be dropped");
+  assert.equal(repair.dayFileRoundTrips(normal + markdown.MEMORY_ENTRY_SEPARATOR + "---\ntitle: 架空\n---\n本文"), false, "an unparseable entry would be dropped");
+  assert.equal(repair.dayFileRoundTrips("---\ntitle: 架空\n---\n本文"), false);
 });
 
 test("表示：理由ごとの件数と次の操作。本文・IDは出さない", () => {
