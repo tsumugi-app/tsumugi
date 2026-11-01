@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
+import VaultBackupSection from "./VaultBackupSection";
 import type {
   DataActionFeedback,
   RestoreCandidate,
@@ -1567,6 +1568,11 @@ export default function SettingsPanel({
                 削除を続ける
               </button>
             </div>
+          )}
+
+          {/* バックアップ（保存先の汎用修復 段階2）：端末と保存先の両方を退避し、読み戻して照合する。PC・Androidとも */}
+          {vaultStatus === "connected" && vaultHandle && (
+            <VaultBackupSection root={vaultHandle} backend={vaultBackend} disabled={vaultActionsDisabled} />
           )}
 
           {vaultBackend === "opfs" && (

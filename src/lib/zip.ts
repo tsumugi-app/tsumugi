@@ -12,7 +12,8 @@
 export interface ZipEntryInput {
   /** ZIP内のパス（例："Memories/2026-07-26.md"）。区切りは常に"/"。 */
   path: string;
-  content: string;
+  /** 文字列はUTF-8で書く。バイト列（バックアップの原本）はそのまま書く。 */
+  content: string | Uint8Array;
 }
 
 let crcTable: Uint32Array | null = null;
@@ -31,7 +32,7 @@ function getCrcTable(): Uint32Array {
   return table;
 }
 
-function crc32(bytes: Uint8Array): number {
+export function crc32(bytes: Uint8Array): number {
   const table = getCrcTable();
   let crc = 0xffffffff;
   for (let i = 0; i < bytes.length; i++) {
@@ -65,17 +66,35 @@ const VERSION = 20;
  * （「データが無い」の判定は呼び出し側で行う想定）。
  */
 export function createZipBlob(files: ZipEntryInput[]): Blob {
+  return new Blob(createZipParts(files) as BlobPart[], { type: "application/zip" });
+}
+
+/** createZipBlobと同じZIPを、1つのバイト列として返す（書き込んだものを読み戻して照合するため）。 */
+export function createZipBytes(files: ZipEntryInput[]): Uint8Array {
+  const parts = createZipParts(files);
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p instanceof Uint8Array ? p : new Uint8Array(p), at); at += p.byteLength; }
+  return out;
+}
+
+/** ZIP64は使わないため、件数・大きさがこの範囲を超えるZIPは作らない（黙って壊れたZIPを作らない）。 */
+const MAX_ENTRIES = 0xffff;
+const MAX_OFFSET = 0xffffffff;
+
+function createZipParts(files: ZipEntryInput[]): (ArrayBuffer | Uint8Array)[] {
+  if (files.length > MAX_ENTRIES) throw new Error("zip-too-many-entries");
   const encoder = new TextEncoder();
   const { time, date } = toDosDateTime(new Date());
 
-  const parts: BlobPart[] = [];
-  const centralParts: BlobPart[] = [];
+  const parts: (ArrayBuffer | Uint8Array)[] = [];
+  const centralParts: (ArrayBuffer | Uint8Array)[] = [];
   let offset = 0;
   let centralSize = 0;
 
   for (const file of files) {
     const nameBytes = encoder.encode(file.path);
-    const contentBytes = encoder.encode(file.content);
+    const contentBytes = typeof file.content === "string" ? encoder.encode(file.content) : file.content;
     const crc = crc32(contentBytes);
 
     const local = new ArrayBuffer(30);
@@ -118,6 +137,7 @@ export function createZipBlob(files: ZipEntryInput[]): Blob {
     centralSize += central.byteLength + nameBytes.length;
 
     offset += local.byteLength + nameBytes.length + contentBytes.length;
+    if (offset > MAX_OFFSET) throw new Error("zip-too-large");
   }
 
   const centralOffset = offset;
@@ -133,5 +153,54 @@ export function createZipBlob(files: ZipEntryInput[]): Blob {
   u32(ev, 16, centralOffset);
   u16(ev, 20, 0);
 
-  return new Blob([...parts, ...centralParts, end], { type: "application/zip" });
+  return [...parts, ...centralParts, end];
+}
+
+export class ZipFormatError extends Error {
+  constructor(public readonly code: string) { super(code); this.name = "ZipFormatError"; }
+}
+
+/**
+ * createZipBytesが作る形式（store方式・ZIP64なし）のZIPを読む。各エントリのCRC32をローカルヘッダ・セントラルディレクトリの
+ * 両方と照合し、壊れていればZipFormatErrorを投げる（途中まで読めた結果は返さない）。バックアップの読み戻し検証用。
+ */
+export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Array }[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const fail = (code: string): never => { throw new ZipFormatError(code); };
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 0xffff); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) fail("zip-no-end-record");
+  const count = view.getUint16(eocd + 10, true);
+  const centralSize = view.getUint32(eocd + 12, true);
+  const centralOffset = view.getUint32(eocd + 16, true);
+  if (centralOffset + centralSize > eocd) fail("zip-bad-central-directory");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const out: { path: string; data: Uint8Array }[] = [];
+  const seen = new Set<string>();
+  let at = centralOffset;
+  for (let n = 0; n < count; n++) {
+    if (at + 46 > eocd || view.getUint32(at, true) !== 0x02014b50) fail("zip-bad-central-entry");
+    const method = view.getUint16(at + 10, true);
+    const crc = view.getUint32(at + 16, true);
+    const size = view.getUint32(at + 20, true);
+    if (method !== STORE_METHOD || view.getUint32(at + 24, true) !== size) fail("zip-unsupported-entry");
+    const nameLength = view.getUint16(at + 28, true);
+    const skip = nameLength + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
+    const localOffset = view.getUint32(at + 42, true);
+    let path = "";
+    try { path = decoder.decode(bytes.subarray(at + 46, at + 46 + nameLength)); } catch { fail("zip-bad-name"); }
+    if (seen.has(path)) fail("zip-duplicate-entry");
+    seen.add(path);
+    if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== 0x04034b50) fail("zip-bad-local-header");
+    if (view.getUint32(localOffset + 14, true) !== crc || view.getUint32(localOffset + 18, true) !== size) fail("zip-header-mismatch");
+    const dataStart = localOffset + 30 + view.getUint16(localOffset + 26, true) + view.getUint16(localOffset + 28, true);
+    if (dataStart + size > centralOffset) fail("zip-truncated-entry");
+    const data = bytes.subarray(dataStart, dataStart + size);
+    if (crc32(data) !== crc) fail("zip-crc-mismatch");
+    out.push({ path, data });
+    at += 46 + skip;
+  }
+  return out;
 }
