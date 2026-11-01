@@ -35,7 +35,7 @@ import {
   sourceToMarkdown,
   parseSourceMarkdown,
 } from "./markdown";
-import { validStatedAt } from "./markdown";
+import { memoryDayFileRewriteIsLossless, validStatedAt } from "./markdown";
 import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives, type HistoryIndexUpdate, type HistoryMeta, type HistoryMonthIndex } from "./vault";
 
 // ---------------------------------------------------------------------------
@@ -625,7 +625,7 @@ interface MemoryMergeResult {
  * たびに必ずday-fileを読み直す（`withMemoryDayFileLock`と組み合わせることで、
  * req 4の「常に最新実体を基準にする」を満たす）。
  */
-async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<MemoryMergeResult> {
+async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string, requireLossless = false): Promise<MemoryMergeResult> {
   const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError("memory-dayfile-unreadable");
 
@@ -658,6 +658,9 @@ async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObjec
       throw new ProjectionConflictError("memory-member-conflict");
     }
   }
+
+  // 自動修復が保存待ちに戻した記録：書き込む時点のファイルでも、書き直しで何も失われないことを確かめる（修復の確認の後の変更・中断後の再開でも同じ）
+  if (requireLossless && verdict !== "no-op" && read.state === "ok" && !memoryDayFileRewriteIsLossless(read.text)) throw new ProjectionConflictError("memory-dayfile-not-mergeable");
 
   const sortedMembers = [...mergedMembers].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   // No-op must describe the bytes on disk, not a hypothetical serialization.
@@ -870,7 +873,7 @@ export async function reconcileMemoryOutboxEntry(env: ProjectionEnv, entry: Vaul
   const day = canonical.date.slice(0, 10);
 
   try {
-    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path));
+    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path, entry.requireLosslessDayFile === true));
     steps.markdown = "done";
 
     await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent);

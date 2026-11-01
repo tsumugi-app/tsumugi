@@ -23,7 +23,7 @@ export const recoverySavingText = (count: number) => `保存待ちの記録が${
 
 export const CATEGORY_TEXT: Record<ConsistencyCategory, { title: string; note: string }> = {
   saving: { title: "保存待ち", note: "自動で保存されます。" },
-  repairable: { title: "自動で直せる記録", note: "保存先へ書き出す、または保存先の管理情報を更新します。記録の内容は変えません。" },
+  repairable: { title: "自動で直せる記録", note: "保存先へ書き出す、保存先の管理情報を更新する、または通常の保存をやり直します。記録の内容は変えず、始める前に全体をバックアップします。" },
   repairLater: { title: "自動修復の対応待ち", note: "今のバージョンでは自動で直せません。データは変更せず保持しています。" },
   needsChoice: { title: "どちらを残すかの確認が必要", note: "どちらが正しいかを自動では決めません。両方の版を変更せず保持しています（選ぶ機能は今後のバージョンで追加します）。" },
   retryable: { title: "時間をおくと解決する可能性がある記録", note: "「もう一度確認する」で確認し直せます。" },
@@ -108,7 +108,7 @@ export function deriveRecoveryUserView(
     if (report.state === "clean") return { kind: "none" };
     if (report.state === "saving") return { kind: "saving", count: report.counts.saving, checking };
     if (report.state === "unsettled") return { kind: "unsettled", checking };
-    return { kind: "attention", sections: attentionSections(report), canRepair: report.repairableIds.length > 0, checking, message: null };
+    return { kind: "attention", sections: attentionSections(report), canRepair: report.repairTargets.length > 0, checking, message: null };
   }
   if (message) return { kind: "attention", sections: [], canRepair: false, checking, message };
   if (status.kind === "clean") return { kind: "none" };

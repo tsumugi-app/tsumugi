@@ -21,6 +21,8 @@ export interface SaveProgressEntry {
   attempts: number;
   lastError: string | null;
   updatedAt: string;
+  /** 保存処理が保留（held）にした理由（`*-unreadable`・`*-conflict`等）。held以外ではnull。 */
+  heldReason?: string | null;
 }
 export interface SaveProgress {
   outbox: SaveProgressEntry[];
@@ -49,7 +51,10 @@ export interface ConsistencyPlanLike {
 /**
  * 分類（ユーザーに見せる区別）。
  *   saving      保存中・保存待ち。異常ではない（通常の保存が自動で反映する）
- *   repairable  今のバージョンで安全に自動修復できる（既存の復旧＝`applyRecovery`が扱う、保存先に無い記録・管理情報の更新）
+ *   repairable  今のバージョンで安全に自動修復できる。修復の方法（`RepairTarget.action`）は2つ：
+ *               apply   既存の復旧（`applyRecovery`）：保存先に無い記録の書き出し・管理情報の更新（journal・compare-and-set）
+ *               resave  通常の保存をやり直す（記録は変えずOutboxを保存待ちに戻す。書き込みは通常の保存処理が、通常どおりの確認をして行う）：
+ *                       同じ日のファイルへの追加が必要な記録、ファイルを読めず保存が保留された記録
  *   repairLater 自動修復の対象だが、今のバージョンでは未対応（データは変更せず保持）
  *   needsChoice 端末と保存先に異なる版がある等、どちらを残すかの確認が必要（選択機能は未対応。両方の版を変更せず保持）
  *   retryable   時間をおいて確認し直せば解決しうる（一時的な読取失敗・保存の再試行中・確認中の変化）
@@ -67,10 +72,21 @@ export type ConsistencyReason =
 
 export type ConsistencyRecordType = "conversation" | "memory" | "reflection" | "source" | "file";
 
+export type RepairAction = "apply" | "resave";
+export interface RepairTarget {
+  action: RepairAction;
+  reason: ConsistencyReason;
+  /** Outboxの種類（memory / reflectionを区別する）。 */
+  recordType: Exclude<ConsistencyRecordType, "file">;
+  recordId: string;
+}
+
 export interface ConsistencyFinding {
   category: ConsistencyCategory;
   reason: ConsistencyReason;
   recordType: ConsistencyRecordType;
+  /** repairableのときだけ：修復の方法 */
+  action?: RepairAction;
   /** 記録のID（ファイルの問題では無い）。画面には出さない（件数・種類・理由だけを出す）。 */
   recordId?: string;
 }
@@ -99,8 +115,10 @@ export interface ConsistencyReport {
   counts: Record<ConsistencyCategory, number>;
   /** 種類 × 理由 × 記録の種類ごとの件数（画面の表示用。IDも本文も含まない）。 */
   groups: ConsistencyGroup[];
-  /** 今のバージョンで自動修復できる（保存待ちではない）記録のID。「修復する」はこの集合だけを対象にする。 */
+  /** 既存の復旧（apply）で直せる（保存待ちではない）記録のID。 */
   repairableIds: string[];
+  /** 今のバージョンで自動修復できる記録と、その方法（apply / resave）。「修復する」はこの集合だけを対象にする。 */
+  repairTargets: RepairTarget[];
 }
 
 /** これ以上の失敗が続くOutbox entryは「保存待ち」ではなく「保存の再試行中」（再試行で解決しうるが、成功していない）。 */
@@ -122,6 +140,19 @@ export const hasPendingSaves = (p: SaveProgress): boolean =>
   p.outbox.some((e) => e.status === "pending" && !(e.attempts >= STALLED_SAVE_ATTEMPTS && e.lastError));
 
 type SaveState = "settled" | "saving" | "retrying" | "held";
+
+/**
+ * 保存処理が保留にした理由の分類（理由の文字列の形だけで決める。記録・件数・日付に依存しない）：
+ *   `*-unreadable`  保存先のファイルを読めなかった → 通常の保存をやり直せば、そのときの実体で通常どおり判定される（resave）
+ *   `*-conflict`    保存先に端末と異なる版がある → どちらを残すかの確認が必要（自動では上書きしない）
+ *   その他（別の保存先・記録が無い等） → 自動では直さない
+ */
+export function heldReasonKind(reason: string | null | undefined): "retry" | "conflict" | "other" {
+  if (typeof reason !== "string") return "other";
+  if (/-unreadable$/.test(reason) || reason === "memory-dayfile-not-mergeable") return "retry";
+  if (/-conflict$/.test(reason)) return "conflict";
+  return "other";
+}
 
 function outboxIdsFor(recordType: string, recordId: string): string[] {
   return recordType === "memory" || recordType === "reflection" ? [`memory:${recordId}`, `reflection:${recordId}`] : [`${recordType}:${recordId}`];
@@ -218,10 +249,20 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     return false;
   };
   /** 保存の状態が「保存中」等なら、その分類を優先する（保存待ちの記録を不整合と数えない）。 */
+  /** 保留になっているOutbox entry（memory / reflectionのどちらか）と、その理由 */
+  const heldEntryOf = (type: string, id: string) => outboxIdsFor(type, id).map((x) => oa.get(x)).find((e) => e?.status === "held");
+  const heldFinding = (type: ConsistencyRecordType, id: string): ConsistencyFinding => {
+    const e = heldEntryOf(type, id);
+    const kind = heldReasonKind(e?.heldReason);
+    // 保存のやり直しは通常のMemoryだけ（書き直しで何も失われないことを確かめられる）。会話・振り返り・資料は1ファイルを丸ごと書き直すため、手で足された内容を確かめられず、自動では直さない
+    if (kind === "retry" && e && e.id.startsWith("memory:")) return { category: "repairable", reason: "save-held", recordType: "memory", recordId: id, action: "resave" };
+    if (kind === "conflict") return { category: "needsChoice", reason: "different-content", recordType: type, recordId: id };
+    return { category: "repairLater", reason: "save-held", recordType: type, recordId: id };
+  };
   const bySave = (s: SaveState, type: ConsistencyRecordType, id: string, cause: { heldReason?: string; historyStepNeeded?: boolean } = {}): ConsistencyFinding | null =>
     s === "saving" ? { category: "saving", reason: "save-pending", recordType: type, recordId: id }
       : s === "retrying" ? { category: "retryable", reason: "save-retrying", recordType: type, recordId: id }
-        : s === "held" ? { category: "repairLater", reason: "save-held", recordType: type, recordId: id }
+        : s === "held" ? heldFinding(type, id)
           : affectedBySharedSave(type, id, cause) ? { category: "saving", reason: "shared-save-pending", recordType: type, recordId: id }
             : null;
 
@@ -232,7 +273,7 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
       const r = recordById.get(m.id);
       const type = asRecordType(r?.recordType ?? "memory");
       const historyStepNeeded = op.kind === "repair" && !!op.steps && op.steps.history !== undefined && op.steps.history !== "not-needed";
-      add(bySave(stateOf(type, m.id), type, m.id, { historyStepNeeded }) ?? { category: "repairable", reason: op.kind === "repair" ? "metadata" : "local-only", recordType: type, recordId: m.id });
+      add(bySave(stateOf(type, m.id), type, m.id, { historyStepNeeded }) ?? { category: "repairable", reason: op.kind === "repair" ? "metadata" : "local-only", recordType: type, recordId: m.id, action: "apply" });
     }
   }
 
@@ -248,7 +289,9 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     const base = { recordType: type, recordId: h.recordId };
     if (h.reason === "record-unavailable") add({ ...base, category: "retryable", reason: "record-changed" });
     else if (h.reason === "conflict") add({ ...base, category: "needsChoice", reason: "different-content" });
-    else if (h.reason === "memory-dayfile-merge-required") add({ ...base, category: "repairLater", reason: "day-file-merge" });
+    // 同じ日のファイルはあるが、この記録が入っていない：通常の保存（既存の記録をすべて残して追加する）をやり直す。
+    // 実行の直前に、そのファイルの書き直しで他の内容が失われないことを確かめ、だめなら確認が必要として残す
+    else if (h.reason === "memory-dayfile-merge-required") add({ ...base, category: "repairable", reason: "day-file-merge", action: "resave" });
     else if (own.includes("duplicate-or-cross-type-id") || own.includes("multiple-memory-files-for-day")) add({ ...base, category: "needsChoice", reason: "multiple-copies" });
     else if (own.includes("orphan-registry-key") || own.includes("registry-identity-mismatch")) add({ ...base, category: "repairLater", reason: "registry-mismatch" });
     else if (own.includes("metadata-trace-without-confirmed-markdown")) add({ ...base, category: "unknown", reason: "trace-without-file" });
@@ -264,6 +307,14 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     add(e.attempts >= STALLED_SAVE_ATTEMPTS && e.lastError
       ? { category: "retryable", reason: "save-retrying", recordType: type, recordId: id }
       : { category: "saving", reason: "save-pending", recordType: type, recordId: id });
+  }
+
+  // 保存処理が保留（held）にしたままの記録も、走査で差分として見えなかったかどうかに関わらず隠さない（保留が残る間は「最新」にしない）
+  for (const e of after.outbox) {
+    if (e.status !== "held") continue;
+    const sep = e.id.indexOf(":");
+    if (sep <= 0) continue;
+    add(heldFinding(asRecordType(e.id.slice(0, sep)), e.id.slice(sep + 1)));
   }
 
   // ファイル単位の問題（読取・解析）。保存中だった可能性があるうちは「原因未特定」と断定しない
@@ -287,8 +338,11 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     CONSISTENCY_CATEGORIES.indexOf(x.category) - CONSISTENCY_CATEGORIES.indexOf(y.category) || x.reason.localeCompare(y.reason) || x.recordType.localeCompare(y.recordType));
   const nonSaving = findings.length - counts.saving;
   const state: ConsistencyState = !settled ? "unsettled" : nonSaving > 0 ? "attention" : counts.saving > 0 ? "saving" : "clean";
-  const repairableIds = findings.filter((f) => f.category === "repairable" && f.recordId !== undefined).map((f) => f.recordId as string);
-  return { state, settled, findings, counts, groups, repairableIds };
+  const repairableIds = findings.filter((f) => f.category === "repairable" && f.action === "apply" && f.recordId !== undefined).map((f) => f.recordId as string);
+  const repairTargets: RepairTarget[] = findings
+    .filter((f): f is ConsistencyFinding & { action: RepairAction; recordId: string } => f.category === "repairable" && !!f.action && f.recordId !== undefined && f.recordType !== "file")
+    .map((f) => ({ action: f.action, reason: f.reason, recordType: f.recordType as RepairTarget["recordType"], recordId: f.recordId }));
+  return { state, settled, findings, counts, groups, repairableIds, repairTargets };
 }
 
 export interface ConsistencyCheckDeps<P extends ConsistencyPlanLike> {

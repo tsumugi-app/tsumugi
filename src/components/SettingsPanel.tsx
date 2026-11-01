@@ -27,6 +27,7 @@ import {
   recoveryAllowsLatest, type RecoveryUserView,
 } from "@/lib/vaultRecoveryUserView";
 import type { VaultStatusView } from "@/lib/vaultStatus";
+import { autoRepairOutcomeView, NEXT_ACTION_TEXT, OPFS_REPAIR_NOTE, type AutoRepairOutcome } from "@/lib/vaultAutoRepair";
 import type { Tombstone } from "@/lib/db";
 import { listIncompleteDeletions } from "@/lib/deleteFlow";
 import DeleteConversationDialog, { type DeleteRequest } from "./DeleteConversationDialog";
@@ -82,6 +83,7 @@ export default function SettingsPanel({
   recoveryStatus,
   recoveryUserView,
   onUserRepair,
+  autoRepairOutcome = null,
   onRecheckRecovery,
   onRunRecoveryDryRun,
   onExecuteRecoveryApply,
@@ -160,6 +162,8 @@ export default function SettingsPanel({
   /** 通常ユーザー向けのRecovery表示（正常なら何も出さない）。導出は`deriveRecoveryUserView`。 */
   recoveryUserView: RecoveryUserView;
   onUserRepair: () => void;
+  /** 直前の「修復する」の結果（無ければnull）。表示は修復の後にもう一度確認した結果に基づく */
+  autoRepairOutcome?: AutoRepairOutcome | null;
   /** 「もう一度確認する」（READ ONLY）。 */
   onRecheckRecovery: () => void;
   onRunRecoveryDryRun: () => void;
@@ -1314,6 +1318,16 @@ export default function SettingsPanel({
             あるときだけ出す（直せない記録しか無いときに、何も解決しない処理を走らせない）。診断・修復前チェック・cleanup等の詳細は、
             下の`?debugLog=1`（`showAdvancedVaultTools`）の開発者向けUIにだけある。
           */}
+          {vaultStatus === "connected" && vaultHandle && autoRepairOutcome && (() => {
+            const view = autoRepairOutcomeView(autoRepairOutcome, vaultBackend);
+            return (
+              <div data-testid="vault-repair-outcome" data-clean={view.clean ? "true" : "false"} className="flex flex-col gap-1 rounded-xl bg-stone-50/80 px-3 py-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-300">
+                <span className="text-sm">{view.headline}</span>
+                {view.lines.map((line) => <span key={line}>{line}</span>)}
+                {view.warning && <span role="alert" className="text-amber-700 dark:text-amber-400">{view.warning}</span>}
+              </div>
+            );
+          })()}
           {vaultStatus === "connected" && vaultHandle && recoveryUserView.kind !== "none" && recoveryUserView.kind !== "pending" && (
             <div data-testid="vault-consistency" className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               <span>
@@ -1333,8 +1347,12 @@ export default function SettingsPanel({
                   <span className="font-medium">{section.title}（{section.count}件）</span>
                   {section.lines.map((line) => <span key={line}>{line}</span>)}
                   <span className="text-stone-500 dark:text-stone-400">{section.note}</span>
+                  <span className="text-stone-500 dark:text-stone-400">{NEXT_ACTION_TEXT[section.category]}</span>
                 </div>
               ))}
+              {recoveryUserView.kind === "attention" && recoveryUserView.canRepair && vaultBackend === "opfs" && (
+                <span className="text-[11px] text-amber-700 dark:text-amber-400">{OPFS_REPAIR_NOTE}</span>
+              )}
               {recoveryUserView.kind === "attention" && <span className="text-[11px] text-stone-500 dark:text-stone-400">{RECOVERY_DATA_KEPT_TEXT}</span>}
               {(recoveryUserView.kind === "attention" || recoveryUserView.kind === "saving" || recoveryUserView.kind === "unsettled" || recoveryUserView.kind === "unknown" || recoveryUserView.kind === "interrupted") && (
                 <div className="flex flex-wrap gap-2">

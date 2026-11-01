@@ -13,6 +13,7 @@ const report = (state: ConsistencyState, counts: Partial<Record<ConsistencyCateg
   const all = { saving: 0, repairable: 0, repairLater: 0, needsChoice: 0, retryable: 0, unknown: 0, ...counts };
   return {
     state, settled: state !== "unsettled", findings: [], counts: all, repairableIds,
+    repairTargets: repairableIds.map((recordId) => ({ action: "apply" as const, reason: "local-only" as const, recordType: "memory" as const, recordId })),
     groups: (Object.entries(all) as [ConsistencyCategory, number][]).filter(([, n]) => n > 0).map(([category, count]) => ({ category, reason: "other", recordType: "memory", count })),
   };
 };
@@ -85,10 +86,11 @@ test("Settingsを開くこととRecovery確認は結びつかない。背景の�
   assert.ok(check.includes("runBackgroundRecoveryCheck(") && !/applyRecovery\(|resumeNarrowRepairForUser|runLegacyHeldCleanup|executeNarrow/.test(check), "the background check never repairs or cleans up");
   assert.ok(/runProductionBootstrapOnce\(vaultHandle\)[\s\S]*\.then\(\(\) => startRecoveryBackgroundCheck\(vaultHandle\)\)/.test(chat), "started after the normal startup (bootstrap) settles");
 });
-test("ユーザー向け「修復する」は、今のバージョンで直せる記録だけを既存の復旧で直す（限定修復は途中で止まったものの続きだけ）", () => {
+test("ユーザー向け「修復する」は、今のバージョンで直せる記録だけを自動修復で直す（限定修復は途中で止まったものの続きだけ）", () => {
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
   const handler = chat.slice(chat.indexOf("async function handleUserRepair()"), chat.indexOf("async function handleExecuteRecoveryApply("));
-  assert.ok(handler.includes("handleExecuteRecoveryApply({ confirmed: { world: recoveryStatus.applyPlan.confirmed.world, recordIds: report.repairableIds } })"));
+  assert.ok(handler.includes("report.repairTargets.length === 0") && handler.includes("runProductionVaultAutoRepair("), "only the repair targets, through the auto repair (backup first)");
+  assert.ok(!handler.includes("handleExecuteRecoveryApply(") || handler.includes('resumed === "not-repairable"'), "the plain Recovery Apply is only used to resume an interrupted one");
   assert.ok(handler.includes("resumeNarrowRepairForUser(") && !handler.includes("runNarrowRepairPreflight") && !handler.includes("runExplicitMemoryRepair"));
 });
 test("通常UIの再確認は読み取りだけの「もう一度確認する」。開発者向けの「確認する」（dry-run）や古い記録の整理は出さない", () => {

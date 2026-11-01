@@ -129,7 +129,9 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of chatDiff) assert.ok(navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
   // vaultProjection.ts: the only allowed change is that the startup integrity reconcile skips a done entry whose divergence the user accepted (for that record version)
   const projDiff = git("diff", "-U0", ...range, "--", "src/lib/vaultProjection.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  for (const l of projDiff) assert.ok(/getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l) || startupIoProjection.test(l), "unexpected vaultProjection.ts change: " + l);
+  // Reviewed (Vault auto repair, PR 3): a Memory re-queued by the repair (requireLosslessDayFile) is held instead of written when rewriting its day file would lose content. Normal saves pass requireLossless = false. Exact lines only (never a pattern)
+  const autoRepairProjectionLines = new Set<string>(["-async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<MemoryMergeResult> {", "+async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string, requireLossless = false): Promise<MemoryMergeResult> {", "+if (requireLossless && verdict !== \"no-op\" && read.state === \"ok\" && !memoryDayFileRewriteIsLossless(read.text)) throw new ProjectionConflictError(\"memory-dayfile-not-mergeable\");", "-const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path));", "+const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path, entry.requireLosslessDayFile === true));"]);
+  for (const l of projDiff) assert.ok(/getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l) || startupIoProjection.test(l) || autoRepairProjectionLines.has(l[0] + l.slice(1).trim()), "unexpected vaultProjection.ts change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
   // Reviewed storage safety extension: exact lines only, never a blanket exemption.
@@ -216,7 +218,8 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
   const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
     "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer",
-    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "cleanReferencesToMissingMemoryInTx", "withoutDeletedLinksInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
+    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "cleanReferencesToMissingMemoryInTx", "withoutDeletedLinksInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation",
+    "requeueRecordForVault"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below. requeueRecordForVault (auto repair) only reads the record and writes its Outbox entry
   const missing: string[] = [];
   // New deletion wrapper only removes records and cleans stored references. It must never
   // become a replacement writer or accept a child owned by a different conversation.
@@ -227,6 +230,10 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   assert.ok(deletionBody.includes('await removeMemoryInTx('));
   assert.ok(!/objectStore\("memoryObjects"\)\.(put|add)\(/.test(deletionBody));
   reviewed.add("beginPhysicalDeletion");
+  // The auto repair's requeue never writes the Memory store (it reads the record and writes only the Outbox entry)
+  const requeueStart = heads.find((h) => h.name === "requeueRecordForVault")!;
+  const requeueBody = src.slice(requeueStart.at, heads.find((h) => h.at > requeueStart.at)!.at);
+  assert.ok(!/objectStore\(store\)\.(put|add|delete)\(/.test(requeueBody) && /outbox\.put\(/.test(requeueBody));
   heads.forEach((h, i) => {
     const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);
     if (!/memoryObjects/.test(body) || !/\.(put|add|delete)\(/.test(body)) return;
