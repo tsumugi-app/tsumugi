@@ -74,7 +74,7 @@ for (const device of ["desktop", "android"] as const) {
 
     test("a pending Outbox entry is 'saving', never corruption; after it drains the re-check is clean", async ({ page }) => {
       await setup(page);
-      await putPending(page, "cons-mem-1", "架空の記録ひとつ（編集中）");
+      await putPending(page, "cons-mem-3", "架空の記録みっつ（保存待ち）"); // a new record the Outbox has not written yet
       const before = await fingerprint(page);
       const r = await check(page);
       expect(r.state, JSON.stringify(r.categories)).toBe("saving"); expect(r.counts.saving).toBe(1);
