@@ -4,8 +4,9 @@
  */
 import { getConversation, getMemoryObject, getSource, getVaultIdentityRecord, getVaultOutboxEntry, readBackupDeviceSnapshot, requeueRecordForVault, RecoveryPendingError } from "./db";
 import { isReflectionSummary } from "./vault";
-import { dayFileRoundTrips, runVaultAutoRepair, type AutoRepairEnv, type AutoRepairOutcome, type AutoRepairTargetInspection } from "./vaultAutoRepair";
+import { runVaultAutoRepair, type AutoRepairEnv, type AutoRepairOutcome, type AutoRepairTargetInspection } from "./vaultAutoRepair";
 import { createVaultBackup } from "./vaultBackup";
+import { dayFileCanTakeMember, decodeVaultText, VaultFileNotUtf8Error } from "./vaultRewriteSafety";
 import { checkVaultConsistency } from "./vaultConsistencyCheck";
 import type { ConsistencyCheckOptions, RepairTarget } from "./vaultConsistency";
 import type { MemoryObject } from "./types";
@@ -85,8 +86,8 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
         if (bytes === "unreadable") blocked = "unreadable";
         else if (bytes !== null) {
           let text: string | null = null;
-          try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { text = null; }
-          if (text === null || !dayFileRoundTrips(text)) blocked = "day-file-not-mergeable";
+          try { text = decodeVaultText(bytes); } catch (error) { if (!(error instanceof VaultFileNotUtf8Error)) throw error; }
+          if (text === null || !dayFileCanTakeMember(text, t.recordId)) blocked = "day-file-not-mergeable";
         }
       }
       return { version: record.updatedAt, paths: [...paths], blocked };

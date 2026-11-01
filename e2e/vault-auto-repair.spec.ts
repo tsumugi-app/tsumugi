@@ -131,34 +131,41 @@ for (const device of ["desktop", "android"] as const) {
       expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);                           // the edited day file is untouched
     });
 
-    test("a day file whose rewrite would drop content (an unknown frontmatter key) is not merged into; the held save stays held", async ({ page }) => {
+    test("a hand-written note in the day file stays byte for byte when a held save is added next to it; a file that is not a day file is not touched", async ({ page }) => {
       test.setTimeout(120_000);
       await setup(page); await addHeldMemory(page);
-      await page.evaluate(async (DAY_FILE) => {
+      const writeDayFile = (edit: "note" | "foreign") => page.evaluate(async ({ DAY_FILE, edit }) => {
         const root = (window as any).__root; const dir = await root.getDirectoryHandle("Memories"); const fh = await dir.getFileHandle(DAY_FILE.split("/")[1]);
         const text = await (await fh.getFile()).text();
-        const w = await fh.createWritable(); await w.write(text.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")); await w.close();
-      }, DAY_FILE);
-      // another held save on another day passes the checks: saving it must write only that record, never the skipped one
-      await page.evaluate(async () => {
-        const { dbm } = (window as any).D;
-        const entry = await dbm.putMemoryObjectWithOutbox({ ...(window as any).__mem("repair-mem-4", "架空の別の日の記録", "2026-10-21T03:00:00.000Z"), date: "2026-10-21T09:15:00.000Z" }, "memory");
-        await dbm.putVaultOutboxEntry({ ...entry, status: "held", heldReason: "memory-dayfile-unreadable", attempt: { count: 1, lastError: "memory-dayfile-unreadable", lastAttemptAt: entry.updatedAt } });
-      });
-      const before = await files(page);
+        const w = await fh.createWritable(); await w.write(edit === "note" ? text.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ") : "# 架空の自分のノート\n\n自由な文章\n"); await w.close();
+      }, { DAY_FILE, edit });
+      await writeDayFile("note");
+      const noted = (await files(page))[DAY_FILE];
       const r = await repair(page);
       expect(r.kind, JSON.stringify(r)).toBe("ran");
-      expect(r.skipped).toEqual([{ reason: "day-file-not-mergeable", recordType: "memory", count: 1 }]);
-      expect(r.repaired).toBe(1);
-      expect(r.view.clean).toBe(false);
-      const after = await files(page);
-      expect(after[DAY_FILE]).toBe(before[DAY_FILE]);
-      expect(after["Memories/2026-10-21.md"]).toContain("架空の別の日の記録");
-      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("held");
-      expect(await outboxOf(page, "memory:repair-mem-4")).toBe("done");
+      expect(r.skipped).toEqual([]);
+      const after = (await files(page))[DAY_FILE];
+      expect(after.startsWith(noted.trimEnd())).toBe(true);                                     // every existing byte, in place
+      expect(after).toContain("myNote: 架空のメモ");
+      expect(after).toContain("架空の記録みっつ");
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("done");
+
+      // another held save, and now the file is the user's own note: nothing is written
+      await page.evaluate(async () => {
+        const { dbm } = (window as any).D;
+        const entry = await dbm.putMemoryObjectWithOutbox((window as any).__mem("repair-mem-4", "架空の記録よっつ", "2026-10-20T04:00:00.000Z"), "memory");
+        await dbm.putVaultOutboxEntry({ ...entry, status: "held", heldReason: "memory-dayfile-unreadable", attempt: { count: 1, lastError: "memory-dayfile-unreadable", lastAttemptAt: entry.updatedAt } });
+      });
+      await writeDayFile("foreign");
+      const before = await files(page);
+      const blocked = await repair(page);
+      expect(blocked.skipped).toContainEqual({ reason: "day-file-not-mergeable", recordType: "memory", count: 1 });
+      expect(blocked.view.clean).toBe(false);
+      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);
+      expect(await outboxOf(page, "memory:repair-mem-4")).toBe("held");
     });
 
-    test("the day file changes after the checks and the tab closes: the normal save that finishes the job holds the record instead of dropping the new content", async ({ page }) => {
+    test("the day file changes after the checks and the tab closes: the normal save that finishes the job keeps the new content", async ({ page }) => {
       test.setTimeout(120_000);
       await setup(page); await addHeldMemory(page);
       const failed = await repair(page, { failSettle: true }).then(() => "finished", (e) => String(e));
@@ -169,14 +176,11 @@ for (const device of ["desktop", "android"] as const) {
         const text = await (await fh.getFile()).text();
         const w = await fh.createWritable(); await w.write(text.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")); await w.close();
       }, DAY_FILE);
-      const before = await files(page);
       await page.evaluate(async () => { await (window as any).D.bootstrap.runSaveFoundationBootstrap({ root: (window as any).__root }); });   // the next start-up
-      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("held");
-      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);                              // the note survives, nothing appended
-      const again = await repair(page);
-      expect(again.skipped).toEqual([{ reason: "day-file-not-mergeable", recordType: "memory", count: 1 }]);
-      expect(again.view.clean).toBe(false);
-      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("done");
+      const after = (await files(page))[DAY_FILE];
+      expect(after).toContain("myNote: 架空のメモ");                                              // the note survives
+      expect(after).toContain("架空の記録みっつ");
     });
 
     test("the day file gains bytes that are not UTF-8 after the checks: the save holds the record and those bytes survive", async ({ page }) => {

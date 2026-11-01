@@ -16,7 +16,6 @@
  *   - 対象にしなかった記録・直せなかった記録は、理由ごとの件数と、次に取れる操作として返す。
  */
 import { readZipEntries } from "./zip";
-import { memoryDayFileRewriteIsLossless } from "./markdown";
 import { BACKUP_DIR, sha256Hex, verifyBackupZip, type BackupFailureReason, type BackupResult } from "./vaultBackup";
 import type { ConsistencyCategory, ConsistencyReport, RepairTarget } from "./vaultConsistency";
 
@@ -26,7 +25,7 @@ export type AutoRepairSkipReason =
   | "record-missing" // 端末に記録が無い
   | "tombstoned" // 削除済み
   | "unreadable" // 保存先のファイルを読めない
-  | "day-file-not-mergeable" // 同じ日のファイルを、そのまま読み書きし直せない（追加すると他の内容が失われうる）
+  | "day-file-not-mergeable" // 同じ日のファイルに、他の内容を保ったまま追加できる見込みが無い（日別ファイルとして読めない・この記録が手で書き換えられている）
   | "repair-in-progress" // 別の修復・復旧の途中
   | "apply-failed"; // 既存の復旧で、書いた後の確認ができなかった（元のデータは保持）
 
@@ -132,8 +131,6 @@ export async function reverifyBackup(
   return { ok: true, content: { versions, vaultSha } };
 }
 
-/** 同じ日のファイルへ記録を足してよいか：書き直しで何も失われないこと（判定はmarkdown.ts。保存の直前にも同じ判定をする：vaultProjection.ts） */
-export const dayFileRoundTrips = memoryDayFileRewriteIsLossless;
 
 const addSkip = (list: AutoRepairSkipped[], reason: AutoRepairSkipReason, recordType: RepairTarget["recordType"], count = 1) => {
   const found = list.find((s) => s.reason === reason && s.recordType === recordType);
@@ -214,7 +211,7 @@ export const SKIP_REASON_TEXT: Record<AutoRepairSkipReason, string> = {
   "record-missing": "端末に記録が見つからないため、直していません",
   tombstoned: "削除済みの記録のため、直していません",
   unreadable: "保存先のファイルを読めなかったため、直していません。時間をおいてもう一度お試しください",
-  "day-file-not-mergeable": "同じ日のファイルに、そのまま読み書きし直せない内容があるため、追加していません（追加すると他の内容が失われるおそれがあります）。両方とも変更せず保持しています",
+  "day-file-not-mergeable": "同じ日のファイルを日別のファイルとして読めない、またはこの記録が手で書き換えられているため、追加していません。両方とも変更せず保持しています",
   "repair-in-progress": "別の修復の途中のため、直していません。「続きを完了する」の後にもう一度お試しください",
   "apply-failed": "書き込んだ後の確認ができなかったため、直したことにしていません。元のデータは保持しています。もう一度「修復する」を押すと、続きから確認します",
 };

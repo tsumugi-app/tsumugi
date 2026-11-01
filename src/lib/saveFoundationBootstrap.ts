@@ -38,7 +38,7 @@
 import { getVaultIdentityRecord } from "./db";
 import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultIdentityEnsureResult } from "./vaultIdentityAdoption";
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
-import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
+import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, reevaluateRewriteHeldOutbox, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
 import { withVaultSaveLock } from "./vaultSaveLock";
@@ -108,6 +108,8 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
 
     // 5b. 比較ルールが変わった場合だけ、過去のルールでheldになったentryを1回再評価する（同じルールversionでは二度と行わない）。
     const heldReevaluation = await reevaluateHeldOutboxOnce(projectionEnv);
+    // 5c. 書き込みの安全条件で保留になった記録：ユーザーがファイルを直していれば、ここで保存が再開する（判定が同じなら何も書かない）。
+    await reevaluateRewriteHeldOutbox(projectionEnv);
 
     // Phase 3-7.1：done outboxのintegrity検証。「doneだから見ない」は禁止
     // （Phase 3-7.1 req 4）——`status`に関わらず、done entry全件についても
