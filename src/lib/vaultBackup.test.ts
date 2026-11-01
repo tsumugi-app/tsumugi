@@ -156,8 +156,11 @@ test("ZIP: binary-exact round trip with Japanese names; a flipped byte is caught
   assert.deepEqual(back.map((e) => e.path), ["vault/日本語/記録.md", "vault/bin"]);
   assert.equal(text(back[0].data), "本文");
   assert.deepEqual([...back[1].data], [...binary]);
-  const bad = z.slice(); bad[40] ^= 0xff;
-  assert.throws(() => zip.readZipEntries(bad), (e: Error) => e instanceof zip.ZipFormatError);
+  const badName = z.slice(); badName[40] ^= 0xff;                     // inside the first local file name
+  assert.throws(() => zip.readZipEntries(badName), (e: Error) => e instanceof zip.ZipFormatError);
+  const dataAt = 30 + enc.encode("vault/日本語/記録.md").length;           // the first entry's content
+  const badData = z.slice(); badData[dataAt] ^= 0xff;
+  assert.throws(() => zip.readZipEntries(badData), (e: Error) => e instanceof zip.ZipFormatError && e.code === "zip-crc-mismatch");
   assert.throws(() => zip.readZipEntries(z.slice(0, z.length - 10)), (e: Error) => e instanceof zip.ZipFormatError);
 });
 

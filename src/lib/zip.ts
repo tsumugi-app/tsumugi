@@ -195,7 +195,10 @@ export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Ar
     seen.add(path);
     if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== 0x04034b50) fail("zip-bad-local-header");
     if (view.getUint32(localOffset + 14, true) !== crc || view.getUint32(localOffset + 18, true) !== size) fail("zip-header-mismatch");
-    const dataStart = localOffset + 30 + view.getUint16(localOffset + 26, true) + view.getUint16(localOffset + 28, true);
+    const localNameLength = view.getUint16(localOffset + 26, true);
+    const centralName = bytes.subarray(at + 46, at + 46 + nameLength), localName = bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength);
+    if (localNameLength !== nameLength || localName.some((b, i) => b !== centralName[i])) fail("zip-header-mismatch");
+    const dataStart = localOffset + 30 + localNameLength + view.getUint16(localOffset + 28, true);
     if (dataStart + size > centralOffset) fail("zip-truncated-entry");
     const data = bytes.subarray(dataStart, dataStart + size);
     if (crc32(data) !== crc) fail("zip-crc-mismatch");
