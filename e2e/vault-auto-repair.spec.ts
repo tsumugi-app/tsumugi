@@ -219,7 +219,15 @@ test.describe("the app (Settings 修復する)", () => {
     await page.getByRole("button", { name: "tsumugiを開く" }).click();
     await page.getByRole("navigation", { name: "メインナビゲーション" }).getByRole("button", { name: "設定" }).click();
   }
-  const screen = (page: Page) => page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 2000));
+  const screen = (page: Page) => page.evaluate(async () => {
+    const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const rows: any[] = await new Promise((res, rej) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+    db.close();
+    const outbox = rows.map((e) => `${e.id}:${e.status}:${e.heldReason ?? ""}`);
+    const root = await navigator.storage.getDirectory(); const md: string[] = [];
+    try { const dir = await root.getDirectoryHandle("Memories"); for await (const [n, h] of (dir as any).entries()) md.push(`${n}=${(await (await h.getFile()).text()).length}`); } catch { md.push("no Memories"); }
+    return `${document.body.innerText.replace(/\s+/g, " ").slice(0, 1200)} | outbox=${JSON.stringify(outbox)} | memories=${md.join(",")}`;
+  });
 
   for (const device of ["PC", "Android"] as const) {
     test.describe(device, () => {
