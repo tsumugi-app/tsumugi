@@ -163,8 +163,9 @@ export class ZipFormatError extends Error {
 /**
  * createZipBytesが作る形式（store方式・ZIP64なし・データ記述子なし）のZIPを厳密に読む（バックアップの読み戻し検証用）。
  * 終端レコード（件数・位置・コメント長）、セントラルディレクトリを最後まで読み切ったこと、各エントリのローカルヘッダとセントラルヘッダの
- * 一致（方式・フラグ・CRC・大きさ・名前）、エントリが隙間・重なりなく並んでいること、CRC32を確かめ、どれかが合わなければ
- * ZipFormatErrorを投げる（途中まで読めた結果は返さない）。
+ * 一致（方式・フラグ・時刻・CRC・大きさ・名前）、createZipBytesが常に0・固定値で書く欄（version・extra・コメント・ディスク番号・属性）が
+ * そのとおりであること、エントリが隙間・重なりなく並んでいること、CRC32を確かめ、どれかが合わなければZipFormatErrorを投げる
+ * （途中まで読めた結果は返さない。読むのは自分で作ったバックアップだけなので、他のZIPツールの形式は受け付けない）。
  */
 export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Array }[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -190,9 +191,12 @@ export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Ar
     const method = view.getUint16(at + 10, true);
     const crc = view.getUint32(at + 16, true);
     const size = view.getUint32(at + 20, true);
-    if ((flags & ~UTF8_FLAG) !== 0 || method !== STORE_METHOD || view.getUint32(at + 24, true) !== size) fail("zip-unsupported-entry");
+    if (flags !== UTF8_FLAG || method !== STORE_METHOD || view.getUint32(at + 24, true) !== size) fail("zip-unsupported-entry");
+    // version made by / needed, extra・コメントの長さ、開始ディスク、内部・外部属性：createZipBytesは常にこの値で書く
+    if (view.getUint16(at + 4, true) !== VERSION || view.getUint16(at + 6, true) !== VERSION || view.getUint16(at + 30, true) !== 0 || view.getUint16(at + 32, true) !== 0
+      || view.getUint16(at + 34, true) !== 0 || view.getUint16(at + 36, true) !== 0 || view.getUint32(at + 38, true) !== 0) fail("zip-unsupported-entry");
     const nameLength = view.getUint16(at + 28, true);
-    const next = at + 46 + nameLength + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
+    const next = at + 46 + nameLength;
     if (next > eocd) fail("zip-bad-central-entry");
     const localOffset = view.getUint32(at + 42, true);
     let path = "";
@@ -200,12 +204,14 @@ export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Ar
     if (seen.has(path)) fail("zip-duplicate-entry");
     seen.add(path);
     if (localOffset !== nextLocal || localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== 0x04034b50) fail("zip-bad-local-header");
-    if (view.getUint16(localOffset + 6, true) !== flags || view.getUint16(localOffset + 8, true) !== method || view.getUint32(localOffset + 14, true) !== crc
-      || view.getUint32(localOffset + 18, true) !== size || view.getUint32(localOffset + 22, true) !== size) fail("zip-header-mismatch");
+    if (view.getUint16(localOffset + 4, true) !== VERSION || view.getUint16(localOffset + 6, true) !== flags || view.getUint16(localOffset + 8, true) !== method
+      || view.getUint16(localOffset + 10, true) !== view.getUint16(at + 12, true) || view.getUint16(localOffset + 12, true) !== view.getUint16(at + 14, true)
+      || view.getUint32(localOffset + 14, true) !== crc || view.getUint32(localOffset + 18, true) !== size || view.getUint32(localOffset + 22, true) !== size
+      || view.getUint16(localOffset + 28, true) !== 0) fail("zip-header-mismatch");
     const localNameLength = view.getUint16(localOffset + 26, true);
     const centralName = bytes.subarray(at + 46, at + 46 + nameLength), localName = bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength);
     if (localNameLength !== nameLength || localName.some((b, i) => b !== centralName[i])) fail("zip-header-mismatch");
-    const dataStart = localOffset + 30 + localNameLength + view.getUint16(localOffset + 28, true);
+    const dataStart = localOffset + 30 + localNameLength;
     if (dataStart + size > centralOffset) fail("zip-truncated-entry");
     const data = bytes.subarray(dataStart, dataStart + size);
     if (crc32(data) !== crc) fail("zip-crc-mismatch");

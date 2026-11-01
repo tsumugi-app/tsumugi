@@ -174,6 +174,12 @@ test("ZIP: binary-exact round trip with Japanese names; a flipped byte is caught
   assert.throws(() => zip.readZipEntries(deflate), (e: Error) => e instanceof zip.ZipFormatError && e.code === "zip-header-mismatch");
   const padded = new Uint8Array(z.length + 3); padded.set(z.subarray(0, eocd)); padded.set(z.subarray(eocd), eocd + 3);   // stray bytes before the end record
   assert.throws(() => zip.readZipEntries(padded), (e: Error) => e instanceof zip.ZipFormatError);
+  // any header field the writer always sets to a fixed value (Codex review of 5fc02ec: the central entry's start disk), central or local
+  const central = new DataView(z.buffer).getUint32(eocd + 16, true);
+  for (const [at, label] of [[central + 34, "start disk"], [central + 36, "internal attributes"], [central + 38, "external attributes"], [central + 4, "version made by"], [central + 30, "extra length"], [4, "local version"], [10, "local time"], [28, "local extra length"]] as const) {
+    const bad = z.slice(); bad[at] ^= 0x01;
+    assert.throws(() => zip.readZipEntries(bad), (e: Error) => e instanceof zip.ZipFormatError, label);
+  }
   assert.deepEqual(zip.readZipEntries(zip.createZipBytes([])), []);
 });
 
