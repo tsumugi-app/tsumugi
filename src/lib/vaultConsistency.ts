@@ -35,6 +35,8 @@ export interface ConsistencyPlanLike {
     records: readonly {
       recordType: string;
       recordId: string;
+      /** 記録の日付（Memoryのday-fileの日）。 */
+      date?: string;
       classification: string;
       reasons: readonly string[];
       syncState: { savedUpdatedAt: string | null; matchesLocal: boolean | null };
@@ -57,7 +59,7 @@ export type ConsistencyCategory = "saving" | "repairable" | "repairLater" | "nee
 export const CONSISTENCY_CATEGORIES: readonly ConsistencyCategory[] = ["saving", "repairable", "repairLater", "needsChoice", "retryable", "unknown"];
 
 export type ConsistencyReason =
-  | "save-pending" | "save-retrying" | "read-error" | "read-during-save" | "record-changed"
+  | "save-pending" | "shared-save-pending" | "save-retrying" | "read-error" | "read-during-save" | "record-changed"
   | "local-only" | "metadata"
   | "day-file-merge" | "registry-mismatch" | "save-held"
   | "different-content" | "multiple-copies"
@@ -186,12 +188,32 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     findings.push(f);
   };
   const stateOf = (type: string, id: string) => saveStateOf(recordOf(type, id), type, id, ob, oa, before.ledger, after.ledger);
+  /**
+   * 同じday-fileの他のMemoryの保存が進行中（保存待ちのOutbox entryがある）日。day-fileとその日のHistory行は同じ日の
+   * Memoryで共有され、保存（projection）はMarkdownを書いてから管理情報を更新し、Outboxの進行は最後にだけ記録する。
+   * そのため保存中のMemory Bの書きかけの共有ファイルが、保存済みのMemory Aの差分として見えることがある（走査の前後で
+   * Outboxも変わらない）。この間は、A自身の保存が完了していても確定した不整合とは断定せず「保存待ち」とする（記録されず、
+   * 後で確認し直す）。別の日の記録は対象にしない（無関係な保存待ちで、真正の不整合を隠さない）。
+   */
+  const savingDays = new Set<string>();
+  for (const e of [...before.outbox, ...after.outbox]) {
+    if (e.status !== "pending" || (e.attempts >= STALLED_SAVE_ATTEMPTS && e.lastError)) continue;
+    const sep = e.id.indexOf(":"), type = e.id.slice(0, sep);
+    if (type !== "memory" && type !== "reflection") continue;
+    const day = recordOf("memory", e.id.slice(sep + 1))?.date?.slice(0, 10);
+    if (day) savingDays.add(day);
+  }
+  const sharesSavingDayFile = (type: ConsistencyRecordType, id: string) => {
+    const day = type === "memory" ? recordOf("memory", id)?.date?.slice(0, 10) : undefined;
+    return !!day && savingDays.has(day);
+  };
   /** 保存の状態が「保存中」等なら、その分類を優先する（保存待ちの記録を不整合と数えない）。 */
   const bySave = (s: SaveState, type: ConsistencyRecordType, id: string): ConsistencyFinding | null =>
     s === "saving" ? { category: "saving", reason: "save-pending", recordType: type, recordId: id }
       : s === "retrying" ? { category: "retryable", reason: "save-retrying", recordType: type, recordId: id }
         : s === "held" ? { category: "repairLater", reason: "save-held", recordType: type, recordId: id }
-          : null;
+          : sharesSavingDayFile(type, id) ? { category: "saving", reason: "shared-save-pending", recordType: type, recordId: id }
+            : null;
 
   // 既存の復旧（applyRecovery）で直せる記録：保存先に無い記録の書き出し、管理情報の更新
   for (const op of plan.ops) {

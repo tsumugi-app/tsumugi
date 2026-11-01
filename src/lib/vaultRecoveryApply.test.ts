@@ -3278,6 +3278,10 @@ test("a Memory saved normally (Outbox) with a time-of-day date is clean whether 
   const rawPlan = await applyMod.planRecoveryApply(makeEnv(db, vault));
   assert.equal(rawPlan.held.filter((h) => h.recordId === m.id).length, 0, "a time-of-day date in the row is not a difference either");
   assert.equal(consistency.classifyConsistency(rawPlan, progress, progress).state, "clean");
+  // another time on the same day is a real difference (History shows a row by its timestamp's JST date: 18:42Z is the next day)
+  const moved = JSON.parse(vault.get(hp)!); moved.days["2025-06-14"].normalMemories[0].date = "2025-06-14T18:42:10.000Z"; vault.put(hp, JSON.stringify(moved));
+  const movedPlan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.ok(movedPlan.held.some((h) => h.recordId === m.id && h.reason === "history-row-differs"), "only the canonical timestamp or its day-normalized form is accepted");
   // a row with a different day is still a genuine difference
   const hist = JSON.parse(vault.get(hp)!); hist.days["2025-06-14"].normalMemories[0].date = "2025-06-13T00:00:00.000Z"; vault.put(hp, JSON.stringify(hist));
   const tampered = await applyMod.planRecoveryApply(makeEnv(db, vault));

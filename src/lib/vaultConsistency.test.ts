@@ -298,3 +298,18 @@ test("設定画面：要確認では種類・件数・理由と「もう一度�
   for (const text of ["RecoveryMemoryDiagnosticPanel", "古い記録を整理する", "onRunRecoveryDryRun", "onExecuteRecoveryApply", "検証済み10件"]) assert.ok(!user.includes(text), text);
   assert.ok(settings.includes('vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView)'), "「✓ 最新の状態です」 only when the check is clean");
 });
+
+test("同じday-fileの別のMemoryが保存中の間は、保存済みのMemoryの差分も確定した異常にしない（別の日の保存中では隠さない）", () => {
+  const records = [rec("memory", "a", "equivalent-existing", { date: "2026-10-20T09:00:00.000Z" }), rec("memory", "b", "local-only-safe", { date: "2026-10-20T11:00:00.000Z" }), rec("memory", "c", "local-only-safe", { date: "2026-10-21T11:00:00.000Z" })];
+  const held = [{ recordType: "memory", recordId: "a", reason: "history-row-differs" }];
+  const sameDay = progress([entry("memory:a", "done"), entry("memory:b", "pending")]);
+  const r = classifyConsistency(plan({ records, held }), sameDay, sameDay);
+  assert.deepEqual(r.findings.map((f) => `${f.recordId}:${f.category}:${f.reason}`).sort(), ["a:saving:shared-save-pending", "b:saving:save-pending"]);
+  assert.equal(r.state, "saving");
+  const otherDay = progress([entry("memory:a", "done"), entry("memory:c", "pending")]);
+  const o = classifyConsistency(plan({ records, held }), otherDay, otherDay);
+  assert.equal(o.findings.find((f) => f.recordId === "a")?.category, "unknown", "a save on another day does not hide a genuine difference");
+  assert.equal(o.state, "attention");
+  const stalled = progress([entry("memory:a", "done"), entry("memory:b", "pending", { attempts: STALLED_SAVE_ATTEMPTS, lastError: "x" })]);
+  assert.equal(classifyConsistency(plan({ records, held }), stalled, stalled).findings.find((f) => f.recordId === "a")?.category, "unknown", "a stalled save does not hide it either");
+});

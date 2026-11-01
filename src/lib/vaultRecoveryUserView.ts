@@ -32,6 +32,7 @@ export const CATEGORY_TEXT: Record<ConsistencyCategory, { title: string; note: s
 
 export const REASON_TEXT: Record<ConsistencyReason, string> = {
   "save-pending": "保存先への保存を待っています",
+  "shared-save-pending": "同じ保存先のファイルに保存中の記録があるため、保存が終わってから確認します",
   "save-retrying": "保存先への保存に失敗し、自動で再試行しています",
   "read-error": "保存先のファイルを一時的に読めませんでした",
   "read-during-save": "保存中だったため、ファイルの内容を確認できませんでした",
