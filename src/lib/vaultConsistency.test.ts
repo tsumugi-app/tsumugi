@@ -124,11 +124,12 @@ test("分類：自動で直せる／対応待ち／確認が必要／再試行�
   const by = Object.fromEntries(r.findings.map((f) => [f.recordId ?? "-", `${f.category}/${f.reason}`]));
   assert.deepEqual(by, {
     c1: "repairable/local-only", m1: "repairable/metadata",
-    m2: "repairLater/day-file-merge", s1: "repairLater/registry-mismatch",
+    m2: "repairable/day-file-merge", s1: "repairLater/registry-mismatch",
     m3: "needsChoice/multiple-copies", m4: "unknown/trace-without-file", r1: "unknown/invalid-local",
     c2: "retryable/save-retrying", m5: "repairLater/save-held",
   });
   assert.deepEqual(r.repairableIds.sort(), ["c1", "m1"]);
+  assert.deepEqual(r.repairTargets.map((t) => `${t.action}:${t.recordType}:${t.recordId}`).sort(), ["apply:conversation:c1", "apply:memory:m1", "resave:memory:m2"]);
   assert.equal(r.state, "attention");
   const view = deriveRecoveryUserView({ kind: "plan" }, r);
   assert.ok(view.kind === "attention" && view.canRepair, "the 修復する button appears only because repairable records exist");
@@ -269,7 +270,7 @@ test("通常の「修復する」は限定修復を新しく実行しない：�
   assert.ok(handler.length > 100);
   assert.ok(!/runNarrowRepairForUser|runExplicitMemoryRepair|executeNarrowMemoryRepair|runNarrowRepairPreflight/.test(handler), "no new narrow repair from the normal button");
   assert.ok(handler.includes("resumeNarrowRepairForUser(vaultHandle)") && handler.includes('recoveryStatus.kind === "interrupted"'));
-  assert.ok(handler.includes("report.repairableIds.length === 0") && handler.includes("recordIds: report.repairableIds"), "only the records the current version can repair");
+  assert.ok(handler.includes("report.repairTargets.length === 0") && handler.includes("runProductionVaultAutoRepair("), "only the records the current version can repair (through the backed-up auto repair)");
   const narrow = strip(fs.readFileSync("src/lib/memoryNarrowRepair.ts", "utf8"));
   const resume = narrow.slice(narrow.indexOf("export async function resumeNarrowRepairForUser"), narrow.indexOf("export async function runRawHeldMemoryDiagnostic"));
   assert.ok(resume.includes('if (!resuming) return { status: "not-repairable" };') && resume.includes("executeNarrowMemoryRepair(env, null)") && !resume.includes("runNarrowRepairPreflight"), "resume only");
@@ -329,4 +330,23 @@ test("History月ファイルの集計の差分：同じ月の保存中なら保�
   const historyOp = [{ kind: "repair", members: [{ id: "a", recordType: "memory" }], steps: { markdown: "not-needed", registry: "not-needed", index: "not-needed", history: "pending", ledger: "not-needed" } }];
   assert.equal(classifyConsistency(plan({ records, ops: historyOp }), otherMonth, otherMonth).findings.find((f) => f.recordId === "a")?.category, "saving");
   assert.equal(classifyConsistency(plan({ records, ops: historyOp }), done, done).findings.find((f) => f.recordId === "a")?.category, "repairable");
+});
+
+test("保存が保留された記録：理由の形だけで分ける（読めなかった→保存のやり直し、内容が違う→確認が必要、それ以外→自動では直さない）", () => {
+  const records = ["m1", "m2", "m3", "m4"].map((id) => rec("memory", id, "conflict"));
+  const held = records.map((r) => ({ recordType: "memory", recordId: r.recordId, reason: "conflict" }));
+  const p = progress([
+    entry("memory:m1", "held", { heldReason: "memory-dayfile-unreadable" }),
+    entry("reflection:m2", "held", { heldReason: "registry-unreadable" }),
+    entry("memory:m3", "held", { heldReason: "memory-member-conflict" }),
+    entry("memory:m4", "held", { heldReason: "vault-identity-mismatch" }),
+  ]);
+  const r = classifyConsistency(plan({ records, held }), p, p);
+  const by = Object.fromEntries(r.findings.map((f) => [f.recordId ?? "-", `${f.category}/${f.reason}/${f.action ?? "-"}`]));
+  assert.deepEqual(by, { m1: "repairable/save-held/resave", m2: "repairable/save-held/resave", m3: "needsChoice/different-content/-", m4: "repairLater/save-held/-" });
+  assert.deepEqual(r.repairTargets, [
+    { action: "resave", reason: "save-held", recordType: "memory", recordId: "m1" },
+    { action: "resave", reason: "save-held", recordType: "reflection", recordId: "m2" },
+  ], "the Outbox type (reflection) is kept so that the right entry is re-queued");
+  assert.deepEqual(r.repairableIds, [], "resave targets never go to the Recovery Apply");
 });

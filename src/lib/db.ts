@@ -1266,9 +1266,45 @@ export async function readVaultSaveProgress(): Promise<import("./vaultConsistenc
   const ledger: Record<string, string> = {};
   keys.forEach((key, i) => { if (typeof values[i] === "string") ledger[String(key)] = values[i] as string; });
   return {
-    outbox: (entries as VaultOutboxEntry[]).map((e) => ({ id: e.id, status: e.status, recordUpdatedAt: e.recordUpdatedAt, attempts: e.attempt?.count ?? 0, lastError: e.attempt?.lastError ?? null, updatedAt: e.updatedAt })),
+    outbox: (entries as VaultOutboxEntry[]).map((e) => ({ id: e.id, status: e.status, recordUpdatedAt: e.recordUpdatedAt, attempts: e.attempt?.count ?? 0, lastError: e.attempt?.lastError ?? null, updatedAt: e.updatedAt, heldReason: e.heldReason ?? null })),
     ledger,
   };
+}
+
+/**
+ * 自動修復（保存先の汎用修復 段階3）の「もう一度保存する」。記録そのものは一切変えず、その記録の今の版をOutboxの保存待ち（pending）にするだけ
+ * （以後は通常の保存処理が、通常どおりの確認をしてから保存先へ書く）。1つのtransactionで、次のどれかなら何も書かない：
+ *   記録が無い（`record-missing`）／削除済み（`tombstoned`）／確認した版から変わった（`changed`：確認後に別タブ等で更新された）／
+ *   修復・Recoveryのjournalが進行中（例外）。既にその版で保存待ちなら何も書かない（`already-pending`）。同じ版で何度呼んでも結果は同じ（冪等）。
+ */
+export async function requeueRecordForVault(
+  recordType: "conversation" | "memory" | "reflection" | "source", recordId: string, expectedUpdatedAt: string, now: string = new Date().toISOString()
+): Promise<"queued" | "already-pending" | "record-missing" | "tombstoned" | "changed"> {
+  const db = await getDB();
+  const store = recordType === "conversation" ? "conversations" : recordType === "source" ? "sources" : "memoryObjects";
+  const tx = db.transaction([store, "vaultOutbox", "settings"], "readwrite");
+  let result: "queued" | "already-pending" | "record-missing" | "tombstoned" | "changed" = "record-missing";
+  try {
+    await assertNoPendingRecoveryInTx(tx);
+    const rec = (await tx.objectStore(store).get(recordId)) as { id: string; updatedAt: string; conversationId?: string | null } | undefined;
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (!rec) result = "record-missing";
+    else if (recordType === "conversation" ? blockedByTombstone(tombs, "conversation", recordId) : recordType === "source" ? false : memoryBlocked(tombs, rec)) result = "tombstoned";
+    else if (rec.updatedAt !== expectedUpdatedAt) result = "changed";
+    else {
+      const outbox = tx.objectStore("vaultOutbox");
+      const id = vaultOutboxIdFor(recordType, recordId);
+      const existing = (await outbox.get(id)) as VaultOutboxEntry | undefined;
+      if (existing && existing.status === "pending" && existing.recordUpdatedAt === rec.updatedAt) result = "already-pending";
+      else {
+        const fresh = buildOutboxEntryForUpdate(undefined, recordType, recordId, rec.updatedAt, now);
+        await outbox.put({ ...fresh, createdAt: existing?.createdAt ?? now });
+        result = "queued";
+      }
+    }
+  } catch (error) { await abortAndSettleTransaction(tx, error); }
+  await tx.done;
+  return result;
 }
 
 /** バックアップの対象にするIndexedDBのstore（`handles`は保存先フォルダのhandleで、JSONにできないため名前だけを残す）。 */

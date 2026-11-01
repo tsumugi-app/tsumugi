@@ -216,7 +216,8 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   const heads = [...src.matchAll(/^(?:export )?(?:async )?function (\w+)/gm)].map((m) => ({ name: m[1], at: m.index! }));
   const reviewed = new Set(["updateMemoryRevisitPrompt", "addMemoryLinkDurably", "commitMemoryLinkRestoration", "commitMaintenanceRestore", "putMemoryProjectionOutcome", "markMemoryProjectionSynced",
     "writeProductionMigrationStateRaw", "deleteSource", "addMemoryObjectIfAbsentAndMarkSynced", "importMissingRecordsIfAbsent", "restoreIfNotNewer",
-    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "cleanReferencesToMissingMemoryInTx", "withoutDeletedLinksInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below
+    "deleteMemoryByUser", "deleteConversationByUser", "deleteConversationWithMemoriesByUser", "listOutboxNeedingAttention", "acceptOutboxDivergence", "removeOrphanOutboxEntry", "removeMemoryInTx", "sanitizeTombstonedLinksInTx", "cleanReferencesToMissingMemoryInTx", "withoutDeletedLinksInTx", "sanitizeTombstonedMemoryRefsInTx", "sanitizeIncoming", "removeConversationInTx", "deleteAcceptedDivergenceInTx", "putConversation",
+    "requeueRecordForVault"]);   // restoreIfNotNewer is generic: its Memory wrapper is asserted below. requeueRecordForVault (auto repair) only reads the record and writes its Outbox entry
   const missing: string[] = [];
   // New deletion wrapper only removes records and cleans stored references. It must never
   // become a replacement writer or accept a child owned by a different conversation.
@@ -227,6 +228,10 @@ test("every db.ts function that writes the Memory store applies the lineage inva
   assert.ok(deletionBody.includes('await removeMemoryInTx('));
   assert.ok(!/objectStore\("memoryObjects"\)\.(put|add)\(/.test(deletionBody));
   reviewed.add("beginPhysicalDeletion");
+  // The auto repair's requeue never writes the Memory store (it reads the record and writes only the Outbox entry)
+  const requeueStart = heads.find((h) => h.name === "requeueRecordForVault")!;
+  const requeueBody = src.slice(requeueStart.at, heads.find((h) => h.at > requeueStart.at)!.at);
+  assert.ok(!/objectStore\(store\)\.(put|add|delete)\(/.test(requeueBody) && /outbox\.put\(/.test(requeueBody));
   heads.forEach((h, i) => {
     const body = src.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : src.length);
     if (!/memoryObjects/.test(body) || !/\.(put|add|delete)\(/.test(body)) return;

@@ -17,11 +17,13 @@ import * as recovery from "../../src/lib/maintenance/crashRecovery";
 import * as consistencyCheck from "../../src/lib/vaultConsistencyCheck";
 import * as backup from "../../src/lib/vaultBackup";
 import * as zip from "../../src/lib/zip";
+import * as autoRepair from "../../src/lib/vaultAutoRepair";
+import * as autoRepairRun from "../../src/lib/vaultAutoRepairRun";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const NOW = "2026-10-10T00:00:00.000Z";
 const g = globalThis as any;
-g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap, proj, lockMod, consistencyCheck, backup, zip };
+g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap, proj, lockMod, consistencyCheck, backup, zip, autoRepair, autoRepairRun };
 let DATA: any, vaultRoot: any, backupRoot: any;
 
 async function dirAt(name: string) {

@@ -122,6 +122,8 @@ import { deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
 import { resumeNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
 import { productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import { checkVaultConsistency } from "@/lib/vaultConsistencyCheck";
+import { runProductionVaultAutoRepair } from "@/lib/vaultAutoRepairRun";
+import type { AutoRepairOutcome } from "@/lib/vaultAutoRepair";
 import type { ConsistencyReport } from "@/lib/vaultConsistency";
 import {
   VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
@@ -803,6 +805,7 @@ export default function ChatScreen() {
   const [recoveryChecking, setRecoveryChecking] = useState(false);
   /** 直近の確定した（または保存中で未確定の）整合性確認の結果。種類・件数・理由の表示と、「修復する」の対象に使う。 */
   const [consistencyReport, setConsistencyReport] = useState<ConsistencyReport | null>(null);
+  const [autoRepairOutcome, setAutoRepairOutcome] = useState<AutoRepairOutcome | null>(null);
   /** 保存待ち・未確定のときに自動で確認し直した回数（有限回）。 */
   const recoveryRecheckCountRef = useRef(0);
   /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
@@ -1447,6 +1450,7 @@ export default function ChatScreen() {
     setRecoveryDetectionFailed(false);
     setRecoveryChecking(false);
     setConsistencyReport(null);
+    setAutoRepairOutcome(null);
     recoveryRecheckCountRef.current = 0;
     setLegacyHeldCleanupStatus({ kind: "idle" });
     setVaultMeasure(null);
@@ -3619,11 +3623,10 @@ export default function ChatScreen() {
   }
 
   /**
-   * 通常ユーザー向けの「修復する」。今のバージョンで安全に直せる記録（確認の結果の`repairableIds`：保存先に無い記録の書き出し・
-   * 管理情報の更新。保存待ちの記録は含まない）だけを、既存の「復旧する」（applyRecovery）で直す。直せる記録が無ければ何も実行しない
-   * （直せない状態で長時間の処理を走らせない）。2026-10-03の事例専用の限定修復は、ここからは新しく実行しない：途中で止まった
-   * 限定修復の続きを完了することだけを行う（未完了のjournalは保存先への書き込みを止めているため）。
-   * どちらの場合も、終わったら確認し直し、「最新」とは断定しない。
+   * 通常ユーザー向けの「修復する」。確認の結果の`repairTargets`（今のバージョンで規則により安全に直せる記録）だけを、自動修復
+   * （vaultAutoRepair.ts：バックアップ→直前の再照合→排他区間での修復→通常の保存→もう一度確認）で直す。直せる記録が無ければ何も実行しない。
+   * 2026-10-03の事例専用の限定修復は、ここからは新しく実行しない：途中で止まった限定修復の続きを完了することだけを行う。
+   * 表示はもう一度確認した結果だけに基づき、問題が残っていれば「最新」とは言わない。
    */
   async function handleUserRepair() {
     if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
@@ -3656,8 +3659,37 @@ export default function ChatScreen() {
       return;
     }
     const report = consistencyReport;
-    if (!report || report.repairableIds.length === 0 || recoveryStatus.kind !== "plan") return;
-    await handleExecuteRecoveryApply({ confirmed: { world: recoveryStatus.applyPlan.confirmed.world, recordIds: report.repairableIds } });
+    if (!report || report.repairTargets.length === 0) return;
+    const handle = vaultHandle;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setAutoRepairOutcome(null);
+    setRecoveryStatus({ kind: "executing" });
+    try {
+      const outcome = await runProductionVaultAutoRepair({
+        root: handle,
+        backend: getVaultBackend() ?? "unknown",
+        isCancelled: () => generation !== vaultGenerationRef.current,
+      });
+      if (generation !== vaultGenerationRef.current) return;
+      setAutoRepairOutcome(outcome);
+      if (outcome.after) setConsistencyReport(outcome.after);
+      setRecoveryStatus(outcome.after?.state === "clean" ? { kind: "clean" } : { kind: "idle" });
+      if (outcome.kind === "ran") {
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        runVaultLightCheckInBackground(handle);
+        bumpHistoryRefreshToken();
+      }
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) { setRecoveryStatus({ kind: "idle" }); return; }
+      console.error("[Tsumugi] auto repair failed", error);
+      setRecoveryStatus({ kind: "error", message: "修復を完了できませんでした。データは保持しています。もう一度「修復する」を押すと、同じ規則で確認し直します。" });
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
   }
 
   /**
@@ -5833,6 +5865,7 @@ export default function ChatScreen() {
             onExecuteRecoveryApply={() => void handleExecuteRecoveryApply()}
             recoveryUserView={deriveRecoveryUserView(recoveryStatus, consistencyReport, { detectionFailed: recoveryDetectionFailed, checking: recoveryChecking })}
             onUserRepair={() => void handleUserRepair()}
+            autoRepairOutcome={autoRepairOutcome}
             onRecheckRecovery={handleRecheckRecovery}
             legacyHeldCleanupStatus={legacyHeldCleanupStatus}
             onRunLegacyHeldCleanup={() => void handleRunLegacyHeldCleanup()}
