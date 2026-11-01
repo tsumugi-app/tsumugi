@@ -291,15 +291,20 @@ async function inspectIndex(env: RecoveryApplyEnv, op: RecoveryJournalOp): Promi
 }
 
 /**
- * History rowの`date`は、旧経路（vault.ts）がcanonicalの値をそのまま、Outboxの保存経路（vaultProjection.ts
- * `decideAndProjectMemoryHistory`）が同じ日の`T00:00:00.000Z`へ正規化して書く。どちらも正しい行なので両方を一致とみなす
- * （日付が違う行は従来どおり不一致）。これが無いと、時刻付きの`date`を持つ通常保存済みのMemoryがすべて
- * `history-row-differs`で保留になる。
+ * History rowの`date`は、旧経路（vault.ts）・bootstrapがcanonicalの値（時刻付きのことがある）をそのまま、Outboxの保存経路
+ * （vaultProjection.ts `decideAndProjectMemoryHistory`）が同じ日の`T00:00:00.000Z`へ正規化して書く。一方、比較の期待値は
+ * day-fileから読んだmember（Markdownには日付部分だけが書かれるため、読むと`T00:00:00.000Z`）のことも、canonicalのことも
+ * ある。同じ日で、どちらかが正規化された値なら一致とみなす（日付が違う行・同じ日の別の時刻どうしは従来どおり不一致）。
+ * これが無いと、時刻付きの`date`を持つ通常保存済みのMemoryがすべて`history-row-differs`で保留になる。
  */
+function historyDateEquals(existing: unknown, expected: unknown): boolean {
+  if (existing === undefined || existing === expected) return true;
+  if (typeof existing !== "string" || typeof expected !== "string" || existing.slice(0, 10) !== expected.slice(0, 10)) return false;
+  const normalized = `${expected.slice(0, 10)}T00:00:00.000Z`;
+  return existing === normalized || expected === normalized;
+}
 function rowEquals(existing: unknown, expected: Obj): boolean {
-  return isObj(existing) && Object.entries(expected).every(([k, v]) => k === "date"
-    ? existing.date === undefined || existing.date === v || (typeof v === "string" && existing.date === `${v.slice(0, 10)}T00:00:00.000Z`)
-    : JSON.stringify(existing[k]) === JSON.stringify(v));
+  return isObj(existing) && Object.entries(expected).every(([k, v]) => k === "date" ? historyDateEquals(existing.date, v) : JSON.stringify(existing[k]) === JSON.stringify(v));
 }
 
 /**

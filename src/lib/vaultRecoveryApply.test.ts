@@ -3257,7 +3257,7 @@ test("DryRun D2 (keep last): once the rule version is recorded, a held outbox is
   assert.equal(report.heldReevaluation.alreadyDone, true); assert.equal(report.notReachedBreakdown.byReason["outbox:existing-held-outbox"], 1); assert.equal(report.notReachedBreakdown.byType.memory, 1);
 });
 
-test("a Memory saved normally (Outbox) with a time-of-day date is clean: the History row's day-normalized date is the projection's own format, not a difference; another day still differs", async () => {
+test("a Memory saved normally (Outbox) with a time-of-day date is clean whether its History row holds the day-normalized (projection) or the time-of-day (bootstrap) date; another day still differs", async () => {
   const db = new FakeDb(), vault = new FakeVault();
   const m = memory(`mt-${uid()}`, { date: "2025-06-14T15:42:10.000Z", createdAt: "2025-06-14T15:42:10.000Z", updatedAt: "2025-06-14T15:42:10.000Z" });
   db.memories.set(m.id, m); await repairDb.putMemoryObject(m);
@@ -3273,6 +3273,11 @@ test("a Memory saved normally (Outbox) with a time-of-day date is clean: the His
   const progress = { outbox: all.outbox.filter((e) => e.id === `memory:${m.id}`), ledger: {} };   // the shared fake IndexedDB also holds other tests' entries
   assert.equal(progress.outbox[0]?.status, "done");
   assert.equal(consistency.classifyConsistency(plan, progress, progress).state, "clean");
+  // the startup bootstrap / legacy writer stores the canonical, time-of-day date in the same row: also the same row
+  const raw = JSON.parse(vault.get(hp)!); raw.days["2025-06-14"].normalMemories[0].date = m.date; vault.put(hp, JSON.stringify(raw));
+  const rawPlan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  assert.equal(rawPlan.held.filter((h) => h.recordId === m.id).length, 0, "a time-of-day date in the row is not a difference either");
+  assert.equal(consistency.classifyConsistency(rawPlan, progress, progress).state, "clean");
   // a row with a different day is still a genuine difference
   const hist = JSON.parse(vault.get(hp)!); hist.days["2025-06-14"].normalMemories[0].date = "2025-06-13T00:00:00.000Z"; vault.put(hp, JSON.stringify(hist));
   const tampered = await applyMod.planRecoveryApply(makeEnv(db, vault));
