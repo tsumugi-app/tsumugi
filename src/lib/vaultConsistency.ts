@@ -189,30 +189,40 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
   };
   const stateOf = (type: string, id: string) => saveStateOf(recordOf(type, id), type, id, ob, oa, before.ledger, after.ledger);
   /**
-   * 同じday-fileの他のMemoryの保存が進行中（保存待ちのOutbox entryがある）日。day-fileとその日のHistory行は同じ日の
-   * Memoryで共有され、保存（projection）はMarkdownを書いてから管理情報を更新し、Outboxの進行は最後にだけ記録する。
-   * そのため保存中のMemory Bの書きかけの共有ファイルが、保存済みのMemory Aの差分として見えることがある（走査の前後で
-   * Outboxも変わらない）。この間は、A自身の保存が完了していても確定した不整合とは断定せず「保存待ち」とする（記録されず、
-   * 後で確認し直す）。別の日の記録は対象にしない（無関係な保存待ちで、真正の不整合を隠さない）。
+   * 他の記録の保存が進行中（止まっていない保存待ちのOutbox entryがある）間に、共有のファイルを通して見える差分。
+   * 保存（projection）は本体のMarkdownを書いてから管理情報を更新し、Outboxの進行は最後にだけ記録する。そのため保存中の記録Bの
+   * 書きかけの共有ファイルが、保存済みの記録Aの差分として見えることがある（走査の前後でOutboxも変わらない）。共有されるのは：
+   *   - 同じ日のday-fileとその日のHistory行（同じ日のMemory）
+   *   - History月ファイルの集計（history-meta.jsonの月の件数：同じ月の記録）と全体の件数（すべての記録）
+   * （Registry・indexは記録ごとのentryで、他の記録の保存はAのentryを変えない。）この間は、A自身の保存が完了していても
+   * 確定した不整合とは断定せず「保存待ち」とする（記録されず、後で確認し直す）。それ以外の差分（別の日の内容の違い等）は
+   * 隠さない。
    */
-  const savingDays = new Set<string>();
+  const savingDays = new Set<string>(), savingMonths = new Set<string>();
+  let anySaving = false, savingMonthUnknown = false;
   for (const e of [...before.outbox, ...after.outbox]) {
     if (e.status !== "pending" || (e.attempts >= STALLED_SAVE_ATTEMPTS && e.lastError)) continue;
+    anySaving = true;
     const sep = e.id.indexOf(":"), type = e.id.slice(0, sep);
-    if (type !== "memory" && type !== "reflection") continue;
-    const day = recordOf("memory", e.id.slice(sep + 1))?.date?.slice(0, 10);
-    if (day) savingDays.add(day);
+    const date = recordOf(type, e.id.slice(sep + 1))?.date;
+    if (!date) { savingMonthUnknown = true; continue; }
+    savingMonths.add(date.slice(0, 7));
+    if (type === "memory" || type === "reflection") savingDays.add(date.slice(0, 10));
   }
-  const sharesSavingDayFile = (type: ConsistencyRecordType, id: string) => {
-    const day = type === "memory" ? recordOf("memory", id)?.date?.slice(0, 10) : undefined;
-    return !!day && savingDays.has(day);
+  const affectedBySharedSave = (type: ConsistencyRecordType, id: string, cause: { heldReason?: string; historyStepNeeded?: boolean }) => {
+    if (!anySaving) return false;
+    const date = recordOf(type, id)?.date;
+    if (type === "memory" && date && savingDays.has(date.slice(0, 10))) return true;
+    if (cause.heldReason === "history-meta-total-mismatch" || cause.historyStepNeeded) return true;
+    if (cause.heldReason === "history-meta-month-mismatch") return savingMonthUnknown || (!!date && savingMonths.has(date.slice(0, 7)));
+    return false;
   };
   /** 保存の状態が「保存中」等なら、その分類を優先する（保存待ちの記録を不整合と数えない）。 */
-  const bySave = (s: SaveState, type: ConsistencyRecordType, id: string): ConsistencyFinding | null =>
+  const bySave = (s: SaveState, type: ConsistencyRecordType, id: string, cause: { heldReason?: string; historyStepNeeded?: boolean } = {}): ConsistencyFinding | null =>
     s === "saving" ? { category: "saving", reason: "save-pending", recordType: type, recordId: id }
       : s === "retrying" ? { category: "retryable", reason: "save-retrying", recordType: type, recordId: id }
         : s === "held" ? { category: "repairLater", reason: "save-held", recordType: type, recordId: id }
-          : sharesSavingDayFile(type, id) ? { category: "saving", reason: "shared-save-pending", recordType: type, recordId: id }
+          : affectedBySharedSave(type, id, cause) ? { category: "saving", reason: "shared-save-pending", recordType: type, recordId: id }
             : null;
 
   // 既存の復旧（applyRecovery）で直せる記録：保存先に無い記録の書き出し、管理情報の更新
@@ -221,7 +231,8 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     for (const m of op.members) {
       const r = recordById.get(m.id);
       const type = asRecordType(r?.recordType ?? "memory");
-      add(bySave(stateOf(type, m.id), type, m.id) ?? { category: "repairable", reason: op.kind === "repair" ? "metadata" : "local-only", recordType: type, recordId: m.id });
+      const historyStepNeeded = op.kind === "repair" && !!op.steps && op.steps.history !== undefined && op.steps.history !== "not-needed";
+      add(bySave(stateOf(type, m.id), type, m.id, { historyStepNeeded }) ?? { category: "repairable", reason: op.kind === "repair" ? "metadata" : "local-only", recordType: type, recordId: m.id });
     }
   }
 
@@ -232,7 +243,7 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     const r = recordOf(h.recordType, h.recordId);
     const own = (r?.reasons ?? []).filter((x) => !GLOBAL_REASONS.has(x));
     if (h.reason === "unreadable-or-indeterminate" && own.length === 0) continue;
-    const save = bySave(stateOf(type, h.recordId), type, h.recordId);
+    const save = bySave(stateOf(type, h.recordId), type, h.recordId, { heldReason: h.reason });
     if (save) { add(save); continue; }
     const base = { recordType: type, recordId: h.recordId };
     if (h.reason === "record-unavailable") add({ ...base, category: "retryable", reason: "record-changed" });

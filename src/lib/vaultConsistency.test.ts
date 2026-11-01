@@ -313,3 +313,20 @@ test("同じday-fileの別のMemoryが保存中の間は、保存済みのMemory
   const stalled = progress([entry("memory:a", "done"), entry("memory:b", "pending", { attempts: STALLED_SAVE_ATTEMPTS, lastError: "x" })]);
   assert.equal(classifyConsistency(plan({ records, held }), stalled, stalled).findings.find((f) => f.recordId === "a")?.category, "unknown", "a stalled save does not hide it either");
 });
+
+test("History月ファイルの集計の差分：同じ月の保存中なら保存待ち（別の日でも）、別の月の保存中では隠さない。全体の件数・Historyの管理情報の更新は保存中なら保存待ち", () => {
+  const records = [rec("memory", "a", "equivalent-existing", { date: "2026-06-14T09:00:00.000Z" }), rec("memory", "b", "local-only-safe", { date: "2026-06-15T09:00:00.000Z" }), rec("memory", "c", "local-only-safe", { date: "2026-07-02T09:00:00.000Z" })];
+  const month = [{ recordType: "memory", recordId: "a", reason: "history-meta-month-mismatch" }];
+  const sameMonth = progress([entry("memory:a", "done"), entry("memory:b", "pending")]);
+  assert.equal(classifyConsistency(plan({ records, held: month }), sameMonth, sameMonth).findings.find((f) => f.recordId === "a")?.reason, "shared-save-pending");
+  const otherMonth = progress([entry("memory:a", "done"), entry("memory:c", "pending")]);
+  const o = classifyConsistency(plan({ records, held: month }), otherMonth, otherMonth);
+  assert.equal(o.findings.find((f) => f.recordId === "a")?.category, "unknown"); assert.equal(o.state, "attention");
+  const total = [{ recordType: "memory", recordId: "a", reason: "history-meta-total-mismatch" }];
+  assert.equal(classifyConsistency(plan({ records, held: total }), otherMonth, otherMonth).findings.find((f) => f.recordId === "a")?.category, "saving");
+  const done = progress([entry("memory:a", "done")]);
+  assert.equal(classifyConsistency(plan({ records, held: total }), done, done).state, "attention", "without any save in progress it is a confirmed difference");
+  const historyOp = [{ kind: "repair", members: [{ id: "a", recordType: "memory" }], steps: { markdown: "not-needed", registry: "not-needed", index: "not-needed", history: "pending", ledger: "not-needed" } }];
+  assert.equal(classifyConsistency(plan({ records, ops: historyOp }), otherMonth, otherMonth).findings.find((f) => f.recordId === "a")?.category, "saving");
+  assert.equal(classifyConsistency(plan({ records, ops: historyOp }), done, done).findings.find((f) => f.recordId === "a")?.category, "repairable");
+});
