@@ -350,3 +350,18 @@ test("保存が保留された記録：理由の形だけで分ける（読め�
   ], "the Outbox type (reflection) is kept so that the right entry is re-queued");
   assert.deepEqual(r.repairableIds, [], "resave targets never go to the Recovery Apply");
 });
+
+test("保存が保留された記録は、走査で差分として見えなくても隠さない（保留が残る間は「最新」にしない）", () => {
+  const p = progress([
+    entry("memory:m1", "done"),
+    entry("memory:m2", "held", { heldReason: "memory-dayfile-unreadable" }),
+    entry("conversation:c3", "held", { heldReason: "markdown-conflict" }),
+  ]);
+  const r = classifyConsistency(plan(), p, p);
+  assert.equal(r.state, "attention");
+  const by = Object.fromEntries(r.findings.map((f) => [f.recordId ?? "-", `${f.category}/${f.reason}/${f.action ?? "-"}`]));
+  assert.deepEqual(by, { m2: "repairable/save-held/resave", c3: "needsChoice/different-content/-" });
+  assert.deepEqual(r.repairTargets, [{ action: "resave", reason: "save-held", recordType: "memory", recordId: "m2" }]);
+  const again = classifyConsistency(plan({ records: [rec("memory", "m2", "conflict")], held: [{ recordType: "memory", recordId: "m2", reason: "conflict" }] }), p, p);
+  assert.equal(again.findings.filter((f) => f.recordId === "m2").length, 1, "counted once when the scan also saw it");
+});

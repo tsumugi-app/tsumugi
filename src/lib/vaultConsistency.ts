@@ -308,6 +308,14 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
       : { category: "saving", reason: "save-pending", recordType: type, recordId: id });
   }
 
+  // 保存処理が保留（held）にしたままの記録も、走査で差分として見えなかったかどうかに関わらず隠さない（保留が残る間は「最新」にしない）
+  for (const e of after.outbox) {
+    if (e.status !== "held") continue;
+    const sep = e.id.indexOf(":");
+    if (sep <= 0) continue;
+    add(heldFinding(asRecordType(e.id.slice(0, sep)), e.id.slice(sep + 1)));
+  }
+
   // ファイル単位の問題（読取・解析）。保存中だった可能性があるうちは「原因未特定」と断定しない
   const savingSeen = !settled || findings.some((f) => f.category === "saving") || hasPendingSaves(before) || hasPendingSaves(after);
   for (const issue of plan.plan.issues) {
