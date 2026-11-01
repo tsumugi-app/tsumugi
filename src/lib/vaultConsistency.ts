@@ -254,7 +254,8 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
   const heldFinding = (type: ConsistencyRecordType, id: string): ConsistencyFinding => {
     const e = heldEntryOf(type, id);
     const kind = heldReasonKind(e?.heldReason);
-    if (kind === "retry" && e) return { category: "repairable", reason: "save-held", recordType: asRecordType(e.id.slice(0, e.id.indexOf(":"))), recordId: id, action: "resave" };
+    // 保存のやり直しは通常のMemoryだけ（書き直しで何も失われないことを確かめられる）。会話・振り返り・資料は1ファイルを丸ごと書き直すため、手で足された内容を確かめられず、自動では直さない
+    if (kind === "retry" && e && e.id.startsWith("memory:")) return { category: "repairable", reason: "save-held", recordType: "memory", recordId: id, action: "resave" };
     if (kind === "conflict") return { category: "needsChoice", reason: "different-content", recordType: type, recordId: id };
     return { category: "repairLater", reason: "save-held", recordType: type, recordId: id };
   };

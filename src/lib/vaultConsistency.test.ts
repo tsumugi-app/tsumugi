@@ -343,11 +343,12 @@ test("保存が保留された記録：理由の形だけで分ける（読め�
   ]);
   const r = classifyConsistency(plan({ records, held }), p, p);
   const by = Object.fromEntries(r.findings.map((f) => [f.recordId ?? "-", `${f.category}/${f.reason}/${f.action ?? "-"}`]));
-  assert.deepEqual(by, { m1: "repairable/save-held/resave", m2: "repairable/save-held/resave", m3: "needsChoice/different-content/-", m4: "repairLater/save-held/-" });
-  assert.deepEqual(r.repairTargets, [
-    { action: "resave", reason: "save-held", recordType: "memory", recordId: "m1" },
-    { action: "resave", reason: "save-held", recordType: "reflection", recordId: "m2" },
-  ], "the Outbox type (reflection) is kept so that the right entry is re-queued");
+  assert.deepEqual(by, { m1: "repairable/save-held/resave", m2: "repairLater/save-held/-", m3: "needsChoice/different-content/-", m4: "repairLater/save-held/-" });
+  assert.deepEqual(r.repairTargets, [{ action: "resave", reason: "save-held", recordType: "memory", recordId: "m1" }], "only normal Memories: a rewrite of the other types can not be checked for lost content");
+  const c = progress([entry("conversation:c1", "held", { heldReason: "markdown-unreadable" }), entry("source:s1", "held", { heldReason: "source-markdown-unreadable" })]);
+  const other = classifyConsistency(plan(), c, c);
+  assert.deepEqual(other.repairTargets, []);
+  assert.deepEqual(other.findings.map((f) => `${f.category}/${f.reason}`), ["repairLater/save-held", "repairLater/save-held"]);
   assert.deepEqual(r.repairableIds, [], "resave targets never go to the Recovery Apply");
 });
 

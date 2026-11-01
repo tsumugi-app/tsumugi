@@ -76,7 +76,9 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
       if (t.action === "apply") return { version: record.updatedAt, paths: [], blocked: null };
       const paths = new Set(vaultPathsOf(t));
       let blocked: AutoRepairTargetInspection["blocked"] = null;
-      if (t.recordType === "memory" && !isReflectionSummary(record as MemoryObject)) {
+      // 保存のやり直しは通常のMemoryだけ（分類もそれ以外を対象にしない。念のためここでも止める）
+      if (t.recordType !== "memory" || isReflectionSummary(record as MemoryObject)) blocked = "day-file-not-mergeable";
+      else {
         const dayPath = memoryDayFilePath(record as MemoryObject);
         paths.add(dayPath);
         const bytes = await readVaultFileBytes(root, dayPath);

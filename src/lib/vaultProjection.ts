@@ -873,7 +873,7 @@ export async function reconcileMemoryOutboxEntry(env: ProjectionEnv, entry: Vaul
   const day = canonical.date.slice(0, 10);
 
   try {
-    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path, entry.requireLosslessDayFile === true && entry.status !== "done"));
+    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path, entry.requireLosslessDayFile === true));
     steps.markdown = "done";
 
     await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent);

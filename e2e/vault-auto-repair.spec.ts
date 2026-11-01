@@ -200,6 +200,25 @@ for (const device of ["desktop", "android"] as const) {
       expect(await bytesOf()).toBe(before);
     });
 
+    test("the integrity pass of a repaired record does not rewrite a day file that has become unsafe", async ({ page }) => {
+      test.setTimeout(120_000);
+      await setup(page); await addHeldMemory(page);
+      const r = await repair(page);
+      expect(r.after?.state, JSON.stringify(r)).toBe("clean");
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("done");
+      // the repaired Memory disappears from the day file and a hand-written key appears in another entry
+      await page.evaluate(async (DAY_FILE) => {
+        const dir = await (window as any).__root.getDirectoryHandle("Memories"); const fh = await dir.getFileHandle(DAY_FILE.split("/")[1]);
+        const sep = "\n<!-- tsumugi:entry -->\n\n";
+        const kept = (await (await fh.getFile()).text()).split(sep).filter((e: string) => !e.includes("repair-mem-3")).join(sep).replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ");
+        const w = await fh.createWritable(); await w.write(kept); await w.close();
+      }, DAY_FILE);
+      const before = await files(page);
+      await page.evaluate(async () => { await (window as any).D.bootstrap.runSaveFoundationBootstrap({ root: (window as any).__root }); });
+      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);                              // the note survives
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("held");
+    });
+
     test("interrupted after the re-queue (the tab closed before the saves ran): nothing is lost, the normal save finishes it, and pressing again does nothing", async ({ page }) => {
       test.setTimeout(120_000);
       await setup(page); await addHeldMemory(page);
