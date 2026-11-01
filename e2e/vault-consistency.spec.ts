@@ -40,7 +40,7 @@ async function setup(page: Page) {
 const check = (page: Page) => page.evaluate(async () => {
   const { consistencyCheck } = (window as any).D; const started = Date.now();
   const { report, plan } = await consistencyCheck.checkVaultConsistency((window as any).__root, () => false, { drainWaitMs: 1500, pollMs: 100, attempts: 3, retryDelayMs: 100 });
-  return { state: report.state, counts: report.counts, categories: [...report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), ...plan.plan.issues.map((i: any) => `issue ${i.path}:${i.status}:${i.error ?? ""}`), ...plan.ops.map((o: any) => `op ${o.kind}:${o.path}:${JSON.stringify(o.steps)}`)], ms: Date.now() - started };
+  return { state: report.state, counts: report.counts, findings: report.findings.length, categories: [...report.findings.map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), ...plan.plan.issues.map((i: any) => `issue ${i.path}:${i.status}:${i.error ?? ""}`), ...plan.ops.map((o: any) => `op ${o.kind}:${o.path}:${JSON.stringify(o.steps)}`)], ms: Date.now() - started };
 });
 /** everything the check could have changed: the OPFS "Vault" files and the save progress (Outbox + ledger) */
 const fingerprint = (page: Page) => page.evaluate(async () => {
@@ -68,7 +68,7 @@ for (const device of ["desktop", "android"] as const) {
     test("a completed save is clean, and the check writes nothing", async ({ page }) => {
       await setup(page); const before = await fingerprint(page);
       const r = await check(page);
-      expect(r.state, JSON.stringify(r.categories)).toBe("clean"); expect(r.categories).toEqual([]);
+      expect(r.state, JSON.stringify(r.categories)).toBe("clean"); expect(r.findings).toBe(0);
       expect(await fingerprint(page)).toBe(before);
     });
 
@@ -81,7 +81,7 @@ for (const device of ["desktop", "android"] as const) {
       expect(r.counts.needsChoice + r.counts.unknown + r.counts.repairLater).toBe(0);
       expect(await fingerprint(page)).toBe(before);
       await flush(page);
-      expect((await check(page)).state).toBe("clean");
+      const drained = await check(page); expect(drained.state, JSON.stringify(drained.categories)).toBe("clean");
     });
 
     test("a save that never drains does not make the check wait forever (bounded) and is reported as retrying, not a conflict", async ({ page }) => {
