@@ -23,7 +23,7 @@
   "+await writing(env, () => vaultProjectionPrimitives.writeFileInDir(dir, fileName, plan.content, \"projection memory day-file\"));",
   "+catch (error) {",
   "+const decided = planDayFileMemberWrite(raw, memoryObject, {",
-  "+const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|-unreadable|-not-mergeable)$/.test(e.heldReason ?? \"\"));",
+  "+const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? \"\"));",
   "+const entry = read.value.files[path];",
   "+const memberHashes = nextMemberHashes(priorMemberHashes, merged, memoryObject.id, (member) => hashVaultText(memoryObjectToMarkdown(member)));",
   "+const memberHashes = nextMemberHashes(typeof currentPath === \"string\" && isObj(files[currentPath]) ? (files[currentPath] as Obj).memberHashes : undefined, finalMembers, targetId, (m) => hashVaultText(memoryEntryMarkdown(m)));",

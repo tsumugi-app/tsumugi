@@ -1420,7 +1420,7 @@ export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: 
  * 判定が変わらなければ何も書かない。1回の起動で1回だけなので、繰り返しにはならない。
  */
 export async function reevaluateRewriteHeldOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
-  const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|-unreadable|-not-mergeable)$/.test(e.heldReason ?? ""));
+  const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? ""));
   for (const entry of entries) quietHolds.add(entry);
   return reconcileOutboxEntries(env, entries);
 }
