@@ -22,6 +22,7 @@ import {
   type BackupDeviceSnapshot,
   type BackupDeviceStore,
 } from "./db";
+import { writeFileHandleContent } from "./vaultWriter";
 import { createZipBytes, readZipEntries, ZipFormatError, type ZipEntryInput } from "./zip";
 
 export const BACKUP_FORMAT = "tsumugi-backup";
@@ -120,9 +121,11 @@ async function readVaultFiles(root: FileSystemDirectoryHandle, isCancelled: () =
       if (isCancelled()) throw new BackupError("cancelled", true);
       const path = prefix ? `${prefix}/${name}` : name;
       if (handle.kind === "directory") {
-        // 隠しフォルダは、Tsumugiのもの（自分のバックアップ置き場は除く）だけに入る
-        if (name.startsWith(".") && !(prefix === "" && (name === ".tsumugi" || name === ".tsumugi-archive"))) continue;
+        // 自分のバックアップ置き場には入らない。Tsumugiの隠しフォルダ（`.tsumugi/`・`.tsumugi-archive/`）の中は、隠しフォルダも含めて全部入る。
+        // それ以外の隠しフォルダ（.obsidian・.trash等、Tsumugiのものではない）には入らない
         if (path === BACKUP_DIR) continue;
+        const insideTsumugi = path.startsWith(".tsumugi/") || path.startsWith(".tsumugi-archive/");
+        if (name.startsWith(".") && !insideTsumugi && !(prefix === "" && (name === ".tsumugi" || name === ".tsumugi-archive"))) continue;
         await walk(handle as FileSystemDirectoryHandle, path, depth + 1);
         continue;
       }
@@ -280,15 +283,16 @@ async function dirFor(root: FileSystemDirectoryHandle, path: string): Promise<Fi
   for (const part of path.split("/")) dir = await dir.getDirectoryHandle(part, { create: true });
   return dir;
 }
-/** 新しいファイルだけを作る。同じ名前が既にあれば何もせず失敗（既存のファイルは決して開かない・上書きしない） */
+/**
+ * 新しいファイルだけを作る。同じ名前が既にあれば何もせず失敗（既存のファイルは決して開かない・上書きしない）。書き込みは通常の保存と
+ * 同じ共通の書き手（`createWritable`が無いiPhone Safari等ではWorker経路）を使う。
+ */
 async function writeNewFile(dir: FileSystemDirectoryHandle, name: string, data: Uint8Array): Promise<FileSystemFileHandle> {
   let exists = true;
   try { await dir.getFileHandle(name, { create: false }); } catch { exists = false; }
   if (exists) throw new BackupError("write-failed", true);
   const handle = await dir.getFileHandle(name, { create: true });
-  const stream = await handle.createWritable();
-  try { await stream.write(data as BufferSource); await stream.close(); }
-  catch (error) { try { await stream.abort(); } catch { /* keep the original failure */ } throw error; }
+  await writeFileHandleContent(handle, data);
   return handle;
 }
 

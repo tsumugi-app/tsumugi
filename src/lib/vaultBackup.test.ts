@@ -128,6 +128,8 @@ const VAULT_FILES = {
   ".tsumugi/history/2026-10.json": "{}",
   ".tsumugi/recovery-archive/entries/a.json": "{\"kept\":true}",
   ".tsumugi-archive/orphan-cleanup/x.md": "架空の退避済みファイル",
+  ".tsumugi/.staging/partial.json": "{\"nested-hidden\":true}",          // a hidden folder INSIDE .tsumugi: still Tsumugi's, backed up
+  "Memories/.drafts/a.md": "架空の下書き",                                 // a hidden folder in a visible folder: not Tsumugi's
   ".obsidian/workspace.json": "{}",           // Tsumugiのものではない隠しフォルダ：入れない
   "Memories/photo.png": new Uint8Array([0x89, 0x50, 0x4e, 0x47]), // Markdown以外のユーザーのファイル：入れない
 };
@@ -171,7 +173,7 @@ test("a backup holds both sides: every device record (pending / held saves inclu
   assert.equal(r.ok, true, JSON.stringify(r));
   if (!r.ok) return;
   assert.equal(r.path, ".tsumugi/repair-backup/backup-20261101-000000-test.zip");
-  assert.deepEqual(r.summary, { conversations: 1, memories: 3, sources: 0, pendingSaves: 1, heldSaves: 1, vaultFiles: 8, vaultBytes: r.summary.vaultBytes, excludedCredentialKeys: 1 });
+  assert.deepEqual(r.summary, { conversations: 1, memories: 3, sources: 0, pendingSaves: 1, heldSaves: 1, vaultFiles: 9, vaultBytes: r.summary.vaultBytes, excludedCredentialKeys: 1 });
   // nothing existing changed; only two NEW files in the backup folder
   for (const [p, hex] of before) assert.equal(Buffer.from(vault.files.get(p)!).toString("hex"), hex, p);
   assert.deepEqual(vault.written.sort(), [".tsumugi/repair-backup/backup-20261101-000000-test.verified.json", ".tsumugi/repair-backup/backup-20261101-000000-test.zip"]);
@@ -181,7 +183,7 @@ test("a backup holds both sides: every device record (pending / held saves inclu
   const v = await backup.verifyBackupZip(stored); assert.equal(v.ok, true);
   const entries = new Map(zip.readZipEntries(stored).map((x) => [x.path, x.data]));
   assert.deepEqual([...entries.keys()].filter((p) => p.startsWith("vault/")).sort(), [
-    "vault/.tsumugi-archive/orphan-cleanup/x.md", "vault/.tsumugi/history/2026-10.json", "vault/.tsumugi/recovery-archive/entries/a.json", "vault/.tsumugi/registry/0a.json",
+    "vault/.tsumugi-archive/orphan-cleanup/x.md", "vault/.tsumugi/.staging/partial.json", "vault/.tsumugi/history/2026-10.json", "vault/.tsumugi/recovery-archive/entries/a.json", "vault/.tsumugi/registry/0a.json",
     "vault/.tsumugi/vault-identity.json", "vault/Conversations/2026/10/2026-10-20-conv-1.md", "vault/Memories/2026/10/2026-10-20.md", "vault/archive/Memories/old.md"]);
   for (const [p, data] of entries) if (p.startsWith("vault/")) assert.deepEqual([...data], [...vault.files.get(p.slice(6))!], p);
   // the conflicting record: the device version AND the Vault version are both there, untouched
@@ -290,7 +292,7 @@ test("an exported copy is accepted only if it is byte-identical to the verified 
 });
 
 test("which Vault paths are backed up", () => {
-  for (const p of ["Memories/a.md", "x/y/z.MD", ".tsumugi/index.json", ".tsumugi/registry/0a.json", ".tsumugi-archive/a/b.md"]) assert.equal(backup.isBackedUpVaultPath(p), true, p);
+  for (const p of ["Memories/a.md", "x/y/z.MD", ".tsumugi/index.json", ".tsumugi/registry/0a.json", ".tsumugi-archive/a/b.md", ".tsumugi/.x/y.json"]) assert.equal(backup.isBackedUpVaultPath(p), true, p);
   for (const p of [".tsumugi/repair-backup/x.zip", ".tsumugi/repair-backup", ".obsidian/a.json", "Memories/.hidden.md", "Memories/photo.png", ".trash/a.md"]) assert.equal(backup.isBackedUpVaultPath(p), false, p);
 });
 
