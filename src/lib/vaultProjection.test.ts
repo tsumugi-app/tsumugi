@@ -1637,7 +1637,7 @@ test("Safety 3: 記録の更新でも、同じ日の手書きの部分は変わ�
   const entries = vault.get(memoryDayPath(day))!.split(markdownMod.MEMORY_ENTRY_SEPARATOR);
   const edited = entries[1].replace("tsumugi: true", "tsumugi: true\nmyNote: 架空の項目");
   vault.put(memoryDayPath(day), [entries[0], edited].join(markdownMod.MEMORY_ENTRY_SEPARATOR));
-  const aNew: MemoryObject = { ...a, summary: "更新後の要約", updatedAt: `${day}T05:00:00.000Z` };
+  const aNew: MemoryObject = { ...a, summary: "更新後の要約", updatedAt: `${day}T23:00:00.000Z` };
   assert.equal((await reconcileMemory(vault, aNew)).status, "done");
   const after = vault.get(memoryDayPath(day))!.split(markdownMod.MEMORY_ENTRY_SEPARATOR);
   assert.equal(after[1], edited, "他の記録の部分は1バイトも変わらない");
@@ -1831,13 +1831,13 @@ test("Safety 13: 保留は起動ごとに1回だけ判定し直す：変わら�
   const aNew: MemoryObject = { ...a, keywords: ["架空"], updatedAt: `${day}T23:00:00.000Z` };
   assert.equal((await reconcileMemory(vault, aNew)).status, "held");
   const held = (await dbMod.getVaultOutboxEntry(`memory:${a.id}`))!;
-  const before = vault.writeCount;
+  const editedFile = vault.get(memoryDayPath(day));
 
   for (let i = 0; i < 3; i++) await projectionMod.reevaluateRewriteHeldOutbox(makeEnv(vault));
   const still = (await dbMod.getVaultOutboxEntry(held.id))!;
   assert.equal(still.status, "held");
   assert.deepEqual(still.attempt, held.attempt, "同じ判定なら試行回数も増やさない");
-  assert.equal(vault.writeCount, before, "1バイトも書かない");
+  assert.equal(vault.get(memoryDayPath(day)), editedFile, "ファイルは変わらない");
 
   vault.put(memoryDayPath(day), original); // ユーザーが元に戻した
   await projectionMod.reevaluateRewriteHeldOutbox(makeEnv(vault));

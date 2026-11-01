@@ -380,6 +380,8 @@ export function registerProjectionDryRun(entry: VaultOutboxEntry, sink: (outcome
 
 const PROJECTION_STEP_NAMES_FOR_COMPARE: ProjectionStepName[] = ["markdown", "registry", "history", "index", "ledger"];
 
+const quietHolds = new WeakSet<object>();
+
 async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionStepName, ProjectionStepState>, status: "done" | "pending" | "held", reason: string | null, now: string): Promise<void> {
   const dryRunSink = dryRunSinks.get(entry);
   if (dryRunSink) { dryRunSink({ steps: { ...steps }, status, reason }); return; }
@@ -390,8 +392,8 @@ async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionS
     projectionReadStats.idbWritesSkipped += 1;
     return;
   }
-  // the same hold again (re-evaluated at start-up): nothing changed, so nothing is written
-  if (status === "held" && entry.status === "held" && entry.heldReason === reason) return;
+  // the same hold again at the start-up re-evaluation: nothing changed, so nothing is written
+  if (quietHolds.has(entry) && status === "held" && entry.heldReason === reason) return;
   const attempt = status === "done" ? entry.attempt : { count: entry.attempt.count + 1, lastError: reason, lastAttemptAt: now };
   const persist = entry.recordType === "memory" || entry.recordType === "reflection" ? putMemoryProjectionOutcome : putVaultOutboxEntry;
   await persist({ ...entry, steps, status, heldReason: status === "held" ? reason : null, attempt, updatedAt: now });
@@ -1404,7 +1406,10 @@ export const PROJECTION_HELD_RULE_VERSION = "memory-sourcetype-normalized-v1";
  * 途中で中断すれば次回また行う（reconcile自体が冪等）。
  */
 export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: string = PROJECTION_HELD_RULE_VERSION): Promise<ReconcileAllRecordTypesResult | null> {
-  if (await getProjectionHeldReevaluationMarker(ruleVersion)) return null;
+  if (await getProjectionHeldReevaluationMarker(ruleVersion)) {
+    await reevaluateRewriteHeldOutbox(env);
+    return null;
+  }
   const result = await reconcileHeldVaultOutbox(env);
   await setProjectionHeldReevaluationMarker(ruleVersion, (env.now ?? (() => new Date().toISOString()))());
   return result;
@@ -1416,6 +1421,7 @@ export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: 
  */
 export async function reevaluateRewriteHeldOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
   const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|-unreadable|-not-mergeable)$/.test(e.heldReason ?? ""));
+  for (const entry of entries) quietHolds.add(entry);
   return reconcileOutboxEntries(env, entries);
 }
 

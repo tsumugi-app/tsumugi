@@ -3011,15 +3011,15 @@ test("DryRun C: only the History row differs -> History wouldUpdate, expected ra
   expectShadowEqualsReal(shadow, vault, before);
 });
 
-test("DryRun E: Vault-only frontmatter (title) that a canonical rewrite would drop is detected by field name", async () => {
+test("DryRun E: Vault-only frontmatter (title) that a canonical rewrite would drop is not rewritten: dry run and production both hold it", async () => {
   const db = new FakeDb(), vault = new FakeVault(); const id = `e-${uid()}`;
   const c = conversation(id); db.conversations.set(id, c);
   vault.put(convPath(c), markdownMod.conversationToMarkdown({ ...c, title: "Vaultだけにある題" }));
   const { report, results, shadow } = await dryRun(db, vault);
-  assert.equal(results[0].markdown, "wouldRewrite"); assert.equal(results[0].rewriteReason, "frontmatterDifference");
-  assert.equal(report.metadataLoss.potentialVaultOnlyMetadataLoss, 1); assert.deepEqual(report.metadataLoss.potentialLossFields, { title: 1 });
+  assert.equal(results[0].markdown, "conflict");
   assert.ok(!JSON.stringify(report).includes("Vaultだけにある題"), "values are never reported");
-  const before = filesOf(vault), real = await realReconcile(db, vault); assert.equal(real[id], "done"); expectShadowEqualsReal(shadow, vault, before);
+  const before = filesOf(vault), real = await realReconcile(db, vault); assert.equal(real[id], "held"); expectShadowEqualsReal(shadow, vault, before);
+  assert.ok(vault.get(convPath(c))!.includes("Vaultだけにある題"), "the Vault-only title is still there");
 });
 
 test("DryRun F: Memory / Reflection / Source projections equal the production reconcile (create, no-op, conflict)", async () => {
