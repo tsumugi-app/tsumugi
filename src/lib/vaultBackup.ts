@@ -10,7 +10,8 @@
  *   端末と保存先で内容が違う記録（競合する版）は、両方の版がそのまま入る。どちらも選ばない・まとめない。
  * - 一貫性：保存ロックは取らない（保存を止めない）。保存先を読む前後で端末の保存の進行状況（Outbox＋ledger）を比べ、変わっていたら
  *   読み直す（有限回）。最後まで落ち着かなければ失敗（もう一度試せる）として返す。保存の途中（Markdownは書けたがOutboxはまだpending）を
- *   読んだ場合も、その記録の端末の版とOutboxが一緒に入るため、何も失われない。world lockは読む間だけ共有モードで持つ。
+ *   読んだ場合も、その記録の端末の版とOutboxが一緒に入るため、何も失われない。world lockは端末データを読む一瞬だけ共有モードで持ち、
+ *   保存先の走査中は持たない（Vault切替・修復を待たせない）。その間の切替は2回目の取得で、修復・移行は各journalの変化で検出して読み直す。
  * - 書き込み：保存先の`.tsumugi/repair-backup/`に、新しい名前のファイルを作るだけ（既存のファイルは開かない・上書きしない・消さない）。
  *   ZIPを書いて読み戻し、全エントリのハッシュ・件数・保存待ちの記録の有無を照合できたときだけ、`<runId>.verified.json`を書いて成功にする。
  *   照合できなかったZIPには`.verified.json`が無いため、後の修復（段階3）は使わない。
@@ -76,7 +77,10 @@ export type BackupResult =
 export interface VaultBackupEnv {
   root: FileSystemDirectoryHandle;
   readDevice(): Promise<BackupDeviceSnapshot>;
-  /** world lockの共有モード（保存と同時に持てる。保存ロックは取らない）。読む間だけ持ち、書き込み・照合の間は持たない */
+  /**
+   * world lockの共有モード（保存と同時に持てる。保存ロックは取らない）。端末データを読む一瞬だけ持つ。保存先の走査・書き込み・照合の間は
+   * 持たない（Vault切替・修復の排他ロックを待たせない）。走査の後にもう一度持つことで、その間の切替を検出する
+   */
   withWorldRead<T>(fn: () => Promise<T>): Promise<T>;
   now(): string;
   runId(): string;
@@ -96,15 +100,22 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** 保存の進行状況：Outboxの各entryの状態と対象の版、ledger。試行回数・時刻（再試行のたびに変わる）は比べない */
+/**
+ * 保存先を書き換えうる処理の進行状況：Outboxの各entryの状態と対象の版、ledger、修復（Recovery）のjournal、migration journal。
+ * 試行回数・時刻（保存の再試行のたびに変わる）は比べない。前後で同じなら、その間に保存・修復・移行は保存先を書いていない
+ */
 export function saveProgressKey(device: BackupDeviceSnapshot): string {
   const outbox = device.stores.vaultOutbox.map((row) => {
     const e = row.value as { id?: unknown; status?: unknown; recordUpdatedAt?: unknown };
     return `${String(e.id)}|${String(e.status)}|${String(e.recordUpdatedAt)}`;
   }).sort();
   const ledger = device.stores.vaultSyncState.map((row) => `${String(row.key)}=${String(row.value)}`).sort();
-  return JSON.stringify([outbox, ledger]);
+  const recoveryJournal = device.stores.settings.filter((row) => row.key === RECOVERY_JOURNAL_SETTING).map((row) => JSON.stringify(row.value));
+  const migrations = device.stores.migrationJournal.map((row) => JSON.stringify(row.value)).sort();
+  return JSON.stringify([outbox, ledger, recoveryJournal, migrations]);
 }
+/** db.tsの`VAULT_RECOVERY_JOURNAL_KEY`（修復の進行中・完了を記録するsettingsのキー） */
+const RECOVERY_JOURNAL_SETTING = "vaultRecoveryJournal";
 
 /** バックアップに入れる保存先のファイル：見えるフォルダのMarkdownと、Tsumugiの隠しフォルダの全ファイル（自分のバックアップ置き場は除く） */
 export function isBackedUpVaultPath(path: string): boolean {
@@ -317,13 +328,12 @@ async function readSettledSnapshot(env: VaultBackupEnv, options: Required<Backup
   for (let attempt = 0; attempt < options.attempts; attempt++) {
     if (attempt > 0) await env.sleep(options.retryDelayMs);
     if (isCancelled()) throw new BackupError("cancelled", true);
-    // 読む間だけworld lockの共有モードを持つ（保存と同時に持てる。保存先の切替だけが、読み終わるまで待つ）
-    const read = await env.withWorldRead(async () => {
-      const before = await env.readDevice();
-      const vault = await readVaultFiles(env.root, isCancelled);
-      const after = await env.readDevice();
-      return { settled: saveProgressKey(before) === saveProgressKey(after), device: after, vault };
-    });
+    // world lockは端末データを読む一瞬だけ持つ。保存先の走査中は持たない（長い走査でVault切替・修復を待たせない）。
+    // 走査の間に切替があれば、2回目のwithWorldReadがこのタブの世代の食い違いで失敗する。保存・修復・移行があれば、前後の進行状況が変わる
+    const before = await env.withWorldRead(() => env.readDevice());
+    const vault = await readVaultFiles(env.root, isCancelled);
+    const after = await env.withWorldRead(() => env.readDevice());
+    const read = { settled: saveProgressKey(before) === saveProgressKey(after), device: after, vault };
     lastUnreadable = read.vault.unreadable;
     // 読めないファイルがあった回も、保存が動いた回と同じく読み直す（書き込みの途中・一覧の後で消えたファイルは、次の回には落ち着いている）
     if (read.settled && read.vault.unreadable === 0) return { device: read.device, vault: read.vault.files };

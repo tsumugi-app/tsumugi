@@ -39,6 +39,7 @@ class MemVault {
   written: string[] = [];
   corruptWrites = false;
   onWrite: (() => void) | null = null;
+  onRead: (() => void) | null = null;
   constructor(files: Record<string, string | Uint8Array>) {
     for (const [p, v] of Object.entries(files)) this.put(p, typeof v === "string" ? bytes(v) : v);
   }
@@ -55,6 +56,7 @@ class MemVault {
     const fileHandle = (p: string) => ({
       kind: "file", name: p.split("/").pop(),
       async getFile() {
+        self.onRead?.();
         if (self.unreadable.has(p)) throw new DOMException("redacted", "NotReadableError");
         const data = self.files.get(p) ?? self.notFound();
         return { size: data.byteLength, async arrayBuffer() { return data.slice().buffer; }, async text() { return text(data); } };
@@ -148,6 +150,7 @@ function env(vault: MemVault, dev: () => Promise<BackupDeviceSnapshot> | BackupD
     ...extra,
   };
   vault.onWrite = () => { if (inLock) lockLog.push("WRITE-IN-LOCK"); };
+  vault.onRead = () => { if (inLock) lockLog.push("VAULT-READ-IN-LOCK"); };
   return e;
 }
 
@@ -213,8 +216,9 @@ test("a backup holds both sides: every device record (pending / held saves inclu
   assert.ok(mems.some((m) => m.value.id === "mem-2") && mems.some((m) => m.value.id === "mem-3"));
   const marker = JSON.parse(text(vault.files.get(".tsumugi/repair-backup/backup-20261101-000000-test.verified.json")!));
   assert.equal(marker.sha256, r.sha256); assert.equal(marker.size, stored.byteLength);
-  // the world lock is held only while reading, never while writing
-  assert.ok(!e.lockLog.includes("WRITE-IN-LOCK"), e.lockLog.join(","));
+  // the world lock is held only for the two device reads: never while the Vault is scanned or written (a Vault switch / recovery never waits on a backup)
+  assert.ok(!e.lockLog.includes("WRITE-IN-LOCK") && !e.lockLog.includes("VAULT-READ-IN-LOCK"), e.lockLog.join(","));
+  assert.deepEqual(e.lockLog, ["enter", "exit", "enter", "exit"]);
 });
 
 test("credentials never enter a backup (read from the fake IndexedDB through the production reader)", async () => {
@@ -282,6 +286,18 @@ test("an existing file of the same name is never opened for writing or overwritt
   const r = await backup.createVaultBackup(env(vault, () => device()));
   assert.deepEqual(r, { ok: false, reason: "write-failed", retryable: true });
   assert.equal(text(vault.files.get(".tsumugi/repair-backup/backup-20261101-000000-test.zip")!), "架空の既存ファイル");
+  assert.deepEqual(vault.written, []);
+});
+
+test("a recovery or migration running during the scan (its journal changes) is detected and the snapshot is read again; a Vault switch during the scan fails the backup", async () => {
+  let n = 0;
+  const recovering = () => { n++; return device({ settings: [{ key: "vaultRecoveryJournal", value: n === 1 ? "{\"phase\":\"applying\"}" : "{\"phase\":\"done\"}" }] } as never); };
+  const r = await backup.createVaultBackup(env(new MemVault(VAULT_FILES), recovering));
+  assert.equal(r.ok, true, JSON.stringify(r)); assert.equal(n, 4, "read again once");
+  // the second world-lock entry re-validates the tab's Vault generation: a switch in between throws there, and nothing is written
+  const vault = new MemVault(VAULT_FILES); let entries = 0;
+  const switched = await backup.createVaultBackup(env(vault, () => device(), { withWorldRead: async (fn) => { if (++entries === 2) throw new Error("StaleVaultTabError"); return fn(); } }));
+  assert.deepEqual(switched, { ok: false, reason: "error", retryable: true });
   assert.deepEqual(vault.written, []);
 });
 
