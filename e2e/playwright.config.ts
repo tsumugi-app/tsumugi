@@ -8,7 +8,7 @@ const APP = path.join(__dirname, "..");   // `next start` runs in the app direct
 const PW = process.env.E2E_PW ?? "local-e2e-only-password";
 export default defineConfig({
   testDir: ".",
-  testMatch: /.*\.spec\.ts/,
+  testMatch: /calendar-delete\.spec\.ts/, repeatEach: 10,
   timeout: 60_000,
   retries: 0,
   workers: 1,

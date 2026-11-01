@@ -95,7 +95,8 @@ for (const [name, size] of [["PC", { width: 1280, height: 800 }], ["Android", { 
     await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible();
     // nothing comes back after a restart
     await page.reload(); await page.getByRole("button", { name: "tsumugiを開く" }).click(); await openHistoryButton(page);
-    await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible({ timeout: 30_000 });
+    try { await expect(page.getByRole("button", { name: /会話B/ })).toBeVisible({ timeout: 30_000 }); }
+    catch (e) { const diag = await page.evaluate(async () => { const r = await navigator.storage.getDirectory(); const out: string[] = []; const walk = async (d: any, p: string) => { for await (const [n, h] of d.entries()) { if (h.kind === "directory") await walk(h, p + n + "/"); else out.push(p + n + (p.includes("History") ? ":" + (await (await h.getFile()).text()).slice(0, 300) : "")); } }; await walk(r, ""); return document.body.innerText.slice(0, 600) + " ||FILES " + out.join(" ; "); }); throw new Error("DIAG " + diag.replace(/\s+/g, " ")); }
     await expect(page.getByRole("button", { name: /会話A/ })).toHaveCount(0);
     expect(await read<any>(page, "conversations", A)).toBeUndefined();
     expect(await vaultText(page)).not.toContain(A1);
