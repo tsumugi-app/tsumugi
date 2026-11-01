@@ -2292,7 +2292,10 @@ async function writeMemoryObjectMarkdownImpl(
   // した文字列のハッシュ）で、将来の再同期がday-file内のどのidが変化したかを
   // 特定するために使う。
   const stat = await readVaultFileStat(targetDir, fileName);
-  const memberHashes = nextMemberHashes(priorMemberHashes, merged, memoryObject.id, (member) => hashVaultText(memoryObjectToMarkdown(member)));
+  const memberHashes = await nextMemberHashes(priorMemberHashes, merged, memoryObject.id, (member) => hashVaultText(memoryObjectToMarkdown(member)), async (member) => {
+    const device = await getMemoryObject(member.id);
+    return !device || memoryObjectToMarkdown(device) === memoryObjectToMarkdown(member);
+  });
   await upsertVaultRegistryRecord(root, {
     registryKey,
     path: relativePath,

@@ -684,7 +684,10 @@ async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, 
   const currentPath = records[registryKey];
 
   const memberIds = finalMembers.map((m) => m.id);
-  const memberHashes = nextMemberHashes(typeof currentPath === "string" && isObj(files[currentPath]) ? (files[currentPath] as Obj).memberHashes : undefined, finalMembers, targetId, (m) => hashVaultText(memoryEntryMarkdown(m)));
+  const memberHashes = await nextMemberHashes(typeof currentPath === "string" && isObj(files[currentPath]) ? (files[currentPath] as Obj).memberHashes : undefined, finalMembers, targetId, (m) => hashVaultText(memoryEntryMarkdown(m)), async (m) => {
+    const device = await getMemoryObject(m.id);
+    return !device || isMemorySame(m, device);
+  });
   const expected = { recordType: "memory-day" as const, mtime: 0, size: 0, contentHash: hashVaultText(finalContent), memberIds, memberHashes, status: "ok" as const };
 
   const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;

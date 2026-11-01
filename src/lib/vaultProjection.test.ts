@@ -1845,3 +1845,22 @@ test("Safety 13: 保留は起動ごとに1回だけ判定し直す：変わら�
   assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([aNew]));
   assert.equal(await heldReasonOf(held.id), null);
 });
+
+test("Safety 14: Registryに記録の無い記録が手で編集されていたら、他の記録の保存で「Tsumugiが書いた版」にならない。端末と同じ記録は記録される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-14";
+  const a = memory("safe-14-a", day, { createdAt: `${day}T01:00:00.000Z`, summary: "要約-safe-14-a" });
+  const same = memory("safe-14-same", day, { createdAt: `${day}T01:30:00.000Z` });
+  await dbMod.putMemoryObjectWithOutbox(a);
+  await dbMod.putMemoryObjectWithOutbox(same);
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([{ ...a, summary: "手で直した要約" }, same]));
+  const b = memory("safe-14-b", day, { createdAt: `${day}T02:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, b)).status, "done");
+  const hashes = JSON.parse(vault.get(memoryShardPathFor(day))!).files[memoryDayPath(day)].memberHashes;
+  assert.equal(hashes[a.id], undefined, "手で編集された内容のハッシュを作らない");
+  assert.equal(typeof hashes[same.id], "string", "端末と同じ記録は記録する");
+  const current = vault.get(memoryDayPath(day));
+  assert.deepEqual(await reconcileMemory(vault, { ...a, keywords: ["架空"], updatedAt: `${day}T23:00:00.000Z` }), { status: "held", reason: "memory-member-edited-conflict" });
+  assert.equal(vault.get(memoryDayPath(day)), current);
+});

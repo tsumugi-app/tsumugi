@@ -166,12 +166,16 @@ export function dayFileCanTakeMember(raw: string, memberId: string): boolean {
 
 /**
  * Registryのmember hashesの次の値：対象の記録だけを今の版にする。他の記録は記録済みの値を引き継ぐ（Tsumugiが書いていない記録のハッシュを更新すると、
- * 手で編集された内容を「Tsumugiが書いた版」と取り違え、次の更新で上書きしてしまう）。初めて見る記録だけは、今読めた内容のハッシュを持つ。
+ * 手で編集された内容を「Tsumugiが書いた版」と取り違え、次の更新で上書きしてしまう）。記録の無い他の記録は、端末の版と一致する（または端末に無く、端末から
+ * 更新されることが無い）と`mayRecord`が確かめたときだけ記録する。一致しなければ記録せず、その記録の更新は証明できないまま保留になる。
  */
-export function nextMemberHashes(prior: unknown, members: MemoryObject[], targetId: string, hashOf: (m: MemoryObject) => string): Record<string, string> {
+export async function nextMemberHashes(prior: unknown, members: MemoryObject[], targetId: string, hashOf: (m: MemoryObject) => string, mayRecord: (m: MemoryObject) => Promise<boolean>): Promise<Record<string, string>> {
   const known = prior && typeof prior === "object" ? (prior as Record<string, unknown>) : {};
-  return Object.fromEntries(members.map((m) => {
+  const next: Record<string, string> = {};
+  for (const m of members) {
     const value = known[m.id];
-    return [m.id, m.id !== targetId && typeof value === "string" ? value : hashOf(m)];
-  }));
+    if (m.id !== targetId && typeof value === "string") next[m.id] = value;
+    else if (m.id === targetId || await mayRecord(m)) next[m.id] = hashOf(m);
+  }
+  return next;
 }
