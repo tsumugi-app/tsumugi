@@ -387,6 +387,31 @@ export async function writeFileHandleContent(file: FileSystemFileHandle, content
   await writeViaWorker(file, content);
 }
 
+/**
+ * 新しく作った、ほかの誰も書かない一意な名前のファイル（バックアップ等）を書く。`createWritable`があれば上と同じ。
+ * 無い環境（iPhone Safari等）では、通常の保存の直列化キュー・タブ間の書き込みロックを使わず、この書き込みだけのWorkerで書く
+ * （大きなファイルの書き込みの間、無関係な通常の保存を待たせない）。旧内容が無いためrollbackはしない。呼び出し側が読み戻して照合すること。
+ */
+export async function writeNewFileIndependently(file: FileSystemFileHandle, content: WriteContent): Promise<void> {
+  if (hasNativeWritable(file)) {
+    const writable = await file.createWritable();
+    await writable.write(content as FileSystemWriteChunkType);
+    await writable.close();
+    return;
+  }
+  const root = await rootProvider();
+  if (typeof root.resolve !== "function") throw new VaultWriterUnavailableError("FileSystemDirectoryHandle.resolve が使えません");
+  const path = await root.resolve(file);
+  if (!path || path.length === 0) throw new Error("cannot resolve the file path from the OPFS root");
+  const own = workerFactory();
+  try {
+    const reply = await own.call({ type: "write", path, bytes: toBytes(content) });
+    if (!reply.ok) throw new Error(reply.error ? errText(reply.error) : "worker write failed");
+  } finally {
+    own.terminate();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 能力確認（createWritableが無いOPFSだけ）
 // ---------------------------------------------------------------------------

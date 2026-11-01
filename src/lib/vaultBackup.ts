@@ -23,7 +23,7 @@ import {
   type BackupDeviceSnapshot,
   type BackupDeviceStore,
 } from "./db";
-import { writeFileHandleContent } from "./vaultWriter";
+import { writeNewFileIndependently } from "./vaultWriter";
 import { createZipBytes, readZipEntries, ZipFormatError, type ZipEntryInput } from "./zip";
 
 export const BACKUP_FORMAT = "tsumugi-backup";
@@ -309,15 +309,15 @@ async function dirFor(root: FileSystemDirectoryHandle, path: string): Promise<Fi
   return dir;
 }
 /**
- * 新しいファイルだけを作る。同じ名前が既にあれば何もせず失敗（既存のファイルは決して開かない・上書きしない）。書き込みは通常の保存と
- * 同じ共通の書き手（`createWritable`が無いiPhone Safari等ではWorker経路）を使う。
+ * 新しいファイルだけを作る。同じ名前が既にあれば何もせず失敗（既存のファイルは決して開かない・上書きしない）。`createWritable`が無い
+ * iPhone Safari等では、通常の保存の書き込みキュー・ロックとは別のWorkerで書く（大きなZIPの書き込みで通常の保存を待たせない）。
  */
 async function writeNewFile(dir: FileSystemDirectoryHandle, name: string, data: Uint8Array): Promise<FileSystemFileHandle> {
   let exists = true;
   try { await dir.getFileHandle(name, { create: false }); } catch { exists = false; }
   if (exists) throw new BackupError("write-failed", true);
   const handle = await dir.getFileHandle(name, { create: true });
-  await writeFileHandleContent(handle, data);
+  await writeNewFileIndependently(handle, data);
   return handle;
 }
 

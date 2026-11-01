@@ -15,6 +15,7 @@
     "src/lib/vaultBackup.test.ts",
     "src/lib/vaultBackup.ts",
     "src/lib/zip.ts",
+    "src/lib/vaultWriter.ts",
     "src/lib/db.ts",
     "src/lib/fakeIdb.ts"
   ]

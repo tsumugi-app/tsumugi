@@ -25,6 +25,7 @@ import type { BackupDeviceSnapshot } from "./db";
 const backup = require("./vaultBackup") as typeof import("./vaultBackup");
 const zip = require("./zip") as typeof import("./zip");
 const db = require("./db") as typeof import("./db");
+const writer = require("./vaultWriter") as typeof import("./vaultWriter");
 
 const T = "2026-10-20T09:15:00.000Z";
 const enc = new TextEncoder();
@@ -357,4 +358,22 @@ test("screen text: counts only, unsaved records mentioned, failures say what to 
     "会話2件・Memory 5件・保存先のファイル9件（保存先へ未反映の記録2件も含みます）");
   assert.match(backup.backupFailureText({ ok: false, reason: "unreadable", retryable: true, count: 2 }), /2件.*一部だけのバックアップは作りません/);
   assert.match(backup.backupFailureText({ ok: false, reason: "verify-failed", retryable: true }), /読み戻して内容を確認できませんでした/);
+});
+
+test("without createWritable (iPhone Safari), a backup file is written by its own Worker: a normal save waiting in the shared writer queue / lock is not blocked by it, and vice versa", async () => {
+  const t = writer.__vaultWriterTesting;
+  const calls: { worker: number; path: string[] }[] = []; let workers = 0; const terminated: number[] = [];
+  let releaseShared: () => void = () => undefined;
+  const sharedHeld = new Promise<void>((resolve) => { releaseShared = resolve; });
+  try {
+    t.setRootProvider(async () => ({ resolve: async (f: { p: string[] }) => f.p }) as unknown as FileSystemDirectoryHandle);
+    t.setWorkerFactory(() => { const n = ++workers; return { async call(m) { calls.push({ worker: n, path: m.path as string[] }); return { ok: true }; }, terminate() { terminated.push(n); } }; });
+    t.setLockRunner(async (fn) => { await sharedHeld; return fn(); });   // the shared writer lock is busy (a normal save is in progress)
+    const file = (p: string[]) => ({ p, async getFile() { return { async arrayBuffer() { return new ArrayBuffer(0); } }; } }) as unknown as FileSystemFileHandle;
+    const normal = writer.writeViaWorker(file(["Memories", "a.md"]), "架空").catch(() => undefined);
+    await writer.writeNewFileIndependently(file([".tsumugi", "repair-backup", "b.zip"]), new Uint8Array([1, 2, 3]));   // completes while the shared lock is still held
+    assert.deepEqual(calls, [{ worker: 1, path: [".tsumugi", "repair-backup", "b.zip"] }]);
+    assert.deepEqual(terminated, [1], "the backup's own Worker is closed right away");
+    releaseShared(); await normal;
+  } finally { releaseShared(); t.reset(); }
 });
