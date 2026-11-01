@@ -2678,10 +2678,11 @@ test("Background: an old anomaly verdict is re-checked on every start (never sho
 });
 test("Background: a saving-only result is not recorded (checked again next time)", async () => {
   const w = await wiredFixture(); await developerRepair(w); const n = { scans: 0 }, build = `s-${Math.random()}`;
+  const markerBefore = await repairDb.getRecoveryCheckMarker("fixture-identity"); // the fake IndexedDB is shared by the whole file
   const m = (await repairDb.getMemoryObject("c-2"))!; await repairDb.putMemoryObjectWithOutbox({ ...m, summary: "pending (fictional)", updatedAt: "2026-11-01T01:00:00.000Z" }, "memory", "2026-11-01T01:00:00.000Z");
   const first = await bgCheck(w, build, n); assert.equal(first.kind === "checked" && first.report.state, "saving");
   assert.equal(uiOf(first).kind, "saving");
-  assert.equal(await repairDb.getRecoveryCheckMarker("fixture-identity"), undefined, "nothing recorded");
+  assert.deepEqual(await repairDb.getRecoveryCheckMarker("fixture-identity"), markerBefore, "nothing recorded");
   for (const e of await repairDb.getPendingVaultOutboxEntries()) await repairDb.putVaultOutboxEntry({ ...e, status: "done" });
   await repairDb.setVaultSyncState("memory:c-2", "2026-11-01T01:00:00.000Z");
   const second = await bgCheck(w, build, n); assert.equal(n.scans, 2); assert.equal(second.kind, "checked");

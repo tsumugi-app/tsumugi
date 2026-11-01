@@ -206,7 +206,7 @@ test("タブ・保存先が切り替わったら途中で止める（cancel）",
 test("確認の依存は読み取りだけ（readProgress・plan）。書き込みの口を持たない", () => {
   const src = fs.readFileSync("src/lib/vaultConsistency.ts", "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   assert.ok(!/\bimport\b/.test(src), "the classifier is pure (no imports)");
-  for (const w of [/\.put\(/, /\.add\(/, /\.delete\(/, /createWritable/, /removeEntry/, /setRecoveryCheckMarker/]) assert.ok(!w.test(src), String(w));
+  for (const w of [/\.put\(/, /objectStore|indexedDB/, /\.delete\(/, /createWritable/, /removeEntry/, /setRecoveryCheckMarker/]) assert.ok(!w.test(src), String(w));
   const wiring = fs.readFileSync("src/lib/vaultConsistencyCheck.ts", "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   assert.ok(wiring.includes("withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(root)))") && wiring.includes("readVaultSaveProgress"));
   assert.ok(!/withVaultSaveLock|runVaultWorldExclusive|applyRecovery\(|executeNarrow|runLegacyHeldCleanup/.test(wiring), "no save lock held across the scan; no repair");
