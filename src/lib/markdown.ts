@@ -417,8 +417,10 @@ export function parseMemoryDayFile(raw: string): MemoryObject[] {
  * (2) 各記録のfrontmatterの元の行がすべて残ること（知らない項目は書き直しで消える。既定の項目が足されるのは失われないので許す）、
  * (3) 本文が同じであること（「## Summary」の外の文章は書き直しで消える）。
  * frontmatterと本文は別々に比べる（本文の行が、書き足された既定の項目と同じ文字列でも、残ったことにしない）。並び順は問わない。
+ * U+FFFDを含むファイルも書き直さない（`file.text()`はUTF-8として読めないバイトをU+FFFDに置き換えるため、書き直すと元のバイトが失われる）。
  */
 export function memoryDayFileRewriteIsLossless(raw: string): boolean {
+  if (raw.includes("\uFFFD")) return false;
   const sections = (note: string) => note.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   for (const entry of raw.split(MEMORY_ENTRY_SEPARATOR).map((e) => e.trim()).filter((e) => e.length > 0)) {
     const parsed = parseMemoryObjectMarkdown(entry);

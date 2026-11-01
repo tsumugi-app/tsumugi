@@ -179,6 +179,27 @@ for (const device of ["desktop", "android"] as const) {
       expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);
     });
 
+    test("the day file gains bytes that are not UTF-8 after the checks: the save holds the record and those bytes survive", async ({ page }) => {
+      test.setTimeout(120_000);
+      await setup(page); await addHeldMemory(page);
+      const failed = await repair(page, { failSettle: true }).then(() => "finished", (e) => String(e));
+      expect(failed).toContain("the tab was closed");
+      const bytesOf = () => page.evaluate(async (DAY_FILE) => {
+        const dir = await (window as any).__root.getDirectoryHandle("Memories"); const fh = await dir.getFileHandle(DAY_FILE.split("/")[1]);
+        return [...new Uint8Array(await (await fh.getFile()).arrayBuffer())].join(",");
+      }, DAY_FILE);
+      await page.evaluate(async (DAY_FILE) => {
+        const dir = await (window as any).__root.getDirectoryHandle("Memories"); const fh = await dir.getFileHandle(DAY_FILE.split("/")[1]);
+        const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+        const w = await fh.createWritable(); await w.write(new Uint8Array([...bytes.slice(0, bytes.length - 2), 0xe9, ...bytes.slice(bytes.length - 2)])); await w.close();
+      }, DAY_FILE);
+      const before = await bytesOf();
+      expect(before.split(",")).toContain("233");
+      await page.evaluate(async () => { await (window as any).D.bootstrap.runSaveFoundationBootstrap({ root: (window as any).__root }); });
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("held");
+      expect(await bytesOf()).toBe(before);
+    });
+
     test("interrupted after the re-queue (the tab closed before the saves ran): nothing is lost, the normal save finishes it, and pressing again does nothing", async ({ page }) => {
       test.setTimeout(120_000);
       await setup(page); await addHeldMemory(page);
