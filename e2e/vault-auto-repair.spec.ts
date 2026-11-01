@@ -158,6 +158,27 @@ for (const device of ["desktop", "android"] as const) {
       expect(await outboxOf(page, "memory:repair-mem-4")).toBe("done");
     });
 
+    test("the day file changes after the checks and the tab closes: the normal save that finishes the job holds the record instead of dropping the new content", async ({ page }) => {
+      test.setTimeout(120_000);
+      await setup(page); await addHeldMemory(page);
+      const failed = await repair(page, { failSettle: true }).then(() => "finished", (e) => String(e));
+      expect(failed).toContain("the tab was closed");
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("pending");
+      await page.evaluate(async (DAY_FILE) => {
+        const dir = await (window as any).__root.getDirectoryHandle("Memories"); const fh = await dir.getFileHandle(DAY_FILE.split("/")[1]);
+        const text = await (await fh.getFile()).text();
+        const w = await fh.createWritable(); await w.write(text.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")); await w.close();
+      }, DAY_FILE);
+      const before = await files(page);
+      await page.evaluate(async () => { await (window as any).D.bootstrap.runSaveFoundationBootstrap({ root: (window as any).__root }); });   // the next start-up
+      expect(await outboxOf(page, "memory:repair-mem-3")).toBe("held");
+      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);                              // the note survives, nothing appended
+      const again = await repair(page);
+      expect(again.skipped).toEqual([{ reason: "day-file-not-mergeable", recordType: "memory", count: 1 }]);
+      expect(again.view.clean).toBe(false);
+      expect((await files(page))[DAY_FILE]).toBe(before[DAY_FILE]);
+    });
+
     test("interrupted after the re-queue (the tab closed before the saves ran): nothing is lost, the normal save finishes it, and pressing again does nothing", async ({ page }) => {
       test.setTimeout(120_000);
       await setup(page); await addHeldMemory(page);

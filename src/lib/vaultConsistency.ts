@@ -149,7 +149,7 @@ type SaveState = "settled" | "saving" | "retrying" | "held";
  */
 export function heldReasonKind(reason: string | null | undefined): "retry" | "conflict" | "other" {
   if (typeof reason !== "string") return "other";
-  if (/-unreadable$/.test(reason)) return "retry";
+  if (/-unreadable$/.test(reason) || reason === "memory-dayfile-not-mergeable") return "retry";
   if (/-conflict$/.test(reason)) return "conflict";
   return "other";
 }
@@ -289,7 +289,7 @@ export function classifyConsistency(plan: ConsistencyPlanLike, before: SaveProgr
     if (h.reason === "record-unavailable") add({ ...base, category: "retryable", reason: "record-changed" });
     else if (h.reason === "conflict") add({ ...base, category: "needsChoice", reason: "different-content" });
     // 同じ日のファイルはあるが、この記録が入っていない：通常の保存（既存の記録をすべて残して追加する）をやり直す。
-    // 実行の直前に、そのファイルが一字一句読み書きし直せる（追加で他の内容が失われない）ことを確かめ、だめなら確認が必要として残す
+    // 実行の直前に、そのファイルの書き直しで他の内容が失われないことを確かめ、だめなら確認が必要として残す
     else if (h.reason === "memory-dayfile-merge-required") add({ ...base, category: "repairable", reason: "day-file-merge", action: "resave" });
     else if (own.includes("duplicate-or-cross-type-id") || own.includes("multiple-memory-files-for-day")) add({ ...base, category: "needsChoice", reason: "multiple-copies" });
     else if (own.includes("orphan-registry-key") || own.includes("registry-identity-mismatch")) add({ ...base, category: "repairLater", reason: "registry-mismatch" });

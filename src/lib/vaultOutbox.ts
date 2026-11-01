@@ -57,6 +57,11 @@ export interface VaultOutboxEntry {
   status: VaultOutboxStatus;
   /** 本当のconflict等でheldになった理由。status!=="held"のときはnull。 */
   heldReason: string | null;
+  /**
+   * 自動修復が保存待ちに戻したMemory：実際に書き込む時点でも、日別ファイルの書き直しで何も失われないことを確かめる（失われるならheld）。
+   * 修復の確認の後にファイルが変わった場合や、中断後に通常の保存処理が続きを行う場合のため。同じ版のentryにだけ残る（新しい版では消える）。
+   */
+  requireLosslessDayFile?: boolean;
   createdAt: string;
   updatedAt: string;
 }

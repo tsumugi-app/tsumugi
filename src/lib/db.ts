@@ -1295,10 +1295,13 @@ export async function requeueRecordForVault(
       const outbox = tx.objectStore("vaultOutbox");
       const id = vaultOutboxIdFor(recordType, recordId);
       const existing = (await outbox.get(id)) as VaultOutboxEntry | undefined;
-      if (existing && existing.status === "pending" && existing.recordUpdatedAt === rec.updatedAt) result = "already-pending";
-      else {
+      const guard = recordType === "memory" ? { requireLosslessDayFile: true } : {};
+      if (existing && existing.status === "pending" && existing.recordUpdatedAt === rec.updatedAt) {
+        await outbox.put({ ...existing, ...guard });
+        result = "already-pending";
+      } else {
         const fresh = buildOutboxEntryForUpdate(undefined, recordType, recordId, rec.updatedAt, now);
-        await outbox.put({ ...fresh, createdAt: existing?.createdAt ?? now });
+        await outbox.put({ ...fresh, ...guard, createdAt: existing?.createdAt ?? now });
         result = "queued";
       }
     }

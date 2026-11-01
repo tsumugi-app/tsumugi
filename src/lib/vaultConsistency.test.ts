@@ -7,7 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
-  classifyConsistency, hasPendingSaves, runConsistencyCheck, saveProgressFingerprint, STALLED_SAVE_ATTEMPTS, ConsistencyCheckCancelledError,
+  classifyConsistency, hasPendingSaves, heldReasonKind, runConsistencyCheck, saveProgressFingerprint, STALLED_SAVE_ATTEMPTS, ConsistencyCheckCancelledError,
   type ConsistencyPlanLike, type SaveProgress, type SaveProgressEntry,
 } from "./vaultConsistency";
 import { deriveRecoveryUserView, recoveryAllowsLatest, RECOVERY_ATTENTION_TEXT, RECOVERY_REPAIR_BUTTON } from "./vaultRecoveryUserView";
@@ -349,6 +349,10 @@ test("保存が保留された記録：理由の形だけで分ける（読め�
     { action: "resave", reason: "save-held", recordType: "reflection", recordId: "m2" },
   ], "the Outbox type (reflection) is kept so that the right entry is re-queued");
   assert.deepEqual(r.repairableIds, [], "resave targets never go to the Recovery Apply");
+});
+
+test("修復の確認の後に書き直せなくなって保留された記録も、理由を調べ直せるよう修復の対象に残す", () => {
+  assert.equal(heldReasonKind("memory-dayfile-not-mergeable"), "retry");
 });
 
 test("保存が保留された記録は、走査で差分として見えなくても隠さない（保留が残る間は「最新」にしない）", () => {

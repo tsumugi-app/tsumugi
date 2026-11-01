@@ -252,6 +252,9 @@ test("同じ日のファイルへの追加：通常の保存の書き直しで�
   assert.equal(repair.dayFileRoundTrips(normal.replace("## Summary", "手で書き足した架空のメモ\n\n## Summary")), false, "text outside the summary would be dropped");
   assert.equal(repair.dayFileRoundTrips(normal + markdown.MEMORY_ENTRY_SEPARATOR + "---\ntitle: 架空\n---\n本文"), false, "an unparseable entry would be dropped");
   assert.equal(repair.dayFileRoundTrips("---\ntitle: 架空\n---\n本文"), false);
+  const inferred = markdown.memoryObjectToMarkdown(markdown.parseMemoryObjectMarkdown(markdown.memoryObjectToMarkdown(a))!).match(/^sourceType: .*$/m)![0];
+  assert.equal(repair.dayFileRoundTrips(markdown.memoryObjectToMarkdown(a).replace("## Summary", `${inferred}\n\n## Summary`)), false, "a body line equal to a generated default is still lost");
+  assert.equal(repair.dayFileRoundTrips(markdown.memoryObjectToMarkdown(a).replace("架空の内容-m1", "架空の内容-m1\n\n後から書き足した架空の段落")), true, "text in the summary is kept by the rewrite");
 });
 
 test("表示：理由ごとの件数と次の操作。本文・IDは出さない", () => {
