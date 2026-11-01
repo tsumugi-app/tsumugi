@@ -3,7 +3,6 @@
  * 規則と順序はvaultAutoRepair.tsにある。
  */
 import { getConversation, getMemoryObject, getPendingVaultOutboxEntries, getSource, readBackupDeviceSnapshot, requeueRecordForVault, RecoveryPendingError } from "./db";
-import { APP_BUILD_ID } from "./recoveryBackgroundCheck";
 import { isReflectionSummary } from "./vault";
 import { dayFileRoundTrips, runVaultAutoRepair, type AutoRepairEnv, type AutoRepairOutcome, type AutoRepairTargetInspection } from "./vaultAutoRepair";
 import { createVaultBackup } from "./vaultBackup";
@@ -32,6 +31,8 @@ export async function readVaultFileBytes(root: FileSystemDirectoryHandle, path: 
 export interface ProductionAutoRepairOptions {
   root: FileSystemDirectoryHandle;
   backend: string;
+  /** バックアップに記録するアプリのビルド識別子（ChatScreenがrecoveryBackgroundCheckのAPP_BUILD_IDを渡す。ここでは読み込まない：process.envを参照するため） */
+  build: string;
   isCancelled(): boolean;
   /** 通常の保存処理を1回流して終わるまで待つ。既定は起動時と同じ保存処理（Outboxの保存待ちを保存先へ反映する。world lockの共有モード） */
   settleSaves?(): Promise<void>;
@@ -58,7 +59,7 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
       withWorldRead: withVaultWorldRead,
       now: () => new Date().toISOString(),
       runId: () => `repair-${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "")}-${Math.random().toString(36).slice(2, 8)}`,
-      build: APP_BUILD_ID,
+      build: options.build,
       backend: options.backend,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       isCancelled: options.isCancelled,

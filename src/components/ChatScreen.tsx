@@ -120,7 +120,7 @@ import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
 import { deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
 import { resumeNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
-import { productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
+import { APP_BUILD_ID, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import { checkVaultConsistency } from "@/lib/vaultConsistencyCheck";
 import { runProductionVaultAutoRepair } from "@/lib/vaultAutoRepairRun";
 import type { AutoRepairOutcome } from "@/lib/vaultAutoRepair";
@@ -3670,6 +3670,7 @@ export default function ChatScreen() {
       const outcome = await runProductionVaultAutoRepair({
         root: handle,
         backend: getVaultBackend() ?? "unknown",
+        build: APP_BUILD_ID,
         isCancelled: () => generation !== vaultGenerationRef.current,
       });
       if (generation !== vaultGenerationRef.current) return;

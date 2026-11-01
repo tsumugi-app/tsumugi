@@ -204,6 +204,9 @@
   "+setRecoveryStatus({ kind: \"error\", message: \"修復を完了できませんでした。データは保持しています。もう一度「修復する」を押すと、同じ規則で確認し直します。\" });",
   "+endTask();",
   "+vaultOperationLockRef.current = false;",
-  "+autoRepairOutcome={autoRepairOutcome}"
- ]
+  "+autoRepairOutcome={autoRepairOutcome}",
+  "-import { productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from \"@/lib/recoveryBackgroundCheck\";",
+  "+import { APP_BUILD_ID, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from \"@/lib/recoveryBackgroundCheck\";",
+  "+build: APP_BUILD_ID,"
+]
 }

@@ -60,7 +60,7 @@ const addLocalOnlyConversation = (page: Page) => page.evaluate(async () => {
 const repair = (page: Page, o: { failSettle?: boolean } = {}) => page.evaluate(async ({ failSettle }) => {
   const { autoRepairRun, autoRepair } = (window as any).D;
   const outcome = await autoRepairRun.runProductionVaultAutoRepair({
-    root: (window as any).__root, backend: "opfs", isCancelled: () => false,
+    root: (window as any).__root, backend: "opfs", build: "e2e", isCancelled: () => false,
     checkOptions: { drainWaitMs: 1500, pollMs: 100, attempts: 3, retryDelayMs: 200 },
     ...(failSettle ? { settleSaves: async () => { throw new Error("fictional: the tab was closed before the saves ran"); } } : {}),
   });
