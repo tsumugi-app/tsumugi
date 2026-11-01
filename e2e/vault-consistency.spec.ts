@@ -68,7 +68,7 @@ for (const device of ["desktop", "android"] as const) {
     test("a completed save is clean, and the check writes nothing", async ({ page }) => {
       await setup(page); const before = await fingerprint(page);
       const r = await check(page);
-      expect(r.state).toBe("clean"); expect(r.categories).toEqual([]);
+      expect(r.state, JSON.stringify(r.categories)).toBe("clean"); expect(r.categories).toEqual([]);
       expect(await fingerprint(page)).toBe(before);
     });
 
@@ -77,7 +77,7 @@ for (const device of ["desktop", "android"] as const) {
       await putPending(page, "cons-mem-1", "架空の記録ひとつ（編集中）");
       const before = await fingerprint(page);
       const r = await check(page);
-      expect(r.state).toBe("saving"); expect(r.counts.saving).toBe(1);
+      expect(r.state, JSON.stringify(r.categories)).toBe("saving"); expect(r.counts.saving).toBe(1);
       expect(r.counts.needsChoice + r.counts.unknown + r.counts.repairLater).toBe(0);
       expect(await fingerprint(page)).toBe(before);
       await flush(page);
@@ -133,7 +133,7 @@ for (const device of ["desktop", "android"] as const) {
         })();
       });
       const r = await check(page);
-      expect(["clean", "saving", "unsettled"]).toContain(r.state);
+      expect(["clean", "saving", "unsettled"], JSON.stringify(r.categories)).toContain(r.state);
       await other.evaluate(async () => { (window as any).__stop = true; await (window as any).__loop; });
       await flush(page);
       expect((await check(page)).state).toBe("clean");
