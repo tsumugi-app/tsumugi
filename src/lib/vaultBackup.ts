@@ -38,6 +38,8 @@ export interface BackupSummary {
   /** Outboxで保存待ち（pending）・保留（held）の記録。端末の版がバックアップに入っていることを照合済み */
   pendingSaves: number;
   heldSaves: number;
+  /** 保存待ち・保留のentryのうち、記録そのものが端末に無いもの（Outboxだけが残った状態）。entryはそのまま退避する */
+  unsavedWithoutRecord: number;
   vaultFiles: number;
   vaultBytes: number;
   excludedCredentialKeys: number;
@@ -51,8 +53,8 @@ export interface BackupManifest {
   backend: string;
   vaultId: string | null;
   summary: BackupSummary;
-  /** 保存待ち・保留の記録（`recordType:recordId`と、Outboxが指す版） */
-  unsavedRecords: { outboxId: string; status: string; recordUpdatedAt: string }[];
+  /** 保存待ち・保留の記録（`recordType:recordId`・Outboxが指す版・その記録の端末の版がバックアップに入っているか） */
+  unsavedRecords: { outboxId: string; status: string; recordUpdatedAt: string; recordInBackup: boolean }[];
   device: { stores: Record<string, { count: number; path: string }>; handleKeys: string[] };
   /** manifest以外の全エントリ（ZIP内のパス・大きさ・SHA-256） */
   entries: { path: string; size: number; sha256: string }[];
@@ -172,11 +174,18 @@ function toJson(value: unknown): string {
 const devicePath = (store: string) => `device/${store}.json`;
 const vaultPath = (path: string) => `vault/${path}`;
 
-function unsavedOf(device: BackupDeviceSnapshot): BackupManifest["unsavedRecords"] {
-  return device.stores.vaultOutbox
-    .map((row) => row.value as { id: string; status: string; recordUpdatedAt: string })
+type OutboxLike = { id: string; status: string; recordType: string; recordId: string; recordUpdatedAt: string };
+/** Outboxのentryが指す記録（端末の版）が、端末データの中にあるか */
+function recordPresent(stores: Record<BackupDeviceStore, { value: unknown }[]>, e: OutboxLike): boolean {
+  const store = BACKUP_STORE_OF_RECORD_TYPE[e.recordType];
+  const rows = store ? stores[store] : BACKUP_DEVICE_STORES.flatMap((name) => stores[name]);
+  return rows.some((row) => (row.value as { id?: unknown } | null)?.id === e.recordId);
+}
+function unsavedOf(stores: Record<BackupDeviceStore, { value: unknown }[]>): BackupManifest["unsavedRecords"] {
+  return stores.vaultOutbox
+    .map((row) => row.value as OutboxLike)
     .filter((e) => e.status !== "done")
-    .map((e) => ({ outboxId: e.id, status: e.status, recordUpdatedAt: e.recordUpdatedAt }))
+    .map((e) => ({ outboxId: e.id, status: e.status, recordUpdatedAt: e.recordUpdatedAt, recordInBackup: recordPresent(stores, e) }))
     .sort((a, b) => (a.outboxId < b.outboxId ? -1 : 1));
 }
 
@@ -196,7 +205,7 @@ export async function buildBackupEntries(
   }
   let vaultBytes = 0;
   for (const file of vault) { body.push({ path: vaultPath(file.path), data: file.data }); vaultBytes += file.data.byteLength; }
-  const unsavedRecords = unsavedOf(device);
+  const unsavedRecords = unsavedOf(device.stores);
   const identity = device.stores.vaultIdentity[0]?.value as { vaultId?: unknown } | undefined;
   const manifest: BackupManifest = {
     format: BACKUP_FORMAT,
@@ -212,6 +221,7 @@ export async function buildBackupEntries(
       sources: device.stores.sources.length,
       pendingSaves: unsavedRecords.filter((r) => r.status === "pending").length,
       heldSaves: unsavedRecords.filter((r) => r.status === "held").length,
+      unsavedWithoutRecord: unsavedRecords.filter((r) => !r.recordInBackup).length,
       vaultFiles: vault.length,
       vaultBytes,
       excludedCredentialKeys: device.excludedCredentialKeys,
@@ -260,20 +270,19 @@ export async function verifyBackupZip(bytes: Uint8Array, expected?: BackupManife
       device[name] = Array.isArray(rows) ? rows : [];
     } catch { problems.push(`device-unreadable:${name}`); device[name] = []; }
   }
-  // 保存待ち・保留の記録：Outboxのentryが全部manifestに載っていて、その記録（端末の版）が端末データに入っていること
-  const outbox = device.vaultOutbox.map((row) => row.value as { id: string; status: string; recordType: string; recordId: string; recordUpdatedAt: string });
-  const unsaved = outbox.filter((e) => e.status !== "done");
-  const listedUnsaved = new Set((manifest.unsavedRecords ?? []).map((r) => `${r.outboxId}|${r.status}|${r.recordUpdatedAt}`));
+  // 保存待ち・保留の記録：Outboxのentryが全部manifestに載っていて、manifestが「入っている」とした記録（端末の版）が本当に端末データに入っていること
+  const unsaved = device.vaultOutbox.map((row) => row.value as OutboxLike).filter((e) => e.status !== "done");
+  const listedUnsaved = new Map((manifest.unsavedRecords ?? []).map((r) => [`${r.outboxId}|${r.status}|${r.recordUpdatedAt}`, r.recordInBackup]));
   if (listedUnsaved.size !== unsaved.length) problems.push("unsaved-count");
   for (const e of unsaved) {
-    if (!listedUnsaved.has(`${e.id}|${e.status}|${e.recordUpdatedAt}`)) problems.push(`unsaved-unlisted:${e.id}`);
-    const store = BACKUP_STORE_OF_RECORD_TYPE[e.recordType];
-    const rows = store ? device[store] : BACKUP_DEVICE_STORES.flatMap((name) => device[name]);
-    if (!rows.some((row) => (row.value as { id?: unknown })?.id === e.recordId)) problems.push(`unsaved-record-missing:${e.id}`);
+    const claimed = listedUnsaved.get(`${e.id}|${e.status}|${e.recordUpdatedAt}`);
+    if (claimed === undefined) { problems.push(`unsaved-unlisted:${e.id}`); continue; }
+    if (claimed !== recordPresent(device, e)) problems.push(`unsaved-record-missing:${e.id}`);
   }
   const s = manifest.summary;
   if (!s || s.conversations !== device.conversations.length || s.memories !== device.memoryObjects.length || s.sources !== device.sources.length
     || s.pendingSaves !== unsaved.filter((e) => e.status === "pending").length || s.heldSaves !== unsaved.filter((e) => e.status === "held").length
+    || s.unsavedWithoutRecord !== unsaved.filter((e) => !recordPresent(device, e)).length
     || s.vaultFiles !== manifest.entries.filter((e) => e.path.startsWith("vault/")).length) problems.push("summary-differs");
   return problems.length ? { ok: false, problems } : { ok: true, manifest };
 }

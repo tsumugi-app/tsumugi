@@ -173,7 +173,7 @@ test("a backup holds both sides: every device record (pending / held saves inclu
   assert.equal(r.ok, true, JSON.stringify(r));
   if (!r.ok) return;
   assert.equal(r.path, ".tsumugi/repair-backup/backup-20261101-000000-test.zip");
-  assert.deepEqual(r.summary, { conversations: 1, memories: 3, sources: 0, pendingSaves: 1, heldSaves: 1, vaultFiles: 9, vaultBytes: r.summary.vaultBytes, excludedCredentialKeys: 1 });
+  assert.deepEqual(r.summary, { conversations: 1, memories: 3, sources: 0, pendingSaves: 1, heldSaves: 1, unsavedWithoutRecord: 0, vaultFiles: 9, vaultBytes: r.summary.vaultBytes, excludedCredentialKeys: 1 });
   // nothing existing changed; only two NEW files in the backup folder
   for (const [p, hex] of before) assert.equal(Buffer.from(vault.files.get(p)!).toString("hex"), hex, p);
   assert.deepEqual(vault.written.sort(), [".tsumugi/repair-backup/backup-20261101-000000-test.verified.json", ".tsumugi/repair-backup/backup-20261101-000000-test.zip"]);
@@ -263,6 +263,17 @@ test("a value JSON cannot hold (e.g. a Date) fails the backup instead of silentl
   assert.deepEqual(vault.written, []);
 });
 
+test("an Outbox entry whose record no longer exists is kept as it is and marked, and does not make every backup fail", async () => {
+  const base = device();
+  const orphan = device({ vaultOutbox: [...base.stores.vaultOutbox, { key: "memory:mem-gone", value: outbox("memory", "mem-gone", "pending") }] } as never);
+  const vault = new MemVault(VAULT_FILES);
+  const r = await backup.createVaultBackup(env(vault, () => orphan));
+  assert.equal(r.ok, true, JSON.stringify(r)); if (!r.ok) return;
+  assert.equal(r.summary.unsavedWithoutRecord, 1); assert.equal(r.summary.pendingSaves, 2);
+  const manifest = JSON.parse(text(new Map(zip.readZipEntries(r.zip).map((e) => [e.path, e.data])).get("manifest.json")!));
+  assert.deepEqual(manifest.unsavedRecords.filter((u: { recordInBackup: boolean }) => !u.recordInBackup).map((u: { outboxId: string }) => u.outboxId), ["memory:mem-gone"]);
+});
+
 test("verification finds a missing unsaved record, a changed entry, an unlisted entry and a wrong summary", async () => {
   const { entries, manifest } = await backup.buildBackupEntries(device(), [{ path: "Memories/a.md", data: bytes("架空") }], { runId: "r", createdAt: T, build: "t", backend: "opfs" });
   assert.equal((await backup.verifyBackupZip(zip.createZipBytes(entries), manifest)).ok, true);
@@ -297,7 +308,7 @@ test("which Vault paths are backed up", () => {
 });
 
 test("screen text: counts only, unsaved records mentioned, failures say what to do", () => {
-  assert.equal(backup.backupSummaryText({ conversations: 2, memories: 5, sources: 0, pendingSaves: 1, heldSaves: 1, vaultFiles: 9, vaultBytes: 1, excludedCredentialKeys: 0 }),
+  assert.equal(backup.backupSummaryText({ conversations: 2, memories: 5, sources: 0, pendingSaves: 1, heldSaves: 1, unsavedWithoutRecord: 0, vaultFiles: 9, vaultBytes: 1, excludedCredentialKeys: 0 }),
     "会話2件・Memory 5件・保存先のファイル9件（保存先へ未反映の記録2件も含みます）");
   assert.match(backup.backupFailureText({ ok: false, reason: "unreadable", retryable: true, count: 2 }), /2件.*一部だけのバックアップは作りません/);
   assert.match(backup.backupFailureText({ ok: false, reason: "verify-failed", retryable: true }), /読み戻して内容を確認できませんでした/);
