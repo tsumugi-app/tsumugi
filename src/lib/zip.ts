@@ -161,40 +161,47 @@ export class ZipFormatError extends Error {
 }
 
 /**
- * createZipBytesが作る形式（store方式・ZIP64なし）のZIPを読む。各エントリのCRC32をローカルヘッダ・セントラルディレクトリの
- * 両方と照合し、壊れていればZipFormatErrorを投げる（途中まで読めた結果は返さない）。バックアップの読み戻し検証用。
+ * createZipBytesが作る形式（store方式・ZIP64なし・データ記述子なし）のZIPを厳密に読む（バックアップの読み戻し検証用）。
+ * 終端レコード（件数・位置・コメント長）、セントラルディレクトリを最後まで読み切ったこと、各エントリのローカルヘッダとセントラルヘッダの
+ * 一致（方式・フラグ・CRC・大きさ・名前）、エントリが隙間・重なりなく並んでいること、CRC32を確かめ、どれかが合わなければ
+ * ZipFormatErrorを投げる（途中まで読めた結果は返さない）。
  */
 export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Array }[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const fail = (code: string): never => { throw new ZipFormatError(code); };
   let eocd = -1;
   for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 0xffff); i--) {
-    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    if (view.getUint32(i, true) === 0x06054b50 && i + 22 + view.getUint16(i + 20, true) === bytes.length) { eocd = i; break; }
   }
   if (eocd < 0) fail("zip-no-end-record");
   const count = view.getUint16(eocd + 10, true);
   const centralSize = view.getUint32(eocd + 12, true);
   const centralOffset = view.getUint32(eocd + 16, true);
-  if (centralOffset + centralSize > eocd) fail("zip-bad-central-directory");
+  if (view.getUint16(eocd + 4, true) !== 0 || view.getUint16(eocd + 6, true) !== 0 || view.getUint16(eocd + 8, true) !== count) fail("zip-bad-end-record");
+  if (centralOffset + centralSize !== eocd) fail("zip-bad-central-directory");
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const out: { path: string; data: Uint8Array }[] = [];
   const seen = new Set<string>();
   let at = centralOffset;
+  let nextLocal = 0;   // エントリは先頭から隙間なく並ぶ
   for (let n = 0; n < count; n++) {
     if (at + 46 > eocd || view.getUint32(at, true) !== 0x02014b50) fail("zip-bad-central-entry");
+    const flags = view.getUint16(at + 8, true);
     const method = view.getUint16(at + 10, true);
     const crc = view.getUint32(at + 16, true);
     const size = view.getUint32(at + 20, true);
-    if (method !== STORE_METHOD || view.getUint32(at + 24, true) !== size) fail("zip-unsupported-entry");
+    if ((flags & ~UTF8_FLAG) !== 0 || method !== STORE_METHOD || view.getUint32(at + 24, true) !== size) fail("zip-unsupported-entry");
     const nameLength = view.getUint16(at + 28, true);
-    const skip = nameLength + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
+    const next = at + 46 + nameLength + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
+    if (next > eocd) fail("zip-bad-central-entry");
     const localOffset = view.getUint32(at + 42, true);
     let path = "";
     try { path = decoder.decode(bytes.subarray(at + 46, at + 46 + nameLength)); } catch { fail("zip-bad-name"); }
     if (seen.has(path)) fail("zip-duplicate-entry");
     seen.add(path);
-    if (localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== 0x04034b50) fail("zip-bad-local-header");
-    if (view.getUint32(localOffset + 14, true) !== crc || view.getUint32(localOffset + 18, true) !== size) fail("zip-header-mismatch");
+    if (localOffset !== nextLocal || localOffset + 30 > centralOffset || view.getUint32(localOffset, true) !== 0x04034b50) fail("zip-bad-local-header");
+    if (view.getUint16(localOffset + 6, true) !== flags || view.getUint16(localOffset + 8, true) !== method || view.getUint32(localOffset + 14, true) !== crc
+      || view.getUint32(localOffset + 18, true) !== size || view.getUint32(localOffset + 22, true) !== size) fail("zip-header-mismatch");
     const localNameLength = view.getUint16(localOffset + 26, true);
     const centralName = bytes.subarray(at + 46, at + 46 + nameLength), localName = bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength);
     if (localNameLength !== nameLength || localName.some((b, i) => b !== centralName[i])) fail("zip-header-mismatch");
@@ -203,7 +210,9 @@ export function readZipEntries(bytes: Uint8Array): { path: string; data: Uint8Ar
     const data = bytes.subarray(dataStart, dataStart + size);
     if (crc32(data) !== crc) fail("zip-crc-mismatch");
     out.push({ path, data });
-    at += 46 + skip;
+    nextLocal = dataStart + size;
+    at = next;
   }
+  if (at !== eocd || nextLocal !== centralOffset) fail("zip-bad-central-directory");   // 宣言より多い・少ないエントリ、余分なバイト
   return out;
 }

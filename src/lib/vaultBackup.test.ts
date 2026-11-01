@@ -164,6 +164,17 @@ test("ZIP: binary-exact round trip with Japanese names; a flipped byte is caught
   const badData = z.slice(); badData[dataAt] ^= 0xff;
   assert.throws(() => zip.readZipEntries(badData), (e: Error) => e instanceof zip.ZipFormatError && e.code === "zip-crc-mismatch");
   assert.throws(() => zip.readZipEntries(z.slice(0, z.length - 10)), (e: Error) => e instanceof zip.ZipFormatError);
+  // contradictory or incomplete headers (Codex review of 5f0fd27): a lowered entry count, a missing declared comment, a local method that differs
+  const eocd = z.length - 22;
+  const fewer = z.slice(); new DataView(fewer.buffer).setUint16(eocd + 8, 1, true); new DataView(fewer.buffer).setUint16(eocd + 10, 1, true);
+  assert.throws(() => zip.readZipEntries(fewer), (e: Error) => e instanceof zip.ZipFormatError);
+  const comment = z.slice(); new DataView(comment.buffer).setUint16(eocd + 20, 5, true);
+  assert.throws(() => zip.readZipEntries(comment), (e: Error) => e instanceof zip.ZipFormatError);
+  const deflate = z.slice(); new DataView(deflate.buffer).setUint16(8, 8, true);
+  assert.throws(() => zip.readZipEntries(deflate), (e: Error) => e instanceof zip.ZipFormatError && e.code === "zip-header-mismatch");
+  const padded = new Uint8Array(z.length + 3); padded.set(z.subarray(0, eocd)); padded.set(z.subarray(eocd), eocd + 3);   // stray bytes before the end record
+  assert.throws(() => zip.readZipEntries(padded), (e: Error) => e instanceof zip.ZipFormatError);
+  assert.deepEqual(zip.readZipEntries(zip.createZipBytes([])), []);
 });
 
 test("a backup holds both sides: every device record (pending / held saves included), every Tsumugi Vault file byte-exact, both versions of a conflicting record; it is read back and verified", async () => {
