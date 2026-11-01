@@ -113,6 +113,12 @@ class FakeTransaction {
         for (const [k, op] of staging) { if (op.op === "delete") merged.delete(k); else merged.set(k, op.value); }
         return [...merged.values()];
       },
+      /** keys in the same order as getAll() (committed values overlaid with this transaction's staged writes). */
+      async getAllKeys() {
+        const merged = new Map<Key, unknown>(store.committed);
+        for (const [k, op] of staging) { if (op.op === "delete") merged.delete(k); else merged.set(k, op.value); }
+        return [...merged.keys()];
+      },
     };
   }
 

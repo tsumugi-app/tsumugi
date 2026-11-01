@@ -1251,6 +1251,27 @@ export async function getHeldVaultOutboxEntries(): Promise<VaultOutboxEntry[]> {
 }
 
 /**
+ * 保存の進行状況（Outboxの全entryとsync ledger）を1つのreadonly transactionで読む。整合性確認（vaultConsistency.ts）が、
+ * 走査の前後で保存処理が動いたか・その記録が保存待ちかを判定するためだけに使う。何も書かない。
+ */
+export async function readVaultSaveProgress(): Promise<import("./vaultConsistency").SaveProgress> {
+  const db = await getDB();
+  const tx = db.transaction(["vaultOutbox", "vaultSyncState"], "readonly");
+  const [entries, keys, values] = await Promise.all([
+    tx.objectStore("vaultOutbox").getAll(),
+    tx.objectStore("vaultSyncState").getAllKeys(),
+    tx.objectStore("vaultSyncState").getAll(),
+  ]);
+  await tx.done;
+  const ledger: Record<string, string> = {};
+  keys.forEach((key, i) => { if (typeof values[i] === "string") ledger[String(key)] = values[i] as string; });
+  return {
+    outbox: (entries as VaultOutboxEntry[]).map((e) => ({ id: e.id, status: e.status, recordUpdatedAt: e.recordUpdatedAt, attempts: e.attempt?.count ?? 0, lastError: e.attempt?.lastError ?? null, updatedAt: e.updatedAt })),
+    ledger,
+  };
+}
+
+/**
  * Projectionの比較ルールのversionごとに「held outboxを再評価済みか」を記録する（settingsの1キー。DB schema変更なし）。
  * ルールが変わらない限り、heldは毎起動では再試行されない。
  */

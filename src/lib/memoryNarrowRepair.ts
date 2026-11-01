@@ -431,18 +431,19 @@ export async function runExplicitRepairPreflight(root: FileSystemDirectoryHandle
 }
 
 /**
- * The user-facing "修復する" for this repair. Same code, same guards as the explicit debug entry, without the debugLog gate:
- * a NEW repair runs only when the READ ONLY pre-repair check (every guard) passes; an in-progress narrow repair is resumed
- * with its own journaled verification. Holds the world lock like the repair. Never reports success unless the repair completed.
+ * The only part of this repair that a normal user can reach: finishing a narrow repair that was ALREADY started (an in-progress
+ * narrow-repair journal blocks normal Vault writes until it completes) with its own journaled verification. It never starts a new
+ * repair: this repair was written for one past case (fixed day-file / Link counts) and is not a general repair. A new run exists only
+ * behind `?debugLog=1` (`runExplicitMemoryRepair`). Holds the world lock like the repair. Never reports success unless it completed.
  */
 export type UserRepairResult = { status: "repaired" | "not-repairable" | "incomplete" | "unavailable" };
-export async function runNarrowRepairForUser(root: FileSystemDirectoryHandle, confirmed: RecoveryApplyPlan | null, options: { apply?: RecoveryApplyEnv } = {}): Promise<UserRepairResult> {
+export async function resumeNarrowRepairForUser(root: FileSystemDirectoryHandle, options: { apply?: RecoveryApplyEnv } = {}): Promise<UserRepairResult> {
   const locked = await runVaultWorldExclusive(async (): Promise<UserRepairResult> => {
     const env = createProductionNarrowRepairEnv(root, options.apply);
     const journal = await readRecoveryJournal(env.apply.store);
     const resuming = journal.kind === "journal" && journal.journal.status === "in-progress" && !!journal.journal.narrowMemoryRepair;
-    if (!resuming && !(await runNarrowRepairPreflight(env, confirmed)).allPass) return { status: "not-repairable" };
-    const result = await executeNarrowMemoryRepair(env, resuming ? null : confirmed);
+    if (!resuming) return { status: "not-repairable" };
+    const result = await executeNarrowMemoryRepair(env, null);
     return { status: result.status === "complete" ? "repaired" : "incomplete" };
   });
   return locked.timedOut || !locked.result ? { status: "unavailable" } : locked.result;

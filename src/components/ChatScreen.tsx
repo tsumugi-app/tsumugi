@@ -104,10 +104,10 @@ import { executeOrphanCleanup, planOrphanCleanup, type OrphanCleanupResult, type
 import {
   applyRecovery,
   createRecoveryApplyEnv,
-  planRecoveryApply,
   readRecoveryState,
   type RecoveryApplyResult,
   type RecoveryApplyPlan,
+  type RecoveryConfirmedSet,
 } from "@/lib/vaultRecoveryApply";
 import { dbRecoveryJournalStore } from "@/lib/vaultRecoveryJournal";
 import {
@@ -119,8 +119,10 @@ import {
 import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
 import { deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
-import { runNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
-import { isRecoveryClean, productionRecoveryBackgroundDeps, recordRecoveryCheck, recoveryStatusFromCheck, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
+import { resumeNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
+import { productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
+import { checkVaultConsistency } from "@/lib/vaultConsistencyCheck";
+import type { ConsistencyReport } from "@/lib/vaultConsistency";
 import {
   VAULT_STATUS_AUTO_CLASSIFY_LIMIT,
   applyVaultStatusCleanup,
@@ -336,8 +338,6 @@ export type RecoveryUiStatus =
   | { kind: "scanning" }
   /** 自動検出済みで、確認が必要な記録も復旧できる記録も無い（通常ユーザー向け表示では何も出さない）。 */
   | { kind: "clean" }
-  /** 過去の背景検査で異常が確定している（再起動後。planは「修復する」を押したときに作り直す）。 */
-  | { kind: "known-issue" }
   | { kind: "plan"; applyPlan: RecoveryApplyPlan; generation: number }
   | { kind: "interrupted" }
   | { kind: "executing" }
@@ -410,6 +410,10 @@ const STARTUP_CONNECT_LIMIT = 3;
 type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed";
 
 const STARTUP_CAPTURE_LIMIT = 3;
+
+/** 保存待ち・未確定の整合性確認を、自動で確認し直す回数と間隔（有限。尽きたら「もう一度確認する」で確認し直せる）。 */
+const RECOVERY_RECHECK_LIMIT = 3;
+const RECOVERY_RECHECK_DELAY_MS = 30_000;
 
 /**
  * Vault境界の安全性（Codexレビュー指摘：永久待機フェイルセーフ）。別Vaultへの切替時、
@@ -791,12 +795,14 @@ export default function ChatScreen() {
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
   const startupRecoveryCheckRanRef = useRef(false);
-  /** Recovery背景検査（読み取りだけ）。ビルド × Vaultごとに未検査の場合だけ1回。Settingsを開くこととは無関係。 */
+  /** 保存先の整合性の背景確認（読み取りだけ）。ビルド × Vaultごとに、正常と確定するまで。Settingsを開くこととは無関係。 */
   const recoveryDetectionRanRef = useRef(false);
   const [recoveryDetectionFailed, setRecoveryDetectionFailed] = useState(false);
   const [recoveryChecking, setRecoveryChecking] = useState(false);
-  /** 直前の「修復する」が完了しなかった（異常表示を維持し、最新状態と誤表示しない）。 */
-  const [userRepairIncomplete, setUserRepairIncomplete] = useState(false);
+  /** 直近の確定した（または保存中で未確定の）整合性確認の結果。種類・件数・理由の表示と、「修復する」の対象に使う。 */
+  const [consistencyReport, setConsistencyReport] = useState<ConsistencyReport | null>(null);
+  /** 保存待ち・未確定のときに自動で確認し直した回数（有限回）。 */
+  const recoveryRecheckCountRef = useRef(0);
   /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
   const startupSaveFoundationBootstrapRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
@@ -1438,7 +1444,8 @@ export default function ChatScreen() {
     recoveryDetectionRanRef.current = false;
     setRecoveryDetectionFailed(false);
     setRecoveryChecking(false);
-    setUserRepairIncomplete(false);
+    setConsistencyReport(null);
+    recoveryRecheckCountRef.current = 0;
     setLegacyHeldCleanupStatus({ kind: "idle" });
     setVaultMeasure(null);
     setVaultHoldMeasure({ measured: false, count: 0 });
@@ -3543,35 +3550,43 @@ export default function ChatScreen() {
   }
 
   /**
-   * Recoveryの背景検査。保存先が使え、startupが落ち着いた後に、ビルド × Vault identityごとに未検査の場合だけ、
-   * 既存のRecovery plan（READ ONLY）を1回作る。結果は「異常が確定したときだけ」通常UIに現れる
-   * （検査中の表示は無い。検査できなかった場合は「最新」とも「異常」とも断定しない）。
-   * 操作中は少し待って再試行する。同じビルド・同じVaultでは、再起動しても再scanしない。
+   * 保存先の整合性の背景確認（READ ONLY）。保存先が使え、startupが落ち着いた後に、ビルド × Vault identityごとに、正常と確定するまで
+   * 確認する（`checkVaultConsistency`：rawなRecovery planに保存の進行状況を重ねる。保存ロックは取らず、保存処理と重なった走査は
+   * 確定させない）。正常と確定したビルド・Vaultでは再起動しても再走査しない。以前の「異常」は次の起動で確認し直す。
+   * 保存待ち・未確定のときは、少し後に有限回だけ自動で確認し直す。何も修復しない。
    */
   async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle) {
     if (recoveryDetectionRanRef.current) return;
     recoveryDetectionRanRef.current = true;
     const generation = vaultGenerationRef.current;
-    // 検査は必ず終わる：待機・再試行は有限回で、尽きたら「failed」を表示する（空白のままにしない）。
-    const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, () => generation !== vaultGenerationRef.current);
+    const cancelled = () => generation !== vaultGenerationRef.current;
+    // 確認は必ず終わる：待機・やり直しは有限回で、尽きたら「確認できませんでした」を表示する（空白のままにしない）。
+    const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, cancelled);
     if (waited === "cancelled") return;
-    const idle = waited === "idle";
-    if (!idle) { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
-    // 既知の異常がある間は「検査中」で上書きしない（隠さない）。
+    if (waited !== "idle") { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
+    // 既知の結果がある間は消さない（隠さない）。確認中であることだけを足す。
     setRecoveryChecking(true);
     try {
-      const result = await runBackgroundRecoveryCheck(
-        // 正常かどうかは必ずrawなplanで決める（archive済みの記録も「解決済み」にはしない）。identityには依存しない。
-        productionRecoveryBackgroundDeps(() => withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(handle))))
-      );
-      if (generation !== vaultGenerationRef.current) return;
-      const checked = recoveryStatusFromCheck(result);
-      if (!checked) { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
+      const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)));
+      if (cancelled()) return;
+      if (result.kind === "failed") { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
       setRecoveryDetectionFailed(false);
-      const next: RecoveryUiStatus = checked.kind === "plan" ? { kind: "plan", applyPlan: checked.applyPlan, generation } : checked;
-      if (checked.kind === "plan" && checked.applyPlan.recoverableCount > 0) setUserRepairIncomplete(false); // 修復できる記録が見つかれば、ボタンを再び出せる
-      // 中断journalの検出（起動時）や実行中の状態は上書きしない。
-      setRecoveryStatus((current) => (current.kind === "idle" ? next : current));
+      if (result.kind === "skipped") {
+        setConsistencyReport(null);
+        setRecoveryStatus((current) => (current.kind === "idle" ? { kind: "clean" } : current));
+        return;
+      }
+      const { report, plan } = result;
+      setConsistencyReport(report);
+      // 中断journalの検出（起動時）・実行中・開発者向けの確認中の状態は上書きしない。
+      setRecoveryStatus((current) =>
+        current.kind === "executing" || current.kind === "interrupted" || current.kind === "scanning" ? current
+          : report.state === "clean" ? { kind: "clean" } : { kind: "plan", applyPlan: plan, generation });
+      if ((report.state === "saving" || report.state === "unsettled") && recoveryRecheckCountRef.current < RECOVERY_RECHECK_LIMIT) {
+        recoveryRecheckCountRef.current += 1;
+        recoveryDetectionRanRef.current = false;
+        window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle); }, RECOVERY_RECHECK_DELAY_MS);
+      }
     } catch (error) {
       recoveryDetectionRanRef.current = false;
       if (handleStaleVaultTabError(error)) return;
@@ -3582,73 +3597,54 @@ export default function ChatScreen() {
     }
   }
 
+  /** 「もう一度確認する」（READ ONLY）。確認中は何もしない。自動の再確認の回数も数え直す。 */
+  function handleRecheckRecovery() {
+    if (!vaultHandle || recoveryChecking || recoveryDetectionRanRef.current) return;
+    recoveryRecheckCountRef.current = 0;
+    setRecoveryStatus((current) => (current.kind === "error" || current.kind === "done" ? { kind: "idle" } : current));
+    void startRecoveryBackgroundCheck(vaultHandle);
+  }
+
   /**
-   * 通常ユーザー向けの「修復する」。復旧できる記録があれば既存の「復旧する」（applyRecovery）、無ければ保留中の記録の
-   * 限定修復（全ての安全条件を読み取りで確認してから実行。確認できなければ何も変更しない）。完了しても
-   * 「最新」とは断定せず、必ず現在の状態を再検出し、異常が残っていれば異常表示を維持する。
+   * 通常ユーザー向けの「修復する」。今のバージョンで安全に直せる記録（確認の結果の`repairableIds`：保存先に無い記録の書き出し・
+   * 管理情報の更新。保存待ちの記録は含まない）だけを、既存の「復旧する」（applyRecovery）で直す。直せる記録が無ければ何も実行しない
+   * （直せない状態で長時間の処理を走らせない）。2026-10-03の事例専用の限定修復は、ここからは新しく実行しない：途中で止まった
+   * 限定修復の続きを完了することだけを行う（未完了のjournalは保存先への書き込みを止めているため）。
+   * どちらの場合も、終わったら確認し直し、「最新」とは断定しない。
    */
   async function handleUserRepair() {
     if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
-    let plan = recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan : null;
-    const wasInterrupted = recoveryStatus.kind === "interrupted";
-    setUserRepairIncomplete(false);
-    if (plan && plan.recoverableCount > 0) {
-      await handleExecuteRecoveryApply();
+    if (recoveryStatus.kind === "interrupted") {
+      const generation = vaultGenerationRef.current;
+      vaultOperationLockRef.current = true;
+      const endTask = beginMemoryTask();
+      setRecoveryStatus({ kind: "executing" });
+      let resumed: Awaited<ReturnType<typeof resumeNarrowRepairForUser>>["status"] = "unavailable";
+      try {
+        resumed = (await resumeNarrowRepairForUser(vaultHandle)).status;
+      } catch (error) {
+        if (handleStaleVaultTabError(error)) { setRecoveryStatus({ kind: "idle" }); return; }
+        console.error("[Tsumugi] resuming the interrupted repair failed", error);
+        setRecoveryStatus({ kind: "interrupted" });
+        return;
+      } finally {
+        endTask();
+        vaultOperationLockRef.current = false;
+      }
+      if (generation !== vaultGenerationRef.current) return;
+      // 中断していたのが通常の復旧（限定修復ではない）なら、従来どおり通常の再開に任せる。
+      if (resumed === "not-repairable") { await handleExecuteRecoveryApply({ resumeOnly: true }); return; }
+      if (resumed === "unavailable") { setRecoveryStatus({ kind: "interrupted" }); return; }
+      setRecoveryStatus(resumed === "repaired" ? { kind: "idle" } : { kind: "interrupted" });
+      setConsistencyReport(null);
+      recoveryRecheckCountRef.current = 0;
+      recoveryDetectionRanRef.current = false;
+      void startRecoveryBackgroundCheck(vaultHandle);
       return;
     }
-    const generation = vaultGenerationRef.current;
-    vaultOperationLockRef.current = true;
-    const endTask = beginMemoryTask();
-    setRecoveryStatus({ kind: "executing" });
-    try {
-      if (!plan && !wasInterrupted) {
-        // 再起動後など、planを持っていない場合（過去の検査で異常が確定していた）：このクリックで現在の状態を確認し直す。
-        plan = await withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(vaultHandle)));
-        if (generation !== vaultGenerationRef.current) return;
-        if (isRecoveryClean(plan)) {
-          await recordRecoveryCheck(true);
-          setRecoveryStatus({ kind: "clean" });
-          return;
-        }
-        if (plan.recoverableCount > 0) {
-          // 復旧できる記録がある：通常の「復旧する」（applyRecovery）へ。このhandlerのlockを先に解放する。
-          setRecoveryStatus({ kind: "plan", applyPlan: plan, generation });
-          vaultOperationLockRef.current = false;
-          endTask();
-          await handleExecuteRecoveryApply();
-          return;
-        }
-      }
-      const result = await runNarrowRepairForUser(vaultHandle, plan);
-      if (generation !== vaultGenerationRef.current) return;
-      if (wasInterrupted && result.status === "not-repairable") {
-        // 中断していたのが通常のRecovery（限定修復ではない）なら、従来どおり通常の再開に任せる。
-        vaultOperationLockRef.current = false;
-        endTask();
-        await handleExecuteRecoveryApply();
-        return;
-      }
-      // 修復後の再検査もrawなplan。archiveへ退避しただけの記録は「解決済み」ではない。
-      const applyPlan = await withVaultWorldRead(() => planRecoveryApply(createRecoveryApplyEnv(vaultHandle)));
-      if (generation !== vaultGenerationRef.current) return;
-      const anomalies = !isRecoveryClean(applyPlan);
-      setRecoveryStatus(anomalies ? { kind: "plan", applyPlan, generation } : { kind: "clean" });
-      await recordRecoveryCheck(!anomalies); // 再検査の結果（正常が確認できた場合だけ「正常」と記録する）
-      setUserRepairIncomplete(result.status !== "repaired" || anomalies);
-    } catch (error) {
-      if (handleStaleVaultTabError(error)) {
-        setRecoveryStatus({ kind: "idle" });
-        return;
-      }
-      console.error("[Tsumugi] user repair failed", error);
-      setRecoveryStatus(plan ? { kind: "plan", applyPlan: plan, generation } : { kind: "interrupted" });
-      setUserRepairIncomplete(true);
-    } finally {
-      if (vaultOperationLockRef.current) {
-        endTask();
-        vaultOperationLockRef.current = false;
-      }
-    }
+    const report = consistencyReport;
+    if (!report || report.repairableIds.length === 0 || recoveryStatus.kind !== "plan") return;
+    await handleExecuteRecoveryApply({ confirmed: { world: recoveryStatus.applyPlan.confirmed.world, recordIds: report.repairableIds } });
   }
 
   /**
@@ -3656,15 +3652,16 @@ export default function ChatScreen() {
    * 未完了journalがあれば実体を再確認して続きから完了させ（idempotent）、無ければ実行直前にPlanを
    * 作り直してから新規に始める。ユーザーが明示的に押した場合だけ呼ぶ。
    */
-  async function handleExecuteRecoveryApply() {
+  async function handleExecuteRecoveryApply(override?: { confirmed?: RecoveryConfirmedSet; resumeOnly?: boolean }) {
     if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
     // M1対応：直前に見せていたPlan（"確認する"の結果）があれば、そのconfirmed set（世界＋対象record ID集合）を
     // そのままApplyへ渡す。"再確認して続ける"（中断からの再開）にはconfirmed setを渡さず、代わりに
     // `resumeOnly: true`を渡す——これにより、今のworldと一致する未完了journalが無い場合（別worldの古い
     // journalしか無い、またはjournalが既に消えている場合を含む）、確認なしで新worldの安全な記録を
     // 自動的にApplyしてしまう（Codexレビュー再指摘）ことを防ぐ。
-    const confirmed = recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan.confirmed : undefined;
-    const resumeOnly = recoveryStatus.kind === "interrupted";
+    // 通常ユーザー向けの「修復する」は、今のバージョンで直せる記録だけのconfirmed setを渡す（handleUserRepair）。
+    const resumeOnly = override?.resumeOnly ?? recoveryStatus.kind === "interrupted";
+    const confirmed = override?.confirmed ?? (!resumeOnly && recoveryStatus.kind === "plan" ? recoveryStatus.applyPlan.confirmed : undefined);
     const generation = vaultGenerationRef.current;
     vaultOperationLockRef.current = true;
     const endTask = beginMemoryTask();
@@ -3697,7 +3694,11 @@ export default function ChatScreen() {
         return;
       }
       setRecoveryStatus({ kind: "done", result });
-      if (result.held === 0 && result.failed === 0) void recordRecoveryCheck(true).catch(() => undefined);
+      // 結果は「最新」と断定しない：整合性を確認し直し、その結果だけを表示・記録する（排他ロックの解放後に始まる）。
+      setConsistencyReport(null);
+      recoveryRecheckCountRef.current = 0;
+      recoveryDetectionRanRef.current = false;
+      void startRecoveryBackgroundCheck(vaultHandle);
       if (recoveryDoneLooksLikeSuccess(result)) {
         // 管理情報が変わった：light-checkの保存済み結果を破棄して再計測する（排他ロック解放後に実行する）。
         vaultLightCheckDiscoveryRef.current = null;
@@ -5817,8 +5818,9 @@ export default function ChatScreen() {
               void handleRunRecoveryDryRun();
             }}
             onExecuteRecoveryApply={() => void handleExecuteRecoveryApply()}
-            recoveryUserView={deriveRecoveryUserView(recoveryStatus, { incomplete: userRepairIncomplete, detectionFailed: recoveryDetectionFailed, checking: recoveryChecking })}
+            recoveryUserView={deriveRecoveryUserView(recoveryStatus, consistencyReport, { detectionFailed: recoveryDetectionFailed, checking: recoveryChecking })}
             onUserRepair={() => void handleUserRepair()}
+            onRecheckRecovery={handleRecheckRecovery}
             legacyHeldCleanupStatus={legacyHeldCleanupStatus}
             onRunLegacyHeldCleanup={() => void handleRunLegacyHeldCleanup()}
             vaultHoldReasons={vaultHoldReasons}
