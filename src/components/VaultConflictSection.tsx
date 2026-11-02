@@ -2,13 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ADOPT_VAULT_BLOCK_TEXT, BLOCK_REASON_TEXT, CHOICE_LABEL, choiceExplanation, inspectConflict, listKeptVersions, NOT_STARTED_REASON_TEXT, STOPPED_TEXT,
+  ADOPT_VAULT_BLOCK_TEXT, BLOCK_REASON_TEXT, CHOICE_LABEL, choiceExplanation, HOLD_DONE_TEXT, HOLD_LABEL, HOLD_NOTE, inspectConflict, keptVersionExportName, keptVersionExportText, listKeptVersions, NOT_STARTED_REASON_TEXT, STOPPED_TEXT,
   type ConflictChoice, type ConflictOutcome, type ConflictRef, type ConflictSnapshot, type ConflictView, type KeptVersion,
 } from "@/lib/vaultConflictResolution";
 import { RECORD_TYPE_TEXT } from "@/lib/vaultRecoveryUserView";
 
 /**
- * 設定の「端末と保存先で内容が異なる記録」。両方の版と差分を見せ、今の実体で安全に実行できる選択肢だけを出す。
+ * 設定の「端末と保存先で内容が異なる記録」。両方の版と差分を見せ、今の実体で安全に実行できる選択肢だけを出す。何も変えない「解決せず保留」はいつでも選べる。
  * 選択は1件ずつ、何が変わり何が失われうるかを見せた上で確定する。表示は、実行後にもう一度確認した結果に基づく。
  */
 const button = "shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/10";
@@ -85,13 +85,15 @@ function ConflictItem({ root, target, activeConversationId, disabled, onResolve 
           )}
           {view.choices.length > 0 && (
             <div className="flex flex-wrap gap-2">
-              {view.choices.map((choice, i) => (
+              {view.state === "differs" && <button data-testid="vault-conflict-hold" className={button} disabled={working} onClick={() => { setSelected(null); setOpen(false); setMessage(HOLD_DONE_TEXT); }}>{HOLD_LABEL}</button>}
+              {view.choices.map((choice) => (
                 <button key={choice} data-testid={`vault-conflict-choice-${choice}`} className={button} disabled={disabled || working} onClick={() => setSelected(choice)}>
-                  {CHOICE_LABEL[choice]}{i === 0 && view.state === "differs" ? "（既定）" : ""}
+                  {CHOICE_LABEL[choice]}
                 </button>
               ))}
             </div>
           )}
+          {view.state === "differs" && <span data-testid="vault-conflict-hold-note" className="text-stone-500 dark:text-stone-400">{HOLD_NOTE}</span>}
           {selected && (
             <div data-testid="vault-conflict-confirmation" className="flex flex-col gap-1 rounded-lg bg-stone-100/70 p-2 dark:bg-black/20">
               <span className="font-medium">「{CHOICE_LABEL[selected]}」を実行すると</span>
@@ -110,28 +112,55 @@ function ConflictItem({ root, target, activeConversationId, disabled, onResolve 
   );
 }
 
+function KeptVersionItem({ version }: { version: KeptVersion }) {
+  const [message, setMessage] = useState<string | null>(null);
+  const copy = async (text: string) => {
+    try { await navigator.clipboard.writeText(text); setMessage("コピーしました。"); }
+    catch { setMessage("コピーできませんでした。全文を選択するか、ファイルに書き出してください。"); }
+  };
+  const exportFile = () => {
+    const url = URL.createObjectURL(new Blob([keptVersionExportText(version)], { type: "text/markdown" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = keptVersionExportName(version);
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    setMessage("ファイルに書き出しました。");
+  };
+  return (
+    <details data-testid="vault-kept-version">
+      <summary className="cursor-pointer">{RECORD_TYPE_TEXT[version.recordType]}（{version.createdAt.slice(0, 10)}に保管）</summary>
+      <div className="flex flex-col gap-1 pt-1">
+        <span className="font-medium">保存先の版</span>
+        <div data-testid="vault-kept-vault" className={pre}>{version.vaultText}</div>
+        <span className="font-medium">端末の版</span>
+        <div data-testid="vault-kept-device" className={pre}>{version.deviceMarkdown}</div>
+        <div className="flex flex-wrap gap-2">
+          <button data-testid="vault-kept-copy-vault" className={button} onClick={() => void copy(version.vaultText)}>保存先の版をコピー</button>
+          <button data-testid="vault-kept-copy-device" className={button} onClick={() => void copy(version.deviceMarkdown)}>端末の版をコピー</button>
+          <button data-testid="vault-kept-export" className={button} onClick={exportFile}>両方をファイルに書き出す</button>
+        </div>
+        {message && <span role="status" data-testid="vault-kept-message">{message}</span>}
+      </div>
+    </details>
+  );
+}
+
 /** 解決した後も読めるように、確認が必要な記録の有無に関わらず出す */
 export function VaultKeptVersions({ root, refreshKey }: { root: FileSystemDirectoryHandle; refreshKey: number }) {
-  const [kept, setKept] = useState<{ listed: KeptVersion[]; others: number; unreadable: number } | null>(null);
+  const [kept, setKept] = useState<{ versions: KeptVersion[]; unreadable: number } | null>(null);
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
-    void listKeptVersions(root).then(({ versions, unreadable }) => {
-      if (alive.current) setKept({ listed: versions.filter((v) => v.choice === "keep-both"), others: versions.filter((v) => v.choice !== "keep-both").length, unreadable });
-    }).catch((error) => console.error("[Tsumugi] conflict: could not list the kept versions", error));
+    void listKeptVersions(root).then((list) => { if (alive.current) setKept(list); })
+      .catch((error) => console.error("[Tsumugi] conflict: could not list the kept versions", error));
     return () => { alive.current = false; };
   }, [root, refreshKey]);
-  if (!kept || (kept.listed.length === 0 && kept.others === 0 && kept.unreadable === 0)) return null;
+  if (!kept || (kept.versions.length === 0 && kept.unreadable === 0)) return null;
   return (
     <div data-testid="vault-kept-versions" className="flex flex-col gap-1 text-xs">
-      <span className="font-medium">保管している別の版（{kept.listed.length}件）</span>
-      {kept.listed.map((v) => (
-        <details key={v.id} data-testid="vault-kept-version">
-          <summary className="cursor-pointer">{RECORD_TYPE_TEXT[v.recordType]}（{v.createdAt.slice(0, 10)}に保管）</summary>
-          <div className={pre}>{v.vaultText}</div>
-        </details>
-      ))}
-      {kept.others > 0 && <span className="text-stone-500 dark:text-stone-400">採用しなかった版{kept.others}件も、保存先の管理領域に残しています。</span>}
+      <span className="font-medium">保管している版（{kept.versions.length}件）</span>
+      <span className="text-stone-500 dark:text-stone-400">通常の記録には出ていない版です。読む・コピーする・ファイルに書き出すことができます。</span>
+      {kept.versions.map((v) => <KeptVersionItem key={v.id} version={v} />)}
       {kept.unreadable > 0 && <span className="text-amber-700 dark:text-amber-400">読み取れない保管ファイルが{kept.unreadable}件あります。削除はしていません。</span>}
     </div>
   );

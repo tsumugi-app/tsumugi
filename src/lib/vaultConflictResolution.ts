@@ -2,7 +2,7 @@
  * 端末と保存先で内容が食い違う記録（Outboxに保留された`*-conflict`・確認で「内容が異なる」と分類された記録）を、ユーザーの選択で解決する。
  *
  * 原則：
- *   - 自動では決めない。新旧を判断できないときの既定は「両方保持」。
+ *   - 自動では決めない。新旧を判断できないときは、何も変えない「解決せず保留」のままにしておける（この場合、保存は止まったままで「最新の状態です」は出ない）。
  *   - 選択肢は、そのときの実体で安全に実行できるものだけを出す。
  *   - 実行の前に、端末と保存先全体のバックアップ（読み戻して照合済みのZIP）と、この記録の両方の版（`.tsumugi/conflict-versions/`）を残す。
  *   - 実行の直前に排他区間の中で読み直し、ユーザーが見たときと少しでも違えば何も変えずに中止する。
@@ -35,12 +35,11 @@ export interface ConflictRef { recordType: ConflictRecordType; recordId: string 
 type LocalRecord = Conversation | MemoryObject | Source;
 
 /**
- * keep-both     端末の版を使い続け、保存先の版を別に保管して一覧に残す（既定）
- * adopt-device  端末の版を採用する。保存先の版は退避するが一覧には出さない
- * adopt-vault   保存先の版を採用する。端末の版は退避する
+ * adopt-device  端末の版を採用する：通常のMarkdownが端末の版に置き換わり、保存先の版は通常の記録から外れて別に保管される
+ * adopt-vault   保存先の版を採用する：端末の記録が保存先の版に置き換わり、端末の版は別に保管される
  * resume        両方が既に同じ、または保存先のファイルが無い：保存を再開するだけ（どちらの版も変わらない）
  */
-export type ConflictChoice = "keep-both" | "adopt-device" | "adopt-vault" | "resume";
+export type ConflictChoice = "adopt-device" | "adopt-vault" | "resume";
 
 export type ConflictBlockReason =
   | "device-missing" | "tombstoned" | "file-unreadable" | "registry-unreadable" | "stored-elsewhere" | "not-separable" | "duplicate-in-file" | "unparseable" | "repair-in-progress";
@@ -70,7 +69,7 @@ export interface ConflictView {
   deviceText?: string;
   vaultText?: string;
   diff?: DiffLine[];
-  /** 実行できる選択肢だけ（先頭が既定） */
+  /** 実行できる選択肢だけ。「解決せず保留」は何も実行しないので、ここには入らない */
   choices: ConflictChoice[];
 }
 
@@ -304,7 +303,7 @@ async function inspect(root: FileSystemDirectoryHandle, ref: ConflictRef, active
   if (same) return { view: { ref: nextRef, state: "same", date, snapshot, deviceText, vaultText: located.version, choices: ["resume"] }, located, device: record, fileText };
   if (fileWithVersion(located, record.id, deviceText) === null) return blocked("not-separable", date);
   const adoptVaultBlock = adoptVaultBlockOf(type, record, located.version, activeConversationId);
-  const choices: ConflictChoice[] = ["keep-both", "adopt-device", ...(adoptVaultBlock ? [] : (["adopt-vault"] as const))];
+  const choices: ConflictChoice[] = ["adopt-device", ...(adoptVaultBlock ? [] : (["adopt-vault"] as const))];
   return { view: { ref: nextRef, state: "differs", date, snapshot, deviceText, vaultText: located.version, diff: lineDiff(deviceText, located.version), adoptVaultBlock, choices }, located, device: record, fileText };
 }
 
@@ -581,29 +580,35 @@ export async function resolveConflict(env: ConflictResolveEnv, seen: ConflictSna
 const countLines = (diff: DiffLine[] | undefined, kind: DiffLine["kind"]) => (diff ?? []).filter((l) => l.kind === kind).length;
 
 export const CHOICE_LABEL: Record<ConflictChoice, string> = {
-  "keep-both": "両方保持",
-  "adopt-device": "端末側を採用",
-  "adopt-vault": "保存先の版を採用",
+  "adopt-device": "端末の版を採用（保存先の版は保管）",
+  "adopt-vault": "保存先の版を採用（端末の版は保管）",
   resume: "保存を再開する",
 };
 
-/** 実行の前に見せる説明。バックアップと別の保管は必ず作るので、「完全に消える」とは言わない */
+export const HOLD_LABEL = "解決せず保留";
+export const HOLD_NOTE = "「解決せず保留」は何も変更しません。この記録の保存は止まったままで、解決するまで「最新の状態です」は表示しません。";
+export const HOLD_DONE_TEXT = "保留にしました。何も変更していません。この記録の保存は止まったままです。";
+
+/** 実行の前に見せる説明。保管した版は設定画面で読めてコピーと書き出しができるが、通常の記録へ戻す操作は無い */
 export function choiceExplanation(choice: ConflictChoice, view: Pick<ConflictView, "diff">): { changes: string; mayLose: string } {
   const deviceOnly = countLines(view.diff, "device"), vaultOnly = countLines(view.diff, "vault");
-  if (choice === "keep-both") return {
-    changes: "端末の版を今までどおり使い、保存先のファイルも端末の版にそろえます。保存先の版は別に保管し、この画面でいつでも読めます（履歴やAIの記憶には出ません）。",
-    mayLose: `通常の記録から失われる内容はありません。保存先だけにある${vaultOnly}行は、保管した版として残ります。`,
-  };
   if (choice === "adopt-device") return {
-    changes: "保存先のファイルのこの記録を、端末の版に置き換えます。",
-    mayLose: `保存先だけにある${vaultOnly}行は、通常の記録から無くなります。元の内容はバックアップと保存先の管理領域に残りますが、一覧には出ません。`,
+    changes: "保存先の通常のMarkdownファイルのこの記録を、端末の版で置き換えます。端末の記録は変わりません。",
+    mayLose: `保存先だけにある${vaultOnly}行は、通常のMarkdown（Obsidianで見るファイル）から無くなります。元の内容は隠しフォルダ（.tsumugi/conflict-versions）に保管し、設定画面で読む・コピーする・ファイルに書き出すことができます。通常の記録へ戻す操作はありません。`,
   };
   if (choice === "adopt-vault") return {
     changes: "端末の記録を保存先の版に置き換えます。履歴の表示とAIが参照する内容も保存先の版になります。",
-    mayLose: `端末だけにある${deviceOnly}行は、通常の記録から無くなります。元の内容はバックアップと保存先の管理領域に残りますが、一覧には出ません。`,
+    mayLose: `端末だけにある${deviceOnly}行は、通常の記録から無くなります。元の内容は隠しフォルダ（.tsumugi/conflict-versions）に保管し、設定画面で読む・コピーする・ファイルに書き出すことができます。通常の記録へ戻す操作はありません。`,
   };
   return { changes: "どちらの版も変えず、止まっていた保存を再開します。", mayLose: "失われる内容はありません。" };
 }
+
+/** 保管した版を1つのテキストにしたもの（書き出し用。保存先には書かない） */
+export function keptVersionExportText(v: KeptVersion): string {
+  return `# Tsumugiが保管した版（${v.recordType} ${v.recordId}、${v.createdAt}）\n\n元のファイル：${v.path}\n\n## 保存先の版\n\n${v.vaultText}\n\n## 端末の版\n\n${v.deviceMarkdown}\n`;
+}
+
+export const keptVersionExportName = (v: KeptVersion) => `tsumugi-kept-${v.recordType}-${v.createdAt.slice(0, 10)}-${v.id.slice(0, 12).replace(/[^a-zA-Z0-9_-]/g, "_")}.md`;
 
 export const BLOCK_REASON_TEXT: Record<ConflictBlockReason, string> = {
   "device-missing": "端末にこの記録が見つからないため、ここでは解決できません。保存先のファイルは保持しています。",

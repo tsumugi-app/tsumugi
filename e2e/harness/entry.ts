@@ -5,7 +5,9 @@ import * as dbm from "../../src/lib/db";
 import * as deletion from "../../src/lib/vaultDeletion";
 import * as bootstrap from "../../src/lib/saveFoundationBootstrap";
 import * as markdown from "../../src/lib/markdown";
+import * as vault from "../../src/lib/vault";
 import { writeMemoryObjectMarkdown } from "../../src/lib/vault";
+import * as legacy from "../../src/lib/vaultLegacyCleanup";
 import * as proj from "../../src/lib/vaultProjection";
 import * as lockMod from "../../src/lib/vaultWorldLock";
 import * as sessionMod from "../../src/lib/maintenance/repairSession";
@@ -25,7 +27,7 @@ import * as conflictRun from "../../src/lib/vaultConflictResolutionRun";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const NOW = "2026-10-10T00:00:00.000Z";
 const g = globalThis as any;
-g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap, proj, lockMod, consistencyCheck, backup, zip, autoRepair, autoRepairRun, conflict, conflictRun };
+g.D = { dbm, deletion, markdown, writeMemoryObjectMarkdown, bootstrap, proj, lockMod, consistencyCheck, backup, zip, autoRepair, autoRepairRun, conflict, conflictRun, vault, legacy };
 let DATA: any, vaultRoot: any, backupRoot: any;
 
 async function dirAt(name: string) {

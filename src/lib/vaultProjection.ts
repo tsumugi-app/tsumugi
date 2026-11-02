@@ -203,7 +203,8 @@ async function registeredContentHash(env: ProjectionEnv, registryKey: string, pa
   const read = await readJsonAt(env, registryShardPath(vaultRegistryBucketOf(registryKey)));
   if (read.state !== "ok" || !isObj(read.value.records) || !isObj(read.value.files) || read.value.records[registryKey] !== path) return undefined;
   const entry = read.value.files[path];
-  return isObj(entry) ? entry.contentHash : undefined;
+  // conflictの行のハッシュは、競合を記録するときにファイルの実体から計算されたもの：Tsumugiが書いた証拠にならない
+  return isObj(entry) && entry.status !== "conflict" ? entry.contentHash : undefined;
 }
 
 async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, registryPath: string | undefined): Promise<MarkdownVerdict> {
@@ -663,7 +664,7 @@ async function readRegisteredMemberHashes(env: ProjectionEnv, day: string, path:
   const read = await readJsonAt(env, registryShardPath(vaultRegistryBucketOf(registryKey)));
   if (read.state !== "ok" || !isObj(read.value.records) || !isObj(read.value.files) || read.value.records[registryKey] !== path) return {};
   const entry = read.value.files[path];
-  return isObj(entry) && isObj(entry.memberHashes) ? entry.memberHashes : {};
+  return isObj(entry) && entry.status !== "conflict" && isObj(entry.memberHashes) ? entry.memberHashes : {};
 }
 
 // ---------------------------------------------------------------------------

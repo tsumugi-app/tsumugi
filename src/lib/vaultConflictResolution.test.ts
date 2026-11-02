@@ -37,9 +37,10 @@ test("差分：とても長い記録でも行を落とさない（対応付け�
 
 test("説明：何が変わり、何が通常の記録から無くなるかを行数つきで示す", () => {
   const diff = conflict.lineDiff("共通\n端末だけ", "共通\n保存先だけ1\n保存先だけ2");
-  assert.match(conflict.choiceExplanation("keep-both", { diff }).mayLose, /失われる内容はありません.*2行/);
-  assert.match(conflict.choiceExplanation("adopt-device", { diff }).mayLose, /保存先だけにある2行.*バックアップ/);
-  assert.match(conflict.choiceExplanation("adopt-vault", { diff }).mayLose, /端末だけにある1行.*バックアップ/);
+  assert.match(conflict.choiceExplanation("adopt-device", { diff }).changes, /Markdownファイル.*端末の版で置き換えます/);
+  assert.match(conflict.choiceExplanation("adopt-device", { diff }).mayLose, /保存先だけにある2行.*通常のMarkdown.*保管.*コピー.*書き出す/);
+  assert.match(conflict.choiceExplanation("adopt-device", { diff }).mayLose, /通常の記録へ戻す操作はありません/);
+  assert.match(conflict.choiceExplanation("adopt-vault", { diff }).mayLose, /端末だけにある1行.*保管/);
   assert.match(conflict.choiceExplanation("adopt-vault", { diff }).changes, /AIが参照する内容/);
 });
 
@@ -67,4 +68,28 @@ test("内容が異なる記録が残る間は「最新の状態です」と言�
 test("すべての理由に説明の文がある（選択肢を出さないときも、理由を示す）", () => {
   for (const reason of ["device-missing", "tombstoned", "file-unreadable", "registry-unreadable", "stored-elsewhere", "not-separable", "duplicate-in-file", "unparseable", "repair-in-progress"] as const) assert.ok(conflict.BLOCK_REASON_TEXT[reason].length > 0);
   for (const reason of ["would-lose-content", "identity-differs", "active-conversation"] as const) assert.ok(conflict.ADOPT_VAULT_BLOCK_TEXT[reason].length > 0);
+});
+
+test("表示：「両方保持」とだけは出さず、保留は何も変えないと示す", () => {
+  assert.ok(!Object.values(conflict.CHOICE_LABEL).includes("両方保持"));
+  assert.match(conflict.CHOICE_LABEL["adopt-device"], /端末の版を採用.*保管/);
+  assert.match(conflict.HOLD_NOTE, /何も変更しません.*「最新の状態です」は表示しません/);
+});
+
+test("書き出し：保管した両方の版が入る", () => {
+  const v = { recordType: "memory", recordId: "m1", createdAt: "2026-11-02T00:00:00.000Z", id: "abc/def", path: "Memories/2026-10-20.md", vaultText: "保存先の架空の文", deviceMarkdown: "端末の架空の文" } as unknown as Parameters<typeof conflict.keptVersionExportText>[0];
+  const text = conflict.keptVersionExportText(v);
+  assert.match(text, /保存先の架空の文/); assert.match(text, /端末の架空の文/);
+  assert.equal(conflict.keptVersionExportName(v), "tsumugi-kept-memory-2026-11-02-abc_def.md");
+});
+
+test("再同期：呼び出しは起動時の確立の2か所だけ（手編集を取り込める画面の操作は無い）", () => {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
+  const calls = walk(path.join(process.cwd(), "src")).filter((f) => /\.tsx?$/.test(f) && !f.endsWith(".test.ts"))
+    .flatMap((f) => fs.readFileSync(f, "utf8").split("\n").filter((l) => /await resyncVaultRegistry\(/.test(l) && !/^\s*(\*|\/\/)/.test(l)).map((l) => `${path.basename(f)}: ${l.trim()}`));
+  assert.deepEqual(calls.sort(), [
+    "vault.ts: const result = await resyncVaultRegistry(root);",
+    "vault.ts: const result = await resyncVaultRegistry(root, { requireEmptyVault: true });",
+  ]);
 });

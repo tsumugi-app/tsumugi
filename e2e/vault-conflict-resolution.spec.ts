@@ -3,6 +3,7 @@
 // backend; the PC folder backend is the same FileSystemDirectoryHandle API). The PRODUCTION wiring runs (backup, re-verification, exclusive section, normal save, re-check). Fictional data only.
 // Both versions must survive every choice and every interruption, nothing may appear twice, repeating an action must change nothing, and only a fresh check may call the result clean.
 import { test, expect, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const BASE = "http://localhost:3100";
@@ -86,25 +87,48 @@ const editMemoryOnBothSides = async (page: Page, vaultEdit: (entry: string) => s
   expect(r.status).toBe("held");
   return edited;
 };
+/** the device changes a field of the entry and keeps the body, the update a registered hash would allow */
+const updateSummary = (page: Page) => page.evaluate(async ({ DAY, LATER }) => {
+  const m = (window as any).__mem("c-mem-1", "架空の本文ひとつ", `${DAY}T01:00:00.000Z`, LATER);
+  return (window as any).__settle(await (window as any).D.dbm.putMemoryObjectWithOutbox({ ...m, summary: "端末の新しい要約" }, "memory"));
+}, { DAY, LATER });
+const readRow = (page: Page, file: string) => page.evaluate(async (file) => {
+  const dir = await (await (window as any).__root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("registry");
+  for await (const [, h] of dir.entries()) { const v = JSON.parse(await (await h.getFile()).text()); if (v.files[file]) return v.files[file]; }
+  return null;
+}, file) as Promise<any>;
+/** change the Registry row of a file, as a conflict anchor taken from the file would have written it */
+const editRow = async (page: Page, file: string, edit: (row: any, hashOfMember: Record<string, string>, hashOfFile: string) => void, text: string) => {
+  const { hashes, fileHash, shard } = await page.evaluate(async ({ file, text }) => {
+    const { vault, markdown } = (window as any).D; const hashes: Record<string, string> = {};
+    for (const m of markdown.parseMemoryDayFile(text)) hashes[m.id] = vault.hashVaultText(markdown.memoryObjectToMarkdown(m));
+    const dir = await (await (window as any).__root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("registry");
+    let shard = ""; for await (const [n, h] of dir.entries()) if (JSON.parse(await (await h.getFile()).text()).files[file]) shard = `.tsumugi/registry/${n}`;
+    return { hashes, fileHash: vault.hashVaultText(text), shard };
+  }, { file, text });
+  const v = JSON.parse(await read(page, shard));
+  edit(v.files[file], hashes, fileHash);
+  await write(page, shard, JSON.stringify(v));
+};
 const entriesWith = (text: string, id: string) => text.split(SEPARATOR).filter((s) => s.includes(`id: ${id}`));
 
 for (const kind of ["desktop", "android"] as const) {
   test.describe(kind, () => {
     if (kind === "android") test.use({ userAgent: ANDROID_UA, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true });
 
-    test("Memory, 両方保持: the file takes the device version, the Vault version is kept apart, nothing appears twice, and saving works again", async ({ page }) => {
+    test("Memory, 端末の版を採用: the file takes the device version, the Vault version is kept apart, nothing appears twice, and saving works again", async ({ page }) => {
       test.setTimeout(180_000);
       await setup(page);
       const edited = await editMemoryOnBothSides(page);
       expect((await check(page)).findings).toContain("c-mem-1:needsChoice:different-content");
       const view: any = await inspect(page, "memory", "c-mem-1");
       expect(view.state).toBe("differs");
-      expect(view.choices).toEqual(["keep-both", "adopt-device", "adopt-vault"]);
+      expect(view.choices).toEqual(["adopt-device", "adopt-vault"]);
       expect(view.vaultText).toContain("手で書き直した"); expect(view.deviceText).toContain("端末で更新した");
       expect(view.diff.some((l: any) => l.kind === "vault" && l.text.includes("手で書き直した"))).toBe(true);
       expect(await read(page, DAY_FILE)).toBe(edited);    // reading changes nothing
 
-      const r: any = await resolve(page, view.snapshot, "keep-both");
+      const r: any = await resolve(page, view.snapshot, "adopt-device");
       expect(r.kind, JSON.stringify(r)).toBe("done"); expect(r.resolved).toBe(true); expect(r.state, JSON.stringify(r)).toBe("clean");
       const file = await read(page, DAY_FILE);
       expect(entriesWith(file, "c-mem-1").length).toBe(1);
@@ -116,7 +140,7 @@ for (const kind of ["desktop", "android"] as const) {
       expect((await device(page, "memory", "c-mem-1") as any).themeIds).toEqual(["theme-kept"]);
 
       // the repeat is refused and changes nothing; the kept version does not multiply
-      const again: any = await resolve(page, view.snapshot, "keep-both");
+      const again: any = await resolve(page, view.snapshot, "adopt-device");
       expect(again.kind).toBe("not-started"); expect(again.reason).toBe("changed");
       expect(await read(page, DAY_FILE)).toBe(file); expect(((await kept(page)) as any).versions.length).toBe(1);
       // start-ups change nothing, and the next normal save goes through
@@ -173,15 +197,15 @@ for (const kind of ["desktop", "android"] as const) {
       const held: any = await page.evaluate(async ({ LATER }) => (window as any).__settle(await (window as any).D.dbm.putConversationWithOutbox((window as any).__conv(["架空の問い", "架空の答え", "架空の続き"], LATER))), { LATER });
       expect(held.status).toBe("held"); expect(held.reason ?? (await outbox(page, "conversation:c-conv")).reason).toBe("markdown-conflict");
       let view: any = await inspect(page, "conversation", "c-conv");
-      expect(view.choices).toEqual(["keep-both", "adopt-device", "adopt-vault"]);
+      expect(view.choices).toEqual(["adopt-device", "adopt-vault"]);
 
       // the hand note is outside any turn: the record can not hold it, so adopting would lose it
       await write(page, p, (await read(page, p)).replace("## Transcript", "架空の手書きのメモ\n\n## Transcript"));
       view = await inspect(page, "conversation", "c-conv");
-      expect(view.choices).toEqual(["keep-both", "adopt-device"]); expect(view.adoptVaultBlock).toBe("would-lose-content");
+      expect(view.choices).toEqual(["adopt-device"]); expect(view.adoptVaultBlock).toBe("would-lose-content");
       const refused: any = await resolve(page, view.snapshot, "adopt-vault");
       expect(refused.kind).toBe("not-started"); expect(refused.reason).toBe("choice-unavailable");
-      const r: any = await resolve(page, view.snapshot, "keep-both");
+      const r: any = await resolve(page, view.snapshot, "adopt-device");
       expect(r.kind, JSON.stringify(r)).toBe("done"); expect(r.state, JSON.stringify(r)).toBe("clean");
       expect(await read(page, p)).toContain("架空の続き");
       expect(((await kept(page)) as any).versions[0].vaultText).toContain("架空の手書きのメモ");
@@ -220,7 +244,7 @@ for (const kind of ["desktop", "android"] as const) {
       expect((await outbox(page, "reflection:c-refl")).status).toBe("held"); expect((await outbox(page, "source:c-src")).status).toBe("held");
       const reflView: any = await inspect(page, "memory", "c-refl");
       expect(reflView.snapshot.recordType).toBe("reflection");
-      const a: any = await resolve(page, reflView.snapshot, "keep-both");
+      const a: any = await resolve(page, reflView.snapshot, "adopt-device");
       expect(a.kind, JSON.stringify(a)).toBe("done"); expect(a.resolved).toBe(true);
       const srcView: any = await inspect(page, "source", "c-src");
       const b: any = await resolve(page, srcView.snapshot, "adopt-vault");
@@ -239,9 +263,75 @@ for (const kind of ["desktop", "android"] as const) {
       await write(page, reflPath, original.replace("source: system-generated", "source: import").replace("架空の振り返りの本文", "架空の振り返り（手で直した）"));
       await page.evaluate(async ({ LATER }) => (window as any).__settle(await (window as any).D.dbm.putMemoryObjectWithOutbox((window as any).__refl("架空の振り返り（端末で更新）", LATER), "reflection")), { LATER });
       const view: any = await inspect(page, "memory", "c-refl");
-      expect(view.choices).toEqual(["keep-both", "adopt-device"]); expect(view.adoptVaultBlock).toBe("identity-differs");
+      expect(view.choices).toEqual(["adopt-device"]); expect(view.adoptVaultBlock).toBe("identity-differs");
       expect((await resolve(page, view.snapshot, "adopt-vault") as any).reason).toBe("choice-unavailable");
       expect((await device(page, "memory", "c-refl") as any).metadata.source).toBe("system-generated");
+    });
+
+    test("a hash taken from a hand-edited file is not proof: a moved day file keeps the hand-edited entry safe from the next device update", async ({ page }) => {
+      test.setTimeout(180_000);
+      await setup(page);
+      const handEdited = (await read(page, DAY_FILE)).replace("要約 c-mem-1", "要約手直し");
+      await write(page, DAY_FILE, handEdited);
+      // another entry of the day is saved: the file's hash is registered again, the hand-edited entry stays unproven
+      const saved = await page.evaluate(async ({ DAY, LATER }) => (window as any).__settle(await (window as any).D.dbm.putMemoryObjectWithOutbox((window as any).__mem("c-mem-2", "架空の本文ふたつ", `${DAY}T02:00:00.000Z`, LATER), "memory")), { DAY, LATER });
+      expect(saved.status, JSON.stringify(saved)).toBe("done");
+      const movedPath = `Memories/moved/${DAY}.md`;
+      await write(page, movedPath, await read(page, DAY_FILE));
+      await page.evaluate(async (DAY_FILE) => { const dir = await (window as any).__root.getDirectoryHandle("Memories"); await dir.removeEntry(DAY_FILE.split("/").at(-1)); }, DAY_FILE);
+      const applied = await page.evaluate(async () => {
+        const { vault } = (window as any).D; const root = (window as any).__root;
+        const discovery = await vault.performVaultLightCheckDiscovery(root);
+        const classified = await vault.classifyVaultLightCheckCandidates(root, discovery);
+        const outcome = await vault.applyVaultLightCheckCandidates(root, classified.records, classified.localSnapshots);
+        return { counts: outcome.counts, errors: outcome.applyErrors, stale: outcome.staleSkipped };
+      });
+      expect(applied.counts.moved, JSON.stringify(applied)).toBe(1);
+      const r = await updateSummary(page);
+      expect(r.status, JSON.stringify(r)).toBe("held");
+      const after = await read(page, movedPath);
+      expect(after).toContain("要約手直し"); expect(after).not.toContain("端末の新しい要約");
+    });
+
+    test("a hash on a conflict row is not proof: the hand-edited entry stays", async ({ page }) => {
+      test.setTimeout(180_000);
+      await setup(page);
+      const handEdited = (await read(page, DAY_FILE)).replace("要約 c-mem-1", "要約手直し");
+      await write(page, DAY_FILE, handEdited);
+      await editRow(page, DAY_FILE, (row, hashOfMember, hashOfFile) => { row.status = "conflict"; row.contentHash = hashOfFile; row.memberHashes = hashOfMember; }, handEdited);
+      const r = await updateSummary(page);
+      expect(r.status, JSON.stringify(r)).toBe("held");
+      expect(await read(page, DAY_FILE)).toBe(handEdited);
+    });
+
+    test("legacy cleanup: an entry that differs from the device gets no hash, and a changed body stops the cleanup", async ({ page }) => {
+      test.setTimeout(180_000);
+      await setup(page);
+      const original = await read(page, DAY_FILE);
+      const entry = entriesWith(original, "c-mem-1")[0].trim();
+      const legacyPath = `Memories/${DAY}-abc123.md`;
+      // a field the content comparison does not look at was edited by hand
+      const handEdited = original.replace("id: c-mem-1\n", "id: c-mem-1\ntopicId: topic-by-hand\n");
+      expect(handEdited).not.toBe(original);
+      await write(page, DAY_FILE, handEdited); await write(page, legacyPath, entry);
+      await editRow(page, DAY_FILE, (row, _m, hashOfFile) => { row.status = "conflict"; row.contentHash = hashOfFile; }, handEdited);
+      const run = () => page.evaluate(async () => { const { lockMod, legacy } = (window as any).D; const locked = await lockMod.runVaultWorldExclusive(() => legacy.executeLegacyCleanup((window as any).__root)); const r = locked.result; return { status: r.status, committed: r.memoryDaysCommitted, errors: r.errors }; });
+      const done = await run();
+      expect(done.committed, JSON.stringify(done)).toBe(1);
+      const row = await readRow(page, DAY_FILE);
+      expect(row.status).toBe("ok"); expect(row.memberHashes["c-mem-1"]).toBeUndefined(); expect(typeof row.memberHashes["c-mem-2"]).toBe("string");
+      const r = await updateSummary(page);
+      expect(r.status, JSON.stringify(r)).toBe("held");
+      expect(await read(page, DAY_FILE)).toContain("topic-by-hand");
+
+      await setup(page);
+      const bodyEdited = original.replace("架空の本文ひとつ", "架空の本文ひとつ（手で書き直した）");
+      await write(page, DAY_FILE, bodyEdited); await write(page, legacyPath, entry);
+      await editRow(page, DAY_FILE, (row, hashOfMember, hashOfFile) => { row.status = "conflict"; row.contentHash = hashOfFile; row.memberHashes = hashOfMember; }, bodyEdited);
+      const refused = await run();
+      expect(refused.status, JSON.stringify(refused)).toBe("refused");
+      expect((await readRow(page, DAY_FILE)).status).toBe("conflict");
+      expect(await read(page, legacyPath)).toBe(entry);
     });
 
     test("anything that moved after the user looked stops the action and changes nothing: file, device record, Registry", async ({ page }) => {
@@ -276,12 +366,12 @@ for (const kind of ["desktop", "android"] as const) {
     });
 
     for (const failAt of ["after-kept", "after-file", "after-requeue"]) {
-      test(`interrupted ${failAt} (両方保持): both versions survive, the next start-up or the same action finishes it, and nothing doubles`, async ({ page }) => {
+      test(`interrupted ${failAt} (端末の版を採用): both versions survive, the next start-up or the same action finishes it, and nothing doubles`, async ({ page }) => {
         test.setTimeout(180_000);
         await setup(page);
         await editMemoryOnBothSides(page);
         const view: any = await inspect(page, "memory", "c-mem-1");
-        const r: any = await resolve(page, view.snapshot, "keep-both", { failAt });
+        const r: any = await resolve(page, view.snapshot, "adopt-device", { failAt });
         expect(r.kind).toBe("interrupted");
         expect(((await kept(page)) as any).versions[0].vaultText).toContain("手で書き直した");
         expect((await device(page, "memory", "c-mem-1") as any).content).toContain("端末で更新した");
@@ -289,7 +379,7 @@ for (const kind of ["desktop", "android"] as const) {
         await startUp(page);
         if ((await outbox(page, "memory:c-mem-1")).status !== "done") {
           const next: any = await inspect(page, "memory", "c-mem-1");
-          const done: any = await resolve(page, next.snapshot, next.state === "differs" ? "keep-both" : "resume");
+          const done: any = await resolve(page, next.snapshot, next.state === "differs" ? "adopt-device" : "resume");
           expect(done.kind, JSON.stringify(done)).toBe("done");
         }
         expect((await check(page)).state).toBe("clean");
@@ -305,7 +395,7 @@ for (const kind of ["desktop", "android"] as const) {
         await setup(page);
         await editMemoryOnBothSides(page);
         const view: any = await inspect(page, "memory", "c-mem-1");
-        expect((await resolve(page, view.snapshot, "keep-both", { failAt: "after-kept" }) as any).kind).toBe("interrupted");
+        expect((await resolve(page, view.snapshot, "adopt-device", { failAt: "after-kept" }) as any).kind).toBe("interrupted");
         await page.evaluate(async ({ damage }) => {
           const dir = await (await (window as any).__root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("conflict-versions");
           for await (const [, h] of (dir as any).entries()) {
@@ -315,7 +405,7 @@ for (const kind of ["desktop", "android"] as const) {
           }
         }, { damage });
         expect(((await kept(page)) as any).unreadable).toBe(1);
-        const r: any = await resolve(page, view.snapshot, "keep-both");
+        const r: any = await resolve(page, view.snapshot, "adopt-device");
         expect(r.kind, JSON.stringify(r)).toBe("done"); expect(r.state, JSON.stringify(r)).toBe("clean");
         const list: any = await kept(page);
         expect(list.unreadable).toBe(0); expect(list.versions.length).toBe(1);
@@ -425,7 +515,7 @@ test.describe("the app (Settings)", () => {
   for (const name of ["PC", "Android"] as const) {
     test.describe(name, () => {
       if (name === "Android") test.use({ userAgent: ANDROID_UA, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true });
-      test("a conflict hides 「✓ 最新の状態です」, shows both versions and what each choice changes, and after 両方保持 the fresh check says 「✓ 最新の状態です」", async ({ page }) => {
+      test("a conflict hides 「✓ 最新の状態です」, shows both versions and what each choice changes, and after adopting the device version the fresh check says 「✓ 最新の状態です」", async ({ page }) => {
         test.setTimeout(240_000);
         await page.goto(`${BASE}/data`); await page.addScriptTag({ path: bundle });
         await page.evaluate(async () => {
@@ -455,14 +545,33 @@ test.describe("the app (Settings)", () => {
         await expect(page.getByTestId("vault-conflict-diff")).toContainText("手で直した");
         await expect(page.getByTestId("vault-conflict-diff")).toContainText("端末で更新");
         await expect(page.getByTestId("vault-conflict-choice-adopt-vault")).toBeVisible();
-        await page.getByTestId("vault-conflict-choice-keep-both").click();
-        await expect(page.getByTestId("vault-conflict-confirmation")).toContainText("失われる内容はありません");
+        // 解決せず保留: nothing changes, it stays listed, and 最新 stays hidden
+        await expect(page.getByTestId("vault-conflict-hold-note")).toContainText("何も変更しません");
+        await page.getByTestId("vault-conflict-hold").click();
+        await expect(page.getByTestId("vault-conflict-message")).toContainText("保留にしました");
+        await expect(page.getByTestId("vault-conflicts")).toBeVisible();
+        await expect(page.getByText("✓ 最新の状態です")).toHaveCount(0);
+        await page.getByTestId("vault-conflict-open").click();
+        await page.getByTestId("vault-conflict-choice-adopt-device").click();
+        await expect(page.getByTestId("vault-conflict-confirmation")).toContainText("端末の版で置き換えます");
+        await expect(page.getByTestId("vault-conflict-confirmation")).toContainText("通常のMarkdown");
         await page.getByTestId("vault-conflict-confirm").click();
         try { await expect(page.getByText("✓ 最新の状態です")).toBeVisible({ timeout: 90_000 }); }
         catch { throw new Error(`no 最新. The screen said: ${await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 1800))}`); }
         await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
         await expect(page.getByTestId("vault-conflict-outcome")).toContainText("問題が無くなった");
         await expect(page.getByTestId("vault-kept-version")).toHaveCount(1);
+        // the kept version can be read, copied and exported
+        await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (t: string) => { (window as any).__copied = t; } } }));
+        await page.getByTestId("vault-kept-version").locator("summary").click();
+        await expect(page.getByTestId("vault-kept-vault")).toContainText("手で直した");
+        await expect(page.getByTestId("vault-kept-device")).toContainText("端末で更新");
+        await page.getByTestId("vault-kept-copy-vault").click();
+        await expect(page.getByTestId("vault-kept-message")).toContainText("コピーしました");
+        expect(await page.evaluate(() => (window as any).__copied)).toContain("手で直した");
+        const [download] = await Promise.all([page.waitForEvent("download"), page.getByTestId("vault-kept-export").click()]);
+        const exported = readFileSync(await download.path(), "utf8");
+        expect(exported).toContain("手で直した"); expect(exported).toContain("端末で更新"); expect(download.suggestedFilename()).toMatch(/^tsumugi-kept-memory-.*\.md$/);
         const kept = await page.evaluate(async () => {
           const root = await navigator.storage.getDirectory(); const dir = await (await root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("conflict-versions");
           const out: string[] = []; for await (const [, h] of (dir as any).entries()) out.push(await (await h.getFile()).text()); return out;
