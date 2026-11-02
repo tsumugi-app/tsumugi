@@ -7,6 +7,7 @@
  *   修復の途中  → 前回の修復の続きを完了する
  * 件数・種類・理由だけを出す（本文・IDは出さない）。PC / Android / iPhoneで意味を分けない。
  */
+import type { ConflictRef } from "./vaultConflictResolution";
 import type { ConsistencyCategory, ConsistencyGroup, ConsistencyReason, ConsistencyRecordType, ConsistencyReport } from "./vaultConsistency";
 
 export const RECOVERY_ATTENTION_TEXT = "保存先に確認が必要な記録があります";
@@ -25,7 +26,7 @@ export const CATEGORY_TEXT: Record<ConsistencyCategory, { title: string; note: s
   saving: { title: "保存待ち", note: "自動で保存されます。" },
   repairable: { title: "自動で直せる記録", note: "保存先へ書き出す、保存先の管理情報を更新する、または通常の保存をやり直します。記録の内容は変えず、始める前に全体をバックアップします。" },
   repairLater: { title: "自動修復の対応待ち", note: "今のバージョンでは自動で直せません。データは変更せず保持しています。" },
-  needsChoice: { title: "どちらを残すかの確認が必要", note: "どちらが正しいかを自動では決めません。両方の版を変更せず保持しています（選ぶ機能は今後のバージョンで追加します）。" },
+  needsChoice: { title: "どちらを残すかの確認が必要", note: "どちらが正しいかを自動では決めません。選ぶまで両方の版を変更せず保持します。" },
   retryable: { title: "時間をおくと解決する可能性がある記録", note: "「もう一度確認する」で確認し直せます。" },
   unknown: { title: "原因を特定できない記録", note: "データは変更せず保持しています。" },
 };
@@ -116,4 +117,14 @@ export function deriveRecoveryUserView(
 }
 
 /** 「✓ 最新の状態です」を出してよいか（保存待ち・未確定・要確認・未確認・修復中の間は出さない）。 */
+/** 確認結果のうち、両方の版を見て選べる可能性がある記録（実際に選べるかは、開いたときに実体で判定する） */
+export const conflictRefsOf = (report: ConsistencyReport | null): ConflictRef[] => {
+  const seen = new Set<string>();
+  return (report?.findings ?? []).flatMap((f) => {
+    if (f.category !== "needsChoice" || f.reason !== "different-content" || f.recordId === undefined || f.recordType === "file" || seen.has(f.recordId)) return [];
+    seen.add(f.recordId);
+    return [{ recordType: f.recordType, recordId: f.recordId }];
+  });
+};
+
 export const recoveryAllowsLatest = (view: RecoveryUserView): boolean => view.kind === "none";

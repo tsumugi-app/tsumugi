@@ -38,6 +38,7 @@ import {
   type RecoveryLocalSnapshot,
   type RecoveryPlan,
   type RecoveryRecord,
+  recoveryRecordsSemanticEqual,
 } from "./vaultRecovery";
 import {
   conversationToMarkdown,
@@ -212,6 +213,8 @@ interface OpContext {
   content: string;
   /** memoryのday-file（create-day＝IndexedDBの当日のMemory、repair＝実ファイルのmember）。 */
   fileMembers: MemoryObject[] | null;
+  /** repairのday-fileで、端末の版と一致しない記録（ハッシュを記録しない） */
+  unprovenMemberIds?: Set<string>;
 }
 
 function memoryHistoryRow(memory: MemoryObject) {
@@ -250,11 +253,22 @@ function parseDayFileStrict(text: string): MemoryObject[] | null {
   return new Set(members.map((m) => m.id)).size === members.length ? members : null;
 }
 
+/** 端末に別の内容がある記録（手で編集された可能性がある）。端末に無い記録は、更新で上書きされることが無いので含めない */
+async function unprovenMembers(env: RecoveryApplyEnv, members: MemoryObject[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const m of members) {
+    const local = await env.readRecord("memory", m.id);
+    if (local && !recoveryRecordsSemanticEqual("memory", local as MemoryObject, m)) out.add(m.id);
+  }
+  return out;
+}
+
 function registryExpectation(op: RecoveryJournalOp, ctx: OpContext) {
   const contentHash = hashVaultText(ctx.content);
   const isDay = op.recordType === "memory";
   const memberIds = isDay ? (ctx.fileMembers ?? []).map((m) => m.id) : [op.members[0].id];
-  const memberHashes = isDay ? Object.fromEntries((ctx.fileMembers ?? []).map((m) => [m.id, hashVaultText(memberObjectMarkdown(m))])) : undefined;
+  // ファイルから読んだ記録を、手で編集されたまま「Tsumugiが書いた版」として記録しない（端末の版と一致しない記録のハッシュは書かない）
+  const memberHashes = isDay ? Object.fromEntries((ctx.fileMembers ?? []).filter((m) => !ctx.unprovenMemberIds?.has(m.id)).map((m) => [m.id, hashVaultText(memberObjectMarkdown(m))])) : undefined;
   return { key: op.registryKey, path: op.path, contentHash, memberIds, memberHashes, recordType: isDay ? ("memory-day" as const) : (op.recordType as "conversation" | "reflection" | "source") };
 }
 const memberObjectMarkdown = (m: MemoryObject) => memoryObjectToMarkdown(m);
@@ -1113,7 +1127,7 @@ export async function planRecoveryApply(env: RecoveryApplyEnv, confirmedIds: Set
       fileMembers = parseDayFileStrict(text.text);
       if (!fileMembers) { hold(r, "dayfile-unparseable"); continue; }
     }
-    const ctx: OpContext = { records: [local], content: text.text, fileMembers };
+    const ctx: OpContext = { records: [local], content: text.text, fileMembers, unprovenMemberIds: fileMembers ? await unprovenMembers(env, fileMembers) : undefined };
     const day = r.date.slice(0, 10);
     const op = baseOp(env, "repair", type, day, [memberOf(type, local)], path, ctx, r.registryKey);
     if (type === "memory") op.expected.history = { day, ids: (fileMembers ?? []).map((m) => m.id) };
@@ -1241,7 +1255,7 @@ async function buildOpContext(env: RecoveryApplyEnv, op: RecoveryJournalOp): Pro
     if (hashVaultText(read.text) !== op.expectedContentHash) throw new RecoveryStepError("markdown-changed");
     const fileMembers = op.recordType === "memory" ? parseDayFileStrict(read.text) : null;
     if (op.recordType === "memory" && !fileMembers) throw new RecoveryStepError("dayfile-unparseable");
-    return { records, content: read.text, fileMembers };
+    return { records, content: read.text, fileMembers, unprovenMemberIds: fileMembers ? await unprovenMembers(env, fileMembers) : undefined };
   }
   const built = contentOfCreate(op.recordType, records);
   if (hashVaultText(built.content) !== op.expectedContentHash) throw new RecoveryStepError("content-changed");

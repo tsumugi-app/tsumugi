@@ -153,6 +153,12 @@
   "-verifiedActualText !== undefined",
   "-}",
   "-} else if (isMemoryLegitimateSuccessor(existing, canonical)) {",
-  "-} else {"
+  "-} else {",
+  "-if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: \"extends\" })) throw new ProjectionConflictError(\"markdown-edited-conflict\");",
+  "+if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: \"extends\", reserialized: conversationToMarkdown(parsed) })) throw new ProjectionConflictError(\"markdown-edited-conflict\");",
+  "-if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, config.registryKeyFor(canonical), path), evolvingKeys: MEMORY_EVOLVING_KEYS, body: \"same\" })) throw new ProjectionConflictError(`${config.recordType}-markdown-edited-conflict`);",
+  "+if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, config.registryKeyFor(canonical), path), evolvingKeys: MEMORY_EVOLVING_KEYS, body: \"same\", reserialized: config.toMarkdown(parsed) })) throw new ProjectionConflictError(`${config.recordType}-markdown-edited-conflict`);",
+  "-const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? \"\"));",
+  "+const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? \"\"));"
  ]
 }

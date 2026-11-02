@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
 import VaultBackupSection from "./VaultBackupSection";
+import VaultConflictSection, { conflictOutcomeText, VaultKeptVersions } from "./VaultConflictSection";
 import type {
   DataActionFeedback,
   RestoreCandidate,
@@ -20,6 +21,7 @@ import type {
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
+import type { ConflictChoice, ConflictOutcome, ConflictRef, ConflictSnapshot } from "@/lib/vaultConflictResolution";
 import { recoveryDoneMessage, recoveryHeadingText } from "@/lib/vaultRecoveryUiText";
 import {
   RECOVERY_ATTENTION_TEXT, RECOVERY_CHECKING_TEXT, RECOVERY_DATA_KEPT_TEXT, RECOVERY_FAILED_TEXT, RECOVERY_INTERRUPTED_TEXT, RECOVERY_RECHECK_BUTTON,
@@ -83,6 +85,9 @@ export default function SettingsPanel({
   recoveryStatus,
   recoveryUserView,
   onUserRepair,
+  conflictRefs = [],
+  activeConversationId = null,
+  onResolveConflict,
   autoRepairOutcome = null,
   onRecheckRecovery,
   onRunRecoveryDryRun,
@@ -162,6 +167,10 @@ export default function SettingsPanel({
   /** 通常ユーザー向けのRecovery表示（正常なら何も出さない）。導出は`deriveRecoveryUserView`。 */
   recoveryUserView: RecoveryUserView;
   onUserRepair: () => void;
+  /** 確認の結果のうち、端末と保存先で内容が異なる記録 */
+  conflictRefs?: ConflictRef[];
+  activeConversationId?: string | null;
+  onResolveConflict?: (snapshot: ConflictSnapshot, choice: ConflictChoice) => Promise<ConflictOutcome>;
   /** 直前の「修復する」の結果（無ければnull）。表示は修復の後にもう一度確認した結果に基づく */
   autoRepairOutcome?: AutoRepairOutcome | null;
   /** 「もう一度確認する」（READ ONLY）。 */
@@ -188,6 +197,13 @@ export default function SettingsPanel({
 }) {
   // 保存先の技術的な確認機能（既存の4つの入口・外部変更の詳細表示）は、通常のUIには出さず、
   // `?debugLog=1`のときだけ「詳細（開発者向け）」に表示する（機能・handler・stateは削除していない）。
+  const [conflictResult, setConflictResult] = useState<{ text: string; at: number } | null>(null);
+  const resolveConflictAndShow = async (snapshot: ConflictSnapshot, choice: ConflictChoice): Promise<ConflictOutcome> => {
+    if (!onResolveConflict) return { kind: "not-started", reason: "busy" };
+    const outcome = await onResolveConflict(snapshot, choice);
+    setConflictResult({ text: conflictOutcomeText(outcome), at: Date.now() });
+    return outcome;
+  };
   const [wipeConfirmOpen, setWipeConfirmOpen] = useState(false);
   const [wipeAcknowledged, setWipeAcknowledged] = useState(false);
   // 途中で止まった削除（あれば「削除を完了する必要があります」と案内し、ここから続きへ進める）。通常は何も表示しない。
@@ -1328,6 +1344,9 @@ export default function SettingsPanel({
               </div>
             );
           })()}
+          {vaultStatus === "connected" && vaultHandle && conflictResult && (
+            <span role="status" data-testid="vault-conflict-outcome" className="rounded-xl bg-stone-50/80 px-3 py-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-300">{conflictResult.text}</span>
+          )}
           {vaultStatus === "connected" && vaultHandle && recoveryUserView.kind !== "none" && recoveryUserView.kind !== "pending" && (
             <div data-testid="vault-consistency" className="flex flex-col gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
               <span>
@@ -1350,6 +1369,9 @@ export default function SettingsPanel({
                   <span className="text-stone-500 dark:text-stone-400">{NEXT_ACTION_TEXT[section.category]}</span>
                 </div>
               ))}
+              {recoveryUserView.kind === "attention" && onResolveConflict && conflictRefs.length > 0 && (
+                <VaultConflictSection root={vaultHandle} conflicts={conflictRefs} activeConversationId={activeConversationId} disabled={vaultActionsDisabled || recoveryUserView.checking} onResolve={resolveConflictAndShow} />
+              )}
               {recoveryUserView.kind === "attention" && recoveryUserView.canRepair && vaultBackend === "opfs" && (
                 <span className="text-[11px] text-amber-700 dark:text-amber-400">{OPFS_REPAIR_NOTE}</span>
               )}
@@ -1375,6 +1397,8 @@ export default function SettingsPanel({
               )}
             </div>
           )}
+
+          {vaultStatus === "connected" && vaultHandle && <VaultKeptVersions root={vaultHandle} refreshKey={conflictResult?.at ?? 0} />}
 
           {/*
             Vault Recovery Apply（Phase 2初期版）。「安全性を証明できた旧記録」だけを保存先へ復旧する。
