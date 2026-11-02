@@ -123,7 +123,7 @@ for (const kind of ["desktop", "android"] as const) {
       await startUp(page); await startUp(page);
       expect(await read(page, DAY_FILE)).toBe(file);
       const next: any = await page.evaluate(async ({ DAY }) => (window as any).__settle(await (window as any).D.dbm.putMemoryObjectWithOutbox((window as any).__mem("c-mem-1", "架空の本文（次の更新）", `${DAY}T01:00:00.000Z`, "2026-10-22T00:00:00.000Z"), "memory")), { DAY });
-      expect(next.status).toBe("done");
+      expect(next.status, `${JSON.stringify(next)} ${JSON.stringify(await outbox(page, "memory:c-mem-1"))} ${await read(page, DAY_FILE)}`).toBe("done");
       expect(await read(page, DAY_FILE)).toContain("次の更新");
       // the kept copy is not a record anywhere
       expect(await page.evaluate(async () => (await (window as any).D.dbm.getAllMemoryObjects()).filter((m: any) => m.id === "c-mem-1").length)).toBe(1);
@@ -421,7 +421,8 @@ test.describe("the app (Settings)", () => {
         await page.getByTestId("vault-conflict-choice-keep-both").click();
         await expect(page.getByTestId("vault-conflict-confirmation")).toContainText("失われる内容はありません");
         await page.getByTestId("vault-conflict-confirm").click();
-        await expect(page.getByText("✓ 最新の状態です")).toBeVisible({ timeout: 90_000 });
+        try { await expect(page.getByText("✓ 最新の状態です")).toBeVisible({ timeout: 90_000 }); }
+        catch { throw new Error(`no 最新. The screen said: ${await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 1800))}`); }
         await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
         await expect(page.getByTestId("vault-conflict-outcome")).toContainText("問題が無くなった");
         await expect(page.getByTestId("vault-kept-version")).toHaveCount(1);
