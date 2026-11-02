@@ -54,6 +54,7 @@ import {
   hashVaultText,
   isMemoryDayFileName,
   memoryObjectsSemanticEqual,
+  normalizedSourceType,
   readVaultRegistryMeta,
   readVaultRegistryShard,
 } from "./vault";
@@ -63,6 +64,8 @@ import type { Conversation, MemoryObject } from "./types";
 // ---------------------------------------------------------------------------
 // 定数
 // ---------------------------------------------------------------------------
+
+const markdownForProof = (m: MemoryObject) => memoryObjectToMarkdown({ ...m, metadata: { ...m.metadata, sourceType: normalizedSourceType(m.metadata.source, m.metadata.sourceType) as MemoryObject["metadata"]["sourceType"] } });
 
 /** 隠しarchive。`.`で始まるため、Tsumugiの全走査・Obsidianの双方から見えない。 */
 export const LEGACY_ARCHIVE_ROOT = ".tsumugi-archive";
@@ -446,7 +449,8 @@ export function computeLegacyCleanupPlan(
         : [{ name: "重複コピーが残っていない", ok: copies.length === 0, detail: `${copies.length}件` }]),
       {
         name: "IndexedDBのConversationと内容が同じ",
-        ok: canonical !== undefined && idbConversation !== undefined && conversationsSemanticEqual(idbConversation, canonical.parsed),
+        // 内容の比較（conversationsSemanticEqual）はタイトルと種類を見ない：ここで手編集が残っていると、ハッシュが証拠として通り、次の保存で上書きされる
+        ok: canonical !== undefined && idbConversation !== undefined && conversationsSemanticEqual(idbConversation, canonical.parsed) && (idbConversation.title ?? null) === (canonical.parsed.title ?? null) && (idbConversation.entryType ?? null) === (canonical.parsed.entryType ?? null),
         detail: idbConversation ? undefined : "IndexedDBに無い",
       },
     ];
@@ -869,7 +873,11 @@ export async function executeLegacyCleanup(
       if (!file) throw new Error("ファイルが見つかりません");
       const members = parseMemoryDayFile(file.text);
       const memberHashes: Record<string, string> = {};
-      for (const member of members) memberHashes[member.id] = hashVaultText(memoryObjectToMarkdown(member));
+      // 内容の比較（memoryObjectsSemanticEqual）はMarkdownの全項目を見ない：端末の版と全項目が同じ記録だけ、Tsumugiの版として記録する
+      for (const member of members) {
+        const device = after.idb.memories.get(member.id);
+        if (device && markdownForProof(device) === markdownForProof(member)) memberHashes[member.id] = hashVaultText(memoryObjectToMarkdown(member));
+      }
       const stat = await statFile(root, item.path);
       await commitVaultRegistryMemoryDayOk(
         root,

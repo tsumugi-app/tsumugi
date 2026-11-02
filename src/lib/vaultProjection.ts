@@ -203,7 +203,8 @@ async function registeredContentHash(env: ProjectionEnv, registryKey: string, pa
   const read = await readJsonAt(env, registryShardPath(vaultRegistryBucketOf(registryKey)));
   if (read.state !== "ok" || !isObj(read.value.records) || !isObj(read.value.files) || read.value.records[registryKey] !== path) return undefined;
   const entry = read.value.files[path];
-  return isObj(entry) ? entry.contentHash : undefined;
+  // conflictの行のハッシュは、競合を記録するときにファイルの実体から計算されたもの：Tsumugiが書いた証拠にならない
+  return isObj(entry) && entry.status !== "conflict" ? entry.contentHash : undefined;
 }
 
 async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, registryPath: string | undefined): Promise<MarkdownVerdict> {
@@ -216,7 +217,7 @@ async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, regis
   const parsed = parseConversationMarkdown(read.text);
   if (!parsed) throw new ProjectionConflictError("markdown-unreadable");
   if (!isLegitimatePredecessor(parsed, canonical)) throw new ProjectionConflictError("markdown-conflict");
-  if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: "extends" })) throw new ProjectionConflictError("markdown-edited-conflict");
+  if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: "extends", reserialized: conversationToMarkdown(parsed) })) throw new ProjectionConflictError("markdown-edited-conflict");
   return { kind: "update", path };
 }
 
@@ -663,7 +664,7 @@ async function readRegisteredMemberHashes(env: ProjectionEnv, day: string, path:
   const read = await readJsonAt(env, registryShardPath(vaultRegistryBucketOf(registryKey)));
   if (read.state !== "ok" || !isObj(read.value.records) || !isObj(read.value.files) || read.value.records[registryKey] !== path) return {};
   const entry = read.value.files[path];
-  return isObj(entry) && isObj(entry.memberHashes) ? entry.memberHashes : {};
+  return isObj(entry) && entry.status !== "conflict" && isObj(entry.memberHashes) ? entry.memberHashes : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +957,7 @@ async function decideSingleFileMarkdown<T extends { id: string; createdAt: strin
   if (read.text === expectedContent) return { kind: "no-op", path, onDisk: parsed ?? canonical };
   if (!parsed) throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);
   if (config.isLegitimateSuccessor && config.isLegitimateSuccessor(parsed, canonical)) {
-    if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, config.registryKeyFor(canonical), path), evolvingKeys: MEMORY_EVOLVING_KEYS, body: "same" })) throw new ProjectionConflictError(`${config.recordType}-markdown-edited-conflict`);
+    if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, config.registryKeyFor(canonical), path), evolvingKeys: MEMORY_EVOLVING_KEYS, body: "same", reserialized: config.toMarkdown(parsed) })) throw new ProjectionConflictError(`${config.recordType}-markdown-edited-conflict`);
     return { kind: "update", path };
   }
   throw new ProjectionConflictError(`${config.recordType}-markdown-conflict`);
@@ -1423,7 +1424,7 @@ export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: 
  * 判定が変わらなければ何も書かない。1回の起動で1回だけなので、繰り返しにはならない。
  */
 export async function reevaluateRewriteHeldOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
-  const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? ""));
+  const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? ""));
   for (const entry of entries) quietHolds.add(entry);
   return reconcileOutboxEntries(env, entries);
 }

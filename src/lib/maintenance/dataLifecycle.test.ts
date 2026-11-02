@@ -127,6 +127,21 @@ test("physical deletion uses the restore parser's exact day boundary and never s
   await deletion.applyVaultDeletionEdits(v.root(), p); assert.equal(v.snapshot()["talk.md"], undefined);
 });
 
+test("physical deletion: a surviving member's hash advances only if Tsumugi wrote the previous version; a hand-edited member never gains a hash", () => {
+  const hash = require(path.join(OUT, "lib/vault.js")).hashVaultText as (t: string) => string;
+  const sep = md.MEMORY_ENTRY_SEPARATOR, DAY = "Memories/2026-08-20.md";
+  const link = { sourceId: "linked", targetId: "gone", type: "related", createdAt: T };
+  const linked = md.memoryObjectToMarkdown(memory("linked", [link])), edited = md.memoryObjectToMarkdown({ ...memory("edited"), content: "手で直した架空の本文" }), noHash = md.memoryObjectToMarkdown(memory("no-hash"));
+  const file = [md.memoryObjectToMarkdown(memory("gone")), linked, edited, noHash].join(sep);
+  const shard = { schemaVersion: 1, bucket: 0, records: { day: DAY }, files: { [DAY]: { recordType: "memory-day", status: "ok", contentHash: hash(file), memberIds: ["gone", "linked", "edited", "no-hash"], memberHashes: { gone: hash(md.memoryObjectToMarkdown(memory("gone"))), linked: hash(linked), edited: hash(md.memoryObjectToMarkdown(memory("edited"))) } } } };
+  const plan = deletion.buildVaultDeletionPlan(new Map([[DAY, file], [".tsumugi/registry/00.json", JSON.stringify(shard)]]), tomb("memory", "gone"), "v", 0);
+  const row = JSON.parse(plan.edits.find((e) => e.path === ".tsumugi/registry/00.json")!.after as string).files[DAY];
+  assert.equal(row.memberHashes.linked, hash(md.memoryObjectToMarkdown(memory("linked"))), "the link was removed by this deletion: the hash follows");
+  assert.equal(row.memberHashes.edited, shard.files[DAY].memberHashes.edited, "the recorded value stays: the hand edit does not become Tsumugi's version");
+  assert.equal(row.memberHashes["no-hash"], undefined);
+  assert.equal(row.memberHashes.gone, undefined);
+});
+
 test("physical deletion keeps a guarded registry container for externally added or moved survivors", async () => {
   const w = deletionWorld();
   const shard = JSON.parse(w.v.snapshot()[".tsumugi/registry/00.json"]);

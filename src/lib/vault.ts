@@ -6423,6 +6423,24 @@ async function applyMemoryDayMembers(root: FileSystemDirectoryHandle, record: Va
   }
 }
 
+/**
+ * Registryへ記録してよいmember hashだけを返す。ハッシュは「端末の版がファイルのその部分と同じか、その部分がTsumugiの書いた版」の証拠で、次の更新はこれを根拠に
+ * ファイルを置き換える。手で編集された部分のハッシュを記録すると、次の更新で上書きしてしまう。`imported`は"edited"を端末へ取り込んだ後か（移動だけのときは取り込まない）。
+ */
+async function provenMemberHashes(members: VaultResyncMemberResult[], imported: boolean): Promise<Record<string, string>> {
+  const hashes: Record<string, string> = {};
+  for (const m of members) {
+    if (!m.parsed || m.outcome === "conflict") continue;
+    if (m.outcome === "unchanged" || (imported && m.outcome === "edited")) {
+      hashes[m.id] = hashVaultText(memoryObjectToMarkdown(m.parsed));
+      continue;
+    }
+    const device = await getMemoryObject(m.id);
+    if (!device || memoryObjectToMarkdown(device) === memoryObjectToMarkdown(m.parsed)) hashes[m.id] = hashVaultText(memoryObjectToMarkdown(m.parsed));
+  }
+  return hashes;
+}
+
 /** normal Memory day-file（container単位）のapply本体。C1（Codexレビュー指摘・
  *  High 1対応）：`applySingleRecordOutcome`と同じ`VaultResyncApplyOutcomeResult`を
  *  返す。 */
@@ -6443,10 +6461,7 @@ async function applyMemoryDayOutcome(
         throw new Error(`moved memory-day outcome for ${record.registryKey} is missing required scan fields`);
       }
       const memberIds = (record.members ?? []).map((m) => m.id);
-      const memberHashes: Record<string, string> = {};
-      for (const m of record.members ?? []) {
-        if (m.parsed) memberHashes[m.id] = hashVaultText(memoryObjectToMarkdown(m.parsed));
-      }
+      const memberHashes = await provenMemberHashes(record.members ?? [], false);
       await commitVaultRegistryMemoryDayOk(
         root,
         record.registryKey,
@@ -6484,10 +6499,7 @@ async function applyMemoryDayOutcome(
         throw new Error(`${record.outcome} memory-day outcome for ${record.registryKey} is missing required scan fields`);
       }
       const memberIds = (record.members ?? []).map((m) => m.id);
-      const memberHashes: Record<string, string> = {};
-      for (const m of record.members ?? []) {
-        if (m.parsed) memberHashes[m.id] = hashVaultText(memoryObjectToMarkdown(m.parsed));
-      }
+      const memberHashes = await provenMemberHashes(record.members ?? [], true);
       await commitVaultRegistryMemoryDayOk(
         root,
         record.registryKey,

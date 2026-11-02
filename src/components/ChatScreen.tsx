@@ -118,7 +118,9 @@ import {
 } from "@/lib/vaultRecoveryLegacyCleanup";
 import { runProductionBootstrapOnce } from "@/lib/productionBootstrap";
 import { recoveryDoneLooksLikeSuccess } from "@/lib/vaultRecoveryUiText";
-import { deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
+import { conflictRefsOf, deriveRecoveryUserView } from "@/lib/vaultRecoveryUserView";
+import { resolveConflict, type ConflictChoice, type ConflictOutcome, type ConflictSnapshot } from "@/lib/vaultConflictResolution";
+import { createProductionConflictEnv } from "@/lib/vaultConflictResolutionRun";
 import { resumeNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
 import { APP_BUILD_ID, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import { checkVaultConsistency } from "@/lib/vaultConsistencyCheck";
@@ -3623,6 +3625,48 @@ export default function ChatScreen() {
   }
 
   /**
+   * 端末と保存先で内容が異なる記録の、ユーザーの選択の実行（vaultConflictResolution.ts）。表示はもう一度確認した結果だけに基づく。
+   */
+  async function handleResolveConflict(snapshot: ConflictSnapshot, choice: ConflictChoice): Promise<ConflictOutcome> {
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return { kind: "not-started", reason: "busy" };
+    const handle = vaultHandle;
+    const generation = vaultGenerationRef.current;
+    vaultOperationLockRef.current = true;
+    const endTask = beginMemoryTask();
+    setAutoRepairOutcome(null);
+    try {
+      const outcome = await resolveConflict(createProductionConflictEnv({
+        root: handle,
+        backend: getVaultBackend() ?? "unknown",
+        build: APP_BUILD_ID,
+        isCancelled: () => generation !== vaultGenerationRef.current,
+        activeConversationId: conversation.id,
+      }), snapshot, choice);
+      if (generation !== vaultGenerationRef.current || outcome.kind === "not-started") return outcome;
+      if (outcome.after) {
+        setConsistencyReport(outcome.after);
+        setRecoveryStatus(outcome.after.state === "clean" ? { kind: "clean" } : { kind: "idle" });
+      }
+      if (outcome.kind === "done") {
+        const adopted = outcome.adopted;
+        if (adopted) setMemoryObjects((prev) => prev.map((m) => (m.id === adopted.id ? (adopted as MemoryObject) : m)));
+        flushPendingToVaultInBackground(handle); // 起動時に測った「未反映」の件数を測り直す（解決した記録を未反映と言い続けない）
+        vaultLightCheckDiscoveryRef.current = null;
+        setVaultLightCheckStatus({ kind: "idle" });
+        runVaultLightCheckInBackground(handle);
+        bumpHistoryRefreshToken();
+      }
+      return outcome;
+    } catch (error) {
+      if (handleStaleVaultTabError(error)) return { kind: "not-started", reason: "busy" };
+      throw error;
+    } finally {
+      endTask();
+      vaultOperationLockRef.current = false;
+    }
+  }
+
+  /**
    * 通常ユーザー向けの「修復する」。確認の結果の`repairTargets`（今のバージョンで規則により安全に直せる記録）だけを、自動修復
    * （vaultAutoRepair.ts：バックアップ→直前の再照合→排他区間での修復→通常の保存→もう一度確認）で直す。直せる記録が無ければ何も実行しない。
    * 2026-10-03の事例専用の限定修復は、ここからは新しく実行しない：途中で止まった限定修復の続きを完了することだけを行う。
@@ -5866,6 +5910,9 @@ export default function ChatScreen() {
             onExecuteRecoveryApply={() => void handleExecuteRecoveryApply()}
             recoveryUserView={deriveRecoveryUserView(recoveryStatus, consistencyReport, { detectionFailed: recoveryDetectionFailed, checking: recoveryChecking })}
             onUserRepair={() => void handleUserRepair()}
+            conflictRefs={conflictRefsOf(consistencyReport)}
+            activeConversationId={conversation.id}
+            onResolveConflict={handleResolveConflict}
             autoRepairOutcome={autoRepairOutcome}
             onRecheckRecovery={handleRecheckRecovery}
             legacyHeldCleanupStatus={legacyHeldCleanupStatus}

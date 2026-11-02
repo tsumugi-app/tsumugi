@@ -158,10 +158,11 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
  * snapshot, (b) records of another conversation, (c) the Outbox entry written in the same transaction, then add it here.
  *   ChatScreen: manual restore from the Vault (explicit user action, trusts the Vault by design) and the revisit prompt (re-reads the record first).
  *   capture: new Memories / Reflections only (record + Outbox in one transaction).  connect: links (both ends + Outbox in one transaction).
+ *   vaultConflictResolution: the user chose the Vault version of a conflicting record (conditional on the version the user saw; record + Outbox in one transaction; both versions kept first).
  *   topPrompt: revisit prompt.  vault: applying a user's Vault edit (field merge, conflicts are held).  vaultProductionMigration: one-time migration.
  */
 test("Memory write surface: only the reviewed production files write Memory records or name the raw store", () => {
-  const WRITE = /\b(putMemoryObject|putMemoryObjectWithOutbox|putCapturedMemoryWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
+  const WRITE = /\b(adoptVaultVersionWithOutbox|putMemoryObject|putMemoryObjectWithOutbox|putCapturedMemoryWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
   const STORE = /["']memoryObjects["']/;
   const writers: Record<string, string[]> = {}, storeUsers: string[] = [];
   const walk = (d: string) => {
@@ -183,6 +184,7 @@ test("Memory write surface: only the reviewed production files write Memory reco
     "lib/connect.ts": ["addMemoryLinkDurably"],
     "lib/topPrompt.ts": ["updateMemoryRevisitPrompt"],
     "lib/vault.ts": ["putMemoryObjectAndMarkSynced"],
+    "lib/vaultConflictResolution.ts": ["adoptVaultVersionWithOutbox"],
     "lib/vaultProductionMigration.ts": ["putMemoryObjectWithOutbox"],
   }, "a Memory write path was added or changed: review it (see the comment above this test) and update the list");
   assert.deepEqual(storeUsers.sort(), ["components/ChatScreen.tsx", "lib/androidDiagnostics.ts", "lib/vaultRecovery.ts"],
