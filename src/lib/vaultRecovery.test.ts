@@ -503,9 +503,20 @@ test("空の発言：連続した空の発言、空のユーザー発言、先�
 test("空の発言：最後の発言が空のファイルを全体をtrimして読んでも（Recoveryの読み方）、前の発言に混ざらない", () => {
   const c = withTurns(["user", "架空の問い"], ["ai", ""]);
   assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(c).trim())!.turns, c.turns);
-  // 最後の行以外の`**User:**`だけの行は、これまでどおり本文の一部
-  const text = withTurns(["user", "架空の前置き\n**User:**\n架空の続き"], ["ai", "架空の答え"]);
-  assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(text))!.turns, text.turns);
+  const two = withTurns(["user", "架空の問い"], ["ai", ""], ["user", ""]);
+  assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(two).trim())!.turns, two.turns);
+  // `**User:**`だけの行は、最後の行でも、turnTimesの件数が合っていれば本文の一部（空の発言と取り違えない）
+  for (const c of [
+    withTurns(["user", "架空の前置き\n**User:**\n架空の続き"], ["ai", "架空の答え"]),
+    withTurns(["user", "架空の前置き\n**Tsumugi:**"]),
+    withTurns(["user", "架空の問い"], ["ai", "架空の前置き\n**User:**"]),
+  ]) {
+    assertRoundTrip(c);
+    assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(c).trim())!.turns, c.turns);
+  }
+  // turnTimesの無いファイルでは見分けられないので、これまでどおり本文の一部
+  const legacy = conversationToMarkdown(withTurns(["user", "架空の前置き\n**Tsumugi:**"])).replace(/^turnTimes: .*\n/m, "");
+  assert.equal(parseConversationMarkdown(legacy)!.turns.length, 1);
 });
 
 test("空の発言：前後の発言の日時は、それぞれの発言のまま（後ろの発言が1つずつずれない）", () => {
