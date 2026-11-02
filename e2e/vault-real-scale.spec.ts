@@ -421,6 +421,45 @@ test("at real size: Settings shows two saves held with the file equal; 保存を
   expect(left).toBe("ok");
 });
 
+test("inside the once-a-day window, a lost History month, History summary or conversation file is still put back at the next start", async ({ page }) => {
+  test.setTimeout(600_000);
+  await page.addInitScript(installTrace);
+  await seedWorld(page);
+  await startApp(page, "clean first");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await waitLatest(page);
+  const read = (path: string) => page.evaluate(async (p) => {
+    const parts = p.split("/"); let d: any = await navigator.storage.getDirectory();
+    try { for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part); return await (await (await d.getFileHandle(parts[parts.length - 1])).getFile()).text(); }
+    catch { return null; }
+  }, path);
+  const remove = (path: string) => page.evaluate(async (p) => {
+    const parts = p.split("/"); let d: any = await navigator.storage.getDirectory();
+    for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part);
+    await d.removeEntry(parts[parts.length - 1]);
+  }, path);
+  const found = await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory(); const tsumugi = await root.getDirectoryHandle(".tsumugi");
+    const months: string[] = []; for await (const [name] of (await tsumugi.getDirectoryHandle("history") as any).entries()) months.push(name);
+    let conversation = ""; for await (const [name, h] of (await root.getDirectoryHandle("Conversations") as any).entries()) { if ((await (await h.getFile()).text()).includes("id: scale-conv-005")) conversation = `Conversations/${name}`; }
+    return { month: `.tsumugi/history/${months.sort()[0]}`, conversation };
+  });
+  for (const lost of [found.month, found.conversation]) {
+    const before = await read(lost); expect(before).not.toBeNull();
+    await remove(lost);
+    await startApp(page, `lost ${lost.startsWith(".tsumugi") ? "a History month" : "a conversation file"}`);
+    await expect.poll(() => read(lost), { timeout: 120_000 }).toBe(before);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await waitLatest(page);
+  }
+  const summary = JSON.parse((await read(".tsumugi/history-meta.json")) as string);
+  await remove(".tsumugi/history-meta.json");
+  await startApp(page, "lost the History summary");
+  await expect.poll(async () => { const t = await read(".tsumugi/history-meta.json"); return t ? JSON.parse(t).months : null; }, { timeout: 120_000 }).toEqual(summary.months);
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await waitLatest(page);
+});
+
 test("at real size: states an older build may have left (a held save with the file already equal, an update held after an empty turn, an empty last turn) end clean by themselves", async ({ page }) => {
   test.setTimeout(600_000);
   await page.addInitScript(installTrace);

@@ -40,6 +40,7 @@ import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultId
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
 import { getDoneIntegrityMarker, setDoneIntegrityMarker } from "./db";
 import { doneIntegrityIsDue } from "./vaultStartupState";
+import { migrationFoundOnlySameRecords, sharedManagementFilesAreReadable } from "./vaultDoneIntegrityGate";
 import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
@@ -57,7 +58,7 @@ export interface SaveFoundationBootstrapEnv {
   generateVaultId?: () => string;
   /**
    * 指定すると、保存済みの全記録の照合を「ビルドごと・maxAgeMsごとに1回」にする（通常の起動を重くしないため）。保存待ち・保留の処理は毎回行う。
-   * その間の欠け・外部の変更は、起動ごとの軽い確認（Registryの大きさ・日時とファイルの突き合わせ）が見つける。指定なしは毎回照合する。
+   * 記録の欠け・変更や、共有する管理ファイルの欠けが見つかった起動では期限内でも照合する（vaultDoneIntegrityGate.ts）。指定なしは毎回照合する。
    */
   doneIntegrity?: { build: string; maxAgeMs: number };
 }
@@ -123,7 +124,7 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     // 実体が既に正しいrecordは、各stepの既存no-op検出により1byteも書き込まれない
     // （Phase 3-7.1 req 3-F）。
     const now = (env.now ?? (() => new Date().toISOString()))();
-    const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs);
+    const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs) || !migrationFoundOnlySameRecords(migration) || !(await sharedManagementFilesAreReadable(env.root));
     const integrity = verifyDone ? await reconcileDoneVaultOutboxIntegrity(projectionEnv) : null;
     if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now });
 
