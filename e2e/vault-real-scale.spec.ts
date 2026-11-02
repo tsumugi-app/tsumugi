@@ -241,6 +241,7 @@ test.only("at real size: the empty AI turns are not a conflict anywhere, Setting
   });
   const third = await startApp(page, "before a new conversation");
   const inputAt = Date.now();
+  await page.getByRole("button", { name: "会話", exact: true }).click();
   await page.locator("footer textarea").fill("架空の新しい話題");
   await page.locator("footer").getByRole("button", { name: "送る" }).click();
   report("perf-first-send", { fromHome: Date.now() - inputAt });
@@ -302,7 +303,8 @@ test.only("at real size: two conversations that really differ are found, nothing
   };
   const startedAt = Date.now();
   await chooseDevice(page.getByTestId("vault-conflict-item").first());
-  await expect(page.getByTestId("vault-conflict-item")).toHaveCount(1, { timeout: 240_000 });
+  try { await expect(page.getByTestId("vault-conflict-item")).toHaveCount(1, { timeout: 120_000 }); }
+  catch { throw new Error(`the first choice did not settle. The screen said: ${(await screenText(page)).slice(150, 700)} WHY: ${await whyNotLatest(page)} LOCKS: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-10).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end), l.abandoned])))}`); }
   const firstDone = Date.now() - startedAt;
   await expect(page.getByText(LATEST)).toHaveCount(0);   // the other one is still a conflict
   await chooseDevice(page.getByTestId("vault-conflict-item").first());   // right after the first
