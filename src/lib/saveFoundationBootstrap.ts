@@ -39,7 +39,7 @@ import { getVaultIdentityRecord } from "./db";
 import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultIdentityEnsureResult } from "./vaultIdentityAdoption";
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
 import { getDoneIntegrityMarker, setDoneIntegrityMarker } from "./db";
-import { doneIntegrityIsDue } from "./recoveryBackgroundCheck";
+import { doneIntegrityIsDue } from "./vaultStartupState";
 import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
