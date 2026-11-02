@@ -347,11 +347,13 @@ test("at real size: Settings shows two saves held with the file equal; 保存を
 
   // the state the phone showed: both empty-turn conversations held as conflicts while their files are the same. One Registry row also says conflict, as older code recorded it
   const snapshot = () => page.evaluate(async () => {
-    const { dbm } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const root = await navigator.storage.getDirectory();
     const out: Record<string, unknown> = {};
     const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else { const t: string = await (await h.getFile()).text(); if (t.includes("scale-conv-020") || t.includes("scale-conv-040")) out[`${prefix}${name}`] = t; } } };
     await walk(await root.getDirectoryHandle("Conversations"), "Conversations/");
-    for (const id of ["scale-conv-020", "scale-conv-040"]) out[`idb:${id}`] = JSON.stringify(await dbm.getConversation(id));
+    const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    for (const id of ["scale-conv-020", "scale-conv-040"]) out[`idb:${id}`] = await new Promise<string>((res) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(JSON.stringify(q.result)); });
+    db.close();
     return out;
   });
   const before = await snapshot();
