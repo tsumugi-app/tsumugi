@@ -6,7 +6,7 @@
   "+const defaultBootstrapFn: BootstrapFn = (root) => runSaveFoundationBootstrap({ root, doneIntegrity: { build: APP_BUILD_ID, maxAgeMs: DONE_INTEGRITY_MAX_AGE_MS } });",
   "+import { getDoneIntegrityMarker, setDoneIntegrityMarker } from \"./db\";",
   "+import { doneIntegrityIsDue } from \"./vaultStartupState\";",
-  "+import { migrationFoundOnlySameRecords, sharedManagementFilesAreReadable } from \"./vaultDoneIntegrityGate\";",
+  "+import { migrationFoundNothingMissing, sharedManagementFilesAreReadable } from \"./vaultDoneIntegrityGate\";",
   "+/**",
   "+* 指定すると、保存済みの全記録の照合を「ビルドごと・maxAgeMsごとに1回」にする（通常の起動を重くしないため）。保存待ち・保留の処理は毎回行う。",
   "+* 記録の欠け・変更や、共有する管理ファイルの欠けが見つかった起動では期限内でも照合する（vaultDoneIntegrityGate.ts）。指定なしは毎回照合する。",
@@ -14,7 +14,7 @@
   "+doneIntegrity?: { build: string; maxAgeMs: number };",
   "-const integrity = await reconcileDoneVaultOutboxIntegrity(projectionEnv);",
   "+const now = (env.now ?? (() => new Date().toISOString()))();",
-  "+const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs) || !migrationFoundOnlySameRecords(migration) || !(await sharedManagementFilesAreReadable(env.root));",
+  "+const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs) || !migrationFoundNothingMissing(migration) || !(await sharedManagementFilesAreReadable(env.root));",
   "+const integrity = verifyDone ? await reconcileDoneVaultOutboxIntegrity(projectionEnv) : null;",
   "+if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now });"
  ]

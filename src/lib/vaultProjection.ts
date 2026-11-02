@@ -235,7 +235,7 @@ async function projectMarkdown(env: ProjectionEnv, canonical: Conversation, verd
 // Conversation：Registry判定（req 4）
 // ---------------------------------------------------------------------------
 
-async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversation, path: string): Promise<void> {
+async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversation, path: string, fileWritten: boolean): Promise<void> {
   const bucket = vaultRegistryBucketOf(canonical.id);
   const shardPath = registryShardPath(bucket);
   const read = await readJsonAt(env, shardPath);
@@ -258,7 +258,7 @@ async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversat
     Array.isArray(currentEntry.memberIds) &&
     currentEntry.memberIds.length === 1 &&
     currentEntry.memberIds[0] === canonical.id;
-  if (alreadyCorrect) return; // no-op
+  if (alreadyCorrect && !fileWritten) return; // no-op (a file written again, e.g. a lost copy put back, has a new mtime for the Registry row)
   // the file stat is only needed when the Registry row has to be written: an already-correct row is decided without it (one operation less per record)
   const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
   let stat: { mtime: number; size: number };
@@ -459,7 +459,7 @@ export async function reconcileConversationOutboxEntry(env: ProjectionEnv, entry
     await projectMarkdown(env, canonical, markdownVerdict);
     steps.markdown = "done";
 
-    await decideAndProjectRegistry(env, canonical, markdownVerdict.path);
+    await decideAndProjectRegistry(env, canonical, markdownVerdict.path, markdownVerdict.kind !== "no-op");
     steps.registry = "done";
 
     await decideAndProjectIndex(env, canonical, markdownVerdict.path);
@@ -673,7 +673,7 @@ async function readRegisteredMemberHashes(env: ProjectionEnv, day: string, path:
 // のRegistry情報を落とさない。
 // ---------------------------------------------------------------------------
 
-async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string, targetId: string): Promise<void> {
+async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string, targetId: string, fileWritten: boolean): Promise<void> {
   const day = finalMembers[0]?.date.slice(0, 10) ?? "";
   const registryKey = dayFileRegistryKey(day);
   const bucket = vaultRegistryBucketOf(registryKey);
@@ -702,7 +702,7 @@ async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, 
     sameStringSet(currentEntry.memberIds as unknown[], memberIds) &&
     isObj(currentEntry.memberHashes) &&
     memberIds.every((id) => (currentEntry.memberHashes as Obj)[id] === memberHashes[id]);
-  if (alreadyCorrect) return;
+  if (alreadyCorrect && !fileWritten) return;
   // the file stat is only needed when the Registry row has to be written: an already-correct row is decided without it (one operation less per record)
   const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
   let stat: { mtime: number; size: number };
@@ -866,7 +866,7 @@ export async function reconcileMemoryOutboxEntry(env: ProjectionEnv, entry: Vaul
     const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path));
     steps.markdown = "done";
 
-    await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent, canonical.id);
+    await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent, canonical.id, merge.verdict !== "no-op");
     steps.registry = "done";
 
     await decideAndProjectMemoryIndex(env, canonical, path);
@@ -982,7 +982,8 @@ async function decideAndProjectSingleFileRegistry<T extends { id: string; create
   env: ProjectionEnv,
   canonical: T,
   path: string,
-  config: SingleFileRecordConfig<T>
+  config: SingleFileRecordConfig<T>,
+  fileWritten: boolean
 ): Promise<void> {
   const registryKey = config.registryKeyFor(canonical);
   const bucket = vaultRegistryBucketOf(registryKey);
@@ -1004,7 +1005,7 @@ async function decideAndProjectSingleFileRegistry<T extends { id: string; create
     Array.isArray(currentEntry.memberIds) &&
     currentEntry.memberIds.length === 1 &&
     currentEntry.memberIds[0] === registryKey;
-  if (alreadyCorrect) return;
+  if (alreadyCorrect && !fileWritten) return;
   // the file stat is only needed when the Registry row has to be written
   const { dir, fileName } = await dirAndFileNameFor(env.root, path, false);
   let stat: { mtime: number; size: number };
@@ -1125,7 +1126,7 @@ async function reconcileSingleFileOutboxEntry<T extends { id: string; createdAt:
     await projectSingleFileMarkdown(env, canonical, markdownVerdict, config);
     steps.markdown = "done";
 
-    await decideAndProjectSingleFileRegistry(env, canonical, markdownVerdict.path, config);
+    await decideAndProjectSingleFileRegistry(env, canonical, markdownVerdict.path, config, markdownVerdict.kind !== "no-op");
     steps.registry = "done";
 
     await decideAndProjectSingleFileIndex(env, canonical, markdownVerdict.path);

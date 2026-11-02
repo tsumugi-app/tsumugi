@@ -193,6 +193,23 @@
   "-if (await isAlreadySyncedToVault(\"memory\", memoryObject.id, memoryObject.updatedAt)) continue;",
   "+if (await alreadySynced(\"memory\", memoryObject.id, memoryObject.updatedAt)) continue;",
   "-if (await isAlreadySyncedToVault(\"source\", source.id, source.updatedAt)) continue;",
-  "+if (await alreadySynced(\"source\", source.id, source.updatedAt)) continue;"
+  "+if (await alreadySynced(\"source\", source.id, source.updatedAt)) continue;",
+  "-async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversation, path: string): Promise<void> {",
+  "+async function decideAndProjectRegistry(env: ProjectionEnv, canonical: Conversation, path: string, fileWritten: boolean): Promise<void> {",
+  "-if (alreadyCorrect) return; // no-op",
+  "+if (alreadyCorrect && !fileWritten) return; // no-op (a file written again, e.g. a lost copy put back, has a new mtime for the Registry row)",
+  "-await decideAndProjectRegistry(env, canonical, markdownVerdict.path);",
+  "+await decideAndProjectRegistry(env, canonical, markdownVerdict.path, markdownVerdict.kind !== \"no-op\");",
+  "-async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string, targetId: string): Promise<void> {",
+  "+async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string, targetId: string, fileWritten: boolean): Promise<void> {",
+  "-if (alreadyCorrect) return;",
+  "+if (alreadyCorrect && !fileWritten) return;",
+  "-await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent, canonical.id);",
+  "+await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent, canonical.id, merge.verdict !== \"no-op\");",
+  "-config: SingleFileRecordConfig<T>",
+  "+config: SingleFileRecordConfig<T>,",
+  "+fileWritten: boolean",
+  "-await decideAndProjectSingleFileRegistry(env, canonical, markdownVerdict.path, config);",
+  "+await decideAndProjectSingleFileRegistry(env, canonical, markdownVerdict.path, config, markdownVerdict.kind !== \"no-op\");"
  ]
 }

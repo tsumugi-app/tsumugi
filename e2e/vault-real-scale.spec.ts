@@ -421,7 +421,7 @@ test("at real size: Settings shows two saves held with the file equal; 保存を
   expect(left).toBe("ok");
 });
 
-test("inside the once-a-day window, a lost History month, History summary or conversation file is still put back at the next start", async ({ page }) => {
+test("inside the once-a-day window, a lost History month, History summary, conversation or Memory file is still put back at the next start", async ({ page }) => {
   test.setTimeout(600_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
@@ -442,12 +442,14 @@ test("inside the once-a-day window, a lost History month, History summary or con
     const root = await navigator.storage.getDirectory(); const tsumugi = await root.getDirectoryHandle(".tsumugi");
     const months: string[] = []; for await (const [name] of (await tsumugi.getDirectoryHandle("history") as any).entries()) months.push(name);
     let conversation = ""; for await (const [name, h] of (await root.getDirectoryHandle("Conversations") as any).entries()) { if ((await (await h.getFile()).text()).includes("id: scale-conv-005")) conversation = `Conversations/${name}`; }
-    return { month: `.tsumugi/history/${months.sort()[0]}`, conversation };
+    const memories: string[] = []; const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else memories.push(`${prefix}${name}`); } };
+    await walk(await root.getDirectoryHandle("Memories"), "Memories/");
+    return { month: `.tsumugi/history/${months.sort()[0]}`, conversation, memory: memories.sort()[0] };
   });
-  for (const lost of [found.month, found.conversation]) {
+  for (const lost of [found.month, found.conversation, found.memory]) {
     const before = await read(lost); expect(before).not.toBeNull();
     await remove(lost);
-    await startApp(page, `lost ${lost.startsWith(".tsumugi") ? "a History month" : "a conversation file"}`);
+    await startApp(page, `lost ${lost.split("/")[0]}`);
     await expect.poll(() => read(lost), { timeout: 120_000 }).toBe(before);
     await nav(page).getByRole("button", { name: "設定" }).click();
     await waitLatest(page);
