@@ -471,7 +471,7 @@ test("dedicated route import/render never accesses storage or mounts normal app"
 
 // 空の発言（架空のデータのみ）。端末の記録と保存先のMarkdownで、発言数・順番・役割・日時が揃い、本当に違う記録だけが競合になること
 const at = (i: number) => `2026-09-24T12:${String(i).padStart(2, "0")}:00.000Z`;
-const withTurns = (...turns: [string, string][]): Conversation => ({ ...conversation(), turns: turns.map(([role, content], i) => ({ role, content, timestamp: at(i) })) } as Conversation);
+const withTurns = (...turns: [string, string][]): Conversation => ({ ...conversation(), metadata: { ...meta, sourceType: "chat" }, turns: turns.map(([role, content], i) => ({ role, content, timestamp: at(i) })) } as Conversation);
 const classify = async (device: Conversation, fileText: string) => (await plan(new ReadOnlyVault({ "c.md": fileText }), local([device]))).records[0].classification;
 const assertRoundTrip = (c: Conversation) => {
   const md = conversationToMarkdown(c), parsed = parseConversationMarkdown(md)!;

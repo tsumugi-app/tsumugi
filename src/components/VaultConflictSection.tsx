@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ADOPT_VAULT_BLOCK_TEXT, BLOCK_REASON_TEXT, CHOICE_LABEL, choiceExplanation, conflictOutcomeText, HOLD_DONE_TEXT, HOLD_LABEL, HOLD_NOTE, inspectConflict, keptVersionExportName, keptVersionExportText, listKeptVersions,
+  ADOPT_VAULT_BLOCK_TEXT, BLOCK_REASON_TEXT, CHOICE_LABEL, choiceExplanation, conflictOutcomeText, HOLD_DONE_TEXT, STOPPED_TEXT, HOLD_LABEL, HOLD_NOTE, inspectConflict, keptVersionExportName, keptVersionExportText, listKeptVersions,
   type ConflictChoice, type ConflictOutcome, type ConflictRef, type ConflictSnapshot, type ConflictView, type KeptVersion,
 } from "@/lib/vaultConflictResolution";
 import { RECORD_TYPE_TEXT } from "@/lib/vaultRecoveryUserView";
