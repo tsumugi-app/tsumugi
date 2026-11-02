@@ -103,7 +103,7 @@ async function seedWorld(page: Page) {
   return page.evaluate(async () => {
     const { dbm, bootstrap, proj, vault } = (window as any).D;
     const root = await navigator.storage.getDirectory();
-    await dbm.saveVaultHandle(root); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated();
+    await dbm.saveVaultHandle(root); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated(); await dbm.markAndroidOpfsVaultInitialized();
     const start = Date.parse("2026-08-01T09:00:00.000Z"), iso = (ms: number) => new Date(ms).toISOString(), DAY = 86_400_000;
     const filler = (seed: number, length: number) => { let s = ""; while (s.length < length) s += `架空の話題${seed}について話した架空の文章です。`; return s.slice(0, length); };
     const meta = (id: string, at: string, source = "ai-capture") => ({ id: `meta-${id}`, source, sourceType: "chat", schemaVersion: "0.1", createdAt: at, updatedAt: at });
@@ -198,7 +198,7 @@ async function waitLatest(page: Page, timeout = 240_000) {
   catch { throw new Error(`no 最新. The screen said: ${(await screenText(page)).slice(150, 500)} WHY: ${await whyNotLatest(page)}`); }
 }
 
-test("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
+test.only("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   const seeded = await seedWorld(page);
@@ -231,7 +231,11 @@ test("at real size: the empty AI turns are not a conflict anywhere, Settings end
   await nav(page).getByRole("button", { name: "設定" }).click();
   await waitLatest(page);
   await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
-  report("perf-reload", { ...second, t0: undefined, latest: Date.now() - second.t0, ...(await traceSummary(page)) });
+  const reload = await traceSummary(page);
+  report("perf-reload", { ...second, t0: undefined, latest: Date.now() - second.t0, ...reload });
+  // a normal start does not read every conversation and does not ask for every ledger row one by one
+  expect(parseInt(String(reload.files["read:Conversations"] ?? "0"), 10), JSON.stringify(reload.files)).toBeLessThan(120);
+  expect(parseInt(String(reload.idb["get:vaultSyncState"] ?? "0"), 10), JSON.stringify(reload.idb)).toBeLessThan(10);
   expect(changedKeys(before, await fingerprint(page)).filter(isRecord)).toEqual([]);
 
   // a new conversation is saved as usual, and the state stays clean
@@ -268,7 +272,7 @@ test("at real size: the empty AI turns are not a conflict anywhere, Settings end
   for (const k of Object.keys(before)) if (k.startsWith("idb:") || k.startsWith("Conversations/")) expect(after[k], k).toBe(before[k]);
 });
 
-test("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
+test.only("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
@@ -318,32 +322,115 @@ test("at real size: two conversations that really differ are found, nothing hide
   report("perf-two-choices", { ...started, t0: undefined, firstDone, bothDone: Date.now() - startedAt, ...(await traceSummary(page)) });
 });
 
-test.only("DIAG: what the backup's state does on this code", async ({ page }) => {
+
+test.only("at real size: states an older build may have left (a held save with the file already equal, an update held after an empty turn, an empty last turn) end clean by themselves", async ({ page }) => {
   test.setTimeout(600_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
+  const before = await page.evaluate(async () => {
+    const { dbm, proj } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const identity = await dbm.getVaultIdentityRecord(); const env = { root, vaultIdentity: identity };
+    const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const hold = async (id: string) => { const key = `conversation:${id}`; const e: any = await new Promise((res) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").get(key); q.onsuccess = () => res(q.result); }); e.status = "held"; e.heldReason = "markdown-conflict"; await new Promise<void>((res) => { const tx = db.transaction("vaultOutbox", "readwrite"); tx.objectStore("vaultOutbox").put(e); tx.oncomplete = () => res(); }); };
+    // 1: the empty-turn conversation with its save held, the file already the same
+    await hold("scale-conv-020");
+    // 2: the other one moved on while an older parser refused to update its file
+    const c = await dbm.getConversation("scale-conv-040"); const at = new Date(Date.parse(c.updatedAt) + 60_000).toISOString();
+    const entry = await dbm.putConversationWithOutbox({ ...c, updatedAt: at, endedAt: at, turns: [...c.turns, { role: "user", content: "架空の続き", timestamp: at }], metadata: { ...c.metadata, updatedAt: at } });
+    await hold("scale-conv-040"); void entry;
+    // 3: an empty last turn, and the conversation goes on through the normal save
+    const d = await dbm.getConversation("scale-conv-060"); const at1 = new Date(Date.parse(d.updatedAt) + 60_000).toISOString();
+    const first = await dbm.putConversationWithOutbox({ ...d, updatedAt: at1, endedAt: at1, turns: [...d.turns, { role: "ai", content: "", timestamp: at1 }], metadata: { ...d.metadata, updatedAt: at1 } });
+    const r1 = await proj.reconcileConversationOutboxEntry(env, first);
+    const at2 = new Date(Date.parse(at1) + 60_000).toISOString();
+    const next = await dbm.getConversation("scale-conv-060");
+    const second = await dbm.putConversationWithOutbox({ ...next, updatedAt: at2, endedAt: at2, turns: [...next.turns, { role: "user", content: "架空の言い直し", timestamp: at2 }], metadata: { ...next.metadata, updatedAt: at2 } });
+    const r2 = await proj.reconcileConversationOutboxEntry(env, second);
+    db.close();
+    return { r1: r1.status, r2: r2.status };
+  });
+  expect(before).toEqual({ r1: "done", r2: "done" });
   await slowCpu(page);
-  await startApp(page, "diag");
+  await startApp(page, "older states");
   await nav(page).getByRole("button", { name: "設定" }).click();
-  await page.waitForTimeout(40_000);
-  const items = page.getByTestId("vault-conflict-item");
-  report("diag-1-settings", { conflicts: await items.count(), text: (await screenText(page)).slice(150, 520) });
-  for (let i = 0; i < 2; i++) {
-    const item = items.first();
-    if (await item.count() === 0) break;
-    await item.getByTestId("vault-conflict-open").click();
-    await item.getByTestId("vault-conflict-choice-resume").click({ timeout: 30_000 });
-    await item.getByTestId("vault-conflict-confirm").click();
-    await item.getByTestId("vault-conflict-message").waitFor({ timeout: 120_000 }).catch(() => undefined);
-    report(`diag-2-resume-${i}`, { conflicts: await items.count(), message: await page.getByTestId("vault-conflict-outcome").textContent({ timeout: 2000 }).catch(() => null), lockTail: await page.evaluate(() => (window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-5).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end)])) });
-    if (i === 0) {
-      const second = items.nth(await items.count() > 1 ? 1 : 0);
-      await second.getByTestId("vault-conflict-open").click();
-      await second.getByTestId("vault-conflict-choice-resume").click({ timeout: 30_000 });
-      await second.getByTestId("vault-conflict-confirm").click();
-      await page.waitForTimeout(25_000);
-      report("diag-3-second-right-after", { conflicts: await items.count(), message: await page.getByTestId("vault-conflict-outcome").textContent({ timeout: 2000 }).catch(() => null) });
-      break;
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+  await startApp(page, "older states, again");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+  const turns = await page.evaluate(async () => {
+    const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const read = (id: string) => new Promise<any>((res) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); });
+    const out = { a: (await read("scale-conv-020")).turns.map((t: any) => t.content === ""), b: (await read("scale-conv-040")).turns.length, c: (await read("scale-conv-060")).turns.slice(-2).map((t: any) => t.content) };
+    db.close(); return out;
+  });
+  expect(turns.a.filter(Boolean).length).toBe(1); expect(turns.a[9]).toBe(true);
+  expect(turns.b).toBe(17);
+  expect(turns.c).toEqual(["", "架空の言い直し"]);
+});
+
+test.only("a long background read does not get a choice refused as busy, and a choice waiting for it does not stop normal reads and writes", async ({ page }) => {
+  test.setTimeout(600_000);
+  await page.addInitScript(installTrace);
+  await seedWorld(page);
+  await page.evaluate(async () => {
+    const { dbm, bootstrap } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle("Conversations");
+    for await (const [, h] of (dir as any).entries()) {
+      const text: string = await (await h.getFile()).text();
+      if (!text.includes("scale-conv-001")) continue;
+      const w = await h.createWritable(); await w.write(text.replace("架空の話題", "手で直した架空の話題")); await w.close();
     }
-  }
+    const c = await dbm.getConversation("scale-conv-001"); const at = new Date(Date.parse(c.updatedAt) + 60_000).toISOString();
+    await dbm.putConversationWithOutbox({ ...c, updatedAt: at, endedAt: at, turns: [...c.turns, { role: "user", content: "架空の続き", timestamp: at }], metadata: { ...c.metadata, updatedAt: at } });
+    await bootstrap.runSaveFoundationBootstrap({ root });
+  });
+  await startApp(page, "long read");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  const item = page.getByTestId("vault-conflict-item");
+  await expect(item).toHaveCount(1, { timeout: 240_000 });
+  await page.waitForTimeout(3_000);
+  await item.getByTestId("vault-conflict-open").click();
+  await item.getByTestId("vault-conflict-choice-adopt-device").click({ timeout: 60_000 });
+  // a background read longer than the old 15 s limit, as a slow phone's start-up or check takes
+  await page.evaluate(() => { (window as any).__release = null; void navigator.locks.request("tsumugi-vault-world", { mode: "shared" }, () => new Promise<void>((resolve) => { (window as any).__release = resolve; })); });
+  await expect.poll(() => page.evaluate(() => (window as any).__release !== null)).toBe(true);
+  await item.getByTestId("vault-conflict-confirm").click();
+  await page.waitForTimeout(18_000);
+  // while the choice waits, a normal shared read goes straight through (no queue behind a waiting exclusive lock)
+  const readWait = await page.evaluate(async () => { const at = performance.now(); await navigator.locks.request("tsumugi-vault-world", { mode: "shared" }, async () => undefined); return Math.round(performance.now() - at); });
+  report("perf-read-while-a-choice-waits", { readWait });
+  expect(readWait).toBeLessThan(2_000);
+  expect(await screenText(page)).not.toContain(BUSY);
+  await page.evaluate(() => (window as any).__release());
+  try { await waitLatest(page, 120_000); }
+  catch (error) { throw new Error(`${(error as Error).message} LOCKS ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-8).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end)])))}`); }
+  // nothing keeps the lock after the work is done
+  await page.waitForTimeout(5_000);
+  const open = await page.evaluate(() => (window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world" && l.got !== null && l.end === null).length);
+  expect(open).toBe(0);
+});
+
+test("a tab left running on an older build says so, shows its build, and offers no repair or conflict choice until it is reloaded", async ({ page }) => {
+  test.setTimeout(300_000);
+  await page.goto(`${BASE}/data`); await page.addScriptTag({ path: bundle });
+  await page.evaluate(async () => {
+    const { dbm, bootstrap } = (window as any).D; const root = await navigator.storage.getDirectory();
+    await dbm.saveVaultHandle(root); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated(); await dbm.markAndroidOpfsVaultInitialized();
+    const T = new Date(Date.now() - 86_400_000).toISOString();
+    await dbm.putConversationWithOutbox({ id: "build-conv", persona: "companion", status: "captured", startedAt: T, endedAt: T, createdAt: T, updatedAt: T, memoryObjectIds: [], turns: [{ role: "user", content: "架空の話", timestamp: T }], metadata: { id: "meta-build", source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
+    await bootstrap.runSaveFoundationBootstrap({ root });
+  });
+  await page.route("**/api/build", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ build: "a-newer-build" }) }));
+  await startApp(page, "older build");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await expect(page.getByTestId("app-outdated")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("app-build")).toBeVisible();
+  await page.unroute("**/api/build");
+  await page.getByTestId("app-outdated-reload").click();
+  await page.getByRole("button", { name: "tsumugiを開く" }).click();
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await waitLatest(page);
+  await expect(page.getByTestId("app-outdated")).toHaveCount(0);
 });

@@ -5,8 +5,8 @@ import assert from "node:assert/strict";
 import type { Conversation, MemoryObject, Source } from "./types";
 import type { RecoveryLocalSnapshot } from "./vaultRecovery";
 const { buildVaultRecoveryPlan, readRecoveryJson, readRecoveryLocalSnapshot } = require("./vaultRecovery") as typeof import("./vaultRecovery");
-const { conversationToMarkdown, memoryObjectToMarkdown, sourceToMarkdown } = require("./markdown") as typeof import("./markdown");
-const { vaultRegistryBucketOf, hashVaultText } = require("./vault") as typeof import("./vault");
+const { conversationToMarkdown, memoryObjectToMarkdown, parseConversationMarkdown, sourceToMarkdown } = require("./markdown") as typeof import("./markdown");
+const { conversationsSemanticEqual, vaultRegistryBucketOf, hashVaultText } = require("./vault") as typeof import("./vault");
 const T = "2026-09-24T12:00:00.000Z";
 const meta = { id: "meta", source: "ai-capture", schemaVersion: "1", createdAt: T, updatedAt: T };
 const conversation = (id = "c1"): Conversation => ({ id, persona: "companion", status: "captured", startedAt: T, endedAt: T,
@@ -467,4 +467,117 @@ test("dedicated route import/render never accesses storage or mounts normal app"
     }
   `;
   execFileSync(process.execPath, ["-e", script], { env: process.env });
+});
+
+// 空の発言（架空のデータのみ）。端末の記録と保存先のMarkdownで、発言数・順番・役割・日時が揃い、本当に違う記録だけが競合になること
+const at = (i: number) => `2026-09-24T12:${String(i).padStart(2, "0")}:00.000Z`;
+const withTurns = (...turns: [string, string][]): Conversation => ({ ...conversation(), metadata: { ...meta, sourceType: "chat" }, turns: turns.map(([role, content], i) => ({ role, content, timestamp: at(i) })) } as Conversation);
+const classify = async (device: Conversation, fileText: string) => (await plan(new ReadOnlyVault({ "c.md": fileText }), local([device]))).records[0].classification;
+const assertRoundTrip = (c: Conversation) => {
+  const md = conversationToMarkdown(c), parsed = parseConversationMarkdown(md)!;
+  assert.deepEqual(parsed.turns, c.turns, "the same number of turns, in the same order, with the same role and time");
+  assert.equal(conversationToMarkdown(parsed), md, "saving what was restored writes the same bytes");
+  assert.equal(conversationsSemanticEqual(c, parsed), true);
+};
+const middle = withTurns(["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い2"], ["ai", ""], ["user", "架空の問い3"], ["ai", "架空の答え3"]);
+
+test("空の発言：会話の途中の空のAI発言は、発言数・順番・日時を変えずに往復し、競合にならない", async () => {
+  assertRoundTrip(middle);
+  assert.equal(await classify(middle, conversationToMarkdown(middle)), "equivalent-existing");
+});
+
+test("空の発言：連続した空の発言、空のユーザー発言、先頭・末尾の空の発言", async () => {
+  for (const c of [
+    withTurns(["user", "架空の問い"], ["ai", ""], ["user", ""], ["ai", ""], ["user", "架空の問い2"], ["ai", "架空の答え2"]),
+    withTurns(["user", ""], ["ai", "架空の答え"]),
+    withTurns(["ai", ""], ["user", "架空の問い"]),
+    withTurns(["user", "架空の問い"], ["ai", ""]),
+    withTurns(["user", "架空の問い"], ["ai", ""], ["user", ""]),
+    withTurns(["ai", ""]),
+  ]) {
+    assertRoundTrip(c);
+    assert.equal(await classify(c, conversationToMarkdown(c)), "equivalent-existing");
+  }
+});
+
+test("空の発言：最後の発言が空のファイルを全体をtrimして読んでも（Recoveryの読み方）、前の発言に混ざらない", () => {
+  const c = withTurns(["user", "架空の問い"], ["ai", ""]);
+  assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(c).trim())!.turns, c.turns);
+  const two = withTurns(["user", "架空の問い"], ["ai", ""], ["user", ""]);
+  assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(two).trim())!.turns, two.turns);
+  // `**User:**`だけの行は、最後の行でも、turnTimesの件数が合っていれば本文の一部（空の発言と取り違えない）
+  for (const c of [
+    withTurns(["user", "架空の前置き\n**User:**\n架空の続き"], ["ai", "架空の答え"]),
+    withTurns(["user", "架空の前置き\n**Tsumugi:**"]),
+    withTurns(["user", "架空の問い"], ["ai", "架空の前置き\n**User:**"]),
+  ]) {
+    assertRoundTrip(c);
+    assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(c).trim())!.turns, c.turns);
+  }
+  // turnTimesの無いファイルでは見分けられないので、これまでどおり本文の一部
+  const legacy = conversationToMarkdown(withTurns(["user", "架空の前置き\n**Tsumugi:**"])).replace(/^turnTimes: .*\n/m, "");
+  assert.equal(parseConversationMarkdown(legacy)!.turns.length, 1);
+});
+
+test("空の発言：前後の発言の日時は、それぞれの発言のまま（後ろの発言が1つずつずれない）", () => {
+  const parsed = parseConversationMarkdown(conversationToMarkdown(middle))!;
+  assert.deepEqual(parsed.turns.map((t) => t.timestamp), [at(0), at(1), at(2), at(3), at(4), at(5)]);
+  assert.equal(parsed.turns[3].content, ""); assert.equal(parsed.turns[3].role, "ai");
+});
+
+test("空白だけの発言と空文字列は別のもの：それぞれ往復し、取り違えると競合になる", async () => {
+  const spaces = withTurns(["user", "架空の問い"], ["ai", "  "], ["user", "架空の問い2"]);
+  const newlines = withTurns(["user", "架空の問い"], ["ai", "\n\n"], ["user", "架空の問い2"]);
+  const empty = withTurns(["user", "架空の問い"], ["ai", ""], ["user", "架空の問い2"]);
+  for (const c of [spaces, newlines, empty]) { assertRoundTrip(c); assert.equal(await classify(c, conversationToMarkdown(c)), "equivalent-existing"); }
+  assert.equal(conversationsSemanticEqual(empty, spaces), false);
+  assert.equal(await classify(empty, conversationToMarkdown(spaces)), "conflict");
+  assert.equal(await classify(spaces, conversationToMarkdown(empty)), "conflict");
+});
+
+test("発言の前後に空白がある記録：Markdownが同じなら競合にしない（「内容を見る」と同じ判定）。保存先の本文が違えば競合", async () => {
+  const c = withTurns(["user", "架空の問い  "], ["ai", "  架空の答え"]);
+  assert.equal(await classify(c, conversationToMarkdown(c)), "equivalent-existing");
+  assert.equal(await classify(c, conversationToMarkdown(withTurns(["user", "架空の問い  "], ["ai", "  架空の別の答え"]))), "conflict");
+});
+
+test("本当に違う記録は、空の発言があっても競合のまま", async () => {
+  const other = (over: [string, string][]) => conversationToMarkdown(withTurns(...over));
+  for (const file of [
+    other([["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い2"], ["ai", ""], ["user", "架空の別の問い"], ["ai", "架空の答え3"]]), // 本文が違う
+    other([["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い2"], ["ai", "空だった発言に書かれた本文"], ["user", "架空の問い3"], ["ai", "架空の答え3"]]), // 空の発言に本文がある
+    other([["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い3"], ["ai", ""], ["user", "架空の問い2"], ["ai", "架空の答え3"]]), // 順番が違う
+    other([["user", "架空の問い1"], ["ai", "架空の答え1"], ["ai", "架空の問い2"], ["ai", ""], ["user", "架空の問い3"], ["ai", "架空の答え3"]]), // 役割が違う
+    other([["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い2"], ["ai", ""], ["user", "架空の問い3"]]), // 本文のある発言が足りない
+    other([["user", "架空の問い1"], ["user", "架空の問い2"], ["ai", "架空の答え3"]]), // 発言数が違い、本文も足りない
+    other([["ai", ""], ["ai", "架空の答え1"], ["user", "架空の問い1"], ["user", "架空の問い2"], ["user", "架空の問い3"], ["ai", "架空の答え3"]]), // 同じ発言数で、並びが違う
+  ]) assert.equal(await classify(middle, file), "conflict");
+  // 発言数が同じなら、空の発言の位置も比べる
+  const moved = withTurns(["user", "架空の問い1"], ["ai", ""], ["ai", "架空の答え1"]);
+  assert.equal(conversationsSemanticEqual(moved, withTurns(["user", "架空の問い1"], ["ai", "架空の答え1"], ["ai", ""])), false);
+});
+
+test("古い記録に新しい誤警告を出さない：以前のパーサーで空の発言が無いまま復元された端末の記録と、空の発言があるファイル", async () => {
+  const restoredByOldParser = withTurns(["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い2"], ["user", "架空の問い3"], ["ai", "架空の答え3"]);
+  assert.equal(await classify(restoredByOldParser, conversationToMarkdown(middle)), "equivalent-existing");
+  // 逆向き：空の発言がある端末の記録と、空の発言を持たないファイル
+  assert.equal(await classify(middle, conversationToMarkdown(restoredByOldParser)), "equivalent-existing");
+  // 空の発言に見えても、本文のある発言が違えば競合
+  const changed = withTurns(["user", "架空の問い1"], ["ai", "架空の答え1"], ["user", "架空の問い2"], ["user", "架空の別の問い"], ["ai", "架空の答え3"]);
+  assert.equal(await classify(changed, conversationToMarkdown(middle)), "conflict");
+});
+
+test("旧形式のMarkdown：turnTimesの無いファイル、空の発言の無いファイルの読み方は変わらない", async () => {
+  const plain = withTurns(["user", "架空の問い"], ["ai", "複数行の\n\n架空の答え"], ["user", "架空の問い2"]);
+  const legacy = conversationToMarkdown(plain).replace(/^turnTimes: .*\n/m, "");
+  const parsed = parseConversationMarkdown(legacy)!;
+  assert.deepEqual(parsed.turns.map((t) => [t.role, t.content]), plain.turns.map((t) => [t.role, t.content]));
+  assert.ok(parsed.turns.every((t) => t.timestamp === plain.startedAt), "a file without turnTimes falls back to the start time");
+  assert.equal(await classify(plain, legacy), "equivalent-existing");
+  // 手で空行を足されたファイル（本文は同じ）も、本文のある発言はこれまでどおりtrimして読む
+  const blankLines = conversationToMarkdown(plain).replace("**Tsumugi:** ", "\n\n**Tsumugi:** ");
+  assert.equal(await classify(plain, blankLines), "equivalent-existing");
+  // 発言の無い会話
+  const none = { ...conversation(), turns: [] } as Conversation;
+  assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(none))!.turns, []);
 });

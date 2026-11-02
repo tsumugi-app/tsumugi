@@ -48,6 +48,7 @@ import type { Conversation, MemoryObject, MemorySource, MemoryType, Source } fro
 import {
   asString,
   conversationToMarkdown,
+  conversationTurnsEqual,
   inferSourceType,
   memoryObjectToMarkdown,
   parseConversationMarkdown,
@@ -4150,8 +4151,7 @@ export function conversationsSemanticEqual(a: Conversation, b: Conversation): bo
   if (a.updatedAt !== b.updatedAt) return false;
   if (a.memoryObjectIds.length !== b.memoryObjectIds.length) return false;
   if (!a.memoryObjectIds.every((id, i) => id === b.memoryObjectIds[i])) return false;
-  if (a.turns.length !== b.turns.length) return false;
-  if (!a.turns.every((turn, i) => turn.role === b.turns[i].role && turn.content === b.turns[i].content)) return false;
+  if (!conversationTurnsEqual(a.turns, b.turns)) return false;
   if (a.metadata.source !== b.metadata.source) return false;
   if (normalizedSourceType(a.metadata.source, a.metadata.sourceType) !== normalizedSourceType(b.metadata.source, b.metadata.sourceType)) return false;
   if (JSON.stringify(a.metadata.sourceDetail ?? null) !== JSON.stringify(b.metadata.sourceDetail ?? null)) return false;

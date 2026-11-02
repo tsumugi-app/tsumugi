@@ -593,40 +593,65 @@ function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (st
 
   // turnTimesとのindex対応を、本文のparseロジック（役割・改行の扱い等）に一切触れずに
   // 取るため、まずrole/contentだけを順番に集め、turnTimesの適用は最後にまとめて行う。
-  const rawTurns: { role: ConversationTurn["role"]; content: string }[] = [];
-  let currentRole: ConversationTurn["role"] | null = null;
-  let currentLines: string[] = [];
+  const readTurns = (lines: string[]) => {
+    const turns: { role: ConversationTurn["role"]; content: string }[] = [];
+    let currentRole: ConversationTurn["role"] | null = null;
+    let currentLines: string[] = [];
 
-  const flush = () => {
-    if (currentRole && currentLines.length > 0) {
-      const content = currentLines.join("\n").trim();
-      if (content) {
-        rawTurns.push({ role: currentRole, content });
+    const flush = () => {
+      if (currentRole && currentLines.length > 0) {
+        const raw = currentLines.join("\n");
+        // 空の発言も落とさない：落とすと端末の記録と発言数が合わなくなり、後ろの発言の`turnTimes`が1つずつずれる。
+        // 空白だけの発言はその空白のまま残す（末尾の改行1つは発言の区切りで、発言の一部ではない）。
+        turns.push({ role: currentRole, content: raw.trim() || raw.replace(/\n$/, "") });
+      }
+      currentLines = [];
+    };
+
+    for (const line of lines) {
+      if (line.startsWith(USER_PREFIX)) {
+        flush();
+        currentRole = "user";
+        currentLines = [line.slice(USER_PREFIX.length)];
+      } else if (line.startsWith(AI_PREFIX)) {
+        flush();
+        currentRole = "ai";
+        currentLines = [line.slice(AI_PREFIX.length)];
+      } else {
+        currentLines.push(line);
       }
     }
-    currentLines = [];
+    flush();
+    return turns;
   };
 
-  for (const line of transcriptText.split("\n")) {
-    if (line.startsWith(USER_PREFIX)) {
-      flush();
-      currentRole = "user";
-      currentLines = [line.slice(USER_PREFIX.length)];
-    } else if (line.startsWith(AI_PREFIX)) {
-      flush();
-      currentRole = "ai";
-      currentLines = [line.slice(AI_PREFIX.length)];
-    } else {
-      currentLines.push(line);
-    }
+  const lines = transcriptText.split("\n");
+  let rawTurns = readTurns(lines);
+  // 読み込み側で全体がtrimされると、最後の発言が空のときは行末の空白が消える（`**Tsumugi:**`だけの行になる）。同じ行は本文の一部でもありうるので、
+  // `turnTimes`の件数が1件足りないときだけ、発言の始まりとして読み直す
+  let last = lines.length - 1;
+  while (last > 0 && !lines[last].trim()) last -= 1;
+  if (turnTimes.length === rawTurns.length + 1 && (lines[last] === USER_PREFIX.trimEnd() || lines[last] === AI_PREFIX.trimEnd())) {
+    lines[last] += " ";
+    rawTurns = readTurns(lines);
   }
-  flush();
 
   return rawTurns.map((turn, index) => {
     const candidate = turnTimes[index];
     const timestamp = candidate !== undefined && isValidIsoTimestamp(candidate) ? candidate : fallbackTimestamp;
     return { ...turn, timestamp };
   });
+}
+
+/**
+ * 2つの会話の発言が同じか（役割と本文。`timestamp`等はここでは見ない）。発言数が同じなら1件ずつ厳密に比べる（空文字列と空白だけの発言も別のもの）。
+ * 発言数が違うときだけ、空の発言を除いて比べる：以前のパーサーは空の発言を読み飛ばしていたため、そのパーサーで保存先から復元された端末の記録には
+ * 空の発言が無い。本文のある発言の内容・順番・役割が1つでも違えば、一致とはしない。
+ */
+export function conversationTurnsEqual(a: ConversationTurn[], b: ConversationTurn[]): boolean {
+  const same = (x: ConversationTurn[], y: ConversationTurn[]) => x.length === y.length && x.every((turn, i) => turn.role === y[i].role && turn.content === y[i].content);
+  const withText = (turns: ConversationTurn[]) => turns.filter((turn) => turn.content.trim());
+  return same(a, b) || (a.length !== b.length && same(withText(a), withText(b)));
 }
 
 /**
