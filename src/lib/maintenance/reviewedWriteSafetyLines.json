@@ -179,6 +179,10 @@
   "+// conflictの行のハッシュは、競合を記録するときにファイルの実体から計算されたもの：Tsumugiが書いた証拠にならない",
   "+return isObj(entry) && entry.status !== \"conflict\" ? entry.contentHash : undefined;",
   "-return isObj(entry) && isObj(entry.memberHashes) ? entry.memberHashes : {};",
-  "+return isObj(entry) && entry.status !== \"conflict\" && isObj(entry.memberHashes) ? entry.memberHashes : {};"
+  "+return isObj(entry) && entry.status !== \"conflict\" && isObj(entry.memberHashes) ? entry.memberHashes : {};",
+  "+conversationTurnsEqual,",
+  "+if (!conversationTurnsEqual(a.turns, b.turns)) return false;",
+  "-if (a.turns.length !== b.turns.length) return false;",
+  "-if (!a.turns.every((turn, i) => turn.role === b.turns[i].role && turn.content === b.turns[i].content)) return false;"
  ]
 }

@@ -639,3 +639,13 @@ export const NOT_STARTED_REASON_TEXT: Record<ConflictNotStarted, string> = {
 };
 
 export const STOPPED_TEXT = "途中で止まりました。両方の版は保管しています。もう一度内容を開いて、同じ操作をやり直せます。";
+
+/** 実行の結果の表示。「両方の版は保管しています」は、実際に保管したときだけ（「保存を再開する」は版を保管しない） */
+export function conflictOutcomeText(outcome: ConflictOutcome): string {
+  if (outcome.kind === "not-started") return NOT_STARTED_REASON_TEXT[outcome.reason];
+  if (outcome.kind === "stopped") return STOPPED_TEXT;
+  if (!outcome.resolved && !outcome.after.settled) return `「${CHOICE_LABEL[outcome.choice]}」を実行しましたが、保存中のため確認を完了できませんでした。「もう一度確認する」で確かめてください。`;
+  return outcome.resolved
+    ? `「${CHOICE_LABEL[outcome.choice]}」を実行し、もう一度確認して問題が無くなったことを確かめました。`
+    : `「${CHOICE_LABEL[outcome.choice]}」を実行しましたが、もう一度確認するとまだ確認が必要です。${outcome.kept ? "両方の版は保管しています。" : ""}`;
+}

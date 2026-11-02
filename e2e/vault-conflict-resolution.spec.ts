@@ -509,6 +509,42 @@ for (const kind of ["desktop", "android"] as const) {
       expect(((await kept(page)) as any).versions.length).toBe(0);
     });
 
+    test("an empty AI turn is not a conflict: the check and the conflict screen agree, saving goes on, 保存を再開する changes no file; a really different turn is still a conflict", async ({ page }) => {
+      test.setTimeout(180_000);
+      await setup(page);
+      const save = (turns: string[], at: string) => page.evaluate(async ({ turns, at }) => (window as any).__settle(await (window as any).D.dbm.putConversationWithOutbox((window as any).__conv(turns, at))), { turns, at });
+      const path = await page.evaluate(async () => { for await (const [name] of (await (window as any).__root.getDirectoryHandle("Conversations")).entries()) return `Conversations/${name}`; }) as string;
+      const turns = ["架空の問い", "架空の答え", "架空の問い2", "", "架空の問い3", "架空の答え3"];
+      expect((await save(turns, LATER) as any).status).toBe("done");
+      expect(await check(page)).toEqual({ state: "clean", findings: [] });
+      const seen: any = await inspect(page, "conversation", "c-conv");
+      expect(seen.state).toBe("same"); expect(seen.choices).toEqual(["resume"]);
+      const before = await read(page, path);
+      expect(before).toContain("**Tsumugi:** \n");
+
+      const resumed: any = await resolve(page, seen.snapshot, "resume");
+      expect(resumed.kind, JSON.stringify(resumed)).toBe("done"); expect(resumed.resolved).toBe(true); expect(resumed.state).toBe("clean");
+      expect(await read(page, path)).toBe(before);
+      expect(((await kept(page)) as any).versions.length).toBe(0);
+
+      // the conversation goes on after the empty turn: the save is not held, and the earlier turns stay as they were
+      const more = [...turns, "架空の問い4", "架空の答え4"];
+      expect((await save(more, "2026-10-22T00:00:00.000Z") as any).status).toBe("done");
+      expect(await read(page, path)).toContain("**Tsumugi:** 架空の答え4");
+      expect(await check(page)).toEqual({ state: "clean", findings: [] });
+
+      // a really different turn, in the same conversation: the save holds and both screens say so
+      const saved = await read(page, path);
+      await write(page, path, saved.replace("**User:** 架空の問い3", "**User:** 架空の問い3（手で書き直した）"));
+      expect((await save([...more, "架空の問い5"], "2026-10-23T00:00:00.000Z") as any).status).toBe("held");
+      const found = await check(page);
+      expect(found.findings).toContain("c-conv:needsChoice:different-content");
+      const differs: any = await inspect(page, "conversation", "c-conv");
+      expect(differs.state).toBe("differs");
+      expect(await outbox(page, "conversation:c-conv")).toEqual({ status: "held", reason: "markdown-conflict" });
+      expect((await device(page, "conversation", "c-conv") as any).turns.map((t: any) => t.content)).toEqual([...more, "架空の問い5"]);
+    });
+
     test("Recovery Apply does not turn a hand edit into Tsumugi's version: the next device update holds and the hand-written text stays", async ({ page }) => {
       test.setTimeout(180_000);
       await setup(page);

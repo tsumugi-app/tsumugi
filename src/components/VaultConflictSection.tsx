@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ADOPT_VAULT_BLOCK_TEXT, BLOCK_REASON_TEXT, CHOICE_LABEL, choiceExplanation, HOLD_DONE_TEXT, HOLD_LABEL, HOLD_NOTE, inspectConflict, keptVersionExportName, keptVersionExportText, listKeptVersions, NOT_STARTED_REASON_TEXT, STOPPED_TEXT,
+  ADOPT_VAULT_BLOCK_TEXT, BLOCK_REASON_TEXT, CHOICE_LABEL, choiceExplanation, conflictOutcomeText, HOLD_DONE_TEXT, HOLD_LABEL, HOLD_NOTE, inspectConflict, keptVersionExportName, keptVersionExportText, listKeptVersions,
   type ConflictChoice, type ConflictOutcome, type ConflictRef, type ConflictSnapshot, type ConflictView, type KeptVersion,
 } from "@/lib/vaultConflictResolution";
 import { RECORD_TYPE_TEXT } from "@/lib/vaultRecoveryUserView";
@@ -16,14 +16,7 @@ const pre = "max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg b
 
 const refKey = (r: ConflictRef) => `${r.recordType}:${r.recordId}`;
 
-export function conflictOutcomeText(outcome: ConflictOutcome): string {
-  if (outcome.kind === "not-started") return NOT_STARTED_REASON_TEXT[outcome.reason];
-  if (outcome.kind === "stopped") return STOPPED_TEXT;
-  if (!outcome.resolved && !outcome.after.settled) return `「${CHOICE_LABEL[outcome.choice]}」を実行しましたが、保存中のため確認を完了できませんでした。「もう一度確認する」で確かめてください。`;
-  return outcome.resolved
-    ? `「${CHOICE_LABEL[outcome.choice]}」を実行し、もう一度確認して問題が無くなったことを確かめました。`
-    : `「${CHOICE_LABEL[outcome.choice]}」を実行しましたが、もう一度確認するとまだ確認が必要です。両方の版は保管しています。`;
-}
+export { conflictOutcomeText };
 
 function ConflictItem({ root, target, activeConversationId, disabled, onResolve }: {
   root: FileSystemDirectoryHandle; target: ConflictRef; activeConversationId: string | null; disabled: boolean;
