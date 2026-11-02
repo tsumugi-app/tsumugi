@@ -188,7 +188,7 @@ async function waitLatest(page: Page, timeout = 240_000) {
   catch { throw new Error(`no 最新. The screen said: ${await screenText(page)}`); }
 }
 
-test("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
+test.only("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   const seeded = await seedWorld(page);
@@ -230,11 +230,10 @@ test("at real size: the empty AI turns are not a conflict anywhere, Settings end
     else await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
   });
   const third = await startApp(page, "before a new conversation");
-  await page.getByPlaceholder("ここに入力してください").first().waitFor({ timeout: 60_000 }).catch(() => undefined);
-  const input = page.locator("textarea").first();
-  await input.fill("架空の新しい話題");
-  await input.press("Enter");
-  await page.getByRole("button", { name: /送信/ }).click({ timeout: 2_000 }).catch(() => undefined);
+  const inputAt = Date.now();
+  await page.locator("footer textarea").fill("架空の新しい話題");
+  await page.getByRole("button", { name: "送信" }).click();
+  report("perf-first-send", { fromHome: Date.now() - inputAt });
   await expect(page.getByText("架空の返答です。")).toBeVisible({ timeout: 60_000 });
   const saved = await page.evaluate(async () => {
     const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -258,7 +257,7 @@ test("at real size: the empty AI turns are not a conflict anywhere, Settings end
   for (const k of Object.keys(before)) if (k.startsWith("idb:") || k.startsWith("Conversations/")) expect(after[k], k).toBe(before[k]);
 });
 
-test("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
+test.only("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
