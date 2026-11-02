@@ -28,7 +28,7 @@ export async function sharedManagementFilesAreReadable(root: FileSystemDirectory
     // Registryは一覧だけを見る（読めない行は軽い確認が見つける）。会話はidでshardが決まる
     const shards = new Set<string>();
     for await (const [name] of (await tsumugi.getDirectoryHandle("registry") as unknown as { entries(): AsyncIterable<[string, unknown]> }).entries()) shards.add(name);
-    return Object.entries(index).every(([id, path]) => typeof path !== "string" || !path.startsWith("Conversations/") || shards.has(`${vaultRegistryBucketOf(id)}.json`));
+    return Object.entries(index).every(([id, path]) => typeof path !== "string" || !path.startsWith("Conversations/") || shards.has(`${vaultRegistryBucketOf(id).toString(16).padStart(2, "0")}.json`));
   } catch {
     return false;
   }
