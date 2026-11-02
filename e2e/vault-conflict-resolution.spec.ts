@@ -277,20 +277,41 @@ for (const kind of ["desktop", "android"] as const) {
       const saved = await page.evaluate(async ({ DAY, LATER }) => (window as any).__settle(await (window as any).D.dbm.putMemoryObjectWithOutbox((window as any).__mem("c-mem-2", "架空の本文ふたつ", `${DAY}T02:00:00.000Z`, LATER), "memory")), { DAY, LATER });
       expect(saved.status, JSON.stringify(saved)).toBe("done");
       const movedPath = `Memories/moved/${DAY}.md`;
-      await write(page, movedPath, await read(page, DAY_FILE));
-      await page.evaluate(async (DAY_FILE) => { const dir = await (window as any).__root.getDirectoryHandle("Memories"); await dir.removeEntry(DAY_FILE.split("/").at(-1)); }, DAY_FILE);
-      const applied = await page.evaluate(async () => {
+      const moveAndApply = (from: string, to: string) => page.evaluate(async ({ from, to, text }) => {
         const { vault } = (window as any).D; const root = (window as any).__root;
+        await (window as any).__write(to, text);
+        const parts = from.split("/"); let dir = root; for (const part of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(part); await dir.removeEntry(parts.at(-1));
         const discovery = await vault.performVaultLightCheckDiscovery(root);
         const classified = await vault.classifyVaultLightCheckCandidates(root, discovery);
         const outcome = await vault.applyVaultLightCheckCandidates(root, classified.records, classified.localSnapshots);
         return { counts: outcome.counts, errors: outcome.applyErrors, stale: outcome.staleSkipped };
-      });
-      expect(applied.counts.moved, JSON.stringify(applied)).toBe(1);
+      }, { from, to, text: handSaved });
+      const handSaved = await read(page, DAY_FILE);
+      // the file is moved in Obsidian and moved back: both moves are applied with 変更を反映
+      const out = await moveAndApply(DAY_FILE, movedPath);
+      expect(out.counts.moved, JSON.stringify(out)).toBe(1);
+      const back = await moveAndApply(movedPath, DAY_FILE);
+      expect(back.counts.moved, JSON.stringify(back)).toBe(1);
+      const row = await readRow(page, DAY_FILE);
+      expect(row.memberHashes["c-mem-1"]).toBeUndefined(); expect(typeof row.memberHashes["c-mem-2"]).toBe("string");
       const r = await updateSummary(page);
       expect(r.status, JSON.stringify(r)).toBe("held");
-      const after = await read(page, movedPath);
+      const after = await read(page, DAY_FILE);
       expect(after).toContain("要約手直し"); expect(after).not.toContain("端末の新しい要約");
+    });
+
+    test("a day file moved by hand is left as it is: the next update writes the usual place, the hand-edited text stays, and the check does not call it clean", async ({ page }) => {
+      test.setTimeout(180_000);
+      await setup(page);
+      const handEdited = (await read(page, DAY_FILE)).replace("要約 c-mem-1", "要約手直し");
+      await write(page, DAY_FILE, handEdited);
+      const movedPath = `Memories/moved/${DAY}.md`;
+      await write(page, movedPath, handEdited);
+      await page.evaluate(async (name) => { const dir = await (window as any).__root.getDirectoryHandle("Memories"); await dir.removeEntry(name); }, DAY_FILE.split("/").at(-1));
+      await updateSummary(page);
+      expect(await read(page, movedPath)).toBe(handEdited);
+      const c = await check(page);
+      expect(c.state, JSON.stringify(c)).not.toBe("clean");
     });
 
     test("a hash on a conflict row is not proof: the hand-edited entry stays", async ({ page }) => {
