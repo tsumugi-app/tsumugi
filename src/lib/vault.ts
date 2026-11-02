@@ -43,6 +43,7 @@ import {
 } from "./db";
 import { conversationEntryTypeOf } from "./conversationEntryKind";
 import { logTimingEvent } from "./debugTimingLog";
+import { nextMemberHashes, planDayFileMemberWrite, readVaultFileText, VaultFileNotUtf8Error, withMemoryDayFileLock } from "./vaultRewriteSafety";
 import type { Conversation, MemoryObject, MemorySource, MemoryType, Source } from "./types";
 import {
   asString,
@@ -1850,6 +1851,15 @@ async function assertAdoptTargetAbsent(dir: FileSystemDirectoryHandle, fileName:
   throw new VaultAdoptTargetExistsError(fileName);
 }
 
+/** Registryに無い記録を書く前に：同じ名前の別の内容があれば、上書きせず保留する（判定はOutboxの保存処理が、共通の安全条件で行う） */
+async function assertUnregisteredTargetUntouched(dir: FileSystemDirectoryHandle, fileName: string, expectedContent: string, recordType: VaultRegistryRecordType, registryKey: string): Promise<void> {
+  try { await assertAdoptTargetAbsent(dir, fileName, expectedContent); }
+  catch (error) {
+    if (error instanceof VaultAdoptTargetExistsError) throw new VaultRecordNeedsResyncError(recordType, registryKey, "conflict", "conflict");
+    throw error;
+  }
+}
+
 async function writeConversationMarkdownImpl(
   root: FileSystemDirectoryHandle,
   conversation: Conversation,
@@ -1884,6 +1894,7 @@ async function writeConversationMarkdownImpl(
     fileName = fileNameFor(conversation.id, conversation.startedAt);
     relativePath = `Conversations/${fileName}`;
     if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, conversationToMarkdown(conversation));
+    else await assertUnregisteredTargetUntouched(dir, fileName, conversationToMarkdown(conversation), "conversation", registryKey);
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
     const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -1988,6 +1999,7 @@ async function writeSourceMarkdownImpl(
     fileName = fileNameFor(source.id, source.createdAt);
     relativePath = `Sources/${fileName}`;
     if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, sourceToMarkdown(source));
+    else await assertUnregisteredTargetUntouched(dir, fileName, sourceToMarkdown(source), "source", registryKey);
   } else if (lookup.entry.status === "ok") {
     relativePath = lookup.path as string;
     const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -2095,6 +2107,18 @@ async function readDayFileEntries(
  * 同じidのエントリが既にあれば置き換え、無ければ追加する（重複を作らない）。
  * MemoryObject自体のデータ構造・idは変えない。保存単位（ファイル）だけを日単位にする。
  */
+/** 日別ファイルの現在の内容（無ければnull）。UTF-8として読めなければ書き込まない */
+async function readDayFileRawForRewrite(dir: FileSystemDirectoryHandle, fileName: string, alreadyVerified: string | undefined): Promise<string | null> {
+  if (alreadyVerified !== undefined) return alreadyVerified;
+  try {
+    return await readVaultFileText(await (await dir.getFileHandle(fileName, { create: false })).getFile());
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    if (error instanceof VaultFileNotUtf8Error) throw new VaultRecordNeedsResyncError("memory-day", dayFileRegistryKey(fileName.slice(0, 10)), "conflict", "conflict");
+    throw error;
+  }
+}
+
 async function writeMemoryObjectMarkdownImpl(
   root: FileSystemDirectoryHandle,
   memoryObject: MemoryObject,
@@ -2126,6 +2150,7 @@ async function writeMemoryObjectMarkdownImpl(
       fileName = fileNameFor(memoryObject.id, memoryObject.date);
       relativePath = `Memories/${fileName}`;
       if (options?.adoptLocalOnly) await assertAdoptTargetAbsent(dir, fileName, memoryObjectToMarkdown(memoryObject));
+      else await assertUnregisteredTargetUntouched(dir, fileName, memoryObjectToMarkdown(memoryObject), "reflection", registryKey);
     } else if (lookup.entry.status === "ok") {
       relativePath = lookup.path as string;
       const resolved = await resolveVaultRelativePath(root, relativePath, dirHandleCache);
@@ -2222,17 +2247,23 @@ async function writeMemoryObjectMarkdownImpl(
     throw new VaultRecordNeedsResyncError("memory-day", registryKey, lookup.entry.status, holdReasonFromEntryStatus(lookup.entry.status));
   }
 
-  const existingEntries =
-    verifiedActualText !== undefined
-      ? parseMemoryDayFile(verifiedActualText)
-      : await timedIOStep("memory existingRead", () => readDayFileEntries(targetDir, fileName));
-  const otherEntries = existingEntries.filter((memory) => memory.id !== memoryObject.id);
-  const mergeStart = Date.now();
-  const merged = [...otherEntries, memoryObject].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const serialized = serializeMemoryDayFile(merged);
-  logSyncStep("memory render", Date.now() - mergeStart);
-
-  await writeFileInDir(targetDir, fileName, serialized, "memory");
+  // 読んでから書くまでを同じ日のロックの中で行う。丸ごと書き直さず、対象の記録の部分だけを変える（判定は共通の安全条件）。書けないときはOutboxの保存処理が保留として残す
+  const priorMemberHashes = lookup.entry?.memberHashes;
+  const plan = await withMemoryDayFileLock(day, async () => {
+    const raw = await timedIOStep("memory existingRead", () => readDayFileRawForRewrite(targetDir, fileName, verifiedActualText));
+    const mergeStart = Date.now();
+    const decided = planDayFileMemberWrite(raw, memoryObject, {
+      isSame: (onDisk, canonical) => memoryObjectToMarkdown(onDisk) === memoryObjectToMarkdown(canonical),
+      isSuccessor: () => true,
+      isRegisteredVersion: (onDisk) => priorMemberHashes?.[onDisk.id] === hashVaultText(memoryObjectToMarkdown(onDisk)),
+    });
+    logSyncStep("memory render", Date.now() - mergeStart);
+    if (decided.kind === "write") await writeFileInDir(targetDir, fileName, decided.content, "memory");
+    return decided;
+  });
+  if (plan.kind === "refuse") throw new VaultRecordNeedsResyncError("memory-day", registryKey, "conflict", "conflict");
+  const merged = plan.members;
+  const serialized = plan.content;
   await updateIndex(root, memoryObject.id, relativePath);
   // History Index（Step 1、Codexレビュー指摘対応。v2でnormalMemories配列を追加）：
   // day-fileへ実際に書き込んだ後のマージ済み配列（絶対値）を、そのまま軽量化して
@@ -2261,10 +2292,10 @@ async function writeMemoryObjectMarkdownImpl(
   // した文字列のハッシュ）で、将来の再同期がday-file内のどのidが変化したかを
   // 特定するために使う。
   const stat = await readVaultFileStat(targetDir, fileName);
-  const memberHashes: Record<string, string> = {};
-  for (const member of merged) {
-    memberHashes[member.id] = hashVaultText(memoryObjectToMarkdown(member));
-  }
+  const memberHashes = await nextMemberHashes(priorMemberHashes, merged, memoryObject.id, (member) => hashVaultText(memoryObjectToMarkdown(member)), async (member) => {
+    const device = await getMemoryObject(member.id);
+    return !device || memoryObjectToMarkdown(device) === memoryObjectToMarkdown(member);
+  });
   await upsertVaultRegistryRecord(root, {
     registryKey,
     path: relativePath,

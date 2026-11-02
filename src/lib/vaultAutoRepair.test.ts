@@ -25,6 +25,7 @@ const repair = require("./vaultAutoRepair") as typeof import("./vaultAutoRepair"
 const backup = require("./vaultBackup") as typeof import("./vaultBackup");
 const zip = require("./zip") as typeof import("./zip");
 const markdown = require("./markdown") as typeof import("./markdown");
+const safety = require("./vaultRewriteSafety") as typeof import("./vaultRewriteSafety");
 
 const T = "2026-10-20T09:15:00.000Z";
 const T2 = "2026-10-21T10:00:00.000Z";
@@ -242,20 +243,34 @@ test("冪等：直った後にもう一度押すと何もしない。途中の�
   assert.ok(!w3.log.some((l) => l.startsWith("settle")), "no save run when nothing was re-queued");
 });
 
-test("同じ日のファイルへの追加：通常の保存の書き直しで何も失われないファイルだけ（それ以外は追加で内容が失われうる）", () => {
+test("同じ日のファイルへの追加：他の部分を変えずに追加できる見込みがあるファイルだけ（記録の件数・日付に依存しない）", () => {
   const a = memory("m1", { createdAt: "2026-10-20T08:00:00.000Z" }), b = memory("m2", { createdAt: "2026-10-20T09:00:00.000Z" });
   const normal = markdown.serializeMemoryDayFile([a, b]);
-  assert.equal(repair.dayFileRoundTrips(normal), true);
-  assert.equal(repair.dayFileRoundTrips(""), true);
-  assert.equal(repair.dayFileRoundTrips(markdown.serializeMemoryDayFile([b, a])), true, "a different order loses nothing");
-  assert.equal(repair.dayFileRoundTrips(normal.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ")), false, "an unknown frontmatter key would be dropped");
-  assert.equal(repair.dayFileRoundTrips(normal.replace("## Summary", "手で書き足した架空のメモ\n\n## Summary")), false, "text outside the summary would be dropped");
-  assert.equal(repair.dayFileRoundTrips(normal + markdown.MEMORY_ENTRY_SEPARATOR + "---\ntitle: 架空\n---\n本文"), false, "an unparseable entry would be dropped");
-  assert.equal(repair.dayFileRoundTrips("---\ntitle: 架空\n---\n本文"), false);
-  assert.equal(repair.dayFileRoundTrips(normal.replace("架空の内容-m1", "架空の\uFFFD内容-m1")), false, "bytes file.text() could not decode would be destroyed by the rewrite");
-  const inferred = markdown.memoryObjectToMarkdown(markdown.parseMemoryObjectMarkdown(markdown.memoryObjectToMarkdown(a))!).match(/^sourceType: .*$/m)![0];
-  assert.equal(repair.dayFileRoundTrips(markdown.memoryObjectToMarkdown(a).replace("## Summary", `${inferred}\n\n## Summary`)), false, "a body line equal to a generated default is still lost");
-  assert.equal(repair.dayFileRoundTrips(markdown.memoryObjectToMarkdown(a).replace("架空の内容-m1", "架空の内容-m1\n\n後から書き足した架空の段落")), true, "text in the summary is kept by the rewrite");
+  assert.equal(safety.dayFileCanTakeMember(normal, "m3"), true);
+  assert.equal(safety.dayFileCanTakeMember("", "m3"), true);
+  assert.equal(safety.dayFileCanTakeMember(normal.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空のメモ"), "m3"), true, "the note stays where it is");
+  assert.equal(safety.dayFileCanTakeMember(normal + markdown.MEMORY_ENTRY_SEPARATOR + "手書きの架空のメモ", "m3"), true, "the note stays where it is");
+  assert.equal(safety.dayFileCanTakeMember("---\ntitle: 架空\n---\n本文", "m3"), false, "not a day file at all");
+  assert.equal(safety.dayFileCanTakeMember(normal + markdown.MEMORY_ENTRY_SEPARATOR + "手書き m3 の架空のメモ", "m3"), false, "the record itself was rewritten by hand: adding it would duplicate it");
+});
+
+test("UTF-8として読めないファイルは文字列にしない（U+FFFDへの置き換えを書き戻さない）。正しくエンコードされたU+FFFDは読める", async () => {
+  assert.throws(() => safety.decodeVaultText(new Uint8Array([0x61, 0xff, 0x62])), safety.VaultFileNotUtf8Error);
+  assert.equal(safety.decodeVaultText(new TextEncoder().encode("架空\uFFFD")), "架空\uFFFD");
+  await assert.rejects(safety.readVaultFileText({ text: async () => "a\uFFFDb", arrayBuffer: async () => new Uint8Array([0x61, 0xff, 0x62]).buffer }), safety.VaultFileNotUtf8Error);
+});
+
+test("書き換えの証明：Registryの版と一致するか、書き換え後も元の内容がすべて残るときだけ", () => {
+  const hash = (t: string) => `h:${t}`;
+  const cur = "---\nid: x\ntitle: 架空\nupdatedAt: 1\n---\n\n# 本文\n", next = "---\nid: x\ntitle: 架空\nupdatedAt: 2\n---\n\n# 本文\n";
+  const opts = { hash, registeredHash: undefined, evolvingKeys: safety.MEMORY_EVOLVING_KEYS, body: "same" as const };
+  assert.equal(safety.singleFileRewriteIsSafe(cur, next, opts), true, "only the update time changes");
+  const retitled = next.replace("架空", "別の題名");
+  assert.equal(safety.singleFileRewriteIsSafe(cur, retitled, opts), false, "a line would be lost and nothing proves Tsumugi wrote it");
+  assert.equal(safety.singleFileRewriteIsSafe(cur, retitled, { ...opts, registeredHash: hash(cur) }), true, "exactly what Tsumugi wrote last");
+  assert.equal(safety.singleFileRewriteIsSafe(cur + "手書き\n", next, opts), false);
+  assert.equal(safety.singleFileRewriteIsSafe(cur, next + "\n続き\n", { ...opts, body: "extends" }), true);
+  assert.equal(safety.singleFileRewriteIsSafe(cur, next.replace("# 本文", "# 本文の続き"), { ...opts, body: "extends" }), false, "a body that merely starts with the same characters is not an extension");
 });
 
 test("表示：理由ごとの件数と次の操作。本文・IDは出さない", () => {

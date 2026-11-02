@@ -593,7 +593,8 @@ test("Projection Memory D: 既存A・未知Xがある状態でAが正当に更�
   const day = "2026-04-04";
   const aOld = memory("mem-d-a", day, { createdAt: `${day}T09:00:00.000Z`, updatedAt: `${day}T09:00:00.000Z` });
   const x = memory("mem-d-x", day, { createdAt: `${day}T08:00:00.000Z` });
-  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([x, aOld]));
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([x]));
+  assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), await seedMemoryCanonical(aOld))).status, "done"); // Tsumugiが書いた版としてRegistryに記録される
   const aNew: MemoryObject = { ...aOld, summary: "更新後の要約", updatedAt: `${day}T09:05:00.000Z` };
   const entry = await seedMemoryCanonical(aNew);
   const result = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
@@ -913,7 +914,7 @@ test("reconcilePendingMemories: pendingなmemory entryだけをまとめて処�
 // 永久iPhone Memory fixture（Phase 3-6 req 15）
 // ===========================================================================
 
-test("Projection Memory iPhone fixture（永久回帰テスト）: migration → Memory Projection reconcileで、A保持/B追加/C安全更新/X保全のすべてが安全に収束する", async () => {
+test("Projection Memory iPhone fixture（永久回帰テスト）: migration → Memory Projection reconcileで、A保持/B追加/X保全が収束し、Registryに証拠の無いCは上書きせず保留する", async () => {
   const vault = new FakeVault();
   await dbMod.clearMemoryData();
   const day = "2026-04-20";
@@ -922,7 +923,7 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
   const a = memory("iphone-mem-a", day, { createdAt: `${day}T09:00:00.000Z` });
   // B：IDB-only（day-fileには無い）。
   const b = memory("iphone-mem-b", day, { createdAt: `${day}T09:01:00.000Z` });
-  // C：Vaultは旧version、IDBは正当な後継（メタデータのみ更新）。
+  // C：Vaultは旧version、IDBは後継（要約が異なる）。Registryに記録が無く、Vaultの要約が手で直されたものか区別できない。
   const cOld = memory("iphone-mem-c", day, { createdAt: `${day}T09:02:00.000Z`, updatedAt: `${day}T09:02:00.000Z` });
   const cNew: MemoryObject = { ...cOld, summary: "更新後の要約（安全な更新）", updatedAt: `${day}T09:10:00.000Z` };
   // X：Vault-only（IndexedDBに存在しない未知member）。
@@ -966,21 +967,24 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
   assert.deepEqual(migrationResult.memoryVaultOnlyMembers.map((v) => v.id), [x.id]);
 
   const projEnv: import("./vaultProjection").ProjectionEnv = { root: vault.root(), vaultIdentity: identity, now: () => T };
-  for (const m of [a, b, cNew]) {
+  for (const m of [a, b]) {
     const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
     assert.ok(entry, `${m.id}のoutbox entryが無い`);
     const reconcileResult = await projectionMod.reconcileMemoryOutboxEntry(projEnv, entry!);
     assert.equal(reconcileResult.status, "done", `${m.id}がdoneにならなかった: ${JSON.stringify(reconcileResult)}`);
   }
+  const cEntry = await dbMod.getVaultOutboxEntry(`memory:${cNew.id}`);
+  assert.deepEqual(await projectionMod.reconcileMemoryOutboxEntry(projEnv, cEntry!), { status: "held", reason: "memory-member-edited-conflict" }, "C：証明できないので上書きしない");
 
-  // 最終状態の確認：A保持・B追加・C安全更新・X保全のすべてが揃っている。
+  // 最終状態の確認：A保持・B追加・C（Vaultの版のまま）・X保全のすべてが揃っている。
   const finalMembers = markdownMod.parseMemoryDayFile(vault.get(path)!);
   assert.equal(finalMembers.length, 4, "X/A/B/Cの4件が最終的に揃う");
   assert.ok(finalMembers.some((m) => m.id === x.id), "X：Vault-onlyは最後まで保全される");
   assert.ok(finalMembers.some((m) => m.id === a.id), "A：保持される");
   assert.ok(finalMembers.some((m) => m.id === b.id), "B：新規追加される");
   const finalC = finalMembers.find((m) => m.id === cNew.id)!;
-  assert.equal(finalC.summary, "更新後の要約（安全な更新）", "C：安全な更新が反映される");
+  assert.equal(finalC.summary, cOld.summary, "C：Vaultの版が残る");
+  assert.equal((await dbMod.getMemoryObject(cNew.id))!.summary, "更新後の要約（安全な更新）", "C：端末の版も残る");
 
   const finalShard = JSON.parse(vault.get(`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`)!);
   assert.deepEqual(new Set(finalShard.files[path].memberIds), new Set([x.id, a.id, b.id, cNew.id]), "Registryはfinal実体から修復される");
@@ -989,9 +993,9 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
   const historyIds = finalMonth.days[day].normalMemories.map((r: { id: string }) => r.id);
   assert.deepEqual(new Set(historyIds), new Set([x.id, a.id, b.id, cNew.id]), "Historyも最終実体から修復される");
 
-  for (const m of [a, b, cNew]) {
+  for (const m of [a, b]) {
     const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
-    assert.equal(entry!.status, "done", "Recovery不要（すべてdone）");
+    assert.equal(entry!.status, "done", "他の記録はCに止められない");
   }
 });
 
@@ -1581,4 +1585,285 @@ test("findUnchangedRegistrations: 同一版・同一内容だけを返し、変�
   await dbMod.putConversation(storedDiffers);
   const found = await dbMod.findUnchangedRegistrations("conversation", [same, newer, edited, unregistered]);
   assert.deepEqual([...found].sort(), ["reg-same-1"]);
+});
+
+// ===========================================================================
+// 既存のMarkdownを書き換える全経路の共通の安全条件（vaultRewriteSafety.ts）
+// ===========================================================================
+
+const HAND_NOTE = "手で書き足した架空のメモ";
+const reconcileMemory = async (vault: FakeVault, m: MemoryObject) => projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), await seedMemoryCanonical(m));
+const heldReasonOf = async (id: string) => (await dbMod.getVaultOutboxEntry(id))?.heldReason ?? null;
+
+test("Safety 1: 日別ファイルに手書きの部分があっても、他の部分を1バイトも変えずに新しい記録を追加する。再試行しても増えない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-01";
+  const a = memory("safe-1-a", day, { createdAt: `${day}T01:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, a)).status, "done");
+  const foreign = `${vault.get(memoryDayPath(day))!.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空の項目")}${markdownMod.MEMORY_ENTRY_SEPARATOR}# ${HAND_NOTE}\n\n自由な文章\n`;
+  vault.put(memoryDayPath(day), foreign);
+
+  const b = memory("safe-1-b", day, { createdAt: `${day}T02:00:00.000Z` });
+  const entry = await seedMemoryCanonical(b);
+  assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry)).status, "done");
+  const after = vault.get(memoryDayPath(day))!;
+  assert.ok(after.includes("myNote: 架空の項目"), "知らない項目が残る");
+  assert.ok(after.includes(HAND_NOTE), "手書きの部分が残る");
+  assert.deepEqual(markdownMod.parseMemoryDayFile(after).map((m) => m.id).sort(), [a.id, b.id]);
+
+  const writes = vault.writeCount;
+  assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!)).status, "done");
+  assert.equal(vault.get(memoryDayPath(day)), after, "再試行で重複しない");
+  assert.equal(vault.writeCount, writes, "再試行で何も書かない");
+});
+
+test("Safety 2: 手が入っていない日別ファイルは、これまでの保存と同じ内容になる（順序も同じ）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-02";
+  const late = memory("safe-2-late", day, { createdAt: `${day}T03:00:00.000Z` });
+  const early = memory("safe-2-early", day, { createdAt: `${day}T01:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, late)).status, "done");
+  assert.equal((await reconcileMemory(vault, early)).status, "done");
+  assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([early, late]));
+});
+
+test("Safety 3: 記録の更新でも、同じ日の手書きの部分は変わらない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-03";
+  const a = memory("safe-3-a", day, { createdAt: `${day}T01:00:00.000Z` });
+  const b = memory("safe-3-b", day, { createdAt: `${day}T02:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, a)).status, "done");
+  assert.equal((await reconcileMemory(vault, b)).status, "done");
+  const entries = vault.get(memoryDayPath(day))!.split(markdownMod.MEMORY_ENTRY_SEPARATOR);
+  const edited = entries[1].replace("tsumugi: true", "tsumugi: true\nmyNote: 架空の項目");
+  vault.put(memoryDayPath(day), [entries[0], edited].join(markdownMod.MEMORY_ENTRY_SEPARATOR));
+  const aNew: MemoryObject = { ...a, summary: "更新後の要約", updatedAt: `${day}T23:00:00.000Z` };
+  assert.equal((await reconcileMemory(vault, aNew)).status, "done");
+  const after = vault.get(memoryDayPath(day))!.split(markdownMod.MEMORY_ENTRY_SEPARATOR);
+  assert.equal(after[1], edited, "他の記録の部分は1バイトも変わらない");
+  assert.equal(markdownMod.parseMemoryObjectMarkdown(after[0].trim())!.summary, "更新後の要約");
+});
+
+test("Safety 4: 対象の記録そのものが手で編集されていたら、新しい版でも上書きせず保留する（ファイルも端末の記録も変えない）", async () => {
+  for (const [name, edit] of [
+    ["要約の編集", (t: string) => t.replace("要約-safe-4", "手で直した要約-safe-4")],
+    ["知らない項目の追加", (t: string) => t.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空の項目")],
+  ] as [string, (t: string) => string][]) {
+    const vault = new FakeVault();
+    seedVaultIdentityFile(vault);
+    const day = "2026-05-04";
+    const a = memory(`safe-4-${name}`, day, { summary: "要約-safe-4" });
+    assert.equal((await reconcileMemory(vault, a)).status, "done", name);
+    const edited = edit(vault.get(memoryDayPath(day))!);
+    vault.put(memoryDayPath(day), edited);
+    const aNew: MemoryObject = { ...a, keywords: ["架空"], updatedAt: `${day}T23:00:00.000Z` };
+    const result = await reconcileMemory(vault, aNew);
+    assert.deepEqual(result, { status: "held", reason: "memory-member-edited-conflict" }, name);
+    assert.equal(vault.get(memoryDayPath(day)), edited, name);
+    assert.equal((await dbMod.getMemoryObject(a.id))!.updatedAt, aNew.updatedAt, "端末の記録はそのまま");
+  }
+});
+
+test("Safety 5: 他の記録の保存が通っても、手で編集された記録が「Tsumugiが書いた版」にならない（整合性確認の後の更新でも上書きしない）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-05";
+  const a = memory("safe-5-a", day, { createdAt: `${day}T01:00:00.000Z`, summary: "要約-safe-5-a" });
+  const b = memory("safe-5-b", day, { createdAt: `${day}T02:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, a)).status, "done");
+  assert.equal((await reconcileMemory(vault, b)).status, "done");
+  const hashBefore = JSON.parse(vault.get(memoryShardPathFor(day))!).files[memoryDayPath(day)].memberHashes[a.id];
+  vault.put(memoryDayPath(day), vault.get(memoryDayPath(day))!.replace("要約-safe-5-a", "手で直した要約"));
+  // Bの完了後の確認（no-op）と、新しいBの保存
+  assert.equal((await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(`memory:${b.id}`))!)).status, "done");
+  assert.equal((await reconcileMemory(vault, { ...b, summary: "Bの更新", updatedAt: `${day}T23:00:00.000Z` })).status, "done");
+  assert.equal(JSON.parse(vault.get(memoryShardPathFor(day))!).files[memoryDayPath(day)].memberHashes[a.id], hashBefore, "他の記録のハッシュは引き継ぐ");
+  const edited = vault.get(memoryDayPath(day))!;
+  const result = await reconcileMemory(vault, { ...a, keywords: ["架空"], updatedAt: `${day}T23:30:00.000Z` });
+  assert.deepEqual(result, { status: "held", reason: "memory-member-edited-conflict" });
+  assert.equal(vault.get(memoryDayPath(day)), edited);
+});
+
+test("Safety 6: Registryに記録が無く、内容が同じとも言えない記録は保留する。更新日時だけの違いなら失われるものが無いので更新する", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-06";
+  const a = memory("safe-6", day);
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([a]));
+  const held = await reconcileMemory(vault, { ...a, summary: "新しい要約", updatedAt: `${day}T23:00:00.000Z` });
+  assert.deepEqual(held, { status: "held", reason: "memory-member-edited-conflict" });
+  assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([a]));
+  const onlyTime: MemoryObject = { ...a, updatedAt: `${day}T23:30:00.000Z` };
+  assert.equal((await reconcileMemory(vault, onlyTime)).status, "done");
+  assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([onlyTime]));
+});
+
+test("Safety 7: 日別ファイルとして読めない・この記録が手で壊されたファイルには追加しない（二重にしない）", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-07";
+  const note = `# ${HAND_NOTE}\n本文\n`;
+  vault.put(memoryDayPath(day), note);
+  const a = memory("safe-7-a", day);
+  assert.deepEqual(await reconcileMemory(vault, a), { status: "held", reason: "memory-dayfile-unreadable" });
+  assert.equal(vault.get(memoryDayPath(day)), note);
+
+  const other = memory("safe-7-b", day, { createdAt: `${day}T01:00:00.000Z` });
+  const broken = `${markdownMod.memoryObjectToMarkdown(other)}${markdownMod.MEMORY_ENTRY_SEPARATOR}${HAND_NOTE}\n${markdownMod.memoryObjectToMarkdown(a)}`;
+  vault.put(memoryDayPath(day), broken);
+  assert.deepEqual(await reconcileMemory(vault, a), { status: "held", reason: "memory-member-edited-conflict" });
+  assert.equal(vault.get(memoryDayPath(day)), broken);
+});
+
+test("Safety 8: 本文に区切りの文字列を含む記録は、読み直すと崩れるので書かない", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-08";
+  const a = memory("safe-8-a", day, { createdAt: `${day}T01:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, a)).status, "done");
+  const before = vault.get(memoryDayPath(day))!;
+  const b = memory("safe-8-b", day, { createdAt: `${day}T02:00:00.000Z`, content: `前半${markdownMod.MEMORY_ENTRY_SEPARATOR}後半` });
+  assert.deepEqual(await reconcileMemory(vault, b), { status: "held", reason: "memory-dayfile-not-mergeable" });
+  assert.equal(vault.get(memoryDayPath(day)), before);
+});
+
+test("Safety 9: 会話：手書きの項目・文章があれば、完了後の確認でも次の発言の保存でも上書きしない。手が入っていなければ通常どおり進む", async () => {
+  for (const [name, edit] of [
+    ["知らない項目", (t: string) => t.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空の項目")],
+    ["題名の編集", (t: string) => t.replace("tsumugi: true", "tsumugi: true\ntitle: 手で付けた題名")],
+    ["見出しの前の手書き", (t: string) => t.replace("## Transcript", `${HAND_NOTE}\n\n## Transcript`)],
+  ] as [string, (t: string) => string][]) {
+    const vault = new FakeVault();
+    seedVaultIdentityFile(vault);
+    const c = conversation(`safe-9-${name}`);
+    const path = `Conversations/${vaultMod.fileNameFor(c.id, c.startedAt)}`;
+    const c2: Conversation = { ...c, turns: [...c.turns, { role: "ai", content: "返信", timestamp: "2026-03-01T09:00:05.000Z" }], updatedAt: "2026-03-01T09:00:05.000Z" };
+    const entry = await seedCanonical(c);
+    assert.equal((await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry)).status, "done", name);
+    const edited = edit(vault.get(path)!);
+    vault.put(path, edited);
+    // 完了後の確認（同じ版）
+    const check = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), (await dbMod.getVaultOutboxEntry(entry.id))!);
+    assert.deepEqual(check, { status: "held", reason: "markdown-edited-conflict" }, name);
+    assert.equal(vault.get(path), edited, name);
+    // 次の発言の保存
+    const next = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), await seedCanonical(c2));
+    assert.deepEqual(next, { status: "held", reason: "markdown-edited-conflict" }, name);
+    assert.equal(vault.get(path), edited, name);
+    assert.equal((await dbMod.getConversation(c.id))!.turns.length, 2, "端末の記録はそのまま");
+  }
+});
+
+test("Safety 10: 会話：Registryの更新前に中断しても、次の発言は失われるものが無いことを確かめて保存する", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const c1 = conversation("safe-10");
+  const path = `Conversations/${vaultMod.fileNameFor(c1.id, c1.startedAt)}`;
+  assert.equal((await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), await seedCanonical(c1))).status, "done");
+  const at = (n: number) => `2026-03-01T09:00:0${n}.000Z`;
+  const c2: Conversation = { ...c1, turns: [...c1.turns, { role: "ai", content: "返信", timestamp: at(5) }], updatedAt: at(5), endedAt: at(5) };
+  vault.put(path, markdownMod.conversationToMarkdown(c2)); // 本文だけ書けて、Registryは古いまま
+  const c3: Conversation = { ...c2, turns: [...c2.turns, { role: "user", content: "次の発言", timestamp: at(6) }], updatedAt: at(6), endedAt: at(6) };
+  assert.equal((await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), await seedCanonical(c3))).status, "done");
+  assert.equal(vault.get(path), markdownMod.conversationToMarkdown(c3));
+});
+
+test("Safety 11: 従来の書き込み（Captureの直後の保存）も同じ条件：手書きを残して追加し、編集された記録は上書きせず、Outboxに任せる", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  vault.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, updatedAt: T, lastFullResyncAt: null, baselineEstablishedAt: "2020-01-01T00:00:00.000Z" }));
+  const day = "2026-05-11";
+  const a = memory("safe-11-a", day, { createdAt: `${day}T01:00:00.000Z`, summary: "要約-safe-11-a" });
+  const b = memory("safe-11-b", day, { createdAt: `${day}T02:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, a)).status, "done");
+  const noted = vault.get(memoryDayPath(day))!.replace("tsumugi: true", "tsumugi: true\nmyNote: 架空の項目");
+  vault.put(memoryDayPath(day), noted);
+  // 外部の変更に気づいて止まる（従来どおり）。その後Outboxが他の部分を変えずに追加する
+  await assert.rejects(vaultMod.writeMemoryObjectMarkdown(vault.root(), b), /vault write held/);
+  assert.equal(vault.get(memoryDayPath(day)), noted);
+  assert.equal((await reconcileMemory(vault, b)).status, "done");
+  assert.ok(vault.get(memoryDayPath(day))!.includes("myNote: 架空の項目"));
+  // Registryが今のファイルに追いついた後の従来の書き込みも、丸ごと書き直さない
+  const c = memory("safe-11-c", day, { createdAt: `${day}T03:00:00.000Z` });
+  await dbMod.putMemoryObjectWithOutbox(c);
+  await vaultMod.writeMemoryObjectMarkdown(vault.root(), c);
+  assert.ok(vault.get(memoryDayPath(day))!.includes("myNote: 架空の項目"), "手書きの部分が残る");
+  assert.deepEqual(markdownMod.parseMemoryDayFile(vault.get(memoryDayPath(day))!).map((m) => m.id), [a.id, b.id, c.id]);
+  // 手で編集された記録の新しい版：上書きしない
+  const edited = vault.get(memoryDayPath(day))!.replace("tsumugi: true\nmyNote: 架空の項目", "tsumugi: true");
+  vault.put(memoryDayPath(day), edited.replace("要約-safe-11-a", "手で直した要約"));
+  const current = vault.get(memoryDayPath(day))!;
+  await assert.rejects(vaultMod.writeMemoryObjectMarkdown(vault.root(), { ...a, keywords: ["架空"], updatedAt: `${day}T23:00:00.000Z` }), /vault write held/);
+  assert.equal(vault.get(memoryDayPath(day)), current);
+});
+
+test("Safety 12: 同じ日への同時の保存（別タブ相当）で、手書きも他の記録も失われない", async () => {
+  const realLocks = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: new FakeLockManager() } });
+  try {
+    const vault = new FakeVault();
+    seedVaultIdentityFile(vault);
+    const day = "2026-05-12";
+    const a = memory("safe-12-a", day, { createdAt: `${day}T01:00:00.000Z` });
+    assert.equal((await reconcileMemory(vault, a)).status, "done");
+    vault.put(memoryDayPath(day), `${vault.get(memoryDayPath(day))!}${markdownMod.MEMORY_ENTRY_SEPARATOR}${HAND_NOTE}\n`);
+    vault.delayPaths.add("Memories");
+    const ids = ["b", "c", "d"].map((x, i) => memory(`safe-12-${x}`, day, { createdAt: `${day}T0${i + 2}:00:00.000Z` }));
+    const entries = await Promise.all(ids.map(seedMemoryCanonical));
+    const results = await Promise.all(entries.map((e) => projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), e)));
+    assert.deepEqual(results.map((r) => r.status), ["done", "done", "done"]);
+    const after = vault.get(memoryDayPath(day))!;
+    assert.ok(after.includes(HAND_NOTE));
+    assert.equal(markdownMod.parseMemoryDayFile(after).length, 4);
+  } finally {
+    if (realLocks) Object.defineProperty(globalThis, "navigator", realLocks); else delete (globalThis as { navigator?: unknown }).navigator;
+  }
+});
+
+test("Safety 13: 保留は起動ごとに1回だけ判定し直す：変わらなければ何も書かず、ファイルが直っていれば保存が再開する", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-13";
+  const a = memory("safe-13", day, { summary: "要約-safe-13" });
+  assert.equal((await reconcileMemory(vault, a)).status, "done");
+  const original = vault.get(memoryDayPath(day))!;
+  vault.put(memoryDayPath(day), original.replace("要約-safe-13", "手で直した要約"));
+  const aNew: MemoryObject = { ...a, keywords: ["架空"], updatedAt: `${day}T23:00:00.000Z` };
+  assert.equal((await reconcileMemory(vault, aNew)).status, "held");
+  const held = (await dbMod.getVaultOutboxEntry(`memory:${a.id}`))!;
+  const editedFile = vault.get(memoryDayPath(day));
+
+  for (let i = 0; i < 3; i++) await projectionMod.reevaluateRewriteHeldOutbox(makeEnv(vault));
+  const still = (await dbMod.getVaultOutboxEntry(held.id))!;
+  assert.equal(still.status, "held");
+  assert.deepEqual(still.attempt, held.attempt, "同じ判定なら試行回数も増やさない");
+  assert.equal(vault.get(memoryDayPath(day)), editedFile, "ファイルは変わらない");
+
+  vault.put(memoryDayPath(day), original); // ユーザーが元に戻した
+  await projectionMod.reevaluateRewriteHeldOutbox(makeEnv(vault));
+  assert.equal((await dbMod.getVaultOutboxEntry(held.id))!.status, "done");
+  assert.equal(vault.get(memoryDayPath(day)), markdownMod.serializeMemoryDayFile([aNew]));
+  assert.equal(await heldReasonOf(held.id), null);
+});
+
+test("Safety 14: Registryに記録の無い記録が手で編集されていたら、他の記録の保存で「Tsumugiが書いた版」にならない。端末と同じ記録は記録される", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-05-14";
+  const a = memory("safe-14-a", day, { createdAt: `${day}T01:00:00.000Z`, summary: "要約-safe-14-a" });
+  const same = memory("safe-14-same", day, { createdAt: `${day}T01:30:00.000Z` });
+  await dbMod.putMemoryObjectWithOutbox(a);
+  await dbMod.putMemoryObjectWithOutbox(same);
+  vault.put(memoryDayPath(day), markdownMod.serializeMemoryDayFile([{ ...a, summary: "手で直した要約" }, same]));
+  const b = memory("safe-14-b", day, { createdAt: `${day}T02:00:00.000Z` });
+  assert.equal((await reconcileMemory(vault, b)).status, "done");
+  const hashes = JSON.parse(vault.get(memoryShardPathFor(day))!).files[memoryDayPath(day)].memberHashes;
+  assert.equal(hashes[a.id], undefined, "手で編集された内容のハッシュを作らない");
+  assert.equal(typeof hashes[same.id], "string", "端末と同じ記録は記録する");
+  const current = vault.get(memoryDayPath(day));
+  assert.deepEqual(await reconcileMemory(vault, { ...a, keywords: ["架空"], updatedAt: `${day}T23:00:00.000Z` }), { status: "held", reason: "memory-member-edited-conflict" });
+  assert.equal(vault.get(memoryDayPath(day)), current);
 });

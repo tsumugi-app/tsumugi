@@ -31,11 +31,11 @@ import {
   memoryObjectToMarkdown,
   parseMemoryObjectMarkdown,
   parseMemoryDayFile,
-  serializeMemoryDayFile,
   sourceToMarkdown,
   parseSourceMarkdown,
 } from "./markdown";
-import { memoryDayFileRewriteIsLossless, validStatedAt } from "./markdown";
+import { validStatedAt } from "./markdown";
+import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, withMemoryDayFileLock } from "./vaultRewriteSafety";
 import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives, type HistoryIndexUpdate, type HistoryMeta, type HistoryMonthIndex } from "./vault";
 
 // ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ async function readTextFromDisk(root: FileSystemDirectoryHandle, path: string): 
     for (const name of segments.slice(0, -1)) dir = await dir.getDirectoryHandle(name, { create: false });
     const fileHandle = await dir.getFileHandle(segments[segments.length - 1], { create: false });
     const file = await fileHandle.getFile();
-    return { state: "ok", text: await file.text() };
+    return { state: "ok", text: await readVaultFileText(file) };
   } catch (error) {
     return isNotFoundError(error) ? { state: "absent" } : { state: "error" };
   }
@@ -198,6 +198,14 @@ type MarkdownVerdict =
   | { kind: "create" | "update"; path: string }
   | { kind: "no-op"; path: string };
 
+/** Registryに記録された、Tsumugiが最後に書いた内容のハッシュ（読めない・無いときはundefined。証明できないだけで、書いてよいことにはならない） */
+async function registeredContentHash(env: ProjectionEnv, registryKey: string, path: string): Promise<unknown> {
+  const read = await readJsonAt(env, registryShardPath(vaultRegistryBucketOf(registryKey)));
+  if (read.state !== "ok" || !isObj(read.value.records) || !isObj(read.value.files) || read.value.records[registryKey] !== path) return undefined;
+  const entry = read.value.files[path];
+  return isObj(entry) ? entry.contentHash : undefined;
+}
+
 async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, registryPath: string | undefined): Promise<MarkdownVerdict> {
   const path = registryPath ?? defaultConversationPath(canonical);
   const expectedContent = conversationToMarkdown(canonical);
@@ -208,6 +216,7 @@ async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, regis
   const parsed = parseConversationMarkdown(read.text);
   if (!parsed) throw new ProjectionConflictError("markdown-unreadable");
   if (!isLegitimatePredecessor(parsed, canonical)) throw new ProjectionConflictError("markdown-conflict");
+  if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: "extends" })) throw new ProjectionConflictError("markdown-edited-conflict");
   return { kind: "update", path };
 }
 
@@ -371,6 +380,8 @@ export function registerProjectionDryRun(entry: VaultOutboxEntry, sink: (outcome
 
 const PROJECTION_STEP_NAMES_FOR_COMPARE: ProjectionStepName[] = ["markdown", "registry", "history", "index", "ledger"];
 
+const quietHolds = new WeakSet<object>();
+
 async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionStepName, ProjectionStepState>, status: "done" | "pending" | "held", reason: string | null, now: string): Promise<void> {
   const dryRunSink = dryRunSinks.get(entry);
   if (dryRunSink) { dryRunSink({ steps: { ...steps }, status, reason }); return; }
@@ -381,6 +392,8 @@ async function persistOutcome(entry: VaultOutboxEntry, steps: Record<ProjectionS
     projectionReadStats.idbWritesSkipped += 1;
     return;
   }
+  // the same hold again at the start-up re-evaluation: nothing changed, so nothing is written
+  if (quietHolds.has(entry) && status === "held" && entry.heldReason === reason) return;
   const attempt = status === "done" ? entry.attempt : { count: entry.attempt.count + 1, lastError: reason, lastAttemptAt: now };
   const persist = entry.recordType === "memory" || entry.recordType === "reflection" ? putMemoryProjectionOutcome : putVaultOutboxEntry;
   await persist({ ...entry, steps, status, heldReason: status === "held" ? reason : null, attempt, updatedAt: now });
@@ -514,16 +527,6 @@ export async function reconcilePendingConversations(env: ProjectionEnv): Promise
 // （Phase 3-6はまだ本番write queueへ未接続のため、Engine自身の直列化が必要）。
 // ---------------------------------------------------------------------------
 
-const MEMORY_DAYFILE_LOCK_PREFIX = "tsumugi-projection-memory-dayfile";
-
-function isLockSupported(): boolean {
-  return typeof navigator !== "undefined" && typeof navigator.locks !== "undefined";
-}
-
-async function withMemoryDayFileLock<T>(day: string, fn: () => Promise<T>): Promise<T> {
-  if (!isLockSupported()) return fn();
-  return navigator.locks.request(`${MEMORY_DAYFILE_LOCK_PREFIX}:${day}`, fn);
-}
 
 // ---------------------------------------------------------------------------
 // req 9：Memory version判定。
@@ -553,6 +556,11 @@ async function withMemoryDayFileLock<T>(day: string, fn: () => Promise<T>): Prom
  */
 function memoryEntryMarkdown(m: MemoryObject): string {
   return memoryObjectToMarkdown({ ...m, metadata: { ...m.metadata, sourceType: normalizedSourceType(m.metadata.source, m.metadata.sourceType) as MemoryObject["metadata"]["sourceType"] } });
+}
+
+/** Registryのmember hashは、新しい保存（`memoryEntryMarkdown`）と従来の書き込み（`memoryObjectToMarkdown`）のどちらの形でも書かれている */
+function memberHashMatches(stored: unknown, member: MemoryObject): boolean {
+  return typeof stored === "string" && (stored === hashVaultText(memoryEntryMarkdown(member)) || stored === hashVaultText(memoryObjectToMarkdown(member)));
 }
 
 export function isMemorySame(onDisk: MemoryObject, canonical: MemoryObject): boolean {
@@ -625,59 +633,37 @@ interface MemoryMergeResult {
  * たびに必ずday-fileを読み直す（`withMemoryDayFileLock`と組み合わせることで、
  * req 4の「常に最新実体を基準にする」を満たす）。
  */
-async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string, requireLossless = false): Promise<MemoryMergeResult> {
+async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObject, path: string): Promise<MemoryMergeResult> {
   const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError("memory-dayfile-unreadable");
 
-  let existingMembers: MemoryObject[] = [];
-  if (read.state === "ok") {
-    const parsed = parseMemoryDayFile(read.text);
-    // parseMemoryDayFile自体はparse不能なentryを黙って除外する実装のため、
-    // 「1件も読めなかった」かつ「元のtextが空でない」場合だけをunreadableとして扱う
-    // （0件のday-fileという状態は無い——create前は必ずabsentのため）。
-    if (parsed.length === 0 && read.text.trim().length > 0) throw new ProjectionConflictError("memory-dayfile-unreadable");
-    existingMembers = parsed;
-  }
+  const registered = await readRegisteredMemberHashes(env, canonical.date.slice(0, 10), path);
+  const plan = planDayFileMemberWrite(read.state === "ok" ? read.text : null, canonical, {
+    isSame: isMemorySame,
+    isSuccessor: isMemoryLegitimateSuccessor,
+    isRegisteredVersion: (onDisk) => memberHashMatches(registered[onDisk.id], onDisk),
+  });
+  if (plan.kind === "refuse") throw new ProjectionConflictError(plan.reason);
 
-  const idx = existingMembers.findIndex((m) => m.id === canonical.id);
-  let verdict: MemoryMemberVerdictKind;
-  let mergedMembers: MemoryObject[];
-
-  if (idx === -1) {
-    verdict = existingMembers.length === 0 ? "create" : "append";
-    mergedMembers = [...existingMembers, canonical];
-  } else {
-    const existing = existingMembers[idx];
-    if (isMemorySame(existing, canonical)) {
-      verdict = "no-op";
-      mergedMembers = existingMembers;
-    } else if (isMemoryLegitimateSuccessor(existing, canonical)) {
-      verdict = "update";
-      mergedMembers = existingMembers.map((m, i) => (i === idx ? canonical : m));
-    } else {
-      throw new ProjectionConflictError("memory-member-conflict");
-    }
-  }
-
-  // 自動修復が保存待ちに戻した記録：書き込む時点のファイルでも、書き直しで何も失われないことを確かめる（修復の確認の後の変更・中断後の再開でも同じ）
-  if (requireLossless && verdict !== "no-op" && read.state === "ok" && !memoryDayFileRewriteIsLossless(read.text)) throw new ProjectionConflictError("memory-dayfile-not-mergeable");
-
-  const sortedMembers = [...mergedMembers].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  // No-op must describe the bytes on disk, not a hypothetical serialization.
-  const finalContent = verdict === "no-op" && read.state === "ok"
-    ? read.text
-    : serializeMemoryDayFile(sortedMembers);
-
-  if (verdict !== "no-op") {
+  if (plan.kind === "write") {
     const { dir, fileName } = await dirAndFileNameFor(env.root, path, true);
     try {
-      await writing(env, () => vaultProjectionPrimitives.writeFileInDir(dir, fileName, finalContent, "projection memory day-file"));
+      await writing(env, () => vaultProjectionPrimitives.writeFileInDir(dir, fileName, plan.content, "projection memory day-file"));
     } catch (error) {
       throw new ProjectionRetryableError(error instanceof Error ? error.message : "memory-dayfile-write-failed");
     }
   }
 
-  return { path, verdict, finalMembers: sortedMembers, finalContent };
+  return { path, verdict: plan.kind === "write" ? plan.verdict : "no-op", finalMembers: plan.members, finalContent: plan.content };
+}
+
+/** Registryに記録された、その日の記録ごとのハッシュ（読めない・無いときは空。証明できないだけで、書いてよいことにはならない） */
+async function readRegisteredMemberHashes(env: ProjectionEnv, day: string, path: string): Promise<Obj> {
+  const registryKey = dayFileRegistryKey(day);
+  const read = await readJsonAt(env, registryShardPath(vaultRegistryBucketOf(registryKey)));
+  if (read.state !== "ok" || !isObj(read.value.records) || !isObj(read.value.files) || read.value.records[registryKey] !== path) return {};
+  const entry = read.value.files[path];
+  return isObj(entry) && isObj(entry.memberHashes) ? entry.memberHashes : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +672,7 @@ async function mergeMemoryIntoDayFile(env: ProjectionEnv, canonical: MemoryObjec
 // のRegistry情報を落とさない。
 // ---------------------------------------------------------------------------
 
-async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string): Promise<void> {
+async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, finalMembers: MemoryObject[], finalContent: string, targetId: string): Promise<void> {
   const day = finalMembers[0]?.date.slice(0, 10) ?? "";
   const registryKey = dayFileRegistryKey(day);
   const bucket = vaultRegistryBucketOf(registryKey);
@@ -698,7 +684,10 @@ async function decideAndProjectMemoryRegistry(env: ProjectionEnv, path: string, 
   const currentPath = records[registryKey];
 
   const memberIds = finalMembers.map((m) => m.id);
-  const memberHashes = Object.fromEntries(finalMembers.map((m) => [m.id, hashVaultText(memoryEntryMarkdown(m))]));
+  const memberHashes = await nextMemberHashes(typeof currentPath === "string" && isObj(files[currentPath]) ? (files[currentPath] as Obj).memberHashes : undefined, finalMembers, targetId, (m) => hashVaultText(memoryEntryMarkdown(m)), async (m) => {
+    const device = await getMemoryObject(m.id);
+    return !device || isMemorySame(m, device);
+  });
   const expected = { recordType: "memory-day" as const, mtime: 0, size: 0, contentHash: hashVaultText(finalContent), memberIds, memberHashes, status: "ok" as const };
 
   const currentEntry = typeof currentPath === "string" ? files[currentPath] : undefined;
@@ -873,10 +862,10 @@ export async function reconcileMemoryOutboxEntry(env: ProjectionEnv, entry: Vaul
   const day = canonical.date.slice(0, 10);
 
   try {
-    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path, entry.requireLosslessDayFile === true));
+    const merge = await withMemoryDayFileLock(day, () => mergeMemoryIntoDayFile(env, canonical, path));
     steps.markdown = "done";
 
-    await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent);
+    await decideAndProjectMemoryRegistry(env, merge.path, merge.finalMembers, merge.finalContent, canonical.id);
     steps.registry = "done";
 
     await decideAndProjectMemoryIndex(env, canonical, path);
@@ -966,7 +955,10 @@ async function decideSingleFileMarkdown<T extends { id: string; createdAt: strin
   const parsed = config.parseMarkdown(read.text);
   if (read.text === expectedContent) return { kind: "no-op", path, onDisk: parsed ?? canonical };
   if (!parsed) throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);
-  if (config.isLegitimateSuccessor && config.isLegitimateSuccessor(parsed, canonical)) return { kind: "update", path };
+  if (config.isLegitimateSuccessor && config.isLegitimateSuccessor(parsed, canonical)) {
+    if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, config.registryKeyFor(canonical), path), evolvingKeys: MEMORY_EVOLVING_KEYS, body: "same" })) throw new ProjectionConflictError(`${config.recordType}-markdown-edited-conflict`);
+    return { kind: "update", path };
+  }
   throw new ProjectionConflictError(`${config.recordType}-markdown-conflict`);
 }
 
@@ -1417,10 +1409,23 @@ export const PROJECTION_HELD_RULE_VERSION = "memory-sourcetype-normalized-v1";
  * 途中で中断すれば次回また行う（reconcile自体が冪等）。
  */
 export async function reevaluateHeldOutboxOnce(env: ProjectionEnv, ruleVersion: string = PROJECTION_HELD_RULE_VERSION): Promise<ReconcileAllRecordTypesResult | null> {
-  if (await getProjectionHeldReevaluationMarker(ruleVersion)) return null;
+  if (await getProjectionHeldReevaluationMarker(ruleVersion)) {
+    await reevaluateRewriteHeldOutbox(env);
+    return null;
+  }
   const result = await reconcileHeldVaultOutbox(env);
   await setProjectionHeldReevaluationMarker(ruleVersion, (env.now ?? (() => new Date().toISOString()))());
   return result;
+}
+
+/**
+ * 書き込みの安全条件で保留になった記録を、起動ごとに1回だけ判定し直す（ユーザーがファイルを直した後に、保存を自動で再開するため）。
+ * 判定が変わらなければ何も書かない。1回の起動で1回だけなので、繰り返しにはならない。
+ */
+export async function reevaluateRewriteHeldOutbox(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
+  const entries = (await getHeldVaultOutboxEntries()).filter((e) => /(-edited-conflict|markdown-unreadable|memory-dayfile-unreadable|-not-mergeable)$/.test(e.heldReason ?? ""));
+  for (const entry of entries) quietHolds.add(entry);
+  return reconcileOutboxEntries(env, entries);
 }
 
 export async function reconcileDoneVaultOutboxIntegrity(env: ProjectionEnv): Promise<ReconcileAllRecordTypesResult> {
