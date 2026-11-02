@@ -141,7 +141,7 @@ async function seedWorld(page: Page) {
         const w = await h.createWritable(); await w.write(next); await w.close();
         for await (const [, sh] of (registry as any).entries()) {
           const v = JSON.parse(await (await sh.getFile()).text());
-          if (v.records?.[c.id] === `Conversations/${name}`) { v.files[`Conversations/${name}`].contentHash = vault.hashVaultText(next); const sw = await sh.createWritable(); await sw.write(JSON.stringify(v)); await sw.close(); }
+          if (v.records?.[c.id] === `Conversations/${name}`) { const row = v.files[`Conversations/${name}`]; row.contentHash = vault.hashVaultText(next); row.size = new TextEncoder().encode(next).length; const sw = await sh.createWritable(); await sw.write(JSON.stringify(v)); await sw.close(); }
         }
       }
     }
@@ -183,9 +183,19 @@ async function startApp(page: Page, label: string) {
   const homeVisible = Date.now() - t0;
   return { label, openVisible, homeVisible, t0 };
 }
+/** why the check is not clean: fictional ids and the reasons of the plan, for failure messages */
+async function whyNotLatest(page: Page) {
+  await page.addScriptTag({ path: bundle });
+  return page.evaluate(async () => {
+    const { lockMod, consistencyCheck, dbm } = (window as any).D; lockMod.setTabVaultEpoch(0);
+    const { report, plan } = await consistencyCheck.checkVaultConsistency(await navigator.storage.getDirectory(), () => false, { drainWaitMs: 1000, pollMs: 100, attempts: 2, retryDelayMs: 200 });
+    const progress = await dbm.readVaultSaveProgress();
+    return JSON.stringify({ state: report.state, findings: report.findings.slice(0, 12).map((f: any) => `${f.recordId}:${f.category}:${f.reason}`), held: plan.held.slice(0, 12), ops: plan.ops.slice(0, 6).map((o: any) => [o.kind, o.steps]), outboxNotDone: progress.outbox.filter((e: any) => e.status !== "done").slice(0, 6).map((e: any) => [e.id, e.status, e.heldReason]) });
+  });
+}
 async function waitLatest(page: Page, timeout = 240_000) {
   try { await expect(page.getByText(LATEST)).toBeVisible({ timeout }); }
-  catch { throw new Error(`no 最新. The screen said: ${await screenText(page)}`); }
+  catch { throw new Error(`no 最新. The screen said: ${(await screenText(page)).slice(150, 500)} WHY: ${await whyNotLatest(page)}`); }
 }
 
 test.only("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
@@ -300,7 +310,7 @@ test.only("at real size: two conversations that really differ are found, nothing
   while (!(await page.getByText(LATEST).isVisible())) {
     const said = await screenText(page);
     expect(said.includes(BUSY), `refused as busy after ${round((Date.now() - startedAt) / 1000)} s: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world" && l.got !== null).slice(-12).map((l: any) => [l.mode[0], Math.round(l.got), Math.round((l.end ?? performance.now()) - l.got)])))}`).toBe(false);
-    expect(Date.now(), said).toBeLessThan(deadline);
+    if (Date.now() > deadline) throw new Error(`no 最新. The screen said: ${said.slice(150, 500)} WHY: ${await whyNotLatest(page)}`);
     await page.waitForTimeout(250);
   }
   report("perf-two-choices", { ...started, t0: undefined, firstDone, bothDone: Date.now() - startedAt, ...(await traceSummary(page)) });
