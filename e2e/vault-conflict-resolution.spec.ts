@@ -286,6 +286,30 @@ for (const kind of ["desktop", "android"] as const) {
       });
     }
 
+    for (const damage of ["empty", "cut inside a character"] as const) {
+      test(`the kept file was left incomplete (${damage}) by a closed tab: the same choice rebuilds it and completes, without a second copy`, async ({ page }) => {
+        test.setTimeout(180_000);
+        await setup(page);
+        await editMemoryOnBothSides(page);
+        const view: any = await inspect(page, "memory", "c-mem-1");
+        expect((await resolve(page, view.snapshot, "keep-both", { failAt: "after-kept" }) as any).kind).toBe("interrupted");
+        await page.evaluate(async ({ damage }) => {
+          const dir = await (await (window as any).__root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("conflict-versions");
+          for await (const [, h] of (dir as any).entries()) {
+            const bytes = new Uint8Array(await (await h.getFile()).arrayBuffer());
+            const at = bytes.findIndex((b, i) => i > 20 && b >= 0xe0);   // the first byte of a multi-byte character: cutting after it leaves invalid UTF-8
+            const w = await h.createWritable(); await w.write(damage === "empty" ? new Uint8Array() : bytes.slice(0, at + 1)); await w.close();
+          }
+        }, { damage });
+        expect(((await kept(page)) as any).unreadable).toBe(1);
+        const r: any = await resolve(page, view.snapshot, "keep-both");
+        expect(r.kind, JSON.stringify(r)).toBe("done"); expect(r.state, JSON.stringify(r)).toBe("clean");
+        const list: any = await kept(page);
+        expect(list.unreadable).toBe(0); expect(list.versions.length).toBe(1);
+        expect(list.versions[0].vaultText).toContain("手で書き直した"); expect(list.versions[0].deviceMarkdown).toContain("端末で更新した");
+      });
+    }
+
     for (const [label, failAt] of [["Memory", "after-device"], ["Memory", "after-file"], ["Source", "after-device"]] as const) {
       test(`interrupted ${failAt} (保存先の版を採用, ${label}): the device version stays in the kept copy and the same text ends up on both sides`, async ({ page }) => {
         test.setTimeout(180_000);

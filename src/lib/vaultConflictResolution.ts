@@ -343,16 +343,23 @@ async function parseKept(text: string): Promise<KeptVersion | null> {
   return (await shaOfText(keptPayload(k))) === k.sha256 ? k : null;
 }
 
-/** 同じ版・同じ選択なら同じ名前（やり直しても増えない）。作った後に読み戻して照合する。既にあるものは読んで照合するだけで、書き換えない */
+/** 途中で切れたファイルは、UTF-8としても読めないことがある */
+async function parseKeptBytes(bytes: Uint8Array): Promise<KeptVersion | null> {
+  try { return await parseKept(decodeVaultText(bytes)); } catch (error) { if (error instanceof VaultFileNotUtf8Error) return null; throw error; }
+}
+
+/**
+ * 同じ版・同じ選択なら同じ名前（やり直しても増えない）。作った後に読み戻して照合する。照合できる既存のものは書き換えない。
+ * 照合できないものは、前回の書き込みが途中で止まった跡として作り直す：名前が両方の版から決まるので、入るべき内容は今の両方の版そのもの（呼び出し側が排他区間で読み直した版）で、失うものは無い。
+ */
 async function writeKeptVersion(root: FileSystemDirectoryHandle, input: Omit<KeptVersion, "format" | "version" | "id" | "sha256">): Promise<KeptVersion> {
   const id = (await shaOfText(JSON.stringify([input.recordType, input.recordId, input.deviceRaw, input.vaultText, input.choice]))).slice(0, 32);
   const path = `${KEPT_VERSIONS_DIR}/${id}.json`;
   const existing = await readBytes(root, path);
   if (existing === "unreadable") throw new Error("kept-version-unreadable");
   if (existing !== null) {
-    const kept = await parseKept(decodeVaultText(existing));
-    if (!kept) throw new Error("kept-version-corrupt");
-    return kept;
+    const kept = await parseKeptBytes(existing);
+    if (kept?.id === id) return kept;
   }
   const body = { format: "tsumugi-conflict-version" as const, version: 1 as const, id, ...input };
   const kept: KeptVersion = { ...body, sha256: await shaOfText(keptPayload(body)) };
@@ -360,7 +367,7 @@ async function writeKeptVersion(root: FileSystemDirectoryHandle, input: Omit<Kep
   for (const part of KEPT_VERSIONS_DIR.split("/")) dir = await dir.getDirectoryHandle(part, { create: true });
   await writeFileHandleContent(await dir.getFileHandle(`${id}.json`, { create: true }), JSON.stringify(kept));
   const back = await readBytes(root, path);
-  if (back === null || back === "unreadable" || !(await parseKept(decodeVaultText(back)))) throw new Error("kept-version-verify-failed");
+  if (back === null || back === "unreadable" || (await parseKeptBytes(back))?.id !== id) throw new Error("kept-version-verify-failed");
   return kept;
 }
 
@@ -429,7 +436,8 @@ async function writeFileChecked(root: FileSystemDirectoryHandle, path: string, e
 }
 
 const targetOf = (s: ConflictSnapshot): RepairTarget => ({ action: "resave", reason: "save-held", recordType: s.recordType, recordId: s.recordId });
-const stillListed = (report: ConsistencyReport, id: string) => report.findings.some((f) => f.recordId === id);
+/** 確定した確認で、この記録の問題が無くなったときだけ解決と言う（保存が続いて確認を確定できなかったときは、問題が無いとは言えない） */
+export const confirmedResolved = (report: ConsistencyReport, id: string) => report.settled && !report.findings.some((f) => f.recordId === id);
 
 async function requeue(s: ConflictSnapshot, version: string): Promise<boolean> {
   const result = await requeueRecordForVault(s.recordType, s.recordId, version);
@@ -456,7 +464,7 @@ export async function resolveConflict(env: ConflictResolveEnv, seen: ConflictSna
     if (locked.value !== "queued") return { kind: "not-started", reason: locked.value };
     await env.settleSaves([targetOf(seen)]);
     const after = await env.check();
-    return { kind: "done", choice, kept: null, resolved: !stillListed(after, seen.recordId), adopted: null, after };
+    return { kind: "done", choice, kept: null, resolved: confirmedResolved(after, seen.recordId), adopted: null, after };
   }
 
   type Ran =
@@ -558,7 +566,7 @@ export async function resolveConflict(env: ConflictResolveEnv, seen: ConflictSna
 
   await env.settleSaves([targetOf(seen)]);
   const after = await env.check();
-  return { kind: "done", choice, kept: ran.kept, resolved: !stillListed(after, seen.recordId), adopted: ran.adopted, after };
+  return { kind: "done", choice, kept: ran.kept, resolved: confirmedResolved(after, seen.recordId), adopted: ran.adopted, after };
 }
 
 // ---------------------------------------------------------------------------

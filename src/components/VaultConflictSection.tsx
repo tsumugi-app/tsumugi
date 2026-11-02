@@ -19,6 +19,7 @@ const refKey = (r: ConflictRef) => `${r.recordType}:${r.recordId}`;
 export function conflictOutcomeText(outcome: ConflictOutcome): string {
   if (outcome.kind === "not-started") return NOT_STARTED_REASON_TEXT[outcome.reason];
   if (outcome.kind === "stopped") return STOPPED_TEXT;
+  if (!outcome.resolved && !outcome.after.settled) return `「${CHOICE_LABEL[outcome.choice]}」を実行しましたが、保存中のため確認を完了できませんでした。「もう一度確認する」で確かめてください。`;
   return outcome.resolved
     ? `「${CHOICE_LABEL[outcome.choice]}」を実行し、もう一度確認して問題が無くなったことを確かめました。`
     : `「${CHOICE_LABEL[outcome.choice]}」を実行しましたが、もう一度確認するとまだ確認が必要です。両方の版は保管しています。`;
