@@ -218,6 +218,8 @@ function identityMatches(type: ConflictRecordType, device: LocalRecord, parsed: 
   if (type === "conversation") return (device as Conversation).startedAt.slice(0, 10) === (parsed as Conversation).startedAt.slice(0, 10);
   if (type === "source") return true;
   const d = device as MemoryObject, p = parsed as MemoryObject;
+  // 通常のMemoryと振り返りは保存の形が違う（`metadata.source`で決まる）：種類をまたぐと、次の起動で別のファイルへ書かれ、元のファイルが残って二重になる
+  if (isReflectionSummary(d) !== isReflectionSummary(p)) return false;
   return d.date.slice(0, 10) === p.date.slice(0, 10) && (d.conversationId ?? undefined) === (p.conversationId ?? undefined);
 }
 
@@ -617,7 +619,7 @@ export const BLOCK_REASON_TEXT: Record<ConflictBlockReason, string> = {
 
 export const ADOPT_VAULT_BLOCK_TEXT: Record<AdoptVaultBlockReason, string> = {
   "would-lose-content": "保存先の版には、記録に取り込むと失われる部分（Tsumugiが読まない項目や文）があるため、「保存先の版を採用」は出していません。",
-  "identity-differs": "保存先の版は日付・作成日時・元の会話が端末の記録と異なるため、「保存先の版を採用」は出していません。",
+  "identity-differs": "保存先の版は記録の種類・日付・作成日時・元の会話のいずれかが端末の記録と異なるため、「保存先の版を採用」は出していません。",
   "active-conversation": "開いている会話のため、「保存先の版を採用」は出していません。会話を閉じると選べるようになります。",
 };
 

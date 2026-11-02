@@ -231,6 +231,19 @@ for (const kind of ["desktop", "android"] as const) {
       expect(((await kept(page)) as any).versions.length).toBe(2);
     });
 
+    test("a Vault version that would change a record between Reflection and normal Memory is never adopted", async ({ page }) => {
+      test.setTimeout(180_000);
+      await setup(page);
+      const reflPath = await page.evaluate(async (DAY_FILE) => { const h = await (window as any).__root.getDirectoryHandle("Memories"); for await (const [n] of h.entries()) if (`Memories/${n}` !== DAY_FILE) return `Memories/${n}`; }, DAY_FILE) as string;
+      const original = await read(page, reflPath);
+      await write(page, reflPath, original.replace("source: system-generated", "source: import").replace("架空の振り返りの本文", "架空の振り返り（手で直した）"));
+      await page.evaluate(async ({ LATER }) => (window as any).__settle(await (window as any).D.dbm.putMemoryObjectWithOutbox((window as any).__refl("架空の振り返り（端末で更新）", LATER), "reflection")), { LATER });
+      const view: any = await inspect(page, "memory", "c-refl");
+      expect(view.choices).toEqual(["keep-both", "adopt-device"]); expect(view.adoptVaultBlock).toBe("identity-differs");
+      expect((await resolve(page, view.snapshot, "adopt-vault") as any).reason).toBe("choice-unavailable");
+      expect((await device(page, "memory", "c-refl") as any).metadata.source).toBe("system-generated");
+    });
+
     test("anything that moved after the user looked stops the action and changes nothing: file, device record, Registry", async ({ page }) => {
       test.setTimeout(180_000);
       await setup(page);
