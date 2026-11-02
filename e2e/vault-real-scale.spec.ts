@@ -198,11 +198,19 @@ async function waitLatest(page: Page, timeout = 240_000) {
   catch { throw new Error(`no 最新. The screen said: ${(await screenText(page)).slice(150, 500)} WHY: ${await whyNotLatest(page)}`); }
 }
 
-test("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
+test.only("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   const seeded = await seedWorld(page);
   report("seed", seeded);
+  report("diag-gate", await page.evaluate(async () => {
+    const { bootstrap } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const r = await bootstrap.runSaveFoundationBootstrap({ root }); const m = r.migration;
+    const t = await root.getDirectoryHandle(".tsumugi"); const names: string[] = []; for await (const [n] of (t as any).entries()) names.push(n);
+    const months: string[] = []; for await (const [n] of (await t.getDirectoryHandle("history") as any).entries()) months.push(n);
+    let meta: any = null; try { meta = Object.keys(JSON.parse(await (await (await t.getFileHandle("history-meta.json")).getFile()).text()).months); } catch (e) { meta = String(e); }
+    return { c: m.summary, mem: m.memorySummary, r: m.reflectionSummary, s: m.sourceSummary, names, months, meta };
+  }));
   const before = await fingerprint(page);
 
   // /recovery-debug
