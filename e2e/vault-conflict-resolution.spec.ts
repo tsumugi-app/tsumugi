@@ -28,7 +28,7 @@ async function setup(page: Page, fresh = true) {
     const ident = { id: "current", vaultId: "fictional-conflict", activeVaultEpoch: 0, registryGeneration: "g", pairedAt: T, pendingCandidateVaultId: null, updatedAt: T };
     const meta = (id: string) => ({ id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T });
     const mem = (id: string, content: string, createdAt: string, updatedAt = createdAt) => ({ id, date: `${DAY}T09:15:00.000Z`, types: ["conversation"], conversationId: "c-conv", content, summary: `要約 ${id}`, keywords: [], themeIds: ["theme-kept"], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], createdAt, updatedAt, metadata: { ...meta(id), createdAt, updatedAt } });
-    const refl = (content: string, updatedAt = T) => ({ ...mem("c-refl", content, T, updatedAt), types: ["summary"], summary: "架空の振り返り" });
+    const refl = (content: string, updatedAt = T) => ({ ...mem("c-refl", content, T, updatedAt), types: ["summary"], summary: "架空の振り返り", conversationId: undefined, metadata: { ...meta("c-refl"), source: "system-generated", updatedAt } });
     const conv = (turns: string[], updatedAt = T) => ({ id: "c-conv", persona: "companion", status: "captured", startedAt: T, endedAt: T, createdAt: T, updatedAt, memoryObjectIds: [], turns: turns.map((content, i) => ({ role: i % 2 ? "ai" : "user", content, timestamp: T })), metadata: { ...meta("c-conv"), updatedAt } });
     const source = (content: string, updatedAt = T) => ({ id: "c-src", sourceType: "manual", title: "架空の資料", content, createdAt: T, updatedAt });
     const settle = async (entry: any) => {
@@ -423,6 +423,8 @@ test.describe("the app (Settings)", () => {
         await page.getByTestId("vault-conflict-confirm").click();
         await expect(page.getByText("✓ 最新の状態です")).toBeVisible({ timeout: 90_000 });
         await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+        await expect(page.getByTestId("vault-conflict-outcome")).toContainText("問題が無くなった");
+        await expect(page.getByTestId("vault-kept-version")).toHaveCount(1);
         const kept = await page.evaluate(async () => {
           const root = await navigator.storage.getDirectory(); const dir = await (await root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("conflict-versions");
           const out: string[] = []; for await (const [, h] of (dir as any).entries()) out.push(await (await h.getFile()).text()); return out;

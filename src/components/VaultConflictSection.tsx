@@ -16,7 +16,7 @@ const pre = "max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg b
 
 const refKey = (r: ConflictRef) => `${r.recordType}:${r.recordId}`;
 
-function outcomeText(outcome: ConflictOutcome): string {
+export function conflictOutcomeText(outcome: ConflictOutcome): string {
   if (outcome.kind === "not-started") return NOT_STARTED_REASON_TEXT[outcome.reason];
   if (outcome.kind === "stopped") return STOPPED_TEXT;
   return outcome.resolved
@@ -47,7 +47,7 @@ function ConflictItem({ root, target, activeConversationId, disabled, onResolve 
     setMessage(null);
     try {
       const outcome = await onResolve(view.snapshot, choice);
-      setMessage(outcomeText(outcome));
+      setMessage(conflictOutcomeText(outcome));
       await load();
     } catch (error) {
       console.error("[Tsumugi] conflict: the choice did not complete", error);
@@ -109,7 +109,8 @@ function ConflictItem({ root, target, activeConversationId, disabled, onResolve 
   );
 }
 
-function KeptVersions({ root, refreshKey }: { root: FileSystemDirectoryHandle; refreshKey: number }) {
+/** 解決した後も読めるように、確認が必要な記録の有無に関わらず出す */
+export function VaultKeptVersions({ root, refreshKey }: { root: FileSystemDirectoryHandle; refreshKey: number }) {
   const [kept, setKept] = useState<{ listed: KeptVersion[]; others: number; unreadable: number } | null>(null);
   const alive = useRef(true);
   useEffect(() => {
@@ -139,14 +140,9 @@ export default function VaultConflictSection({ root, conflicts, activeConversati
   root: FileSystemDirectoryHandle; conflicts: ConflictRef[]; activeConversationId: string | null; disabled: boolean;
   onResolve: (snapshot: ConflictSnapshot, choice: ConflictChoice) => Promise<ConflictOutcome>;
 }) {
-  const [refreshKey, setRefreshKey] = useState(0);
-  const resolve = async (snapshot: ConflictSnapshot, choice: ConflictChoice) => {
-    try { return await onResolve(snapshot, choice); } finally { setRefreshKey((k) => k + 1); }
-  };
   return (
     <div data-testid="vault-conflicts" className="flex flex-col gap-2">
-      {conflicts.map((target) => <ConflictItem key={refKey(target)} root={root} target={target} activeConversationId={activeConversationId} disabled={disabled} onResolve={resolve} />)}
-      <KeptVersions root={root} refreshKey={refreshKey} />
+      {conflicts.map((target) => <ConflictItem key={refKey(target)} root={root} target={target} activeConversationId={activeConversationId} disabled={disabled} onResolve={onResolve} />)}
     </div>
   );
 }

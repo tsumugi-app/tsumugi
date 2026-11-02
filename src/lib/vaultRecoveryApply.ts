@@ -38,6 +38,7 @@ import {
   type RecoveryLocalSnapshot,
   type RecoveryPlan,
   type RecoveryRecord,
+  recoveryRecordsSemanticEqual,
 } from "./vaultRecovery";
 import {
   conversationToMarkdown,
@@ -257,7 +258,7 @@ async function unprovenMembers(env: RecoveryApplyEnv, members: MemoryObject[]): 
   const out = new Set<string>();
   for (const m of members) {
     const local = await env.readRecord("memory", m.id);
-    if (local && memberObjectMarkdown(local as MemoryObject) !== memberObjectMarkdown(m)) out.add(m.id);
+    if (local && !recoveryRecordsSemanticEqual("memory", local as MemoryObject, m)) out.add(m.id);
   }
   return out;
 }

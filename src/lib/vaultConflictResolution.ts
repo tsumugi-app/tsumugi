@@ -429,7 +429,7 @@ async function writeFileChecked(root: FileSystemDirectoryHandle, path: string, e
 }
 
 const targetOf = (s: ConflictSnapshot): RepairTarget => ({ action: "resave", reason: "save-held", recordType: s.recordType, recordId: s.recordId });
-const stillListed = (report: ConsistencyReport, id: string) => report.findings.some((f) => f.recordId === id && f.category !== "saving");
+const stillListed = (report: ConsistencyReport, id: string) => report.findings.some((f) => f.recordId === id);
 
 async function requeue(s: ConflictSnapshot, version: string): Promise<boolean> {
   const result = await requeueRecordForVault(s.recordType, s.recordId, version);

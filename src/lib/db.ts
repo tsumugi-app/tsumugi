@@ -1487,10 +1487,10 @@ export async function adoptVaultVersionWithOutbox<T extends Conversation | Memor
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (recordType === "conversation") {
       if (blockedByTombstone(tombs, "conversation", record.id)) throw new TombstonedRecordError("conversation", record.id);
-      stored = withoutDeletedMemoryRefs(record as Conversation, tombs) as T;
+      stored = ((withoutDeletedMemoryRefs(record as Conversation, tombs) as T | undefined) ?? record);
     } else if (recordType !== "source") {
       if (memoryBlocked(tombs, record as MemoryObject)) throw new TombstonedRecordError("memory", record.id);
-      stored = (await withoutDeletedLinksInTx(tx, record as MemoryObject, tombs, now)) as T;
+      stored = ((await withoutDeletedLinksInTx(tx, record as MemoryObject, tombs, now)) as T | undefined) ?? record;
     }
     return stored;
   }) as never);
