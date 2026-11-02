@@ -198,19 +198,11 @@ async function waitLatest(page: Page, timeout = 240_000) {
   catch { throw new Error(`no 最新. The screen said: ${(await screenText(page)).slice(150, 500)} WHY: ${await whyNotLatest(page)}`); }
 }
 
-test.only("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
+test("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   const seeded = await seedWorld(page);
   report("seed", seeded);
-  report("diag-gate", await page.evaluate(async () => {
-    const { bootstrap } = (window as any).D; const root = await navigator.storage.getDirectory();
-    const r = await bootstrap.runSaveFoundationBootstrap({ root }); const m = r.migration;
-    const t = await root.getDirectoryHandle(".tsumugi"); const names: string[] = []; for await (const [n] of (t as any).entries()) names.push(n);
-    const months: string[] = []; for await (const [n] of (await t.getDirectoryHandle("history") as any).entries()) months.push(n);
-    let meta: any = null; try { meta = Object.keys(JSON.parse(await (await (await t.getFileHandle("history-meta.json")).getFile()).text()).months); } catch (e) { meta = String(e); }
-    return { c: m.summary, mem: m.memorySummary, r: m.reflectionSummary, s: m.sourceSummary, names, months, meta };
-  }));
   const before = await fingerprint(page);
 
   // /recovery-debug
@@ -436,6 +428,13 @@ test("inside the once-a-day window, a lost History month, History summary, conve
   await startApp(page, "clean first");
   await nav(page).getByRole("button", { name: "設定" }).click();
   await waitLatest(page);
+  // a lost file really was an outside change: if Settings says so, its own 「確認する」 settles it
+  const settle = async () => {
+    const check = page.getByRole("button", { name: "確認する", exact: true });
+    await expect(page.getByText(LATEST).or(check).first()).toBeVisible({ timeout: 240_000 });
+    if (await check.isVisible()) await check.click();
+    await waitLatest(page);
+  };
   const read = (path: string) => page.evaluate(async (p) => {
     const parts = p.split("/"); let d: any = await navigator.storage.getDirectory();
     try { for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part); return await (await (await d.getFileHandle(parts[parts.length - 1])).getFile()).text(); }
@@ -460,14 +459,14 @@ test("inside the once-a-day window, a lost History month, History summary, conve
     await startApp(page, `lost ${lost.split("/")[0]}`);
     await expect.poll(() => read(lost), { timeout: 120_000 }).toBe(before);
     await nav(page).getByRole("button", { name: "設定" }).click();
-    await waitLatest(page);
+    await settle();
   }
   const summary = JSON.parse((await read(".tsumugi/history-meta.json")) as string);
   await remove(".tsumugi/history-meta.json");
   await startApp(page, "lost the History summary");
   await expect.poll(async () => { const t = await read(".tsumugi/history-meta.json"); return t ? JSON.parse(t).months : null; }, { timeout: 120_000 }).toEqual(summary.months);
   await nav(page).getByRole("button", { name: "設定" }).click();
-  await waitLatest(page);
+  await settle();
 });
 
 test("at real size: states an older build may have left (a held save with the file already equal, an update held after an empty turn, an empty last turn) end clean by themselves", async ({ page }) => {
