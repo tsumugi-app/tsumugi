@@ -20,7 +20,7 @@
 import type { Conversation, ConversationTurn, Link, MemoryObject, Source } from "./types";
 import type { RecoveryApplyPlan } from "./vaultRecoveryApply";
 import type { RecoveryLocalSnapshot, RecoveryRecord } from "./vaultRecovery";
-import { parseRecoveryMemoryMarkdown, recoveryRecordsSemanticEqual } from "./vaultRecovery";
+import { parseRecoveryMemoryMarkdown, recoveryConversationMatchesFile, recoveryRecordsSemanticEqual } from "./vaultRecovery";
 import { parseConversationMarkdown, parseSourceMarkdown, inferSourceType } from "./markdown";
 
 export type ClassifierLevel = "L0" | "L1" | "L2" | "L3" | "L4" | "L5";
@@ -284,7 +284,7 @@ async function classifyOne(held: { recordType: string; recordId: string; reason:
     if (type === "conversation") {
       const parsed = parseConversationMarkdown(raw);
       if (!parsed) return v("L5", [], "malformed");
-      return recoveryRecordsSemanticEqual("conversation", local as Conversation, parsed) ? v("L0", [reason]) : compareConversation(local as Conversation, parsed);
+      return recoveryConversationMatchesFile(local as Conversation, parsed, raw) ? v("L0", [reason]) : compareConversation(local as Conversation, parsed);
     }
     if (type === "source") {
       const parsed = parseSourceMarkdown(raw);
