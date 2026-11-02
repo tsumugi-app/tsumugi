@@ -38,6 +38,8 @@
 import { getVaultIdentityRecord } from "./db";
 import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultIdentityEnsureResult } from "./vaultIdentityAdoption";
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
+import { getDoneIntegrityMarker, setDoneIntegrityMarker } from "./db";
+import { doneIntegrityIsDue } from "./recoveryBackgroundCheck";
 import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
@@ -53,6 +55,11 @@ export interface SaveFoundationBootstrapEnv {
   now?: () => string;
   /** テスト・DI用。既定は`crypto.randomUUID()`（`ensureVaultIdentityForCurrentWorld`に委譲）。 */
   generateVaultId?: () => string;
+  /**
+   * 指定すると、保存済みの全記録の照合を「ビルドごと・maxAgeMsごとに1回」にする（通常の起動を重くしないため）。保存待ち・保留の処理は毎回行う。
+   * その間の欠け・外部の変更は、起動ごとの軽い確認（Registryの大きさ・日時とファイルの突き合わせ）が見つける。指定なしは毎回照合する。
+   */
+  doneIntegrity?: { build: string; maxAgeMs: number };
 }
 
 export interface SaveFoundationBootstrapResult {
@@ -115,7 +122,10 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     // ことを、既存のreconcile*OutboxEntry関数を再利用してそのつど確認する。
     // 実体が既に正しいrecordは、各stepの既存no-op検出により1byteも書き込まれない
     // （Phase 3-7.1 req 3-F）。
-    const integrity = await reconcileDoneVaultOutboxIntegrity(projectionEnv);
+    const now = (env.now ?? (() => new Date().toISOString()))();
+    const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs);
+    const integrity = verifyDone ? await reconcileDoneVaultOutboxIntegrity(projectionEnv) : null;
+    if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now });
 
     // 6. final rescanはmigration自身の内部rescanで既に完結している。
     // 7. 必要なら追加outbox reconcile：migrationの最終rescan・reconcile・

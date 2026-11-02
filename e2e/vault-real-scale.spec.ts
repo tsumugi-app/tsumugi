@@ -347,9 +347,9 @@ test.only("at real size: states an older build may have left (a held save with t
     const second = await dbm.putConversationWithOutbox({ ...next, updatedAt: at2, endedAt: at2, turns: [...next.turns, { role: "user", content: "架空の言い直し", timestamp: at2 }], metadata: { ...next.metadata, updatedAt: at2 } });
     const r2 = await proj.reconcileConversationOutboxEntry(env, second);
     db.close();
-    return { r1: r1.status, r2: r2.status };
+    return { r1: r1.status, r2: r2.status, reason: (r2 as any).reason ?? null };
   });
-  expect(before).toEqual({ r1: "done", r2: "done" });
+  expect(before).toEqual({ r1: "done", r2: "done", reason: null });
   await slowCpu(page);
   await startApp(page, "older states");
   await nav(page).getByRole("button", { name: "設定" }).click();

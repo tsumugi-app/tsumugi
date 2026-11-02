@@ -161,7 +161,29 @@ const isNotFound = (e: unknown) => isObj(e) && e.name === "NotFoundError";
 
 type TextRead = { state: "absent" } | { state: "error" } | { state: "ok"; text: string; size: number };
 /** 「存在しない」（NotFoundだけ）と「読めない」を区別して読む。 */
-async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
+/**
+ * 確認（`planRecoveryApply`）の間だけ、同じファイルを読み直さない（Registry・index・Historyは全記録で共有するため、記録ごとに読むと件数×ファイル数になる）。
+ * 確認は読むだけで、保存処理と重なった走査は前後の保存の進行状況で検出してやり直す（vaultConsistency.ts）。実行（apply）の読み取りはキャッシュしない。
+ */
+const planReads = new WeakMap<FileSystemDirectoryHandle, { users: number; text: Map<string, Promise<TextRead>>; json: Map<string, Promise<JsonRead>> }>();
+
+async function withPlanReads<T>(root: FileSystemDirectoryHandle, fn: () => Promise<T>): Promise<T> {
+  const reads = planReads.get(root) ?? { users: 0, text: new Map(), json: new Map() };
+  reads.users += 1;
+  planReads.set(root, reads);
+  try { return await fn(); }
+  finally { reads.users -= 1; if (reads.users === 0) planReads.delete(root); }
+}
+
+function readTextAt(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
+  const reads = planReads.get(root);
+  if (!reads) return readTextFresh(root, path);
+  let read = reads.text.get(path);
+  if (!read) { read = readTextFresh(root, path); reads.text.set(path, read); }
+  return read;
+}
+
+async function readTextFresh(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
   const segments = path.split("/");
   let file: File;
   try {
@@ -179,7 +201,15 @@ async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promis
 }
 
 type JsonRead = { state: "absent" } | { state: "error" } | { state: "ok"; value: Obj; text: string };
-async function readJsonAt(root: FileSystemDirectoryHandle, path: string): Promise<JsonRead> {
+function readJsonAt(root: FileSystemDirectoryHandle, path: string): Promise<JsonRead> {
+  const reads = planReads.get(root);
+  if (!reads) return parseJsonAt(root, path);
+  let read = reads.json.get(path);
+  if (!read) { read = parseJsonAt(root, path); reads.json.set(path, read); }
+  return read;
+}
+
+async function parseJsonAt(root: FileSystemDirectoryHandle, path: string): Promise<JsonRead> {
   const read = await readTextAt(root, path);
   if (read.state !== "ok") return read;
   try {
@@ -1116,7 +1146,7 @@ export async function planRecoveryApply(env: RecoveryApplyEnv, confirmedIds: Set
   }
 
   // ---- repair（equivalent-existing：不足している管理情報だけ） ----
-  for (const { r, local } of repairs) {
+  await withPlanReads(env.root, async () => { for (const { r, local } of repairs) {
     const type = r.recordType as RecoveryRecordType;
     const path = r.vaultPaths.length === 1 ? r.vaultPaths[0] : null;
     if (!path) { hold(r, "path-unresolved"); continue; }
@@ -1135,7 +1165,7 @@ export async function planRecoveryApply(env: RecoveryApplyEnv, confirmedIds: Set
     if (inspected.conflict) { hold(r, inspected.conflict); continue; }
     if (STEP_ORDER.every((s) => op.steps[s] === "not-needed")) continue; // 不足なし（既に整っている）
     ops.push(op);
-  }
+  } });
 
   const recoverableCount = ops.reduce((n, op) => n + op.members.length, 0);
   const confirmed: RecoveryConfirmedSet = { world, recordIds: ops.flatMap((op) => op.members.map((m) => m.id)) };

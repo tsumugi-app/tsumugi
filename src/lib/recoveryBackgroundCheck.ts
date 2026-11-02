@@ -13,6 +13,19 @@ import type { ConsistencyReport } from "./vaultConsistency";
 /** アプリのビルド識別子（Vercelのcommit SHAを`next.config.ts`で埋め込む。無ければ"dev"）。 */
 export const APP_BUILD_ID: string = process.env.NEXT_PUBLIC_APP_BUILD ?? "dev";
 
+/** 配信中のビルドと違うコードが動いているか（開きっぱなしのタブ等）。確かめられないとき（null）と開発用ビルド（"dev"）は、古いとは言わない。 */
+export const isAppOutdated = (deployed: string | null, running: string = APP_BUILD_ID): boolean => !!deployed && deployed !== "dev" && deployed !== running;
+
+/** 保存済みの全記録の照合を、次に行う時期か。ビルドが変わったとき、前回から時間が経ったとき、前回の記録が読めないときに行う。 */
+export function doneIntegrityIsDue(marker: unknown, build: string, now: string, maxAgeMs: number): boolean {
+  if (typeof marker !== "string") return true;
+  let parsed: { build?: unknown; at?: unknown };
+  try { parsed = JSON.parse(marker); } catch { return true; }
+  if (parsed?.build !== build || typeof parsed.at !== "string") return true;
+  const age = Date.parse(now) - Date.parse(parsed.at);
+  return !(age >= 0 && age < maxAgeMs);
+}
+
 /**
  * 判定に使うplanの形。必ずrawなplan（`planRecoveryApply`。archiveで除外したplanは使わない）を渡す。
  * archiveは修復前の安全な退避であり、「解決済み」ではない。

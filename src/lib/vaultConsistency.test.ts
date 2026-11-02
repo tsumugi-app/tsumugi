@@ -370,3 +370,21 @@ test("保存が保留された記録は、走査で差分として見えなく�
   const again = classifyConsistency(plan({ records: [rec("memory", "m2", "conflict")], held: [{ recordType: "memory", recordId: "m2", reason: "conflict" }] }), p, p);
   assert.equal(again.findings.filter((f) => f.recordId === "m2").length, 1, "counted once when the scan also saw it");
 });
+
+test("isAppOutdated：配信中のビルドと違うときだけ。確かめられない・開発用のビルドでは言わない", () => {
+  assert.equal(isAppOutdated("new", "old"), true);
+  assert.equal(isAppOutdated("same", "same"), false);
+  assert.equal(isAppOutdated(null, "old"), false);
+  assert.equal(isAppOutdated("dev", "old"), false);
+});
+
+test("doneIntegrityIsDue：同じビルドで期限内なら照合しない。ビルドの変更・期限切れ・読めない記録・未来の日時では照合する", () => {
+  const now = "2026-11-03T12:00:00.000Z", day = 86_400_000;
+  const marker = (build: string, at: string) => JSON.stringify({ build, at });
+  assert.equal(doneIntegrityIsDue(marker("b", "2026-11-03T00:00:00.000Z"), "b", now, day), false);
+  assert.equal(doneIntegrityIsDue(marker("a", "2026-11-03T00:00:00.000Z"), "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(marker("b", "2026-11-02T00:00:00.000Z"), "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(marker("b", "2026-11-04T00:00:00.000Z"), "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(undefined, "b", now, day), true);
+  assert.equal(doneIntegrityIsDue("{not json", "b", now, day), true);
+});
