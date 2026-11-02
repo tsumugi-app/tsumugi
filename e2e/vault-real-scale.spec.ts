@@ -323,6 +323,102 @@ test("at real size: two conversations that really differ are found, nothing hide
 });
 
 
+test("at real size: Settings shows two saves held with the file equal; 保存を再開する on one and at once on the other both finish, a really different record stays a conflict, and after choosing it Settings says 最新 and stays there", async ({ page }) => {
+  test.setTimeout(900_000);
+  await page.addInitScript(installTrace);
+  await seedWorld(page);
+  // one really different conversation keeps the attention view (and its 「もう一度確認する」) on screen
+  await page.evaluate(async () => {
+    const { dbm, bootstrap } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle("Conversations");
+    for await (const [, h] of (dir as any).entries()) {
+      const text: string = await (await h.getFile()).text();
+      if (!text.includes("scale-conv-001")) continue;
+      const w = await h.createWritable(); await w.write(text.replace("架空の話題", "手で直した架空の話題")); await w.close();
+    }
+    const c = await dbm.getConversation("scale-conv-001"); const at = new Date(Date.parse(c.updatedAt) + 60_000).toISOString();
+    await dbm.putConversationWithOutbox({ ...c, updatedAt: at, endedAt: at, turns: [...c.turns, { role: "user", content: "架空の続き", timestamp: at }], metadata: { ...c.metadata, updatedAt: at } });
+    await bootstrap.runSaveFoundationBootstrap({ root });
+  });
+  await slowCpu(page);
+  await startApp(page, "two held saves");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await expect(page.getByTestId("vault-conflict-item")).toHaveCount(1, { timeout: 240_000 });
+
+  // the state the phone showed: both empty-turn conversations held as conflicts while their files are the same. One Registry row also says conflict, as older code recorded it
+  const snapshot = () => page.evaluate(async () => {
+    const { dbm } = (window as any).D; const root = await navigator.storage.getDirectory();
+    const out: Record<string, unknown> = {};
+    const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else { const t: string = await (await h.getFile()).text(); if (t.includes("scale-conv-020") || t.includes("scale-conv-040")) out[`${prefix}${name}`] = t; } } };
+    await walk(await root.getDirectoryHandle("Conversations"), "Conversations/");
+    for (const id of ["scale-conv-020", "scale-conv-040"]) out[`idb:${id}`] = JSON.stringify(await dbm.getConversation(id));
+    return out;
+  });
+  const before = await snapshot();
+  await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    for (const id of ["scale-conv-020", "scale-conv-040"]) {
+      const e: any = await new Promise((res) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").get(`conversation:${id}`); q.onsuccess = () => res(q.result); });
+      e.status = "held"; e.heldReason = "markdown-conflict";
+      await new Promise<void>((res) => { const tx = db.transaction("vaultOutbox", "readwrite"); tx.objectStore("vaultOutbox").put(e); tx.oncomplete = () => res(); });
+    }
+    db.close();
+    const registry = await (await root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("registry");
+    for await (const [, h] of (registry as any).entries()) {
+      const j = JSON.parse(await (await h.getFile()).text());
+      const path = j.records?.["scale-conv-040"];
+      if (!path) continue;
+      j.files[path] = { ...j.files[path], status: "conflict" };
+      const w = await h.createWritable(); await w.write(JSON.stringify(j)); await w.close();
+    }
+  });
+  await page.getByRole("button", { name: "もう一度確認する" }).first().click();
+  const items = page.getByTestId("vault-conflict-item");
+  await expect(items).toHaveCount(3, { timeout: 120_000 });
+  for (let i = 0; i < 3; i++) await items.nth(i).getByTestId("vault-conflict-open").click();
+  const resume = page.getByTestId("vault-conflict-choice-resume");
+  await expect(resume).toHaveCount(2, { timeout: 60_000 });
+  await resume.nth(0).click(); await resume.nth(1).click();
+  const confirm = page.getByTestId("vault-conflict-confirm");
+  await expect(confirm).toHaveCount(2);
+  const startedAt = Date.now();
+  // one, and at once the other, as the phone's owner did
+  await confirm.nth(0).click();
+  await confirm.last().click({ timeout: 240_000 }).catch(() => undefined);   // gone if the first already cleared the list
+  const deadline = Date.now() + 240_000;
+  for (;;) {
+    const said = await screenText(page);
+    expect(said.includes(BUSY), `refused as busy after ${round((Date.now() - startedAt) / 1000)} s`).toBe(false);
+    if (await resume.count() === 0 && await items.count() === 1) break;
+    if (Date.now() > deadline) throw new Error(`the resumes did not settle. The screen said: ${said.slice(150, 700)} WHY: ${await whyNotLatest(page)}`);
+    await page.waitForTimeout(250);
+  }
+  report("perf-two-resumes", { done: Date.now() - startedAt });
+  // the really different one is still a conflict, nothing hid it
+  await expect(page.getByText(LATEST)).toHaveCount(0);
+  await expect(items).toHaveCount(1);
+  expect(await snapshot()).toEqual(before);
+  await items.first().getByTestId("vault-conflict-choice-adopt-device").click({ timeout: 60_000 });
+  await items.first().getByTestId("vault-conflict-confirm").click();
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+  // nothing keeps the lock, and the warning does not come back
+  await page.waitForTimeout(5_000);
+  expect(await page.evaluate(() => (window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world" && l.got !== null && l.end === null).length)).toBe(0);
+  await startApp(page, "after the resumes");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+  expect(await snapshot()).toEqual(before);
+  const left = await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory(); const registry = await (await root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("registry");
+    for await (const [, h] of (registry as any).entries()) { const j = JSON.parse(await (await h.getFile()).text()); const path = j.records?.["scale-conv-040"]; if (path) return j.files[path].status; }
+    return null;
+  });
+  expect(left).toBe("ok");
+});
+
 test("at real size: states an older build may have left (a held save with the file already equal, an update held after an empty turn, an empty last turn) end clean by themselves", async ({ page }) => {
   test.setTimeout(600_000);
   await page.addInitScript(installTrace);
@@ -345,21 +441,10 @@ test("at real size: states an older build may have left (a held save with the fi
     const at2 = new Date(Date.parse(at1) + 60_000).toISOString();
     const next = await dbm.getConversation("scale-conv-060");
     const second = await dbm.putConversationWithOutbox({ ...next, updatedAt: at2, endedAt: at2, turns: [...next.turns, { role: "user", content: "架空の言い直し", timestamp: at2 }], metadata: { ...next.metadata, updatedAt: at2 } });
-    const diag = await (async () => { try {
-      const dir = await root.getDirectoryHandle("Conversations"); let text = ""; let found = 0;
-      const walk = async (d: any): Promise<void> => { for await (const [, h] of d.entries()) { if (h.kind === "directory") await walk(h); else { const t = await (await h.getFile()).text(); if (t.includes("id: scale-conv-060")) { text = t; found += 1; } } } };
-      await walk(dir);
-      const { vault } = (window as any).D; const hash = vault?.hashVaultText?.(text) ?? null;
-      const registry = await (await root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("registry"); let entry: any = null, recorded: any = null;
-      for await (const [, h] of (registry as any).entries()) { const j = JSON.parse(await (await h.getFile()).text()); if (j.records?.["scale-conv-060"]) { recorded = j.records["scale-conv-060"]; entry = j.files?.[recorded]; } }
-      return { found, tail: JSON.stringify(text.slice(-24).replace(/[^ \n*:a-zA-Z]/g, "x")), hash, registered: entry?.contentHash ?? null, status: entry?.status ?? null, hasRecord: !!recorded };
-    } catch (e) { return { error: String(e) }; } })();
-    (window as any).__diag060 = diag;
     const r2 = await proj.reconcileConversationOutboxEntry(env, second);
     db.close();
     return { r1: r1.status, r2: r2.status, reason: (r2 as any).reason ?? null };
   });
-  report("diag-blank-last", await page.evaluate(() => (window as any).__diag060));
   expect(before).toEqual({ r1: "done", r2: "done", reason: null });
   await slowCpu(page);
   await startApp(page, "older states");
