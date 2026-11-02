@@ -141,7 +141,7 @@ async function seedWorld(page: Page) {
         const w = await h.createWritable(); await w.write(next); await w.close();
         for await (const [, sh] of (registry as any).entries()) {
           const v = JSON.parse(await (await sh.getFile()).text());
-          if (v.records?.[c.id] === `Conversations/${name}`) { const row = v.files[`Conversations/${name}`]; row.contentHash = vault.hashVaultText(next); row.size = new TextEncoder().encode(next).length; const sw = await sh.createWritable(); await sw.write(JSON.stringify(v)); await sw.close(); }
+          if (v.records?.[c.id] === `Conversations/${name}`) { const row = v.files[`Conversations/${name}`]; row.contentHash = vault.hashVaultText(next); row.size = new TextEncoder().encode(next).length; row.mtime = (await h.getFile()).lastModified; const sw = await sh.createWritable(); await sw.write(JSON.stringify(v)); await sw.close(); }
         }
       }
     }
