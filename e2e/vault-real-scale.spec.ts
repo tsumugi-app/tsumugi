@@ -421,7 +421,7 @@ test("at real size: Settings shows two saves held with the file equal; 保存を
   expect(left).toBe("ok");
 });
 
-test("inside the once-a-day window, a lost History month, History summary, conversation or Memory file is still put back at the next start", async ({ page }) => {
+test("inside the once-a-day window, a lost History month, History summary, conversation, Memory or Registry file is still put back at the next start", async ({ page }) => {
   test.setTimeout(600_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
@@ -461,6 +461,18 @@ test("inside the once-a-day window, a lost History month, History summary, conve
     await nav(page).getByRole("button", { name: "設定" }).click();
     await settle();
   }
+  // a Registry shard that holds Memory day files
+  const shard = await page.evaluate(async () => {
+    const registry = await (await (await navigator.storage.getDirectory()).getDirectoryHandle(".tsumugi")).getDirectoryHandle("registry");
+    for await (const [name, h] of (registry as any).entries()) { const keys = Object.keys(JSON.parse(await (await h.getFile()).text()).records ?? {}); if (keys.some((k) => k.startsWith("day:"))) return { path: `.tsumugi/registry/${name}`, keys: keys.sort() }; }
+    return null;
+  });
+  expect(shard).not.toBeNull();
+  await remove(shard!.path);
+  await startApp(page, "lost a Registry shard");
+  await expect.poll(async () => { const t = await read(shard!.path); return t ? Object.keys(JSON.parse(t).records ?? {}).sort() : null; }, { timeout: 120_000 }).toEqual(shard!.keys);
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await settle();
   const summary = JSON.parse((await read(".tsumugi/history-meta.json")) as string);
   await remove(".tsumugi/history-meta.json");
   await startApp(page, "lost the History summary");
