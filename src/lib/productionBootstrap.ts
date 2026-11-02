@@ -26,12 +26,10 @@
 import { runSaveFoundationBootstrap, type SaveFoundationBootstrapResult } from "./saveFoundationBootstrap";
 import { getStoragePersistenceDiagnostics } from "./storagePersistence";
 import { debugLogEnabled } from "./generationDebugLog";
-import { APP_BUILD_ID } from "./recoveryBackgroundCheck";
 
 type BootstrapFn = (root: FileSystemDirectoryHandle) => Promise<SaveFoundationBootstrapResult>;
 
-const DONE_INTEGRITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const defaultBootstrapFn: BootstrapFn = (root) => runSaveFoundationBootstrap({ root, doneIntegrity: { build: APP_BUILD_ID, maxAgeMs: DONE_INTEGRITY_MAX_AGE_MS } });
+const defaultBootstrapFn: BootstrapFn = (root) => runSaveFoundationBootstrap({ root });
 
 let inFlight: Promise<SaveFoundationBootstrapResult | null> | null = null;
 

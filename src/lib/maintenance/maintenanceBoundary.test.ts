@@ -93,17 +93,11 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
   const range = BASE ? [`${BASE}...HEAD`] : ["HEAD"];
   const changed = git("diff", "--name-only", ...range).split("\n").filter(Boolean);
-  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts"];
+  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts", "src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts"];
   for (const f of untouchable) assert.ok(!changed.includes(f), `${f} must not be modified`);
-  // Reviewed (startup I/O): the check of every saved record runs once per build and day. These two files may gain exactly that and nothing else
-  const doneIntegrityLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedDoneIntegrityLines.json"), "utf8")).lines);
-  for (const f of ["src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts"]) {
-    for (const l of git("diff", "-U0", ...range, "--", f).split("\n").filter((x) => /^[+-]/.test(x) && !/^(\+\+\+|---)/.test(x))) assert.ok(doneIntegrityLines.has(l[0] + l.slice(1).trim()), `${f} must not be modified (unreviewed line): ${l}`);
-  }
   // Reviewed exception (Memory Timeline trial): the chat route may only gain the optional memoryTimeline section
   // Reviewed (Memory Synthesis S1): the new, stateless generation route /api/synthesize (it reads and writes no Memory)
-  // Reviewed (outdated build notice): /api/build only says which build is deployed (it reads and writes nothing else)
-  const synthesisApi = new Set(["src/app/api/chat/route.ts", "src/app/api/synthesize/route.ts", "src/app/api/build/route.ts"]);
+  const synthesisApi = new Set(["src/app/api/chat/route.ts", "src/app/api/synthesize/route.ts"]);
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/") && !synthesisApi.has(f)), "API routes must not be modified");
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (conversation voice): prompt text lives in lib/conversationVoice.ts; the route only resolves it, appends it, and may raise the thinking floor

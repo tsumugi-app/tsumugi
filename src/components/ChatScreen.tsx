@@ -122,7 +122,7 @@ import { conflictRefsOf, deriveRecoveryUserView } from "@/lib/vaultRecoveryUserV
 import { resolveConflict, type ConflictChoice, type ConflictOutcome, type ConflictSnapshot } from "@/lib/vaultConflictResolution";
 import { createProductionConflictEnv } from "@/lib/vaultConflictResolutionRun";
 import { resumeNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
-import { APP_BUILD_ID, isAppOutdated, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
+import { APP_BUILD_ID, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import { checkVaultConsistency } from "@/lib/vaultConsistencyCheck";
 import { runProductionVaultAutoRepair } from "@/lib/vaultAutoRepairRun";
 import type { AutoRepairOutcome } from "@/lib/vaultAutoRepair";
@@ -811,7 +811,6 @@ export default function ChatScreen() {
   /** 保存待ち・未確定のときに自動で確認し直した回数（有限回）。 */
   const recoveryRecheckCountRef = useRef(0);
   /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
-  const [appOutdated, setAppOutdated] = useState(false);
   const startupSaveFoundationBootstrapRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
@@ -2191,21 +2190,6 @@ export default function ChatScreen() {
    *   effect側で追加のtry/catchを重ねる必要はないが、`withVaultWorldRead`が
    *   投げうる上記エラーに備えて念のため包む。
    */
-  // 開きっぱなしのタブが古いビルドのまま動いていないか（起動時と、画面に戻ったとき）。確かめられなければ何も言わない。
-  useEffect(() => {
-    let alive = true;
-    const check = () => {
-      if (document.visibilityState !== "visible") return;
-      void fetch("/api/build", { cache: "no-store" })
-        .then((response) => (response.ok ? response.json() : null))
-        .then((body: { build?: unknown } | null) => { if (alive && typeof body?.build === "string") setAppOutdated(isAppOutdated(body.build)); })
-        .catch(() => {});
-    };
-    check();
-    document.addEventListener("visibilitychange", check);
-    return () => { alive = false; document.removeEventListener("visibilitychange", check); };
-  }, []);
-
   useEffect(() => {
     if (vaultStatus !== "connected" || !vaultHandle || startupSaveFoundationBootstrapRanRef.current) return;
     startupSaveFoundationBootstrapRanRef.current = true;
@@ -3644,17 +3628,12 @@ export default function ChatScreen() {
    * 端末と保存先で内容が異なる記録の、ユーザーの選択の実行（vaultConflictResolution.ts）。表示はもう一度確認した結果だけに基づく。
    */
   async function handleResolveConflict(snapshot: ConflictSnapshot, choice: ConflictChoice): Promise<ConflictOutcome> {
-    if (!vaultHandle || isVaultSwitchingRef.current || crossTabStale) return { kind: "not-started", reason: "busy" };
+    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return { kind: "not-started", reason: "busy" };
     const handle = vaultHandle;
     const generation = vaultGenerationRef.current;
-    // 直前の確認や修復が終わるのを待ってから始める（すぐに「他の操作が実行中」で断らない。待ち時間は有限）
-    const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, () => generation !== vaultGenerationRef.current);
-    if (waited !== "idle") return { kind: "not-started", reason: "busy" };
     vaultOperationLockRef.current = true;
     const endTask = beginMemoryTask();
     setAutoRepairOutcome(null);
-    // 前の解決の後に始めた保存（別の経路で管理情報を更新する）を、この解決の確認に重ねない
-    await abortBackgroundFlushAndWait(VAULT_SWITCH_SETTLE_TIMEOUT_MS);
     try {
       const outcome = await resolveConflict(createProductionConflictEnv({
         root: handle,
@@ -3676,15 +3655,6 @@ export default function ChatScreen() {
         setVaultLightCheckStatus({ kind: "idle" });
         runVaultLightCheckInBackground(handle);
         bumpHistoryRefreshToken();
-        // 解決の直後の確認は、続く保存と重なることがある。問題が残っていれば、保存が終わってからもう一度確かめる（古い警告を残さない）
-        if (outcome.after.state !== "clean") {
-          void waitForBackgroundFlushToSettle(VAULT_SWITCH_SETTLE_TIMEOUT_MS).then(() => {
-            if (generation !== vaultGenerationRef.current) return;
-            recoveryDetectionRanRef.current = false;
-            recoveryRecheckCountRef.current = 0;
-            void startRecoveryBackgroundCheck(handle);
-          });
-        }
       }
       return outcome;
     } catch (error) {
@@ -5900,11 +5870,9 @@ export default function ChatScreen() {
             vaultActionsDisabled={
               isVaultSwitching ||
               crossTabStale ||
-              appOutdated ||
               vaultLightCheckStatus.kind === "classifying" ||
               vaultLightCheckStatus.kind === "applying"
             }
-            appOutdated={appOutdated}
             exportDataFeedback={exportDataFeedback}
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}

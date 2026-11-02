@@ -13,7 +13,7 @@ import type { MemoryObject } from "./types";
 import { memoryDayFilePath, reconcileConversationOutboxEntry, reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry, reconcileSourceOutboxEntry, type ProjectionEnv } from "./vaultProjection";
 import { withVaultSaveLock } from "./vaultSaveLock";
 import { applyRecovery, createRecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
-import { runVaultWorldExclusiveWhenIdle, withVaultWorldRead } from "./vaultWorldLock";
+import { runVaultWorldExclusive, withVaultWorldRead } from "./vaultWorldLock";
 
 /** 保存先のファイルを読む（無ければnull。読めなければ"unreadable"） */
 export async function readVaultFileBytes(root: FileSystemDirectoryHandle, path: string): Promise<Uint8Array | null | "unreadable"> {
@@ -66,7 +66,7 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
       isCancelled: options.isCancelled,
     }),
     async withExclusive(fn) {
-      const locked = await runVaultWorldExclusiveWhenIdle(fn);
+      const locked = await runVaultWorldExclusive(fn);
       return locked.timedOut || locked.result === undefined ? { ok: false } : { ok: true, value: locked.result };
     },
     readVaultFile: (path) => readVaultFileBytes(root, path),

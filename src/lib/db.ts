@@ -1271,27 +1271,6 @@ export async function readVaultSaveProgress(): Promise<import("./vaultConsistenc
   };
 }
 
-/** 同期台帳の全件（flushの「保存済みか」の判定を1回の読み取りで済ませる）。読むだけ。 */
-export async function readVaultSyncLedger(): Promise<Map<string, string>> {
-  const db = await getDB();
-  const tx = db.transaction("vaultSyncState", "readonly");
-  const [keys, values] = await Promise.all([tx.store.getAllKeys(), tx.store.getAll()]);
-  await tx.done;
-  const ledger = new Map<string, string>();
-  keys.forEach((key, i) => { if (typeof values[i] === "string") ledger.set(String(key), values[i] as string); });
-  return ledger;
-}
-
-const DONE_INTEGRITY_MARKER_KEY = "doneIntegrityVerified";
-export async function getDoneIntegrityMarker(): Promise<unknown> {
-  const db = await getDB();
-  return db.get("settings", DONE_INTEGRITY_MARKER_KEY);
-}
-export async function setDoneIntegrityMarker(marker: { build: string; at: string }): Promise<void> {
-  const db = await getDB();
-  await db.put("settings", JSON.stringify(marker), DONE_INTEGRITY_MARKER_KEY);
-}
-
 /**
  * 自動修復（保存先の汎用修復 段階3）の「もう一度保存する」。記録そのものは一切変えず、その記録の今の版をOutboxの保存待ち（pending）にするだけ
  * （以後は通常の保存処理が、通常どおりの確認をしてから保存先へ書く）。1つのtransactionで、次のどれかなら何も書かない：
