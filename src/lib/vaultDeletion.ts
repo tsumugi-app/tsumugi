@@ -10,6 +10,7 @@ import {
 import { isRecoveryBlockingNormalWrites } from "./vaultRecoveryJournal";
 import { withVaultSaveLock } from "./vaultSaveLock";
 import { writeFileHandleContent } from "./vaultWriter";
+import type { MemoryObject } from "./types";
 import { parseFrontmatter, parseMemoryDayFile, memoryObjectToMarkdown, MEMORY_ENTRY_SEPARATOR } from "./markdown";
 import { computeMonthAggregate, getVaultBackend, hashVaultText, dayFileRegistryKey, vaultRegistryBucketOf, type HistoryMonthIndex } from "./vault";
 
@@ -108,9 +109,15 @@ function withoutDeletedReferences(entry: Entry, ids: Set<string>): Entry {
   return { ...entry, raw };
 }
 
-const priorMemberHashes = (prior: unknown, members: { id: string }[]): Record<string, string> => {
+/**
+ * 残る記録のハッシュ：記録済みの値が今の版と一致する記録（Tsumugiが書いた版）は、この削除が書く内容へ進める。一致しない記録（手で編集された可能性がある）は記録済みの値のまま、
+ * 記録の無い記録には足さない（ファイルから計算すると、手で編集された記録を「Tsumugiが書いた版」と取り違える）。
+ */
+const survivingMemberHashes = (prior: unknown, before: string | undefined, members: MemoryObject[]): Record<string, string> => {
   const known = object(prior) ? prior : {};
-  return Object.fromEntries(members.flatMap((m) => (typeof known[m.id] === "string" ? [[m.id, known[m.id] as string]] : [])));
+  const hashOf = (m: MemoryObject) => hashVaultText(memoryObjectToMarkdown(m));
+  const proven = new Set((typeof before === "string" ? parseMemoryDayFile(before) : []).filter((m) => known[m.id] === hashOf(m)).map((m) => m.id));
+  return Object.fromEntries(members.flatMap((m) => (proven.has(m.id) ? [[m.id, hashOf(m)]] : typeof known[m.id] === "string" ? [[m.id, known[m.id] as string]] : [])));
 };
 
 /** Pure plan builder used by both browser and fault-injection tests. No file is created. */
@@ -172,8 +179,7 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
           // A deletion is not permission to adopt an unrelated external edit as a safe baseline.
           if (row.status === "ok" && row.contentHash !== hashVaultText(files.get(p) ?? "")) row.status = "needs-resync";
           row.contentHash = hashVaultText(content); row.size = new TextEncoder().encode(content).length; row.mtime = 0;
-          // 残る記録のハッシュは記録済みの値だけを引き継ぐ（ファイルから計算すると、手で編集された記録を「Tsumugiが書いた版」と取り違える）
-          if (row.recordType === "memory-day") row.memberHashes = priorMemberHashes(row.memberHashes, parseMemoryDayFile(content));
+          if (row.recordType === "memory-day") row.memberHashes = survivingMemberHashes(row.memberHashes, files.get(p), parseMemoryDayFile(content));
         }
         // Existing conflict/needs-resync states are never relaxed by deletion.
       }
@@ -206,7 +212,7 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
       shard.files[survivor.path] = {
         ...existing, recordType: "memory-day", mtime: 0, size: new TextEncoder().encode(survivor.content).length,
         contentHash: hashVaultText(survivor.content), memberIds: members.map((m) => m.id),
-        memberHashes: priorMemberHashes(existing?.memberHashes, members),
+        memberHashes: survivingMemberHashes(existing?.memberHashes, files.get(survivor.path), members),
         status: survivors.length > 1 || existing?.status === "conflict" ? "conflict" : "needs-resync",
       };
     }
