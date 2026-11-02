@@ -914,7 +914,7 @@ test("reconcilePendingMemories: pendingなmemory entryだけをまとめて処�
 // 永久iPhone Memory fixture（Phase 3-6 req 15）
 // ===========================================================================
 
-test("Projection Memory iPhone fixture（永久回帰テスト）: migration → Memory Projection reconcileで、A保持/B追加/C安全更新/X保全のすべてが安全に収束する", async () => {
+test("Projection Memory iPhone fixture（永久回帰テスト）: migration → Memory Projection reconcileで、A保持/B追加/X保全が収束し、Registryに証拠の無いCは上書きせず保留する", async () => {
   const vault = new FakeVault();
   await dbMod.clearMemoryData();
   const day = "2026-04-20";
@@ -923,7 +923,7 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
   const a = memory("iphone-mem-a", day, { createdAt: `${day}T09:00:00.000Z` });
   // B：IDB-only（day-fileには無い）。
   const b = memory("iphone-mem-b", day, { createdAt: `${day}T09:01:00.000Z` });
-  // C：Vaultは旧version、IDBは正当な後継（メタデータのみ更新）。
+  // C：Vaultは旧version、IDBは後継（要約が異なる）。Registryに記録が無く、Vaultの要約が手で直されたものか区別できない。
   const cOld = memory("iphone-mem-c", day, { createdAt: `${day}T09:02:00.000Z`, updatedAt: `${day}T09:02:00.000Z` });
   const cNew: MemoryObject = { ...cOld, summary: "更新後の要約（安全な更新）", updatedAt: `${day}T09:10:00.000Z` };
   // X：Vault-only（IndexedDBに存在しない未知member）。
@@ -967,21 +967,24 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
   assert.deepEqual(migrationResult.memoryVaultOnlyMembers.map((v) => v.id), [x.id]);
 
   const projEnv: import("./vaultProjection").ProjectionEnv = { root: vault.root(), vaultIdentity: identity, now: () => T };
-  for (const m of [a, b, cNew]) {
+  for (const m of [a, b]) {
     const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
     assert.ok(entry, `${m.id}のoutbox entryが無い`);
     const reconcileResult = await projectionMod.reconcileMemoryOutboxEntry(projEnv, entry!);
     assert.equal(reconcileResult.status, "done", `${m.id}がdoneにならなかった: ${JSON.stringify(reconcileResult)}`);
   }
+  const cEntry = await dbMod.getVaultOutboxEntry(`memory:${cNew.id}`);
+  assert.deepEqual(await projectionMod.reconcileMemoryOutboxEntry(projEnv, cEntry!), { status: "held", reason: "memory-member-edited-conflict" }, "C：証明できないので上書きしない");
 
-  // 最終状態の確認：A保持・B追加・C安全更新・X保全のすべてが揃っている。
+  // 最終状態の確認：A保持・B追加・C（Vaultの版のまま）・X保全のすべてが揃っている。
   const finalMembers = markdownMod.parseMemoryDayFile(vault.get(path)!);
   assert.equal(finalMembers.length, 4, "X/A/B/Cの4件が最終的に揃う");
   assert.ok(finalMembers.some((m) => m.id === x.id), "X：Vault-onlyは最後まで保全される");
   assert.ok(finalMembers.some((m) => m.id === a.id), "A：保持される");
   assert.ok(finalMembers.some((m) => m.id === b.id), "B：新規追加される");
   const finalC = finalMembers.find((m) => m.id === cNew.id)!;
-  assert.equal(finalC.summary, "更新後の要約（安全な更新）", "C：安全な更新が反映される");
+  assert.equal(finalC.summary, cOld.summary, "C：Vaultの版が残る");
+  assert.equal((await dbMod.getMemoryObject(cNew.id))!.summary, "更新後の要約（安全な更新）", "C：端末の版も残る");
 
   const finalShard = JSON.parse(vault.get(`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`)!);
   assert.deepEqual(new Set(finalShard.files[path].memberIds), new Set([x.id, a.id, b.id, cNew.id]), "Registryはfinal実体から修復される");
@@ -990,9 +993,9 @@ test("Projection Memory iPhone fixture（永久回帰テスト）: migration →
   const historyIds = finalMonth.days[day].normalMemories.map((r: { id: string }) => r.id);
   assert.deepEqual(new Set(historyIds), new Set([x.id, a.id, b.id, cNew.id]), "Historyも最終実体から修復される");
 
-  for (const m of [a, b, cNew]) {
+  for (const m of [a, b]) {
     const entry = await dbMod.getVaultOutboxEntry(`memory:${m.id}`);
-    assert.equal(entry!.status, "done", "Recovery不要（すべてdone）");
+    assert.equal(entry!.status, "done", "他の記録はCに止められない");
   }
 });
 
