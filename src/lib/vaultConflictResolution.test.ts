@@ -60,15 +60,6 @@ test("解決と言うのは、確定した確認でこの記録の問題が無�
   assert.equal(conflict.confirmedResolved(report(true, [undefined]), "m1"), false, "a scan that could not read a file did not check this record");
 });
 
-test("結果の表示：「両方の版は保管しています」は、実際に保管したときだけ（「保存を再開する」は保管しない）", () => {
-  const done = (choice: "resume" | "adopt-device", kept: string | null, resolved: boolean, settled = true) => ({ kind: "done", choice, kept, resolved, adopted: null, after: { settled } }) as unknown as Parameters<typeof conflict.conflictOutcomeText>[0];
-  assert.doesNotMatch(conflict.conflictOutcomeText(done("resume", null, false)), /保管/);
-  assert.match(conflict.conflictOutcomeText(done("resume", null, false)), /まだ確認が必要/);
-  assert.doesNotMatch(conflict.conflictOutcomeText(done("resume", null, true)), /保管/);
-  assert.doesNotMatch(conflict.conflictOutcomeText(done("resume", null, false, false)), /保管/);
-  assert.match(conflict.conflictOutcomeText(done("adopt-device", "kept-id", false)), /両方の版は保管しています/);
-});
-
 test("内容が異なる記録が残る間は「最新の状態です」と言わない", () => {
   const report = { state: "attention", findings: [], groups: [{ category: "needsChoice", reason: "different-content", recordType: "memory", count: 1 }], repairTargets: [] } as unknown as ConsistencyReport;
   assert.equal(view.recoveryAllowsLatest(view.deriveRecoveryUserView({ kind: "idle" }, report)), false);

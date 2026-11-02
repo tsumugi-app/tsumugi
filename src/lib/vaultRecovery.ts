@@ -6,7 +6,7 @@
  * Unknown/malformed Tsumugi-owned Markdown conservatively prevents a proof of absence.
  */
 import type { Conversation, MemoryObject, Source } from "./types";
-import { conversationToMarkdown, parseConversationMarkdown, parseFrontmatter, parseMemoryObjectMarkdown, parseSourceMarkdown } from "./markdown";
+import { parseConversationMarkdown, parseFrontmatter, parseMemoryObjectMarkdown, parseSourceMarkdown } from "./markdown";
 import { conversationsSemanticEqual, memoryObjectsSemanticEqual, sourcesSemanticEqual,
   isReflectionSummary, dayFileRegistryKey, vaultRegistryBucketOf, fileNameFor, dayFileNameFor } from "./vault";
 
@@ -183,7 +183,7 @@ export function parseRecoveryMemoryMarkdown(raw: string): MemoryObject | null {
   return result;
 }
 
-interface Observed { type: RecordType; data: Data; path: string; day: string; text: string }
+interface Observed { type: RecordType; data: Data; path: string; day: string }
 const recordDate = (type: RecordType, data: Data) => type === "conversation" ? (data as Conversation).startedAt : type === "source" ? data.createdAt : (data as MemoryObject).date;
 export function recoveryRecordsSemanticEqual(type: RecordType, a: Data, b: Data): boolean {
   if (type === "conversation") return conversationsSemanticEqual(a as Conversation, b as Conversation);
@@ -195,14 +195,6 @@ export function recoveryRecordsSemanticEqual(type: RecordType, a: Data, b: Data)
   return ["topicId", "profileClaims", "personMentions", "topicEvents", "evidenceQuotes"].every(k =>
     JSON.stringify((x as unknown as Obj)[k] ?? (k === "topicId" ? null : [])) ===
     JSON.stringify((y as unknown as Obj)[k] ?? (k === "topicId" ? null : [])));
-}
-
-/**
- * 端末の会話と保存先の会話が同じか。端末の記録から作るMarkdownがファイルと同じなら、解析で失われる差（発言の前後の空白など）だけなので同じ記録：「内容を見る」と同じ基準。
- * Markdownが違えば、解析した結果を比べる（`turnTimes`の書式だけの違いは同じ、本文の違いは異なる）。
- */
-export function recoveryConversationMatchesFile(local: Conversation, parsed: Conversation, fileText: string): boolean {
-  return conversationToMarkdown(local).trim() === fileText.trim() || conversationsSemanticEqual(local, parsed);
 }
 
 /** All local records are included (not just a potentially stale Settings list), plus Vault-only records.
@@ -301,7 +293,7 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
             else if (body.includes("## Content\n") && typeof fm.sourceType === "string") { type = "source"; data = parseSourceMarkdown(block); }
             else throw new Error("unsupported-record");
             if (!data || !data.id || !dateOK(data.createdAt) || !dateOK(data.updatedAt) || !dateOK(recordDate(type, data))) throw new Error("invalid-record");
-            fileRecords.push({ type, data, path, day: recordDate(type, data).slice(0, 10), text: block });
+            fileRecords.push({ type, data, path, day: recordDate(type, data).slice(0, 10) });
           }
           if (fileRecords.length > 1 && (fileRecords.some(r => r.type !== "memory") || new Set(fileRecords.map(r => r.day)).size !== 1)) throw new Error("mixed-day-file");
           observed.push(...fileRecords);
@@ -342,7 +334,7 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
     const reasons: string[] = [];
     let semanticEqual: boolean | null = null;
     if (inLocal && matches.length === 1 && matches[0].type === type) {
-      try { semanticEqual = type === "conversation" ? recoveryConversationMatchesFile(data as Conversation, matches[0].data as Conversation, matches[0].text) : recoveryRecordsSemanticEqual(type, data, matches[0].data); } catch { reasons.push("invalid-local-record"); }
+      try { semanticEqual = recoveryRecordsSemanticEqual(type, data, matches[0].data); } catch { reasons.push("invalid-local-record"); }
     }
     if (!scanCompleted) reasons.push("vault-scan-incomplete");
     if (issues.length) reasons.push("strict-read-or-parse-failure");

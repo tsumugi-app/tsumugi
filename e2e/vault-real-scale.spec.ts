@@ -198,7 +198,7 @@ async function waitLatest(page: Page, timeout = 240_000) {
   catch { throw new Error(`no 最新. The screen said: ${(await screenText(page)).slice(150, 500)} WHY: ${await whyNotLatest(page)}`); }
 }
 
-test.only("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
+test("at real size: the empty AI turns are not a conflict anywhere, Settings ends at 「✓ 最新の状態です」, stays there after a reload and a new conversation, and no record changes", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   const seeded = await seedWorld(page);
@@ -268,7 +268,7 @@ test.only("at real size: the empty AI turns are not a conflict anywhere, Setting
   for (const k of Object.keys(before)) if (k.startsWith("idb:") || k.startsWith("Conversations/")) expect(after[k], k).toBe(before[k]);
 });
 
-test.only("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
+test("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
@@ -316,4 +316,34 @@ test.only("at real size: two conversations that really differ are found, nothing
     await page.waitForTimeout(250);
   }
   report("perf-two-choices", { ...started, t0: undefined, firstDone, bothDone: Date.now() - startedAt, ...(await traceSummary(page)) });
+});
+
+test.only("DIAG: what the backup's state does on this code", async ({ page }) => {
+  test.setTimeout(600_000);
+  await page.addInitScript(installTrace);
+  await seedWorld(page);
+  await slowCpu(page);
+  await startApp(page, "diag");
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  await page.waitForTimeout(40_000);
+  const items = page.getByTestId("vault-conflict-item");
+  report("diag-1-settings", { conflicts: await items.count(), text: (await screenText(page)).slice(150, 520) });
+  for (let i = 0; i < 2; i++) {
+    const item = items.first();
+    if (await item.count() === 0) break;
+    await item.getByTestId("vault-conflict-open").click();
+    await item.getByTestId("vault-conflict-choice-resume").click({ timeout: 30_000 });
+    await item.getByTestId("vault-conflict-confirm").click();
+    await item.getByTestId("vault-conflict-message").waitFor({ timeout: 120_000 }).catch(() => undefined);
+    report(`diag-2-resume-${i}`, { conflicts: await items.count(), message: await page.getByTestId("vault-conflict-outcome").textContent({ timeout: 2000 }).catch(() => null), lockTail: await page.evaluate(() => (window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-5).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end)])) });
+    if (i === 0) {
+      const second = items.nth(await items.count() > 1 ? 1 : 0);
+      await second.getByTestId("vault-conflict-open").click();
+      await second.getByTestId("vault-conflict-choice-resume").click({ timeout: 30_000 });
+      await second.getByTestId("vault-conflict-confirm").click();
+      await page.waitForTimeout(25_000);
+      report("diag-3-second-right-after", { conflicts: await items.count(), message: await page.getByTestId("vault-conflict-outcome").textContent({ timeout: 2000 }).catch(() => null) });
+      break;
+    }
+  }
 });
