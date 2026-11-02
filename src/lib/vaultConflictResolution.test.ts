@@ -51,11 +51,12 @@ test("選べる記録：内容が異なる記録だけ。ファイルの問題�
 });
 
 test("解決と言うのは、確定した確認でこの記録の問題が無いときだけ", () => {
-  const report = (settled: boolean, ids: string[]) => ({ settled, findings: ids.map((recordId) => ({ recordId })) }) as unknown as ConsistencyReport;
+  const report = (settled: boolean, ids: (string | undefined)[]) => ({ settled, findings: ids.map((recordId) => ({ recordId })) }) as unknown as ConsistencyReport;
   assert.equal(conflict.confirmedResolved(report(true, []), "m1"), true);
   assert.equal(conflict.confirmedResolved(report(true, ["m2"]), "m1"), true);
   assert.equal(conflict.confirmedResolved(report(true, ["m1"]), "m1"), false);
   assert.equal(conflict.confirmedResolved(report(false, []), "m1"), false, "an unsettled check proves nothing");
+  assert.equal(conflict.confirmedResolved(report(true, [undefined]), "m1"), false, "a scan that could not read a file did not check this record");
 });
 
 test("内容が異なる記録が残る間は「最新の状態です」と言わない", () => {

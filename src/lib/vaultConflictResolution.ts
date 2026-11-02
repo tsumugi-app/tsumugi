@@ -436,8 +436,11 @@ async function writeFileChecked(root: FileSystemDirectoryHandle, path: string, e
 }
 
 const targetOf = (s: ConflictSnapshot): RepairTarget => ({ action: "resave", reason: "save-held", recordType: s.recordType, recordId: s.recordId });
-/** 確定した確認で、この記録の問題が無くなったときだけ解決と言う（保存が続いて確認を確定できなかったときは、問題が無いとは言えない） */
-export const confirmedResolved = (report: ConsistencyReport, id: string) => report.settled && !report.findings.some((f) => f.recordId === id);
+/**
+ * 確定した確認で、この記録の問題が無くなったときだけ解決と言う。保存が続いて確定できなかったときと、走査が完走しなかったときは、問題が無いとは言えない
+ * （読めないファイルがあると、その記録の問題はファイル単位の項目（recordIdなし）にまとめられる）。
+ */
+export const confirmedResolved = (report: ConsistencyReport, id: string) => report.settled && report.findings.every((f) => f.recordId !== undefined && f.recordId !== id);
 
 async function requeue(s: ConflictSnapshot, version: string): Promise<boolean> {
   const result = await requeueRecordForVault(s.recordType, s.recordId, version);
