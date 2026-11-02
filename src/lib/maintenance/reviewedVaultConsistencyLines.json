@@ -232,6 +232,7 @@
   "+throw error;",
   "+conflictRefs={conflictRefsOf(consistencyReport)}",
   "+activeConversationId={conversation.id}",
-  "+onResolveConflict={handleResolveConflict}"
+  "+onResolveConflict={handleResolveConflict}",
+  "+flushPendingToVaultInBackground(handle); // 起動時に測った「未反映」の件数を測り直す（解決した記録を未反映と言い続けない）"
  ]
 }

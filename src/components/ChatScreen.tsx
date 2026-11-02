@@ -3650,6 +3650,7 @@ export default function ChatScreen() {
       if (outcome.kind === "done") {
         const adopted = outcome.adopted;
         if (adopted) setMemoryObjects((prev) => prev.map((m) => (m.id === adopted.id ? (adopted as MemoryObject) : m)));
+        flushPendingToVaultInBackground(handle); // 起動時に測った「未反映」の件数を測り直す（解決した記録を未反映と言い続けない）
         vaultLightCheckDiscoveryRef.current = null;
         setVaultLightCheckStatus({ kind: "idle" });
         runVaultLightCheckInBackground(handle);
