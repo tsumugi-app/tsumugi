@@ -183,6 +183,16 @@
   "+conversationTurnsEqual,",
   "+if (!conversationTurnsEqual(a.turns, b.turns)) return false;",
   "-if (a.turns.length !== b.turns.length) return false;",
-  "-if (!a.turns.every((turn, i) => turn.role === b.turns[i].role && turn.content === b.turns[i].content)) return false;"
+  "-if (!a.turns.every((turn, i) => turn.role === b.turns[i].role && turn.content === b.turns[i].content)) return false;",
+  "+readVaultSyncLedger,",
+  "+// 全件を1回の読み取りで判定する。台帳と一致しなかった記録だけ、1件ずつ読み直す",
+  "+const ledger = await readVaultSyncLedger().catch(() => new Map<string, string>());",
+  "+const alreadySynced = (kind: VaultSyncKind, id: string, updatedAt: string) => ledger.get(vaultSyncKeyFor(kind, id)) === updatedAt || isAlreadySyncedToVault(kind, id, updatedAt);",
+  "-if (await isAlreadySyncedToVault(\"conversation\", conversation.id, conversation.updatedAt)) continue;",
+  "+if (await alreadySynced(\"conversation\", conversation.id, conversation.updatedAt)) continue;",
+  "-if (await isAlreadySyncedToVault(\"memory\", memoryObject.id, memoryObject.updatedAt)) continue;",
+  "+if (await alreadySynced(\"memory\", memoryObject.id, memoryObject.updatedAt)) continue;",
+  "-if (await isAlreadySyncedToVault(\"source\", source.id, source.updatedAt)) continue;",
+  "+if (await alreadySynced(\"source\", source.id, source.updatedAt)) continue;"
  ]
 }

@@ -13,6 +13,9 @@ import type { ConsistencyReport } from "./vaultConsistency";
 /** アプリのビルド識別子（Vercelのcommit SHAを`next.config.ts`で埋め込む。無ければ"dev"）。 */
 export const APP_BUILD_ID: string = process.env.NEXT_PUBLIC_APP_BUILD ?? "dev";
 
+/** 配信中のビルドと違うコードが動いているか（開きっぱなしのタブ等）。確かめられないとき（null）と開発用ビルド（"dev"）は、古いとは言わない。 */
+export const isAppOutdated = (deployed: string | null, running: string = APP_BUILD_ID): boolean => !!deployed && deployed !== "dev" && deployed !== running;
+
 /**
  * 判定に使うplanの形。必ずrawなplan（`planRecoveryApply`。archiveで除外したplanは使わない）を渡す。
  * archiveは修復前の安全な退避であり、「解決済み」ではない。
