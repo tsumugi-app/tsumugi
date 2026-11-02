@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
 import VaultBackupSection from "./VaultBackupSection";
+import VaultConflictSection from "./VaultConflictSection";
 import type {
   DataActionFeedback,
   RestoreCandidate,
@@ -20,6 +21,7 @@ import type {
   VaultStatus,
 } from "./ChatScreen";
 import type { VaultBackend, VaultHoldReason } from "@/lib/vault";
+import type { ConflictChoice, ConflictOutcome, ConflictRef, ConflictSnapshot } from "@/lib/vaultConflictResolution";
 import { recoveryDoneMessage, recoveryHeadingText } from "@/lib/vaultRecoveryUiText";
 import {
   RECOVERY_ATTENTION_TEXT, RECOVERY_CHECKING_TEXT, RECOVERY_DATA_KEPT_TEXT, RECOVERY_FAILED_TEXT, RECOVERY_INTERRUPTED_TEXT, RECOVERY_RECHECK_BUTTON,
@@ -83,6 +85,9 @@ export default function SettingsPanel({
   recoveryStatus,
   recoveryUserView,
   onUserRepair,
+  conflictRefs = [],
+  activeConversationId = null,
+  onResolveConflict,
   autoRepairOutcome = null,
   onRecheckRecovery,
   onRunRecoveryDryRun,
@@ -162,6 +167,10 @@ export default function SettingsPanel({
   /** 通常ユーザー向けのRecovery表示（正常なら何も出さない）。導出は`deriveRecoveryUserView`。 */
   recoveryUserView: RecoveryUserView;
   onUserRepair: () => void;
+  /** 確認の結果のうち、端末と保存先で内容が異なる記録 */
+  conflictRefs?: ConflictRef[];
+  activeConversationId?: string | null;
+  onResolveConflict?: (snapshot: ConflictSnapshot, choice: ConflictChoice) => Promise<ConflictOutcome>;
   /** 直前の「修復する」の結果（無ければnull）。表示は修復の後にもう一度確認した結果に基づく */
   autoRepairOutcome?: AutoRepairOutcome | null;
   /** 「もう一度確認する」（READ ONLY）。 */
@@ -1350,6 +1359,9 @@ export default function SettingsPanel({
                   <span className="text-stone-500 dark:text-stone-400">{NEXT_ACTION_TEXT[section.category]}</span>
                 </div>
               ))}
+              {recoveryUserView.kind === "attention" && onResolveConflict && conflictRefs.length > 0 && (
+                <VaultConflictSection root={vaultHandle} conflicts={conflictRefs} activeConversationId={activeConversationId} disabled={vaultActionsDisabled || recoveryUserView.checking} onResolve={onResolveConflict} />
+              )}
               {recoveryUserView.kind === "attention" && recoveryUserView.canRepair && vaultBackend === "opfs" && (
                 <span className="text-[11px] text-amber-700 dark:text-amber-400">{OPFS_REPAIR_NOTE}</span>
               )}

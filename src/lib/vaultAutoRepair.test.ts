@@ -263,12 +263,13 @@ test("UTF-8として読めないファイルは文字列にしない（U+FFFDへ
 test("書き換えの証明：Registryの版と一致するか、書き換え後も元の内容がすべて残るときだけ", () => {
   const hash = (t: string) => `h:${t}`;
   const cur = "---\nid: x\ntitle: 架空\nupdatedAt: 1\n---\n\n# 本文\n", next = "---\nid: x\ntitle: 架空\nupdatedAt: 2\n---\n\n# 本文\n";
-  const opts = { hash, registeredHash: undefined, evolvingKeys: safety.MEMORY_EVOLVING_KEYS, body: "same" as const };
+  const opts = { hash, registeredHash: undefined, evolvingKeys: safety.MEMORY_EVOLVING_KEYS, body: "same" as const, reserialized: cur };
   assert.equal(safety.singleFileRewriteIsSafe(cur, next, opts), true, "only the update time changes");
   const retitled = next.replace("架空", "別の題名");
   assert.equal(safety.singleFileRewriteIsSafe(cur, retitled, opts), false, "a line would be lost and nothing proves Tsumugi wrote it");
   assert.equal(safety.singleFileRewriteIsSafe(cur, retitled, { ...opts, registeredHash: hash(cur) }), true, "exactly what Tsumugi wrote last");
   assert.equal(safety.singleFileRewriteIsSafe(cur + "手書き\n", next, opts), false);
+  assert.equal(safety.singleFileRewriteIsSafe(cur + "手書き\n", next, { ...opts, registeredHash: hash(cur + "手書き\n") }), false, "a hash taken from the file does not prove Tsumugi wrote a line it can not read back");
   assert.equal(safety.singleFileRewriteIsSafe(cur, next + "\n続き\n", { ...opts, body: "extends" }), true);
   assert.equal(safety.singleFileRewriteIsSafe(cur, next.replace("# 本文", "# 本文の続き"), { ...opts, body: "extends" }), false, "a body that merely starts with the same characters is not an extension");
 });

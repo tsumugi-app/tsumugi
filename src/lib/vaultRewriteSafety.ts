@@ -72,7 +72,11 @@ export function rewriteKeepsContent(current: string, next: string, evolvingKeys:
 
 /** 1記録分の部分に、読み書きで失われるもの（知らない項目・手書きの文）が無いか。Registryのハッシュは読み取った結果から計算されるため、ハッシュだけではこれが分からない */
 function sectionHasNothingForeign(section: string, parsed: MemoryObject): boolean {
-  const a = sections(section), b = sections(memoryObjectToMarkdown(parsed));
+  return serializedKeepsEverything(section, memoryObjectToMarkdown(parsed));
+}
+
+function serializedKeepsEverything(section: string, serialized: string): boolean {
+  const a = sections(section), b = sections(serialized);
   if (!a || !b) return false;
   if (a[2].trim() !== b[2].trim()) return false;
   const lines = b[1].split("\n");
@@ -88,8 +92,12 @@ function sectionHasNothingForeign(section: string, parsed: MemoryObject): boolea
 // 1記録1ファイル（会話・振り返り）
 // ---------------------------------------------------------------------------
 
-export function singleFileRewriteIsSafe(current: string, next: string, opts: { hash: (text: string) => string; registeredHash: unknown; evolvingKeys: ReadonlySet<string>; body: "same" | "extends" }): boolean {
-  if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash) return true;
+/**
+ * `reserialized`は今のファイルを読んで書き直した内容。Registryのハッシュが一致しても、読み書きで失われる部分（知らない項目・手書きの文）があれば
+ * Tsumugiが書いた版とは言えない（復旧がファイルの実体からハッシュを記録した場合に、手で足された文を上書きしない）。
+ */
+export function singleFileRewriteIsSafe(current: string, next: string, opts: { hash: (text: string) => string; registeredHash: unknown; evolvingKeys: ReadonlySet<string>; body: "same" | "extends"; reserialized: string }): boolean {
+  if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash && serializedKeepsEverything(current, opts.reserialized)) return true;
   return rewriteKeepsContent(current, next, opts.evolvingKeys, opts.body);
 }
 

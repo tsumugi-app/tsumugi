@@ -1468,6 +1468,35 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
   }, skipIfUnchanged);
 }
 
+/** The device record moved on since the user chose the Vault version (another tab saved): nothing is written. */
+export class VaultVersionChangedError extends Error {
+  constructor() { super("vault-version-changed"); this.name = "VaultVersionChangedError"; }
+}
+
+/**
+ * The user chose the Vault version of a conflicting record (vaultConflictResolution.ts, after the two versions were kept and backed up). Writes the record and its Outbox entry in one
+ * transaction, only if the stored record is still exactly the version the user saw; a tombstone or a pending recovery refuses it like any other write. Returns the record as stored.
+ */
+export async function adoptVaultVersionWithOutbox<T extends Conversation | MemoryObject | Source>(recordType: "conversation" | "memory" | "reflection" | "source", record: T, expectedUpdatedAt: string, now: string = new Date().toISOString()): Promise<T> {
+  const storeName = recordType === "conversation" ? "conversations" : recordType === "source" ? "sources" : "memoryObjects";
+  let stored = record;
+  await putCanonicalRecordWithOutboxInternal(storeName as "memoryObjects", recordType, record as never, now, (async (tx: Parameters<typeof assertNoPendingRecoveryInTx>[0]) => {
+    await assertNoPendingRecoveryInTx(tx);
+    const current = (await tx.objectStore(storeName).get(record.id)) as { updatedAt: string } | undefined;
+    if (!current || current.updatedAt !== expectedUpdatedAt) throw new VaultVersionChangedError();
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (recordType === "conversation") {
+      if (blockedByTombstone(tombs, "conversation", record.id)) throw new TombstonedRecordError("conversation", record.id);
+      stored = withoutDeletedMemoryRefs(record as Conversation, tombs) as T;
+    } else if (recordType !== "source") {
+      if (memoryBlocked(tombs, record as MemoryObject)) throw new TombstonedRecordError("memory", record.id);
+      stored = (await withoutDeletedLinksInTx(tx, record as MemoryObject, tombs, now)) as T;
+    }
+    return stored;
+  }) as never);
+  return stored;
+}
+
 /** `recordType`は既定で`"memory"`（normal Memory）。Reflectionを書く場合は`"reflection"`を渡す。 */
 /**
  * The write API for Memories PRODUCED BY A CAPTURE. The conversation that produced the content is passed independently of the record: the record's own

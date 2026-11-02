@@ -108,6 +108,11 @@ function withoutDeletedReferences(entry: Entry, ids: Set<string>): Entry {
   return { ...entry, raw };
 }
 
+const priorMemberHashes = (prior: unknown, members: { id: string }[]): Record<string, string> => {
+  const known = object(prior) ? prior : {};
+  return Object.fromEntries(members.flatMap((m) => (typeof known[m.id] === "string" ? [[m.id, known[m.id] as string]] : [])));
+};
+
 /** Pure plan builder used by both browser and fault-injection tests. No file is created. */
 export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone, vaultId: string, epoch: number, priorIds: string[] = [], priorDays: string[] = []): VaultDeletionPlan {
   const ids = new Set([t.id, ...priorIds]);
@@ -167,7 +172,8 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
           // A deletion is not permission to adopt an unrelated external edit as a safe baseline.
           if (row.status === "ok" && row.contentHash !== hashVaultText(files.get(p) ?? "")) row.status = "needs-resync";
           row.contentHash = hashVaultText(content); row.size = new TextEncoder().encode(content).length; row.mtime = 0;
-          if (row.recordType === "memory-day") row.memberHashes = Object.fromEntries(parseMemoryDayFile(content).map((m) => [m.id, hashVaultText(memoryObjectToMarkdown(m))]));
+          // 残る記録のハッシュは記録済みの値だけを引き継ぐ（ファイルから計算すると、手で編集された記録を「Tsumugiが書いた版」と取り違える）
+          if (row.recordType === "memory-day") row.memberHashes = priorMemberHashes(row.memberHashes, parseMemoryDayFile(content));
         }
         // Existing conflict/needs-resync states are never relaxed by deletion.
       }
@@ -200,7 +206,7 @@ export function buildVaultDeletionPlan(files: Map<string, string>, t: Tombstone,
       shard.files[survivor.path] = {
         ...existing, recordType: "memory-day", mtime: 0, size: new TextEncoder().encode(survivor.content).length,
         contentHash: hashVaultText(survivor.content), memberIds: members.map((m) => m.id),
-        memberHashes: Object.fromEntries(members.map((m) => [m.id, hashVaultText(memoryObjectToMarkdown(m))])),
+        memberHashes: priorMemberHashes(existing?.memberHashes, members),
         status: survivors.length > 1 || existing?.status === "conflict" ? "conflict" : "needs-resync",
       };
     }
