@@ -67,7 +67,9 @@ export function rewriteKeepsContent(current: string, next: string, evolvingKeys:
     lines.splice(at, 1);
   }
   const before = a[2].trim(), after = b[2].trim();
-  return body === "same" ? before === after : after === before || after.startsWith(`${before}\n`);
+  if (body === "same") return before === after;
+  // 最後の発言が空のファイルは`**Tsumugi:** `で終わる。上のtrimで消えるのはその行末の空白1つだけで、続きがあれば書いた後にはそのまま残る
+  return after === before || after.startsWith(`${before}\n`) || after.startsWith(`${before} \n`);
 }
 
 /** 1記録分の部分に、読み書きで失われるもの（知らない項目・手書きの文）が無いか。Registryのハッシュは読み取った結果から計算されるため、ハッシュだけではこれが分からない */

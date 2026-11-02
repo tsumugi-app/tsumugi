@@ -11,6 +11,8 @@ import {
   type ConsistencyPlanLike, type SaveProgress, type SaveProgressEntry,
 } from "./vaultConsistency";
 import { deriveRecoveryUserView, recoveryAllowsLatest, RECOVERY_ATTENTION_TEXT, RECOVERY_REPAIR_BUTTON } from "./vaultRecoveryUserView";
+import { isAppOutdated } from "./recoveryBackgroundCheck";
+import { doneIntegrityIsDue } from "./vaultStartupState";
 
 type Rec = ConsistencyPlanLike["plan"]["records"][number];
 const rec = (recordType: string, recordId: string, classification: string, extra: Partial<Rec> = {}): Rec => ({
