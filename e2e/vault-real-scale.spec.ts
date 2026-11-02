@@ -232,7 +232,7 @@ test.only("at real size: the empty AI turns are not a conflict anywhere, Setting
   const third = await startApp(page, "before a new conversation");
   const inputAt = Date.now();
   await page.locator("footer textarea").fill("架空の新しい話題");
-  await page.getByRole("button", { name: "送信" }).click();
+  await page.locator("footer").getByRole("button", { name: "送る" }).click();
   report("perf-first-send", { fromHome: Date.now() - inputAt });
   await expect(page.getByText("架空の返答です。")).toBeVisible({ timeout: 60_000 });
   const saved = await page.evaluate(async () => {
