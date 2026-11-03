@@ -11,6 +11,8 @@ import {
   type ConsistencyPlanLike, type SaveProgress, type SaveProgressEntry,
 } from "./vaultConsistency";
 import { deriveRecoveryUserView, recoveryAllowsLatest, RECOVERY_ATTENTION_TEXT, RECOVERY_REPAIR_BUTTON } from "./vaultRecoveryUserView";
+import { isAppOutdated } from "./recoveryBackgroundCheck";
+import { doneIntegrityIsDue } from "./vaultStartupState";
 
 type Rec = ConsistencyPlanLike["plan"]["records"][number];
 const rec = (recordType: string, recordId: string, classification: string, extra: Partial<Rec> = {}): Rec => ({
@@ -283,7 +285,7 @@ test("背景の確認は読み取りだけ。修復・整理・限定修復を�
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, "");
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
   const check = chat.slice(chat.indexOf("async function startRecoveryBackgroundCheck("), chat.indexOf("function handleRecheckRecovery()"));
-  assert.ok(check.includes("runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)))"));
+  assert.ok(check.includes("runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)), force)"));
   assert.ok(!/applyRecovery\(|resumeNarrowRepairForUser|runLegacyHeldCleanup|executeNarrow|handleExecuteRecoveryApply/.test(check), "never repairs");
   assert.ok(check.includes("recoveryRecheckCountRef.current < RECOVERY_RECHECK_LIMIT"), "bounded automatic re-checks");
   assert.ok(/runProductionBootstrapOnce\(vaultHandle\)[\s\S]*\.then\(\(\) => startRecoveryBackgroundCheck\(vaultHandle\)\)/.test(chat), "started after the normal startup (bootstrap) settles");
@@ -369,4 +371,24 @@ test("保存が保留された記録は、走査で差分として見えなく�
   assert.deepEqual(r.repairTargets, [{ action: "resave", reason: "save-held", recordType: "memory", recordId: "m2" }]);
   const again = classifyConsistency(plan({ records: [rec("memory", "m2", "conflict")], held: [{ recordType: "memory", recordId: "m2", reason: "conflict" }] }), p, p);
   assert.equal(again.findings.filter((f) => f.recordId === "m2").length, 1, "counted once when the scan also saw it");
+});
+
+test("isAppOutdated：配信中のビルドと違うときだけ。確かめられない・開発用のビルドでは言わない", () => {
+  assert.equal(isAppOutdated("new", "old"), true);
+  assert.equal(isAppOutdated("same", "same"), false);
+  assert.equal(isAppOutdated(null, "old"), false);
+  assert.equal(isAppOutdated("dev", "old"), false);
+});
+
+test("doneIntegrityIsDue：同じビルドで期限内なら照合しない。ビルドの変更・期限切れ・読めない記録・未来の日時では照合する", () => {
+  const now = "2026-11-03T12:00:00.000Z", day = 86_400_000;
+  const marker = (build: string, at: string) => JSON.stringify({ build, at });
+  assert.equal(doneIntegrityIsDue(marker("b", "2026-11-03T00:00:00.000Z"), "b", now, day), false);
+  assert.equal(doneIntegrityIsDue(marker("a", "2026-11-03T00:00:00.000Z"), "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(marker("b", "2026-11-02T00:00:00.000Z"), "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(marker("b", "2026-11-04T00:00:00.000Z"), "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(undefined, "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(JSON.stringify({ build: "b", at: "2026-11-03T00:00:00.000Z", missing: 1 }), "b", now, day, 1), false, "a moved file stays counted");
+  assert.equal(doneIntegrityIsDue(JSON.stringify({ build: "b", at: "2026-11-03T00:00:00.000Z", missing: 1 }), "b", now, day, 2), true, "one more is missing");
+  assert.equal(doneIntegrityIsDue("{not json", "b", now, day), true);
 });

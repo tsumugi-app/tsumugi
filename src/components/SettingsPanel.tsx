@@ -1,5 +1,6 @@
 "use client";
 
+import { APP_BUILD_ID } from "@/lib/recoveryBackgroundCheck";
 import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
 import VaultBackupSection from "./VaultBackupSection";
@@ -86,6 +87,7 @@ export default function SettingsPanel({
   recoveryUserView,
   onUserRepair,
   conflictRefs = [],
+  appOutdated = false,
   activeConversationId = null,
   onResolveConflict,
   autoRepairOutcome = null,
@@ -169,6 +171,8 @@ export default function SettingsPanel({
   onUserRepair: () => void;
   /** 確認の結果のうち、端末と保存先で内容が異なる記録 */
   conflictRefs?: ConflictRef[];
+  /** 配信中のビルドより古いコードが動いている（開きっぱなしのタブ等） */
+  appOutdated?: boolean;
   activeConversationId?: string | null;
   onResolveConflict?: (snapshot: ConflictSnapshot, choice: ConflictChoice) => Promise<ConflictOutcome>;
   /** 直前の「修復する」の結果（無ければnull）。表示は修復の後にもう一度確認した結果に基づく */
@@ -338,9 +342,16 @@ export default function SettingsPanel({
             </div>
           )}
 
+          {appOutdated && (
+            <div role="status" data-testid="app-outdated" className="flex items-center justify-between gap-2 rounded-xl bg-amber-50/60 px-3 py-2 text-xs text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <span>新しいバージョンがあります。再読み込みするまで、修復と競合の解決はできません。</span>
+              <button className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1" data-testid="app-outdated-reload" onClick={() => window.location.reload()}>再読み込み</button>
+            </div>
+          )}
+
           {vaultStatus === "connected" && vaultHandle && (
             <div className="flex items-center justify-between gap-4 text-xs text-stone-500 dark:text-stone-400">
-              <span>保存先：{vaultBackend === "opfs" ? "この端末の安全な領域" : vaultHandle.name}</span>
+              <span>保存先：{vaultBackend === "opfs" ? "この端末の安全な領域" : vaultHandle.name}<span data-testid="app-build" className="ml-2 text-[11px] text-stone-400 dark:text-stone-500">v{APP_BUILD_ID.slice(0, 7)}</span></span>
               {/*
                 OPFS（スマホ等のフォールバック）には、PCのようにユーザーが選び直せる
                 別のフォルダという概念が無い（navigator.storage.getDirectory()は常に同じ
@@ -461,7 +472,14 @@ export default function SettingsPanel({
                 </span>
               )}
 
-              {vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView) && <span>✓ 最新の状態です</span>}
+              {vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView) && (
+                <div className="flex items-center justify-between gap-4">
+                  <span>✓ 最新の状態です</span>
+                  <button data-testid="vault-check-now" onClick={onCheckVaultStatus} disabled={vaultActionsDisabled} className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/10">
+                    確認する
+                  </button>
+                </div>
+              )}
 
               {vaultStatusView.kind === "maybe" && (
                 <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 dark:bg-amber-950/20">
@@ -536,6 +554,16 @@ export default function SettingsPanel({
                         className="rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-200 dark:hover:bg-white/5"
                       >
                         整理する
+                      </button>
+                    )}
+                    {vaultStatusView.hasAttention && !vaultStatusView.hasUpdate && !vaultStatusView.hasCleanup && (
+                      <button
+                        data-testid="vault-check-again"
+                        onClick={onCheckVaultStatus}
+                        disabled={vaultActionsDisabled}
+                        className="rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/10"
+                      >
+                        もう一度確認する
                       </button>
                     )}
                   </div>
@@ -1366,7 +1394,7 @@ export default function SettingsPanel({
                   <span className="font-medium">{section.title}（{section.count}件）</span>
                   {section.lines.map((line) => <span key={line}>{line}</span>)}
                   <span className="text-stone-500 dark:text-stone-400">{section.note}</span>
-                  <span className="text-stone-500 dark:text-stone-400">{NEXT_ACTION_TEXT[section.category]}</span>
+                  <span className="text-stone-500 dark:text-stone-400">{section.action ?? NEXT_ACTION_TEXT[section.category]}</span>
                 </div>
               ))}
               {recoveryUserView.kind === "attention" && onResolveConflict && conflictRefs.length > 0 && (

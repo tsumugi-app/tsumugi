@@ -32,6 +32,7 @@ import {
   getRegistryGenerationEpoch,
   getSource,
   getVaultSyncState,
+  readVaultSyncLedger,
   hasAnyVaultSyncState,
   isAndroidOpfsVaultInitialized,
   loadVaultHandle,
@@ -2447,12 +2448,15 @@ export async function flushPendingToVault(
   // Conversations/Memories/Sourcesディレクトリハンドルを使い回す。ローカル
   // 変数のため、この関数を抜ければ破棄され、次回のflushへは持ち越さない。
   const dirHandleCache: VaultDirHandleCache = new Map();
+  // 全件を1回の読み取りで判定する。台帳と一致しなかった記録だけ、1件ずつ読み直す
+  const ledger = await readVaultSyncLedger().catch(() => new Map<string, string>());
+  const alreadySynced = (kind: VaultSyncKind, id: string, updatedAt: string) => ledger.get(vaultSyncKeyFor(kind, id)) === updatedAt || isAlreadySyncedToVault(kind, id, updatedAt);
   for (const conversation of conversations) {
     if (signal?.aborted) {
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
       return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
-    if (await isAlreadySyncedToVault("conversation", conversation.id, conversation.updatedAt)) continue;
+    if (await alreadySynced("conversation", conversation.id, conversation.updatedAt)) continue;
     pendingCount += 1;
     try {
       await writeConversationMarkdown(root, conversation, priority, dirHandleCache);
@@ -2476,7 +2480,7 @@ export async function flushPendingToVault(
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
       return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
-    if (await isAlreadySyncedToVault("memory", memoryObject.id, memoryObject.updatedAt)) continue;
+    if (await alreadySynced("memory", memoryObject.id, memoryObject.updatedAt)) continue;
     pendingCount += 1;
     try {
       await writeMemoryObjectMarkdown(root, memoryObject, priority, dirHandleCache);
@@ -2498,7 +2502,7 @@ export async function flushPendingToVault(
       logTimingEvent("Vault flush:aborted", { count: totalCount, writtenCount });
       return { totalCount, writtenCount, failedCount, heldCount, heldByReason };
     }
-    if (await isAlreadySyncedToVault("source", source.id, source.updatedAt)) continue;
+    if (await alreadySynced("source", source.id, source.updatedAt)) continue;
     pendingCount += 1;
     try {
       await writeSourceMarkdown(root, source, priority, dirHandleCache);

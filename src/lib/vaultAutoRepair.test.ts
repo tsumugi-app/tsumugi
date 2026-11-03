@@ -271,6 +271,10 @@ test("書き換えの証明：Registryの版と一致するか、書き換え後
   assert.equal(safety.singleFileRewriteIsSafe(cur + "手書き\n", next, opts), false);
   assert.equal(safety.singleFileRewriteIsSafe(cur + "手書き\n", next, { ...opts, registeredHash: hash(cur + "手書き\n") }), false, "a hash taken from the file does not prove Tsumugi wrote a line it can not read back");
   assert.equal(safety.singleFileRewriteIsSafe(cur, next + "\n続き\n", { ...opts, body: "extends" }), true);
+  const blankEnd = "---\nid: c\n---\n**User:** 架空\n\n**Tsumugi:** \n";
+  assert.equal(safety.rewriteKeepsContent(blankEnd, "---\nid: c\n---\n**User:** 架空\n\n**Tsumugi:** \n\n**User:** 続き\n", new Set(), "extends"), true, "an empty last turn then the conversation goes on");
+  assert.equal(safety.rewriteKeepsContent(blankEnd, "---\nid: c\n---\n**User:** 架空\n\n**Tsumugi:** 別の内容\n", new Set(), "extends"), false, "that line may only be followed by a line break");
+  assert.equal(safety.rewriteKeepsContent(blankEnd, "---\nid: c\n---\n**User:** 別\n\n**Tsumugi:** \n\n**User:** 続き\n", new Set(), "extends"), false, "an earlier difference is still a difference");
   assert.equal(safety.singleFileRewriteIsSafe(cur, next.replace("# 本文", "# 本文の続き"), { ...opts, body: "extends" }), false, "a body that merely starts with the same characters is not an extension");
 });
 

@@ -122,7 +122,7 @@ import { conflictRefsOf, deriveRecoveryUserView } from "@/lib/vaultRecoveryUserV
 import { resolveConflict, type ConflictChoice, type ConflictOutcome, type ConflictSnapshot } from "@/lib/vaultConflictResolution";
 import { createProductionConflictEnv } from "@/lib/vaultConflictResolutionRun";
 import { resumeNarrowRepairForUser } from "@/lib/memoryNarrowRepair";
-import { APP_BUILD_ID, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
+import { APP_BUILD_ID, isAppOutdated, productionRecoveryBackgroundDeps, runBackgroundRecoveryCheck } from "@/lib/recoveryBackgroundCheck";
 import { checkVaultConsistency } from "@/lib/vaultConsistencyCheck";
 import { runProductionVaultAutoRepair } from "@/lib/vaultAutoRepairRun";
 import type { AutoRepairOutcome } from "@/lib/vaultAutoRepair";
@@ -811,10 +811,15 @@ export default function ChatScreen() {
   /** 保存待ち・未確定のときに自動で確認し直した回数（有限回）。 */
   const recoveryRecheckCountRef = useRef(0);
   /** 新保存基盤 Phase 3-8：Save Foundation Bootstrapを起動のたびに1回だけ呼ぶためのガード。 */
+  const [appOutdated, setAppOutdated] = useState(false);
   const startupSaveFoundationBootstrapRanRef = useRef(false);
   const topPromptRanRef = useRef(false);
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
+  /** 会話を書き込む途中の処理（送信・会話の区切りの保存）。保存先の変更を取り込む前に終わりを待つ。 */
+  const conversationWritesRef = useRef(new Set<Promise<unknown>>());
+  /** 保存先の変更を取り込んでいる間だけtrue。古い画面状態から会話を書き戻す操作をこの間は始めない。 */
+  const openConversationUpdatingRef = useRef(false);
 
   /**
    * Vault境界の安全性（Codexレビュー指摘H1〜H3対応）。
@@ -1591,10 +1596,18 @@ export default function ChatScreen() {
    * 今回もこの引数を渡さず、既存のawaitする挙動を維持する（Gemini呼び出し回数の
    * クォータ保護を目的とした逐次処理のペースを変えないため）。
    */
-  async function runConversationBoundary(
+  function runConversationBoundary(
     target: Conversation,
     priority: VaultWritePriority = "interactive",
     awaitVaultSync: boolean = true
+  ): Promise<MemoryObject[]> {
+    return trackConversationWrite(captureAtConversationBoundary(target, priority, awaitVaultSync));
+  }
+
+  async function captureAtConversationBoundary(
+    target: Conversation,
+    priority: VaultWritePriority,
+    awaitVaultSync: boolean
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
       boundaryOutcomeRef.current = "empty";
@@ -2190,6 +2203,21 @@ export default function ChatScreen() {
    *   effect側で追加のtry/catchを重ねる必要はないが、`withVaultWorldRead`が
    *   投げうる上記エラーに備えて念のため包む。
    */
+  // 開きっぱなしのタブが古いビルドのまま動いていないか（起動時と、画面に戻ったとき）。確かめられなければ何も言わない。
+  useEffect(() => {
+    let alive = true;
+    const check = () => {
+      if (document.visibilityState !== "visible") return;
+      void fetch("/api/build", { cache: "no-store" })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((body: { build?: unknown } | null) => { if (alive && typeof body?.build === "string") setAppOutdated(isAppOutdated(body.build)); })
+        .catch(() => {});
+    };
+    check();
+    document.addEventListener("visibilitychange", check);
+    return () => { alive = false; document.removeEventListener("visibilitychange", check); };
+  }, []);
+
   useEffect(() => {
     if (vaultStatus !== "connected" || !vaultHandle || startupSaveFoundationBootstrapRanRef.current) return;
     startupSaveFoundationBootstrapRanRef.current = true;
@@ -3563,19 +3591,19 @@ export default function ChatScreen() {
    * 確定させない）。正常と確定したビルド・Vaultでは再起動しても再走査しない。以前の「異常」は次の起動で確認し直す。
    * 保存待ち・未確定のときは、少し後に有限回だけ自動で確認し直す。何も修復しない。
    */
-  async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle) {
+  async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle, force = false) {
     const generation = vaultGenerationRef.current;
     if (recoveryDetectionRanRef.current || recoveryCheckInFlightRef.current === generation) return;
     recoveryDetectionRanRef.current = true;
     recoveryCheckInFlightRef.current = generation;
     try {
-      await runRecoveryBackgroundCheckOnce(handle, generation);
+      await runRecoveryBackgroundCheckOnce(handle, generation, force);
     } finally {
       if (recoveryCheckInFlightRef.current === generation) recoveryCheckInFlightRef.current = null;
     }
   }
 
-  async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number) {
+  async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number, force: boolean) {
     const cancelled = () => generation !== vaultGenerationRef.current;
     // 確認は必ず終わる：待機・やり直しは有限回で、尽きたら「確認できませんでした」を表示する（空白のままにしない）。
     const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, cancelled);
@@ -3584,7 +3612,7 @@ export default function ChatScreen() {
     // 既知の結果がある間は消さない（隠さない）。確認中であることだけを足す。
     setRecoveryChecking(true);
     try {
-      const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)));
+      const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)), force);
       if (cancelled()) return;
       if (result.kind === "failed") { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
       setRecoveryDetectionFailed(false);
@@ -3602,7 +3630,7 @@ export default function ChatScreen() {
       if ((report.state === "saving" || report.state === "unsettled") && recoveryRecheckCountRef.current < RECOVERY_RECHECK_LIMIT) {
         recoveryRecheckCountRef.current += 1;
         recoveryDetectionRanRef.current = false;
-        window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle); }, RECOVERY_RECHECK_DELAY_MS);
+        window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle, force); }, RECOVERY_RECHECK_DELAY_MS);
       }
     } catch (error) {
       recoveryDetectionRanRef.current = false;
@@ -3621,19 +3649,24 @@ export default function ChatScreen() {
     recoveryDetectionRanRef.current = false;
     recoveryRecheckCountRef.current = 0;
     setRecoveryStatus((current) => (current.kind === "error" || current.kind === "done" ? { kind: "idle" } : current));
-    void startRecoveryBackgroundCheck(vaultHandle);
+    void startRecoveryBackgroundCheck(vaultHandle, true);
   }
 
   /**
    * 端末と保存先で内容が異なる記録の、ユーザーの選択の実行（vaultConflictResolution.ts）。表示はもう一度確認した結果だけに基づく。
    */
   async function handleResolveConflict(snapshot: ConflictSnapshot, choice: ConflictChoice): Promise<ConflictOutcome> {
-    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return { kind: "not-started", reason: "busy" };
+    if (!vaultHandle || isVaultSwitchingRef.current || crossTabStale) return { kind: "not-started", reason: "busy" };
     const handle = vaultHandle;
     const generation = vaultGenerationRef.current;
+    // 直前の確認や修復が終わるのを待ってから始める（すぐに「他の操作が実行中」で断らない。待ち時間は有限）
+    const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, () => generation !== vaultGenerationRef.current);
+    if (waited !== "idle") return { kind: "not-started", reason: "busy" };
     vaultOperationLockRef.current = true;
     const endTask = beginMemoryTask();
     setAutoRepairOutcome(null);
+    // 前の解決の後に始めた保存（別の経路で管理情報を更新する）を、この解決の確認に重ねない
+    await abortBackgroundFlushAndWait(VAULT_SWITCH_SETTLE_TIMEOUT_MS);
     try {
       const outcome = await resolveConflict(createProductionConflictEnv({
         root: handle,
@@ -3655,6 +3688,15 @@ export default function ChatScreen() {
         setVaultLightCheckStatus({ kind: "idle" });
         runVaultLightCheckInBackground(handle);
         bumpHistoryRefreshToken();
+        // 解決の直後の確認は、続く保存と重なることがある。問題が残っていれば、保存が終わってからもう一度確かめる（古い警告を残さない）
+        if (outcome.after.state !== "clean") {
+          void waitForBackgroundFlushToSettle(VAULT_SWITCH_SETTLE_TIMEOUT_MS).then(() => {
+            if (generation !== vaultGenerationRef.current) return;
+            recoveryDetectionRanRef.current = false;
+            recoveryRecheckCountRef.current = 0;
+            void startRecoveryBackgroundCheck(handle, true);
+          });
+        }
       }
       return outcome;
     } catch (error) {
@@ -3855,7 +3897,63 @@ export default function ChatScreen() {
     return findings;
   }
 
+  function trackConversationWrite<T>(work: Promise<T>): Promise<T> {
+    const writes = conversationWritesRef.current;
+    const entry = work.catch(() => {});
+    writes.add(entry);
+    void entry.then(() => writes.delete(entry));
+    return work;
+  }
+
+  /**
+   * 保存先の変更を端末へ取り込む処理を、開いている会話と食い違わないように実行する。画面の会話は端末の記録の
+   * コピーなので、取り込みの後も古いままだと、次の送信で外部の編集を消してしまう。先に書き込み中の処理を待ち、
+   * 取り込みの間は新しい書き込みを始めさせず、端末の記録が変わったときだけ画面の会話を読み直す。待ちきれないときは
+   * 何も取り込まない（呼び出し元が「完了できませんでした」を表示する）。
+   */
+  async function keepOpenConversationCurrent<T>(apply: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + VAULT_SWITCH_SETTLE_TIMEOUT_MS;
+    while (conversationWritesRef.current.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("settle-timeout");
+      await Promise.race([
+        Promise.allSettled([...conversationWritesRef.current]),
+        new Promise((resolve) => window.setTimeout(resolve, remaining)),
+      ]);
+    }
+    openConversationUpdatingRef.current = true;
+    setBusy(true);
+    const id = latestConversationRef.current.id;
+    let before: string | null = null;
+    try {
+      before = JSON.stringify((await getConversation(id)) ?? null);
+      return await apply();
+    } finally {
+      try {
+        const after = await getConversation(id);
+        if (after && before !== null && before !== "null" && JSON.stringify(after) !== before && latestConversationRef.current.id === id) {
+          latestConversationRef.current = after;
+          setConversation(after);
+        }
+      } catch (error) {
+        console.error("[Tsumugi] could not re-read the open conversation", error);
+      }
+      openConversationUpdatingRef.current = false;
+      setBusy(false);
+    }
+  }
+
   /** 「確認する」。既存のdry-runを順に実行して、必要な対応を導く（何も書き込まない）。 */
+  /** 手動の確認・反映の後は、整合性の表示も今の状態で確かめ直す（前回の判定を残さない）。保存が終わってから読む。 */
+  function recheckConsistencyAfterSaves(handle: FileSystemDirectoryHandle, generation: number) {
+    void waitForBackgroundFlushToSettle(VAULT_SWITCH_SETTLE_TIMEOUT_MS).then(() => {
+      if (generation !== vaultGenerationRef.current) return;
+      recoveryDetectionRanRef.current = false;
+      recoveryRecheckCountRef.current = 0;
+      void startRecoveryBackgroundCheck(handle, true);
+    });
+  }
+
   async function handleCheckVaultStatus() {
     if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
     const generation = vaultGenerationRef.current;
@@ -3871,6 +3969,8 @@ export default function ChatScreen() {
       setVaultStatusCheck({ kind: "ready", findings, generation, note: null });
       // 確認のために中断したflushの残り（通常の保存の未反映分）を再開する。
       flushPendingToVaultInBackground(vaultHandle);
+      // 反映できる変更があるときは、ここで「違い」と言わない（「更新する」の後に確かめる）
+      if (!findings.updatableRecords.length) recheckConsistencyAfterSaves(vaultHandle, generation);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setVaultStatusCheck({ kind: "idle" });
@@ -3903,7 +4003,7 @@ export default function ChatScreen() {
     const endTask = beginMemoryTask();
     setVaultStatusCheck({ kind: "working", label });
     try {
-      const outcome = await action(vaultHandle, status.findings, generation);
+      const outcome = await keepOpenConversationCurrent(() => action(vaultHandle, status.findings, generation));
       if (generation !== vaultGenerationRef.current) {
         setVaultStatusCheck({ kind: "idle" });
         return;
@@ -3916,6 +4016,7 @@ export default function ChatScreen() {
       }
       setVaultStatusCheck({ kind: "ready", findings, generation, note: outcome.steps.filter((step) => !step.ok) });
       flushPendingToVaultInBackground(vaultHandle);
+      recheckConsistencyAfterSaves(vaultHandle, generation);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setVaultStatusCheck({ kind: "idle" });
@@ -4260,7 +4361,7 @@ export default function ChatScreen() {
       // 既存の`runVaultWorldExclusive`（full resyncと同じ排他ロックhelper）を
       // 使うため、ここではwithVaultWorldRead（共有ロック）で包まない——同名
       // ロックの共有→排他という二重要求による自己デッドロックを避けるため。
-      const outcome = await applyVaultLightCheckCandidates(vaultHandle, records, localSnapshots);
+      const outcome = await keepOpenConversationCurrent(() => applyVaultLightCheckCandidates(vaultHandle, records, localSnapshots));
 
       if (outcome.timedOut) {
         setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
@@ -4336,7 +4437,7 @@ export default function ChatScreen() {
    */
   async function handleEndSession() {
     // Vault境界の安全性：切替処理中は新規のReflection開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     const endTask = beginMemoryTask();
     try {
       // UI改善：ボタン押下の直後、Boundary Captureの解決を待つ前から状態を表示する。
@@ -4387,11 +4488,11 @@ export default function ChatScreen() {
         const { title, reflection: text } = await generateSessionReflection(persona, reflectionSource);
         const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
         const endedConversation: Conversation = {
-          ...conversation,
+          ...latestConversationRef.current,
           title,
           endedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
-          memoryObjectIds: [...conversation.memoryObjectIds, insightMemory.id],
+          memoryObjectIds: [...latestConversationRef.current.memoryObjectIds, insightMemory.id],
         };
 
         // 既存のwriteConversationMarkdown / writeMemoryObjectMarkdown / putConversation / putMemoryObjectを
@@ -4401,7 +4502,7 @@ export default function ChatScreen() {
         // 反映は待たない（reflectionFailedIdsはIndexedDB保存の成否のみを表すため、
         // この変更でも判定の意味は変わらない）。
         const { failedMemoryIds: reflectionFailedIds, backgroundSyncPromise: reflectionBackgroundSyncPromise } =
-          await persistCapture(vaultHandle, endedConversation, [insightMemory], "interactive", false);
+          await trackConversationWrite(persistCapture(vaultHandle, endedConversation, [insightMemory], "interactive", false));
         // H4 Codexレビュー指摘High-2対応：この関数自体が既にbeginMemoryTask()で追跡中の
         // 親taskであるため、ここで子として登録すればdrainPendingMemoryTasksが確実に待てる。
         if (reflectionBackgroundSyncPromise) trackMemoryTask(reflectionBackgroundSyncPromise);
@@ -4471,7 +4572,7 @@ export default function ChatScreen() {
    */
   async function handleEndConversation() {
     // Vault境界の安全性：切替処理中は新規の会話終了（Capture）開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     const endTask = beginMemoryTask();
     setEndingConversation(true);
     try {
@@ -4488,12 +4589,12 @@ export default function ChatScreen() {
       // 責務分離の目的そのもの）。
       // awaitVaultSync=false：ここでの「保存完了」はIndexedDBへの保存成功のみで確定させ、
       // Vaultへの反映は待たない（Beta修正。ユーザー操作をVault I/Oの遅さから切り離す）。
-      const { backgroundSyncPromise: endedConversationBackgroundSyncPromise } = await persistConversation(
+      const { backgroundSyncPromise: endedConversationBackgroundSyncPromise } = await trackConversationWrite(persistConversation(
         vaultHandle,
         endedConversation,
         "interactive",
         false
-      );
+      ));
       // H4 Codexレビュー指摘High-2対応：この関数自体が既にbeginMemoryTask()で追跡中の
       // 親taskであるため、ここで子として登録すればdrainPendingMemoryTasksが確実に待てる。
       if (endedConversationBackgroundSyncPromise) trackMemoryTask(endedConversationBackgroundSyncPromise);
@@ -4547,7 +4648,7 @@ export default function ChatScreen() {
    */
   function handleSwitchPersona(nextPersona: Persona, nextEntryType: ConversationEntryKind) {
     // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
     // Entry Type / Persona分離（2026-10-01）：呼び出し元（下記の「日記」「会話」button）
@@ -4576,7 +4677,7 @@ export default function ChatScreen() {
    */
   function handleGoToTop() {
     // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
     // Entry Type / Persona分離（2026-10-01）：トップ画面（entry未確定）へ戻るため、
@@ -4616,6 +4717,8 @@ export default function ChatScreen() {
     // closure変数のentryTypeはまだ更新前の値のままになりうる）でoverrideEntryTypeを使う。
     const activeEntryType = overrideEntryType ?? entryType;
     const endTask = beginMemoryTask();
+    let sendDone = () => {};
+    void trackConversationWrite(new Promise<void>((resolve) => { sendDone = resolve; }));
 
     setBusy(true);
     setStreamingText("");
@@ -4970,7 +5073,7 @@ export default function ChatScreen() {
       // persistConversation自体が内部でH4のロック＋epoch確認を行うため、fire-and-forgetの
       // ままだとStaleVaultTabErrorが未処理のPromise rejectionになってしまう。.catch()で拾う。
       setBusy(false);
-      void trackMemoryTask(persistConversation(vaultHandle, updated)).catch((error) => {
+      void trackMemoryTask(trackConversationWrite(persistConversation(vaultHandle, updated))).catch((error) => {
         if (!handleStaleVaultTabError(error)) {
           console.error("Failed to persist conversation turn", error);
         }
@@ -4983,6 +5086,7 @@ export default function ChatScreen() {
       setBusy(false);
       stopWaiting();
       endTask();
+      sendDone();
     }
   }
 
@@ -5870,9 +5974,11 @@ export default function ChatScreen() {
             vaultActionsDisabled={
               isVaultSwitching ||
               crossTabStale ||
+              appOutdated ||
               vaultLightCheckStatus.kind === "classifying" ||
               vaultLightCheckStatus.kind === "applying"
             }
+            appOutdated={appOutdated}
             exportDataFeedback={exportDataFeedback}
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}

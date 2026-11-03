@@ -38,6 +38,9 @@
 import { getVaultIdentityRecord } from "./db";
 import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultIdentityEnsureResult } from "./vaultIdentityAdoption";
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
+import { getDoneIntegrityMarker, setDoneIntegrityMarker } from "./db";
+import { doneIntegrityIsDue } from "./vaultStartupState";
+import { recordsMissingAtTheirPlace, sharedManagementFilesAreReadable } from "./vaultDoneIntegrityGate";
 import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
@@ -53,6 +56,11 @@ export interface SaveFoundationBootstrapEnv {
   now?: () => string;
   /** テスト・DI用。既定は`crypto.randomUUID()`（`ensureVaultIdentityForCurrentWorld`に委譲）。 */
   generateVaultId?: () => string;
+  /**
+   * 指定すると、保存済みの全記録の照合を「ビルドごと・maxAgeMsごとに1回」にする（通常の起動を重くしないため）。保存待ち・保留の処理は毎回行う。
+   * 記録の欠け・変更や、共有する管理ファイルの欠けが見つかった起動では期限内でも照合する（vaultDoneIntegrityGate.ts）。指定なしは毎回照合する。
+   */
+  doneIntegrity?: { build: string; maxAgeMs: number };
 }
 
 export interface SaveFoundationBootstrapResult {
@@ -115,7 +123,15 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     // ことを、既存のreconcile*OutboxEntry関数を再利用してそのつど確認する。
     // 実体が既に正しいrecordは、各stepの既存no-op検出により1byteも書き込まれない
     // （Phase 3-7.1 req 3-F）。
-    const integrity = await reconcileDoneVaultOutboxIntegrity(projectionEnv);
+    const now = (env.now ?? (() => new Date().toISOString()))();
+    const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs, recordsMissingAtTheirPlace(migration)) || !(await sharedManagementFilesAreReadable(env.root));
+    const integrity = verifyDone ? await reconcileDoneVaultOutboxIntegrity(projectionEnv) : null;
+    if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) {
+      // 覚えるのは照合の後にまだ足りない数（戻した記録は数えない）。次の起動で同じ数が別の記録で足りなくなっても見逃さない。足りない記録があったときだけ走査し直す
+      const missing = recordsMissingAtTheirPlace(migration);
+      const remaining = missing === 0 ? 0 : recordsMissingAtTheirPlace(await runProductionBootstrapMigration({ root: env.root, now: env.now }));
+      await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now, missing: remaining });
+    }
 
     // 6. final rescanはmigration自身の内部rescanで既に完結している。
     // 7. 必要なら追加outbox reconcile：migrationの最終rescan・reconcile・

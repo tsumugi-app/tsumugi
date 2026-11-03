@@ -23,7 +23,7 @@
  */
 "use client";
 
-import { getAllConversations, getAllMemoryObjects, getAllSources } from "./db";
+import { getAllConversations, getAllMemoryObjects, getAllSources, getConversation, getHeldVaultOutboxEntries, getMemoryObject, getSource, requeueRecordForVault } from "./db";
 import { jstDateOf } from "./dateModel";
 import {
   applyVaultLightCheckCandidates,
@@ -45,6 +45,7 @@ import { executeOrphanCleanup, planOrphanCleanup } from "./vaultOrphanCleanup";
 import type { OrphanCleanupResult, OrphanPlan } from "./vaultOrphanCleanup";
 import { planVaultRestore, restoreMissingRecordsFromVault } from "./vaultRestore";
 import type { VaultRestorePlan, VaultRestoreResult } from "./vaultRestore";
+import { settleRequeuedSaves } from "./vaultAutoRepairRun";
 import { runVaultWorldExclusive, withVaultWorldRead } from "./vaultWorldLock";
 
 /** 起動時のLevel 3自動分類を行う候補数の上限。これを超える場合は自動分類せず「確認する」にする。 */
@@ -334,7 +335,7 @@ export async function collectVaultStatusFindings(root: FileSystemDirectoryHandle
   for (const r of missingKept) attention.push(`保存先で本体が見つかりません（この端末には記録が残っています）：${recordLabel(r)}`);
   if (counts.unreadable > 0) attention.push(`読み込めないファイルが${counts.unreadable}件あります`);
   if (!legacyExecutable) {
-    if (counts.conflict > 0) attention.push(`保存先で内容の重複・食い違いが見つかった記録が${counts.conflict}件あります`);
+    if (counts.conflict > 0) attention.push(`保存先で内容の重複・食い違いが見つかった記録が${counts.conflict}件あります。どのファイルも変更していません。同じ記録が複数のファイルにある場合は、移動やコピーをしたファイルのうち余分なものを外してから、もう一度確認してください`);
     for (const p of diff.problems) {
       if (p.status === "conflict") attention.push(`保存先で内容の重複・食い違いが見つかっています（${p.key}）`);
     }
@@ -411,6 +412,23 @@ function message(error: unknown): string {
  * 続行し、結果を返す（呼び出し元が再計測して、未解決が残っていれば「最新」にはしない）。
  * `withVaultWorldRead`／`runVaultWorldExclusive`を呼び出し元が保持していないこと。
  */
+/**
+ * 反映した記録の「内容が違う」保留は、反映前の判定のまま残さない。保存待ちへ戻して、今の内容で保存処理にかけ直す（まだ違えば、また保留になる）
+ */
+async function resettleHeldConflictsOf(root: FileSystemDirectoryHandle, records: VaultResyncRecordResult[]): Promise<void> {
+  const ids = new Set(records.flatMap((r) => (r.members ?? []).map((m) => m.id).concat(r.registryKey)));
+  const targets: { recordType: "conversation" | "memory" | "reflection" | "source"; recordId: string }[] = [];
+  for (const e of await getHeldVaultOutboxEntries()) {
+    if (!ids.has(e.recordId) || !/-conflict$/.test(e.heldReason ?? "")) continue;
+    const recordType = e.recordType as (typeof targets)[number]["recordType"];
+    const current = recordType === "conversation" ? await getConversation(e.recordId) : recordType === "source" ? await getSource(e.recordId) : await getMemoryObject(e.recordId);
+    if (!current) continue;
+    await requeueRecordForVault(recordType, e.recordId, current.updatedAt);
+    targets.push({ recordType, recordId: e.recordId });
+  }
+  if (targets.length > 0) await settleRequeuedSaves(root, targets);
+}
+
 export async function applyVaultStatusUpdate(
   root: FileSystemDirectoryHandle,
   findings: VaultStatusFindings,
@@ -425,6 +443,7 @@ export async function applyVaultStatusUpdate(
         out.steps.push({ name: "保存先の変更を反映", ok: false, detail: "他の操作が実行中でした" });
       } else {
         const problems = outcome.applyErrors.length + outcome.staleSkipped.length;
+        await resettleHeldConflictsOf(root, findings.updatableRecords);
         out.steps.push({ name: "保存先の変更を反映", ok: problems === 0, detail: problems > 0 ? `${problems}件を反映できませんでした` : undefined });
         out.changed = true;
       }

@@ -92,6 +92,8 @@ import {
 
 export interface RecoveryApplyEnv {
   root: FileSystemDirectoryHandle;
+  /** `planRecoveryApply`が1回の確認の間だけ付ける。実行（apply）では付けない。 */
+  planReads?: PlanReads;
   /** 毎回、IndexedDBを新しく読む（キャッシュしない）。 */
   readLocalSnapshot(): Promise<RecoveryLocalSnapshot>;
   /** 1件だけ読み直す（各opの直前に、IndexedDBの記録が変わっていないことを確認する。全件を読み直さないため）。 */
@@ -161,7 +163,20 @@ const isNotFound = (e: unknown) => isObj(e) && e.name === "NotFoundError";
 
 type TextRead = { state: "absent" } | { state: "error" } | { state: "ok"; text: string; size: number };
 /** 「存在しない」（NotFoundだけ）と「読めない」を区別して読む。 */
-async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
+/**
+ * 確認（`planRecoveryApply`）の1回の間だけ、同じファイルを読み直さない（Registry・index・Historyは全記録で共有するため、記録ごとに読むと件数×ファイル数になる）。
+ * 確認は読むだけで、保存処理と重なった走査は前後の保存の進行状況で検出してやり直す（vaultConsistency.ts）。確認ごとに別の入れ物を使い、他の確認や実行（apply）とは共有しない。
+ */
+interface PlanReads { text: Map<string, Promise<TextRead>>; json: Map<string, Promise<JsonRead>> }
+
+function readTextAt(root: FileSystemDirectoryHandle, path: string, reads?: PlanReads): Promise<TextRead> {
+  if (!reads) return readTextFresh(root, path);
+  let read = reads.text.get(path);
+  if (!read) { read = readTextFresh(root, path); reads.text.set(path, read); }
+  return read;
+}
+
+async function readTextFresh(root: FileSystemDirectoryHandle, path: string): Promise<TextRead> {
   const segments = path.split("/");
   let file: File;
   try {
@@ -179,8 +194,15 @@ async function readTextAt(root: FileSystemDirectoryHandle, path: string): Promis
 }
 
 type JsonRead = { state: "absent" } | { state: "error" } | { state: "ok"; value: Obj; text: string };
-async function readJsonAt(root: FileSystemDirectoryHandle, path: string): Promise<JsonRead> {
-  const read = await readTextAt(root, path);
+function readJsonAt(root: FileSystemDirectoryHandle, path: string, reads?: PlanReads): Promise<JsonRead> {
+  if (!reads) return parseJsonAt(root, path);
+  let read = reads.json.get(path);
+  if (!read) { read = parseJsonAt(root, path, reads); reads.json.set(path, read); }
+  return read;
+}
+
+async function parseJsonAt(root: FileSystemDirectoryHandle, path: string, reads?: PlanReads): Promise<JsonRead> {
+  const read = await readTextAt(root, path, reads);
   if (read.state !== "ok") return read;
   try {
     const value: unknown = JSON.parse(read.text);
@@ -283,7 +305,7 @@ const NEEDED: StepVerdict = { state: "needed" };
 const conflict = (detail: string): StepVerdict => ({ state: "conflict", detail });
 
 async function inspectMarkdown(env: RecoveryApplyEnv, op: RecoveryJournalOp, ctx: OpContext): Promise<StepVerdict & { size?: number }> {
-  const read = await readTextAt(env.root, op.path);
+  const read = await readTextAt(env.root, op.path, env.planReads);
   if (read.state === "error") return conflict("markdown-unreadable");
   if (read.state === "absent") return op.kind === "repair" ? conflict("markdown-missing") : NEEDED;
   if (read.size === 0 && op.kind !== "repair") return NEEDED; // 以前の書き込みが途中で失敗して残った空ファイル（内容を持たない）
@@ -292,7 +314,7 @@ async function inspectMarkdown(env: RecoveryApplyEnv, op: RecoveryJournalOp, ctx
 }
 
 async function inspectIndex(env: RecoveryApplyEnv, op: RecoveryJournalOp): Promise<StepVerdict> {
-  const read = await readJsonAt(env.root, INDEX_PATH);
+  const read = await readJsonAt(env.root, INDEX_PATH, env.planReads);
   if (read.state === "error") return conflict("index-unreadable");
   if (read.state === "absent") return NEEDED;
   let needed = false;
@@ -348,7 +370,7 @@ async function memoryHistoryRowMatches(env: RecoveryApplyEnv, row: unknown, memb
  *   → conflict（矛盾）。既存値を「不足」とみなして勝手に上書きしない。
  */
 async function inspectHistoryMeta(env: RecoveryApplyEnv, month: string, monthIndex: Obj): Promise<StepVerdict> {
-  const read = await readJsonAt(env.root, HISTORY_META_PATH);
+  const read = await readJsonAt(env.root, HISTORY_META_PATH, env.planReads);
   if (read.state === "error") return conflict("history-meta-unreadable");
   if (read.state === "absent") return NEEDED;
   const months = read.value.months;
@@ -401,7 +423,7 @@ function isOutOfScopeMultiMemberRepair(op: RecoveryJournalOp, ctx: OpContext): b
 async function inspectHistory(env: RecoveryApplyEnv, op: RecoveryJournalOp, ctx: OpContext): Promise<StepVerdict> {
   const h = op.expected.history;
   if (!h) return SATISFIED;
-  const read = await readJsonAt(env.root, historyPath(h.day));
+  const read = await readJsonAt(env.root, historyPath(h.day), env.planReads);
   if (read.state === "error") return conflict("history-unreadable");
   if (read.state === "absent") {
     // Codexレビュー再指摘M3（History月ファイルは存在するが対象日/member行が不存在のケースが
@@ -490,7 +512,7 @@ async function inspectRegistry(env: RecoveryApplyEnv, op: RecoveryJournalOp, ctx
   const exp = op.expected.registry;
   if (!exp) return SATISFIED;
   const bucket = vaultRegistryBucketOf(exp.key);
-  const read = await readJsonAt(env.root, shardPath(bucket));
+  const read = await readJsonAt(env.root, shardPath(bucket), env.planReads);
   if (read.state === "error") return conflict("registry-unreadable");
   if (read.state === "absent") return NEEDED;
   const records = read.value.records;
@@ -1116,22 +1138,23 @@ export async function planRecoveryApply(env: RecoveryApplyEnv, confirmedIds: Set
   }
 
   // ---- repair（equivalent-existing：不足している管理情報だけ） ----
+  const planEnv: RecoveryApplyEnv = { ...env, planReads: { text: new Map(), json: new Map() } };
   for (const { r, local } of repairs) {
     const type = r.recordType as RecoveryRecordType;
     const path = r.vaultPaths.length === 1 ? r.vaultPaths[0] : null;
     if (!path) { hold(r, "path-unresolved"); continue; }
-    const text = await readTextAt(env.root, path);
+    const text = await readTextAt(planEnv.root, path, planEnv.planReads);
     if (text.state !== "ok") { hold(r, "markdown-unreadable"); continue; }
     let fileMembers: MemoryObject[] | null = null;
     if (type === "memory") {
       fileMembers = parseDayFileStrict(text.text);
       if (!fileMembers) { hold(r, "dayfile-unparseable"); continue; }
     }
-    const ctx: OpContext = { records: [local], content: text.text, fileMembers, unprovenMemberIds: fileMembers ? await unprovenMembers(env, fileMembers) : undefined };
+    const ctx: OpContext = { records: [local], content: text.text, fileMembers, unprovenMemberIds: fileMembers ? await unprovenMembers(planEnv, fileMembers) : undefined };
     const day = r.date.slice(0, 10);
     const op = baseOp(env, "repair", type, day, [memberOf(type, local)], path, ctx, r.registryKey);
     if (type === "memory") op.expected.history = { day, ids: (fileMembers ?? []).map((m) => m.id) };
-    const inspected = await inspectOp(env, op, ctx);
+    const inspected = await inspectOp(planEnv, op, ctx);
     if (inspected.conflict) { hold(r, inspected.conflict); continue; }
     if (STEP_ORDER.every((s) => op.steps[s] === "not-needed")) continue; // 不足なし（既に整っている）
     ops.push(op);

@@ -203,6 +203,31 @@ export interface VaultWorldExclusiveResult<T> {
  * `navigator.locks`が使えない環境では、タブ間の排他を保証できないため実行せず
  * timedOut扱いにする（安全側、`runVaultSwitchExclusive`と同じ方針）。
  */
+const EXCLUSIVE_WHEN_IDLE_POLL_MS = 500;
+const EXCLUSIVE_WHEN_IDLE_WAIT_MS = 45_000;
+const EXCLUSIVE_LAST_QUEUE_MS = 15_000;
+
+/**
+ * ユーザーが設定画面で選んだ操作（競合の解決・修復）用の排他区間。起動時の確認や保存は共有ロックを長く持つことがあり（端末が遅いほど長い）、
+ * そこへ排他ロックを並べると、その後の通常の読み書き（会話の保存を含む）まで、順番待ちで止まる（Web Locksの順序）。
+ * そこで、まず「空いていれば取る」を繰り返し、順番待ちの列には並ばない。空かなければ、最後に短い時間だけ列に並ぶ（共有ロックが途切れない場合でも進めるため）。
+ * 中の確認と`fn`の決まりは`runVaultWorldExclusive`と同じ。
+ */
+export async function runVaultWorldExclusiveWhenIdle<T>(fn: () => Promise<T>, waitMs: number = EXCLUSIVE_WHEN_IDLE_WAIT_MS, pollMs: number = EXCLUSIVE_WHEN_IDLE_POLL_MS): Promise<VaultWorldExclusiveResult<T>> {
+  if (!locksSupported()) return runVaultWorldExclusive(fn);
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const idle = await navigator.locks.request(LOCK_NAME, { mode: "exclusive", ifAvailable: true }, async (lock) => lock !== null);
+    if (idle && Date.now() < deadline) {
+      // 空きを見た直後に取り直す（取れなければ、ごく短い順番待ちで済む）
+      const quick = await runVaultWorldExclusive(fn, pollMs);
+      if (!quick.timedOut) return quick;
+    }
+    if (Date.now() >= deadline) return runVaultWorldExclusive(fn, EXCLUSIVE_LAST_QUEUE_MS);
+    await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
 export async function runVaultWorldExclusive<T>(
   fn: () => Promise<T>,
   timeoutMs: number = EXCLUSIVE_LOCK_TIMEOUT_MS

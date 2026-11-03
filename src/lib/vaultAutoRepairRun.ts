@@ -13,7 +13,7 @@ import type { MemoryObject } from "./types";
 import { memoryDayFilePath, reconcileConversationOutboxEntry, reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry, reconcileSourceOutboxEntry, type ProjectionEnv } from "./vaultProjection";
 import { withVaultSaveLock } from "./vaultSaveLock";
 import { applyRecovery, createRecoveryApplyEnv, type RecoveryApplyPlan } from "./vaultRecoveryApply";
-import { runVaultWorldExclusive, withVaultWorldRead } from "./vaultWorldLock";
+import { runVaultWorldExclusiveWhenIdle, withVaultWorldRead } from "./vaultWorldLock";
 
 /** 保存先のファイルを読む（無ければnull。読めなければ"unreadable"） */
 export async function readVaultFileBytes(root: FileSystemDirectoryHandle, path: string): Promise<Uint8Array | null | "unreadable"> {
@@ -41,6 +41,20 @@ export interface ProductionAutoRepairOptions {
   checkOptions?: ConsistencyCheckOptions;
 }
 
+/** 保存待ちに戻した記録のOutboxだけを処理する。書き出せなければ（競合・読めない）保存処理がheldに戻す・保存待ちのまま残す */
+export function settleRequeuedSaves(root: FileSystemDirectoryHandle, targets: Pick<RepairTarget, "recordType" | "recordId">[]): Promise<void> {
+  return withVaultWorldRead(() => withVaultSaveLock(async () => {
+    const env: ProjectionEnv = { root, vaultIdentity: (await getVaultIdentityRecord()) ?? null };
+    for (const t of targets) {
+      const entry = await getVaultOutboxEntry(`${t.recordType}:${t.recordId}`);
+      if (!entry || entry.status !== "pending") continue;
+      const reconcile = entry.recordType === "conversation" ? reconcileConversationOutboxEntry : entry.recordType === "memory" ? reconcileMemoryOutboxEntry : entry.recordType === "reflection" ? reconcileReflectionOutboxEntry : entry.recordType === "source" ? reconcileSourceOutboxEntry : null;
+      if (!reconcile) continue;
+      try { await reconcile(env, entry); } catch (error) { console.error("[Tsumugi] auto repair: save of a requeued record failed; it stays in the Outbox", error); }
+    }
+  }));
+}
+
 export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptions): AutoRepairEnv {
   const { root } = options;
   let lastPlan: RecoveryApplyPlan | null = null;
@@ -66,7 +80,7 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
       isCancelled: options.isCancelled,
     }),
     async withExclusive(fn) {
-      const locked = await runVaultWorldExclusive(fn);
+      const locked = await runVaultWorldExclusiveWhenIdle(fn);
       return locked.timedOut || locked.result === undefined ? { ok: false } : { ok: true, value: locked.result };
     },
     readVaultFile: (path) => readVaultFileBytes(root, path),
@@ -107,16 +121,7 @@ export function createProductionAutoRepairEnv(options: ProductionAutoRepairOptio
     },
     // 起動時の保存処理（移行・全件の確認）は使わない：飛ばした記録まで書き出しうるため。保存待ちに戻した記録のOutboxだけを処理する。
     // 書き出せなければ（競合・読めない）保存処理がheldに戻す・保存待ちのまま残す。どちらも直後の再確認に残る
-    settleSaves: options.settleSaves ?? ((targets) => withVaultWorldRead(() => withVaultSaveLock(async () => {
-      const env: ProjectionEnv = { root, vaultIdentity: (await getVaultIdentityRecord()) ?? null };
-      for (const t of targets) {
-        const entry = await getVaultOutboxEntry(`${t.recordType}:${t.recordId}`);
-        if (!entry || entry.status !== "pending") continue;
-        const reconcile = entry.recordType === "conversation" ? reconcileConversationOutboxEntry : entry.recordType === "memory" ? reconcileMemoryOutboxEntry : entry.recordType === "reflection" ? reconcileReflectionOutboxEntry : entry.recordType === "source" ? reconcileSourceOutboxEntry : null;
-        if (!reconcile) continue;
-        try { await reconcile(env, entry); } catch (error) { console.error("[Tsumugi] auto repair: save of a requeued record failed; it stays in the Outbox", error); }
-      }
-    }))),
+    settleSaves: options.settleSaves ?? ((targets) => settleRequeuedSaves(root, targets)),
     isCancelled: options.isCancelled,
   };
 }
