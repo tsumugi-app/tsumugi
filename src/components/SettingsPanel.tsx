@@ -556,6 +556,16 @@ export default function SettingsPanel({
                         整理する
                       </button>
                     )}
+                    {vaultStatusView.hasAttention && !vaultStatusView.hasUpdate && !vaultStatusView.hasCleanup && (
+                      <button
+                        data-testid="vault-check-again"
+                        onClick={onCheckVaultStatus}
+                        disabled={vaultActionsDisabled}
+                        className="rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/10"
+                      >
+                        もう一度確認する
+                      </button>
+                    )}
                   </div>
                 </div>
               )}

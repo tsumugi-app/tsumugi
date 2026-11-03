@@ -837,12 +837,11 @@ test.only("a Memory day file moved outside is not moved in Tsumugi: the copy is 
   expect(await textAt(page, p)).toContain("id: scale-mem-010");
   expect(await rowOf(page, "memoryObjects", "scale-mem-010")).toEqual(device);
   // what the person is told, and what ends it: there is no pair of versions to compare, so no such button is promised
-  await expect(page.getByText("余分なものを外してから")).toBeVisible({ timeout: 120_000 });
+  await expect(page.getByText(/余分なものを外してから/).first()).toBeVisible({ timeout: 120_000 });
   await expect(page.getByTestId("vault-conflict-open")).toHaveCount(0);
   await expect(page.getByText("「内容を見る」で")).toHaveCount(0);
   await removeAt(page, q);
-  await page.getByRole("button", { name: "もう一度確認する" }).click();
-  await pressCheckIfAsked(page);
+  await page.getByTestId("vault-check-again").click({ timeout: 60_000 });
   await waitLatest(page);
   expect(await textAt(page, p)).toContain("id: scale-mem-010");
   expect(await rowOf(page, "memoryObjects", "scale-mem-010")).toEqual(device);

@@ -335,7 +335,7 @@ export async function collectVaultStatusFindings(root: FileSystemDirectoryHandle
   for (const r of missingKept) attention.push(`保存先で本体が見つかりません（この端末には記録が残っています）：${recordLabel(r)}`);
   if (counts.unreadable > 0) attention.push(`読み込めないファイルが${counts.unreadable}件あります`);
   if (!legacyExecutable) {
-    if (counts.conflict > 0) attention.push(`保存先で内容の重複・食い違いが見つかった記録が${counts.conflict}件あります`);
+    if (counts.conflict > 0) attention.push(`保存先で内容の重複・食い違いが見つかった記録が${counts.conflict}件あります。どのファイルも変更していません。同じ記録が複数のファイルにある場合は、移動やコピーをしたファイルのうち余分なものを外してから、もう一度確認してください`);
     for (const p of diff.problems) {
       if (p.status === "conflict") attention.push(`保存先で内容の重複・食い違いが見つかっています（${p.key}）`);
     }
