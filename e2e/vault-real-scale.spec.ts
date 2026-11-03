@@ -316,7 +316,7 @@ test("at real size: two conversations that really differ are found, nothing hide
   while (!(await page.getByText(LATEST).isVisible())) {
     const said = await screenText(page);
     expect(said.includes(BUSY), `refused as busy after ${round((Date.now() - startedAt) / 1000)} s: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world" && l.got !== null).slice(-12).map((l: any) => [l.mode[0], Math.round(l.got), Math.round((l.end ?? performance.now()) - l.got)])))}`).toBe(false);
-    if (Date.now() > deadline) throw new Error(`no 最新. The screen said: ${said.slice(150, 500)} WHY: ${await whyNotLatest(page)}`);
+    if (Date.now() > deadline) throw new Error(`no 最新. The screen said: ${said.slice(150, 500)} ... ${(await page.evaluate(() => [...document.querySelectorAll("[data-testid=vault-conflict-item] button, [data-testid=vault-conflict-message]")].map((b: any) => `${b.innerText.slice(0, 40)}${b.disabled ? "(off)" : ""}`).join(" | ")))} WHY: ${await whyNotLatest(page)} LOCKS: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-8).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end)])))}`);
     await page.waitForTimeout(250);
   }
   report("perf-two-choices", { ...started, t0: undefined, firstDone, bothDone: Date.now() - startedAt, ...(await traceSummary(page)) });
