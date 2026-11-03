@@ -419,7 +419,7 @@ async function requeueHeldConflictsOf(records: VaultResyncRecordResult[]): Promi
   for (const e of await getHeldVaultOutboxEntries()) {
     if (!ids.has(e.recordId) || !/-conflict$/.test(e.heldReason ?? "")) continue;
     const current = e.recordType === "conversation" ? await getConversation(e.recordId) : e.recordType === "source" ? await getSource(e.recordId) : await getMemoryObject(e.recordId);
-    if (current) await requeueRecordForVault(e.recordType, e.recordId, current.updatedAt);
+    if (current) await requeueRecordForVault(e.recordType as "conversation" | "memory" | "reflection" | "source", e.recordId, current.updatedAt);
   }
 }
 
