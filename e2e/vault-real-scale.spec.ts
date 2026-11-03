@@ -684,6 +684,60 @@ test("edited while the app stays open, even with 最新 on screen: its 確認す
   expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話頭");
 });
 
+test.only("the conversation open on screen, edited outside: 更新する shows the edit on the open screen, the next message goes on from it, and after a reload both are kept and Settings says 最新", async ({ page }) => {
+  await cleanStart(page);
+  const chats: string[] = [];
+  await page.route("**/api/**", async (route) => {
+    if (route.request().url().includes("/api/chat")) { chats.push(route.request().postData() ?? ""); await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" }); }
+    else await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+  });
+  const BEFORE = "架空の開いている話題", AFTER = "架空の開いている話題を外で直した", NEXT = "架空の続きの発言";
+  const send = async (text: string) => { await page.locator("footer textarea").fill(text); await page.locator("footer").getByRole("button", { name: "送る" }).click(); };
+  await page.getByRole("button", { name: "閉じる", exact: true }).first().click();
+  // 1. the conversation is open, and saved
+  await page.getByRole("button", { name: "会話", exact: true }).click();
+  await send(BEFORE);
+  await expect(page.getByText("架空の返答です。")).toHaveCount(1, { timeout: 60_000 });
+  const id = await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const all: any[] = await new Promise((res) => { const q = db.transaction("conversations").objectStore("conversations").getAll(); q.onsuccess = () => res(q.result); }); db.close(); return all.filter((c) => !c.id.startsWith("scale-") && c.turns.length > 0).map((c) => c.id)[0]; });
+  await expect.poll(() => outboxOf(page, `conversation:${id}`), { timeout: 60_000 }).toBe("done");
+  await expect.poll(() => fileOf(page, id), { timeout: 60_000 }).toBeTruthy();
+  const p = await fileOf(page, id); const t = (await textAt(page, p))!;
+  expect(t).toContain(BEFORE);
+  // 2. its Markdown is edited outside, 3. 確認する then 更新する
+  const edited = t.replace(BEFORE, AFTER);
+  await writeAt(page, p, edited);
+  await openSettings(page);
+  await pressCheck(page);
+  await pressUpdate(page);
+  await waitLatest(page);
+  await page.getByRole("button", { name: "閉じる", exact: true }).first().click();
+  // 4. the open screen shows the edit, and no longer the old words
+  await expect.soft(page.getByText(AFTER, { exact: true }), "the open screen shows the edit").toHaveCount(1, { timeout: 10_000 });
+  await expect.soft(page.getByText(BEFORE, { exact: true }), "the open screen no longer shows the old words").toHaveCount(0);
+  // 5. the next message goes on from the edit
+  await send(NEXT);
+  await expect(page.getByText("架空の返答です。")).toHaveCount(2, { timeout: 60_000 });
+  expect.soft(chats[chats.length - 1], "the AI is given the edit").toContain(AFTER);
+  await expect.poll(async () => (await rowOf(page, "conversations", id)).turns.length, { timeout: 30_000 }).toBe(4);
+  await expect.poll(() => outboxOf(page, `conversation:${id}`), { timeout: 60_000 }).toBe("done");
+  const kept = async () => {
+    const device = conversationText(await rowOf(page, "conversations", id)); const file = (await textAt(page, p))!;
+    expect.soft(device, "the device keeps the edit").toContain(AFTER); expect.soft(device, "the device keeps the new message").toContain(NEXT);
+    expect.soft(file, "the file keeps the edit").toContain(AFTER); expect.soft(file, "the file keeps the new message").toContain(NEXT);
+    expect.soft(file.includes(`${BEFORE}\n`), "the old words did not come back to the file").toBe(false);
+    expect.soft(device.includes(`"${BEFORE}"`), "the old words did not come back to the device").toBe(false);
+  };
+  await kept();
+  // 6. after a reload both are kept and Settings says 最新
+  await restart(page, "after the open edit");
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+  await kept();
+  await page.getByTestId("vault-check-now").click();
+  await waitLatest(page);
+  await kept();
+});
+
 test("a Memory edited outside: 確認する then 更新する takes the text in, History and search show it, and it survives a reload", async ({ page }) => {
   await cleanStart(page);
   const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!;
