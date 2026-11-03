@@ -684,7 +684,7 @@ test("edited while the app stays open, even with 最新 on screen: its 確認す
   expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話頭");
 });
 
-test.only("the conversation open on screen, edited outside: 更新する shows the edit on the open screen, the next message goes on from it, and after a reload both are kept and Settings says 最新", async ({ page }) => {
+test("the conversation open on screen, edited outside: 更新する shows the edit on the open screen, the next message goes on from it, and after a reload both are kept and Settings says 最新", async ({ page }) => {
   await cleanStart(page);
   // a device that has been used has its Registry baseline (the seed marks the device as set up without one), which is what lets a new conversation's save write its Markdown at once
   const at = new Date(Date.now() - 86_400_000).toISOString();
@@ -744,7 +744,7 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   await kept();
 });
 
-test.only("更新する pressed while a message to the same conversation is still on its way: the update waits for it, then nothing is lost: the file keeps the edit, the device keeps the message, and Settings asks instead of saying 最新", async ({ page }) => {
+test("更新する pressed while a message to the same conversation is still on its way: the update waits for it, then nothing is lost: the file keeps the edit, the device keeps the message, and Settings asks instead of saying 最新", async ({ page }) => {
   await cleanStart(page);
   const at = new Date(Date.now() - 86_400_000).toISOString();
   await writeAt(page, ".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, updatedAt: at, lastFullResyncAt: null, baselineEstablishedAt: at }));
