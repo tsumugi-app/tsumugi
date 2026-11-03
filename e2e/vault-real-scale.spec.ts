@@ -92,6 +92,19 @@ function report(title: string, value: unknown) {
   process.stdout.write(`\n::notice title=${title}::${text}\n`);
 }
 
+/**
+ * Press 実行する the way a person does. The button turns grey while a check runs, and a press at the very moment it turns grey does nothing and
+ * changes nothing: the confirmation stays on screen with 実行する, so the person presses again. Once the choice runs the label changes, and then the confirmation goes.
+ */
+async function pressConfirm(page: Page, confirm: ReturnType<Page["locator"]>) {
+  await confirm.click();
+  for (let i = 0; i < 60; i++) {
+    await page.waitForTimeout(500);
+    if (!(await confirm.isVisible()) || (await confirm.innerText()) !== "実行する") return;
+    if (await confirm.isEnabled()) { report("confirm-pressed-again", { after: (i + 1) * 500 }); await confirm.click(); }
+  }
+}
+
 async function slowCpu(page: Page) {
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_SLOWDOWN });
@@ -303,7 +316,7 @@ test("at real size: two conversations that really differ are found, nothing hide
   const chooseDevice = async (item: ReturnType<Page["locator"]>) => {
     await item.getByTestId("vault-conflict-open").click();
     await item.getByTestId("vault-conflict-choice-adopt-device").click({ timeout: 60_000 });
-    await item.getByTestId("vault-conflict-confirm").click();
+    await pressConfirm(page, item.getByTestId("vault-conflict-confirm"));
   };
   const startedAt = Date.now();
   await chooseDevice(page.getByTestId("vault-conflict-item").first());
@@ -402,7 +415,7 @@ test("at real size: Settings shows two saves held with the file equal; 保存を
   await expect(items).toHaveCount(1);
   expect(await snapshot()).toEqual(before);
   await items.first().getByTestId("vault-conflict-choice-adopt-device").click({ timeout: 60_000 });
-  await items.first().getByTestId("vault-conflict-confirm").click();
+  await pressConfirm(page, items.first().getByTestId("vault-conflict-confirm"));
   await waitLatest(page);
   await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
   // nothing keeps the lock, and the warning does not come back
@@ -554,7 +567,7 @@ test("a long background read does not get a choice refused as busy, and a choice
   // a background read longer than the old 15 s limit, as a slow phone's start-up or check takes
   await page.evaluate(() => { (window as any).__release = null; void navigator.locks.request("tsumugi-vault-world", { mode: "shared" }, () => new Promise<void>((resolve) => { (window as any).__release = resolve; })); });
   await expect.poll(() => page.evaluate(() => (window as any).__release !== null)).toBe(true);
-  await item.getByTestId("vault-conflict-confirm").click();
+  await pressConfirm(page, item.getByTestId("vault-conflict-confirm"));
   await page.waitForTimeout(18_000);
   // while the choice waits, a normal shared read goes straight through (no queue behind a waiting exclusive lock)
   const readWait = await page.evaluate(async () => { const at = performance.now(); await navigator.locks.request("tsumugi-vault-world", { mode: "shared" }, async () => undefined); return Math.round(performance.now() - at); });
@@ -725,7 +738,7 @@ test("both sides changed: nothing is taken in automatically, both versions stay,
   // the user's choice: the device version, with the file's version kept
   await items.first().getByTestId("vault-conflict-open").click();
   await items.first().getByTestId("vault-conflict-choice-adopt-device").click({ timeout: 60_000 });
-  await items.first().getByTestId("vault-conflict-confirm").click();
+  await pressConfirm(page, items.first().getByTestId("vault-conflict-confirm"));
   await expect(items).toHaveCount(0, { timeout: 240_000 });
   await expect.poll(async () => (await textAt(page, p))?.includes("架空の端末の続き")).toBe(true);
   await expect(page.getByTestId("vault-kept-version").first()).toBeVisible();
