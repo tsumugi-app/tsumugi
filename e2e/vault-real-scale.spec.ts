@@ -699,8 +699,8 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   await send(BEFORE);
   await expect(page.getByText("架空の返答です。")).toHaveCount(1, { timeout: 60_000 });
   const id = await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const all: any[] = await new Promise((res) => { const q = db.transaction("conversations").objectStore("conversations").getAll(); q.onsuccess = () => res(q.result); }); db.close(); return all.filter((c) => !c.id.startsWith("scale-") && c.turns.length > 0).map((c) => c.id)[0]; });
-  await expect.poll(() => outboxOf(page, `conversation:${id}`), { timeout: 60_000 }).toBe("done");
-  await expect.poll(() => fileOf(page, id), { timeout: 60_000 }).toBeTruthy();
+  // the normal save writes the Markdown at once (its outbox entry settles at the next start)
+  await expect.poll(async () => { const at = await fileOf(page, id); return at ? await textAt(page, at) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。");
   const p = await fileOf(page, id); const t = (await textAt(page, p))!;
   expect(t).toContain(BEFORE);
   // 2. its Markdown is edited outside, 3. 確認する then 更新する
@@ -719,7 +719,7 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   await expect(page.getByText("架空の返答です。")).toHaveCount(2, { timeout: 60_000 });
   expect.soft(chats[chats.length - 1], "the AI is given the edit").toContain(AFTER);
   await expect.poll(async () => (await rowOf(page, "conversations", id)).turns.length, { timeout: 30_000 }).toBe(4);
-  await expect.poll(() => outboxOf(page, `conversation:${id}`), { timeout: 60_000 }).toBe("done");
+  await expect.poll(async () => (await textAt(page, p)) ?? "", { timeout: 60_000 }).toContain(NEXT);
   const kept = async () => {
     const device = conversationText(await rowOf(page, "conversations", id)); const file = (await textAt(page, p))!;
     expect.soft(device, "the device keeps the edit").toContain(AFTER); expect.soft(device, "the device keeps the new message").toContain(NEXT);
