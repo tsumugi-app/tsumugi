@@ -705,7 +705,7 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   try { await expect.poll(async () => { const at = await fileWith(BEFORE); return at ? await textAt(page, at) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。"); }
   catch (e) {
     const row = await rowOf(page, "conversations", id); const out = await rowOf(page, "vaultOutbox", `conversation:${id}`);
-    const meta = await page.evaluate(async () => { const root = await navigator.storage.getDirectory(); const d = await root.getDirectoryHandle(".tsumugi"); return JSON.parse(await (await (await d.getFileHandle("registry-meta.json")).getFile()).text()); });
+    const meta = await page.evaluate(async () => { const root = await navigator.storage.getDirectory(); const d = await root.getDirectoryHandle(".tsumugi"); const names: string[] = []; const texts: Record<string, string> = {}; for await (const [name, h] of (d as any).entries()) { names.push(name); if (h.kind === "file" && /meta|schema/.test(name)) texts[name] = (await (await h.getFile()).text()).slice(0, 400); } return { names, texts }; });
     throw new Error(`DIAG ${JSON.stringify({ now: new Date().toISOString(), createdAt: row.createdAt, startedAt: row.startedAt, meta, out: out && { status: out.status, steps: out.steps, reason: out.reason ?? out.holdReason, attempts: out.attempts }, logs: logs.slice(-25) })}`, { cause: e });
   }
   const p = await fileWith(BEFORE); const t = (await textAt(page, p))!;
