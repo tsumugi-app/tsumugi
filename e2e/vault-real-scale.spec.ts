@@ -700,8 +700,9 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   await expect(page.getByText("架空の返答です。")).toHaveCount(1, { timeout: 60_000 });
   const id = await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const all: any[] = await new Promise((res) => { const q = db.transaction("conversations").objectStore("conversations").getAll(); q.onsuccess = () => res(q.result); }); db.close(); return all.filter((c) => !c.id.startsWith("scale-") && c.turns.length > 0).map((c) => c.id)[0]; });
   // the normal save writes the Markdown at once (its outbox entry settles at the next start)
-  await expect.poll(async () => { const at = await fileOf(page, id); return at ? await textAt(page, at) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。");
-  const p = await fileOf(page, id); const t = (await textAt(page, p))!;
+  const fileWith = (needle: string) => page.evaluate(async (text) => { const root = await navigator.storage.getDirectory(); let found = ""; const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else if ((await (await h.getFile()).text()).includes(text)) found = `${prefix}${name}`; } }; await walk(await root.getDirectoryHandle("Conversations"), "Conversations/"); return found; }, needle);
+  await expect.poll(async () => { const at = await fileWith(BEFORE); return at ? await textAt(page, at) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。");
+  const p = await fileWith(BEFORE); const t = (await textAt(page, p))!;
   expect(t).toContain(BEFORE);
   // 2. its Markdown is edited outside, 3. 確認する then 更新する
   const edited = t.replace(BEFORE, AFTER);
