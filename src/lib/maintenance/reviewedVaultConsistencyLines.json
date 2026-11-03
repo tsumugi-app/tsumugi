@@ -275,6 +275,12 @@
   "+void startRecoveryBackgroundCheck(vaultHandle, true);",
   "+void startRecoveryBackgroundCheck(handle, true);",
   "+// 反映できる変更があるときは、ここで「違い」と言わない（「更新する」の後に確かめる）",
-  "+if (!findings.updatableRecords.length) recheckConsistencyAfterSaves(vaultHandle, generation);"
+  "+if (!findings.updatableRecords.length) recheckConsistencyAfterSaves(vaultHandle, generation);",
+  "-await runRecoveryBackgroundCheckOnce(handle, generation);",
+  "+await runRecoveryBackgroundCheckOnce(handle, generation, force);",
+  "-async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number) {",
+  "+async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number, force: boolean) {",
+  "-window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle); }, RECOVERY_RECHECK_DELAY_MS);",
+  "+window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle, force); }, RECOVERY_RECHECK_DELAY_MS);"
  ]
 }

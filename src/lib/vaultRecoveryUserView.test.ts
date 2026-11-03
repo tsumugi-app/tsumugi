@@ -98,7 +98,7 @@ test("通常UIの再確認は読み取りだけの「もう一度確認する」
   for (const text of ["古い記録", "onRunRecoveryDryRun", "確認してください"]) assert.ok(!user.includes(text), text);
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
   const recheck = chat.slice(chat.indexOf("function handleRecheckRecovery()"), chat.indexOf("async function handleUserRepair()"));
-  assert.ok(recheck.includes("startRecoveryBackgroundCheck(vaultHandle)") && !/applyRecovery|handleExecuteRecoveryApply|resumeNarrow/.test(recheck), "read-only re-check");
+  assert.ok(recheck.includes("startRecoveryBackgroundCheck(vaultHandle, true)") && !/applyRecovery|handleExecuteRecoveryApply|resumeNarrow/.test(recheck), "read-only re-check");
 });
 test("「もう一度確認する」は、前回の確認が終わっていれば（要確認・保存待ち・未確定のどれでも）必ずもう一度確認する。実行中の確認とは重ねない", () => {
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));

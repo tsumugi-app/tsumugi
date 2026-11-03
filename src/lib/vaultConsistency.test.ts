@@ -285,7 +285,7 @@ test("背景の確認は読み取りだけ。修復・整理・限定修復を�
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, "");
   const chat = strip(fs.readFileSync("src/components/ChatScreen.tsx", "utf8"));
   const check = chat.slice(chat.indexOf("async function startRecoveryBackgroundCheck("), chat.indexOf("function handleRecheckRecovery()"));
-  assert.ok(check.includes("runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)))"));
+  assert.ok(check.includes("runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)), force)"));
   assert.ok(!/applyRecovery\(|resumeNarrowRepairForUser|runLegacyHeldCleanup|executeNarrow|handleExecuteRecoveryApply/.test(check), "never repairs");
   assert.ok(check.includes("recoveryRecheckCountRef.current < RECOVERY_RECHECK_LIMIT"), "bounded automatic re-checks");
   assert.ok(/runProductionBootstrapOnce\(vaultHandle\)[\s\S]*\.then\(\(\) => startRecoveryBackgroundCheck\(vaultHandle\)\)/.test(chat), "started after the normal startup (bootstrap) settles");

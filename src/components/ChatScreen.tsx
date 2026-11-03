@@ -3585,13 +3585,13 @@ export default function ChatScreen() {
     recoveryDetectionRanRef.current = true;
     recoveryCheckInFlightRef.current = generation;
     try {
-      await runRecoveryBackgroundCheckOnce(handle, generation);
+      await runRecoveryBackgroundCheckOnce(handle, generation, force);
     } finally {
       if (recoveryCheckInFlightRef.current === generation) recoveryCheckInFlightRef.current = null;
     }
   }
 
-  async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number) {
+  async function runRecoveryBackgroundCheckOnce(handle: FileSystemDirectoryHandle, generation: number, force: boolean) {
     const cancelled = () => generation !== vaultGenerationRef.current;
     // 確認は必ず終わる：待機・やり直しは有限回で、尽きたら「確認できませんでした」を表示する（空白のままにしない）。
     const waited = await waitUntilIdle(() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current, cancelled);
@@ -3618,7 +3618,7 @@ export default function ChatScreen() {
       if ((report.state === "saving" || report.state === "unsettled") && recoveryRecheckCountRef.current < RECOVERY_RECHECK_LIMIT) {
         recoveryRecheckCountRef.current += 1;
         recoveryDetectionRanRef.current = false;
-        window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle); }, RECOVERY_RECHECK_DELAY_MS);
+        window.setTimeout(() => { if (!cancelled()) void startRecoveryBackgroundCheck(handle, force); }, RECOVERY_RECHECK_DELAY_MS);
       }
     } catch (error) {
       recoveryDetectionRanRef.current = false;
