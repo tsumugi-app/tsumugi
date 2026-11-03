@@ -272,7 +272,7 @@ test("at real size: the empty AI turns are not a conflict anywhere, Settings end
   for (const k of Object.keys(before)) if (k.startsWith("idb:") || k.startsWith("Conversations/")) expect(after[k], k).toBe(before[k]);
 });
 
-test("at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy", async ({ page }) => {
+for (const n of [1, 2, 3, 4, 5, 6]) test.only(`${n} at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy`, async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
