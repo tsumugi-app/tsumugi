@@ -212,7 +212,11 @@ async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, regis
   const expectedContent = conversationToMarkdown(canonical);
   const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError("markdown-unreadable");
-  if (read.state === "absent") return { kind: "create", path };
+  if (read.state === "absent") {
+    // 保存済みの記録が記録された場所に無く、別の場所にある：移動された。ここに作り直すと二重になる（「確認する」で移動を反映すると保存できる）
+    if (registryPath && (await findRecordInVault(env.root, canonical.id)) !== "absent") throw new ProjectionRetryableError("markdown-moved");
+    return { kind: "create", path };
+  }
   if (read.text === expectedContent) return { kind: "no-op", path };
   const parsed = parseConversationMarkdown(read.text);
   if (!parsed) throw new ProjectionConflictError("markdown-unreadable");
@@ -952,7 +956,10 @@ async function decideSingleFileMarkdown<T extends { id: string; createdAt: strin
   const expectedContent = config.toMarkdown(canonical);
   const read = await readTextAt(env, path);
   if (read.state === "error") throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);
-  if (read.state === "absent") return { kind: "create", path };
+  if (read.state === "absent") {
+    if (registryPath && (await findRecordInVault(env.root, canonical.id)) !== "absent") throw new ProjectionRetryableError("markdown-moved");
+    return { kind: "create", path };
+  }
   const parsed = config.parseMarkdown(read.text);
   if (read.text === expectedContent) return { kind: "no-op", path, onDisk: parsed ?? canonical };
   if (!parsed) throw new ProjectionConflictError(`${config.recordType}-markdown-unreadable`);

@@ -14,11 +14,12 @@ export function isVaultStartupInProgress(tabVaultEpoch: number | null, vaultStat
 }
 
 /** 保存済みの全記録の照合を、次に行う時期か。ビルドが変わったとき、前回から時間が経ったとき、前回の記録が読めないときに行う。 */
-export function doneIntegrityIsDue(marker: unknown, build: string, now: string, maxAgeMs: number): boolean {
+export function doneIntegrityIsDue(marker: unknown, build: string, now: string, maxAgeMs: number, missing = 0): boolean {
   if (typeof marker !== "string") return true;
-  let parsed: { build?: unknown; at?: unknown };
+  let parsed: { build?: unknown; at?: unknown; missing?: unknown };
   try { parsed = JSON.parse(marker); } catch { return true; }
   if (parsed?.build !== build || typeof parsed.at !== "string") return true;
+  if ((typeof parsed.missing === "number" ? parsed.missing : 0) !== missing) return true;
   const age = Date.parse(now) - Date.parse(parsed.at);
   return !(age >= 0 && age < maxAgeMs);
 }

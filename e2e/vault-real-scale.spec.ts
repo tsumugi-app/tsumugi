@@ -593,79 +593,234 @@ test("a tab left running on an older build says so, shows its build, and offers 
   await expect(page.getByTestId("app-outdated")).toHaveCount(0);
 });
 
-// TEMPORARY exploration of 「確認する」 with outside edits: what the screen says at each step and what ends up in the records
-let xlog: unknown[] = []; const xr = (k: string, v: unknown) => { xlog.push([k.replace(/^x-[a-z]+-?/, ""), typeof v === "string" ? v.replace("保存先：この端末の安全な領域vdev ", "") : v]); };
-test.afterEach(async ({}, info) => { if (info.title.startsWith("x ")) { report(info.title.replace(/ /g, "-"), { status: info.status, log: xlog }); xlog = []; } });
-const statusPart = async (page: Page) => { const t = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ")); const a = t.indexOf("保存先："); const b = t.indexOf("データ バックアップ"); return t.slice(a, b > a ? b : a + 500).slice(0, 500); };
+
+// ---------------------------------------------------------------------------
+// Outside edits and 「確認する」: what is taken in, what stays held, on the real screens and the real save path. Each start is inside the once-a-day window unless it says otherwise.
+// ---------------------------------------------------------------------------
+const EDIT = "架空の外部編集";
 const fileOf = (page: Page, id: string) => page.evaluate(async (needle) => { const root = await navigator.storage.getDirectory(); let found = ""; const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else if ((await (await h.getFile()).text()).includes(needle)) found = `${prefix}${name}`; } }; await walk(await root.getDirectoryHandle("Conversations"), "Conversations/"); await walk(await root.getDirectoryHandle("Memories"), "Memories/"); return found; }, `id: ${id}`);
 const textAt = (page: Page, path: string) => page.evaluate(async (p) => { const parts = p.split("/"); let d: any = await navigator.storage.getDirectory(); try { for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part); return await (await (await d.getFileHandle(parts[parts.length - 1])).getFile()).text(); } catch { return null; } }, path);
 const writeAt = (page: Page, path: string, text: string) => page.evaluate(async ([p, t]) => { const parts = p.split("/"); let d: any = await navigator.storage.getDirectory(); for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part, { create: true }); const h = await d.getFileHandle(parts[parts.length - 1], { create: true }); const w = await h.createWritable(); await w.write(t); await w.close(); }, [path, text] as const);
 const removeAt = (page: Page, path: string) => page.evaluate(async (p) => { const parts = p.split("/"); let d: any = await navigator.storage.getDirectory(); for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part); await d.removeEntry(parts[parts.length - 1]); }, path);
 const rowOf = (page: Page, store: string, id: string) => page.evaluate(async ([s, k]) => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const v = await new Promise<any>((res) => { const q = db.transaction(s).objectStore(s).get(k); q.onsuccess = () => res(q.result); }); db.close(); return v; }, [store, id] as const);
-async function drive(page: Page, label: string) {
-  for (let step = 0; step < 5; step++) {
-    await page.waitForTimeout(9_000);
-    xr(`x-${label}-${step}`, await statusPart(page));
-    const next = ["変更を反映", "更新する", "確認する"].map((name) => page.getByRole("button", { name, exact: true }).first());
-    let clicked = false;
-    for (const b of next) if (await b.isVisible() && await b.isEnabled()) { xr(`x-${label}-click-${step}`, await b.innerText()); await b.click(); clicked = true; break; }
-    if (!clicked) break;
-  }
+const outboxOf = async (page: Page, id: string) => { const e = await rowOf(page, "vaultOutbox", id); return e?.status; };
+const statusText = async (page: Page) => { const t = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ")); const a = t.indexOf("保存先："); const b = t.indexOf("データ バックアップ"); return t.slice(a, b > a ? b : a + 600).slice(0, 600); };
+const conversationText = (r: any) => JSON.stringify(r.turns);
+async function cleanStart(page: Page) { test.setTimeout(420_000); await page.addInitScript(installTrace); await seedWorld(page); await startApp(page, "clean"); await openSettings(page); await waitLatest(page); await expect.poll(() => rowOf(page, "settings", "doneIntegrityVerified")).toBeTruthy(); }
+async function openSettings(page: Page) { await nav(page).getByRole("button", { name: "設定" }).click(); }
+async function restart(page: Page, label: string) { await startApp(page, label); await openSettings(page); }
+const checkButton = (page: Page) => page.getByRole("button", { name: "確認する", exact: true }).first();
+const updateButton = (page: Page) => page.getByRole("button", { name: "更新する", exact: true });
+/** Settings says something may have changed (or 最新, whose own button still checks), 確認する shows what was found */
+async function pressCheck(page: Page) { await expect(checkButton(page)).toBeEnabled({ timeout: 120_000 }); await checkButton(page).click(); }
+async function pressUpdate(page: Page) { await expect(updateButton(page), await statusText(page)).toBeVisible({ timeout: 60_000 }); await page.getByText("保存先に新しい記録・変更が1件あります").waitFor({ timeout: 10_000 }); await updateButton(page).click(); }
+async function reconcileWithBundle(page: Page, id: string, addTurn: string) {
+  await page.goto(`${BASE}/data`); await page.addScriptTag({ path: bundle });
+  return page.evaluate(async ([cid, text]) => {
+    const { dbm, proj } = (window as any).D; const root = await navigator.storage.getDirectory(); const identity = await dbm.getVaultIdentityRecord();
+    const c = await dbm.getConversation(cid); const at = new Date(Date.parse(c.updatedAt) + 3_600_000).toISOString();
+    const e = await dbm.putConversationWithOutbox({ ...c, updatedAt: at, endedAt: at, turns: [...c.turns, { role: "user", content: text, timestamp: at }], metadata: { ...c.metadata, updatedAt: at } });
+    const r = await proj.reconcileConversationOutboxEntry({ root, vaultIdentity: identity }, e);
+    return { status: r.status, reason: r.reason ?? null };
+  }, [id, addTurn] as const);
 }
-async function cleanStart(page: Page) { await page.addInitScript(installTrace); await seedWorld(page); await startApp(page, "clean"); await nav(page).getByRole("button", { name: "設定" }).click(); await waitLatest(page); }
-async function settings(page: Page, label: string) { await startApp(page, label); await nav(page).getByRole("button", { name: "設定" }).click(); }
-const EDIT = "架空の外部編集";
 
-test("x conversation edit, restart", async ({ page }) => {
-  test.setTimeout(300_000); await cleanStart(page);
-  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
-  await settings(page, "edit"); await drive(page, "conv");
+test("a conversation edited outside, app closed: 確認する then 更新する takes the edit into the conversation, the file stays, it survives a reload, and saving goes on", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const edited = t.replace("架空の話題", EDIT);
+  const others = (await rowOf(page, "conversations", "scale-conv-011"));
+  await writeAt(page, p, edited);
+  await restart(page, "edited");
+  await expect(page.getByText(LATEST)).toHaveCount(0);
+  await pressCheck(page);
+  await pressUpdate(page);
+  await waitLatest(page);
   const r = await rowOf(page, "conversations", "scale-conv-010");
-  xr("x-conv-idb", { edited: JSON.stringify(r.turns).includes(EDIT), turns: r.turns.length, updatedAt: r.updatedAt, file: (await textAt(page, p))!.includes(EDIT) });
-  await settings(page, "edit again"); await page.waitForTimeout(12_000); xr("x-conv-after", await statusPart(page));
-  xr("x-conv-idb2", { edited: JSON.stringify((await rowOf(page, "conversations", "scale-conv-010")).turns).includes(EDIT), file: (await textAt(page, p))!.includes(EDIT) });
+  expect(conversationText(r)).toContain(EDIT);
+  expect(r.turns.length).toBe(8);
+  expect(await textAt(page, p)).toBe(edited);
+  expect(await rowOf(page, "conversations", "scale-conv-011")).toEqual(others);
+  await expect.poll(() => outboxOf(page, "conversation:scale-conv-010")).toBe("done");
+  await restart(page, "after the edit");
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain(EDIT);
+  expect(await textAt(page, p)).toBe(edited);
+  // the conversation goes on with the normal save: both the edit and the new turn are in the file
+  expect(await reconcileWithBundle(page, "scale-conv-010", "架空の編集後の続き")).toEqual({ status: "done", reason: null });
+  const after = (await textAt(page, p))!;
+  expect(after).toContain(EDIT); expect(after).toContain("架空の編集後の続き");
 });
-test("x conversation edit while open", async ({ page }) => {
-  test.setTimeout(300_000); await cleanStart(page);
-  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
-  await drive(page, "open");
-  xr("x-open-buttons", await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()).filter((x) => x.includes("確認"))));
+
+test("edited while the app stays open, even with 最新 on screen: its 確認する finds it at once, with no reload and no waiting for the daily check", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!;
+  // the same size: only the file's time tells
+  const edited = t.replace("架空の話題", "架空の話しだ");
+  expect(new Blob([edited]).size === new Blob([t]).size || edited.length === t.length).toBeTruthy();
+  await writeAt(page, p, edited);
+  const startedAt = Date.now();
+  await page.getByTestId("vault-check-now").click();
+  await pressUpdate(page);
+  await waitLatest(page);
+  report("perf-manual-check", { ms: Date.now() - startedAt });
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話しだ");
+  await restart(page, "after");
+  await waitLatest(page);
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話しだ");
 });
-test.only("x memory edit, restart", async ({ page }) => {
-  test.setTimeout(300_000); await cleanStart(page);
-  const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!; const at = t.indexOf("id: scale-mem-010"); const body = t.indexOf("架空の話題", at); await writeAt(page, p, t.slice(0, body) + EDIT + t.slice(body));
-  await settings(page, "edit"); await drive(page, "mem");
+
+test("a Memory edited outside: 確認する then 更新する takes the text in, History and search show it, and it survives a reload", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!;
+  const at = t.indexOf("id: scale-mem-010"); const summaryAt = t.indexOf("架空の話題", at); const close = t.indexOf("\n---\n", at); const bodyAt = t.indexOf("架空の話題", close);
+  expect(summaryAt).toBeGreaterThan(0); expect(bodyAt).toBeGreaterThan(close);
+  const edited = t.slice(0, summaryAt) + EDIT + t.slice(summaryAt, bodyAt) + EDIT + t.slice(bodyAt);
+  const other = await rowOf(page, "memoryObjects", "scale-mem-011");
+  await writeAt(page, p, edited);
+  await restart(page, "edited");
+  await pressCheck(page);
+  await pressUpdate(page);
+  await waitLatest(page);
   const r = await rowOf(page, "memoryObjects", "scale-mem-010");
-  xr("x-mem-idb", { content: String(r.content).includes(EDIT), summary: String(r.summary).includes(EDIT), updatedAt: r.updatedAt, file: (await textAt(page, p))!.includes(EDIT) });
-  await settings(page, "edit again"); await page.waitForTimeout(12_000); xr("x-mem-after", await statusPart(page));
-  const r2 = await rowOf(page, "memoryObjects", "scale-mem-010"); xr("x-mem-idb2", { content: String(r2.content).includes(EDIT), summary: String(r2.summary).includes(EDIT), file: (await textAt(page, p))!.includes(EDIT) });
+  expect(String(r.content), "body").toContain(EDIT); expect(String(r.summary), "summary").toContain(EDIT);
+  expect(await rowOf(page, "memoryObjects", "scale-mem-011")).toEqual(other);
+  expect(await textAt(page, p)).toBe(edited);
+  await expect.poll(() => outboxOf(page, "memory:scale-mem-010")).toBe("done");
+  const history = await page.evaluate(async () => { const root = await navigator.storage.getDirectory(); const h = await (await root.getDirectoryHandle(".tsumugi")).getDirectoryHandle("history"); let hit = false; for await (const [, f] of (h as any).entries()) if ((await (await f.getFile()).text()).includes("架空の外部編集")) hit = true; return hit; });
+  expect(history, "the History list shows the edited summary").toBe(true);
+  await restart(page, "after the edit");
+  await waitLatest(page);
+  await page.route("**/api/**", async (route) => {
+    if (route.request().url().includes("/api/chat")) await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" });
+    else await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+  });
+  await startApp(page, "search");
+  const sent = page.waitForRequest((q) => q.url().includes("/api/chat"));
+  await page.getByRole("button", { name: "会話", exact: true }).click();
+  await page.locator("footer textarea").fill("架空の外部編集のことを覚えてる？");
+  await page.locator("footer").getByRole("button", { name: "送る" }).click();
+  expect((await sent).postData() ?? "", "the memory search finds the edited text").toContain(EDIT);
+  expect(String((await rowOf(page, "memoryObjects", "scale-mem-010")).content)).toContain(EDIT);
 });
-test.only("x both sides changed", async ({ page }) => {
-  test.setTimeout(300_000); await page.addInitScript(installTrace); await seedWorld(page);
+
+test("both sides changed: nothing is taken in automatically, both versions stay, and the choice in Settings keeps the other version", async ({ page }) => {
+  test.setTimeout(420_000); await page.addInitScript(installTrace); await seedWorld(page);
   await page.evaluate(async () => { const { dbm } = (window as any).D; const c = await dbm.getConversation("scale-conv-010"); const at = new Date(Date.parse(c.updatedAt) + 60_000).toISOString(); await dbm.putConversationWithOutbox({ ...c, updatedAt: at, endedAt: at, turns: [...c.turns, { role: "user", content: "架空の端末の続き", timestamp: at }], metadata: { ...c.metadata, updatedAt: at } }); });
-  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
-  await settings(page, "both"); await drive(page, "both");
-  const r = await rowOf(page, "conversations", "scale-conv-010"); const f = (await textAt(page, p))!;
-  xr("x-both-data", { device: JSON.stringify(r.turns).includes("架空の端末の続き"), deviceHasEdit: JSON.stringify(r.turns).includes(EDIT), fileEdit: f.includes(EDIT), fileHasDevice: f.includes("架空の端末の続き") });
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const edited = t.replace("架空の話題", EDIT); await writeAt(page, p, edited);
+  await restart(page, "both");
+  const items = page.getByTestId("vault-conflict-item");
+  await expect(items).toHaveCount(1, { timeout: 240_000 });
+  await pressCheck(page);
+  await expect(page.getByText("確認が必要な記録があります（今回は変更しません）")).toBeVisible({ timeout: 120_000 });
+  await expect(updateButton(page)).toHaveCount(0);
+  const device = conversationText(await rowOf(page, "conversations", "scale-conv-010"));
+  expect(device).toContain("架空の端末の続き"); expect(device).not.toContain(EDIT);
+  expect(await textAt(page, p)).toBe(edited);
+  await expect(page.getByText(LATEST)).toHaveCount(0);
+  // it stays held across a reload
+  await restart(page, "still both");
+  await expect(items).toHaveCount(1, { timeout: 240_000 });
+  expect(await textAt(page, p)).toBe(edited);
+  // the user's choice: the device version, with the file's version kept
+  await items.first().getByTestId("vault-conflict-open").click();
+  await items.first().getByTestId("vault-conflict-choice-adopt-device").click({ timeout: 60_000 });
+  await items.first().getByTestId("vault-conflict-confirm").click();
+  await expect(items).toHaveCount(0, { timeout: 240_000 });
+  await expect.poll(async () => (await textAt(page, p))?.includes("架空の端末の続き")).toBe(true);
+  await expect(page.getByTestId("vault-kept-version").first()).toBeVisible();
+  await page.getByTestId("vault-kept-version").first().locator("summary").click();
+  await expect(page.getByTestId("vault-kept-vault").first()).toContainText(EDIT);
+  await pressCheckIfAsked(page);
+  await waitLatest(page);
 });
-test.only("x delete, restart", async ({ page }) => {
-  test.setTimeout(300_000); await cleanStart(page);
-  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await removeAt(page, p);
-  await settings(page, "deleted"); await drive(page, "del");
-  xr("x-del-data", { idb: !!(await rowOf(page, "conversations", "scale-conv-010")), file: (await textAt(page, p)) === t });
+async function pressCheckIfAsked(page: Page) {
+  const check = page.getByRole("button", { name: "確認する", exact: true }).first();
+  await expect(page.getByText(LATEST).or(check).first()).toBeVisible({ timeout: 240_000 });
+  if (!(await page.getByText(LATEST).isVisible())) { await check.click(); const update = updateButton(page); await expect(page.getByText(LATEST).or(update).first()).toBeVisible({ timeout: 120_000 }); if (await update.isVisible()) await update.click(); }
+}
+
+test("the normal save does not lose an outside edit it has not seen yet: it holds, the file and the device keep their versions", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const edited = t.replace("架空の話題", EDIT); await writeAt(page, p, edited);
+  const saved = await reconcileWithBundle(page, "scale-conv-010", "架空の端末の続き");
+  expect(saved.status).toBe("held");
+  expect(saved.reason).toMatch(/-conflict$/);
+  expect(await textAt(page, p)).toBe(edited);
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の端末の続き");
+  await restart(page, "held");
+  await expect(page.getByTestId("vault-conflict-item")).toHaveCount(1, { timeout: 240_000 });
+  expect(await textAt(page, p)).toBe(edited);
 });
-test.only("x move, restart", async ({ page }) => {
-  test.setTimeout(300_000); await cleanStart(page);
-  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const q = "Conversations/moved/architected.md"; await removeAt(page, p); await writeAt(page, q, t);
-  await settings(page, "moved"); await drive(page, "mov");
-  xr("x-mov-data", { idb: !!(await rowOf(page, "conversations", "scale-conv-010")), old: (await textAt(page, p)) !== null, moved: (await textAt(page, q)) === t });
-  await settings(page, "moved again"); await page.waitForTimeout(12_000); xr("x-mov-after", await statusPart(page));
-  xr("x-mov-data2", { old: (await textAt(page, p)) !== null, moved: (await textAt(page, q)) === t });
-});
-test.only("x edit, and the daily check runs at the next start", async ({ page }) => {
-  test.setTimeout(300_000); await cleanStart(page);
-  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
+
+test("an edit found by the daily check at the start: the same 確認する and 更新する still take it in, and no hold is left", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const edited = t.replace("架空の話題", EDIT); await writeAt(page, p, edited);
   await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); await new Promise<void>((res) => { const tx = db.transaction("settings", "readwrite"); tx.objectStore("settings").delete("doneIntegrityVerified"); tx.oncomplete = () => res(); }); db.close(); });
-  await settings(page, "daily"); await drive(page, "daily");
-  const r = await rowOf(page, "conversations", "scale-conv-010"); xr("x-daily-data", { deviceHasEdit: JSON.stringify(r.turns).includes(EDIT), fileEdit: (await textAt(page, p))!.includes(EDIT), outbox: await rowOf(page, "vaultOutbox", "conversation:scale-conv-010").then((e: any) => [e.status, e.heldReason]) });
+  await restart(page, "daily");
+  await pressCheck(page);
+  await pressUpdate(page);
+  await waitLatest(page);
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain(EDIT);
+  expect(await textAt(page, p)).toBe(edited);
+  await expect.poll(() => outboxOf(page, "conversation:scale-conv-010")).toBe("done");
+  await restart(page, "after");
+  await waitLatest(page);
+  await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
+});
+
+test("a file deleted outside: nothing is removed from the device; the copy is put back at the next start, and with the app open 確認する says what it found", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!;
+  const device = await rowOf(page, "conversations", "scale-conv-010");
+  await removeAt(page, p);
+  await page.getByTestId("vault-check-now").click();
+  await expect(page.getByText(/見つからない|確認が必要な記録|新しい記録・変更/).first(), await statusText(page)).toBeVisible({ timeout: 60_000 });
+  report("delete-while-open", await statusText(page));
+  expect(await rowOf(page, "conversations", "scale-conv-010")).toEqual(device);
+  await restart(page, "deleted");
+  await expect.poll(() => textAt(page, p), { timeout: 120_000 }).toBe(t);
+  await pressCheckIfAsked(page);
+  await waitLatest(page);
+  expect(await rowOf(page, "conversations", "scale-conv-010")).toEqual(device);
+});
+
+test("a conversation moved outside: no second copy is made, 確認する and 更新する record the new place, later saves go there, and a normal start stays light", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const q = "Conversations/moved/architected.md";
+  const device = await rowOf(page, "conversations", "scale-conv-010");
+  await removeAt(page, p); await writeAt(page, q, t);
+  await restart(page, "moved");
+  await pressCheck(page);
+  await pressUpdate(page);
+  await waitLatest(page);
+  expect(await textAt(page, p)).toBeNull();
+  expect(await textAt(page, q)).toBe(t);
+  expect(await rowOf(page, "conversations", "scale-conv-010")).toEqual(device);
+  await restart(page, "after the move");
+  await waitLatest(page);
+  await restart(page, "and again");
+  await waitLatest(page);
+  const reads = await traceSummary(page);
+  report("perf-after-a-move", { files: reads.files["read:Conversations"] });
+  expect(parseInt(String(reads.files["read:Conversations"] ?? "0"), 10), JSON.stringify(reads.files)).toBeLessThan(120);
+  expect(await textAt(page, p)).toBeNull();
+  expect(await reconcileWithBundle(page, "scale-conv-010", "架空の移動後の続き")).toEqual({ status: "done", reason: null });
+  expect(await textAt(page, p)).toBeNull();
+  expect(await textAt(page, q)).toContain("架空の移動後の続き");
+});
+
+test("a Memory day file moved outside is not moved in Tsumugi: the copy is put back at its place, nothing is lost, and Settings says there are two copies", async ({ page }) => {
+  await cleanStart(page);
+  const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!; const q = "Memories/moved/architected.md";
+  const device = await rowOf(page, "memoryObjects", "scale-mem-010");
+  await removeAt(page, p); await writeAt(page, q, t);
+  await restart(page, "moved");
+  await pressCheck(page);
+  await page.waitForTimeout(10_000);
+  report("memory-move", await statusText(page));
+  await expect(page.getByText(LATEST)).toHaveCount(0);
+  expect(await textAt(page, q)).toBe(t);
+  expect(await textAt(page, p)).toContain("id: scale-mem-010");
+  expect(await rowOf(page, "memoryObjects", "scale-mem-010")).toEqual(device);
 });

@@ -23,7 +23,7 @@
  */
 "use client";
 
-import { getAllConversations, getAllMemoryObjects, getAllSources } from "./db";
+import { getAllConversations, getAllMemoryObjects, getAllSources, getConversation, getHeldVaultOutboxEntries, getMemoryObject, getSource, requeueRecordForVault } from "./db";
 import { jstDateOf } from "./dateModel";
 import {
   applyVaultLightCheckCandidates,
@@ -411,6 +411,18 @@ function message(error: unknown): string {
  * 続行し、結果を返す（呼び出し元が再計測して、未解決が残っていれば「最新」にはしない）。
  * `withVaultWorldRead`／`runVaultWorldExclusive`を呼び出し元が保持していないこと。
  */
+/**
+ * 反映した記録の「内容が違う」保留は、反映前の判定のまま残さない。保存待ちへ戻すだけで、次の保存処理が今の内容で判定し直す（まだ違えば、また保留になる）。
+ */
+async function requeueHeldConflictsOf(records: VaultResyncRecordResult[]): Promise<void> {
+  const ids = new Set(records.flatMap((r) => (r.members ?? []).map((m) => m.id).concat(r.registryKey)));
+  for (const e of await getHeldVaultOutboxEntries()) {
+    if (!ids.has(e.recordId) || !/-conflict$/.test(e.heldReason ?? "")) continue;
+    const current = e.recordType === "conversation" ? await getConversation(e.recordId) : e.recordType === "source" ? await getSource(e.recordId) : await getMemoryObject(e.recordId);
+    if (current) await requeueRecordForVault(e.recordType, e.recordId, current.updatedAt);
+  }
+}
+
 export async function applyVaultStatusUpdate(
   root: FileSystemDirectoryHandle,
   findings: VaultStatusFindings,
@@ -425,6 +437,7 @@ export async function applyVaultStatusUpdate(
         out.steps.push({ name: "保存先の変更を反映", ok: false, detail: "他の操作が実行中でした" });
       } else {
         const problems = outcome.applyErrors.length + outcome.staleSkipped.length;
+        await requeueHeldConflictsOf(findings.updatableRecords);
         out.steps.push({ name: "保存先の変更を反映", ok: problems === 0, detail: problems > 0 ? `${problems}件を反映できませんでした` : undefined });
         out.changed = true;
       }

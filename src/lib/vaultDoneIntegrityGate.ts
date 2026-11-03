@@ -1,14 +1,14 @@
 /**
  * 保存済みの全記録の照合を間引いてよいかの判定（`saveFoundationBootstrap.ts`）。起動ごとに次を確かめ、どれかに当てはまれば期限内でも照合する：
- *   - 起動時の走査で、保存先に無い・読めない記録があった（内容の違いは数えない：turnTimesの無い古い形式は毎回違って見え、照合で直るものでもない。変更は軽い確認が見つける）
+ *   - 起動時の走査で、既定の場所に無い・読めない記録の数が前回の照合の時から変わった（移動された記録は数え続けるので、数の変化を見る。内容の違いは数えない：turnTimesの無い古い形式は毎回違って見え、変更は軽い確認が見つける）
  *   - 全記録で共有する管理ファイル（index、Historyの目次）が無い・読めない、Registryのshardが無い
  * 走査は毎回全ファイルを読むので前者に追加の読み取りは無い。後者は数ファイルだけ読む。
  */
 import { dayFileRegistryKey, vaultRegistryBucketOf } from "./vault";
 import type { ProductionMigrationResult } from "./vaultProductionMigration";
 
-export function migrationFoundNothingMissing(m: ProductionMigrationResult): boolean {
-  return [m.summary, m.reflectionSummary, m.sourceSummary].every((s) => s.idbOnly === 0 && s.unreadable === 0) && m.memorySummary.idbOnly === 0 && m.memorySummary.unreadableDayfiles === 0;
+export function recordsMissingAtTheirPlace(m: ProductionMigrationResult): number {
+  return [m.summary, m.reflectionSummary, m.sourceSummary].reduce((n, s) => n + s.idbOnly + s.unreadable, 0) + m.memorySummary.idbOnly + m.memorySummary.unreadableDayfiles;
 }
 
 async function readObject(dir: FileSystemDirectoryHandle, name: string): Promise<Record<string, unknown>> {

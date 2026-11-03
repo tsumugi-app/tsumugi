@@ -263,6 +263,9 @@
   "+// 解決の直後の確認は、続く保存と重なることがある。問題が残っていれば、保存が終わってからもう一度確かめる（古い警告を残さない）",
   "+if (outcome.after.state !== \"clean\") {",
   "+void waitForBackgroundFlushToSettle(VAULT_SWITCH_SETTLE_TIMEOUT_MS).then(() => {",
-  "+void startRecoveryBackgroundCheck(handle);"
+  "+void startRecoveryBackgroundCheck(handle);",
+  "+/** 手動の確認・反映の後は、整合性の表示も今の状態で確かめ直す（前回の判定を残さない）。保存が終わってから読む。 */",
+  "+function recheckConsistencyAfterSaves(handle: FileSystemDirectoryHandle, generation: number) {",
+  "+recheckConsistencyAfterSaves(vaultHandle, generation);"
  ]
 }

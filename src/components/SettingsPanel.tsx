@@ -472,7 +472,14 @@ export default function SettingsPanel({
                 </span>
               )}
 
-              {vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView) && <span>✓ 最新の状態です</span>}
+              {vaultStatusView.kind === "latest" && recoveryAllowsLatest(recoveryUserView) && (
+                <div className="flex items-center justify-between gap-4">
+                  <span>✓ 最新の状態です</span>
+                  <button data-testid="vault-check-now" onClick={onCheckVaultStatus} disabled={vaultActionsDisabled} className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/10">
+                    確認する
+                  </button>
+                </div>
+              )}
 
               {vaultStatusView.kind === "maybe" && (
                 <div className="flex items-center justify-between gap-4 rounded-xl bg-amber-50/60 px-3 py-2 dark:bg-amber-950/20">

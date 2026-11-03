@@ -388,5 +388,7 @@ test("doneIntegrityIsDue：同じビルドで期限内なら照合しない。�
   assert.equal(doneIntegrityIsDue(marker("b", "2026-11-02T00:00:00.000Z"), "b", now, day), true);
   assert.equal(doneIntegrityIsDue(marker("b", "2026-11-04T00:00:00.000Z"), "b", now, day), true);
   assert.equal(doneIntegrityIsDue(undefined, "b", now, day), true);
+  assert.equal(doneIntegrityIsDue(JSON.stringify({ build: "b", at: "2026-11-03T00:00:00.000Z", missing: 1 }), "b", now, day, 1), false, "a moved file stays counted");
+  assert.equal(doneIntegrityIsDue(JSON.stringify({ build: "b", at: "2026-11-03T00:00:00.000Z", missing: 1 }), "b", now, day, 2), true, "one more is missing");
   assert.equal(doneIntegrityIsDue("{not json", "b", now, day), true);
 });

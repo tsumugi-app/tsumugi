@@ -1287,7 +1287,7 @@ export async function getDoneIntegrityMarker(): Promise<unknown> {
   const db = await getDB();
   return db.get("settings", DONE_INTEGRITY_MARKER_KEY);
 }
-export async function setDoneIntegrityMarker(marker: { build: string; at: string }): Promise<void> {
+export async function setDoneIntegrityMarker(marker: { build: string; at: string; missing: number }): Promise<void> {
   const db = await getDB();
   await db.put("settings", JSON.stringify(marker), DONE_INTEGRITY_MARKER_KEY);
 }

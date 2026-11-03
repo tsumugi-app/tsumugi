@@ -40,7 +40,7 @@ import { ensureVaultIdentityForCurrentWorld, type VaultIdentityEnv, type VaultId
 import { runProductionBootstrapMigration, type ProductionMigrationResult } from "./vaultProductionMigration";
 import { getDoneIntegrityMarker, setDoneIntegrityMarker } from "./db";
 import { doneIntegrityIsDue } from "./vaultStartupState";
-import { migrationFoundNothingMissing, sharedManagementFilesAreReadable } from "./vaultDoneIntegrityGate";
+import { recordsMissingAtTheirPlace, sharedManagementFilesAreReadable } from "./vaultDoneIntegrityGate";
 import { reconcilePendingVaultOutbox, reconcileDoneVaultOutboxIntegrity, reevaluateHeldOutboxOnce, type ReconcileAllRecordTypesResult, type ProjectionEnv } from "./vaultProjection";
 
 // legacy writerと同じ排他区間を使用し、day-fileのread/modify/write競合を防ぐ。
@@ -124,9 +124,9 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     // 実体が既に正しいrecordは、各stepの既存no-op検出により1byteも書き込まれない
     // （Phase 3-7.1 req 3-F）。
     const now = (env.now ?? (() => new Date().toISOString()))();
-    const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs) || !migrationFoundNothingMissing(migration) || !(await sharedManagementFilesAreReadable(env.root));
+    const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs, recordsMissingAtTheirPlace(migration)) || !(await sharedManagementFilesAreReadable(env.root));
     const integrity = verifyDone ? await reconcileDoneVaultOutboxIntegrity(projectionEnv) : null;
-    if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now });
+    if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now, missing: recordsMissingAtTheirPlace(migration) });
 
     // 6. final rescanはmigration自身の内部rescanで既に完結している。
     // 7. 必要なら追加outbox reconcile：migrationの最終rescan・reconcile・

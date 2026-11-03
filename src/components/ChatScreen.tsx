@@ -3886,6 +3886,16 @@ export default function ChatScreen() {
   }
 
   /** 「確認する」。既存のdry-runを順に実行して、必要な対応を導く（何も書き込まない）。 */
+  /** 手動の確認・反映の後は、整合性の表示も今の状態で確かめ直す（前回の判定を残さない）。保存が終わってから読む。 */
+  function recheckConsistencyAfterSaves(handle: FileSystemDirectoryHandle, generation: number) {
+    void waitForBackgroundFlushToSettle(VAULT_SWITCH_SETTLE_TIMEOUT_MS).then(() => {
+      if (generation !== vaultGenerationRef.current) return;
+      recoveryDetectionRanRef.current = false;
+      recoveryRecheckCountRef.current = 0;
+      void startRecoveryBackgroundCheck(handle);
+    });
+  }
+
   async function handleCheckVaultStatus() {
     if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
     const generation = vaultGenerationRef.current;
@@ -3901,6 +3911,7 @@ export default function ChatScreen() {
       setVaultStatusCheck({ kind: "ready", findings, generation, note: null });
       // 確認のために中断したflushの残り（通常の保存の未反映分）を再開する。
       flushPendingToVaultInBackground(vaultHandle);
+      recheckConsistencyAfterSaves(vaultHandle, generation);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setVaultStatusCheck({ kind: "idle" });
@@ -3946,6 +3957,7 @@ export default function ChatScreen() {
       }
       setVaultStatusCheck({ kind: "ready", findings, generation, note: outcome.steps.filter((step) => !step.ok) });
       flushPendingToVaultInBackground(vaultHandle);
+      recheckConsistencyAfterSaves(vaultHandle, generation);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setVaultStatusCheck({ kind: "idle" });
