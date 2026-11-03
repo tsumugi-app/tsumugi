@@ -823,7 +823,7 @@ test("a conversation moved outside: no second copy is made, 確認する and 更
   expect(await textAt(page, q)).toContain("架空の移動後の続き");
 });
 
-test.only("a Memory day file moved outside is not moved in Tsumugi: the copy is put back at its place, nothing is lost, and Settings says there are two copies", async ({ page }) => {
+test("a Memory day file moved outside is not moved in Tsumugi: the copy is put back at its place, nothing is lost, and Settings says there are two copies", async ({ page }) => {
   await cleanStart(page);
   const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!; const q = "Memories/moved/architected.md";
   const device = await rowOf(page, "memoryObjects", "scale-mem-010");
