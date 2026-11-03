@@ -686,12 +686,16 @@ test("edited while the app stays open, even with 最新 on screen: its 確認す
 
 test.only("the conversation open on screen, edited outside: 更新する shows the edit on the open screen, the next message goes on from it, and after a reload both are kept and Settings says 最新", async ({ page }) => {
   await cleanStart(page);
+  // a device that has been used has its Registry baseline (the seed marks the device as set up without one), which is what lets a new conversation's save write its Markdown at once
+  const at = new Date(Date.now() - 86_400_000).toISOString();
+  await writeAt(page, ".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, updatedAt: at, lastFullResyncAt: null, baselineEstablishedAt: at }));
+  await restart(page, "with its baseline");
+  await waitLatest(page);
   const chats: string[] = [];
   await page.route("**/api/**", async (route) => {
     if (route.request().url().includes("/api/chat")) { chats.push(route.request().postData() ?? ""); await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" }); }
     else await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
   });
-  const logs: string[] = []; page.on("console", (m) => { const t = m.text(); if (m.type() !== "log" || t.startsWith("[Conversation]")) logs.push(`${m.type()}:${t.slice(0, 160)}`); });
   const BEFORE = "架空の開いている話題", AFTER = "架空の開いている話題を外で直した", NEXT = "架空の続きの発言";
   const send = async (text: string) => { await page.locator("footer textarea").fill(text); await page.locator("footer").getByRole("button", { name: "送る" }).click(); };
   await page.getByRole("button", { name: "閉じる", exact: true }).first().click();
@@ -702,12 +706,7 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   const id = await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const all: any[] = await new Promise((res) => { const q = db.transaction("conversations").objectStore("conversations").getAll(); q.onsuccess = () => res(q.result); }); db.close(); return all.filter((c) => !c.id.startsWith("scale-") && c.turns.length > 0).map((c) => c.id)[0]; });
   // the normal save writes the Markdown at once (its outbox entry settles at the next start)
   const fileWith = (needle: string) => page.evaluate(async (text) => { const root = await navigator.storage.getDirectory(); let found = ""; const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else if ((await (await h.getFile()).text()).includes(text)) found = `${prefix}${name}`; } }; await walk(await root.getDirectoryHandle("Conversations"), "Conversations/"); return found; }, needle);
-  try { await expect.poll(async () => { const at = await fileWith(BEFORE); return at ? await textAt(page, at) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。"); }
-  catch (e) {
-    const row = await rowOf(page, "conversations", id); const out = await rowOf(page, "vaultOutbox", `conversation:${id}`);
-    const meta = await page.evaluate(async () => { const root = await navigator.storage.getDirectory(); const d = await root.getDirectoryHandle(".tsumugi"); const names: string[] = []; const texts: Record<string, string> = {}; for await (const [name, h] of (d as any).entries()) { names.push(name); if (h.kind === "file" && /meta|schema/.test(name)) texts[name] = (await (await h.getFile()).text()).slice(0, 400); } return { names, texts }; });
-    throw new Error(`DIAG ${JSON.stringify({ now: new Date().toISOString(), createdAt: row.createdAt, startedAt: row.startedAt, meta, out: out && { status: out.status, steps: out.steps, reason: out.reason ?? out.holdReason, attempts: out.attempts }, logs: logs.slice(-25) })}`, { cause: e });
-  }
+  await expect.poll(async () => { const at = await fileWith(BEFORE); return at ? await textAt(page, at) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。");
   const p = await fileWith(BEFORE); const t = (await textAt(page, p))!;
   expect(t).toContain(BEFORE);
   // 2. its Markdown is edited outside, 3. 確認する then 更新する
