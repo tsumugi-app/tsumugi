@@ -116,7 +116,7 @@ async function cutThenReload(page: Page, part: string) {
   await expect(page.getByRole("button", { name: OPEN_AGAIN })).toBeVisible({ timeout: 30_000 });
 }
 
-test.describe.only("a reply cut off on its way, after a reload", () => {
+test.describe("a reply cut off on its way, after a reload", () => {
   const PART = "架空の返答の途中まで", FULL = "架空の最後まで届いた返答です。", NEXT = "架空の次の発言";
 
   test("cut → marked as unfinished → reload → try again → a normal reply: the cut words stay marked and folded, nothing counts twice, and the AI and Capture do not get them", async ({ page }) => {
@@ -250,6 +250,36 @@ test.describe.only("a reply cut off on its way, after a reload", () => {
     expect(contents(await opened(page))).toEqual([["user", SAID], ["ai", EDITED], ["ai", FULL]]);
     expect(marked(await opened(page))).toEqual([EDITED]);
     expect((await fileWith(page, EDITED)).length).toBe(1);
+  });
+
+  test("the history marks the cut words too: unfinished while nothing follows, folded once a reply follows", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    await fakeApi(page, [{ body: FULL }]);
+    await openConversation(page);
+    await cutNext(page, PART);
+    await send(page, SAID);
+    await expect(page.getByText(CUT_MESSAGE)).toBeVisible({ timeout: 30_000 });
+    const history = async () => {
+      await nav(page).getByRole("button", { name: "これまでの記憶を見る" }).click();
+      await page.getByRole("button", { name: new RegExp(SAID) }).first().click({ timeout: 30_000 });
+      await page.getByRole("button", { name: "会話全文を見る" }).click();
+      return page.locator("div.flex.flex-col.gap-3", { has: page.getByRole("button", { name: "戻る" }) }).last();
+    };
+    let view = await history();
+    await expect(view.getByText(CUT_LABEL)).toBeVisible();
+    await expect(view.getByText(PART, { exact: true })).toBeVisible();
+    await page.goto(BASE);
+    await page.getByRole("button", { name: "tsumugiを開く" }).click({ timeout: 60_000 });
+    await page.getByRole("button", { name: OPEN_AGAIN }).click({ timeout: 30_000 });
+    await retryButton(page).click();
+    await expect(page.getByText(FULL, { exact: true })).toBeVisible({ timeout: 30_000 });
+    view = await history();
+    await expect(view.getByText(CUT_LABEL)).toBeVisible();
+    await expect(view.getByText(PART, { exact: true })).toBeHidden();
+    await expect(view.getByText(FULL, { exact: true })).toBeVisible();
+    await view.getByText(CUT_LABEL).click();
+    await expect(view.getByText(PART, { exact: true }), "folded, not gone").toBeVisible();
   });
 
   test("a conversation without a cut reply stays byte for byte as it was", async ({ page }) => {
