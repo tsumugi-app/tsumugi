@@ -224,12 +224,14 @@ export const NOT_STARTED_TEXT: Record<AutoRepairNotStarted, string> = {
   cancelled: "修復を中止しました。何も変更していません。",
 };
 
+export const NEEDS_CHOICE_ACTION_TEXT = "どちらを残すかは自動で決めません。「内容を見る」で両方の版を確認し、安全に実行できる選択肢から選べます。選ぶまで両方の版を保持します。";
+
 /** 残った記録の種類ごとの、次に取れる操作 */
 export const NEXT_ACTION_TEXT: Record<ConsistencyCategory, string> = {
   saving: "自動で保存されます。少し後に「もう一度確認する」で確かめられます。",
   repairable: "もう一度「修復する」を押すと、同じ規則で続きを直します。",
   repairLater: "今のバージョンでは自動で直せません。データは保持しています。「バックアップを作成」で退避できます。",
-  needsChoice: "どちらを残すかは自動で決めません。「内容を見る」で両方の版を確認し、安全に実行できる選択肢から選べます。選ぶまで両方の版を保持します。",
+  needsChoice: NEEDS_CHOICE_ACTION_TEXT,
   retryable: "時間をおいて「もう一度確認する」を押してください。",
   unknown: "データは保持しています。「バックアップを作成」で退避できます。",
 };

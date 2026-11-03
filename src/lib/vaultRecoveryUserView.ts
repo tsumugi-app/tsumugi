@@ -7,6 +7,7 @@
  *   修復の途中  → 前回の修復の続きを完了する
  * 件数・種類・理由だけを出す（本文・IDは出さない）。PC / Android / iPhoneで意味を分けない。
  */
+import { NEEDS_CHOICE_ACTION_TEXT } from "./vaultAutoRepair";
 import type { ConflictRef } from "./vaultConflictResolution";
 import type { ConsistencyCategory, ConsistencyGroup, ConsistencyReason, ConsistencyRecordType, ConsistencyReport } from "./vaultConsistency";
 
@@ -68,6 +69,8 @@ export interface RecoveryAttentionSection {
   note: string;
   lines: string[];
   count: number;
+  /** 種類ごとの標準の案内（NEXT_ACTION_TEXT）が当てはまらないときの案内 */
+  action?: string;
 }
 export type RecoveryUserView =
   /** まだ確認を始めていない。「最新の状態です」と言ってはいけない。 */
@@ -84,13 +87,18 @@ export type RecoveryUserView =
   | { kind: "interrupted" }
   | { kind: "repairing" };
 
+export const MULTIPLE_COPIES_ACTION_TEXT = "同じ記録が複数のファイルにあります。どのファイルも変更していません。保存先のフォルダで、移動やコピーをしたファイルのうち余分なものを外してから「もう一度確認する」を押してください。";
+
 /** 確認結果（report）から、要確認の表示（種類ごとの見出し・説明・件数×理由の行）を作る。保存待ちも隠さず最後に数える。 */
 export function attentionSections(report: ConsistencyReport): RecoveryAttentionSection[] {
   const order: ConsistencyCategory[] = ["repairable", "needsChoice", "repairLater", "retryable", "unknown", "saving"];
   return order
     .map((category) => {
       const groups = report.groups.filter((g) => g.category === category);
-      return { category, ...CATEGORY_TEXT[category], lines: groups.map(consistencyGroupText), count: groups.reduce((n, g) => n + g.count, 0) };
+      const section = { category, ...CATEGORY_TEXT[category], lines: groups.map(consistencyGroupText), count: groups.reduce((n, g) => n + g.count, 0) };
+      // 同じ記録が複数のファイルにある場合は、版を見比べて選ぶ画面が無い。無いものを案内しない
+      const copies = groups.some((g) => g.reason === "multiple-copies");
+      return copies ? { ...section, action: groups.every((g) => g.reason === "multiple-copies") ? MULTIPLE_COPIES_ACTION_TEXT : `${MULTIPLE_COPIES_ACTION_TEXT} ${NEEDS_CHOICE_ACTION_TEXT}` } : section;
     })
     .filter((s) => s.count > 0);
 }

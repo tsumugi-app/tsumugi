@@ -1384,7 +1384,7 @@ export default function SettingsPanel({
                   <span className="font-medium">{section.title}（{section.count}件）</span>
                   {section.lines.map((line) => <span key={line}>{line}</span>)}
                   <span className="text-stone-500 dark:text-stone-400">{section.note}</span>
-                  <span className="text-stone-500 dark:text-stone-400">{NEXT_ACTION_TEXT[section.category]}</span>
+                  <span className="text-stone-500 dark:text-stone-400">{section.action ?? NEXT_ACTION_TEXT[section.category]}</span>
                 </div>
               ))}
               {recoveryUserView.kind === "attention" && onResolveConflict && conflictRefs.length > 0 && (

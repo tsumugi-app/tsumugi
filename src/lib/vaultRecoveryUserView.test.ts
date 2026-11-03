@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { deriveRecoveryUserView, recoveryAllowsLatest, RECOVERY_ATTENTION_TEXT, RECOVERY_REPAIR_BUTTON } from "./vaultRecoveryUserView";
+import { attentionSections, deriveRecoveryUserView, MULTIPLE_COPIES_ACTION_TEXT, recoveryAllowsLatest, RECOVERY_ATTENTION_TEXT, RECOVERY_REPAIR_BUTTON } from "./vaultRecoveryUserView";
 import type { ConsistencyCategory, ConsistencyReport, ConsistencyState } from "./vaultConsistency";
 
 const report = (state: ConsistencyState, counts: Partial<Record<ConsistencyCategory, number>> = {}, repairableIds: string[] = []): ConsistencyReport => {
@@ -106,4 +106,12 @@ test("「もう一度確認する」は、前回の確認が終わっていれ�
   assert.ok(/if \(!vaultHandle \|\| recoveryCheckInFlightRef\.current === vaultGenerationRef\.current\) return;\s+recoveryDetectionRanRef\.current = false;/.test(recheck), "only an in-flight check blocks a manual re-check");
   const start = chat.slice(chat.indexOf("async function startRecoveryBackgroundCheck("), chat.indexOf("async function runRecoveryBackgroundCheckOnce("));
   assert.ok(start.includes("recoveryCheckInFlightRef.current = generation;") && /finally \{\s+if \(recoveryCheckInFlightRef\.current === generation\) recoveryCheckInFlightRef\.current = null;/.test(start), "the in-flight mark is always cleared");
+});
+
+test("同じ記録が複数のファイルにある場合：無い「内容を見る」を案内せず、ファイルを外す操作を案内する。選べる記録が混ざれば両方を案内する", () => {
+  const withGroups = (reasons: ("multiple-copies" | "different-content")[]) => attentionSections({ ...report("attention", { needsChoice: reasons.length }), groups: reasons.map((reason) => ({ category: "needsChoice" as const, reason, recordType: "memory" as const, count: 1 })) });
+  assert.equal(withGroups(["multiple-copies"])[0].action, MULTIPLE_COPIES_ACTION_TEXT);
+  assert.ok(!withGroups(["multiple-copies"])[0].action?.includes("内容を見る"));
+  assert.ok(withGroups(["multiple-copies", "different-content"])[0].action?.includes("内容を見る"));
+  assert.equal(withGroups(["different-content"])[0].action, undefined);
 });
