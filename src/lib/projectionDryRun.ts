@@ -168,8 +168,9 @@ function analyzeRewrite(type: RT, canonical: Conversation | MemoryObject | Sourc
     const o = fmOf(before), n = fmOf(after);
     const keys = new Set([...Object.keys(o), ...Object.keys(n)]);
     keys.delete("turnTimes");
+    keys.delete("interruptedTurns");
     const diff = [...keys].filter((k) => !same(o[k], n[k]));
-    const lossFields = Object.keys(o).filter((k) => k !== "turnTimes" && o[k] !== undefined && !same(o[k], n[k]));
+    const lossFields = Object.keys(o).filter((k) => k !== "turnTimes" && k !== "interruptedTurns" && o[k] !== undefined && !same(o[k], n[k]));
     if (type === "conversation") {
       const old = parseConversationMarkdown(before);
       if (old && old.turns.length < (canonical as Conversation).turns.length) return { reason: "semanticSuccessor", lossFields };

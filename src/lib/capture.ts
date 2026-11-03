@@ -33,6 +33,7 @@ import {
   validateTopicEventQuotes,
 } from "./topicEvent";
 import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { turnsForAi } from "./aiReplyOutcome";
 import { trustedStatedAt } from "./captureEvidence";
 
 const AI_PROVIDER = "gemini";
@@ -460,7 +461,7 @@ async function captureConversationImpl(
   const relatedMemoryObjects = await findRelatedMemoriesFromOtherConversations(conversation, existingMemoryObjects);
   const { memories: extracted, diagnostics } = await extractMemories(
     conversation.persona,
-    conversation.turns,
+    turnsForAi(conversation.turns),
     existingMemoryObjects,
     relatedMemoryObjects,
     debugId

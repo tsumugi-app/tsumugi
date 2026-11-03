@@ -101,6 +101,8 @@ export interface ConversationTurn {
    * 既存Conversationとの後方互換性のためoptional（未設定＝不明として扱う）。
    */
   webSearchRequested?: boolean;
+  /** このAIターンは生成の途中で止まった（届いた分だけの本文）。Markdownにはfrontmatterの`interruptedTurns`で保存する。未設定＝完了した応答。 */
+  interrupted?: boolean;
   /**
    * このAIターンを生成した直前のユーザー発言が、明示的な記録依頼だったか
    * （`looksLikeRecordRequest()`の判定結果）。Test 27で判明した通り、AI出力の見た目

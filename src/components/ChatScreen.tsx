@@ -20,7 +20,8 @@ import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
-import { isBlankAiReply, retryableTurns } from "@/lib/aiReplyOutcome";
+import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
+import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
   applyVaultLightCheckCandidates,
@@ -713,8 +714,8 @@ export default function ChatScreen() {
   const [vaultReauthDismissed, setVaultReauthDismissed] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
   const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
-  // 途中で止まった応答のturn。もう一度試すときに、このturnはAIへ渡さない（記録には残す）。
-  const [interruptedTurnAt, setInterruptedTurnAt] = useState<string | null>(null);
+  // 再読み込みの前に途中で止まった応答で終わった会話。ホーム画面から続きを開ける。
+  const [interruptedConversation, setInterruptedConversation] = useState<Conversation | null>(null);
   const sendInFlightRef = useRef(false);
   const [reflectionStatus, setReflectionStatus] = useState<ReflectionStatus>("idle");
   const [reflectionText, setReflectionText] = useState("");
@@ -740,6 +741,7 @@ export default function ChatScreen() {
       setMemoryObjects((prev) => prev.filter((m) => m.conversationId !== deletedConversationId));
       setTopPrompt((prev) => (prev && prev.memory.conversationId === deletedConversationId ? null : prev));       // 「過去からの問いかけ」も、削除した会話の記憶から作られたものは出さない
       setEndedConversationMemories((prev) => (prev ? prev.filter((m) => m.conversationId !== deletedConversationId) : prev));
+      setInterruptedConversation((prev) => (prev?.id === deletedConversationId ? null : prev));
       if (latestConversationRef.current.id === deletedConversationId) {
         const fresh = createConversation(persona, entryType);
         setConversation(fresh);
@@ -1445,6 +1447,7 @@ export default function ChatScreen() {
     setBusy(false);
     setCaptureStatus("idle");
     setSendStatus("idle");
+    setInterruptedConversation(null);
     setReflectionStatus("idle");
     setReflectionText("");
     setRestoreCandidate(null);
@@ -2332,8 +2335,10 @@ export default function ChatScreen() {
           // （後続のrunConversationBoundary()自体が内部でロックを取得する関数を呼ぶため、
           // ここでロックを保持したまま呼ぶとネストになる。vaultWorldLock.ts参照）。
           const allConversations = await withVaultWorldRead(() => getAllConversations());
+          setInterruptedConversation(newestInterruptedConversation(allConversations));
           const uncaptured = allConversations
-            .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0)
+            // 途中で止まった応答で終わった会話は、再試行するかを利用者が決めるまでCaptureしない。
+            .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0 && !endsWithInterruptedReply(conversationRecord))
             .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
             .slice(0, STARTUP_CAPTURE_LIMIT);
           logStartupCatchupStart("captureCatchup", uncaptured.length);
@@ -4958,7 +4963,7 @@ export default function ChatScreen() {
         },
         body: JSON.stringify({
           persona: activePersona,
-          turns: retryTurns ?? updated.turns,
+          turns: turnsForAi(retryTurns ?? updated.turns),
           retrievedMemories,
           ...(recentConversation ? { recentConversation } : {}),
           ...(topicContext ? { topicContext } : {}),
@@ -5035,6 +5040,7 @@ export default function ChatScreen() {
         content: replyText,
         timestamp: new Date().toISOString(),
         ...(webSearchRequested !== undefined ? { webSearchRequested } : {}),
+        ...(interrupted ? { interrupted: true } : {}),
       };
       // 新保存基盤 Phase 3-2：User turn送信からGemini応答までの間にcanonicalが
       // （このタブの別処理等で）先へ進んでいる可能性を考慮し、React state（`updated`、
@@ -5109,10 +5115,7 @@ export default function ChatScreen() {
       // ままだとStaleVaultTabErrorが未処理のPromise rejectionになってしまう。.catch()で拾う。
       setBusy(false);
       saveConversationFile(updated);
-      if (interrupted) {
-        setInterruptedTurnAt(aiTurn.timestamp);
-        setSendStatus("interrupted");
-      }
+      if (interrupted) setSendStatus("interrupted");
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to send message", error);
@@ -5129,9 +5132,40 @@ export default function ChatScreen() {
   /** 応答を得られなかった発言について、発言を増やさずもう一度応答を求める。 */
   function handleRetryReply() {
     const current = latestConversationRef.current;
-    const turns = current.endedAt ? null : retryableTurns(current.turns, interruptedTurnAt);
+    const turns = current.endedAt ? null : retryableTurns(current.turns);
     if (!turns) return;
     void handleSend(turns[turns.length - 1].content, current.persona, undefined, turns);
+  }
+
+  /** ホーム画面から、途中で止まった応答で終わった会話を開き直す。最新の記録を読み直してから開く。 */
+  async function handleOpenInterruptedConversation() {
+    const target = interruptedConversation;
+    if (!target || busy || isVaultSwitchingRef.current || crossTabStale) return;
+    setInterruptedConversation(null);
+    const latest = await withVaultWorldRead(() => getConversation(target.id));
+    if (!latest || !endsWithInterruptedReply(latest)) return;
+    setConversation(latest);
+    latestConversationRef.current = latest;
+    setPersona(latest.persona);
+    setEntryType(latest.entryType);
+    setEntryConfirmed(true);
+    setMemoryObjects([]);
+    setEndedConversationMemories(null);
+    setReflectionStatus("idle");
+    setReflectionText("");
+    setSessionCapturedMemories([]);
+    setInputResetKey((k) => k + 1);
+    setStreamingText("");
+    setSendStatus("interrupted");
+  }
+
+  /** 再試行しないと決めた会話を、通常の会話の区切りと同じ扱いで閉じる（Captureは1回だけ。本文はそのまま残る）。 */
+  async function handleLeaveInterruptedConversation() {
+    const target = interruptedConversation;
+    if (!target || isVaultSwitchingRef.current || crossTabStale) return;
+    setInterruptedConversation(null);
+    const latest = await withVaultWorldRead(() => getConversation(target.id));
+    if (latest && endsWithInterruptedReply(latest)) void trackMemoryTask(runConversationBoundary(latest));
   }
 
   /**
@@ -5465,6 +5499,29 @@ export default function ChatScreen() {
 
         {showEntryScreen ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
+            {interruptedConversation && (
+              <div className="flex flex-col items-center gap-3 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                <p>前回の応答が途中で止まっています。届いた部分は残っています。</p>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenInterruptedConversation()}
+                    disabled={isVaultSwitching || crossTabStale}
+                    className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/5"
+                  >
+                    続きを開く
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleLeaveInterruptedConversation()}
+                    disabled={isVaultSwitching || crossTabStale}
+                    className="shrink-0 rounded-full px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 disabled:opacity-50 dark:text-stone-400 dark:hover:bg-white/5"
+                  >
+                    このままにする
+                  </button>
+                </div>
+              </div>
+            )}
             {topPrompt && (
               <div className="flex w-full flex-col items-center gap-3 border-b border-black/5 pb-8 dark:border-white/10">
                 <p className="whitespace-pre-wrap text-base text-stone-600 dark:text-stone-300">
@@ -5566,7 +5623,7 @@ export default function ChatScreen() {
 
             {conversation.turns.map((turn, index) => (
               <div key={index}>
-                <TurnBubble turn={turn} />
+                <TurnBubble turn={turn} superseded={isSupersededTurn(conversation.turns, index)} />
                 {turn.role === "ai" && <GenerationDebugBadge turnTimestamp={turn.timestamp} />}
               </div>
             ))}
@@ -5943,7 +6000,7 @@ export default function ChatScreen() {
             応答が途中で止まりました。届いた部分は残しています。
           </p>
         )}
-        {sendStatus !== "idle" && !busy && !conversation.endedAt && retryableTurns(conversation.turns, interruptedTurnAt) && (
+        {sendStatus !== "idle" && !busy && !conversation.endedAt && retryableTurns(conversation.turns) && (
           <button
             type="button"
             onClick={handleRetryReply}
@@ -6389,7 +6446,8 @@ function HomeIcon() {
   );
 }
 
-function TurnBubble({ turn }: { turn: ConversationTurn }) {
+function TurnBubble({ turn, superseded }: { turn: ConversationTurn; superseded?: boolean }) {
+  if (turn.interrupted) return <InterruptedTurn content={turn.content} superseded={!!superseded} />;
   if (turn.role === "user") {
     return (
       <div className="flex justify-end">

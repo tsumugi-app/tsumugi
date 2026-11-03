@@ -111,7 +111,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of chatRouteDiff) assert.ok(/synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  for (const l of captureDiff) assert.ok(/existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  for (const l of captureDiff) assert.ok(/turnsForAi|existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
   // ChatScreen: the only allowed change is the reviewed swap of the three restore-from-Vault writers (never replace newer local data with an older Vault copy)
   // Third reviewed change (startup I/O reduction): the projection engine remembers reads inside ONE reconcile pass (cleared by every write; a write / hold / conflict is always decided again
   // from fresh reads), skips writes that would change nothing, and ChatScreen's fixed startup wait became completion detection. Reviewed as one unit; see vaultProjection.test.ts "Pass reuse".

@@ -50,7 +50,7 @@ const keyOf = (line: string) => line.slice(0, line.indexOf(":")).trim();
 
 /** Tsumugiが版を進めるたびに変わる項目。これ以外のfrontmatterの行は、置き換えた後にも残っていなければ「元の内容が残る」とは言えない */
 export const MEMORY_EVOLVING_KEYS: ReadonlySet<string> = new Set(["updatedAt"]);
-export const CONVERSATION_EVOLVING_KEYS: ReadonlySet<string> = new Set(["updatedAt", "endedAt", "status", "turnTimes", "memoryObjectIds"]);
+export const CONVERSATION_EVOLVING_KEYS: ReadonlySet<string> = new Set(["updatedAt", "endedAt", "status", "turnTimes", "interruptedTurns", "memoryObjectIds"]);
 
 /**
  * `next`が`current`の内容をすべて含むか（上の原則の(2)）：

@@ -252,7 +252,7 @@ test.describe.only("a reply cut off on its way, after a reload", () => {
     expect((await fileWith(page, EDITED)).length).toBe(1);
   });
 
-  test("the history shows the cut words as unfinished; a conversation without any stays byte for byte as it was", async ({ page }) => {
+  test("a conversation without a cut reply stays byte for byte as it was", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page);
     await fakeApi(page, [{ body: FULL }]);
