@@ -20,6 +20,7 @@ import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
+import { isBlankAiReply, retryableTurns } from "@/lib/aiReplyOutcome";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
 import {
   applyVaultLightCheckCandidates,
@@ -271,7 +272,7 @@ export type VaultLightCheckStatus =
   | { kind: "partial"; message: string }
   | { kind: "error"; message: string };
 
-type SendStatus = "idle" | "error" | "authError";
+type SendStatus = "idle" | "error" | "authError" | "emptyReply" | "interrupted";
 
 /**
  * 「保存先の記録を端末へ追加」（Vault→IndexedDBの追加専用復元）のUI状態。"dry-run"は
@@ -712,6 +713,9 @@ export default function ChatScreen() {
   const [vaultReauthDismissed, setVaultReauthDismissed] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
   const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
+  // 途中で止まった応答のturn。もう一度試すときに、このturnはAIへ渡さない（記録には残す）。
+  const [interruptedTurnAt, setInterruptedTurnAt] = useState<string | null>(null);
+  const sendInFlightRef = useRef(false);
   const [reflectionStatus, setReflectionStatus] = useState<ReflectionStatus>("idle");
   const [reflectionText, setReflectionText] = useState("");
   const [restoreCandidate, setRestoreCandidate] = useState<RestoreCandidate | null>(null);
@@ -4707,10 +4711,11 @@ export default function ChatScreen() {
    * 読む必要はない（`input`自体がもうChatScreenには存在しない。ChatInputが送信成功後に
    * 自分のローカルstateをクリアする）。
    */
-  async function handleSend(overrideText?: string, overridePersona?: Persona, overrideEntryType?: ConversationEntryKind) {
+  async function handleSend(overrideText?: string, overridePersona?: Persona, overrideEntryType?: ConversationEntryKind, retryTurns?: ConversationTurn[]) {
     const text = (overrideText ?? "").trim();
     // Vault境界の安全性：切替処理中・stale判定中は新規の送信を開始させない。
-    if (!text || busy || isVaultSwitchingRef.current || crossTabStale) return;
+    if (!text || busy || sendInFlightRef.current || isVaultSwitchingRef.current || crossTabStale) return;
+    sendInFlightRef.current = true;
     const activePersona = overridePersona ?? persona;
     // Entry Type / Persona分離（2026-10-01）：overridePersonaと同じ理由
     // （「過去からの問いかけ」はsetEntryType()直後、再レンダーを挟まずこの関数を呼ぶため、
@@ -4751,9 +4756,16 @@ export default function ChatScreen() {
       content: text,
       timestamp: new Date().toISOString(),
     };
-    let updated = appendTurn(baseConversation, userTurn);
+    // もう一度試すときは、記録済みの発言をそのまま使う（発言を追加しない）。
+    let updated = retryTurns ? baseConversation : appendTurn(baseConversation, userTurn);
     setConversation(updated);
     latestConversationRef.current = updated;
+    const saveConversationFile = (target: Conversation) =>
+      void trackMemoryTask(trackConversationWrite(persistConversation(vaultHandle, target))).catch((error) => {
+        if (!handleStaleVaultTabError(error)) {
+          console.error("Failed to persist conversation turn", error);
+        }
+      });
 
     try {
       // 新保存基盤 Phase 3-2（Invariant 6）：Userが送信したturnは、Gemini requestより
@@ -4946,7 +4958,7 @@ export default function ChatScreen() {
         },
         body: JSON.stringify({
           persona: activePersona,
-          turns: updated.turns,
+          turns: retryTurns ?? updated.turns,
           retrievedMemories,
           ...(recentConversation ? { recentConversation } : {}),
           ...(topicContext ? { topicContext } : {}),
@@ -4974,18 +4986,29 @@ export default function ChatScreen() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let full = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        full += decoder.decode(value, { stream: true });
-        // Conversation Debugger v1：generationIdを送った場合だけ、サーバーが応答末尾に
-        // 付け足すdebug envelope区切りを探し、表示にはその手前までしか使わない
-        // （通常ユーザーの表示は従来通りfullをそのまま使う＝区切りが見つかることが無い）。
-        const delimiterIdx = generationId ? full.indexOf(DEBUG_ENVELOPE_DELIMITER) : -1;
-        const displayText = delimiterIdx === -1 ? full : full.slice(0, delimiterIdx);
-        // サーバーが先頭の日時ラベル（入力専用）を取り除くが、念のためクライアントでも表示前に防御する。
-        setStreamingText(stripLeadingTimeLabelsForDisplay(displayText));
-        stopWaiting();
+      let shownText = "";
+      let interrupted = false;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          full += decoder.decode(value, { stream: true });
+          // Conversation Debugger v1：generationIdを送った場合だけ、サーバーが応答末尾に
+          // 付け足すdebug envelope区切りを探し、表示にはその手前までしか使わない
+          // （通常ユーザーの表示は従来通りfullをそのまま使う＝区切りが見つかることが無い）。
+          const delimiterIdx = generationId ? full.indexOf(DEBUG_ENVELOPE_DELIMITER) : -1;
+          const displayText = delimiterIdx === -1 ? full : full.slice(0, delimiterIdx);
+          // サーバーが先頭の日時ラベル（入力専用）を取り除くが、念のためクライアントでも表示前に防御する。
+          shownText = stripLeadingTimeLabelsForDisplay(displayText);
+          setStreamingText(shownText);
+          stopWaiting();
+        }
+      } catch (streamError) {
+        // 本文が届く前に切れたら送信失敗のまま。本文が届いた後に切れたら、届いた分を消さず発言として残す。
+        if (isBlankAiReply(shownText)) throw streamError;
+        console.error("[Tsumugi] AI reply stopped on its way", streamError);
+        interrupted = true;
+        full = shownText;
       }
 
       // Conversation Debugger v1：最終的なfullから、可視本文とdebug envelopeを分離する。
@@ -4993,7 +5016,7 @@ export default function ChatScreen() {
       // ため、delimiterIdxは常に-1＝visibleTextは従来のfullと完全に同じになる。
       let visibleText = full;
       let debugEnvelope: GenerationDebugEnvelope | null = null;
-      if (generationId) {
+      if (generationId && !interrupted) {
         const delimiterIdx = full.indexOf(DEBUG_ENVELOPE_DELIMITER);
         if (delimiterIdx !== -1) {
           visibleText = full.slice(0, delimiterIdx);
@@ -5005,10 +5028,11 @@ export default function ChatScreen() {
         }
       }
 
+      // 保存（IndexedDB・Vault Markdown・以降のCapture）へ日時ラベルが混入しないよう、保存直前にも正規化する。
+      const replyText = normalizeAiResponseText(visibleText);
       const aiTurn: ConversationTurn = {
         role: "ai",
-        // 保存（IndexedDB・Vault Markdown・以降のCapture）へ日時ラベルが混入しないよう、保存直前にも正規化する。
-        content: normalizeAiResponseText(visibleText),
+        content: replyText,
         timestamp: new Date().toISOString(),
         ...(webSearchRequested !== undefined ? { webSearchRequested } : {}),
       };
@@ -5024,6 +5048,17 @@ export default function ChatScreen() {
         if (latestBeforeAssistant && latestBeforeAssistant.updatedAt > updated.updatedAt) assistantBase = latestBeforeAssistant;
       } catch (error) {
         console.error("[Tsumugi] failed to re-read latest conversation before appending assistant turn", error);
+      }
+      // 本文の無い応答は発言にしない。発言はそのまま保存し、画面で知らせて、同じ発言でもう一度試せるようにする。
+      if (isBlankAiReply(replyText)) {
+        console.warn("[Tsumugi] AI reply ended with no text");
+        updated = assistantBase;
+        setConversation(updated);
+        latestConversationRef.current = updated;
+        setStreamingText("");
+        setSendStatus("emptyReply");
+        saveConversationFile(updated);
+        return;
       }
       updated = appendTurn(assistantBase, aiTurn);
       setConversation(updated);
@@ -5073,21 +5108,30 @@ export default function ChatScreen() {
       // persistConversation自体が内部でH4のロック＋epoch確認を行うため、fire-and-forgetの
       // ままだとStaleVaultTabErrorが未処理のPromise rejectionになってしまう。.catch()で拾う。
       setBusy(false);
-      void trackMemoryTask(trackConversationWrite(persistConversation(vaultHandle, updated))).catch((error) => {
-        if (!handleStaleVaultTabError(error)) {
-          console.error("Failed to persist conversation turn", error);
-        }
-      });
+      saveConversationFile(updated);
+      if (interrupted) {
+        setInterruptedTurnAt(aiTurn.timestamp);
+        setSendStatus("interrupted");
+      }
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to send message", error);
       setSendStatus(error instanceof ChatRequestError && error.status === 401 ? "authError" : "error");
     } finally {
       setBusy(false);
+      sendInFlightRef.current = false;
       stopWaiting();
       endTask();
       sendDone();
     }
+  }
+
+  /** 応答を得られなかった発言について、発言を増やさずもう一度応答を求める。 */
+  function handleRetryReply() {
+    const current = latestConversationRef.current;
+    const turns = current.endedAt ? null : retryableTurns(current.turns, interruptedTurnAt);
+    if (!turns) return;
+    void handleSend(turns[turns.length - 1].content, current.persona, undefined, turns);
   }
 
   /**
@@ -5888,6 +5932,26 @@ export default function ChatScreen() {
           <p className="mt-1 text-xs text-red-600 dark:text-red-400">
             メッセージの送信に失敗しました。しばらくしてからもう一度お試しください。
           </p>
+        )}
+        {sendStatus === "emptyReply" && (
+          <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+            AIから応答を受け取れませんでした。発言は残っています。
+          </p>
+        )}
+        {sendStatus === "interrupted" && (
+          <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+            応答が途中で止まりました。届いた部分は残しています。
+          </p>
+        )}
+        {sendStatus !== "idle" && !busy && !conversation.endedAt && retryableTurns(conversation.turns, interruptedTurnAt) && (
+          <button
+            type="button"
+            onClick={handleRetryReply}
+            disabled={isVaultSwitching || crossTabStale}
+            className="mt-1 text-xs text-stone-500 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-700 disabled:opacity-50 dark:text-stone-400 dark:decoration-stone-700 dark:hover:text-stone-200"
+          >
+            もう一度試す
+          </button>
         )}
       </footer>
       )}
