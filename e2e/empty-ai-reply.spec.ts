@@ -98,7 +98,7 @@ async function staysLatest(page: Page) {
   await expect(conflicts(page)).toHaveCount(0);
 }
 
-test.describe.only("an AI reply with no words", () => {
+test.describe("an AI reply with no words", () => {
   test("empty reply → the screen says so → try again → a normal reply → saved → reload: one user turn, one AI turn, one Memory, and 最新", async ({ page }) => {
     test.setTimeout(240_000);
     await seed(page);
@@ -305,6 +305,7 @@ test.describe.only("an AI reply with no words", () => {
     await page.getByRole("button", { name: "トップ画面へ戻る" }).click();
     await expect(page.getByText("今日は、どう話そう？")).toBeVisible({ timeout: 30_000 });
     await expect.poll(() => captures.length, { timeout: 30_000 }).toBe(1);
+    await expect.poll(async () => (await memoriesOf(page, id)).length, { timeout: 30_000 }).toBe(1);
     await page.getByRole("button", { name: "会話", exact: true }).click();
     await expect(retryButton(page)).toHaveCount(0);
     await expect(page.getByText(EMPTY_MESSAGE)).toHaveCount(0);
