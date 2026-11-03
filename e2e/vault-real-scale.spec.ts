@@ -272,7 +272,7 @@ test("at real size: the empty AI turns are not a conflict anywhere, Settings end
   for (const k of Object.keys(before)) if (k.startsWith("idb:") || k.startsWith("Conversations/")) expect(after[k], k).toBe(before[k]);
 });
 
-for (const n of [1, 2, 3, 4, 5, 6]) test.only(`${n} at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy`, async ({ page }) => {
+for (const n of Array.from({ length: 24 }, (_, i) => i)) test.only(`${n} at real size: two conversations that really differ are found, nothing hides them, and choosing one right after the other is not refused as busy`, async ({ page }) => {
   test.setTimeout(900_000);
   await page.addInitScript(installTrace);
   await seedWorld(page);
@@ -311,12 +311,14 @@ for (const n of [1, 2, 3, 4, 5, 6]) test.only(`${n} at real size: two conversati
   catch { throw new Error(`the first choice did not settle. The screen said: ${(await screenText(page)).slice(150, 700)} WHY: ${await whyNotLatest(page)} LOCKS: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-10).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end), l.abandoned])))}`); }
   const firstDone = Date.now() - startedAt;
   await expect(page.getByText(LATEST)).toHaveCount(0);   // the other one is still a conflict
+  await page.waitForTimeout([0, 1500, 4000, 8000][n % 4]);
+  const logs: string[] = []; page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") logs.push(m.text().slice(0, 160)); });
   await chooseDevice(page.getByTestId("vault-conflict-item").first());   // right after the first
-  const deadline = Date.now() + 240_000;
+  const deadline = Date.now() + 90_000;
   while (!(await page.getByText(LATEST).isVisible())) {
     const said = await screenText(page);
     expect(said.includes(BUSY), `refused as busy after ${round((Date.now() - startedAt) / 1000)} s: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world" && l.got !== null).slice(-12).map((l: any) => [l.mode[0], Math.round(l.got), Math.round((l.end ?? performance.now()) - l.got)])))}`).toBe(false);
-    if (Date.now() > deadline) throw new Error(`no 最新. The screen said: ${said.slice(150, 500)} ... ${(await page.evaluate(() => [...document.querySelectorAll("[data-testid=vault-conflict-item] button, [data-testid=vault-conflict-message]")].map((b: any) => `${b.innerText.slice(0, 40)}${b.disabled ? "(off)" : ""}`).join(" | ")))} WHY: ${await whyNotLatest(page)} LOCKS: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-8).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end)])))}`);
+    if (Date.now() > deadline) throw new Error(`delay ${n % 4} logs ${logs.slice(-6).join(" ## ")} no 最新. The screen said: ${said.slice(150, 500)} ... ${(await page.evaluate(() => [...document.querySelectorAll("[data-testid=vault-conflict-item] button, [data-testid=vault-conflict-message]")].map((b: any) => `${b.innerText.slice(0, 40)}${b.disabled ? "(off)" : ""}`).join(" | ")))} WHY: ${await whyNotLatest(page)} LOCKS: ${await page.evaluate(() => JSON.stringify((window as any).__trace.locks.filter((l: any) => l.name === "tsumugi-vault-world").slice(-8).map((l: any) => [l.mode[0], Math.round(l.at), l.got === null ? "waiting" : Math.round(l.got), l.end === null ? "open" : Math.round(l.end)])))}`);
     await page.waitForTimeout(250);
   }
   report("perf-two-choices", { ...started, t0: undefined, firstDone, bothDone: Date.now() - startedAt, ...(await traceSummary(page)) });
