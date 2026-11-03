@@ -592,3 +592,78 @@ test("a tab left running on an older build says so, shows its build, and offers 
   await waitLatest(page);
   await expect(page.getByTestId("app-outdated")).toHaveCount(0);
 });
+
+// TEMPORARY exploration of 「確認する」 with outside edits: what the screen says at each step and what ends up in the records
+const statusPart = async (page: Page) => { const t = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ")); const a = t.indexOf("保存先："); const b = t.indexOf("データ バックアップ"); return t.slice(a, b > a ? b : a + 500).slice(0, 500); };
+const fileOf = (page: Page, id: string) => page.evaluate(async (needle) => { const root = await navigator.storage.getDirectory(); let found = ""; const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else if ((await (await h.getFile()).text()).includes(needle)) found = `${prefix}${name}`; } }; await walk(await root.getDirectoryHandle("Conversations"), "Conversations/"); await walk(await root.getDirectoryHandle("Memories"), "Memories/"); return found; }, `id: ${id}`);
+const textAt = (page: Page, path: string) => page.evaluate(async (p) => { const parts = p.split("/"); let d: any = await navigator.storage.getDirectory(); try { for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part); return await (await (await d.getFileHandle(parts[parts.length - 1])).getFile()).text(); } catch { return null; } }, path);
+const writeAt = (page: Page, path: string, text: string) => page.evaluate(async ([p, t]) => { const parts = p.split("/"); let d: any = await navigator.storage.getDirectory(); for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part, { create: true }); const h = await d.getFileHandle(parts[parts.length - 1], { create: true }); const w = await h.createWritable(); await w.write(t); await w.close(); }, [path, text] as const);
+const removeAt = (page: Page, path: string) => page.evaluate(async (p) => { const parts = p.split("/"); let d: any = await navigator.storage.getDirectory(); for (const part of parts.slice(0, -1)) d = await d.getDirectoryHandle(part); await d.removeEntry(parts[parts.length - 1]); }, path);
+const rowOf = (page: Page, store: string, id: string) => page.evaluate(async ([s, k]) => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const v = await new Promise<any>((res) => { const q = db.transaction(s).objectStore(s).get(k); q.onsuccess = () => res(q.result); }); db.close(); return v; }, [store, id] as const);
+async function drive(page: Page, label: string) {
+  for (let step = 0; step < 5; step++) {
+    await page.waitForTimeout(9_000);
+    report(`x-${label}-${step}`, await statusPart(page));
+    const next = ["変更を反映", "更新する", "確認する"].map((name) => page.getByRole("button", { name, exact: true }).first());
+    let clicked = false;
+    for (const b of next) if (await b.isVisible() && await b.isEnabled()) { report(`x-${label}-click-${step}`, await b.innerText()); await b.click(); clicked = true; break; }
+    if (!clicked) break;
+  }
+}
+async function cleanStart(page: Page) { await page.addInitScript(installTrace); await seedWorld(page); await startApp(page, "clean"); await nav(page).getByRole("button", { name: "設定" }).click(); await waitLatest(page); }
+async function settings(page: Page, label: string) { await startApp(page, label); await nav(page).getByRole("button", { name: "設定" }).click(); }
+const EDIT = "架空の外部編集";
+
+test.only("x conversation edit, restart", async ({ page }) => {
+  test.setTimeout(300_000); await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
+  await settings(page, "edit"); await drive(page, "conv");
+  const r = await rowOf(page, "conversations", "scale-conv-010");
+  report("x-conv-idb", { edited: JSON.stringify(r.turns).includes(EDIT), turns: r.turns.length, updatedAt: r.updatedAt, file: (await textAt(page, p))!.includes(EDIT) });
+  await settings(page, "edit again"); await page.waitForTimeout(12_000); report("x-conv-after", await statusPart(page));
+  report("x-conv-idb2", { edited: JSON.stringify((await rowOf(page, "conversations", "scale-conv-010")).turns).includes(EDIT), file: (await textAt(page, p))!.includes(EDIT) });
+});
+test.only("x conversation edit while open", async ({ page }) => {
+  test.setTimeout(300_000); await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
+  await drive(page, "open");
+  report("x-open-buttons", await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()).filter((x) => x.includes("確認"))));
+});
+test.only("x memory edit, restart", async ({ page }) => {
+  test.setTimeout(300_000); await cleanStart(page);
+  const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!; const at = t.indexOf("id: scale-mem-010"); const body = t.indexOf("架空の話題", at); await writeAt(page, p, t.slice(0, body) + EDIT + t.slice(body));
+  await settings(page, "edit"); await drive(page, "mem");
+  const r = await rowOf(page, "memoryObjects", "scale-mem-010");
+  report("x-mem-idb", { content: String(r.content).includes(EDIT), summary: String(r.summary).includes(EDIT), updatedAt: r.updatedAt, file: (await textAt(page, p))!.includes(EDIT) });
+  await settings(page, "edit again"); await page.waitForTimeout(12_000); report("x-mem-after", await statusPart(page));
+  const r2 = await rowOf(page, "memoryObjects", "scale-mem-010"); report("x-mem-idb2", { content: String(r2.content).includes(EDIT), summary: String(r2.summary).includes(EDIT), file: (await textAt(page, p))!.includes(EDIT) });
+});
+test.only("x both sides changed", async ({ page }) => {
+  test.setTimeout(300_000); await page.addInitScript(installTrace); await seedWorld(page);
+  await page.evaluate(async () => { const { dbm } = (window as any).D; const c = await dbm.getConversation("scale-conv-010"); const at = new Date(Date.parse(c.updatedAt) + 60_000).toISOString(); await dbm.putConversationWithOutbox({ ...c, updatedAt: at, endedAt: at, turns: [...c.turns, { role: "user", content: "架空の端末の続き", timestamp: at }], metadata: { ...c.metadata, updatedAt: at } }); });
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
+  await settings(page, "both"); await drive(page, "both");
+  const r = await rowOf(page, "conversations", "scale-conv-010"); const f = (await textAt(page, p))!;
+  report("x-both-data", { device: JSON.stringify(r.turns).includes("架空の端末の続き"), deviceHasEdit: JSON.stringify(r.turns).includes(EDIT), fileEdit: f.includes(EDIT), fileHasDevice: f.includes("架空の端末の続き") });
+});
+test.only("x delete, restart", async ({ page }) => {
+  test.setTimeout(300_000); await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await removeAt(page, p);
+  await settings(page, "deleted"); await drive(page, "del");
+  report("x-del-data", { idb: !!(await rowOf(page, "conversations", "scale-conv-010")), file: (await textAt(page, p)) === t });
+});
+test.only("x move, restart", async ({ page }) => {
+  test.setTimeout(300_000); await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; const q = "Conversations/moved/architected.md"; await removeAt(page, p); await writeAt(page, q, t);
+  await settings(page, "moved"); await drive(page, "mov");
+  report("x-mov-data", { idb: !!(await rowOf(page, "conversations", "scale-conv-010")), old: (await textAt(page, p)) !== null, moved: (await textAt(page, q)) === t });
+  await settings(page, "moved again"); await page.waitForTimeout(12_000); report("x-mov-after", await statusPart(page));
+  report("x-mov-data2", { old: (await textAt(page, p)) !== null, moved: (await textAt(page, q)) === t });
+});
+test.only("x edit, and the daily check runs at the next start", async ({ page }) => {
+  test.setTimeout(300_000); await cleanStart(page);
+  const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!; await writeAt(page, p, t.replace("架空の話題", EDIT));
+  await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); await new Promise<void>((res) => { const tx = db.transaction("settings", "readwrite"); tx.objectStore("settings").delete("doneIntegrityVerified"); tx.oncomplete = () => res(); }); db.close(); });
+  await settings(page, "daily"); await drive(page, "daily");
+  const r = await rowOf(page, "conversations", "scale-conv-010"); report("x-daily-data", { deviceHasEdit: JSON.stringify(r.turns).includes(EDIT), fileEdit: (await textAt(page, p))!.includes(EDIT), outbox: await rowOf(page, "vaultOutbox", "conversation:scale-conv-010").then((e: any) => [e.status, e.heldReason]) });
+});
