@@ -125,15 +125,17 @@ test.describe.only("an AI reply with no words", () => {
     await saved(page, SAID, 2);
     expect(captures.length, "trying again runs no Capture").toBe(0);
     const id = (await opened(page)).id;
+    // ending the conversation makes one Memory from one message
+    await page.getByRole("button", { name: "この会話を終える" }).click();
+    await expect.poll(() => captures.length, { timeout: 30_000 }).toBe(1);
+    expect(captures[0].turns.map((t: any) => [t.role, t.content]), "Capture sees each turn once").toEqual([["user", SAID], ["ai", REPLY]]);
+    await expect.poll(async () => (await memoriesOf(page, id)).length, { timeout: 30_000 }).toBe(1);
     // reload: the same, in the record and in the file, and the state is clean
     await staysLatest(page);
     expect(shape(await opened(page))).toEqual([["user", SAID], ["ai", REPLY]]);
     await saved(page, SAID, 2);
-    await expect.poll(() => captures.length, { timeout: 30_000 }).toBe(1);
-    expect(captures[0].turns.filter((t: any) => t.role === "user").length, "Capture sees the message once").toBe(1);
-    await expect.poll(async () => (await memoriesOf(page, id)).length, { timeout: 30_000 }).toBe(1);
     await staysLatest(page);
-    expect(captures.length, "the next start does not capture it again").toBe(1);
+    expect(captures.length, "no start captures it again").toBe(1);
     expect((await memoriesOf(page, id)).length).toBe(1);
   });
 
@@ -264,7 +266,11 @@ test.describe.only("an AI reply with no words", () => {
     const EDITED = "架空の話題を外で直した";
     await seed(page);
     const { chats } = await fakeApi(page, [{ body: "" }, { body: REPLY }]);
-    await openConversation(page);
+    await startApp(page);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
+    await page.getByRole("button", { name: "閉じる", exact: true }).first().click();
+    await page.getByRole("button", { name: "会話", exact: true }).click();
     await send(page, SAID);
     await expect(retryButton(page)).toBeVisible({ timeout: 30_000 });
     await saved(page, SAID, 1);
@@ -296,7 +302,7 @@ test.describe.only("an AI reply with no words", () => {
     await send(page, SAID);
     await expect(retryButton(page)).toBeVisible({ timeout: 30_000 });
     const id = (await opened(page)).id;
-    await page.getByRole("button", { name: "ホームへ戻る" }).click();
+    await page.getByRole("button", { name: "トップ画面へ戻る" }).click();
     await expect(page.getByText("今日は、どう話そう？")).toBeVisible({ timeout: 30_000 });
     await expect.poll(() => captures.length, { timeout: 30_000 }).toBe(1);
     await page.getByRole("button", { name: "会話", exact: true }).click();
