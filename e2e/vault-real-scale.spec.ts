@@ -744,6 +744,52 @@ test.only("the conversation open on screen, edited outside: 更新する shows t
   await kept();
 });
 
+test.only("更新する pressed while a message to the same conversation is still on its way: the update waits for it, then nothing is lost: the file keeps the edit, the device keeps the message, and Settings asks instead of saying 最新", async ({ page }) => {
+  await cleanStart(page);
+  const at = new Date(Date.now() - 86_400_000).toISOString();
+  await writeAt(page, ".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, updatedAt: at, lastFullResyncAt: null, baselineEstablishedAt: at }));
+  await restart(page, "with its baseline");
+  await waitLatest(page);
+  let release: () => void = () => {}; let held: Promise<void> | null = null;
+  await page.route("**/api/**", async (route) => {
+    if (route.request().url().includes("/api/chat")) { if (held) await held; await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" }); }
+    else await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+  });
+  const BEFORE = "架空の送信中の話題", AFTER = "架空の送信中の話題を外で直した", NEXT = "架空の送信中の発言";
+  const send = async (text: string) => { await page.locator("footer textarea").fill(text); await page.locator("footer").getByRole("button", { name: "送る" }).click(); };
+  const close = () => page.getByRole("button", { name: "閉じる", exact: true }).first().click();
+  const fileWith = (needle: string) => page.evaluate(async (text) => { const root = await navigator.storage.getDirectory(); let found = ""; const walk = async (d: any, prefix: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h, `${prefix}${name}/`); else if ((await (await h.getFile()).text()).includes(text)) found = `${prefix}${name}`; } }; await walk(await root.getDirectoryHandle("Conversations"), "Conversations/"); return found; }, needle);
+  await close();
+  await page.getByRole("button", { name: "会話", exact: true }).click();
+  await send(BEFORE);
+  await expect(page.getByText("架空の返答です。")).toHaveCount(1, { timeout: 60_000 });
+  await expect.poll(async () => { const f = await fileWith(BEFORE); return f ? await textAt(page, f) : ""; }, { timeout: 60_000 }).toContain("架空の返答です。");
+  const p = await fileWith(BEFORE); const edited = (await textAt(page, p))!.replace(BEFORE, AFTER);
+  await writeAt(page, p, edited);
+  await openSettings(page);
+  await pressCheck(page);
+  await expect(updateButton(page)).toBeVisible({ timeout: 60_000 });
+  await close();
+  held = new Promise<void>((resolve) => { release = resolve; });
+  await send(NEXT);
+  await expect(page.getByText(NEXT, { exact: true })).toHaveCount(1, { timeout: 10_000 });
+  await openSettings(page);
+  await updateButton(page).click();
+  await page.waitForTimeout(1_500);
+  held = null; release();
+  await expect(page.getByText("架空の返答です。")).toHaveCount(2, { timeout: 60_000 });
+  const device = async () => conversationText((await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const all: any[] = await new Promise((res) => { const q = db.transaction("conversations").objectStore("conversations").getAll(); q.onsuccess = () => res(q.result); }); db.close(); return all.find((c) => !c.id.startsWith("scale-") && c.turns.length > 2); })));
+  await expect.poll(device, { timeout: 30_000 }).toContain(NEXT);
+  await page.waitForTimeout(3_000);
+  expect((await textAt(page, p))!, "the file keeps the edit").toContain(AFTER);
+  await restart(page, "after the race");
+  await pressCheck(page);
+  await expect(page.getByText(LATEST)).toHaveCount(0);
+  await page.waitForTimeout(3_000);
+  expect((await textAt(page, p))!, "the file keeps the edit after a reload").toContain(AFTER);
+  expect(await device(), "the device keeps the message after a reload").toContain(NEXT);
+});
+
 test("a Memory edited outside: 確認する then 更新する takes the text in, History and search show it, and it survives a reload", async ({ page }) => {
   await cleanStart(page);
   const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!;

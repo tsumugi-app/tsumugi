@@ -816,6 +816,10 @@ export default function ChatScreen() {
   const topPromptRanRef = useRef(false);
   /** setConversationを呼ぶ箇所では必ず同時に更新する、常に最新のconversationを指すref。 */
   const latestConversationRef = useRef(conversation);
+  /** 会話を書き込む途中の処理（送信・会話の区切りの保存）。保存先の変更を取り込む前に終わりを待つ。 */
+  const conversationWritesRef = useRef(new Set<Promise<unknown>>());
+  /** 保存先の変更を取り込んでいる間だけtrue。古い画面状態から会話を書き戻す操作をこの間は始めない。 */
+  const openConversationUpdatingRef = useRef(false);
 
   /**
    * Vault境界の安全性（Codexレビュー指摘H1〜H3対応）。
@@ -1592,10 +1596,18 @@ export default function ChatScreen() {
    * 今回もこの引数を渡さず、既存のawaitする挙動を維持する（Gemini呼び出し回数の
    * クォータ保護を目的とした逐次処理のペースを変えないため）。
    */
-  async function runConversationBoundary(
+  function runConversationBoundary(
     target: Conversation,
     priority: VaultWritePriority = "interactive",
     awaitVaultSync: boolean = true
+  ): Promise<MemoryObject[]> {
+    return trackConversationWrite(captureAtConversationBoundary(target, priority, awaitVaultSync));
+  }
+
+  async function captureAtConversationBoundary(
+    target: Conversation,
+    priority: VaultWritePriority,
+    awaitVaultSync: boolean
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
       boundaryOutcomeRef.current = "empty";
@@ -3885,6 +3897,52 @@ export default function ChatScreen() {
     return findings;
   }
 
+  function trackConversationWrite<T>(work: Promise<T>): Promise<T> {
+    const writes = conversationWritesRef.current;
+    const entry = work.catch(() => {});
+    writes.add(entry);
+    void entry.then(() => writes.delete(entry));
+    return work;
+  }
+
+  /**
+   * 保存先の変更を端末へ取り込む処理を、開いている会話と食い違わないように実行する。画面の会話は端末の記録の
+   * コピーなので、取り込みの後も古いままだと、次の送信で外部の編集を消してしまう。先に書き込み中の処理を待ち、
+   * 取り込みの間は新しい書き込みを始めさせず、端末の記録が変わったときだけ画面の会話を読み直す。待ちきれないときは
+   * 何も取り込まない（呼び出し元が「完了できませんでした」を表示する）。
+   */
+  async function keepOpenConversationCurrent<T>(apply: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + VAULT_SWITCH_SETTLE_TIMEOUT_MS;
+    while (conversationWritesRef.current.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("settle-timeout");
+      await Promise.race([
+        Promise.allSettled([...conversationWritesRef.current]),
+        new Promise((resolve) => window.setTimeout(resolve, remaining)),
+      ]);
+    }
+    openConversationUpdatingRef.current = true;
+    setBusy(true);
+    const id = latestConversationRef.current.id;
+    let before: string | null = null;
+    try {
+      before = JSON.stringify((await getConversation(id)) ?? null);
+      return await apply();
+    } finally {
+      try {
+        const after = await getConversation(id);
+        if (after && before !== null && before !== "null" && JSON.stringify(after) !== before && latestConversationRef.current.id === id) {
+          latestConversationRef.current = after;
+          setConversation(after);
+        }
+      } catch (error) {
+        console.error("[Tsumugi] could not re-read the open conversation", error);
+      }
+      openConversationUpdatingRef.current = false;
+      setBusy(false);
+    }
+  }
+
   /** 「確認する」。既存のdry-runを順に実行して、必要な対応を導く（何も書き込まない）。 */
   /** 手動の確認・反映の後は、整合性の表示も今の状態で確かめ直す（前回の判定を残さない）。保存が終わってから読む。 */
   function recheckConsistencyAfterSaves(handle: FileSystemDirectoryHandle, generation: number) {
@@ -3945,7 +4003,7 @@ export default function ChatScreen() {
     const endTask = beginMemoryTask();
     setVaultStatusCheck({ kind: "working", label });
     try {
-      const outcome = await action(vaultHandle, status.findings, generation);
+      const outcome = await keepOpenConversationCurrent(() => action(vaultHandle, status.findings, generation));
       if (generation !== vaultGenerationRef.current) {
         setVaultStatusCheck({ kind: "idle" });
         return;
@@ -4303,7 +4361,7 @@ export default function ChatScreen() {
       // 既存の`runVaultWorldExclusive`（full resyncと同じ排他ロックhelper）を
       // 使うため、ここではwithVaultWorldRead（共有ロック）で包まない——同名
       // ロックの共有→排他という二重要求による自己デッドロックを避けるため。
-      const outcome = await applyVaultLightCheckCandidates(vaultHandle, records, localSnapshots);
+      const outcome = await keepOpenConversationCurrent(() => applyVaultLightCheckCandidates(vaultHandle, records, localSnapshots));
 
       if (outcome.timedOut) {
         setVaultLightCheckStatus({ kind: "error", message: "外部の変更を確認できませんでした。" });
@@ -4379,7 +4437,7 @@ export default function ChatScreen() {
    */
   async function handleEndSession() {
     // Vault境界の安全性：切替処理中は新規のReflection開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     const endTask = beginMemoryTask();
     try {
       // UI改善：ボタン押下の直後、Boundary Captureの解決を待つ前から状態を表示する。
@@ -4430,11 +4488,11 @@ export default function ChatScreen() {
         const { title, reflection: text } = await generateSessionReflection(persona, reflectionSource);
         const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
         const endedConversation: Conversation = {
-          ...conversation,
+          ...latestConversationRef.current,
           title,
           endedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
-          memoryObjectIds: [...conversation.memoryObjectIds, insightMemory.id],
+          memoryObjectIds: [...latestConversationRef.current.memoryObjectIds, insightMemory.id],
         };
 
         // 既存のwriteConversationMarkdown / writeMemoryObjectMarkdown / putConversation / putMemoryObjectを
@@ -4444,7 +4502,7 @@ export default function ChatScreen() {
         // 反映は待たない（reflectionFailedIdsはIndexedDB保存の成否のみを表すため、
         // この変更でも判定の意味は変わらない）。
         const { failedMemoryIds: reflectionFailedIds, backgroundSyncPromise: reflectionBackgroundSyncPromise } =
-          await persistCapture(vaultHandle, endedConversation, [insightMemory], "interactive", false);
+          await trackConversationWrite(persistCapture(vaultHandle, endedConversation, [insightMemory], "interactive", false));
         // H4 Codexレビュー指摘High-2対応：この関数自体が既にbeginMemoryTask()で追跡中の
         // 親taskであるため、ここで子として登録すればdrainPendingMemoryTasksが確実に待てる。
         if (reflectionBackgroundSyncPromise) trackMemoryTask(reflectionBackgroundSyncPromise);
@@ -4514,7 +4572,7 @@ export default function ChatScreen() {
    */
   async function handleEndConversation() {
     // Vault境界の安全性：切替処理中は新規の会話終了（Capture）開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     const endTask = beginMemoryTask();
     setEndingConversation(true);
     try {
@@ -4531,12 +4589,12 @@ export default function ChatScreen() {
       // 責務分離の目的そのもの）。
       // awaitVaultSync=false：ここでの「保存完了」はIndexedDBへの保存成功のみで確定させ、
       // Vaultへの反映は待たない（Beta修正。ユーザー操作をVault I/Oの遅さから切り離す）。
-      const { backgroundSyncPromise: endedConversationBackgroundSyncPromise } = await persistConversation(
+      const { backgroundSyncPromise: endedConversationBackgroundSyncPromise } = await trackConversationWrite(persistConversation(
         vaultHandle,
         endedConversation,
         "interactive",
         false
-      );
+      ));
       // H4 Codexレビュー指摘High-2対応：この関数自体が既にbeginMemoryTask()で追跡中の
       // 親taskであるため、ここで子として登録すればdrainPendingMemoryTasksが確実に待てる。
       if (endedConversationBackgroundSyncPromise) trackMemoryTask(endedConversationBackgroundSyncPromise);
@@ -4590,7 +4648,7 @@ export default function ChatScreen() {
    */
   function handleSwitchPersona(nextPersona: Persona, nextEntryType: ConversationEntryKind) {
     // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
     // Entry Type / Persona分離（2026-10-01）：呼び出し元（下記の「日記」「会話」button）
@@ -4619,7 +4677,7 @@ export default function ChatScreen() {
    */
   function handleGoToTop() {
     // Vault境界の安全性：切替処理中は新規のConversation Boundary（Capture）開始をさせない。
-    if (isVaultSwitchingRef.current || crossTabStale) return;
+    if (openConversationUpdatingRef.current || isVaultSwitchingRef.current || crossTabStale) return;
     void trackMemoryTask(runConversationBoundary(latestConversationRef.current));
 
     // Entry Type / Persona分離（2026-10-01）：トップ画面（entry未確定）へ戻るため、
@@ -4659,6 +4717,8 @@ export default function ChatScreen() {
     // closure変数のentryTypeはまだ更新前の値のままになりうる）でoverrideEntryTypeを使う。
     const activeEntryType = overrideEntryType ?? entryType;
     const endTask = beginMemoryTask();
+    let sendDone = () => {};
+    void trackConversationWrite(new Promise<void>((resolve) => { sendDone = resolve; }));
 
     setBusy(true);
     setStreamingText("");
@@ -5013,7 +5073,7 @@ export default function ChatScreen() {
       // persistConversation自体が内部でH4のロック＋epoch確認を行うため、fire-and-forgetの
       // ままだとStaleVaultTabErrorが未処理のPromise rejectionになってしまう。.catch()で拾う。
       setBusy(false);
-      void trackMemoryTask(persistConversation(vaultHandle, updated)).catch((error) => {
+      void trackMemoryTask(trackConversationWrite(persistConversation(vaultHandle, updated))).catch((error) => {
         if (!handleStaleVaultTabError(error)) {
           console.error("Failed to persist conversation turn", error);
         }
@@ -5026,6 +5086,7 @@ export default function ChatScreen() {
       setBusy(false);
       stopWaiting();
       endTask();
+      sendDone();
     }
   }
 
