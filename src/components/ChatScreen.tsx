@@ -2333,8 +2333,10 @@ export default function ChatScreen() {
             .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
             .slice(0, STARTUP_CAPTURE_LIMIT);
           logStartupCatchupStart("captureCatchup", uncaptured.length);
+          console.log(`[DIAG] catchup read: uncaptured=${uncaptured.length} cancelled=${cancelled}`);
           for (const conversationRecord of uncaptured) {
             // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
+            console.log(`[DIAG] catchup loop: cancelled=${cancelled} switching=${isVaultSwitchingRef.current} stale=${crossTabStale}`);
             if (cancelled || isVaultSwitchingRef.current || crossTabStale) return;
             // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
             // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
@@ -2353,6 +2355,7 @@ export default function ChatScreen() {
     );
     return () => {
       cancelled = true;
+      console.log("[DIAG] catchup cleanup: cancelled set");
     };
   }, [vaultStatus, vaultHandle, runConversationBoundary]);
 
