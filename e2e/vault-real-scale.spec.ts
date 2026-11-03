@@ -466,7 +466,8 @@ test("inside the once-a-day window, a lost History month, History summary, conve
     await walk(await root.getDirectoryHandle("Memories"), "Memories/");
     return { month: `.tsumugi/history/${months.sort()[0]}`, conversation, memory: memories.sort()[0] };
   });
-  for (const lost of [found.month, found.conversation, found.memory]) {
+  // two conversations in a row: the same count missing at both starts, but not the same record
+  for (const lost of [found.month, found.conversation, await fileOf(page, "scale-conv-006"), found.memory]) {
     const before = await read(lost); expect(before).not.toBeNull();
     await remove(lost);
     await startApp(page, `lost ${lost.split("/")[0]}`);

@@ -126,7 +126,12 @@ export async function runSaveFoundationBootstrap(env: SaveFoundationBootstrapEnv
     const now = (env.now ?? (() => new Date().toISOString()))();
     const verifyDone = !env.doneIntegrity || doneIntegrityIsDue(await getDoneIntegrityMarker(), env.doneIntegrity.build, now, env.doneIntegrity.maxAgeMs, recordsMissingAtTheirPlace(migration)) || !(await sharedManagementFilesAreReadable(env.root));
     const integrity = verifyDone ? await reconcileDoneVaultOutboxIntegrity(projectionEnv) : null;
-    if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now, missing: recordsMissingAtTheirPlace(migration) });
+    if (env.doneIntegrity && integrity && integrity.failed === 0 && integrity.pending === 0) {
+      // 覚えるのは照合の後にまだ足りない数（戻した記録は数えない）。次の起動で同じ数が別の記録で足りなくなっても見逃さない。足りない記録があったときだけ走査し直す
+      const missing = recordsMissingAtTheirPlace(migration);
+      const remaining = missing === 0 ? 0 : recordsMissingAtTheirPlace(await runProductionBootstrapMigration({ root: env.root, now: env.now }));
+      await setDoneIntegrityMarker({ build: env.doneIntegrity.build, at: now, missing: remaining });
+    }
 
     // 6. final rescanはmigration自身の内部rescanで既に完結している。
     // 7. 必要なら追加outbox reconcile：migrationの最終rescan・reconcile・
