@@ -823,7 +823,7 @@ test("a conversation moved outside: no second copy is made, 確認する and 更
   expect(await textAt(page, q)).toContain("架空の移動後の続き");
 });
 
-test("a Memory day file moved outside is not moved in Tsumugi: the copy is put back at its place, nothing is lost, and Settings says there are two copies", async ({ page }) => {
+test.only("a Memory day file moved outside is not moved in Tsumugi: the copy is put back at its place, nothing is lost, and Settings says there are two copies", async ({ page }) => {
   await cleanStart(page);
   const p = await fileOf(page, "scale-mem-010"); const t = (await textAt(page, p))!; const q = "Memories/moved/architected.md";
   const device = await rowOf(page, "memoryObjects", "scale-mem-010");
@@ -834,6 +834,17 @@ test("a Memory day file moved outside is not moved in Tsumugi: the copy is put b
   report("memory-move", await statusText(page));
   await expect(page.getByText(LATEST)).toHaveCount(0);
   expect(await textAt(page, q)).toBe(t);
+  expect(await textAt(page, p)).toContain("id: scale-mem-010");
+  expect(await rowOf(page, "memoryObjects", "scale-mem-010")).toEqual(device);
+  // what the person is shown, and what ends it: removing the extra copy they made
+  const item = page.getByTestId("vault-conflict-item").first();
+  await item.getByTestId("vault-conflict-open").click();
+  await page.waitForTimeout(3000);
+  report("memory-move-item", (await item.innerText()).replace(/\s+/g, " ").slice(0, 300));
+  await removeAt(page, q);
+  await page.getByRole("button", { name: "もう一度確認する" }).click();
+  await pressCheckIfAsked(page);
+  await waitLatest(page);
   expect(await textAt(page, p)).toContain("id: scale-mem-010");
   expect(await rowOf(page, "memoryObjects", "scale-mem-010")).toEqual(device);
 });
