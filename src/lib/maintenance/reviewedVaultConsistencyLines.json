@@ -266,6 +266,15 @@
   "+void startRecoveryBackgroundCheck(handle);",
   "+/** 手動の確認・反映の後は、整合性の表示も今の状態で確かめ直す（前回の判定を残さない）。保存が終わってから読む。 */",
   "+function recheckConsistencyAfterSaves(handle: FileSystemDirectoryHandle, generation: number) {",
-  "+recheckConsistencyAfterSaves(vaultHandle, generation);"
+  "+recheckConsistencyAfterSaves(vaultHandle, generation);",
+  "-async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle) {",
+  "+async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle, force = false) {",
+  "-const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)));",
+  "+const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)), force);",
+  "-void startRecoveryBackgroundCheck(vaultHandle);",
+  "+void startRecoveryBackgroundCheck(vaultHandle, true);",
+  "+void startRecoveryBackgroundCheck(handle, true);",
+  "+// 反映できる変更があるときは、ここで「違い」と言わない（「更新する」の後に確かめる）",
+  "+if (!findings.updatableRecords.length) recheckConsistencyAfterSaves(vaultHandle, generation);"
  ]
 }

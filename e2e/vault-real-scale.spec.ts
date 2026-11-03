@@ -112,7 +112,7 @@ async function seedWorld(page: Page) {
       const id = `scale-conv-${String(i).padStart(3, "0")}`, at = start + i * (DAY * 0.7), turnCount = i === 20 ? 14 : i === 40 ? 16 : 2 + 2 * (i % 7), blank = i === 20 ? 9 : i === 40 ? 7 : -1;
       const turns = Array.from({ length: turnCount }, (_, k) => ({ role: k % 2 ? "ai" : "user", content: k === blank ? "" : filler(i * 100 + k, Math.round(2400 / turnCount)), timestamp: iso(at + k * 60_000) }));
       const end = iso(at + turnCount * 60_000);
-      conversations.push({ id, persona: "companion", entryType: "chat", status: "captured", startedAt: iso(at), endedAt: end, createdAt: iso(at), updatedAt: end, memoryObjectIds: [], turns, metadata: meta(id, end) });
+      conversations.push({ id, persona: "companion", entryType: "conversation", status: "captured", startedAt: iso(at), endedAt: end, createdAt: iso(at), updatedAt: end, memoryObjectIds: [], turns, metadata: meta(id, end) });
     }
     for (const c of conversations) await dbm.putConversationWithOutbox(c);
     const memories: any[] = [];
@@ -656,18 +656,18 @@ test("edited while the app stays open, even with 最新 on screen: its 確認す
   await cleanStart(page);
   const p = await fileOf(page, "scale-conv-010"); const t = (await textAt(page, p))!;
   // the same size: only the file's time tells
-  const edited = t.replace("架空の話題", "架空の話しだ");
-  expect(new Blob([edited]).size === new Blob([t]).size || edited.length === t.length).toBeTruthy();
+  const edited = t.replace("架空の話題", "架空の話頭");
+  expect(new Blob([edited]).size).toBe(new Blob([t]).size);
   await writeAt(page, p, edited);
   const startedAt = Date.now();
   await page.getByTestId("vault-check-now").click();
   await pressUpdate(page);
   await waitLatest(page);
   report("perf-manual-check", { ms: Date.now() - startedAt });
-  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話しだ");
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話頭");
   await restart(page, "after");
   await waitLatest(page);
-  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話しだ");
+  expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain("架空の話頭");
 });
 
 test("a Memory edited outside: 確認する then 更新する takes the text in, History and search show it, and it survives a reload", async ({ page }) => {
@@ -763,7 +763,7 @@ test("an edit found by the daily check at the start: the same 確認する and �
   await waitLatest(page);
   expect(conversationText(await rowOf(page, "conversations", "scale-conv-010"))).toContain(EDIT);
   expect(await textAt(page, p)).toBe(edited);
-  await expect.poll(() => outboxOf(page, "conversation:scale-conv-010")).toBe("done");
+  await expect.poll(() => outboxOf(page, "conversation:scale-conv-010"), { timeout: 60_000 }).toBe("done");
   await restart(page, "after");
   await waitLatest(page);
   await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);

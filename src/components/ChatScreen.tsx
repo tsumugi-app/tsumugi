@@ -3579,7 +3579,7 @@ export default function ChatScreen() {
    * 確定させない）。正常と確定したビルド・Vaultでは再起動しても再走査しない。以前の「異常」は次の起動で確認し直す。
    * 保存待ち・未確定のときは、少し後に有限回だけ自動で確認し直す。何も修復しない。
    */
-  async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle) {
+  async function startRecoveryBackgroundCheck(handle: FileSystemDirectoryHandle, force = false) {
     const generation = vaultGenerationRef.current;
     if (recoveryDetectionRanRef.current || recoveryCheckInFlightRef.current === generation) return;
     recoveryDetectionRanRef.current = true;
@@ -3600,7 +3600,7 @@ export default function ChatScreen() {
     // 既知の結果がある間は消さない（隠さない）。確認中であることだけを足す。
     setRecoveryChecking(true);
     try {
-      const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)));
+      const result = await runBackgroundRecoveryCheck(productionRecoveryBackgroundDeps(() => checkVaultConsistency(handle, cancelled)), force);
       if (cancelled()) return;
       if (result.kind === "failed") { recoveryDetectionRanRef.current = false; setRecoveryDetectionFailed(true); return; }
       setRecoveryDetectionFailed(false);
@@ -3637,7 +3637,7 @@ export default function ChatScreen() {
     recoveryDetectionRanRef.current = false;
     recoveryRecheckCountRef.current = 0;
     setRecoveryStatus((current) => (current.kind === "error" || current.kind === "done" ? { kind: "idle" } : current));
-    void startRecoveryBackgroundCheck(vaultHandle);
+    void startRecoveryBackgroundCheck(vaultHandle, true);
   }
 
   /**
@@ -3682,7 +3682,7 @@ export default function ChatScreen() {
             if (generation !== vaultGenerationRef.current) return;
             recoveryDetectionRanRef.current = false;
             recoveryRecheckCountRef.current = 0;
-            void startRecoveryBackgroundCheck(handle);
+            void startRecoveryBackgroundCheck(handle, true);
           });
         }
       }
@@ -3892,7 +3892,7 @@ export default function ChatScreen() {
       if (generation !== vaultGenerationRef.current) return;
       recoveryDetectionRanRef.current = false;
       recoveryRecheckCountRef.current = 0;
-      void startRecoveryBackgroundCheck(handle);
+      void startRecoveryBackgroundCheck(handle, true);
     });
   }
 
@@ -3911,7 +3911,8 @@ export default function ChatScreen() {
       setVaultStatusCheck({ kind: "ready", findings, generation, note: null });
       // 確認のために中断したflushの残り（通常の保存の未反映分）を再開する。
       flushPendingToVaultInBackground(vaultHandle);
-      recheckConsistencyAfterSaves(vaultHandle, generation);
+      // 反映できる変更があるときは、ここで「違い」と言わない（「更新する」の後に確かめる）
+      if (!findings.updatableRecords.length) recheckConsistencyAfterSaves(vaultHandle, generation);
     } catch (error) {
       if (handleStaleVaultTabError(error)) {
         setVaultStatusCheck({ kind: "idle" });

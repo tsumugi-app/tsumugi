@@ -7,7 +7,7 @@
  * 確認できなかった場合（plan作成失敗）は何も保存せず、「最新」とも「異常」とも断定しない。
  * 判定は`vaultConsistency.ts`（rawなRecovery plan＋保存の進行状況）。修復ロジックは一切呼ばない。
  */
-import { getRecoveryCheckMarker, getRecoveryCheckWorldKey, setRecoveryCheckMarker, type RecoveryCheckMarker } from "./db";
+import { getHeldVaultOutboxEntries, getRecoveryCheckMarker, getRecoveryCheckWorldKey, setRecoveryCheckMarker, type RecoveryCheckMarker } from "./db";
 import type { ConsistencyReport } from "./vaultConsistency";
 
 /** アプリのビルド識別子（Vercelのcommit SHAを`next.config.ts`で埋め込む。無ければ"dev"）。 */
@@ -32,6 +32,7 @@ export interface RecoveryBackgroundDeps<P> {
   worldKey(): Promise<string>;
   readMarker(worldKey: string): Promise<RecoveryCheckMarker | undefined>;
   writeMarker(worldKey: string, marker: RecoveryCheckMarker): Promise<void>;
+  hasHeldSaves?(): Promise<boolean>;
   /** 整合性確認（READ ONLY・全走査。`runConsistencyCheck`）。 */
   check(): Promise<{ report: ConsistencyReport; plan: P }>;
 }
@@ -52,11 +53,12 @@ export const hasRecoveryAnomaly = (plan: RecoveryPlanLike): boolean => !isRecove
 /** 確定した結果だけを記録する：正常（clean）か、保存待ち以外の不整合（attention）。 */
 export const reportIsRecordable = (report: ConsistencyReport): boolean => report.state === "clean" || report.state === "attention";
 
-export async function runBackgroundRecoveryCheck<P>(deps: RecoveryBackgroundDeps<P>): Promise<RecoveryBackgroundResult<P>> {
+export async function runBackgroundRecoveryCheck<P>(deps: RecoveryBackgroundDeps<P>, force = false): Promise<RecoveryBackgroundResult<P>> {
   try {
     const worldKey = await deps.worldKey();
     const marker = await deps.readMarker(worldKey);
-    if (marker && marker.build === deps.build && marker.clean) return { kind: "skipped" };
+    // 手動の確認と、正常の記録の後に保留になった保存があるときは、記録を信じず確かめる
+    if (!force && marker && marker.build === deps.build && marker.clean && !(await deps.hasHeldSaves?.())) return { kind: "skipped" };
     const { report, plan } = await deps.check();
     if (reportIsRecordable(report)) await deps.writeMarker(worldKey, { build: deps.build, clean: report.state === "clean" });
     return { kind: "checked", report, plan };
@@ -71,6 +73,7 @@ export const productionRecoveryBackgroundDeps = <P>(check: () => Promise<{ repor
   worldKey: getRecoveryCheckWorldKey,
   readMarker: getRecoveryCheckMarker,
   writeMarker: setRecoveryCheckMarker,
+  hasHeldSaves: async () => (await getHeldVaultOutboxEntries()).length > 0,
   check,
 });
 
