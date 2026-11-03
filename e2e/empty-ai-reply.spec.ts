@@ -98,6 +98,179 @@ async function staysLatest(page: Page) {
   await expect(conflicts(page)).toHaveCount(0);
 }
 
+const CUT_LABEL = "途中で止まった応答";
+const OPEN_AGAIN = "続きを開く", LEAVE_IT = "このままにする";
+const marked = (c: any) => c.turns.filter((t: any) => t.interrupted === true).map((t: any) => t.content);
+const contents = (c: any) => c.turns.map((t: any) => [t.role, t.content]);
+const cutNext = (page: Page, words: string) => page.evaluate((w) => { (window as any).__cutAfter = w; }, words);
+/** a reply cut off on its way, then a reload: the home screen offers to go on */
+async function cutThenReload(page: Page, part: string) {
+  await openConversation(page);
+  await cutNext(page, part);
+  await send(page, SAID);
+  await expect(page.getByText(CUT_MESSAGE)).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(CUT_LABEL)).toBeVisible();
+  await expect.poll(async () => marked(await opened(page))).toEqual([part]);
+  await saved(page, SAID, 2);
+  await startApp(page);
+  await expect(page.getByRole("button", { name: OPEN_AGAIN })).toBeVisible({ timeout: 30_000 });
+}
+
+test.describe.only("a reply cut off on its way, after a reload", () => {
+  const PART = "架空の返答の途中まで", FULL = "架空の最後まで届いた返答です。", NEXT = "架空の次の発言";
+
+  test("cut → marked as unfinished → reload → try again → a normal reply: the cut words stay marked and folded, nothing counts twice, and the AI and Capture do not get them", async ({ page }) => {
+    test.setTimeout(240_000);
+    await seed(page);
+    const { chats, captures } = await fakeApi(page, [{ body: FULL }, { body: REPLY }]);
+    await cutThenReload(page, PART);
+    const file = (await fileWith(page, SAID))[0];
+    expect(file.text, "the file knows the reply was cut").toContain("interruptedTurns:");
+    expect(captures.length, "the offer is still open: no Capture ran").toBe(0);
+    await page.getByRole("button", { name: OPEN_AGAIN }).click();
+    await expect(page.getByText(SAID, { exact: true })).toHaveCount(1);
+    await expect(page.getByText(PART, { exact: true })).toBeVisible();
+    await expect(page.getByText(CUT_LABEL)).toBeVisible();
+    await expect(page.getByText(CUT_MESSAGE)).toBeVisible();
+    await retryButton(page).click();
+    await expect(page.getByText(FULL, { exact: true })).toBeVisible({ timeout: 30_000 });
+    expect(contents({ turns: chats[0].turns }), "the AI is asked about the message alone").toEqual([["user", SAID]]);
+    // the finished reply is the reply; the cut one is folded under its label
+    await expect(page.getByText(PART, { exact: true })).toBeHidden();
+    await expect(page.getByText(CUT_LABEL)).toBeVisible();
+    await expect(page.getByText(CUT_MESSAGE)).toHaveCount(0);
+    await expect(retryButton(page)).toHaveCount(0);
+    await expect.poll(async () => contents(await opened(page))).toEqual([["user", SAID], ["ai", PART], ["ai", FULL]]);
+    expect(marked(await opened(page))).toEqual([PART]);
+    await saved(page, SAID, 3);
+    // the next message: the AI gets the finished reply only
+    await send(page, NEXT);
+    await expect(page.getByText(REPLY, { exact: true })).toHaveCount(1, { timeout: 30_000 });
+    expect(contents({ turns: chats[1].turns })).toEqual([["user", SAID], ["ai", FULL], ["user", NEXT]]);
+    await saved(page, NEXT, 5);
+    // one Memory, made without the cut words
+    const id = (await opened(page)).id;
+    await page.getByRole("button", { name: "この会話を終える" }).click();
+    await expect.poll(() => captures.length, { timeout: 30_000 }).toBe(1);
+    expect(contents({ turns: captures[0].turns })).toEqual([["user", SAID], ["ai", FULL], ["user", NEXT], ["ai", REPLY]]);
+    await expect.poll(async () => (await memoriesOf(page, id)).length, { timeout: 30_000 }).toBe(1);
+    // reload: all as it was, and the state is clean
+    await staysLatest(page);
+    const row = (await allRows(page, "conversations")).find((c) => c.id === id);
+    expect(contents(row)).toEqual([["user", SAID], ["ai", PART], ["ai", FULL], ["user", NEXT], ["ai", REPLY]]);
+    expect(marked(row)).toEqual([PART]);
+    await expect(page.getByRole("button", { name: OPEN_AGAIN })).toHaveCount(0);
+    expect(captures.length).toBe(1);
+    expect((await memoriesOf(page, id)).length).toBe(1);
+  });
+
+  test("trying again fails every way after the reload: the cut words are never lost, and a final success still works", async ({ page }) => {
+    test.setTimeout(240_000);
+    const PART2 = "架空の二度目の途中まで";
+    await seed(page);
+    const { chats } = await fakeApi(page, [{ abort: true }, { body: "" }, { body: FULL }]);
+    await cutThenReload(page, PART);
+    await page.getByRole("button", { name: OPEN_AGAIN }).click();
+    await retryButton(page).click();
+    await expect(page.getByText(FAILED_MESSAGE)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText(PART, { exact: true })).toBeVisible();
+    expect(contents(await opened(page))).toEqual([["user", SAID], ["ai", PART]]);
+    await retryButton(page).click();
+    await expect(page.getByText(EMPTY_MESSAGE)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText(PART, { exact: true })).toBeVisible();
+    expect(contents(await opened(page))).toEqual([["user", SAID], ["ai", PART]]);
+    // cut once more: both stay, both marked
+    await cutNext(page, PART2);
+    await retryButton(page).click();
+    await expect(page.getByText(CUT_MESSAGE)).toBeVisible({ timeout: 30_000 });
+    await expect.poll(async () => contents(await opened(page))).toEqual([["user", SAID], ["ai", PART], ["ai", PART2]]);
+    expect(marked(await opened(page))).toEqual([PART, PART2]);
+    await saved(page, SAID, 3);
+    // a reload in the middle changes nothing
+    await startApp(page);
+    await page.getByRole("button", { name: OPEN_AGAIN }).click({ timeout: 30_000 });
+    await retryButton(page).click();
+    await expect(page.getByText(FULL, { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect.poll(async () => contents(await opened(page))).toEqual([["user", SAID], ["ai", PART], ["ai", PART2], ["ai", FULL]]);
+    expect(marked(await opened(page))).toEqual([PART, PART2]);
+    for (const c of chats) expect(c.turns.map((t: any) => t.content)).toEqual([SAID]);
+    await saved(page, SAID, 4);
+    await staysLatest(page);
+    await expect(page.getByRole("button", { name: OPEN_AGAIN })).toHaveCount(0);
+  });
+
+  test("leaving it as it is: one Memory, the words stay marked, and the offer does not come back", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page);
+    const { chats, captures } = await fakeApi(page, []);
+    await cutThenReload(page, PART);
+    const id = (await opened(page)).id;
+    await page.getByRole("button", { name: LEAVE_IT }).click();
+    await expect(page.getByRole("button", { name: OPEN_AGAIN })).toHaveCount(0);
+    await expect.poll(() => captures.length, { timeout: 30_000 }).toBe(1);
+    await expect.poll(async () => (await memoriesOf(page, id)).length, { timeout: 30_000 }).toBe(1);
+    await staysLatest(page);
+    await expect(page.getByRole("button", { name: OPEN_AGAIN })).toHaveCount(0);
+    const row = (await allRows(page, "conversations")).find((c) => c.id === id);
+    expect(contents(row)).toEqual([["user", SAID], ["ai", PART]]);
+    expect(marked(row)).toEqual([PART]);
+    expect(chats.length).toBe(0);
+    expect(captures.length).toBe(1);
+  });
+
+  test("the words edited outside while they wait: 更新する keeps the edit and the mark; trying again adds the reply; the edit is kept and the state is 最新", async ({ page }) => {
+    test.setTimeout(240_000);
+    const EDITED = "架空の途中までを外で直した";
+    await seed(page);
+    await fakeApi(page, [{ body: FULL }]);
+    await startApp(page);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
+    await page.getByRole("button", { name: "閉じる", exact: true }).first().click();
+    await page.getByRole("button", { name: "会話", exact: true }).click();
+    await cutNext(page, PART);
+    await send(page, SAID);
+    await expect(page.getByText(CUT_MESSAGE)).toBeVisible({ timeout: 30_000 });
+    await saved(page, SAID, 2);
+    const f = (await fileWith(page, SAID))[0];
+    await writeAt(page, f.path, f.text.replace(PART, EDITED));
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    const check = page.getByRole("button", { name: "確認する", exact: true }).first();
+    await expect(check).toBeEnabled({ timeout: 60_000 }); await check.click();
+    await page.getByRole("button", { name: "更新する", exact: true }).click({ timeout: 60_000 });
+    await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
+    await page.getByRole("button", { name: "閉じる", exact: true }).first().click();
+    await expect(page.getByText(EDITED, { exact: true })).toBeVisible({ timeout: 10_000 });
+    expect(marked(await opened(page))).toEqual([EDITED]);
+    await retryButton(page).click();
+    await expect(page.getByText(FULL, { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect.poll(async () => contents(await opened(page))).toEqual([["user", SAID], ["ai", EDITED], ["ai", FULL]]);
+    await saved(page, SAID, 3);
+    await staysLatest(page);
+    expect(contents(await opened(page))).toEqual([["user", SAID], ["ai", EDITED], ["ai", FULL]]);
+    expect(marked(await opened(page))).toEqual([EDITED]);
+    expect((await fileWith(page, EDITED)).length).toBe(1);
+  });
+
+  test("the history shows the cut words as unfinished; a conversation without any stays byte for byte as it was", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    await fakeApi(page, [{ body: FULL }]);
+    await openConversation(page);
+    const before = (await fileWith(page, "昨日の架空の話"))[0];
+    await cutNext(page, PART);
+    await send(page, SAID);
+    await expect(page.getByText(CUT_MESSAGE)).toBeVisible({ timeout: 30_000 });
+    await retryButton(page).click();
+    await expect(page.getByText(FULL, { exact: true })).toBeVisible({ timeout: 30_000 });
+    await saved(page, SAID, 3);
+    expect((await fileWith(page, "昨日の架空の話"))[0].text).toBe(before.text);
+    expect(before.text).not.toContain("interruptedTurns");
+    await staysLatest(page);
+    expect((await fileWith(page, "昨日の架空の話"))[0].text).toBe(before.text);
+  });
+});
+
 test.describe("an AI reply with no words", () => {
   test("empty reply → the screen says so → try again → a normal reply → saved → reload: one user turn, one AI turn, one Memory, and 最新", async ({ page }) => {
     test.setTimeout(240_000);
