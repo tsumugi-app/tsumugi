@@ -6,7 +6,7 @@ import path from "node:path";
 const BASE = "http://localhost:3100";
 const bundle = path.join(__dirname, ".build/harness.js");
 const LATEST = "✓ 最新の状態です";
-const SETTLE = 7_000, MIN = 60_000;
+const SETTLE = 6_500, MIN = 60_000;
 const said = (name: string) => `架空の話題${name}です`;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 
@@ -158,14 +158,25 @@ const allowOthers = (page: Page) => page.evaluate(async () => {
   await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(JSON.stringify({ enabled: true, allowOtherProviders: true }), "autoCapture:settings"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
   db.close();
 });
+/** Settings: 確認する, then 更新する takes the edit into the stored conversation */
+async function takeInEdit(page: Page) {
+  await nav(page).getByRole("button", { name: "設定" }).click();
+  const check = page.getByRole("button", { name: "確認する", exact: true }).first();
+  await expect(check).toBeEnabled({ timeout: 120_000 });
+  await check.click();
+  await page.getByRole("button", { name: "更新する", exact: true }).first().click({ timeout: 60_000 });
+  await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
+}
+const conversationWords = async (page: Page, id: string) => (await rows(page, "conversations")).find((c) => c.id === id)?.turns.map((t: any) => t.content).join(" ") ?? "";
 const providersOf = async (page: Page, words: string) => (await withWords(page, words))?.chatProviders;
 
 /** one Memory on the device and in exactly one Vault file, the conversation captured in both, nothing more after another start, and Settings says 最新 */
-async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiCalls>[0], words: string, openSettings = false) {
+async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiCalls>[0], words: string, openSettings = false, restart = true) {
   await expect.poll(() => statusOf(page, id), { timeout: 40_000 }).toBe("captured");
   expect((await memoriesOf(page, id)).length).toBe(1);
   await expect.poll(async () => (await filesWith(page, "架空の記憶")).length, { timeout: 40_000 }).toBe(1);
   await expect.poll(async () => (await filesWith(page, words)).filter((t) => /^status: "?captured"?$/m.test(t)).length, { timeout: 40_000 }).toBe(1);
+  if (!restart) return;
   const after = calls.capture.length;
   await startApp(page);
   await page.waitForTimeout(SETTLE);
@@ -228,7 +239,7 @@ test.describe("startup Memory creation", () => {
     await startApp(page);
     release();
     await captureSeen(calls, 2);
-    await finishedOnce(page, "closed-1", calls, said("closed-1"));
+    await finishedOnce(page, "closed-1", calls, said("closed-1"), false, false);
     expect(calls.capture.length).toBe(2);
   });
 
@@ -459,7 +470,7 @@ test.describe("the end of a conversation: Memory and status are saved together",
     await backdate(page, held.id);
     await startApp(page);
     await captureSeen(calls, 2);
-    await finishedOnce(page, held.id, calls, said("切断"));
+    await finishedOnce(page, held.id, calls, said("切断"), false, false);
     expect(calls.capture.length).toBe(2);
   });
 
@@ -480,7 +491,7 @@ test.describe("the end of a conversation: Memory and status are saved together",
     await backdate(page, c.id);
     await startApp(page);
     await captureSeen(calls, 2);
-    await finishedOnce(page, c.id, calls, said("閉じる"));
+    await finishedOnce(page, c.id, calls, said("閉じる"), false, false);
     expect(calls.capture.length).toBe(2);
   });
 
@@ -563,12 +574,13 @@ test.describe("what an AI request costs, and what it may not overwrite", () => {
     expect((await memoriesOf(page, id)).length).toBe(0);
   });
 
-  test("the Vault file is edited from outside during the AI call: at a start the result is thrown away; at the end of a conversation the file keeps the edit", async ({ page }) => {
-    test.setTimeout(240_000);
-    const EDIT = "架空の通信中の外部編集", EDIT_END = "架空の終了時の外部編集";
+  test("automatic: the file is edited during the AI call, so the result is thrown away; once the edit is taken in, one Memory from the edited words, and no second at the next start", async ({ page }) => {
+    test.setTimeout(300_000);
+    const EDIT = "架空の通信中の外部編集";
     await seed(page);
-    let release = () => {}; let held = new Promise<void>((r) => { release = r; });
-    const calls = await fakeApi(page, () => ({ hold: held }));
+    let release = () => {}; const held = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
     await startApp(page);
     await talkFromHome(page, said("外部中"));
     await expect.poll(async () => (await filesWith(page, said("外部中"))).length, { timeout: 30_000 }).toBe(1);
@@ -578,20 +590,105 @@ test.describe("what an AI request costs, and what it may not overwrite", () => {
     await captureSeen(calls, 1);
     expect(await editFile(page, said("外部中"), EDIT)).toBe(true);
     release();
-    await page.waitForTimeout(SETTLE);
+    await page.waitForTimeout(3_000);
     expect((await memoriesOf(page, id)).length, "nothing from the old words").toBe(0);
     expect(await statusOf(page, id)).toBe("active");
     expect((await filesWith(page, EDIT)).length).toBe(1);
-
-    held = new Promise<void>((r) => { release = r; });
-    await talkFromHome(page, said("終了時"));
-    await expect.poll(async () => (await filesWith(page, said("終了時"))).length, { timeout: 30_000 }).toBe(1);
-    await goHome(page);
+    await startApp(page);
+    await takeInEdit(page);
+    await backdate(page, id);
+    await startApp(page);
     await captureSeen(calls, 2);
-    expect(await editFile(page, said("終了時"), EDIT_END)).toBe(true);
+    expect(calls.capture[1]).toContain(EDIT);
+    await finishedOnce(page, id, calls, EDIT);
+  });
+
+  test("automatic: a Memory write that fails leaves the conversation open, and a later try makes one Memory", async ({ page }) => {
+    test.setTimeout(240_000);
+    await seed(page, [{ id: "auto-fails", ago: 120 * MIN }]);
+    let release = () => {}; const held = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await page.evaluate(() => { (window as any).__failMemoryWrite = true; });
     release();
     await page.waitForTimeout(3_000);
-    expect((await filesWith(page, EDIT_END)).length, "the conversation is not written over the edit").toBe(1);
+    expect((await memoriesOf(page, "auto-fails")).length).toBe(0);
+    expect(await statusOf(page, "auto-fails")).toBe("active");
+    const state = JSON.parse(await settingsValue(page, "autoCapture:state"));
+    expect(state.conversations["auto-fails"].lastKind).toBe("wait");
+    // as if the wait after a failure had passed
+    await page.evaluate(async (state) => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(JSON.stringify(state), "autoCapture:state"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+      db.close();
+    }, { ...state, conversations: { "auto-fails": { ...state.conversations["auto-fails"], lastAttemptAt: new Date(Date.now() - 7 * 3_600_000).toISOString() } } });
+    await startApp(page);
+    await captureSeen(calls, 2);
+    await finishedOnce(page, "auto-fails", calls, said("auto-fails"));
+  });
+
+  test("end of a conversation: the file is edited during the AI call, so no Memory from the old words and not captured; nothing is lost, the next start leaves it alone, and once the edit is taken in, one Memory", async ({ page }) => {
+    test.setTimeout(300_000);
+    const EDIT = "架空の終了時の外部編集";
+    await seed(page);
+    let release = () => {}; const held = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
+    await startApp(page);
+    await talkFromHome(page, said("終了時"));
+    await expect.poll(async () => (await filesWith(page, said("終了時"))).length, { timeout: 30_000 }).toBe(1);
+    const { id } = await withWords(page, said("終了時"));
+    await goHome(page);
+    await captureSeen(calls, 1);
+    expect(await editFile(page, said("終了時"), EDIT)).toBe(true);
+    release();
+    await page.waitForTimeout(3_000);
+    expect((await memoriesOf(page, id)).length, "nothing from the old words").toBe(0);
+    expect(await statusOf(page, id), "not processed").toBe("active");
+    expect(await conversationWords(page, id), "the user's words stay").toContain(said("終了時"));
+    expect((await filesWith(page, EDIT)).length, "the edit stays").toBe(1);
+    await backdate(page, id);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length, "not sent again while the edit is not taken in").toBe(1);
+    expect((await memoriesOf(page, id)).length).toBe(0);
+    await takeInEdit(page);
+    expect(await conversationWords(page, id)).toContain(EDIT);
+    await backdate(page, id);
+    await startApp(page);
+    await captureSeen(calls, 2);
+    expect(calls.capture[1]).toContain(EDIT);
+    expect(calls.capture[1], "the user's words too").toContain(said("終了時"));
+    await finishedOnce(page, id, calls, EDIT);
+  });
+
+  test("end of a conversation: a file edited before it costs no AI call; a change that leaves the words as they are does not stop it", async ({ page }) => {
+    test.setTimeout(180_000);
+    const EDIT = "架空の終了前の外部編集";
+    await seed(page, [], undefined, { enabled: false });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, said("終了前"));
+    await expect.poll(async () => (await filesWith(page, said("終了前"))).length, { timeout: 30_000 }).toBe(1);
+    const edited = await withWords(page, said("終了前"));
+    expect(await editFile(page, said("終了前"), EDIT)).toBe(true);
+    await goHome(page);
+    await page.waitForTimeout(3_000);
+    expect(calls.capture.length).toBe(0);
+    expect(await statusOf(page, edited.id)).toBe("active");
+    expect((await memoriesOf(page, edited.id)).length).toBe(0);
+    expect((await filesWith(page, EDIT)).length).toBe(1);
+
+    await talkFromHome(page, said("空白だけ"));
+    await expect.poll(async () => (await filesWith(page, said("空白だけ"))).length, { timeout: 30_000 }).toBe(1);
+    const spaced = await withWords(page, said("空白だけ"));
+    expect(await editFile(page, said("空白だけ"), "")).toBe(true);
+    await goHome(page);
+    await captureSeen(calls, 1);
+    await expect.poll(() => statusOf(page, spaced.id), { timeout: 30_000 }).toBe("captured");
+    expect((await memoriesOf(page, spaced.id)).length).toBe(1);
   });
 
   test("how much Vault reading, writing and AI a start costs", async ({ page }) => {
