@@ -412,6 +412,43 @@ test.describe("the end of a conversation: Memory and status are saved together",
   });
 });
 
+test.describe("the save of a Capture result checks what is stored", () => {
+  test("a conversation whose words changed during the AI call gets nothing; an unchanged one, or one whose last turn is still being saved, is saved whole", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page, [{ id: "same", ago: 120 * MIN }, { id: "edited", ago: 120 * MIN }, { id: "shortened", ago: 120 * MIN }, { id: "grown", ago: 120 * MIN }, { id: "behind", ago: 120 * MIN }, { id: "done", ago: 120 * MIN, status: "captured" }], undefined, { enabled: false });
+    const outcomes = await page.evaluate(async () => {
+      const { dbm } = (window as any).D;
+      const T = new Date().toISOString();
+      const later = new Date(Date.now() + 60_000).toISOString();
+      const memory = (id: string) => ({ id: `new-${id}`, date: T, types: ["conversation"], conversationId: id, content: "架空の記憶", summary: "架空の要約", keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T, metadata: { id: `meta-new-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
+      const commit = async (id: string, change: (stored: any) => any, snapshot: (stored: any) => any = (s) => s) => {
+        const stored = await dbm.getConversation(id);
+        const read = snapshot(stored);
+        await dbm.putConversationWithOutbox(change(stored));
+        const r = await dbm.commitCaptureResult({ ...read, status: "captured", memoryObjectIds: [`new-${id}`], updatedAt: later }, [{ memory: memory(id), recordType: "memory" }], read.updatedAt);
+        const after = await dbm.getConversation(id);
+        return [r.outcome, after.status, after.memoryObjectIds.length, after.turns.length, !!(await dbm.getMemoryObject(`new-${id}`))];
+      };
+      const newer = new Date(Date.now() + 1000).toISOString();
+      return {
+        same: await commit("same", (s) => s),
+        edited: await commit("edited", (s) => ({ ...s, updatedAt: newer, turns: s.turns.map((t: any, i: number) => (i === 0 ? { ...t, content: "架空の書き換え" } : t)) })),
+        shortened: await commit("shortened", (s) => ({ ...s, updatedAt: newer, turns: s.turns.slice(0, 1) })),
+        grown: await commit("grown", (s) => ({ ...s, updatedAt: newer, turns: [...s.turns, { role: "user", content: "架空の続き", timestamp: newer }] })),
+        // the snapshot has a turn whose own save has not landed: the stored record is older than what Capture read
+        behind: await commit("behind", (s) => s, (s) => ({ ...s, updatedAt: newer, turns: [...s.turns, { role: "user", content: "架空の未保存", timestamp: newer }] })),
+        done: await commit("done", (s) => s),
+      };
+    });
+    expect(outcomes.same).toEqual(["committed", "captured", 1, 2, true]);
+    expect(outcomes.edited).toEqual(["conversation-changed", "active", 0, 2, false]);
+    expect(outcomes.shortened).toEqual(["conversation-changed", "active", 0, 1, false]);
+    expect(outcomes.grown).toEqual(["conversation-changed", "active", 0, 3, false]);
+    expect(outcomes.behind).toEqual(["committed", "captured", 1, 3, true]);
+    expect(outcomes.done).toEqual(["already-captured", "captured", 0, 2, false]);
+  });
+});
+
 test.describe("startup Memory creation: limits", () => {
   test("nothing waiting: a start makes no AI call at all", async ({ page }) => {
     test.setTimeout(120_000);

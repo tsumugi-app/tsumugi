@@ -41,8 +41,12 @@ test("another AI, or no record of which AI, needs the permission", () => {
   const list = [conv("gemini", undefined, { chatProviders: ["gemini"] }), conv("openai", undefined, { chatProviders: ["openai"] }), conv("mixed", undefined, { chatProviders: ["gemini", "openai"] }), conv("unknown")];
   assert.deepEqual(select(list, undefined, { enabled: true, allowOtherProviders: false }), ["gemini"]);
   assert.equal(select(list).length, 4);
-  assert.equal(heldOnlyWithGemini(withChatProvider(withChatProvider(conv("x"), "gemini"), "gemini")), true);
-  assert.deepEqual(withChatProvider(withChatProvider(conv("x"), "gemini"), "openai").chatProviders, ["gemini", "openai"]);
+  const fresh = conv("x", undefined, { turns: [] });
+  assert.equal(heldOnlyWithGemini(withChatProvider(withChatProvider(fresh, "gemini"), "gemini")), true);
+  assert.deepEqual(withChatProvider(withChatProvider(fresh, "gemini"), "openai").chatProviders, ["gemini", "openai"]);
+  const resumed = withChatProvider(conv("old"), "gemini");
+  assert.deepEqual(resumed.chatProviders, ["unknown", "gemini"], "an old conversation that goes on with Gemini is still unknown");
+  assert.equal(heldOnlyWithGemini(resumed), false);
 });
 
 test("5 attempts in 24 hours, older ones no longer count", () => {

@@ -33,7 +33,7 @@ Order: never tried before retried, then oldest first, so a conversation that kee
 ## State
 
 - Done or not: the existing `Conversation.status`. Markdown keeps its format and gains no new key.
-- Which AI: `Conversation.chatProviders`, added at each send, on the device only. A conversation restored from the Vault loses it and counts as unknown.
+- Which AI: `Conversation.chatProviders`, added at each send, on the device only. A conversation restored from the Vault loses it and counts as unknown, and an old conversation that goes on with Gemini stays unknown.
 - Settings: `enabled` and `allowOtherProviders` in the `settings` store, both off by default.
 - Attempts: one device-local value in the IndexedDB `settings` store, `{ conversationId: { attempts, lastAttemptAt, lastKind } }`, plus the daily count. No schema version change and nothing in the Vault. If it is lost, the limits restart; finished conversations stay finished through `status`.
 - The attempt is written before the AI call, so a stop during the call is still counted.
@@ -45,7 +45,7 @@ The conversation's `captured` status, all its Memories and the outbox entries of
 
 - A stop before it: nothing changed; the conversation stays `active` and is tried again within the limits.
 - A stop after it: finished. Vault files follow through the existing outbox and repair path.
-- Turns changed since the snapshot: nothing is written and the result is discarded (no second AI call in this run).
+- The words changed since the snapshot (more turns, or an adopted Vault version with other or fewer turns): nothing is written and the result is discarded (no second AI call in this run). The next start decides again on what is stored.
 - Tombstones and Memory lineage checks stay inside the transaction, as they are now.
 
 The normal end action uses the same save, which also removes its `captured` without Memory state.

@@ -52,9 +52,13 @@ export function parseAutoCaptureState(raw: string | undefined): AutoCaptureState
   } catch { return emptyAutoCaptureState(); }
 }
 
-/** which AI this conversation was held with is recorded from now on. A conversation without the record may have been held with any of them. */
+/**
+ * Which AI this conversation was held with is recorded from now on, before the new turn is added. A conversation that already has turns but no record may have been held with any of them,
+ * and stays unknown when it goes on with Gemini, so it still needs the permission.
+ */
+export const UNKNOWN_CHAT_PROVIDER = "unknown";
 export function withChatProvider(conversation: Conversation, provider: string): Conversation {
-  const known = conversation.chatProviders ?? [];
+  const known = conversation.chatProviders ?? (conversation.turns.length > 0 ? [UNKNOWN_CHAT_PROVIDER] : []);
   return known.includes(provider) ? conversation : { ...conversation, chatProviders: [...known, provider] };
 }
 export function heldOnlyWithGemini(conversation: Conversation): boolean {

@@ -1669,7 +1669,7 @@ export default function ChatScreen() {
       // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
       let saved: Awaited<ReturnType<typeof persistCaptureAtomically>>;
       try {
-        saved = await persistCaptureAtomically(vaultHandle, capturedDelta, touchedMemoryObjects, priority, awaitVaultSync);
+        saved = await persistCaptureAtomically(vaultHandle, capturedDelta, touchedMemoryObjects, target.updatedAt, priority, awaitVaultSync);
       } catch (error) {
         if (auto || handleStaleVaultTabError(error)) throw error;
         console.error("Capture result could not be saved", error);
@@ -4831,7 +4831,8 @@ export default function ChatScreen() {
       timestamp: new Date().toISOString(),
     };
     // もう一度試すときは、記録済みの発言をそのまま使う（発言を追加しない）。
-    let updated = withChatProvider(retryTurns ? baseConversation : appendTurn(baseConversation, userTurn), chatProvider);
+    const providerRecorded = withChatProvider(baseConversation, chatProvider);
+    let updated = retryTurns ? providerRecorded : appendTurn(providerRecorded, userTurn);
     setConversation(updated);
     latestConversationRef.current = updated;
     const saveConversationFile = (target: Conversation) =>
