@@ -33,7 +33,7 @@
 "+await writeMemoryObjectMarkdown(vaultHandle, memory, priority);",
 "+awaitVaultSync: boolean = true",
 "+awaitVaultSync: boolean,",
-"+blocked: () => vaultStatus !== \"connected\" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || recoveryStatus.kind !== \"idle\" || !conversationLocksSupported(),",
+"+blocked: () => vaultStatus !== \"connected\" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || !(recoveryStatus.kind === \"idle\" || recoveryStatus.kind === \"clean\" || recoveryStatus.kind === \"done\") || !conversationLocksSupported(),",
 "+boundaryOutcomeRef.current =",
 "+boundaryOutcomeRef.current = \"empty\";",
 "+boundaryOutcomeRef.current = \"persist-failed\";",

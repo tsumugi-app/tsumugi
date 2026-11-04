@@ -1752,7 +1752,7 @@ export default function ChatScreen() {
       loadSettings: async () => parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings),
       hasUserKey: async () => !!(await loadApiKey("gemini")),
       online: () => navigator.onLine !== false,
-      blocked: () => vaultStatus !== "connected" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || recoveryStatus.kind !== "idle" || !conversationLocksSupported(),
+      blocked: () => vaultStatus !== "connected" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || !(recoveryStatus.kind === "idle" || recoveryStatus.kind === "clean" || recoveryStatus.kind === "done") || !conversationLocksSupported(),
       withRunLock: async (fn) => {
         const run = await ifLockFree(AUTO_CAPTURE_RUN_LOCK, fn);
         return run.ran ? run.value : null;
