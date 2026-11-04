@@ -6,19 +6,21 @@ import path from "node:path";
 const BASE = "http://localhost:3100";
 const bundle = path.join(__dirname, ".build/harness.js");
 const LATEST = "✓ 最新の状態です";
-const SETTLE = 6_500, MIN = 60_000;
+const SETTLE = 4_500, MIN = 60_000;
 const said = (name: string) => `架空の話題${name}です`;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 
 type Past = { id: string; ago: number; status?: "active" | "captured"; turns?: [string, string][]; chatProviders?: string[] };
 type CaptureReply = { status?: number; hold?: Promise<void>; abort?: boolean };
 /** on, with permission for conversations of any AI, and a fictional key; each test takes away what it is about */
-type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string };
+type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string; fullStartDelay?: boolean };
 
 /** a device in normal use: a real OPFS Vault with its Registry baseline, holding fictional past conversations */
 async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: Device = {}) {
   // the home screen shows a past question at random: keep every draw under its 45%
   if (device.revisit) await page.addInitScript(() => { const random = Math.random; Math.random = () => random() * 0.4; });
+  // the run starts 5 s after a start. These tests go through dozens of starts within the E2E time limit, so here it waits 2 s; the first test keeps the real wait.
+  if (!device.fullStartDelay) await page.addInitScript(() => { const later = window.setTimeout; window.setTimeout = ((fn: any, ms?: number, ...rest: any[]) => later(fn, ms === 5000 ? 2000 : ms, ...rest)) as any; });
   await page.addInitScript(() => {
     (window as any).__io = { reads: 0, writes: 0 };
     const getFile = FileSystemFileHandle.prototype.getFile;
@@ -206,7 +208,7 @@ async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiC
 test.describe("startup Memory creation", () => {
   test("a conversation left without an end gets one Capture and one Memory, reaches the file, Settings stays 最新, and later starts call nothing", async ({ page }) => {
     test.setTimeout(240_000);
-    await seed(page, [{ id: "left-1", ago: 120 * MIN }]);
+    await seed(page, [{ id: "left-1", ago: 120 * MIN }], undefined, { fullStartDelay: true });
     const calls = await fakeApi(page);
     await startApp(page);
     await captureSeen(calls, 1);
