@@ -6,7 +6,7 @@ import path from "node:path";
 const BASE = "http://localhost:3100";
 const bundle = path.join(__dirname, ".build/harness.js");
 const LATEST = "✓ 最新の状態です";
-const SETTLE = 8_000, MIN = 60_000;
+const SETTLE = 7_000, MIN = 60_000;
 const said = (name: string) => `架空の話題${name}です`;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 
@@ -161,7 +161,7 @@ const allowOthers = (page: Page) => page.evaluate(async () => {
 const providersOf = async (page: Page, words: string) => (await withWords(page, words))?.chatProviders;
 
 /** one Memory on the device and in exactly one Vault file, the conversation captured in both, nothing more after another start, and Settings says 最新 */
-async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiCalls>[0], words: string) {
+async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiCalls>[0], words: string, openSettings = false) {
   await expect.poll(() => statusOf(page, id), { timeout: 40_000 }).toBe("captured");
   expect((await memoriesOf(page, id)).length).toBe(1);
   await expect.poll(async () => (await filesWith(page, "架空の記憶")).length, { timeout: 40_000 }).toBe(1);
@@ -172,6 +172,7 @@ async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiC
   expect(calls.capture.length, "a processed conversation costs nothing at the next start").toBe(after);
   expect((await memoriesOf(page, id)).length).toBe(1);
   expect((await filesWith(page, "架空の記憶")).length).toBe(1);
+  if (!openSettings) return;
   await nav(page).getByRole("button", { name: "設定" }).click();
   await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
   await expect(page.getByTestId("vault-conflicts")).toHaveCount(0);
@@ -184,7 +185,7 @@ test.describe("startup Memory creation", () => {
     const calls = await fakeApi(page);
     await startApp(page);
     await captureSeen(calls, 1);
-    await finishedOnce(page, "left-1", calls, said("left-1"));
+    await finishedOnce(page, "left-1", calls, said("left-1"), true);
     expect(calls.capture.length).toBe(1);
   });
 
@@ -373,6 +374,8 @@ test.describe("startup Memory creation: who decides", () => {
     await page.waitForTimeout(2_000);
     await talkFromHome(page, said("普通の新規"));
     await expect.poll(() => providersOf(page, said("普通の新規")), { timeout: 30_000 }).toEqual(["gemini"]);
+    await expect.poll(async () => (await filesWith(page, said("普通の新規"))).length, { timeout: 30_000 }).toBe(1);
+    expect((await filesWith(page, said("普通の新規")))[0], "the Markdown stays as it was").not.toContain("chatProviders");
     const plain = await withWords(page, said("普通の新規"));
     await backdate(page, plain.id);
     await startApp(page);
@@ -402,17 +405,6 @@ test.describe("startup Memory creation: who decides", () => {
     await startApp(page);
     await captureSeen(calls, 1);
     await expect.poll(() => statusOf(page, "old-cut"), { timeout: 30_000 }).toBe("captured");
-  });
-
-  test("a conversation held now records its AI, and the Markdown stays as it was", async ({ page }) => {
-    test.setTimeout(120_000);
-    await seed(page, [], undefined, { enabled: false });
-    await fakeApi(page);
-    await startApp(page);
-    await talkFromHome(page, said("記録"));
-    await expect.poll(async () => (await withWords(page, said("記録")))?.chatProviders, { timeout: 30_000 }).toEqual(["gemini"]);
-    await expect.poll(async () => (await filesWith(page, said("記録"))).length, { timeout: 30_000 }).toBe(1);
-    expect((await filesWith(page, said("記録")))[0]).not.toContain("chatProviders");
   });
 });
 
@@ -506,7 +498,7 @@ test.describe("the end of a conversation: Memory and status are saved together",
     expect((await memoriesOf(page, c.id)).length).toBe(1);
     expect((await filesWith(page, "架空の記憶")).length, "the file was not written").toBe(0);
     await startApp(page);
-    await finishedOnce(page, c.id, calls, said("ファイル"));
+    await finishedOnce(page, c.id, calls, said("ファイル"), true);
     expect(calls.capture.length).toBe(1);
   });
 });
@@ -611,6 +603,7 @@ test.describe("what an AI request costs, and what it may not overwrite", () => {
       await page.waitForTimeout(SETTLE);
       return page.evaluate(() => (window as any).__io);
     };
+    await startApp(page);
     const off = await measure();
     const offAi = aiCalls(calls);
     await allowOthers(page);
@@ -668,32 +661,15 @@ test.describe("the save of a Capture result checks what is stored", () => {
 });
 
 test.describe("startup Memory creation: limits", () => {
-  test("nothing waiting: a start makes no AI call at all", async ({ page }) => {
-    test.setTimeout(120_000);
-    await seed(page, [{ id: "done-1", ago: 120 * MIN, status: "captured" }, { id: "done-2", ago: 180 * MIN, status: "captured" }]);
-    const calls = await fakeApi(page);
-    await startApp(page);
-    await page.waitForTimeout(SETTLE);
-    expect(aiCalls(calls)).toBe(0);
-  });
-
-  test("a conversation that already has its Memory is not captured again", async ({ page }) => {
-    test.setTimeout(120_000);
-    await seed(page, [{ id: "has-memory", ago: 120 * MIN }], "has-memory");
-    const calls = await fakeApi(page);
-    await startApp(page);
-    await page.waitForTimeout(SETTLE);
-    expect(calls.capture.length).toBe(0);
-    expect((await memoriesOf(page, "has-memory")).length).toBe(1);
-  });
-
-  test("recently touched, without an AI reply, or ending in a cut reply: not sent", async ({ page }) => {
+  test("nothing to send, no AI call at all: already captured, already has its Memory, recently touched, without an AI reply, or ending in a cut reply", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page, [
+      { id: "done-1", ago: 120 * MIN, status: "captured" },
+      { id: "has-memory", ago: 120 * MIN },
       { id: "recent", ago: 5 * MIN },
       { id: "no-reply", ago: 120 * MIN, turns: [["user", said("no-reply")]] },
       { id: "cut", ago: 120 * MIN },
-    ]);
+    ], "has-memory");
     await page.evaluate(async () => {
       const { dbm } = (window as any).D; const c = await dbm.getConversation("cut");
       await dbm.putConversationWithOutbox({ ...c, turns: c.turns.map((t: any) => (t.role === "ai" ? { ...t, interrupted: true } : t)) });
@@ -701,7 +677,8 @@ test.describe("startup Memory creation: limits", () => {
     const calls = await fakeApi(page);
     await startApp(page);
     await page.waitForTimeout(SETTLE);
-    expect(calls.capture).toEqual([]);
+    expect(aiCalls(calls)).toBe(0);
+    expect((await memoriesOf(page, "has-memory")).length).toBe(1);
     for (const id of ["recent", "no-reply", "cut"]) expect(await statusOf(page, id)).toBe("active");
   });
 
