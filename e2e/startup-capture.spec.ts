@@ -99,7 +99,7 @@ const captureSeen = (calls: { capture: string[] }, n: number, timeout = 30_000) 
 
 test.describe("startup Memory creation: not done yet", () => {
   test("a conversation left without an end gets one Capture and one Memory, reaches the file, Settings stays 最新, and later starts call nothing", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(240_000);
     await seed(page, [{ id: "left-1", ago: 120 * MIN }]);
     const calls = await fakeApi(page);
@@ -119,7 +119,7 @@ test.describe("startup Memory creation: not done yet", () => {
   });
 
   test("an HTTP failure is remembered: the conversation stays as it was and the next start does not ask again", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(180_000);
     await seed(page, [{ id: "fails-1", ago: 120 * MIN }]);
     const calls = await fakeApi(page, () => ({ status: 503 }));
@@ -133,7 +133,7 @@ test.describe("startup Memory creation: not done yet", () => {
   });
 
   test("a conversation that keeps failing does not hold back another one", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(240_000);
     await seed(page, [{ id: "fails-2", ago: 300 * MIN }, { id: "works-2", ago: 120 * MIN }]);
     const calls = await fakeApi(page, (words) => (words.includes("fails-2") ? { status: 503 } : {}));
@@ -148,7 +148,7 @@ test.describe("startup Memory creation: not done yet", () => {
   });
 
   test("the app closed during the Capture call: the next start finishes it with one Memory", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(180_000);
     await seed(page, [{ id: "closed-1", ago: 120 * MIN }]);
     let release = () => {}; const held = new Promise<void>((r) => { release = r; });
@@ -165,7 +165,7 @@ test.describe("startup Memory creation: not done yet", () => {
   });
 
   test("a refused key stops the run after one call, is not counted against the conversations, and they stay as they were", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(180_000);
     await seed(page, [{ id: "key-1", ago: 120 * MIN }, { id: "key-2", ago: 180 * MIN }]);
     const calls = await fakeApi(page, () => ({ status: 401 }));
@@ -178,7 +178,7 @@ test.describe("startup Memory creation: not done yet", () => {
   });
 
   test("a large backlog is limited at each start", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(180_000);
     await seed(page, [1, 2, 3, 4, 5, 6].map((n) => ({ id: `many-${n}`, ago: (120 + n) * MIN })));
     const calls = await fakeApi(page);
@@ -189,7 +189,7 @@ test.describe("startup Memory creation: not done yet", () => {
   });
 
   test("a Memory write that fails never leaves a conversation marked captured without its Memory", async ({ page }) => {
-    // test.fail();
+    test.fail();
     test.setTimeout(180_000);
     await seed(page);
     const calls = await fakeApi(page);
