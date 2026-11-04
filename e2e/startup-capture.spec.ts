@@ -120,11 +120,18 @@ const nav = (page: Page) => page.getByRole("navigation", { name: "メインナ�
 const talkFromHome = async (page: Page, words: string) => { await page.getByRole("button", { name: "会話", exact: true }).click(); await talk(page, words); };
 const goHome = (page: Page) => page.getByRole("button", { name: /ホームへ戻る|トップ画面へ戻る/ }).first().click();
 const withWords = async (page: Page, words: string) => (await rows(page, "conversations")).find((c) => c.turns.some((t: any) => t.content === words));
-/** as if the conversation had been left for two hours */
+/** as if the conversation had been left for two hours: a conversation already saved to the Vault stays saved */
 const backdate = (page: Page, id: string) => page.evaluate(async (id) => {
   const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
-  await new Promise<void>((res, rej) => { const t = db.transaction("conversations", "readwrite"); t.objectStore("conversations").put({ ...c, updatedAt: new Date(Date.now() - 7_200_000).toISOString() }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  const synced: any = await new Promise((res, rej) => { const q = db.transaction("vaultSyncState").objectStore("vaultSyncState").get(`conversation:${id}`); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  const updatedAt = new Date(Date.now() - 7_200_000).toISOString();
+  await new Promise<void>((res, rej) => {
+    const t = db.transaction(["conversations", "vaultSyncState"], "readwrite");
+    t.objectStore("conversations").put({ ...c, updatedAt });
+    if (synced === c.updatedAt) t.objectStore("vaultSyncState").put(updatedAt, `conversation:${id}`);
+    t.oncomplete = () => res(); t.onerror = () => rej(t.error);
+  });
   db.close();
 }, id);
 /** the words of the first turn change in the stored conversation, as another tab's edit would */
@@ -173,23 +180,8 @@ async function takeInEdit(page: Page) {
   const conflict = page.getByTestId("vault-conflict-open").first();
   await expect(check.or(conflict).first()).toBeVisible({ timeout: 120_000 });
   if (await check.isVisible()) { await expect(check).toBeEnabled({ timeout: 60_000 }); await check.click(); }
-  const screen = () => page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(150, 900));
-  const outbox = async () => (await rows(page, "vaultOutbox")).map((e) => [e.recordType, e.status, e.holdReason ?? e.reason ?? null]);
-  try { await expect(update.or(conflict).first()).toBeVisible({ timeout: 25_000 }); }
-  catch {
-    notice("diag-1", { s: await screen(), o: await outbox() });
-    await page.waitForTimeout(25_000);
-    notice("diag-2", { s: await screen(), o: await outbox() });
-    const again = page.getByTestId("vault-check-again");
-    if (await again.isVisible()) await again.click();
-    await page.waitForTimeout(25_000);
-    notice("diag-3", { s: await screen(), o: await outbox() });
-    await startApp(page);
-    await nav(page).getByRole("button", { name: "設定" }).click();
-    await page.waitForTimeout(25_000);
-    notice("diag-4", { s: await screen(), o: await outbox() });
-    throw new Error("no update or choice");
-  }
+  try { await expect(update.or(conflict).first()).toBeVisible({ timeout: 60_000 }); }
+  catch { throw new Error(`no update or choice. The screen said: ${await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 1500))}`); }
   const asChoice = !(await update.isVisible());
   notice("edit-taken-in", asChoice ? "choice of versions" : "update");
   if (asChoice) {
