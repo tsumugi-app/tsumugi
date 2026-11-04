@@ -2414,7 +2414,8 @@ export default function ChatScreen() {
           const allConversations = await withVaultWorldRead(() => getAllConversations());
           setInterruptedConversation(newestInterruptedConversation(allConversations));
           // Memory作成そのものは、設定でオンにした端末だけ、画面が使えるようになってから始める（lib/autoCaptureRun.ts）。
-          if (vaultStatus === "connected" && vaultHandle) {
+          // 起動後にオンにした場合は、画面の案内どおり次回の起動から動く。
+          if (vaultStatus === "connected" && vaultHandle && parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings).enabled) {
             window.setTimeout(() => void trackMemoryTask(autoCaptureRunnerRef.current(false)), AUTO_CAPTURE_START_DELAY_MS);
           }
         } catch (error) {
