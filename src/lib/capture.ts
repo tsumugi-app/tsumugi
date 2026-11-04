@@ -8,7 +8,7 @@
 
 import { beginCaptureDebug, bindCaptureDebug, captureDebugId, observeCapture, observeCaptureSave, type CaptureDebugServer } from "./captureDebug";
 import { ulid } from "ulid";
-import { getAllMemoryObjects, loadApiKey, putConversation, putCapturedMemoryWithOutbox } from "./db";
+import { commitCaptureResult, getAllMemoryObjects, loadApiKey, putConversation, putCapturedMemoryWithOutbox, type CaptureCommitResult } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
 import { isReflectionSummary, writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import type { ConversationEntryKind } from "./conversationEntryKind";
@@ -355,13 +355,21 @@ function logTopicEventsHeader(res: Response): void {
   }
 }
 
+/** /api/capture answered with an error: the status decides what happens next */
+export class CaptureRequestError extends Error {
+  constructor(public readonly status: number) { super(`capture request failed with status ${status}`); this.name = "CaptureRequestError"; }
+}
+
+type ExtractionResult = { memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics };
+
 async function extractMemories(
   persona: Persona,
   turns: ConversationTurn[],
   existingMemoryObjects: MemoryObject[],
   relatedMemoryObjects: MemoryObject[],
-  debugId?: string
-): Promise<{ memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics }> {
+  debugId?: string,
+  signal?: AbortSignal
+): Promise<ExtractionResult> {
   const apiKey = await loadApiKey();
   const toRef = (memory: MemoryObject) => ({
     id: memory.id,
@@ -374,6 +382,7 @@ async function extractMemories(
   observeCapture(debugId, e => { e.phase = "request-sent"; });
   const res = await fetch("/api/capture", {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       ...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}),
@@ -395,7 +404,7 @@ async function extractMemories(
         observeCapture(debugId, e => { e.server = failure.captureDebug; });
       } catch { /* Non-JSON errors do not change the existing exception. */ }
     }
-    throw new Error(`capture request failed with status ${res.status}`);
+    throw new CaptureRequestError(res.status);
   }
   logEvidenceBoundaryHeader(res);
   logPersonMentionsHeader(res);
@@ -438,11 +447,17 @@ export interface CaptureResult {
  */
 export async function captureConversation(
   conversation: Conversation,
-  existingMemoryObjects: MemoryObject[]
+  existingMemoryObjects: MemoryObject[],
+  options?: { signal?: AbortSignal }
 ): Promise<CaptureResult> {
   const debugId = beginCaptureDebug(conversation);
   try {
-    return await withVaultWorldRead(() => captureConversationImpl(conversation, existingMemoryObjects, debugId));
+    // The Vault world lock is held for the reads and for building the result, never during the AI call, so a slow answer does not hold up a Vault switch.
+    // A switch in the meantime is seen by the second lock's epoch check (another tab) or waits for this tracked task (this tab).
+    const ownMemoryObjects = existingMemoryObjects.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
+    const relatedMemoryObjects = await withVaultWorldRead(() => findRelatedMemoriesFromOtherConversations(conversation, ownMemoryObjects));
+    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal);
+    return await withVaultWorldRead(() => captureConversationImpl(conversation, ownMemoryObjects, relatedMemoryObjects, extraction, debugId));
   } catch (error) {
     observeCapture(debugId, e => { e.phase += "; capture-failed"; });
     throw error;
@@ -452,20 +467,15 @@ export async function captureConversation(
 async function captureConversationImpl(
   conversation: Conversation,
   existingMemoryObjectsArg: MemoryObject[],
+  relatedMemoryObjects: MemoryObject[],
+  extraction: ExtractionResult,
   debugId?: string
 ): Promise<CaptureResult> {
   // 契約の強制（M1の三重目の防御）：existingMemoryObjectsは「このConversation自身から既に生成済みのMemory」だけ。
   // 現在の唯一の呼び出し元は空配列を渡す（会話境界のCaptureは1回だけ）ため通常は何も除外されないが、将来の呼び出し元が
   // 別Conversation由来のMemoryを誤って渡しても、UPDATE対象にもLLMへの「更新可能」提示にもならないよう、ここで必ず絞る。
   const existingMemoryObjects = existingMemoryObjectsArg.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
-  const relatedMemoryObjects = await findRelatedMemoriesFromOtherConversations(conversation, existingMemoryObjects);
-  const { memories: extracted, diagnostics } = await extractMemories(
-    conversation.persona,
-    turnsForAi(conversation.turns),
-    existingMemoryObjects,
-    relatedMemoryObjects,
-    debugId
-  );
+  const { memories: extracted, diagnostics } = extraction;
   const timestamp = nowISO();
   // Memory UPDATE破壊の停止（M1、2026-09-25）：UPDATE（content/summary/keywords/typesの置換）の
   // 対象にできるのは、このConversation自身から既に生成済みのMemory（existingMemoryObjects）だけ。
@@ -942,6 +952,45 @@ export async function persistCapture(
   // ロックは既に解放済み。ここで初めて（ネストしない、独立した新規ロック要求として）
   // 背景Vault write群をまとめて開始する（H4 Codexレビュー指摘High-2対応）。
   return { conversationFailed, failedMemoryIds, backgroundSyncPromise: startBackgroundSync ? startBackgroundSync() : null };
+}
+
+/**
+ * The save of a Capture's result at a conversation boundary: everything on the device in one transaction (db.ts `commitCaptureResult`), then the Vault files. A failed file write
+ * stays pending in the Outbox and the next flush repairs it. Throws when the transaction fails, and then nothing has changed.
+ */
+export async function persistCaptureAtomically(
+  vaultHandle: FileSystemDirectoryHandle | null,
+  conversation: Conversation,
+  memoryObjects: MemoryObject[],
+  priority: VaultWritePriority = "interactive",
+  awaitVaultSync: boolean = true
+): Promise<{ commit: CaptureCommitResult; backgroundSyncPromise: Promise<void> | null }> {
+  const debugId = captureDebugId(conversation);
+  const { commit, start } = await withVaultWorldRead(async () => {
+    const commit = await commitCaptureResult(conversation, memoryObjects.map((memory) => ({ memory, recordType: isReflectionSummary(memory) ? "reflection" as const : "memory" as const })));
+    if (commit.outcome !== "committed") return { commit, start: null };
+    observeCapture(debugId, e => { e.phase = "committed"; });
+    if (!vaultHandle) return { commit, start: null };
+    const sync = async () => {
+      try {
+        await writeConversationMarkdown(vaultHandle, commit.conversation, priority);
+      } catch (error) {
+        console.error("[Tsumugi] conversation markdown write failed (will retry on next vault flush):", error);
+      }
+      for (const memory of commit.memories) {
+        try {
+          await writeMemoryObjectMarkdown(vaultHandle, memory, priority);
+          observeCaptureSave(debugId, memory.id, "vault", "success");
+        } catch (error) {
+          observeCaptureSave(debugId, memory.id, "vault", error instanceof Error && error.name === "VaultRecordNeedsResyncError" ? "held" : "failed");
+          console.error(`[Tsumugi Capture] memory markdown write failed for ${memory.id} (will retry on next vault flush):`, error);
+        }
+      }
+    };
+    if (awaitVaultSync) { await sync(); return { commit, start: null }; }
+    return { commit, start: scheduleBackgroundVaultSync(sync) };
+  });
+  return { commit, backgroundSyncPromise: start ? start() : null };
 }
 
 interface PersistCaptureImplResult {

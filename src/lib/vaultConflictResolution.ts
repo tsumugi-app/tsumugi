@@ -182,7 +182,7 @@ function fileWithVersion(located: Located, id: string, next: string): string | n
 // 保存先の版を採用できるか
 // ---------------------------------------------------------------------------
 
-const CONVERSATION_DERIVED_KEYS: ReadonlySet<string> = new Set(["updatedAt", "turnTimes", "interruptedTurns"]);
+const CONVERSATION_DERIVED_KEYS: ReadonlySet<string> = new Set(["updatedAt", "turnTimes", "interruptedTurns", "chatProviders"]);
 
 /** 保存先の版のうち、Markdownが持つ項目だけを端末の記録に重ねる（Markdownに無い項目は端末の値を保つ） */
 function mergedVaultVersion(type: ConflictRecordType, device: LocalRecord, parsed: LocalRecord, updatedAt: string): LocalRecord {

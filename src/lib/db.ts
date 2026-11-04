@@ -1543,6 +1543,60 @@ export async function putCapturedMemoryWithOutbox(
   });
 }
 
+export type CaptureCommitResult =
+  | { outcome: "committed"; conversation: Conversation; memories: MemoryObject[] }
+  | { outcome: "already-captured" | "conversation-changed" };
+
+/**
+ * The result of a Capture is saved whole or not at all: the conversation's status, its Memories and their Outbox entries, in one transaction. A stop or a failed write leaves
+ * the conversation as it was, ready for another try; it can never be `captured` without its Memories, or have Memories while still open for another Capture.
+ * Read again inside the transaction: a conversation another tab finished is left alone, and one that gained turns after the AI call is left alone because the result does not cover them.
+ */
+export async function commitCaptureResult(
+  conversation: Conversation,
+  memories: { memory: MemoryObject; recordType: "memory" | "reflection" }[],
+  now: string = new Date().toISOString(),
+): Promise<CaptureCommitResult> {
+  const db = await getDB();
+  const tx = db.transaction(["conversations", "memoryObjects", "vaultOutbox", "settings"], "readwrite");
+  let result: CaptureCommitResult;
+  try {
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    const conversations = tx.objectStore("conversations");
+    const stored = await conversations.get(conversation.id);
+    if (stored?.status === "captured") result = { outcome: "already-captured" };
+    else if (stored && stored.turns.length > conversation.turns.length) result = { outcome: "conversation-changed" };
+    else {
+      const outbox = tx.objectStore("vaultOutbox");
+      const store = tx.objectStore("memoryObjects");
+      const saved: MemoryObject[] = [];
+      for (const { memory, recordType } of memories) {
+        if (memory.conversationId !== conversation.id) throw new MemoryLineageViolationError(memory.id);
+        if (memoryBlocked(tombs, memory)) continue;
+        assertMemoryLineage(await store.get(memory.id), memory);
+        const record = (await withoutDeletedLinksInTx(tx, memory, tombs)) ?? memory;
+        const id = vaultOutboxIdFor(recordType, record.id);
+        await Promise.all([store.put(record), outbox.put(buildOutboxEntryForUpdate(await outbox.get(id), recordType, record.id, record.updatedAt, now))]);
+        saved.push(record);
+      }
+      const savedIds = new Set(saved.map((m) => m.id));
+      const requested = new Set(memories.map((m) => m.memory.id));
+      const memoryObjectIds = conversation.memoryObjectIds.filter((id) => !requested.has(id) || savedIds.has(id));
+      // the same turns: only what Capture decides changes, so a field another writer set on the stored record stays. Fewer stored turns: a turn's own save is still on its way.
+      const base = stored && stored.turns.length === conversation.turns.length ? stored : conversation;
+      const next = withoutDeletedMemoryRefs({ ...base, status: conversation.status, memoryObjectIds, updatedAt: conversation.updatedAt }, tombs);
+      const id = vaultOutboxIdFor("conversation", next.id);
+      await Promise.all([conversations.put(next), outbox.put(buildOutboxEntryForUpdate(await outbox.get(id), "conversation", next.id, next.updatedAt, now))]);
+      result = { outcome: "committed", conversation: next, memories: saved };
+    }
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return result!;
+}
+
 /**
  * A write by the app of a Memory snapshot taken earlier (another tab, a long-running migration, a Capture waiting for the AI) must not bring back a link to a Memory
  * the user deleted meanwhile: the link is dropped, as a NEW version later than both the snapshot and what is stored now, so the corrected record is what the Vault
@@ -1712,6 +1766,23 @@ const CHAT_PROVIDER_KEY = "chatProvider";
 export async function saveChatProvider(provider: AIProviderName) {
   const db = await getDB();
   await db.put("settings", provider, CHAT_PROVIDER_KEY);
+}
+
+const AUTO_CAPTURE_SETTINGS_KEY = "autoCapture:settings";
+const AUTO_CAPTURE_STATE_KEY = "autoCapture:state";
+
+/** 起動時のMemory作成（docs/startup-memory-capture.md）の設定と試行回数。端末だけの値でVaultには書かない。値の解釈はautoCapturePolicy.ts。 */
+export async function loadAutoCaptureRaw(): Promise<{ settings: string | undefined; state: string | undefined }> {
+  const db = await getDB();
+  return { settings: await db.get("settings", AUTO_CAPTURE_SETTINGS_KEY), state: await db.get("settings", AUTO_CAPTURE_STATE_KEY) };
+}
+export async function saveAutoCaptureSettingsRaw(json: string) {
+  const db = await getDB();
+  await db.put("settings", json, AUTO_CAPTURE_SETTINGS_KEY);
+}
+export async function saveAutoCaptureStateRaw(json: string) {
+  const db = await getDB();
+  await db.put("settings", json, AUTO_CAPTURE_STATE_KEY);
 }
 
 export async function loadChatProvider(): Promise<AIProviderName> {

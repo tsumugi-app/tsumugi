@@ -1,5 +1,6 @@
 "use client";
 
+import AutoCaptureSettings from "./AutoCaptureSettings";
 import { APP_BUILD_ID } from "@/lib/recoveryBackgroundCheck";
 import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
@@ -61,6 +62,7 @@ export default function SettingsPanel({
   deleteDataFeedback,
   onExportData,
   onWipeAllData,
+  onAutoCaptureRetry,
   vaultLightCheckStatus,
   onConfirmVaultLightCheck,
   onApplyVaultLightCheck,
@@ -123,6 +125,7 @@ export default function SettingsPanel({
   deleteDataFeedback: DataActionFeedback | null;
   onExportData: () => void;
   onWipeAllData: () => void;
+  onAutoCaptureRetry: () => Promise<string>;
   /**
    * 軽量「外部の変更」検知フロー（Level 1〜4）のUI状態。"idle"の間は何も
    * 表示しない（起動時のLevel 1/2で候補が1件も無い場合も含む）。
@@ -1612,6 +1615,8 @@ export default function SettingsPanel({
             </div>
           )}
         </section>
+
+        <AutoCaptureSettings onRetry={onAutoCaptureRetry} />
 
         {/*
           データ管理。「データ」セクションは全プラットフォームで表示する。
