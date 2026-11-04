@@ -8,6 +8,7 @@ const APP = path.join(__dirname, "..");   // `next start` runs in the app direct
 const PW = process.env.E2E_PW ?? "local-e2e-only-password";
 export default defineConfig({
   testDir: ".",
+  testMatch: "startup-capture.spec.ts", // TEMPORARY diagnosis, to be reverted
   testMatch: /.*\.spec\.ts/,
   timeout: 60_000,
   retries: 0,

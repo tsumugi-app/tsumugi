@@ -173,7 +173,8 @@ async function takeInEdit(page: Page) {
   const conflict = page.getByTestId("vault-conflict-open").first();
   await expect(check.or(conflict).first()).toBeVisible({ timeout: 120_000 });
   if (await check.isVisible()) { await expect(check).toBeEnabled({ timeout: 60_000 }); await check.click(); }
-  await expect(update.or(conflict).first()).toBeVisible({ timeout: 60_000 });
+  try { await expect(update.or(conflict).first()).toBeVisible({ timeout: 60_000 }); }
+  catch { throw new Error(`no update or choice. The screen said: ${await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 2500))}`); }
   const asChoice = !(await update.isVisible());
   notice("edit-taken-in", asChoice ? "choice of versions" : "update");
   if (asChoice) {
