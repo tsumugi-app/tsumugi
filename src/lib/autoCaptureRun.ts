@@ -22,7 +22,7 @@ export interface AutoCaptureDeps {
   writeState(state: AutoCaptureState): Promise<void>;
   ifConversationFree<T>(id: string, fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: false }>;
   /** false: the Vault file was edited from outside or is held, so the stored words may be old */
-  vaultFileUnchanged(id: string): Promise<boolean>;
+  vaultFileUnchanged(conversation: Conversation): Promise<boolean>;
   /** calls `onRequestSent` just before the AI request starts */
   capture(conversation: Conversation, signal: AbortSignal, onRequestSent: () => void): Promise<AutoCaptureResult>;
   now(): number;
@@ -47,7 +47,7 @@ export async function runAutoCapture(deps: AutoCaptureDeps, options: { manual?: 
         const stored = await deps.readConversation(candidate.id);
         const memoriesNow = await deps.conversationsWithMemory();
         if (!stored || !selectAutoCaptureTargets([stored], memoriesNow, before, settings, deps.now(), manual).length) return "not-sent";
-        if (!(await deps.vaultFileUnchanged(stored.id))) return "not-sent";
+        if (!(await deps.vaultFileUnchanged(stored))) return "not-sent";
         await deps.writeState(beginAutoCaptureAttempt(before, stored.id, deps.now(), manual && isStopped(before, stored.id)));
 
         const controller = new AbortController();

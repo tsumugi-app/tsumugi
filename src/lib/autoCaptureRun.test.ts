@@ -115,7 +115,7 @@ test("what ended before any request costs nothing and gives way to the next conv
 });
 
 test("a Vault file edited from outside: no request for it, nothing recorded, and the next conversation goes", async () => {
-  const { deps, seen } = setup([conv("edited", AUTO_CAPTURE_QUIET_MS * 2), conv("b")], { vaultFileUnchanged: async (id) => id !== "edited" });
+  const { deps, seen } = setup([conv("edited", AUTO_CAPTURE_QUIET_MS * 2), conv("b")], { vaultFileUnchanged: async (c) => c.id !== "edited" });
   assert.equal(await runAutoCapture(deps), "saved");
   assert.deepEqual(seen.captured, ["b"]);
   assert.equal(seen.state.recentRuns.length, 1);

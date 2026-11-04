@@ -22,7 +22,7 @@ import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona 
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
-import { vaultConversationFileUnchanged } from "@/lib/autoCaptureVaultCheck";
+import { conversationFileState } from "@/lib/conversationFileCheck";
 import { parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
 import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
 import { AUTO_CAPTURE_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, withConversationCapture } from "@/lib/conversationLocks";
@@ -414,7 +414,7 @@ type RestoreScanTrigger = "startup" | "connect" | "reauthorize" | "recovery";
 const STARTUP_CONNECT_LIMIT = 3;
 
 /** 会話終了時のCapture結果の区別（表示専用）。"empty"のみが「正常に完了し、保存対象が0件」。 */
-type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed";
+type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed" | "vault-edited";
 
 /** 起動時のMemory作成は、画面が使えるようになってから始める。 */
 const AUTO_CAPTURE_START_DELAY_MS = 5000;
@@ -1640,6 +1640,19 @@ export default function ChatScreen() {
     // pending taskとして待つこと。ここはその保険）。
     const generation = vaultGenerationRef.current;
     try {
+      // 保存先のファイルが外部で編集されていたら、編集前の本文からMemoryを作らない。会話は処理済みにせず、編集を取り込んだ後にもう一度処理できる。
+      const stoppedByVaultEdit = async () => {
+        if (!vaultHandle) return false;
+        const fileState = await conversationFileState(vaultHandle, target);
+        if (auto ? fileState === "same" : fileState !== "edited") return false;
+        if (auto) auto.result = "changed";
+        else {
+          boundaryOutcomeRef.current = "vault-edited";
+          setCaptureStatus("error");
+        }
+        connectConversationBoundary(Promise.resolve([]), priority);
+        return true;
+      };
       if (!auto) {
         setCaptureStatus("saving");
         // 別タブや前回の起動で処理済みの会話には、AIを呼ばない。
@@ -1658,6 +1671,7 @@ export default function ChatScreen() {
           connectConversationBoundary(Promise.resolve([]), priority);
           return [];
         }
+        if (await stoppedByVaultEdit()) return [];
       }
       // 境界Captureは会話ごとに1回だけなので、このConversation自身からの
       // 既存Memory（existingMemoryObjects）は常に空でよい（前のターンでのCaptureが
@@ -1667,12 +1681,7 @@ export default function ChatScreen() {
         [],
         auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent } : undefined
       );
-      // 応答を待つ間にVaultのファイルが外部で編集されていたら、編集前の本文から作った結果は保存しない。
-      if (auto && vaultHandle && !(await vaultConversationFileUnchanged(vaultHandle, target.id))) {
-        auto.result = "changed";
-        connectConversationBoundary(Promise.resolve([]), priority);
-        return [];
-      }
+      if (await stoppedByVaultEdit()) return [];
       // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
       let saved: Awaited<ReturnType<typeof persistCaptureAtomically>>;
       try {
@@ -1770,7 +1779,7 @@ export default function ChatScreen() {
       readState: async () => parseAutoCaptureState((await loadAutoCaptureRaw()).state),
       writeState: (state) => saveAutoCaptureStateRaw(JSON.stringify(state)),
       ifConversationFree,
-      vaultFileUnchanged: async (id) => !vaultHandle || vaultConversationFileUnchanged(vaultHandle, id),
+      vaultFileUnchanged: async (target) => !vaultHandle || (await conversationFileState(vaultHandle, target)) === "same",
       capture: async (target, signal, onRequestSent) => {
         const auto: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult } = { signal, onRequestSent, result: "changed" };
         await trackConversationWrite(captureConversationBoundaryBody(target, "background", true, auto));
@@ -5871,7 +5880,9 @@ export default function ChatScreen() {
                   ? "記憶の候補は見つかりましたが、発言との照合を通らず保存できませんでした。会話は保存されています。次回起動時に再確認する対象として残しています。"
                   : endedCaptureOutcome === "failed"
                     ? "記憶の保存に失敗しました。会話は保存されています。次回起動時にもう一度試します。"
-                    : endedCaptureOutcome === "persist-failed"
+                    : endedCaptureOutcome === "vault-edited"
+                      ? "保存先のファイルが外部で変更されていたため、記憶は作りませんでした。会話とファイルはそのままです。設定で変更を確認してください。"
+                      : endedCaptureOutcome === "persist-failed"
                       ? "記憶を端末へ保存できませんでした。会話は保存されています。"
                       : "今回は新しく記憶したことはありませんでした。"}
               </p>
