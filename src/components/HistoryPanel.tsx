@@ -1,5 +1,7 @@
 "use client";
 
+import { isSupersededTurn } from "@/lib/aiReplyOutcome";
+import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { decodeTime } from "ulid";
 import DeleteConversationDialog, { type DeleteRequest } from "@/components/DeleteConversationDialog";
@@ -1251,7 +1253,7 @@ export default function HistoryPanel({
                   </p>
                   <div className="flex flex-col gap-3">
                     {selectedConversation.turns.map((turn, index) => (
-                      <HistoryTurnBubble key={index} turn={turn} />
+                      <HistoryTurnBubble key={index} turn={turn} superseded={isSupersededTurn(selectedConversation.turns, index)} />
                     ))}
                   </div>
                 </div>
@@ -1503,7 +1505,8 @@ function ConversationCard({
  * importしているため、循環importを避けるためにここでは同じ見た目を再実装する
  * （ロジックを持たない純粋な表示コンポーネントで、双方の見た目は意図的に揃えている）。
  */
-function HistoryTurnBubble({ turn }: { turn: ConversationTurn }) {
+function HistoryTurnBubble({ turn, superseded }: { turn: ConversationTurn; superseded: boolean }) {
+  if (turn.interrupted) return <InterruptedTurn content={turn.content} superseded={superseded} />;
   if (turn.role === "user") {
     return (
       <div className="flex justify-end">

@@ -6018,6 +6018,7 @@ function mergeConversationForApply(f: Conversation, l: Conversation): Conversati
       timestamp: lTurn.timestamp,
       webSearchRequested: lTurn.webSearchRequested,
       isRecordTurn: lTurn.isRecordTurn,
+      ...(lTurn.interrupted || fTurn.interrupted ? { interrupted: true } : {}),
     };
   });
   return {

@@ -129,6 +129,8 @@ export function conversationToMarkdown(conversation: Conversation): string {
     // 取り戻すための追加情報（`parseTranscript`参照）。turnが無いConversationにはキー自体を
     // 書かない（`links`/`profile`と同じ、既存の空値省略ルール）。
     turnTimes: conversation.turns.length > 0 ? JSON.stringify(conversation.turns.map((turn) => turn.timestamp)) : undefined,
+    // 途中で止まった応答の時刻（`turnTimes`と同じ形）。本文の形式は変えない。該当が無い会話にはキー自体を書かない。
+    interruptedTurns: conversation.turns.some((turn) => turn.interrupted) ? JSON.stringify(conversation.turns.filter((turn) => turn.interrupted).map((turn) => turn.timestamp)) : undefined,
     source: conversation.metadata.source,
     sourceType: conversation.metadata.sourceType,
     sourceDetail: stringifySourceDetail(conversation.metadata.sourceDetail),
@@ -557,6 +559,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const source = (asString(frontmatter.source) ?? "import") as MemorySource;
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
   const turnTimes = parseTurnTimes(frontmatter.turnTimes);
+  const interruptedTurns = new Set(parseTurnTimes(frontmatter.interruptedTurns));
 
   return {
     id,
@@ -564,7 +567,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
     entryType,
     startedAt,
     endedAt: asString(frontmatter.endedAt),
-    turns: parseTranscript(body, startedAt, turnTimes),
+    turns: parseTranscript(body, startedAt, turnTimes).map((turn) => (turn.role === "ai" && interruptedTurns.has(turn.timestamp) ? { ...turn, interrupted: true } : turn)),
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
     title: asString(frontmatter.title),

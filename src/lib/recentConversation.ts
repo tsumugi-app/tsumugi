@@ -21,6 +21,7 @@
  *   1リクエストごとに組み立てて破棄する /api/chat body の optional field。
  */
 
+import { turnsForAi } from "./aiReplyOutcome";
 import type { Conversation, ConversationTurn } from "./types";
 
 /** endedAt が現在時刻からこのミリ秒以内の直前Conversationのみ Recent として扱う（v1: 6時間）。 */
@@ -101,7 +102,7 @@ export function toRecentConversationPayload(
   conversation: Conversation,
   elapsedMs: number
 ): RecentConversationPayload {
-  const tailTurns = conversation.turns.slice(-RECENT_CONVERSATION_MAX_TURNS).map((turn) => ({
+  const tailTurns = turnsForAi(conversation.turns).slice(-RECENT_CONVERSATION_MAX_TURNS).map((turn) => ({
     role: toPayloadRole(turn.role),
     content: turn.content,
     ...(turn.timestamp ? { timestamp: turn.timestamp } : {}),
