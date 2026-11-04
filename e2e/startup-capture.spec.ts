@@ -173,8 +173,23 @@ async function takeInEdit(page: Page) {
   const conflict = page.getByTestId("vault-conflict-open").first();
   await expect(check.or(conflict).first()).toBeVisible({ timeout: 120_000 });
   if (await check.isVisible()) { await expect(check).toBeEnabled({ timeout: 60_000 }); await check.click(); }
-  try { await expect(update.or(conflict).first()).toBeVisible({ timeout: 60_000 }); }
-  catch { throw new Error(`no update or choice. The screen said: ${await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 2500))}`); }
+  const screen = () => page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(150, 900));
+  const outbox = async () => (await rows(page, "vaultOutbox")).map((e) => [e.recordType, e.status, e.holdReason ?? e.reason ?? null]);
+  try { await expect(update.or(conflict).first()).toBeVisible({ timeout: 25_000 }); }
+  catch {
+    notice("diag-1", { s: await screen(), o: await outbox() });
+    await page.waitForTimeout(25_000);
+    notice("diag-2", { s: await screen(), o: await outbox() });
+    const again = page.getByTestId("vault-check-again");
+    if (await again.isVisible()) await again.click();
+    await page.waitForTimeout(25_000);
+    notice("diag-3", { s: await screen(), o: await outbox() });
+    await startApp(page);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await page.waitForTimeout(25_000);
+    notice("diag-4", { s: await screen(), o: await outbox() });
+    throw new Error("no update or choice");
+  }
   const asChoice = !(await update.isVisible());
   notice("edit-taken-in", asChoice ? "choice of versions" : "update");
   if (asChoice) {
@@ -534,7 +549,7 @@ test.describe("the end of a conversation: Memory and status are saved together",
 test.describe("what an AI request costs, and what it may not overwrite", () => {
   test("the words change during the AI call: the result is thrown away, no other conversation is sent in this start, the request is counted, and the 5 in 24 hours hold", async ({ page }) => {
     test.setTimeout(180_000);
-    await seed(page, [{ id: "edited-now", ago: 300 * MIN }, { id: "next-one", ago: 120 * MIN }], undefined, { recentRuns: 3 });
+    await seed(page, [{ id: "edited-now", ago: 300 * MIN }, { id: "next-one", ago: 120 * MIN }], undefined, { recentRuns: 3, fullStartDelay: true });
     let release = () => {}; const held = new Promise<void>((r) => { release = r; });
     let first = true;
     const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
