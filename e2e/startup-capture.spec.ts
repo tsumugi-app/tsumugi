@@ -661,15 +661,14 @@ test.describe("the save of a Capture result checks what is stored", () => {
 });
 
 test.describe("startup Memory creation: limits", () => {
-  test("nothing to send, no AI call at all: already captured, already has its Memory, recently touched, without an AI reply, or ending in a cut reply", async ({ page }) => {
+  test("nothing to send, no AI call at all: already captured, recently touched, without an AI reply, or ending in a cut reply", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page, [
       { id: "done-1", ago: 120 * MIN, status: "captured" },
-      { id: "has-memory", ago: 120 * MIN },
       { id: "recent", ago: 5 * MIN },
       { id: "no-reply", ago: 120 * MIN, turns: [["user", said("no-reply")]] },
       { id: "cut", ago: 120 * MIN },
-    ], "has-memory");
+    ]);
     await page.evaluate(async () => {
       const { dbm } = (window as any).D; const c = await dbm.getConversation("cut");
       await dbm.putConversationWithOutbox({ ...c, turns: c.turns.map((t: any) => (t.role === "ai" ? { ...t, interrupted: true } : t)) });
@@ -678,8 +677,17 @@ test.describe("startup Memory creation: limits", () => {
     await startApp(page);
     await page.waitForTimeout(SETTLE);
     expect(aiCalls(calls)).toBe(0);
-    expect((await memoriesOf(page, "has-memory")).length).toBe(1);
     for (const id of ["recent", "no-reply", "cut"]) expect(await statusOf(page, id)).toBe("active");
+  });
+
+  test("a conversation that already has its Memory is not captured again", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page, [{ id: "has-memory", ago: 120 * MIN }], "has-memory");
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length).toBe(0);
+    expect((await memoriesOf(page, "has-memory")).length).toBe(1);
   });
 
   test("there is no age limit: a conversation from long ago is processed", async ({ page }) => {
