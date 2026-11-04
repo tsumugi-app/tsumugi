@@ -158,13 +158,27 @@ const allowOthers = (page: Page) => page.evaluate(async () => {
   await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(JSON.stringify({ enabled: true, allowOtherProviders: true }), "autoCapture:settings"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
   db.close();
 });
-/** Settings: 確認する, then 更新する takes the edit into the stored conversation */
+/** the file has the whole conversation, the reply too, and its save is over */
+async function fileIsWritten(page: Page, words: string) {
+  await expect.poll(async () => (await filesWith(page, words)).filter((t) => t.includes("架空の返答です。")).length, { timeout: 30_000 }).toBe(1);
+  await page.waitForTimeout(1_500);
+}
+/** Settings, what the person does: 確認する then 更新する takes the edit in. When the device also has something the file has not, it is a choice between two versions, and the person takes the file's. */
 async function takeInEdit(page: Page) {
   await nav(page).getByRole("button", { name: "設定" }).click();
   const check = page.getByRole("button", { name: "確認する", exact: true }).first();
-  await expect(check).toBeEnabled({ timeout: 120_000 });
-  await check.click();
-  await page.getByRole("button", { name: "更新する", exact: true }).first().click({ timeout: 60_000 });
+  const update = page.getByRole("button", { name: "更新する", exact: true }).first();
+  const conflict = page.getByTestId("vault-conflict-open").first();
+  await expect(check.or(conflict).first()).toBeVisible({ timeout: 120_000 });
+  if (await check.isVisible()) { await expect(check).toBeEnabled({ timeout: 60_000 }); await check.click(); }
+  await expect(update.or(conflict).first()).toBeVisible({ timeout: 60_000 });
+  const asChoice = !(await update.isVisible());
+  notice("edit-taken-in", asChoice ? "choice of versions" : "update");
+  if (asChoice) {
+    await conflict.click();
+    await page.getByTestId("vault-conflict-choice-adopt-vault").click();
+    await page.getByTestId("vault-conflict-confirm").click();
+  } else await update.click();
   await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
 }
 const conversationWords = async (page: Page, id: string) => (await rows(page, "conversations")).find((c) => c.id === id)?.turns.map((t: any) => t.content).join(" ") ?? "";
@@ -583,7 +597,7 @@ test.describe("what an AI request costs, and what it may not overwrite", () => {
     const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
     await startApp(page);
     await talkFromHome(page, said("外部中"));
-    await expect.poll(async () => (await filesWith(page, said("外部中"))).length, { timeout: 30_000 }).toBe(1);
+    await fileIsWritten(page, said("外部中"));
     const { id } = await withWords(page, said("外部中"));
     await backdate(page, id);
     await startApp(page);
@@ -638,7 +652,7 @@ test.describe("what an AI request costs, and what it may not overwrite", () => {
     const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
     await startApp(page);
     await talkFromHome(page, said("終了時"));
-    await expect.poll(async () => (await filesWith(page, said("終了時"))).length, { timeout: 30_000 }).toBe(1);
+    await fileIsWritten(page, said("終了時"));
     const { id } = await withWords(page, said("終了時"));
     await goHome(page);
     await captureSeen(calls, 1);
