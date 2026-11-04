@@ -58,6 +58,7 @@ export function createConversation(persona: Persona, entryType?: ConversationEnt
     entryType,
     startedAt: timestamp,
     turns: [],
+    chatProviders: [],
     status: "active",
     memoryObjectIds: [],
     createdAt: timestamp,
@@ -368,7 +369,8 @@ async function extractMemories(
   existingMemoryObjects: MemoryObject[],
   relatedMemoryObjects: MemoryObject[],
   debugId?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onRequestSent?: () => void
 ): Promise<ExtractionResult> {
   const apiKey = await loadApiKey();
   const toRef = (memory: MemoryObject) => ({
@@ -380,6 +382,7 @@ async function extractMemories(
   console.log(`[Capture] request:start`);
   logTimingEvent("Capture request:start");
   observeCapture(debugId, e => { e.phase = "request-sent"; });
+  onRequestSent?.();
   const res = await fetch("/api/capture", {
     method: "POST",
     signal,
@@ -448,7 +451,7 @@ export interface CaptureResult {
 export async function captureConversation(
   conversation: Conversation,
   existingMemoryObjects: MemoryObject[],
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; onRequestSent?: () => void }
 ): Promise<CaptureResult> {
   const debugId = beginCaptureDebug(conversation);
   try {
@@ -456,7 +459,7 @@ export async function captureConversation(
     // A switch in the meantime is seen by the second lock's epoch check (another tab) or waits for this tracked task (this tab).
     const ownMemoryObjects = existingMemoryObjects.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
     const relatedMemoryObjects = await withVaultWorldRead(() => findRelatedMemoriesFromOtherConversations(conversation, ownMemoryObjects));
-    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal);
+    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal, options?.onRequestSent);
     return await withVaultWorldRead(() => captureConversationImpl(conversation, ownMemoryObjects, relatedMemoryObjects, extraction, debugId));
   } catch (error) {
     observeCapture(debugId, e => { e.phase += "; capture-failed"; });

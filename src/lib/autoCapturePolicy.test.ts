@@ -44,6 +44,10 @@ test("another AI, or no record of which AI, needs the permission", () => {
   const fresh = conv("x", undefined, { turns: [] });
   assert.equal(heldOnlyWithGemini(withChatProvider(withChatProvider(fresh, "gemini"), "gemini")), true);
   assert.deepEqual(withChatProvider(withChatProvider(fresh, "gemini"), "openai").chatProviders, ["gemini", "openai"]);
+  const asked = { ...fresh, chatProviders: [], turns: conv("asked").turns };
+  assert.deepEqual(withChatProvider(asked, "gemini").chatProviders, ["gemini"], "a new conversation's first turn may be a past question");
+  assert.equal(heldOnlyWithGemini(asked), false, "no AI on record yet");
+  assert.deepEqual(withChatProvider(asked, "openai").chatProviders, ["openai"]);
   const resumed = withChatProvider(conv("old"), "gemini");
   assert.deepEqual(resumed.chatProviders, ["unknown", "gemini"], "an old conversation that goes on with Gemini is still unknown");
   assert.equal(heldOnlyWithGemini(resumed), false);
@@ -69,7 +73,11 @@ test("after an HTTP failure it waits; after a dropped connection or a closed app
   assert.deepEqual(select([conv("c")], started), ["c"], "closed during the call");
   assert.deepEqual(select([conv("c")], finishAutoCaptureAttempt(started, empty, "c", "network")), ["c"]);
   for (const r of ["http", "all-dropped", "save-failed"] as const) assert.deepEqual(select([conv("c")], finishAutoCaptureAttempt(started, empty, "c", r)), []);
-  for (const r of ["key", "changed", "cancelled"] as const) assert.deepEqual(finishAutoCaptureAttempt(started, empty, "c", r), empty);
+  for (const r of ["key", "changed", "cancelled"] as const) {
+    assert.equal(finishAutoCaptureAttempt(started, empty, "c", r).conversations.c, undefined);
+    assert.equal(finishAutoCaptureAttempt(started, empty, "c", r).recentRuns.length, 1, "the request was made");
+    assert.deepEqual(finishAutoCaptureAttempt(started, empty, "c", r, false), empty, "no request was made");
+  }
   for (const r of ["saved", "empty", "deleted", "already"] as const) assert.equal(finishAutoCaptureAttempt(started, empty, "c", r).conversations.c, undefined);
 });
 

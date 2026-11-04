@@ -21,7 +21,10 @@ export interface AutoCaptureDeps {
   readState(): Promise<AutoCaptureState>;
   writeState(state: AutoCaptureState): Promise<void>;
   ifConversationFree<T>(id: string, fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: false }>;
-  capture(conversation: Conversation, signal: AbortSignal): Promise<AutoCaptureResult>;
+  /** false: the Vault file was edited from outside or is held, so the stored words may be old */
+  vaultFileUnchanged(id: string): Promise<boolean>;
+  /** calls `onRequestSent` just before the AI request starts */
+  capture(conversation: Conversation, signal: AbortSignal, onRequestSent: () => void): Promise<AutoCaptureResult>;
   now(): number;
 }
 
@@ -38,25 +41,27 @@ export async function runAutoCapture(deps: AutoCaptureDeps, options: { manual?: 
     const conversations = await deps.readConversations();
     const withMemory = await deps.conversationsWithMemory();
     for (const candidate of selectAutoCaptureTargets(conversations, withMemory, state, settings, deps.now(), manual)) {
-      const run = await deps.ifConversationFree(candidate.id, async (): Promise<AutoCaptureRunOutcome> => {
+      const run = await deps.ifConversationFree(candidate.id, async (): Promise<AutoCaptureRunOutcome | "not-sent"> => {
         // the lists above were read before the locks: decide again on what is stored now
         const before = await deps.readState();
         const stored = await deps.readConversation(candidate.id);
         const memoriesNow = await deps.conversationsWithMemory();
-        if (!stored || !selectAutoCaptureTargets([stored], memoriesNow, before, settings, deps.now(), manual).length) return "changed";
+        if (!stored || !selectAutoCaptureTargets([stored], memoriesNow, before, settings, deps.now(), manual).length) return "not-sent";
+        if (!(await deps.vaultFileUnchanged(stored.id))) return "not-sent";
         await deps.writeState(beginAutoCaptureAttempt(before, stored.id, deps.now(), manual && isStopped(before, stored.id)));
 
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), AUTO_CAPTURE_TIMEOUT_MS);
         let cancelledNow = false;
+        let requested = false;
         const poll = setInterval(() => { if (options.shouldCancel?.()) { cancelledNow = true; controller.abort(); } }, 500);
         let result: AutoCaptureResult;
         try {
-          result = await deps.capture(stored, controller.signal);
+          result = await deps.capture(stored, controller.signal, () => { requested = true; });
         } catch (error) {
           const name = (error as Error | undefined)?.name;
           if (name === "StaleVaultTabError" || name === "IncompleteVaultWorldError") {
-            await deps.writeState(finishAutoCaptureAttempt(await deps.readState(), before, stored.id, "cancelled")).catch(() => undefined);
+            await deps.writeState(finishAutoCaptureAttempt(await deps.readState(), before, stored.id, "cancelled", requested)).catch(() => undefined);
             throw error;
           }
           result = classifyAutoCaptureFailure(error, cancelledNow);
@@ -64,10 +69,11 @@ export async function runAutoCapture(deps: AutoCaptureDeps, options: { manual?: 
           clearTimeout(timeout);
           clearInterval(poll);
         }
-        await deps.writeState(finishAutoCaptureAttempt(await deps.readState(), before, stored.id, result));
-        return result;
+        await deps.writeState(finishAutoCaptureAttempt(await deps.readState(), before, stored.id, result, requested));
+        return !requested && result === "changed" ? "not-sent" : result;
       });
-      if (run.ran && run.value !== "changed") return run.value;
+      // Only a conversation that cost no request gives way to the next one. Once a request was made, this start has had its conversation, whatever became of the result.
+      if (run.ran && run.value !== "not-sent") return run.value;
     }
     return "nothing";
   });

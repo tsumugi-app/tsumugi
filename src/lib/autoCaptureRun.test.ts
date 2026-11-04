@@ -24,7 +24,8 @@ function setup(list: Conversation[], over: Partial<AutoCaptureDeps> = {}, result
     readState: async () => seen.state,
     writeState: async (s) => { seen.state = s; },
     ifConversationFree: async (_id, fn) => ({ ran: true, value: await fn() }),
-    capture: async (c) => { seen.captured.push(c.id); seen.statesAtCall.push(seen.state); return result(); },
+    vaultFileUnchanged: async () => true,
+    capture: async (c, _signal, onRequestSent) => { onRequestSent(); seen.captured.push(c.id); seen.statesAtCall.push(seen.state); return result(); },
     now: () => NOW,
     ...over,
   };
@@ -72,20 +73,73 @@ test("decided again on what is stored after the locks: changed in between means 
   assert.deepEqual(second.seen.captured, []);
 });
 
+test("once a request was made the run ends there and the request stays counted, whatever became of its result", async () => {
+  for (const result of ["changed", "already", "key", "cancelled", "network", "http", "save-failed", "all-dropped", "empty", "deleted"] as const) {
+    const { deps, seen } = setup([conv("a", AUTO_CAPTURE_QUIET_MS * 2), conv("b")], {}, () => result);
+    assert.equal(await runAutoCapture(deps), result);
+    assert.deepEqual(seen.captured, ["a"], result);
+    assert.equal(seen.state.recentRuns.length, 1, result);
+  }
+});
+
+test("a thrown away result uses no attempt of the conversation, and the words go at the next start", async () => {
+  const { deps, seen } = setup([conv("a")], {}, () => "changed");
+  await runAutoCapture(deps);
+  assert.equal(seen.state.conversations.a, undefined);
+  await runAutoCapture(deps);
+  assert.deepEqual(seen.captured, ["a", "a"]);
+  assert.equal(seen.state.recentRuns.length, 2);
+});
+
+test("5 requests in 24 hours, thrown away or refused ones included; a sixth start sends nothing", async () => {
+  let n = 0;
+  const { deps, seen } = setup([conv("a")], {}, () => (n++ % 2 === 0 ? "changed" : "key"));
+  for (let i = 0; i < 5; i++) await runAutoCapture(deps);
+  assert.equal(seen.captured.length, 5);
+  assert.equal(await runAutoCapture(deps), "nothing");
+  assert.equal(seen.captured.length, 5);
+});
+
+test("what ended before any request costs nothing and gives way to the next conversation", async () => {
+  const sent: string[] = [];
+  const { deps, seen } = setup([conv("a", AUTO_CAPTURE_QUIET_MS * 2), conv("b")], {
+    capture: async (c, _signal, onRequestSent) => {
+      if (c.id === "a") return "changed";
+      onRequestSent(); sent.push(c.id); return "saved";
+    },
+  });
+  assert.equal(await runAutoCapture(deps), "saved");
+  assert.deepEqual(sent, ["b"]);
+  assert.equal(seen.state.recentRuns.length, 1);
+  assert.equal(seen.state.conversations.a, undefined);
+});
+
+test("a Vault file edited from outside: no request for it, nothing recorded, and the next conversation goes", async () => {
+  const { deps, seen } = setup([conv("edited", AUTO_CAPTURE_QUIET_MS * 2), conv("b")], { vaultFileUnchanged: async (id) => id !== "edited" });
+  assert.equal(await runAutoCapture(deps), "saved");
+  assert.deepEqual(seen.captured, ["b"]);
+  assert.equal(seen.state.recentRuns.length, 1);
+});
+
 test("a failure is recorded, not thrown; a stale tab is thrown and costs no attempt", async () => {
   const failing = setup([conv("a")], {}, () => { throw Object.assign(new Error("x"), { name: "CaptureRequestError", status: 503 }); });
   assert.equal(await runAutoCapture(failing.deps), "http");
   assert.equal(failing.seen.state.conversations.a.attempts, 1);
   assert.equal(failing.seen.state.conversations.a.lastKind, "wait");
-  const stale = setup([conv("a")], {}, () => { throw Object.assign(new Error("x"), { name: "StaleVaultTabError" }); });
+  const stale = setup([conv("a")], { capture: async () => { throw Object.assign(new Error("x"), { name: "StaleVaultTabError" }); } });
   await assert.rejects(runAutoCapture(stale.deps), /x/);
   assert.deepEqual(stale.seen.state, emptyAutoCaptureState());
+  const staleAfter = setup([conv("a")], {}, () => { throw Object.assign(new Error("x"), { name: "StaleVaultTabError" }); });
+  await assert.rejects(runAutoCapture(staleAfter.deps), /x/);
+  assert.equal(staleAfter.seen.state.conversations.a, undefined);
+  assert.equal(staleAfter.seen.state.recentRuns.length, 1, "the request was made");
 });
 
-test("a Vault switch cancels the call, which costs no attempt", async () => {
+test("a Vault switch cancels the call: no attempt used, and the request stays counted", async () => {
   const { deps, seen } = setup([conv("a")], {
-    capture: (_c, signal) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(Object.assign(new Error("x"), { name: "AbortError" })))),
+    capture: (_c, signal, onRequestSent) => { onRequestSent(); return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(Object.assign(new Error("x"), { name: "AbortError" })))); },
   });
   assert.equal(await runAutoCapture(deps, { shouldCancel: () => true }), "cancelled");
-  assert.deepEqual(seen.state, emptyAutoCaptureState());
+  assert.equal(seen.state.conversations.a, undefined);
+  assert.equal(seen.state.recentRuns.length, 1);
 });

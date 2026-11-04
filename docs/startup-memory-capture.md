@@ -24,11 +24,15 @@ All of these must hold:
 4. Not touched for at least 30 minutes (`updatedAt`). There is no upper age limit.
 5. Open in no tab (Web Lock below).
 6. Attempt limit not reached, and the wait after an HTTP failure has passed.
-7. Known to be held only with Gemini (`chatProviders`), or the user has allowed other conversations. A conversation from before this record existed counts as unknown and needs the permission.
+7. Known to be held only with Gemini (`chatProviders`), or the user has allowed other conversations. A new conversation starts with an empty record, also when its first turn is a past question from the home screen. A conversation from before this record existed counts as unknown and needs the permission.
 
 The run itself needs: the setting on, Vault connected, no recovery journal pending, no Vault switch, online, and a user Gemini key saved on this device. Otherwise it makes no call and records nothing. With a user key the request always carries it, so the server key is not used. The startup Connect catch-up now also needs a user key.
 
-Order: never tried before retried, then oldest first, so a conversation that keeps failing does not hold back the others and no conversation waits forever. 1 conversation per start, at most 5 attempts per 24 hours on the device.
+Order: never tried before retried, then oldest first, so a conversation that keeps failing does not hold back the others and no conversation waits forever. 1 conversation per start, at most 5 AI requests per 24 hours on the device.
+
+A conversation passed over before any request costs nothing, and the next one is tried. Once a request is made, this start has had its conversation: the run ends and the request counts, whatever becomes of it (a result thrown away because the words changed, a refused key, a failure). Only a request really started counts: what stops before it does not. A thrown away result or a refused key uses none of the conversation's 3 attempts.
+
+An edit made from outside to the conversation's Vault file is not in the stored conversation yet. The run reads that one file before the request and again before saving: if it differs from what the app last wrote, or its Registry entry is held, nothing is sent or saved. The file stays as it is and the existing Vault check tells the user. The end of a conversation does not make this check, because the file of the last turn may still be on its way; there the file is protected by the write check and the conversation can be marked needs-resync.
 
 ## State
 

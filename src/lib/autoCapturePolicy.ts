@@ -25,7 +25,7 @@ export type AutoCaptureAttemptKind = "started" | "next-start" | "wait";
 export interface AutoCaptureAttempt { attempts: number; lastAttemptAt: string; lastKind: AutoCaptureAttemptKind }
 export interface AutoCaptureState {
   conversations: Record<string, AutoCaptureAttempt>;
-  /** when each attempt started, within the last 24 hours */
+  /** when each AI request was started, within the last 24 hours, whatever became of its result */
   recentRuns: string[];
 }
 export const emptyAutoCaptureState = (): AutoCaptureState => ({ conversations: {}, recentRuns: [] });
@@ -34,7 +34,7 @@ export type AutoCaptureResult =
   | "saved" | "empty"                             // finished
   | "all-dropped" | "http" | "save-failed"        // counted, after the wait
   | "network"                                     // counted, at the next start
-  | "key" | "changed" | "already" | "cancelled"   // not counted: nothing was learned about this conversation
+  | "key" | "changed" | "already" | "cancelled"   // no attempt used: nothing was learned about this conversation
   | "deleted";
 
 export function parseAutoCaptureSettings(raw: string | undefined): AutoCaptureSettings {
@@ -53,8 +53,9 @@ export function parseAutoCaptureState(raw: string | undefined): AutoCaptureState
 }
 
 /**
- * Which AI this conversation was held with is recorded from now on, before the new turn is added. A conversation that already has turns but no record may have been held with any of them,
- * and stays unknown when it goes on with Gemini, so it still needs the permission.
+ * Which AI this conversation was held with is recorded before the new turn is added. A new conversation starts with an empty record (createConversation), so a past question as its first turn
+ * changes nothing. Turns with no record at all come from before the record existed, or from the Vault: they may have been held with any AI, and stay unknown when the conversation goes on with
+ * Gemini, so it still needs the permission.
  */
 export const UNKNOWN_CHAT_PROVIDER = "unknown";
 export function withChatProvider(conversation: Conversation, provider: string): Conversation {
@@ -108,24 +109,28 @@ export function beginAutoCaptureAttempt(state: AutoCaptureState, id: string, now
   };
 }
 
-/** `before` is the state from before beginAutoCaptureAttempt: a result that says nothing about the conversation does not use up an attempt */
-export function finishAutoCaptureAttempt(state: AutoCaptureState, before: AutoCaptureState, id: string, result: AutoCaptureResult): AutoCaptureState {
+/**
+ * `before` is the state from before beginAutoCaptureAttempt. A result that says nothing about the conversation does not use up one of its attempts.
+ * `requested`: an AI request was really started. It stays in the 24 hour count whatever became of it, a thrown away result or a refused key included; without one the count goes back.
+ */
+export function finishAutoCaptureAttempt(state: AutoCaptureState, before: AutoCaptureState, id: string, result: AutoCaptureResult, requested = true): AutoCaptureState {
   const conversations = { ...state.conversations };
+  const recentRuns = requested ? state.recentRuns : before.recentRuns;
   const current = conversations[id];
   switch (result) {
     case "saved": case "empty": case "deleted": case "already":
       delete conversations[id];
-      return { ...state, conversations };
+      return { conversations, recentRuns };
     case "all-dropped": case "http": case "save-failed":
       if (current) conversations[id] = { ...current, lastKind: "wait" };
-      return { ...state, conversations };
+      return { conversations, recentRuns };
     case "network":
       if (current) conversations[id] = { ...current, lastKind: "next-start" };
-      return { ...state, conversations };
+      return { conversations, recentRuns };
     default:   // key, changed, cancelled
       if (before.conversations[id]) conversations[id] = before.conversations[id];
       else delete conversations[id];
-      return { conversations, recentRuns: before.recentRuns };
+      return { conversations, recentRuns };
   }
 }
 

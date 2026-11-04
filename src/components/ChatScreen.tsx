@@ -22,6 +22,7 @@ import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona 
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
+import { vaultConversationFileUnchanged } from "@/lib/autoCaptureVaultCheck";
 import { parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
 import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
 import { AUTO_CAPTURE_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, withConversationCapture } from "@/lib/conversationLocks";
@@ -1625,7 +1626,7 @@ export default function ChatScreen() {
     target: Conversation,
     priority: VaultWritePriority,
     awaitVaultSync: boolean,
-    auto?: { signal: AbortSignal; result: AutoCaptureResult }
+    auto?: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult }
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
       boundaryOutcomeRef.current = "empty";
@@ -1664,8 +1665,14 @@ export default function ChatScreen() {
       const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects, outcome: captureOutcome } = await captureConversation(
         target,
         [],
-        auto ? { signal: auto.signal } : undefined
+        auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent } : undefined
       );
+      // 応答を待つ間にVaultのファイルが外部で編集されていたら、編集前の本文から作った結果は保存しない。
+      if (auto && vaultHandle && !(await vaultConversationFileUnchanged(vaultHandle, target.id))) {
+        auto.result = "changed";
+        connectConversationBoundary(Promise.resolve([]), priority);
+        return [];
+      }
       // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
       let saved: Awaited<ReturnType<typeof persistCaptureAtomically>>;
       try {
@@ -1763,8 +1770,9 @@ export default function ChatScreen() {
       readState: async () => parseAutoCaptureState((await loadAutoCaptureRaw()).state),
       writeState: (state) => saveAutoCaptureStateRaw(JSON.stringify(state)),
       ifConversationFree,
-      capture: async (target, signal) => {
-        const auto: { signal: AbortSignal; result: AutoCaptureResult } = { signal, result: "changed" };
+      vaultFileUnchanged: async (id) => !vaultHandle || vaultConversationFileUnchanged(vaultHandle, id),
+      capture: async (target, signal, onRequestSent) => {
+        const auto: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult } = { signal, onRequestSent, result: "changed" };
         await trackConversationWrite(captureConversationBoundaryBody(target, "background", true, auto));
         return auto.result;
       },
