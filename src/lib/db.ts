@@ -1575,7 +1575,7 @@ export async function commitCaptureResult(
         if (memory.conversationId !== conversation.id) throw new MemoryLineageViolationError(memory.id);
         if (memoryBlocked(tombs, memory)) continue;
         assertMemoryLineage(await store.get(memory.id), memory);
-        const record = (await withoutDeletedLinksInTx(tx, memory, tombs)) ?? memory;
+        const record = (await withoutDeletedLinksInTx(tx, memory, tombs, now)) ?? memory;
         const id = vaultOutboxIdFor(recordType, record.id);
         await Promise.all([store.put(record), outbox.put(buildOutboxEntryForUpdate(await outbox.get(id), recordType, record.id, record.updatedAt, now))]);
         saved.push(record);
