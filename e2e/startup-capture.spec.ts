@@ -6,18 +6,23 @@ import path from "node:path";
 const BASE = "http://localhost:3100";
 const bundle = path.join(__dirname, ".build/harness.js");
 const LATEST = "✓ 最新の状態です";
-const SETTLE = 10_000, MIN = 60_000;
+const SETTLE = 8_000, MIN = 60_000;
 const said = (name: string) => `架空の話題${name}です`;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 
 type Past = { id: string; ago: number; status?: "active" | "captured"; turns?: [string, string][]; chatProviders?: string[] };
 type CaptureReply = { status?: number; hold?: Promise<void>; abort?: boolean };
 /** on, with permission for conversations of any AI, and a fictional key; each test takes away what it is about */
-type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number };
+type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string };
 
 /** a device in normal use: a real OPFS Vault with its Registry baseline, holding fictional past conversations */
 async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: Device = {}) {
+  // the home screen shows a past question at random: keep every draw under its 45%
+  if (device.revisit) await page.addInitScript(() => { const random = Math.random; Math.random = () => random() * 0.4; });
   await page.addInitScript(() => {
+    (window as any).__io = { reads: 0, writes: 0 };
+    const getFile = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (this: FileSystemFileHandle) { (window as any).__io.reads++; return getFile.call(this); };
     // a failed Memory write, turned on by the test (the mark does not survive a reload)
     const put = IDBObjectStore.prototype.put;
     IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: any[]) {
@@ -28,6 +33,7 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: De
     const createWritable = FileSystemFileHandle.prototype.createWritable;
     FileSystemFileHandle.prototype.createWritable = function (this: FileSystemFileHandle, ...args: any[]) {
       if ((window as any).__failFileWrite) return Promise.reject(new DOMException("fictional write failure", "UnknownError"));
+      (window as any).__io.writes++;
       return (createWritable as any).apply(this, args);
     } as any;
   });
@@ -46,7 +52,7 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: De
       await dbm.putConversationWithOutbox({ id: c.id, persona: "companion", status: c.status ?? "active", startedAt: T, createdAt: T, updatedAt: T, memoryObjectIds: [], turns, ...(c.chatProviders ? { chatProviders: c.chatProviders } : {}),
         metadata: { id: `meta-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
       if (c.id === memoryOf) await dbm.putMemoryObjectWithOutbox({ id: `mem-${c.id}`, date: T, types: ["conversation"], conversationId: c.id, content: "架空の保存済みの記憶", summary: "架空の保存済みの要約", keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T,
-        metadata: { id: `meta-mem-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
+        ...(device.revisit ? { revisitPrompt: device.revisit } : {}), metadata: { id: `meta-mem-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
     }
     await bootstrap.runSaveFoundationBootstrap({ root });
     const d = await root.getDirectoryHandle(".tsumugi", { create: true });
@@ -119,6 +125,41 @@ const backdate = (page: Page, id: string) => page.evaluate(async (id) => {
   await new Promise<void>((res, rej) => { const t = db.transaction("conversations", "readwrite"); t.objectStore("conversations").put({ ...c, updatedAt: new Date(Date.now() - 7_200_000).toISOString() }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
   db.close();
 }, id);
+/** the words of the first turn change in the stored conversation, as another tab's edit would */
+const editStored = (page: Page, id: string, words: string) => page.evaluate(async ({ id, words }) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("conversations", "readwrite"); t.objectStore("conversations").put({ ...c, turns: c.turns.map((turn: any, i: number) => (i === 0 ? { ...turn, content: words } : turn)) }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, { id, words });
+/** the Markdown file holding `needle` gets `added` from outside the app */
+const editFile = (page: Page, needle: string, added: string) => page.evaluate(async ({ needle, added }) => {
+  const walk = async (d: any): Promise<boolean> => {
+    for await (const [name, h] of d.entries()) {
+      if (h.kind === "directory") { if (await walk(h)) return true; continue; }
+      if (!name.endsWith(".md")) continue;
+      const text = await (await h.getFile()).text();
+      if (!text.includes(needle)) continue;
+      const w = await h.createWritable(); await w.write(`${text}\n${added}\n`); await w.close();
+      return true;
+    }
+    return false;
+  };
+  return walk(await navigator.storage.getDirectory());
+}, { needle, added });
+const settingsValue = (page: Page, key: string) => page.evaluate(async (key) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const value: any = await new Promise((res, rej) => { const q = db.transaction("settings").objectStore("settings").get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  db.close(); return value;
+}, key);
+const usedToday = async (page: Page) => JSON.parse((await settingsValue(page, "autoCapture:state")) ?? "{}").recentRuns?.length ?? 0;
+const allowOthers = (page: Page) => page.evaluate(async () => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(JSON.stringify({ enabled: true, allowOtherProviders: true }), "autoCapture:settings"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+});
+const providersOf = async (page: Page, words: string) => (await withWords(page, words))?.chatProviders;
+
 /** one Memory on the device and in exactly one Vault file, the conversation captured in both, nothing more after another start, and Settings says 最新 */
 async function finishedOnce(page: Page, id: string, calls: Parameters<typeof aiCalls>[0], words: string) {
   await expect.poll(() => statusOf(page, id), { timeout: 40_000 }).toBe("captured");
@@ -303,6 +344,64 @@ test.describe("startup Memory creation: who decides", () => {
     await page.waitForTimeout(SETTLE);
     expect(calls.capture.length).toBe(1);
     for (const id of ["other-ai", "both-ai", "no-record"]) expect(await statusOf(page, id)).toBe("active");
+    await allowOthers(page);
+    await startApp(page);
+    await captureSeen(calls, 2);
+    expect(calls.capture[1], "with the permission, the oldest of them goes").toContain("other-ai");
+    await expect.poll(() => statusOf(page, "other-ai"), { timeout: 30_000 }).toBe("captured");
+  });
+
+  test("a new conversation held with Gemini goes without the permission, also when it starts from a past question", async ({ page }) => {
+    test.setTimeout(180_000);
+    const QUESTION = "架空の話題について、どう感じていますか？";
+    await seed(page, [{ id: "source", ago: 3000 * MIN, status: "captured" }], "source", { allowOtherProviders: false, revisit: QUESTION });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await expect(page.getByText(QUESTION)).toBeVisible({ timeout: 30_000 });
+    const box = page.getByPlaceholder("ここに入力してください");
+    await box.fill(said("問いかけから"));
+    await box.locator("xpath=..").getByRole("button", { name: "送る" }).click();
+    await expect(page.getByText("架空の返答です。")).toHaveCount(1, { timeout: 30_000 });
+    await expect.poll(() => providersOf(page, said("問いかけから")), { timeout: 15_000 }).toEqual(["gemini"]);
+    const fromQuestion = await withWords(page, said("問いかけから"));
+    expect(fromQuestion.turns[0].role, "the question is the first turn").toBe("ai");
+    await backdate(page, fromQuestion.id);
+    await startApp(page);
+    await captureSeen(calls, 1);
+    expect(calls.capture[0]).toContain(said("問いかけから"));
+    await expect.poll(() => statusOf(page, fromQuestion.id), { timeout: 30_000 }).toBe("captured");
+    await page.waitForTimeout(2_000);
+    await talkFromHome(page, said("普通の新規"));
+    await expect.poll(() => providersOf(page, said("普通の新規")), { timeout: 30_000 }).toEqual(["gemini"]);
+    const plain = await withWords(page, said("普通の新規"));
+    await backdate(page, plain.id);
+    await startApp(page);
+    await captureSeen(calls, 2);
+    expect(calls.capture[1]).toContain(said("普通の新規"));
+  });
+
+  test("an old conversation of unknown AI that goes on with Gemini stays unknown: it waits for the permission, and goes with it", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "old-cut", ago: 120 * MIN }], undefined, { allowOtherProviders: false });
+    await page.evaluate(async () => {
+      const { dbm } = (window as any).D; const c = await dbm.getConversation("old-cut");
+      await dbm.putConversationWithOutbox({ ...c, turns: c.turns.map((t: any) => (t.role === "ai" ? { ...t, interrupted: true } : t)) });
+    });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await page.getByRole("button", { name: "続きを開く" }).click({ timeout: 30_000 });
+    await page.locator("footer textarea").fill(said("再開"));
+    await page.locator("footer").getByRole("button", { name: "送る" }).click();
+    await expect.poll(async () => (await rows(page, "conversations")).find((c) => c.id === "old-cut")?.turns.length, { timeout: 30_000 }).toBe(4);
+    expect(await providersOf(page, said("再開"))).toEqual(["unknown", "gemini"]);
+    await backdate(page, "old-cut");
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length, "no permission, no request").toBe(0);
+    await allowOthers(page);
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await expect.poll(() => statusOf(page, "old-cut"), { timeout: 30_000 }).toBe("captured");
   });
 
   test("a conversation held now records its AI, and the Markdown stays as it was", async ({ page }) => {
@@ -408,6 +507,125 @@ test.describe("the end of a conversation: Memory and status are saved together",
     expect((await filesWith(page, "架空の記憶")).length, "the file was not written").toBe(0);
     await startApp(page);
     await finishedOnce(page, c.id, calls, said("ファイル"));
+    expect(calls.capture.length).toBe(1);
+  });
+});
+
+test.describe("what an AI request costs, and what it may not overwrite", () => {
+  test("the words change during the AI call: the result is thrown away, no other conversation is sent in this start, the request is counted, and the 5 in 24 hours hold", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "edited-now", ago: 300 * MIN }, { id: "next-one", ago: 120 * MIN }], undefined, { recentRuns: 3 });
+    let release = () => {}; const held = new Promise<void>((r) => { release = r; });
+    let first = true;
+    const calls = await fakeApi(page, () => { if (first) { first = false; return { hold: held }; } return {}; });
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await editStored(page, "edited-now", said("書き換え後"));
+    release();
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length, "this start already used its one conversation").toBe(1);
+    expect((await rows(page, "memoryObjects")).length, "nothing from the old words").toBe(0);
+    expect(await statusOf(page, "edited-now")).toBe("active");
+    expect(await usedToday(page), "the request happened, so it counts").toBe(4);
+    await startApp(page);
+    await captureSeen(calls, 2);
+    expect(calls.capture[1], "the new words, at the next start").toContain(said("書き換え後"));
+    await expect.poll(() => statusOf(page, "edited-now"), { timeout: 30_000 }).toBe("captured");
+    expect((await memoriesOf(page, "edited-now")).length).toBe(1);
+    expect(await usedToday(page)).toBe(5);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length, "5 in 24 hours").toBe(2);
+    expect(await statusOf(page, "next-one")).toBe("active");
+  });
+
+  test("a refused key counts as a request: it cannot go past the 5 in 24 hours", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page, [{ id: "refused-1", ago: 120 * MIN }], undefined, { recentRuns: 4 });
+    const calls = await fakeApi(page, () => ({ status: 401 }));
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await page.waitForTimeout(2_000);
+    expect(await usedToday(page)).toBe(5);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length).toBe(1);
+    expect(await statusOf(page, "refused-1")).toBe("active");
+  });
+
+  test("the Vault file was edited from outside before the start: the old words are not sent, and the file keeps the edit", async ({ page }) => {
+    test.setTimeout(180_000);
+    const EDIT = "架空の外部編集の一文";
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, said("外部前"));
+    await expect.poll(async () => (await filesWith(page, said("外部前"))).length, { timeout: 30_000 }).toBe(1);
+    const { id } = await withWords(page, said("外部前"));
+    await backdate(page, id);
+    expect(await editFile(page, said("外部前"), EDIT)).toBe(true);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.filter((words) => !words.includes(EDIT)), "never the words from before the edit").toEqual([]);
+    expect((await filesWith(page, EDIT)).length, "the edit is still in the file").toBe(1);
+    expect((await memoriesOf(page, id)).length).toBe(0);
+  });
+
+  test("the Vault file is edited from outside during the AI call: at a start the result is thrown away; at the end of a conversation the file keeps the edit", async ({ page }) => {
+    test.setTimeout(240_000);
+    const EDIT = "架空の通信中の外部編集", EDIT_END = "架空の終了時の外部編集";
+    await seed(page);
+    let release = () => {}; let held = new Promise<void>((r) => { release = r; });
+    const calls = await fakeApi(page, () => ({ hold: held }));
+    await startApp(page);
+    await talkFromHome(page, said("外部中"));
+    await expect.poll(async () => (await filesWith(page, said("外部中"))).length, { timeout: 30_000 }).toBe(1);
+    const { id } = await withWords(page, said("外部中"));
+    await backdate(page, id);
+    await startApp(page);
+    await captureSeen(calls, 1);
+    expect(await editFile(page, said("外部中"), EDIT)).toBe(true);
+    release();
+    await page.waitForTimeout(SETTLE);
+    expect((await memoriesOf(page, id)).length, "nothing from the old words").toBe(0);
+    expect(await statusOf(page, id)).toBe("active");
+    expect((await filesWith(page, EDIT)).length).toBe(1);
+
+    held = new Promise<void>((r) => { release = r; });
+    await talkFromHome(page, said("終了時"));
+    await expect.poll(async () => (await filesWith(page, said("終了時"))).length, { timeout: 30_000 }).toBe(1);
+    await goHome(page);
+    await captureSeen(calls, 2);
+    expect(await editFile(page, said("終了時"), EDIT_END)).toBe(true);
+    release();
+    await page.waitForTimeout(3_000);
+    expect((await filesWith(page, EDIT_END)).length, "the conversation is not written over the edit").toBe(1);
+  });
+
+  test("how much Vault reading, writing and AI a start costs", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "done-io", ago: 300 * MIN, status: "captured" }], undefined, { enabled: false });
+    const calls = await fakeApi(page);
+    const measure = async () => {
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      return page.evaluate(() => (window as any).__io);
+    };
+    const off = await measure();
+    const offAi = aiCalls(calls);
+    await allowOthers(page);
+    const onNothing = await measure();
+    const onNothingAi = aiCalls(calls) - offAi;
+    await page.evaluate(async () => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get("done-io"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      await new Promise<void>((res, rej) => { const t = db.transaction("conversations", "readwrite"); t.objectStore("conversations").put({ ...c, id: "waits-io", status: "active" }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+      db.close();
+    });
+    const onOne = await measure();
+    const onOneAi = aiCalls(calls) - offAi - onNothingAi;
+    notice("perf-vault-io", { off, offAi, onNothing, onNothingAi, onOne, onOneAi, capture: calls.capture.length, connect: calls.connect, prompt: calls.prompt });
+    expect(onNothingAi).toBe(0);
     expect(calls.capture.length).toBe(1);
   });
 });
