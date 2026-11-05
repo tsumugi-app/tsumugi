@@ -4,6 +4,7 @@ import {
   AUTO_CAPTURE_DAY_MS, AUTO_CAPTURE_QUIET_MS, AUTO_CAPTURE_WAIT_MS, beginAutoCaptureAttempt, classifyAutoCaptureFailure, emptyAutoCaptureState, finishAutoCaptureAttempt, heldOnlyWithGemini,
   isStopped, parseAutoCaptureSettings, parseAutoCaptureState, selectAutoCaptureTargets, summarizeAutoCapture, withChatProvider, type AutoCaptureSettings,
 } from "./autoCapturePolicy";
+import { chatProvidersAfterAdopting } from "./chatProviderRecord";
 import type { Conversation } from "./types";
 
 const NOW = Date.parse("2026-11-04T12:00:00Z");
@@ -126,4 +127,16 @@ test("the summary keeps a conversation whose Memories are missing apart: not wai
   assert.deepEqual(summarizeAutoCapture([missing, conv("free")], new Set(), emptyAutoCaptureState(), settings, new Set()), { waiting: 1, stopped: 0, needsPermission: 0, heldForMemory: 1 });
   assert.deepEqual(summarizeAutoCapture([missing], new Set(), emptyAutoCaptureState(), settings, new Set(["gone"])), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "found, under another or no conversationId: nothing is missing");
   assert.deepEqual(summarizeAutoCapture([missing], new Set(["missing"]), emptyAutoCaptureState(), settings, new Set()), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "it has a Memory");
+});
+
+test("adopting a Vault version: the record of the AI stays only while the words are the same", () => {
+  const turns = conv("x").turns;
+  const other = [turns[0], { ...turns[1], content: "架空の別の返答" }];
+  assert.deepEqual(chatProvidersAfterAdopting({ turns, chatProviders: ["gemini"] }, turns.map((t) => ({ ...t }))), ["gemini"], "same words: nothing lost");
+  assert.deepEqual(chatProvidersAfterAdopting({ turns, chatProviders: ["gemini"] }, other), ["gemini", "unknown"], "other words: no longer known");
+  assert.deepEqual(chatProvidersAfterAdopting({ turns, chatProviders: ["gemini"] }, [...turns, turns[0]]), ["gemini", "unknown"], "more words: no longer known");
+  assert.deepEqual(chatProvidersAfterAdopting({ turns: [], chatProviders: [] }, turns), ["unknown"], "a new record taking in words from elsewhere");
+  assert.equal(chatProvidersAfterAdopting({ turns, chatProviders: undefined }, other), undefined, "already unknown");
+  assert.deepEqual(chatProvidersAfterAdopting({ turns, chatProviders: ["gemini", "unknown"] }, other), ["gemini", "unknown"]);
+  assert.equal(heldOnlyWithGemini({ ...conv("y"), chatProviders: chatProvidersAfterAdopting({ turns, chatProviders: ["gemini"] }, other) } as Conversation), false);
 });

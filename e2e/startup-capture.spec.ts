@@ -201,6 +201,26 @@ const rewriteFile = (page: Page, needle: string, from: string, to: string) => pa
   };
   return walk(await navigator.storage.getDirectory());
 }, { needle, from, to });
+/** a save of this conversation still to come on this device, as when the app closed before it reached the file */
+const leaveSavePending = (page: Page, id: string) => page.evaluate(async (id) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  const o: any = await new Promise((res, rej) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").get(`conversation:${id}`); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("vaultOutbox", "readwrite"); t.objectStore("vaultOutbox").put({ ...o, recordUpdatedAt: c.updatedAt, status: "pending" }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, id);
+const autoCaptureSetting = (page: Page, enabled: boolean, allowOtherProviders: boolean) => page.evaluate(async (v) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(JSON.stringify(v), "autoCapture:settings"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, { enabled, allowOtherProviders });
+/** the browser forgets the folder permission at every start, as Android does; 「アクセスを再許可」 gives it back until the next start */
+const permissionLostAtStart = (page: Page) => page.addInitScript(() => {
+  const w = window as any;
+  const proto = w.FileSystemHandle.prototype;
+  proto.queryPermission = async function () { return w.__granted ? "granted" : "prompt"; };
+  proto.requestPermission = async function () { w.__granted = true; w.__requested = (w.__requested ?? 0) + 1; return "granted"; };
+});
 const settingsValue = (page: Page, key: string) => page.evaluate(async (key) => {
   const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const value: any = await new Promise((res, rej) => { const q = db.transaction("settings").objectStore("settings").get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
@@ -1160,6 +1180,153 @@ test.describe("a conversation that refers to Memories is never given new ones by
     expect(outcomes.b).toEqual(["conversation-changed", "active", ["arrived"], false]);
     expect(outcomes.c).toEqual(["committed", "captured", ["new-c"], true]);
     expect(outcomes.d).toEqual(["committed", "captured", ["new-d"], true]);
+  });
+});
+
+test.describe("which AI held it, once a Vault version is taken in", () => {
+  test("a change elsewhere that leaves the words (a title): the record that Gemini held it stays, so it goes without the permission", async ({ page }) => {
+    test.setTimeout(300_000);
+    const words = said("題だけ変更");
+    await seed(page, [], undefined, { enabled: false, allowOtherProviders: false });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, words);
+    await fileIsWritten(page, words);
+    const { id } = await withWords(page, words);
+    expect(await providersOf(page, words)).toEqual(["gemini"]);
+    await backdate(page, id);
+    await nothingLeftToSave(page, id);
+    expect(await rewriteFile(page, words, "^status: .*$", '$&\ntitle: "架空の別端末で付けた題"')).toBe(true);
+    await startApp(page);
+    await takeInEdit(page);
+    expect((await withWords(page, words)).title, "the version was taken in").toBe("架空の別端末で付けた題");
+    expect(await providersOf(page, words), "nothing lost").toEqual(["gemini"]);
+    await autoCaptureSetting(page, true, false);
+    await startApp(page);
+    await captureSeen(calls, 1);
+  });
+
+  for (const pending of [false, true]) {
+    test(`words changed elsewhere and taken in${pending ? ", with a save pending here (a choice of versions)" : ""}: no longer known, so it waits for the permission, and goes with it`, async ({ page }) => {
+      test.setTimeout(300_000);
+      const words = said(pending ? "別端末で続けた保存待ち" : "別端末で続けた");
+      const EDIT = "架空の別のAIとの続き";
+      await seed(page, [], undefined, { enabled: false, allowOtherProviders: false });
+      const calls = await fakeApi(page);
+      await startApp(page);
+      await talkFromHome(page, words);
+      await fileIsWritten(page, words);
+      const { id } = await withWords(page, words);
+      await backdate(page, id);
+      if (pending) await leaveSavePending(page, id); else await nothingLeftToSave(page, id);
+      expect(await editFile(page, words, EDIT)).toBe(true);
+      await startApp(page);
+      await takeInEdit(page);
+      expect(await conversationWords(page, id), "the version was taken in").toContain(EDIT);
+      expect(await providersOf(page, words), "no longer known").toContain("unknown");
+      await backdate(page, id);
+      await autoCaptureSetting(page, true, false);
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      expect(calls.capture.length, "not without the permission").toBe(0);
+      await autoCaptureSetting(page, true, true);
+      await startApp(page);
+      await captureSeen(calls, 1);
+      expect(calls.capture[0]).toContain(EDIT);
+    });
+  }
+});
+
+test.describe("the folder permission is given back after the start", () => {
+  test("once given, the run goes, one conversation in this start, and nothing more", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "first", ago: 180 * MIN }, { id: "second", ago: 120 * MIN }]);
+    const calls = await fakeApi(page);
+    await permissionLostAtStart(page);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(aiCalls(calls), "nothing without the folder").toBe(0);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await page.getByRole("button", { name: "アクセスを再許可" }).first().click();
+    await captureSeen(calls, 1);
+    expect(calls.capture[0]).toContain(said("first"));
+    await page.waitForTimeout(SETTLE * 2);
+    expect(calls.capture.length, "one conversation per start").toBe(1);
+    allWithUserKey(calls);
+    await expect.poll(() => statusOf(page, "first"), { timeout: 30_000 }).toBe("captured");
+    expect(await statusOf(page, "second")).toBe("active");
+  });
+
+  test("with the setting off, or nothing to do, giving it back calls no AI", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "off", ago: 120 * MIN }], undefined, { enabled: false });
+    const calls = await fakeApi(page);
+    await permissionLostAtStart(page);
+    await startApp(page);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await page.getByRole("button", { name: "アクセスを再許可" }).first().click();
+    await page.waitForTimeout(SETTLE);
+    expect(aiCalls(calls)).toBe(0);
+    await autoCaptureSetting(page, true, true);
+    await page.evaluate(async () => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      await new Promise<void>((res, rej) => { const t = db.transaction("conversations", "readwrite"); const s = t.objectStore("conversations"); const g = s.get("off"); g.onsuccess = () => s.put({ ...g.result, status: "captured" }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+      db.close();
+    });
+    await startApp(page);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await page.getByRole("button", { name: "アクセスを再許可" }).first().click();
+    await page.waitForTimeout(SETTLE);
+    expect(aiCalls(calls), "nothing to do").toBe(0);
+  });
+});
+
+test.describe("another device finished the conversation: what this device does with it", () => {
+  test("a save still pending here does not take back captured or the Memory reference, and no Memory is made again", async ({ page }) => {
+    test.setTimeout(300_000);
+    const words = said("別端末で処理済み保存待ち");
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, words);
+    await fileIsWritten(page, words);
+    const { id } = await withWords(page, words);
+    await backdate(page, id);
+    await leaveSavePending(page, id);
+    expect(await rewriteFile(page, words, "^status: .*$", 'status: "captured"\nmemoryObjectIds: ["架空の別端末のMemory"]')).toBe(true);
+    for (let start = 0; start < 2; start++) {
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      expect(calls.capture.length, "no Capture").toBe(0);
+      const file = (await filesWith(page, words))[0];
+      expect(file, "the file keeps captured").toMatch(/^status: "?captured"?$/m);
+      expect(file, "the file keeps the reference").toContain("架空の別端末のMemory");
+    }
+    await takeInEdit(page);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.status).toBe("captured");
+    expect(stored.memoryObjectIds).toEqual(["架空の別端末のMemory"]);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length).toBe(0);
+    expect((await memoriesOf(page, id)).length).toBe(0);
+  });
+
+  test("end of a conversation: the file says another device finished it, so no Capture, and the file stays", async ({ page }) => {
+    test.setTimeout(180_000);
+    const words = said("別端末で処理済み終了");
+    await seed(page, [], undefined, { enabled: false });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, words);
+    await fileIsWritten(page, words);
+    const { id } = await withWords(page, words);
+    expect(await rewriteFile(page, words, "^status: .*$", 'status: "captured"\nmemoryObjectIds: ["架空の別端末のMemory"]')).toBe(true);
+    await goHome(page);
+    await page.waitForTimeout(3_000);
+    expect(calls.capture.length, "no Capture").toBe(0);
+    expect((await memoriesOf(page, id)).length).toBe(0);
+    expect((await filesWith(page, words))[0]).toContain("架空の別端末のMemory");
   });
 });
 
