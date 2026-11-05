@@ -1551,13 +1551,14 @@ export type CaptureCommitResult =
  * The result of a Capture is saved whole or not at all: the conversation's status, its Memories and their Outbox entries, in one transaction. A stop or a failed write leaves
  * the conversation as it was, ready for another try; it can never be `captured` without its Memories, or have Memories while still open for another Capture.
  * Read again inside the transaction: a conversation another tab finished is left alone, and so is one whose words changed after the AI call (more turns, or a Vault version the user adopted),
- * because the result does not cover them. `snapshotUpdatedAt` is the version Capture read: fewer stored turns are accepted only when the stored record is not newer than that (a turn's own save still on its way).
+ * because the result does not cover them. With `onlyIfNoMemory` (the automatic run), so is one that has come to have a Memory. `snapshotUpdatedAt` is the version Capture read: fewer stored turns are accepted only when the stored record is not newer than that (a turn's own save still on its way).
  */
 export async function commitCaptureResult(
   conversation: Conversation,
   memories: { memory: MemoryObject; recordType: "memory" | "reflection" }[],
   snapshotUpdatedAt: string,
   now: string = new Date().toISOString(),
+  options: { onlyIfNoMemory?: boolean } = {},
 ): Promise<CaptureCommitResult> {
   const db = await getDB();
   const tx = db.transaction(["conversations", "memoryObjects", "vaultOutbox", "settings"], "readwrite");
@@ -1573,6 +1574,8 @@ export async function commitCaptureResult(
       || stored.turns.some((turn, i) => turn.role !== conversation.turns[i].role || turn.content !== conversation.turns[i].content)
       || (stored.turns.length < conversation.turns.length && stored.updatedAt > snapshotUpdatedAt)
     )) result = { outcome: "conversation-changed" };
+    // the automatic run started from a conversation with no Memory: one, or a reference to one, that came back during the AI call (a Vault restore or sync) means the result would be a duplicate
+    else if (options.onlyIfNoMemory && ((stored?.memoryObjectIds?.length ?? 0) > 0 || (await tx.objectStore("memoryObjects").getAll()).some((m) => m.conversationId === conversation.id))) result = { outcome: "conversation-changed" };
     else {
       const outbox = tx.objectStore("vaultOutbox");
       const store = tx.objectStore("memoryObjects");

@@ -1690,7 +1690,7 @@ export default function ChatScreen() {
       // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
       let saved: Awaited<ReturnType<typeof persistCaptureAtomically>>;
       try {
-        saved = await persistCaptureAtomically(vaultHandle, capturedDelta, touchedMemoryObjects, target.updatedAt, priority, awaitVaultSync);
+        saved = await persistCaptureAtomically(vaultHandle, capturedDelta, touchedMemoryObjects, target.updatedAt, priority, awaitVaultSync, !!auto);
       } catch (error) {
         if (auto || handleStaleVaultTabError(error)) throw error;
         console.error("Capture result could not be saved", error);

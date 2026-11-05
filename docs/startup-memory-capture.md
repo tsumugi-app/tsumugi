@@ -20,7 +20,7 @@ All of these must hold:
 
 1. `status === "active"`, with at least one user turn and at least one AI turn with words.
 2. Not ending in a cut-off reply (`endsWithInterruptedReply`). The user decides those on the home screen, as decided in #24.
-3. No Memory exists for it (no stored Memory with this `conversationId`, and `memoryObjectIds` empty). Otherwise it has been processed: no AI call.
+3. No Memory exists for it (no stored Memory with this `conversationId`, and `memoryObjectIds` empty). Otherwise it has been processed: no AI call. References to Memories not found on the device count too, because a Vault restore or sync may bring them back: nothing is made in their place, the conversation stays `active`, no attempt is used, no record is changed, and Settings shows how many wait. The check is repeated under the conversation lock and inside the save transaction, so a Memory or reference arriving during the AI call discards the result, and a Vault file with the same words that says `captured` or refers to Memories (another device finished it) stops the run for that conversation. Normal end actions keep their own check.
 4. Not touched for at least 30 minutes (`updatedAt`). There is no upper age limit.
 5. Open in no tab (Web Lock below).
 6. Attempt limit not reached, and the wait after an HTTP failure has passed.

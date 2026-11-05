@@ -970,11 +970,12 @@ export async function persistCaptureAtomically(
   memoryObjects: MemoryObject[],
   snapshotUpdatedAt: string,
   priority: VaultWritePriority = "interactive",
-  awaitVaultSync: boolean = true
+  awaitVaultSync: boolean = true,
+  onlyIfNoMemory: boolean = false
 ): Promise<{ commit: CaptureCommitResult; backgroundSyncPromise: Promise<void> | null }> {
   const debugId = captureDebugId(conversation);
   const { commit, start } = await withVaultWorldRead(async () => {
-    const commit = await commitCaptureResult(conversation, memoryObjects.map((memory) => ({ memory, recordType: isReflectionSummary(memory) ? "reflection" as const : "memory" as const })), snapshotUpdatedAt);
+    const commit = await commitCaptureResult(conversation, memoryObjects.map((memory) => ({ memory, recordType: isReflectionSummary(memory) ? "reflection" as const : "memory" as const })), snapshotUpdatedAt, undefined, { onlyIfNoMemory });
     if (commit.outcome !== "committed") return { commit, start: null };
     observeCapture(debugId, e => { e.phase = "committed"; });
     if (!vaultHandle) return { commit, start: null };

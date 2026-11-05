@@ -6,8 +6,9 @@ import { withVaultSaveLock } from "./vaultSaveLock";
 /**
  * "edited": the words in the Vault file are not this conversation's words, so what the app holds may be old. "same": the file is what the app last wrote, or has the same words.
  * "unknown": no way to tell (the file cannot be read, or its record is held for another reason); the file stays protected by the check before each write.
+ * "processed": the same words, but the file says the conversation is captured or refers to Memories the stored conversation does not (another device finished it). Only the automatic run stops for it.
  */
-export type ConversationFileState = "same" | "edited" | "unknown";
+export type ConversationFileState = "same" | "edited" | "unknown" | "processed";
 
 /**
  * Read only: nothing is marked, and telling the user about the edit stays with the Vault check. A Memory made from the words before an edit would not match the record, so a Capture asks this
@@ -29,7 +30,8 @@ export function conversationFileState(root: FileSystemDirectoryHandle, conversat
       const text = await file.text();
       if (hashVaultText(text) === entry.contentHash) return held ? "unknown" : "same";
       const parsed = parseConversationMarkdown(text);
-      return parsed && conversationTurnsEqual(parsed.turns, conversation.turns) ? "same" : "edited";
+      if (!parsed || !conversationTurnsEqual(parsed.turns, conversation.turns)) return "edited";
+      return parsed.status === "captured" || parsed.memoryObjectIds.some((id) => !conversation.memoryObjectIds.includes(id)) ? "processed" : "same";
     } catch {
       return "unknown";
     }

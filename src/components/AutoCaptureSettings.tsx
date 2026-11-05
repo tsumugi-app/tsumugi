@@ -27,7 +27,7 @@ export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promis
     setSettings(loaded);
     const { conversations, memories } = await withVaultWorldRead(async () => ({ conversations: await getAllConversations(), memories: await getAllMemoryObjects() }));
     const withMemory = new Set(memories.flatMap((m) => (m.conversationId ? [m.conversationId] : [])));
-    setSummary(summarizeAutoCapture(conversations, withMemory, parseAutoCaptureState(raw.state), loaded));
+    setSummary(summarizeAutoCapture(conversations, withMemory, parseAutoCaptureState(raw.state), loaded, new Set(memories.map((m) => m.id))));
   };
 
   useEffect(() => {
@@ -82,6 +82,11 @@ export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promis
       {summary && (
         <p className="text-xs text-stone-500 dark:text-stone-400" data-testid="auto-capture-summary">
           未処理 {summary.waiting} 件 ／ 許可待ち {summary.needsPermission} 件 ／ 停止中 {summary.stopped} 件
+        </p>
+      )}
+      {summary && summary.heldForMemory > 0 && (
+        <p className="text-xs text-stone-500 dark:text-stone-400" data-testid="auto-capture-held">
+          作成済みのMemoryが見つからない会話 {summary.heldForMemory} 件は、重複を防ぐため新しく作らず、元のMemoryが戻るのを待っています。
         </p>
       )}
       {summary && summary.stopped > 0 && (

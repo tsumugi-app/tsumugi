@@ -75,6 +75,12 @@ export function isUnprocessedConversation(c: Conversation): boolean {
     && !endsWithInterruptedReply(c);
 }
 
+/**
+ * It already refers to Memories, found on this device or not. Those not found may come back with a Vault restore or sync, so the automatic run makes none in their place, and the conversation stays
+ * as it is: not finished, and no attempt used. The stored records are not changed.
+ */
+const refersToMemories = (c: Conversation) => (c.memoryObjectIds?.length ?? 0) > 0;
+
 const ms = (iso: string) => { const t = Date.parse(iso); return Number.isNaN(t) ? 0 : t; };
 export const recentRunCount = (state: AutoCaptureState, now: number) => state.recentRuns.filter((t) => now - ms(t) < AUTO_CAPTURE_DAY_MS).length;
 export const isStopped = (state: AutoCaptureState, id: string) => (state.conversations[id]?.attempts ?? 0) >= AUTO_CAPTURE_MAX_ATTEMPTS;
@@ -93,7 +99,7 @@ export function selectAutoCaptureTargets(
   if (!manual && recentRunCount(state, now) >= AUTO_CAPTURE_PER_DAY) return [];
   const attempts = (c: Conversation) => state.conversations[c.id]?.attempts ?? 0;
   return conversations
-    .filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id))
+    .filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id) && !refersToMemories(c))
     .filter((c) => now - ms(c.updatedAt) >= AUTO_CAPTURE_QUIET_MS)
     .filter((c) => settings.allowOtherProviders || heldOnlyWithGemini(c))
     .filter((c) => (manual ? isStopped(state, c.id) : !isStopped(state, c.id) && !waiting(state, c.id, now)))
@@ -148,13 +154,14 @@ export function classifyAutoCaptureFailure(error: unknown, cancelled: boolean): 
 }
 
 export interface AutoCaptureSummary { waiting: number; stopped: number; needsPermission: number; heldForMemory: number }
-export function summarizeAutoCapture(conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, _storedMemoryIds: ReadonlySet<string> = new Set()): AutoCaptureSummary {
-  const left = conversations.filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id));
+export function summarizeAutoCapture(conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, storedMemoryIds: ReadonlySet<string> = new Set()): AutoCaptureSummary {
+  const unprocessed = conversations.filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id));
+  const left = unprocessed.filter((c) => !refersToMemories(c));
   const allowed = left.filter((c) => settings.allowOtherProviders || heldOnlyWithGemini(c));
   return {
     waiting: allowed.filter((c) => !isStopped(state, c.id)).length,
     stopped: allowed.filter((c) => isStopped(state, c.id)).length,
     needsPermission: left.length - allowed.length,
-    heldForMemory: 0,
+    heldForMemory: unprocessed.filter((c) => refersToMemories(c) && c.memoryObjectIds.some((id) => !storedMemoryIds.has(id))).length,
   };
 }
