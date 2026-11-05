@@ -10,7 +10,7 @@ const SETTLE = 4_500, MIN = 60_000;
 const said = (name: string) => `架空の話題${name}です`;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 
-type Past = { id: string; ago: number; status?: "active" | "captured"; turns?: [string, string][]; chatProviders?: string[] };
+type Past = { id: string; ago: number; status?: "active" | "captured"; turns?: [string, string][]; chatProviders?: string[]; memoryIds?: string[] };
 type CaptureReply = { status?: number; hold?: Promise<void>; abort?: boolean };
 /** on, with permission for conversations of any AI, and a fictional key; each test takes away what it is about */
 type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string; fullStartDelay?: boolean };
@@ -51,7 +51,7 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string | string[],
     for (const c of past) {
       const T = new Date(Date.now() - c.ago).toISOString();
       const turns = (c.turns ?? [["user", `架空の話題${c.id}です`], ["ai", "架空の返答です。"]]).map(([role, content]) => ({ role, content, timestamp: T }));
-      await dbm.putConversationWithOutbox({ id: c.id, persona: "companion", status: c.status ?? "active", startedAt: T, createdAt: T, updatedAt: T, memoryObjectIds: [], turns, ...(c.chatProviders ? { chatProviders: c.chatProviders } : {}),
+      await dbm.putConversationWithOutbox({ id: c.id, persona: "companion", status: c.status ?? "active", startedAt: T, createdAt: T, updatedAt: T, memoryObjectIds: c.memoryIds ?? [], turns, ...(c.chatProviders ? { chatProviders: c.chatProviders } : {}),
         metadata: { id: `meta-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
       if ([memoryOf].flat().includes(c.id)) await dbm.putMemoryObjectWithOutbox({ id: `mem-${c.id}`, date: T, types: ["conversation"], conversationId: c.id, content: "架空の保存済みの記憶", summary: "架空の保存済みの要約", keywords: ["架空"], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T,
         ...(device.revisit ? { revisitPrompt: device.revisit } : {}), metadata: { id: `meta-mem-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
@@ -161,6 +161,38 @@ const editFile = (page: Page, needle: string, added: string) => page.evaluate(as
   };
   return walk(await navigator.storage.getDirectory());
 }, { needle, added });
+/** one store on the device changed directly, as a Vault restore or sync in the background would leave it */
+const memoryRow = (page: Page, id: string) => page.evaluate(async (id) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const row: any = await new Promise((res, rej) => { const q = db.transaction("memoryObjects").objectStore("memoryObjects").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  db.close(); return row;
+}, id);
+const dropMemoryRow = (page: Page, id: string) => page.evaluate(async (id) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("memoryObjects", "readwrite"); t.objectStore("memoryObjects").delete(id); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, id);
+const putRow = (page: Page, store: string, row: any) => page.evaluate(async ({ store, row }) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction(store, "readwrite"); t.objectStore(store).put(row); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, { store, row });
+const fictionalMemory = (id: string, conversationId: string) => { const T = new Date(Date.now() - 86_400_000).toISOString(); return { id, date: T, types: ["conversation"], conversationId, content: "架空の復元された記憶", summary: "架空の復元された要約", keywords: ["架空"], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T, metadata: { id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } }; };
+/** the file holding `needle` gets its first line matching `from` rewritten from outside the app; the words stay */
+const rewriteFile = (page: Page, needle: string, from: string, to: string) => page.evaluate(async ({ needle, from, to }) => {
+  const walk = async (d: any): Promise<boolean> => {
+    for await (const [name, h] of d.entries()) {
+      if (h.kind === "directory") { if (await walk(h)) return true; continue; }
+      if (!name.endsWith(".md")) continue;
+      const text = await (await h.getFile()).text();
+      if (!text.includes(needle)) continue;
+      const w = await h.createWritable(); await w.write(text.replace(new RegExp(from, "m"), to)); await w.close();
+      return true;
+    }
+    return false;
+  };
+  return walk(await navigator.storage.getDirectory());
+}, { needle, from, to });
 const settingsValue = (page: Page, key: string) => page.evaluate(async (key) => {
   const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const value: any = await new Promise((res, rej) => { const q = db.transaction("settings").objectStore("settings").get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
@@ -987,6 +1019,138 @@ test.describe("the save of a Capture result checks what is stored", () => {
     expect(outcomes.grown).toEqual(["conversation-changed", "active", 0, 3, false]);
     expect(outcomes.behind).toEqual(["committed", "captured", 1, 3, true]);
     expect(outcomes.done).toEqual(["already-captured", "captured", 0, 2, false]);
+  });
+});
+
+test.describe("a conversation that refers to Memories is never given new ones by the automatic run", () => {
+  test("its Memory is gone from the device for a while and comes back: no Capture, nothing marked done, nothing rewritten, and one Memory in the end", async ({ page }) => {
+    test.setTimeout(300_000);
+    const id = "refers";
+    await seed(page, [{ id, ago: 120 * MIN, memoryIds: [`mem-${id}`] }], id);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await expect.poll(async () => (await filesWith(page, "架空の保存済みの記憶")).length, { timeout: 40_000 }).toBe(1);
+    const original = await memoryRow(page, `mem-${id}`);
+    expect(original).toBeTruthy();
+    await dropMemoryRow(page, `mem-${id}`);
+    const stateBefore = await settingsValue(page, "autoCapture:state");
+
+    for (let start = 0; start < 2; start++) {
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      expect(calls.capture.length, "no Capture while the Memory is missing").toBe(0);
+      expect(await memoryRow(page, `mem-${id}`), "no Memory is made up for it").toBeUndefined();
+      expect((await memoriesOf(page, id)).length).toBe(0);
+      const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+      expect(stored.status, "not taken as finished").toBe("active");
+      expect(stored.memoryObjectIds, "the reference stays").toEqual([`mem-${id}`]);
+      expect((await filesWith(page, "架空の保存済みの記憶")).length, "the Memory file stays").toBe(1);
+      expect(await settingsValue(page, "autoCapture:state"), "no attempt or daily count is used").toEqual(stateBefore);
+    }
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await expect(page.getByTestId("auto-capture-held"), "Settings says it is waiting").toContainText("1 件", { timeout: 30_000 });
+    await expect(page.getByTestId("auto-capture-summary")).toContainText("未処理 0 件");
+
+    await page.goto(`${BASE}/data`);
+    await page.addScriptTag({ path: bundle });
+    await page.evaluate(async (memory) => { await (window as any).D.dbm.importMissingRecordsIfAbsent({ conversations: [], memoryObjects: [memory], sources: [] }); }, original);
+
+    for (let start = 0; start < 2; start++) {
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      expect(calls.capture.length, "no Capture once it is back").toBe(0);
+      const memories = await memoriesOf(page, id);
+      expect(memories.map((m) => m.id), "only the original").toEqual([`mem-${id}`]);
+      expect((await rows(page, "conversations")).find((c) => c.id === id).memoryObjectIds).toEqual([`mem-${id}`]);
+    }
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await expect(page.getByTestId("auto-capture-summary")).toContainText("未処理 0 件", { timeout: 30_000 });
+    await expect(page.getByTestId("auto-capture-held")).toHaveCount(0);
+  });
+
+  test("it does not hold back another conversation: the other one goes, once", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "refers", ago: 300 * MIN, memoryIds: ["mem-gone"] }, { id: "free", ago: 120 * MIN }]);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await captureSeen(calls, 1);
+    expect(calls.capture[0]).toContain(said("free"));
+    await expect.poll(() => statusOf(page, "free"), { timeout: 30_000 }).toBe("captured");
+    expect(await statusOf(page, "refers")).toBe("active");
+    expect((await memoriesOf(page, "refers")).length).toBe(0);
+  });
+
+  for (const arrives of ["its Memory", "the reference to its Memory"]) {
+    test(`${arrives} comes back during the AI call: the result is thrown away, nothing is marked done, and the next start calls nothing`, async ({ page }) => {
+      test.setTimeout(180_000);
+      await seed(page, [{ id: "late", ago: 120 * MIN }]);
+      let release = () => {}; const held = new Promise<void>((r) => { release = r; });
+      const calls = await fakeApi(page, () => ({ hold: held }));
+      await startApp(page);
+      await captureSeen(calls, 1);
+      if (arrives === "its Memory") await putRow(page, "memoryObjects", fictionalMemory("mem-late", "late"));
+      else await putRow(page, "conversations", { ...(await rows(page, "conversations")).find((c) => c.id === "late"), memoryObjectIds: ["mem-late"] });
+      release();
+      await page.waitForTimeout(3_000);
+      expect((await memoriesOf(page, "late")).filter((m) => m.id !== "mem-late"), "no second Memory").toEqual([]);
+      const stored = (await rows(page, "conversations")).find((c) => c.id === "late");
+      expect(stored.status).toBe("active");
+      if (arrives !== "its Memory") expect(stored.memoryObjectIds, "the reference is not overwritten").toEqual(["mem-late"]);
+      expect(await usedToday(page), "the request stays counted").toBe(1);
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      expect(calls.capture.length).toBe(1);
+    });
+  }
+
+  for (const [what, from, to] of [
+    ["refers to a Memory", "^status: .*$", 'status: "active"\nmemoryObjectIds: ["架空の別端末のMemory"]'],
+    ["says captured", "^status: .*$", 'status: "captured"'],
+  ] as const) {
+    test(`the Vault file, with the same words, ${what} (another device finished it): nothing is sent, and the file stays`, async ({ page }) => {
+      test.setTimeout(180_000);
+      const words = said(`別端末${what.length}`);
+      await seed(page);
+      const calls = await fakeApi(page);
+      await startApp(page);
+      await talkFromHome(page, words);
+      await fileIsWritten(page, words);
+      const { id } = await withWords(page, words);
+      await backdate(page, id);
+      expect(await rewriteFile(page, words, from, to)).toBe(true);
+      const file = (await filesWith(page, words))[0];
+      await startApp(page);
+      await page.waitForTimeout(SETTLE);
+      expect(calls.capture.length, "no Capture").toBe(0);
+      expect((await memoriesOf(page, id)).length).toBe(0);
+      expect((await filesWith(page, words))[0], "the file is as it was").toBe(file);
+    });
+  }
+
+  test("the save refuses when a Memory or a reference arrived, for the automatic run only; the end of a conversation saves as before", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page, [{ id: "a", ago: 120 * MIN }, { id: "b", ago: 120 * MIN }, { id: "c", ago: 120 * MIN }, { id: "d", ago: 120 * MIN }], undefined, { enabled: false });
+    const outcomes = await page.evaluate(async () => {
+      const { dbm } = (window as any).D;
+      const T = new Date().toISOString();
+      const later = new Date(Date.now() + 60_000).toISOString();
+      const memory = (id: string, conversationId: string) => ({ id, date: T, types: ["conversation"], conversationId, content: "架空の記憶", summary: "架空の要約", keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T, metadata: { id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
+      const commit = async (id: string, onlyIfNoMemory: boolean) => {
+        const read = await dbm.getConversation(id);
+        const r = await dbm.commitCaptureResult({ ...read, status: "captured", memoryObjectIds: [`new-${id}`], updatedAt: later }, [{ memory: memory(`new-${id}`, id), recordType: "memory" }], read.updatedAt, undefined, { onlyIfNoMemory });
+        const after = await dbm.getConversation(id);
+        return [r.outcome, after.status, after.memoryObjectIds, !!(await dbm.getMemoryObject(`new-${id}`))];
+      };
+      const arrive = async (id: string) => { const c = await dbm.getConversation(id); await dbm.putConversationWithOutbox({ ...c, memoryObjectIds: ["arrived"] }); };
+      await dbm.putMemoryObjectWithOutbox(memory("arrived-a", "a"));
+      const a = await commit("a", true);
+      const b = await (async () => { const read = await dbm.getConversation("b"); await arrive("b"); const r = await dbm.commitCaptureResult({ ...read, status: "captured", memoryObjectIds: ["new-b"], updatedAt: later }, [{ memory: memory("new-b", "b"), recordType: "memory" }], read.updatedAt, undefined, { onlyIfNoMemory: true }); const after = await dbm.getConversation("b"); return [r.outcome, after.status, after.memoryObjectIds, !!(await dbm.getMemoryObject("new-b"))]; })();
+      return { a, b, c: await commit("c", true), d: await commit("d", false) };
+    });
+    expect(outcomes.a).toEqual(["conversation-changed", "active", [], false]);
+    expect(outcomes.b).toEqual(["conversation-changed", "active", ["arrived"], false]);
+    expect(outcomes.c).toEqual(["committed", "captured", ["new-c"], true]);
+    expect(outcomes.d).toEqual(["committed", "captured", ["new-d"], true]);
   });
 });
 

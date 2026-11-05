@@ -147,13 +147,14 @@ export function classifyAutoCaptureFailure(error: unknown, cancelled: boolean): 
   return "save-failed";
 }
 
-export interface AutoCaptureSummary { waiting: number; stopped: number; needsPermission: number }
-export function summarizeAutoCapture(conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings): AutoCaptureSummary {
+export interface AutoCaptureSummary { waiting: number; stopped: number; needsPermission: number; heldForMemory: number }
+export function summarizeAutoCapture(conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, _storedMemoryIds: ReadonlySet<string> = new Set()): AutoCaptureSummary {
   const left = conversations.filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id));
   const allowed = left.filter((c) => settings.allowOtherProviders || heldOnlyWithGemini(c));
   return {
     waiting: allowed.filter((c) => !isStopped(state, c.id)).length,
     stopped: allowed.filter((c) => isStopped(state, c.id)).length,
     needsPermission: left.length - allowed.length,
+    heldForMemory: 0,
   };
 }

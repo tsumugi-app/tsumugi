@@ -109,5 +109,21 @@ test("the summary counts what waits, what needs permission and what stopped", ()
   let state = emptyAutoCaptureState();
   for (let i = 0; i < 3; i++) state = beginAutoCaptureAttempt(state, "stopped", NOW);
   const list = [conv("stopped", undefined, { chatProviders: ["gemini"] }), conv("ok", undefined, { chatProviders: ["gemini"] }), conv("unknown")];
-  assert.deepEqual(summarizeAutoCapture(list, new Set(), state, { enabled: true, allowOtherProviders: false }), { waiting: 1, stopped: 1, needsPermission: 1 });
+  assert.deepEqual(summarizeAutoCapture(list, new Set(), state, { enabled: true, allowOtherProviders: false }), { waiting: 1, stopped: 1, needsPermission: 1, heldForMemory: 0 });
+});
+
+test("a conversation that refers to Memories is not sent, automatically or by the manual retry, whether or not they are found", () => {
+  const refers = conv("refers", undefined, { memoryObjectIds: ["memory-of-it"] });
+  assert.deepEqual(select([refers, conv("free")]), ["free"]);
+  let state = emptyAutoCaptureState();
+  for (let i = 0; i < 3; i++) state = beginAutoCaptureAttempt(state, "refers", NOW);
+  assert.deepEqual(select([refers], state, ON, true), [], "not by the manual retry either");
+});
+
+test("the summary keeps a conversation whose Memories are missing apart: not waiting, not stopped, not finished", () => {
+  const settings = { enabled: true, allowOtherProviders: true };
+  const missing = conv("missing", undefined, { memoryObjectIds: ["gone"] });
+  assert.deepEqual(summarizeAutoCapture([missing, conv("free")], new Set(), emptyAutoCaptureState(), settings, new Set()), { waiting: 1, stopped: 0, needsPermission: 0, heldForMemory: 1 });
+  assert.deepEqual(summarizeAutoCapture([missing], new Set(), emptyAutoCaptureState(), settings, new Set(["gone"])), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "found, under another or no conversationId: nothing is missing");
+  assert.deepEqual(summarizeAutoCapture([missing], new Set(["missing"]), emptyAutoCaptureState(), settings, new Set()), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "it has a Memory");
 });

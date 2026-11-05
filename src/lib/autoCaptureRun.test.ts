@@ -152,3 +152,18 @@ test("a Vault switch cancels the call: no attempt used, and the request stays co
   assert.equal(seen.state.conversations.a, undefined);
   assert.equal(seen.state.recentRuns.length, 1);
 });
+
+test("a conversation that refers to Memories: no request, nothing recorded, and the result is no finished conversation", async () => {
+  const refers = { ...conv("refers"), memoryObjectIds: ["gone"] } as Conversation;
+  const { deps, seen } = setup([refers]);
+  assert.equal(await runAutoCapture(deps), "nothing");
+  assert.deepEqual(seen.captured, []);
+  assert.deepEqual(seen.state, emptyAutoCaptureState());
+});
+
+test("the reference arrives after the list was read: decided again under the lock, so no request", async () => {
+  const { deps, seen } = setup([conv("a")], { readConversation: async () => ({ ...conv("a"), memoryObjectIds: ["arrived"] }) as Conversation });
+  assert.equal(await runAutoCapture(deps), "nothing");
+  assert.deepEqual(seen.captured, []);
+  assert.deepEqual(seen.state, emptyAutoCaptureState());
+});
