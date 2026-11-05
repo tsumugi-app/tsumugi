@@ -28,6 +28,7 @@ const origResolve = mod._resolveFilename;
 mod._resolveFilename = function (request, ...rest) {
   return origResolve.call(this, request.startsWith("@/") ? path.join(ROOT, request.slice(2)) : request, ...rest);
 };
+const keys = require(path.join(ROOT, "lib/apiKeyHeader.js")) as typeof import("./apiKeyHeader");
 const route = (name: string) => require(path.join(ROOT, `app/api/${name}/route.js`)) as { POST: (r: Request) => Promise<Response> };
 
 const MEMORY = { summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], date: "2026-01-01" };
@@ -41,6 +42,14 @@ async function call(name: string, headers: Record<string, string>) {
   const res = await route(name).POST(new Request(`http://localhost/api/${name}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(ROUTES[name]) }));
   return { status: res.status, used: [...used] };
 }
+
+test("in the app, an automatic request is built only with a usable key, and always with the mark", () => {
+  for (const key of [undefined, "", "   ", "架空のキー", "key\u200b"]) {
+    assert.equal(keys.isUsableUserKey(key), false);
+    assert.throws(() => keys.userKeyOnlyHeaders(key), { name: "NoUserKeyError" });
+  }
+  assert.deepEqual(keys.userKeyOnlyHeaders(USER_KEY), { "X-Gemini-Api-Key": USER_KEY, [ONLY]: "1" });
+});
 
 for (const name of Object.keys(ROUTES)) {
   test(`${name}: marked automatic with no key, the server refuses and no provider is reached, though it has its own key`, async () => {

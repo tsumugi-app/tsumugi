@@ -1,0 +1,22 @@
+{
+"note": "The only change connect.ts may have: automatic runs require the user's key at the request and mark it so the server refuses its own key.",
+"lines": [
+"-import { GEMINI_API_KEY_HEADER } from \"./apiKeyHeader\";",
+"+import { GEMINI_API_KEY_HEADER, userKeyOnlyHeaders } from \"./apiKeyHeader\";",
+"-candidates: { id: string; date: string; summary: string; keywords: string[] }[]",
+"+candidates: { id: string; date: string; summary: string; keywords: string[] }[],",
+"+requireUserKey?: boolean",
+"+const keyHeaders = requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};",
+"-...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}),",
+"+...keyHeaders,",
+"-priority: VaultWritePriority = \"interactive\"",
+"+priority: VaultWritePriority = \"interactive\",",
+"+options?: { requireUserKey?: boolean }",
+"-return withVaultWorldRead(() => connectMemoryImpl(vaultHandle, newMemory, priority));",
+"+return withVaultWorldRead(() => connectMemoryImpl(vaultHandle, newMemory, priority, options));",
+"-_priority: VaultWritePriority = \"interactive\"",
+"+_priority: VaultWritePriority = \"interactive\",",
+"-const judgments = await judgeCandidates(newMemory, candidates);",
+"+const judgments = await judgeCandidates(newMemory, candidates, options?.requireUserKey);"
+]
+}

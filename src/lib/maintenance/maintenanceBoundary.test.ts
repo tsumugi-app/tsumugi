@@ -93,8 +93,11 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
   const range = BASE ? [`${BASE}...HEAD`] : ["HEAD"];
   const changed = git("diff", "--name-only", ...range).split("\n").filter(Boolean);
-  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts"];
+  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts"];
   for (const f of untouchable) assert.ok(!changed.includes(f), `${f} must not be modified`);
+  // Reviewed exception (automatic runs never use the server key): connect.ts may gain exactly this and nothing else
+  const connectKeyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedConnectKeyLines.json"), "utf8")).lines);
+  for (const l of git("diff", "-U0", ...range, "--", "src/lib/connect.ts").split("\n").filter((x) => /^[+-]/.test(x) && !/^(\+\+\+|---)/.test(x))) assert.ok(connectKeyLines.has(l[0] + l.slice(1).trim()), `src/lib/connect.ts must not be modified (unreviewed line): ${l}`);
   // Reviewed (startup I/O): the check of every saved record runs once per build and day. These two files may gain exactly that and nothing else
   const doneIntegrityLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedDoneIntegrityLines.json"), "utf8")).lines);
   for (const f of ["src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts"]) {

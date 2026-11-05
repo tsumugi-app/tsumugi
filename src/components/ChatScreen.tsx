@@ -25,6 +25,7 @@ import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { conversationFileState } from "@/lib/conversationFileCheck";
 import { parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
 import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
+import { isUsableUserKey } from "@/lib/apiKeyHeader";
 import { AUTO_CAPTURE_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, withConversationCapture } from "@/lib/conversationLocks";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistCaptureAtomically, persistConversation } from "@/lib/capture";
 import {
@@ -574,8 +575,8 @@ async function resolveVaultWorldStartupDecision(): Promise<VaultWorldStartupDeci
   return { kind: "normal", epoch };
 }
 
-/** 利用者自身のGeminiキーがあるか。空白だけのキーは、サーバーでは「キーなし」として運営側のキーに切り替わるため、ないものとして扱う。 */
-const userKeySaved = async () => !!(await loadApiKey("gemini"))?.trim();
+/** 利用者自身のGeminiキーがあるか。空白だけのキーや、ヘッダーで送れないキーは、ないものとして扱う。 */
+const userKeySaved = async () => isUsableUserKey(await loadApiKey("gemini"));
 
 export default function ChatScreen() {
   /**
@@ -1516,7 +1517,7 @@ export default function ChatScreen() {
    * 生成が完了したMemoryはmemoryObjects stateへも反映する（画面に既に表示されている
    * Memoryへ、revisitPromptだけが後から追記される形になる）。
    */
-  function enqueueRevisitPromptGeneration(memories: MemoryObject[]) {
+  function enqueueRevisitPromptGeneration(memories: MemoryObject[], requireUserKey = false) {
     const targets = memories.filter((memory) => !memory.revisitPrompt);
     if (targets.length === 0) return;
     // Vault境界の安全性：Memory Worldへ影響する非同期処理として追跡する
@@ -1526,7 +1527,7 @@ export default function ChatScreen() {
       Promise.all(
         targets.map(async (memory) => {
           try {
-            const revisitPrompt = await generateRevisitPrompt(memory);
+            const revisitPrompt = await generateRevisitPrompt(memory, { requireUserKey });
             if (!revisitPrompt) return;
             // Vault境界の安全性（H4対応）：最新recordへのfield更新をロック＋epoch確認で包む。
             const memoryWithPrompt = await withVaultWorldRead(() => updateMemoryRevisitPrompt(memory.id, revisitPrompt));
@@ -1558,7 +1559,7 @@ export default function ChatScreen() {
   function connectConversationBoundary(
     pendingMemoryObjects: Promise<MemoryObject[]>,
     priority: VaultWritePriority = "interactive",
-    onlyWithUserKey = false
+    requireUserKey = false
   ) {
     // Vault境界の安全性：Connect自体もMemory Worldへ影響する非同期処理として追跡する
     // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
@@ -1570,9 +1571,7 @@ export default function ChatScreen() {
         try {
           const memories = await pendingMemoryObjects;
           for (const memory of memories) {
-            // 自動の処理では、途中でキーが消えても運営側のキーを使わない。残りは次回以降の起動時Connectで処理する。
-            if (onlyWithUserKey && !(await userKeySaved())) return;
-            await connectMemory(vaultHandle, memory, priority);
+            await connectMemory(vaultHandle, memory, priority, { requireUserKey });
           }
         } catch (error) {
           console.error("Failed to connect conversation-boundary memories", error);
@@ -1754,7 +1753,7 @@ export default function ChatScreen() {
         window.setTimeout(() => setCaptureStatus("idle"), 2500);
       }
 
-      if (!auto || (await userKeySaved())) enqueueRevisitPromptGeneration(persistedMemoryObjects);
+      enqueueRevisitPromptGeneration(persistedMemoryObjects, !!auto);
       connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority, !!auto);
       return persistedMemoryObjects;
     } catch (error) {
@@ -2374,7 +2373,7 @@ export default function ChatScreen() {
             // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
             // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
             try {
-              await connectMemory(vaultHandle, memory, "background");
+              await connectMemory(vaultHandle, memory, "background", { requireUserKey: true });
             } catch (error) {
               // 実機不具合対応（1件のHOLD/conflictがcatch-up全体を止める問題）：
               // connectMemoryImpl自身は失敗時にclaimを解放したうえで必ず再throwする

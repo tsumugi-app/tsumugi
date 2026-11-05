@@ -23,7 +23,7 @@ import { retrieveRelevantMemoriesImpl } from "./retrieval";
 import { IncompleteVaultWorldError, StaleVaultTabError, withVaultWorldRead } from "./vaultWorldLock";
 import { markMemoryConnected, releaseMemoryConnectClaim, tryClaimMemoryForConnect } from "./connectState";
 import type { Link, LinkAxis, MemoryObject } from "./types";
-import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { GEMINI_API_KEY_HEADER, userKeyOnlyHeaders } from "./apiKeyHeader";
 
 const CANDIDATE_LIMIT = 5;
 const MAX_LINKS_PER_MEMORY = 2;
@@ -39,14 +39,16 @@ interface ConnectJudgment {
 
 async function judgeCandidates(
   newMemory: MemoryObject,
-  candidates: { id: string; date: string; summary: string; keywords: string[] }[]
+  candidates: { id: string; date: string; summary: string; keywords: string[] }[],
+  requireUserKey?: boolean
 ): Promise<ConnectJudgment[]> {
   const apiKey = await loadApiKey();
+  const keyHeaders = requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};
   const res = await fetch("/api/connect", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}),
+      ...keyHeaders,
     },
     body: JSON.stringify({
       newMemory: {
@@ -84,15 +86,17 @@ async function judgeCandidates(
 export async function connectMemory(
   vaultHandle: FileSystemDirectoryHandle | null,
   newMemory: MemoryObject,
-  priority: VaultWritePriority = "interactive"
+  priority: VaultWritePriority = "interactive",
+  options?: { requireUserKey?: boolean }
 ): Promise<void> {
-  return withVaultWorldRead(() => connectMemoryImpl(vaultHandle, newMemory, priority));
+  return withVaultWorldRead(() => connectMemoryImpl(vaultHandle, newMemory, priority, options));
 }
 
 async function connectMemoryImpl(
   vaultHandle: FileSystemDirectoryHandle | null,
   newMemory: MemoryObject,
-  _priority: VaultWritePriority = "interactive"
+  _priority: VaultWritePriority = "interactive",
+  options?: { requireUserKey?: boolean }
 ): Promise<void> {
   // Projection now uses the serialized durable outbox path; keep the public
   // priority parameter compatible with existing callers.
@@ -119,7 +123,7 @@ async function connectMemoryImpl(
       return;
     }
 
-    const judgments = await judgeCandidates(newMemory, candidates);
+    const judgments = await judgeCandidates(newMemory, candidates, options?.requireUserKey);
 
     const accepted = judgments
       .filter((judgment) => judgment.strength >= STRENGTH_THRESHOLD && judgment.reason?.trim())

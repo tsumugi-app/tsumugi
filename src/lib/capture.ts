@@ -32,7 +32,7 @@ import {
   sanitizeStoredTopicEvents,
   validateTopicEventQuotes,
 } from "./topicEvent";
-import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { GEMINI_API_KEY_HEADER, userKeyOnlyHeaders } from "./apiKeyHeader";
 import { turnsForAi } from "./aiReplyOutcome";
 import { trustedStatedAt } from "./captureEvidence";
 
@@ -361,11 +361,6 @@ export class CaptureRequestError extends Error {
   constructor(public readonly status: number) { super(`capture request failed with status ${status}`); this.name = "CaptureRequestError"; }
 }
 
-/** an automatic run found no user key at the moment of the request: nothing was sent, so the server key was not used */
-export class NoUserKeyError extends Error {
-  constructor() { super("no user key"); this.name = "NoUserKeyError"; }
-}
-
 type ExtractionResult = { memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics };
 
 async function extractMemories(
@@ -379,7 +374,8 @@ async function extractMemories(
   requireUserKey?: boolean
 ): Promise<ExtractionResult> {
   const apiKey = await loadApiKey();
-  if (requireUserKey && !apiKey?.trim()) throw new NoUserKeyError();
+  // an automatic run: no usable key at this moment, no request. The mark makes the server refuse too, so its own key is never used.
+  const keyHeaders = requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};
   const toRef = (memory: MemoryObject) => ({
     id: memory.id,
     summary: memory.summary,
@@ -395,7 +391,7 @@ async function extractMemories(
     signal,
     headers: {
       "Content-Type": "application/json",
-      ...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}),
+      ...keyHeaders,
     },
     body: JSON.stringify({
       persona,

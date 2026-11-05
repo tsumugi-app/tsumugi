@@ -112,7 +112,9 @@ const memoriesOf = async (page: Page, id: string) => (await rows(page, "memoryOb
 /** the Markdown files holding these words, wherever the app put them */
 const filesWith = (page: Page, needle: string) => page.evaluate(async (text) => {
   const found: string[] = [];
-  const walk = async (d: any): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h); else if (name.endsWith(".md")) { const t = await (await h.getFile()).text(); if (t.includes(text)) found.push(t); } } };
+  const walk = async (d: any): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") await walk(h); else if (name.endsWith(".md")) { const t = await readFile(h); if (t.includes(text)) found.push(t); } } };
+  // the app may be writing the file at this moment
+  const readFile = async (h: any): Promise<string> => { for (let i = 0; ; i++) { try { return await (await h.getFile()).text(); } catch (e) { if (i >= 4) throw e; await new Promise((r) => setTimeout(r, 300)); } } };
   await walk(await navigator.storage.getDirectory());
   return found;
 }, needle);

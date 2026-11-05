@@ -5,7 +5,7 @@
  * - APIキー・モデル名のprovider別解決
  * route.ts側はここの関数だけを使い、`@google/genai`やGemini固有の詳細を知らない。
  */
-import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER } from "@/lib/apiKeyHeader";
+import { AI_PROVIDER_HEADER, API_KEY_HEADER_BY_PROVIDER, USER_KEY_ONLY_HEADER } from "@/lib/apiKeyHeader";
 import { geminiProvider } from "./providers/gemini";
 import { openaiProvider } from "./providers/openai";
 import type { AIFeature, AIProvider, AIProviderName } from "./types";
@@ -52,6 +52,7 @@ const API_KEY_ENV_FALLBACK: Partial<Record<AIProviderName, string | undefined>> 
 /**
  * `allowEnvFallback: false`はapi-key/test/route.ts専用（検証中のキー自体を
  * 使わせたいので、サーバーの既定キーへ黙ってフォールバックしてはいけない）。
+ * `USER_KEY_ONLY_HEADER`付きの要求（自動の処理）も同じく、運営側のキーを使わない。
  */
 export function resolveApiKey(
   request: Request,
@@ -61,7 +62,7 @@ export function resolveApiKey(
   const headerName = API_KEY_HEADER_BY_PROVIDER[provider];
   const fromHeader = headerName ? request.headers.get(headerName)?.trim() : undefined;
   if (fromHeader) return fromHeader;
-  if (options?.allowEnvFallback === false) return undefined;
+  if (options?.allowEnvFallback === false || request.headers.get(USER_KEY_ONLY_HEADER) === "1") return undefined;
   return API_KEY_ENV_FALLBACK[provider] || undefined;
 }
 
