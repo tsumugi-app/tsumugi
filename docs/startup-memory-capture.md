@@ -108,6 +108,8 @@ Running this writes to existing data on a device: new Memories, and `status` cha
 
 ## Known limits
 
+- A save still pending on this device may rewrite a file with the same words, including its `status` and `memoryObjectIds`, as these keys evolve with the conversation (as on main). If another device finished that conversation and this device had such a save pending, its result can be lost before the automatic check reads the file, and the automatic run then treats the conversation as unprocessed. The words are not affected.
+
 - A conversation already saved as `captured` without its Memory before this change stays that way; nothing can tell what its Memories were without a new AI call.
 - A conversation with a failed Capture at the end action stays `active`. With the setting off nothing retries it.
 - The end action and other features still fall back to the server key when the device has no user key, as before. Only the automatic runs do not.

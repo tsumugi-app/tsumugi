@@ -178,6 +178,14 @@ const putRow = (page: Page, store: string, row: any) => page.evaluate(async ({ s
   db.close();
 }, { store, row });
 const fictionalMemory = (id: string, conversationId: string) => { const T = new Date(Date.now() - 86_400_000).toISOString(); return { id, date: T, types: ["conversation"], conversationId, content: "架空の復元された記憶", summary: "架空の復元された要約", keywords: ["架空"], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T, metadata: { id: `meta-${id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } }; };
+/** as after a finished save: with one still to come, the app rewrites a file with the same words itself (a save may update status and references), which a later test does not want */
+const nothingLeftToSave = (page: Page, id: string) => page.evaluate(async (id) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  const o: any = await new Promise((res, rej) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").get(`conversation:${id}`); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("vaultOutbox", "readwrite"); t.objectStore("vaultOutbox").put({ ...o, recordUpdatedAt: c.updatedAt, status: "done" }); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, id);
 /** the file holding `needle` gets its first line matching `from` rewritten from outside the app; the words stay */
 const rewriteFile = (page: Page, needle: string, from: string, to: string) => page.evaluate(async ({ needle, from, to }) => {
   const walk = async (d: any): Promise<boolean> => {
@@ -1110,7 +1118,6 @@ test.describe("a conversation that refers to Memories is never given new ones by
     test(`the Vault file, with the same words, ${what} (another device finished it): nothing is sent, and the file stays`, async ({ page }) => {
       test.setTimeout(180_000);
       const words = said(`別端末${what.length}`);
-      await page.addInitScript(() => { (window as any).__writes = []; const c = FileSystemFileHandle.prototype.createWritable; FileSystemFileHandle.prototype.createWritable = function (this: FileSystemFileHandle, ...a: any[]) { if (this.name.endsWith(".md")) (window as any).__writes.push(`${Date.now() % 100000} ${this.name} ${(new Error().stack ?? "").split("\n").slice(2, 9).map((l) => l.trim().replace(/https?:[^ ]*\//, "").slice(0, 60)).join(" < ")}`); return (c as any).apply(this, a); } as any; });
       await seed(page);
       const calls = await fakeApi(page);
       await startApp(page);
@@ -1118,38 +1125,11 @@ test.describe("a conversation that refers to Memories is never given new ones by
       await fileIsWritten(page, words);
       const { id } = await withWords(page, words);
       await backdate(page, id);
+      await nothingLeftToSave(page, id);
       expect(await rewriteFile(page, words, from, to)).toBe(true);
       const file = (await filesWith(page, words))[0];
-      const dump = (at: string) => page.evaluate(async ({ id, words, at }) => {
-        const out: any = { at, shards: [] };
-        const walk = async (d: any, pre: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") { await walk(h, `${pre}${name}/`); continue; } const f = await h.getFile(); const t = await f.text(); if (name.endsWith(".md") && t.includes(words)) { out.file = { path: pre + name, lastModified: f.lastModified, size: f.size, head: t.split("\n").filter((l: string) => /^(status|memoryObjectIds|updatedAt):/.test(l)) }; } else if (name.endsWith(".json") && t.includes(id)) { const j = JSON.parse(t); out.shards.push({ path: pre + name, records: j.records?.[id], files: j.records?.[id] ? j.files?.[j.records[id]] : undefined }); } } };
-        await walk(await navigator.storage.getDirectory(), "");
-        const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-        const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
-        db.close(); out.stored = { status: c?.status, refs: c?.memoryObjectIds, updatedAt: c?.updatedAt, turns: c?.turns?.length };
-        return out;
-      }, { id, words, at });
-      notice(`diag-${what.length}-before`, await dump("before"));
       await startApp(page);
-      const line = await page.evaluate(async ({ id, words }) => {
-        const out: string[] = [];
-        const t0 = Date.now();
-        while (Date.now() - t0 < 4500) {
-          let row = "";
-          const walk = async (d: any): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") { await walk(h); continue; } if (!(name.endsWith(".md") || /registry/.test(name) || /^\d+\.json$/.test(name))) continue; try { const f = await h.getFile(); const t = await f.text(); if (name.endsWith(".md") && t.includes(words)) row += ` F:${f.lastModified % 100000},${(t.match(/^status: (.*)$/m) ?? [])[1]},${/memoryObjectIds/.test(t)}`; else if (name.endsWith(".json") && t.includes(id)) { const j = JSON.parse(t); const e = j.files?.[j.records?.[id]]; if (e) row += ` R:${e.mtime % 100000},${e.status}`; } } catch { row += " busy"; } } };
-          await walk(await navigator.storage.getDirectory());
-          const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-          const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
-          const o: any = await new Promise((res, rej) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").get(`conversation:${id}`); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
-          db.close();
-          row += ` S:${c?.status},${c?.memoryObjectIds?.length} O:${o?.status},${o?.heldReason}`;
-          if (out[out.length - 1]?.split("|")[1] !== row) out.push(`${Date.now() % 100000}|${row}`);
-          await new Promise((r) => setTimeout(r, 120));
-        }
-        return out;
-      }, { id, words });
-      notice(`diag-${what.length}-timeline`, { line, captures: calls.capture.length, stacks: await page.evaluate(() => (window as any).__writes) });
-      notice(`diag-${what.length}-after`, { ...(await dump("after")), captures: calls.capture.length });
+      await page.waitForTimeout(SETTLE);
       expect(calls.capture.length, "no Capture").toBe(0);
       expect((await memoriesOf(page, id)).length).toBe(0);
       expect((await filesWith(page, words))[0], "the file is as it was").toBe(file);
