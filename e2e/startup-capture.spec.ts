@@ -221,6 +221,13 @@ const permissionLostAtStart = (page: Page) => page.addInitScript(() => {
   proto.queryPermission = async function () { return w.__granted ? "granted" : "prompt"; };
   proto.requestPermission = async function () { w.__granted = true; w.__requested = (w.__requested ?? 0) + 1; return "granted"; };
 });
+/** 「アクセスを再許可」 in Settings. The button sits under the bottom bar in the test window, so the click goes to the button itself */
+const giveBackPermission = async (page: Page) => {
+  const button = page.getByRole("button", { name: "アクセスを再許可" }).first();
+  await expect(button).toBeEnabled({ timeout: 30_000 });
+  await button.evaluate((el: HTMLElement) => el.click());
+  await expect.poll(() => page.evaluate(() => (window as any).__requested ?? 0), { timeout: 10_000 }).toBe(1);
+};
 const settingsValue = (page: Page, key: string) => page.evaluate(async (key) => {
   const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const value: any = await new Promise((res, rej) => { const q = db.transaction("settings").objectStore("settings").get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
@@ -1247,7 +1254,7 @@ test.describe("the folder permission is given back after the start", () => {
     await page.waitForTimeout(SETTLE);
     expect(aiCalls(calls), "nothing without the folder").toBe(0);
     await nav(page).getByRole("button", { name: "設定" }).click();
-    await page.getByRole("button", { name: "アクセスを再許可" }).first().click();
+    await giveBackPermission(page);
     await captureSeen(calls, 1);
     expect(calls.capture[0]).toContain(said("first"));
     await page.waitForTimeout(SETTLE * 2);
@@ -1264,7 +1271,7 @@ test.describe("the folder permission is given back after the start", () => {
     await permissionLostAtStart(page);
     await startApp(page);
     await nav(page).getByRole("button", { name: "設定" }).click();
-    await page.getByRole("button", { name: "アクセスを再許可" }).first().click();
+    await giveBackPermission(page);
     await page.waitForTimeout(SETTLE);
     expect(aiCalls(calls)).toBe(0);
     await autoCaptureSetting(page, true, true);
@@ -1275,7 +1282,7 @@ test.describe("the folder permission is given back after the start", () => {
     });
     await startApp(page);
     await nav(page).getByRole("button", { name: "設定" }).click();
-    await page.getByRole("button", { name: "アクセスを再許可" }).first().click();
+    await giveBackPermission(page);
     await page.waitForTimeout(SETTLE);
     expect(aiCalls(calls), "nothing to do").toBe(0);
   });
