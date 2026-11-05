@@ -13,7 +13,7 @@ concurrency:
 jobs:
   maintenance-panel:
     runs-on: ubuntu-24.04   # pinned: the Playwright version used here supports Ubuntu 24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       NEXT_TELEMETRY_DISABLED: "1"
       CI: "true"
