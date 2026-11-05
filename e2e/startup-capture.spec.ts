@@ -295,6 +295,7 @@ async function takeInEdit(page: Page) {
   notice("edit-taken-in", asChoice ? "choice of versions" : "update");
   if (asChoice) {
     await conflict.click();
+    if (!(await page.getByTestId("vault-conflict-choice-adopt-vault").isVisible({ timeout: 15_000 }).catch(() => false))) notice("diag-choice", (await page.evaluate(() => document.body.innerText)).replace(/\s+/g, " ").slice(0, 1500));
     await page.getByTestId("vault-conflict-choice-adopt-vault").click();
     await page.getByTestId("vault-conflict-confirm").click();
   } else await update.click();
@@ -1208,6 +1209,8 @@ test.describe("which AI held it, once a Vault version is taken in", () => {
     await takeInEdit(page);
     expect((await withWords(page, words)).title, "the version was taken in").toBe("架空の別端末で付けた題");
     expect(await providersOf(page, words), "nothing lost").toEqual(["gemini"]);
+    await backdate(page, id);
+    await nothingLeftToSave(page, id);
     await autoCaptureSetting(page, true, false);
     await startApp(page);
     await captureSeen(calls, 1);
@@ -1300,19 +1303,19 @@ test.describe("another device finished the conversation: what this device does w
     const { id } = await withWords(page, words);
     await backdate(page, id);
     await leaveSavePending(page, id);
-    expect(await rewriteFile(page, words, "^status: .*$", 'status: "captured"\nmemoryObjectIds: ["架空の別端末のMemory"]')).toBe(true);
+    expect(await rewriteFile(page, words, "^status: .*$", 'status: captured\nmemoryObjectIds: [FICTIONALOTHERDEVICEMEMORY1]')).toBe(true);
     for (let start = 0; start < 2; start++) {
       await startApp(page);
       await page.waitForTimeout(SETTLE);
       expect(calls.capture.length, "no Capture").toBe(0);
       const file = (await filesWith(page, words))[0];
       expect(file, "the file keeps captured").toMatch(/^status: "?captured"?$/m);
-      expect(file, "the file keeps the reference").toContain("架空の別端末のMemory");
+      expect(file, "the file keeps the reference").toContain("FICTIONALOTHERDEVICEMEMORY1");
     }
     await takeInEdit(page);
     const stored = (await rows(page, "conversations")).find((c) => c.id === id);
     expect(stored.status).toBe("captured");
-    expect(stored.memoryObjectIds).toEqual(["架空の別端末のMemory"]);
+    expect(stored.memoryObjectIds).toEqual(["FICTIONALOTHERDEVICEMEMORY1"]);
     await startApp(page);
     await page.waitForTimeout(SETTLE);
     expect(calls.capture.length).toBe(0);
@@ -1328,12 +1331,12 @@ test.describe("another device finished the conversation: what this device does w
     await talkFromHome(page, words);
     await fileIsWritten(page, words);
     const { id } = await withWords(page, words);
-    expect(await rewriteFile(page, words, "^status: .*$", 'status: "captured"\nmemoryObjectIds: ["架空の別端末のMemory"]')).toBe(true);
+    expect(await rewriteFile(page, words, "^status: .*$", 'status: captured\nmemoryObjectIds: [FICTIONALOTHERDEVICEMEMORY1]')).toBe(true);
     await goHome(page);
     await page.waitForTimeout(3_000);
     expect(calls.capture.length, "no Capture").toBe(0);
     expect((await memoriesOf(page, id)).length).toBe(0);
-    expect((await filesWith(page, words))[0]).toContain("架空の別端末のMemory");
+    expect((await filesWith(page, words))[0]).toContain("FICTIONALOTHERDEVICEMEMORY1");
   });
 });
 

@@ -91,7 +91,11 @@ const saved = (page: Page, needle: string, turns: number) => expect.poll(async (
 async function staysLatest(page: Page) {
   await startApp(page);
   await nav(page).getByRole("button", { name: "設定" }).click();
-  await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
+  try { await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 }); } catch (e) {
+    const state = await page.evaluate(async () => { const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const all: any[] = await new Promise((res) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").getAll(); q.onsuccess = () => res(q.result); }); const cs: any[] = await new Promise((res) => { const q = db.transaction("conversations").objectStore("conversations").getAll(); q.onsuccess = () => res(q.result); }); db.close(); return { outbox: all.filter((o) => o.status !== "done").map((o) => [o.recordType, o.status, o.heldReason, o.attempt?.lastError, JSON.stringify(o.steps).slice(0, 300)]), convs: cs.map((c) => [c.status, c.memoryObjectIds?.length, c.turns?.length]) }; });
+    process.stdout.write(`\n::notice title=diag-latest::${JSON.stringify({ text: (await page.evaluate(() => document.body.innerText)).replace(/\s+/g, " ").slice(0, 1200), state })}\n`);
+    throw e;
+  }
   await expect(conflicts(page)).toHaveCount(0);
   await page.getByTestId("vault-check-now").click();
   await expect(page.getByText(LATEST)).toBeVisible({ timeout: 120_000 });
