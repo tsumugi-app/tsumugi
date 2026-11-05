@@ -221,7 +221,7 @@ async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, regis
   const parsed = parseConversationMarkdown(read.text);
   if (!parsed) throw new ProjectionConflictError("markdown-unreadable");
   if (!isLegitimatePredecessor(parsed, canonical)) throw new ProjectionConflictError("markdown-conflict");
-  if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path))) throw new ProjectionConflictError("markdown-conflict");
+  if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError("markdown-conflict");
   if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: "extends", reserialized: conversationToMarkdown(parsed) })) throw new ProjectionConflictError("markdown-edited-conflict");
   return { kind: "update", path };
 }

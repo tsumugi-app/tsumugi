@@ -295,7 +295,6 @@ async function takeInEdit(page: Page) {
   notice("edit-taken-in", asChoice ? "choice of versions" : "update");
   if (asChoice) {
     await conflict.click();
-    if (!(await page.getByTestId("vault-conflict-choice-adopt-vault").isVisible({ timeout: 15_000 }).catch(() => false))) notice("diag-choice", (await page.evaluate(() => document.body.innerText)).replace(/\s+/g, " ").slice(0, 1500));
     await page.getByTestId("vault-conflict-choice-adopt-vault").click();
     await page.getByTestId("vault-conflict-confirm").click();
   } else await update.click();

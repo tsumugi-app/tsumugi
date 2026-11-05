@@ -5,6 +5,6 @@
 "+chatProviders: chatProvidersAfterAdopting(l, f.turns),",
 "-import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, withMemoryDayFileLock } from \"./vaultRewriteSafety\";",
 "+import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, takesBackFinishedConversation, withMemoryDayFileLock } from \"./vaultRewriteSafety\";",
-"+if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path))) throw new ProjectionConflictError(\"markdown-conflict\");"
+"+if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError(\"markdown-conflict\");"
 ]
 }
