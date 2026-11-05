@@ -16,7 +16,7 @@ type CaptureReply = { status?: number; hold?: Promise<void>; abort?: boolean };
 type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string; fullStartDelay?: boolean };
 
 /** a device in normal use: a real OPFS Vault with its Registry baseline, holding fictional past conversations */
-async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: Device = {}) {
+async function seed(page: Page, past: Past[] = [], memoryOf?: string | string[], device: Device = {}) {
   // the home screen shows a past question at random: keep every draw under its 45%
   if (device.revisit) await page.addInitScript(() => { const random = Math.random; Math.random = () => random() * 0.4; });
   // the run starts 5 s after a start. These tests go through dozens of starts within the E2E time limit, so here it waits 2 s; the first test keeps the real wait.
@@ -53,7 +53,7 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: De
       const turns = (c.turns ?? [["user", `架空の話題${c.id}です`], ["ai", "架空の返答です。"]]).map(([role, content]) => ({ role, content, timestamp: T }));
       await dbm.putConversationWithOutbox({ id: c.id, persona: "companion", status: c.status ?? "active", startedAt: T, createdAt: T, updatedAt: T, memoryObjectIds: [], turns, ...(c.chatProviders ? { chatProviders: c.chatProviders } : {}),
         metadata: { id: `meta-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
-      if (c.id === memoryOf) await dbm.putMemoryObjectWithOutbox({ id: `mem-${c.id}`, date: T, types: ["conversation"], conversationId: c.id, content: "架空の保存済みの記憶", summary: "架空の保存済みの要約", keywords: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T,
+      if ([memoryOf].flat().includes(c.id)) await dbm.putMemoryObjectWithOutbox({ id: `mem-${c.id}`, date: T, types: ["conversation"], conversationId: c.id, content: "架空の保存済みの記憶", summary: "架空の保存済みの要約", keywords: ["架空"], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [], links: [], evidenceQuotes: [], createdAt: T, updatedAt: T,
         ...(device.revisit ? { revisitPrompt: device.revisit } : {}), metadata: { id: `meta-mem-${c.id}`, source: "ai-capture", sourceType: "chat", schemaVersion: "0.1", createdAt: T, updatedAt: T } });
     }
     await bootstrap.runSaveFoundationBootstrap({ root });
@@ -65,9 +65,11 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string, device: De
 
 /** fictional AI that counts every call. `reply(body)` decides the answer to one Capture; by default it returns one fictional Memory. */
 async function fakeApi(page: Page, reply: (words: string) => CaptureReply = () => ({})) {
-  const calls = { chat: 0, capture: [] as string[], connect: 0, prompt: 0 };
+  const calls = { chat: 0, capture: [] as string[], connect: 0, prompt: 0, sent: [] as { api: string; key?: string; only?: string }[], connectAnswers: false };
   await page.route("**/api/**", async (route) => {
     const url = route.request().url();
+    const api = ["capture", "connect", "prompt"].find((name) => url.includes(`/api/${name}`));
+    if (api) { const h = route.request().headers(); calls.sent.push({ api, key: h["x-gemini-api-key"], only: h["x-tsumugi-user-key-only"] }); }
     if (url.includes("/api/chat")) {
       calls.chat++;
       await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" });
@@ -81,6 +83,7 @@ async function fakeApi(page: Page, reply: (words: string) => CaptureReply = () =
     } else {
       if (url.includes("/api/connect")) calls.connect++;
       if (url.includes("/api/prompt")) calls.prompt++;
+      if (url.includes("/api/connect") && calls.connectAnswers) { await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ links: [] }) }); return; }
       await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
     }
   });
@@ -167,6 +170,37 @@ const setKey = (page: Page, value?: string) => page.evaluate(async (value) => {
   await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); const s = t.objectStore("settings"); if (value === undefined) s.delete("geminiApiKey"); else s.put(value, "geminiApiKey"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
   db.close();
 }, value);
+/** every request of an automatic run went with the user's key and with the mark that forbids the server key */
+const allWithUserKey = (calls: { sent: { api: string; key?: string; only?: string }[] }) => expect(calls.sent.filter((r) => r.key !== "fictional-test-key" || r.only !== "1"), "a request without the user's key").toEqual([]);
+const connectedCount = async (page: Page) => (await rows(page, "connectState")).filter((r) => r?.status === "done").length;
+const memoryIdOf = async (page: Page, conversation: string) => (await memoriesOf(page, conversation))[0]?.id;
+const isConnected = async (page: Page, memoryId: string) => page.evaluate(async (id) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  const r: any = await new Promise((res, rej) => { const q = db.transaction("connectState").objectStore("connectState").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  db.close(); return r?.status === "done";
+}, memoryId);
+/** Settings in another tab: the key goes at the exact moment the test asks for. Marks do not survive a reload, except the one for the first Connect of a start, which fires once. */
+const keyCanGo = (page: Page, atFirstConnect = false) => page.addInitScript((atFirstConnect) => {
+  const w = window as any;
+  w.__keyGoesAtConnect = atFirstConnect && !sessionStorage.getItem("key-went");
+  const transaction = IDBDatabase.prototype.transaction;
+  IDBDatabase.prototype.transaction = function (this: IDBDatabase, stores: any, mode?: any, ...rest: any[]) {
+    if (w.__keyGoesAtConnect && mode === "readwrite" && [stores].flat().includes("connectState")) {
+      w.__keyGoesAtConnect = false; sessionStorage.setItem("key-went", "1");
+      (transaction as any).call(this, "settings", "readwrite").objectStore("settings").delete("geminiApiKey");
+    }
+    return (transaction as any).call(this, stores, mode, ...rest);
+  } as any;
+  const get = IDBObjectStore.prototype.get;
+  IDBObjectStore.prototype.get = function (this: IDBObjectStore, key: any) {
+    const read = get.call(this, key);
+    if (w.__keyGoesAfterRead && key === "geminiApiKey") {
+      w.__keyGoesAfterRead = false;
+      (transaction as any).call(this.transaction.db, "settings", "readwrite").objectStore("settings").delete("geminiApiKey");
+    }
+    return read;
+  };
+}, atFirstConnect);
 const usedToday = async (page: Page) => JSON.parse((await settingsValue(page, "autoCapture:state")) ?? "{}").recentRuns?.length ?? 0;
 const allowOthers = (page: Page) => page.evaluate(async () => {
   const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
@@ -362,7 +396,7 @@ test.describe("startup Memory creation: who decides", () => {
 
   test("no user key: nothing is sent, so the server key is never used", async ({ page }) => {
     test.setTimeout(120_000);
-    await seed(page, [{ id: "nokey-1", ago: 120 * MIN }], undefined, { key: false });
+    await seed(page, [{ id: "nokey-1", ago: 120 * MIN }, { id: "nokey-o1", ago: 3000 * MIN, status: "captured" }, { id: "nokey-o2", ago: 4000 * MIN, status: "captured" }], ["nokey-o1", "nokey-o2"], { key: false, revisit: "架空の問いですか" });
     const calls = await fakeApi(page);
     await startApp(page);
     await page.waitForTimeout(SETTLE);
@@ -375,6 +409,15 @@ test.describe("startup Memory creation: who decides", () => {
     expect(aiCalls(calls), "a blank key is no key").toBe(0);
     expect(await statusOf(page, "nokey-1")).toBe("active");
     expect(await usedToday(page)).toBe(0);
+    // a key that cannot go in a header is no key either
+    await setKey(page, "架空のキー");
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(aiCalls(calls), "an unusable key is no key").toBe(0);
+    expect(await statusOf(page, "nokey-1")).toBe("active");
+    expect(await usedToday(page)).toBe(0);
+    expect(JSON.parse((await settingsValue(page, "autoCapture:state")) ?? "{}").conversations?.["nokey-1"], "no attempt used").toBeUndefined();
+    expect(await connectedCount(page), "Connect is left for later, not marked done").toBe(0);
   });
 
   test("the key is removed after the run checked it: nothing is sent, nothing is counted, and with a key again one Memory", async ({ page }) => {
@@ -426,8 +469,91 @@ test.describe("startup Memory creation: who decides", () => {
     await page.waitForTimeout(SETTLE);
     expect(calls.prompt - prompt, "no question request without the key").toBe(0);
     expect(calls.connect - connect, "no Connect request without the key").toBe(0);
+    const memory = await memoryIdOf(page, "during-1");
+    expect(await isConnected(page, memory), "Connect is left for later, not marked done").toBe(false);
+    expect((await memoriesOf(page, "during-1"))[0].revisitPrompt, "no question was made").toBeFalsy();
+    calls.connectAnswers = true;
     await setKey(page, "fictional-test-key");
     await finishedOnce(page, "during-1", calls, said("during-1"));
+    await expect.poll(() => isConnected(page, memory), { timeout: 30_000 }).toBe(true);
+    expect(calls.connect - connect, "with the key back, Connect once").toBe(1);
+    allWithUserKey(calls);
+  });
+
+  test("a normal key: Capture, Connect and the question all go once, with the user's key and the mark; nothing again at the next start", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "ok-old", ago: 3000 * MIN, status: "captured" }, { id: "ok-1", ago: 120 * MIN }], "ok-old", { revisit: "架空の問いですか" });
+    const calls = await fakeApi(page);
+    calls.connectAnswers = true;
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await finishedOnce(page, "ok-1", calls, said("ok-1"));
+    expect([calls.capture.length, calls.connect, calls.prompt]).toEqual([1, 1, 1]);
+    allWithUserKey(calls);
+  });
+
+  test("the key goes just as the startup Connect starts: nothing is sent without it, nothing is marked done, and with the key back each Memory connects once", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "c-1", ago: 3000 * MIN, status: "captured" }, { id: "c-2", ago: 4000 * MIN, status: "captured" }], ["c-1", "c-2"], { revisit: "架空の問いですか" });
+    const calls = await fakeApi(page);
+    calls.connectAnswers = true;
+    await keyCanGo(page, true);
+    await startApp(page);
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem("key-went")), { timeout: 30_000 }).toBe("1");
+    await page.waitForTimeout(SETTLE);
+    expect(calls.connect, "no Connect request without the key").toBe(0);
+    expect(await connectedCount(page), "nothing marked done").toBe(0);
+    await setKey(page, "fictional-test-key");
+    await startApp(page);
+    await expect.poll(() => connectedCount(page), { timeout: 30_000 }).toBe(2);
+    expect(calls.connect).toBe(2);
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.connect, "no second Connect").toBe(2);
+    allWithUserKey(calls);
+  });
+
+  test("the key goes between the last check and a request after the Capture: no request goes without it, and with the key back the rest finishes once", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "g-old", ago: 3000 * MIN, status: "captured" }, { id: "g-1", ago: 120 * MIN }], "g-old", { revisit: "架空の問いですか" });
+    let release = () => {};
+    const held = new Promise<void>((res) => { release = res; });
+    const calls = await fakeApi(page, () => ({ hold: held }));
+    calls.connectAnswers = true;
+    await keyCanGo(page);
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await page.evaluate(() => { (window as any).__keyGoesAfterRead = true; });
+    release();
+    await expect.poll(() => statusOf(page, "g-1"), { timeout: 40_000 }).toBe("captured");
+    await page.waitForTimeout(SETTLE);
+    allWithUserKey(calls);
+    expect(calls.prompt + calls.connect, "the one read before the key went, and nothing after").toBe(1);
+    await setKey(page, "fictional-test-key");
+    await finishedOnce(page, "g-1", calls, said("g-1"));
+    await expect.poll(async () => isConnected(page, await memoryIdOf(page, "g-1")), { timeout: 30_000 }).toBe(true);
+    expect(calls.capture.length).toBe(1);
+    allWithUserKey(calls);
+  });
+
+  test("a question left unmade because the key went is made by the home screen once the key is back", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "q-1", ago: 120 * MIN }], undefined, { revisit: "unused" });
+    let release = () => {};
+    const held = new Promise<void>((res) => { release = res; });
+    const calls = await fakeApi(page, () => ({ hold: held }));
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await setKey(page);
+    release();
+    await expect.poll(() => statusOf(page, "q-1"), { timeout: 40_000 }).toBe("captured");
+    await page.waitForTimeout(SETTLE);
+    expect(calls.prompt).toBe(0);
+    await setKey(page, "fictional-test-key");
+    await startApp(page);
+    await expect.poll(() => calls.prompt, { timeout: 30_000 }).toBe(1);
+    expect(calls.sent.filter((r) => r.api === "prompt")[0].key).toBe("fictional-test-key");
+    expect(calls.capture.length).toBe(1);
   });
 
   test("without the permission only conversations known to be held with Gemini go to Gemini", async ({ page }) => {
@@ -521,6 +647,21 @@ test.describe("the end of a conversation: Memory and status are saved together",
     const c = await withWords(page, said("通常"));
     await finishedOnce(page, c.id, calls, said("通常"));
     expect(calls.capture.length).toBe(1);
+    expect(calls.sent.filter((r) => r.only), "the end of a conversation carries no mark").toEqual([]);
+    expect(calls.sent.find((r) => r.api === "capture")?.key).toBe("fictional-test-key");
+  });
+
+  test("the end of a conversation on a device with no key goes as before, for the server's key to serve it", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page, [], undefined, { enabled: false, key: false });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, said("キーなし終了"));
+    await goHome(page);
+    await captureSeen(calls, 1);
+    expect(calls.sent.find((r) => r.api === "capture")).toEqual({ api: "capture", key: undefined, only: undefined });
+    const c = await withWords(page, said("キーなし終了"));
+    await expect.poll(() => statusOf(page, c.id), { timeout: 40_000 }).toBe("captured");
   });
 
   test("a Memory write that fails leaves the conversation open, never captured without its Memory; a later start finishes it with one Memory", async ({ page }) => {

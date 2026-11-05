@@ -13,6 +13,10 @@
   "include": [],
   "files": [
     "src/lib/autoCapturePolicy.test.ts",
-    "src/lib/autoCaptureRun.test.ts"
+    "src/lib/autoCaptureRun.test.ts",
+    "src/lib/userKeyOnly.test.ts",
+    "src/app/api/capture/route.ts",
+    "src/app/api/connect/route.ts",
+    "src/app/api/prompt/route.ts"
   ]
 }
