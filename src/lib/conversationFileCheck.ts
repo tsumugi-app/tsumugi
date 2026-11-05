@@ -1,6 +1,7 @@
 import { conversationTurnsEqual, parseConversationMarkdown } from "./markdown";
 import type { Conversation } from "./types";
 import { hashVaultText, lookupVaultRegistryRecord } from "./vault";
+import { takesBackFinishedConversation } from "./vaultRewriteSafety";
 import { withVaultSaveLock } from "./vaultSaveLock";
 
 /**
@@ -31,7 +32,7 @@ export function conversationFileState(root: FileSystemDirectoryHandle, conversat
       if (hashVaultText(text) === entry.contentHash) return held ? "unknown" : "same";
       const parsed = parseConversationMarkdown(text);
       if (!parsed || !conversationTurnsEqual(parsed.turns, conversation.turns)) return "edited";
-      return parsed.status === "captured" || parsed.memoryObjectIds.some((id) => !conversation.memoryObjectIds.includes(id)) ? "processed" : "same";
+      return takesBackFinishedConversation(parsed, conversation) ? "processed" : "same";
     } catch {
       return "unknown";
     }

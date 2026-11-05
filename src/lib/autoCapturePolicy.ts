@@ -1,4 +1,5 @@
 import { endsWithInterruptedReply, isBlankAiReply } from "./aiReplyOutcome";
+import { UNKNOWN_CHAT_PROVIDER } from "./chatProviderRecord";
 import type { Conversation } from "./types";
 
 /**
@@ -57,7 +58,7 @@ export function parseAutoCaptureState(raw: string | undefined): AutoCaptureState
  * changes nothing. Turns with no record at all come from before the record existed, or from the Vault: they may have been held with any AI, and stay unknown when the conversation goes on with
  * Gemini, so it still needs the permission.
  */
-export const UNKNOWN_CHAT_PROVIDER = "unknown";
+export { UNKNOWN_CHAT_PROVIDER };
 export function withChatProvider(conversation: Conversation, provider: string): Conversation {
   const known = conversation.chatProviders ?? (conversation.turns.length > 0 ? [UNKNOWN_CHAT_PROVIDER] : []);
   return known.includes(provider) ? conversation : { ...conversation, chatProviders: [...known, provider] };

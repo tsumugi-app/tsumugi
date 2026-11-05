@@ -35,7 +35,7 @@ import {
   parseSourceMarkdown,
 } from "./markdown";
 import { validStatedAt } from "./markdown";
-import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, withMemoryDayFileLock } from "./vaultRewriteSafety";
+import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, takesBackFinishedConversation, withMemoryDayFileLock } from "./vaultRewriteSafety";
 import { fileNameFor, dayFileNameFor, dayFileRegistryKey, vaultRegistryBucketOf, hashVaultText, truncateHistoryPreview, normalizedSourceType, vaultProjectionPrimitives, type HistoryIndexUpdate, type HistoryMeta, type HistoryMonthIndex } from "./vault";
 
 // ---------------------------------------------------------------------------
@@ -221,6 +221,7 @@ async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, regis
   const parsed = parseConversationMarkdown(read.text);
   if (!parsed) throw new ProjectionConflictError("markdown-unreadable");
   if (!isLegitimatePredecessor(parsed, canonical)) throw new ProjectionConflictError("markdown-conflict");
+  if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path))) throw new ProjectionConflictError("markdown-conflict");
   if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: "extends", reserialized: conversationToMarkdown(parsed) })) throw new ProjectionConflictError("markdown-edited-conflict");
   return { kind: "update", path };
 }

@@ -810,6 +810,7 @@ export default function ChatScreen() {
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
+  const autoCaptureScheduledRef = useRef(false);
   const startupRecoveryCheckRanRef = useRef(false);
   /** 保存先の整合性の背景確認（読み取りだけ）。ビルド × Vaultごとに、正常と確定するまで。Settingsを開くこととは無関係。 */
   const recoveryDetectionRanRef = useRef(false);
@@ -1649,7 +1650,8 @@ export default function ChatScreen() {
       const stoppedByVaultEdit = async () => {
         if (!vaultHandle) return false;
         const fileState = await conversationFileState(vaultHandle, target);
-        if (auto ? fileState === "same" : fileState !== "edited") return false;
+        // the end of a conversation also stops when another device finished it: its Memories exist there
+        if (auto ? fileState === "same" : fileState === "same" || fileState === "unknown") return false;
         if (auto) auto.result = "changed";
         else {
           boundaryOutcomeRef.current = "vault-edited";
@@ -2435,11 +2437,6 @@ export default function ChatScreen() {
           // ここでロックを保持したまま呼ぶとネストになる。vaultWorldLock.ts参照）。
           const allConversations = await withVaultWorldRead(() => getAllConversations());
           setInterruptedConversation(newestInterruptedConversation(allConversations));
-          // Memory作成そのものは、設定でオンにした端末だけ、画面が使えるようになってから始める（lib/autoCaptureRun.ts）。
-          // 起動後にオンにした場合は、画面の案内どおり次回の起動から動く。
-          if (vaultStatus === "connected" && vaultHandle && parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings).enabled) {
-            window.setTimeout(() => void trackMemoryTask(autoCaptureRunnerRef.current(false)), AUTO_CAPTURE_START_DELAY_MS);
-          }
         } catch (error) {
           if (handleStaleVaultTabError(error)) return;
           console.error("Failed to run startup capture catch-up", error);
@@ -2448,6 +2445,26 @@ export default function ChatScreen() {
           // （既存のtry/catch自体の分岐・処理順序は変更していない）。
           logStartupCatchupEnd("captureCatchup", Date.now() - catchupStart);
           markBootPhaseDone();
+        }
+      })()
+    );
+  }, [vaultStatus, vaultHandle]);
+
+  /**
+   * Memory作成そのものは、設定でオンにした端末だけ、保存先が使えるようになってから、起動ごとに1回だけ始める（lib/autoCaptureRun.ts）。起動時にフォルダの許可が切れていれば、
+   * 再許可で接続されたときに始める。起動後にオンにした場合は、画面の案内どおり次回の起動から動く。
+   */
+  useEffect(() => {
+    if (autoCaptureScheduledRef.current || vaultStatus !== "connected" || !vaultHandle) return;
+    autoCaptureScheduledRef.current = true;
+    void trackMemoryTask(
+      (async () => {
+        try {
+          if (parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings).enabled) {
+            window.setTimeout(() => void trackMemoryTask(autoCaptureRunnerRef.current(false)), AUTO_CAPTURE_START_DELAY_MS);
+          }
+        } catch (error) {
+          console.error("Failed to schedule startup Memory creation", error);
         }
       })()
     );

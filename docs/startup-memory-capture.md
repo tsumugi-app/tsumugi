@@ -108,7 +108,9 @@ Running this writes to existing data on a device: new Memories, and `status` cha
 
 ## Known limits
 
-- A save still pending on this device may rewrite a file with the same words, including its `status` and `memoryObjectIds`, as these keys evolve with the conversation (as on main). If another device finished that conversation and this device had such a save pending, its result can be lost before the automatic check reads the file, and the automatic run then treats the conversation as unprocessed. The words are not affected.
+- Another device finished a conversation (its file says `captured` or refers to Memories this device does not hold): a save from this device's older state does not take that back. The save is held as a choice of versions in Settings, unless the file is the version Tsumugi itself last wrote here (Registry hash). The automatic run does not send it, and the end of a conversation stops as for an outside edit, so no Memory is made twice.
+- Which AI held a conversation is kept when a Vault version with the same words is taken in. Other or more words may have been held with any AI elsewhere, so the conversation becomes unknown and needs the permission (`chatProvidersAfterAdopting`).
+- The run is scheduled once per start, when the Vault is connected. A start with the folder permission lost runs after the permission is given back, not before.
 
 - A conversation already saved as `captured` without its Memory before this change stays that way; nothing can tell what its Memories were without a new AI call.
 - A conversation with a failed Capture at the end action stays `active`. With the setting off nothing retries it.

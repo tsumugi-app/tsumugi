@@ -10,7 +10,7 @@
  * このモジュールはファイルに触れない（読み書きは呼び出し側）。
  */
 import { MEMORY_ENTRY_SEPARATOR, memoryObjectToMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown } from "./markdown";
-import type { MemoryObject } from "./types";
+import type { Conversation, MemoryObject } from "./types";
 
 // ---------------------------------------------------------------------------
 // 読み込み
@@ -51,6 +51,14 @@ const keyOf = (line: string) => line.slice(0, line.indexOf(":")).trim();
 /** Tsumugiが版を進めるたびに変わる項目。これ以外のfrontmatterの行は、置き換えた後にも残っていなければ「元の内容が残る」とは言えない */
 export const MEMORY_EVOLVING_KEYS: ReadonlySet<string> = new Set(["updatedAt"]);
 export const CONVERSATION_EVOLVING_KEYS: ReadonlySet<string> = new Set(["updatedAt", "endedAt", "status", "turnTimes", "interruptedTurns", "memoryObjectIds"]);
+
+/**
+ * The file says the conversation is finished, or refers to Memories, beyond what this device holds: another device finished it. A save from the older state here must not take that back
+ * (the conversation would look unprocessed and get its Memories again), whatever the rule for evolving keys says. Not when Tsumugi wrote that file version itself here.
+ */
+export function takesBackFinishedConversation(onDisk: Pick<Conversation, "status" | "memoryObjectIds">, canonical: Pick<Conversation, "status" | "memoryObjectIds">): boolean {
+  return (onDisk.status === "captured" && canonical.status !== "captured") || onDisk.memoryObjectIds.some((id) => !canonical.memoryObjectIds.includes(id));
+}
 
 /**
  * `next`が`current`の内容をすべて含むか（上の原則の(2)）：

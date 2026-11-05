@@ -146,7 +146,10 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (write safety): every rewrite of an existing Markdown goes through the shared safety conditions (vaultRewriteSafety.ts). The exact added / removed lines of vaultProjection.ts and vault.ts only (never a pattern)
   const writeSafetyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedWriteSafetyLines.json"), "utf8")).lines);
   const writeSafety = (l: string) => writeSafetyLines.has(l[0] + l.slice(1).trim());
-  for (const l of projDiff) assert.ok(/getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l) || startupIoProjection.test(l) || autoRepairProjectionLines.has(l[0] + l.slice(1).trim()) || writeSafety(l), "unexpected vaultProjection.ts change: " + l);
+  // Reviewed (PR #26, owner approval 2026-11-06): the AI record after adopting a Vault version, and no save taking back what another device finished. Exact lines only
+  const autoCaptureSafetyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedAutoCaptureSafetyLines.json"), "utf8")).lines);
+  const autoCaptureSafety = (l: string) => autoCaptureSafetyLines.has(l[0] + l.slice(1).trim());
+  for (const l of projDiff) assert.ok(autoCaptureSafety(l) || /getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l) || startupIoProjection.test(l) || autoRepairProjectionLines.has(l[0] + l.slice(1).trim()) || writeSafety(l), "unexpected vaultProjection.ts change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
   // Reviewed storage safety extension: exact lines only, never a blanket exemption.
@@ -161,7 +164,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
     'await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);',
     'await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);',
   ]);
-  for (const l of vaultDiff) assert.ok(writeSafety(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(autoCaptureSafety(l) || writeSafety(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**

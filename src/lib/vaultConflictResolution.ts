@@ -16,6 +16,7 @@ import {
   adoptVaultVersionWithOutbox, getConversation, getMemoryObject, getSource, getTombstone, getVaultOutboxEntry, isMemoryBlockedByTombstone,
   RecoveryPendingError, requeueRecordForVault, VaultVersionChangedError,
 } from "./db";
+import { chatProvidersAfterAdopting } from "./chatProviderRecord";
 import { findRecordInVault } from "./dataLifecycle";
 import { conversationToMarkdown, MEMORY_ENTRY_SEPARATOR, memoryObjectToMarkdown, parseConversationMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown, parseSourceMarkdown, sourceToMarkdown } from "./markdown";
 import type { Conversation, MemoryObject, Source } from "./types";
@@ -195,6 +196,7 @@ function mergedVaultVersion(type: ConflictRecordType, device: LocalRecord, parse
         const same = d.turns[i];
         return same && same.role === turn.role && same.content === turn.content ? { ...same, timestamp: turn.timestamp } : turn;
       }),
+      chatProviders: chatProvidersAfterAdopting(d, p.turns),
       metadata: { ...d.metadata, schemaVersion: p.metadata.schemaVersion, source: p.metadata.source, sourceType: p.metadata.sourceType, sourceDetail: p.metadata.sourceDetail, updatedAt },
       updatedAt,
     };
