@@ -161,6 +161,12 @@ const settingsValue = (page: Page, key: string) => page.evaluate(async (key) => 
   const value: any = await new Promise((res, rej) => { const q = db.transaction("settings").objectStore("settings").get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
   db.close(); return value;
 }, key);
+/** the Gemini key as the Settings screen would leave it: removed (undefined), or as stored */
+const setKey = (page: Page, value?: string) => page.evaluate(async (value) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); const s = t.objectStore("settings"); if (value === undefined) s.delete("geminiApiKey"); else s.put(value, "geminiApiKey"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, value);
 const usedToday = async (page: Page) => JSON.parse((await settingsValue(page, "autoCapture:state")) ?? "{}").recentRuns?.length ?? 0;
 const allowOthers = (page: Page) => page.evaluate(async () => {
   const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
@@ -362,6 +368,66 @@ test.describe("startup Memory creation: who decides", () => {
     await page.waitForTimeout(SETTLE);
     expect(aiCalls(calls)).toBe(0);
     expect(await statusOf(page, "nokey-1")).toBe("active");
+    // blank is no key: the server would see an empty header and use its own
+    await setKey(page, "   ");
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(aiCalls(calls), "a blank key is no key").toBe(0);
+    expect(await statusOf(page, "nokey-1")).toBe("active");
+    expect(await usedToday(page)).toBe(0);
+  });
+
+  test("the key is removed after the run checked it: nothing is sent, nothing is counted, and with a key again one Memory", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "gone-1", ago: 120 * MIN }]);
+    const calls = await fakeApi(page);
+    // Settings in another tab: the key goes just as the run gets its lock, after its check. Once.
+    await page.addInitScript(() => {
+      if (sessionStorage.getItem("key-removed")) return;
+      const request = LockManager.prototype.request;
+      LockManager.prototype.request = function (this: LockManager, name: string, ...rest: any[]) {
+        const fn = rest[rest.length - 1];
+        if (name !== "tsumugi-auto-capture-run") return (request as any).call(this, name, ...rest);
+        return (request as any).call(this, name, ...rest.slice(0, -1), async (lock: any) => {
+          sessionStorage.setItem("key-removed", "1");
+          const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+          await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").delete("geminiApiKey"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+          db.close();
+          return fn(lock);
+        });
+      } as any;
+    });
+    await startApp(page);
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem("key-removed")), { timeout: 30_000 }).toBe("1");
+    await page.waitForTimeout(SETTLE);
+    expect(aiCalls(calls), "no request without the user's key").toBe(0);
+    expect(await statusOf(page, "gone-1")).toBe("active");
+    expect(await usedToday(page), "no request, so nothing counted").toBe(0);
+    expect(JSON.parse((await settingsValue(page, "autoCapture:state")) ?? "{}").conversations?.["gone-1"], "no attempt used").toBeUndefined();
+    await setKey(page, "fictional-test-key");
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await finishedOnce(page, "gone-1", calls, said("gone-1"));
+  });
+
+  test("the key is removed during the AI call: the Memory is kept, and no later AI request goes out without the key", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [{ id: "old", ago: 240 * MIN, status: "captured" }, { id: "during-1", ago: 120 * MIN }], "old", { revisit: "架空の問いですか" });
+    let release = () => {};
+    const held = new Promise<void>((res) => { release = res; });
+    const calls = await fakeApi(page, () => ({ hold: held }));
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await setKey(page);
+    const { connect, prompt } = calls;
+    release();
+    await expect.poll(() => statusOf(page, "during-1"), { timeout: 40_000 }).toBe("captured");
+    expect((await memoriesOf(page, "during-1")).length).toBe(1);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.prompt - prompt, "no question request without the key").toBe(0);
+    expect(calls.connect - connect, "no Connect request without the key").toBe(0);
+    await setKey(page, "fictional-test-key");
+    await finishedOnce(page, "during-1", calls, said("during-1"));
   });
 
   test("without the permission only conversations known to be held with Gemini go to Gemini", async ({ page }) => {

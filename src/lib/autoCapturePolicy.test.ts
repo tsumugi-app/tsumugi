@@ -97,6 +97,7 @@ test("failures are told apart", () => {
   const http = (status: number) => Object.assign(new Error("x"), { name: "CaptureRequestError", status });
   for (const s of [400, 401, 403]) assert.equal(classifyAutoCaptureFailure(http(s), false), "key");
   for (const s of [429, 500, 503]) assert.equal(classifyAutoCaptureFailure(http(s), false), "http");
+  assert.equal(classifyAutoCaptureFailure(Object.assign(new Error("x"), { name: "NoUserKeyError" }), false), "key");
   assert.equal(classifyAutoCaptureFailure(new TypeError("network"), false), "network");
   assert.equal(classifyAutoCaptureFailure(Object.assign(new Error("x"), { name: "AbortError" }), false), "network");
   assert.equal(classifyAutoCaptureFailure(Object.assign(new Error("x"), { name: "AbortError" }), true), "cancelled");

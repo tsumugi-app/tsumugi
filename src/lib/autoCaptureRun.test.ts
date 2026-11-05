@@ -91,6 +91,15 @@ test("a thrown away result uses no attempt of the conversation, and the words go
   assert.equal(seen.state.recentRuns.length, 2);
 });
 
+test("the key is gone by the time of the request: nothing was sent, nothing is counted, and the run ends", async () => {
+  const { deps, seen } = setup([conv("a", AUTO_CAPTURE_QUIET_MS * 2), conv("b")], {
+    capture: async (c) => { seen.captured.push(c.id); throw Object.assign(new Error("x"), { name: "NoUserKeyError" }); },
+  });
+  assert.equal(await runAutoCapture(deps), "key");
+  assert.deepEqual(seen.captured, ["a"]);
+  assert.deepEqual(seen.state, emptyAutoCaptureState());
+});
+
 test("5 requests in 24 hours, thrown away or refused ones included; a sixth start sends nothing", async () => {
   let n = 0;
   const { deps, seen } = setup([conv("a")], {}, () => (n++ % 2 === 0 ? "changed" : "key"));
