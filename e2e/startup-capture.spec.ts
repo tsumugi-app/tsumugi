@@ -1119,8 +1119,20 @@ test.describe("a conversation that refers to Memories is never given new ones by
       await backdate(page, id);
       expect(await rewriteFile(page, words, from, to)).toBe(true);
       const file = (await filesWith(page, words))[0];
+      const dump = (at: string) => page.evaluate(async ({ id, words, at }) => {
+        const out: any = { at, shards: [] };
+        const walk = async (d: any, pre: string): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") { await walk(h, `${pre}${name}/`); continue; } const f = await h.getFile(); const t = await f.text(); if (name.endsWith(".md") && t.includes(words)) { out.file = { path: pre + name, lastModified: f.lastModified, size: f.size, head: t.split("\n").filter((l: string) => /^(status|memoryObjectIds|updatedAt):/.test(l)) }; } else if (name.endsWith(".json") && t.includes(id)) { const j = JSON.parse(t); out.shards.push({ path: pre + name, records: j.records?.[id], files: j.records?.[id] ? j.files?.[j.records[id]] : undefined }); } } };
+        await walk(await navigator.storage.getDirectory(), "");
+        const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+        const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+        db.close(); out.stored = { status: c?.status, refs: c?.memoryObjectIds, updatedAt: c?.updatedAt, turns: c?.turns?.length };
+        return out;
+      }, { id, words, at });
+      notice(`diag-${what.length}-before`, await dump("before"));
       await startApp(page);
+      notice(`diag-${what.length}-started`, await dump("started"));
       await page.waitForTimeout(SETTLE);
+      notice(`diag-${what.length}-after`, { ...(await dump("after")), captures: calls.capture.length });
       expect(calls.capture.length, "no Capture").toBe(0);
       expect((await memoriesOf(page, id)).length).toBe(0);
       expect((await filesWith(page, words))[0], "the file is as it was").toBe(file);
