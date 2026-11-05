@@ -8,7 +8,7 @@ export type AutoCaptureRunOutcome = "off" | "blocked" | "no-key" | "offline" | "
 
 export interface AutoCaptureDeps {
   loadSettings(): Promise<AutoCaptureSettings>;
-  /** only the user's own Gemini key: without one nothing is sent, so the server key is never used */
+  /** only the user's own Gemini key: without one nothing is sent, so the server key is never used. `capture` asks again at the request, as the key can go at any time. */
   hasUserKey(): Promise<boolean>;
   online(): boolean;
   /** Vault not connected, recovery pending, Vault switch running, stale tab */

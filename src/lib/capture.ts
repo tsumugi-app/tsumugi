@@ -361,6 +361,11 @@ export class CaptureRequestError extends Error {
   constructor(public readonly status: number) { super(`capture request failed with status ${status}`); this.name = "CaptureRequestError"; }
 }
 
+/** an automatic run found no user key at the moment of the request: nothing was sent, so the server key was not used */
+export class NoUserKeyError extends Error {
+  constructor() { super("no user key"); this.name = "NoUserKeyError"; }
+}
+
 type ExtractionResult = { memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics };
 
 async function extractMemories(
@@ -370,9 +375,11 @@ async function extractMemories(
   relatedMemoryObjects: MemoryObject[],
   debugId?: string,
   signal?: AbortSignal,
-  onRequestSent?: () => void
+  onRequestSent?: () => void,
+  requireUserKey?: boolean
 ): Promise<ExtractionResult> {
   const apiKey = await loadApiKey();
+  if (requireUserKey && !apiKey?.trim()) throw new NoUserKeyError();
   const toRef = (memory: MemoryObject) => ({
     id: memory.id,
     summary: memory.summary,
@@ -451,7 +458,7 @@ export interface CaptureResult {
 export async function captureConversation(
   conversation: Conversation,
   existingMemoryObjects: MemoryObject[],
-  options?: { signal?: AbortSignal; onRequestSent?: () => void }
+  options?: { signal?: AbortSignal; onRequestSent?: () => void; requireUserKey?: boolean }
 ): Promise<CaptureResult> {
   const debugId = beginCaptureDebug(conversation);
   try {
@@ -459,7 +466,7 @@ export async function captureConversation(
     // A switch in the meantime is seen by the second lock's epoch check (another tab) or waits for this tracked task (this tab).
     const ownMemoryObjects = existingMemoryObjects.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
     const relatedMemoryObjects = await withVaultWorldRead(() => findRelatedMemoriesFromOtherConversations(conversation, ownMemoryObjects));
-    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal, options?.onRequestSent);
+    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal, options?.onRequestSent, options?.requireUserKey);
     return await withVaultWorldRead(() => captureConversationImpl(conversation, ownMemoryObjects, relatedMemoryObjects, extraction, debugId));
   } catch (error) {
     observeCapture(debugId, e => { e.phase += "; capture-failed"; });

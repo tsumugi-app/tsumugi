@@ -574,6 +574,9 @@ async function resolveVaultWorldStartupDecision(): Promise<VaultWorldStartupDeci
   return { kind: "normal", epoch };
 }
 
+/** 利用者自身のGeminiキーがあるか。空白だけのキーは、サーバーでは「キーなし」として運営側のキーに切り替わるため、ないものとして扱う。 */
+const userKeySaved = async () => !!(await loadApiKey("gemini"))?.trim();
+
 export default function ChatScreen() {
   /**
    * 起動時（ページの新規読み込み・リロード直後）にだけ「つむぎの木」を表示するための
@@ -1554,7 +1557,8 @@ export default function ChatScreen() {
    */
   function connectConversationBoundary(
     pendingMemoryObjects: Promise<MemoryObject[]>,
-    priority: VaultWritePriority = "interactive"
+    priority: VaultWritePriority = "interactive",
+    onlyWithUserKey = false
   ) {
     // Vault境界の安全性：Connect自体もMemory Worldへ影響する非同期処理として追跡する
     // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
@@ -1566,6 +1570,8 @@ export default function ChatScreen() {
         try {
           const memories = await pendingMemoryObjects;
           for (const memory of memories) {
+            // 自動の処理では、途中でキーが消えても運営側のキーを使わない。残りは次回以降の起動時Connectで処理する。
+            if (onlyWithUserKey && !(await userKeySaved())) return;
             await connectMemory(vaultHandle, memory, priority);
           }
         } catch (error) {
@@ -1679,7 +1685,7 @@ export default function ChatScreen() {
       const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects, outcome: captureOutcome } = await captureConversation(
         target,
         [],
-        auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent } : undefined
+        auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent, requireUserKey: true } : undefined
       );
       if (await stoppedByVaultEdit()) return [];
       // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
@@ -1748,8 +1754,8 @@ export default function ChatScreen() {
         window.setTimeout(() => setCaptureStatus("idle"), 2500);
       }
 
-      enqueueRevisitPromptGeneration(persistedMemoryObjects);
-      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority);
+      if (!auto || (await userKeySaved())) enqueueRevisitPromptGeneration(persistedMemoryObjects);
+      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority, !!auto);
       return persistedMemoryObjects;
     } catch (error) {
       if (auto) throw error;
@@ -1766,7 +1772,7 @@ export default function ChatScreen() {
   function autoCaptureDeps(): AutoCaptureDeps {
     return {
       loadSettings: async () => parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings),
-      hasUserKey: async () => !!(await loadApiKey("gemini")),
+      hasUserKey: userKeySaved,
       online: () => navigator.onLine !== false,
       blocked: () => vaultStatus !== "connected" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || !(recoveryStatus.kind === "idle" || recoveryStatus.kind === "clean" || recoveryStatus.kind === "done") || !conversationLocksSupported(),
       withRunLock: async (fn) => {
@@ -2355,7 +2361,7 @@ export default function ChatScreen() {
           // それ自体が内部で共有ロックを取得するため、ここでロックを保持したまま呼ぶと
           // 同名ロックのネストになりデッドロックしうる。vaultWorldLock.ts参照）。
           // 利用者のAPIキーがない端末では、自動の処理で運営側のキーを使わない。
-          if (!(await loadApiKey("gemini"))) return;
+          if (!(await userKeySaved())) return;
           const allMemories = await withVaultWorldRead(() => getAllMemoryObjects());
           const unconnected = await filterUnconnected(allMemories);
           const pending = [...unconnected]
@@ -2364,7 +2370,7 @@ export default function ChatScreen() {
           logStartupCatchupStart("connectCatchup", pending.length);
           for (const memory of pending) {
             // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
-            if (cancelled || isVaultSwitchingRef.current || crossTabStale) return;
+            if (cancelled || isVaultSwitchingRef.current || crossTabStale || !(await userKeySaved())) return;
             // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
             // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
             try {

@@ -26,7 +26,7 @@ All of these must hold:
 6. Attempt limit not reached, and the wait after an HTTP failure has passed.
 7. Known to be held only with Gemini (`chatProviders`), or the user has allowed other conversations. A new conversation starts with an empty record, also when its first turn is a past question from the home screen. A conversation from before this record existed counts as unknown and needs the permission.
 
-The run itself needs: the setting on, Vault connected, no recovery journal pending, no Vault switch, online, and a user Gemini key saved on this device. Otherwise it makes no call and records nothing. With a user key the request always carries it, so the server key is not used. The startup Connect catch-up now also needs a user key.
+The run itself needs: the setting on, Vault connected, no recovery journal pending, no Vault switch, online, and a user Gemini key saved on this device. Otherwise it makes no call and records nothing. With a user key the request always carries it, so the server key is not used. The key is read again at the moment of the Capture request: if it was removed or is blank by then, nothing is sent, no attempt or daily count is used, and the conversation waits for a later start. If it goes during the AI call the Memory is kept, and the question and Connect requests after it are not sent; Connect catches up at a later start with a key. The startup Connect catch-up also needs a user key, and checks it before each Memory.
 
 Order: never tried before retried, then oldest first, so a conversation that keeps failing does not hold back the others and no conversation waits forever. 1 conversation per start, at most 5 AI requests per 24 hours on the device.
 

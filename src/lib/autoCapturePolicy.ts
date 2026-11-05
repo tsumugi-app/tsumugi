@@ -138,6 +138,7 @@ export function classifyAutoCaptureFailure(error: unknown, cancelled: boolean): 
   if (cancelled) return "cancelled";
   const name = (error as Error | undefined)?.name;
   if (name === "TombstonedRecordError") return "deleted";
+  if (name === "NoUserKeyError") return "key";
   if (name === "CaptureRequestError") {
     const status = (error as { status?: number }).status ?? 0;
     return status === 400 || status === 401 || status === 403 ? "key" : "http";
