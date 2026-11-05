@@ -1110,6 +1110,7 @@ test.describe("a conversation that refers to Memories is never given new ones by
     test(`the Vault file, with the same words, ${what} (another device finished it): nothing is sent, and the file stays`, async ({ page }) => {
       test.setTimeout(180_000);
       const words = said(`別端末${what.length}`);
+      await page.addInitScript(() => { (window as any).__writes = []; const c = FileSystemFileHandle.prototype.createWritable; FileSystemFileHandle.prototype.createWritable = function (this: FileSystemFileHandle, ...a: any[]) { if (this.name.endsWith(".md")) (window as any).__writes.push(`${Date.now() % 100000} ${this.name} ${(new Error().stack ?? "").split("\n").slice(2, 9).map((l) => l.trim().replace(/https?:[^ ]*\//, "").slice(0, 60)).join(" < ")}`); return (c as any).apply(this, a); } as any; });
       await seed(page);
       const calls = await fakeApi(page);
       await startApp(page);
@@ -1130,8 +1131,24 @@ test.describe("a conversation that refers to Memories is never given new ones by
       }, { id, words, at });
       notice(`diag-${what.length}-before`, await dump("before"));
       await startApp(page);
-      notice(`diag-${what.length}-started`, await dump("started"));
-      await page.waitForTimeout(SETTLE);
+      const line = await page.evaluate(async ({ id, words }) => {
+        const out: string[] = [];
+        const t0 = Date.now();
+        while (Date.now() - t0 < 4500) {
+          let row = "";
+          const walk = async (d: any): Promise<void> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") { await walk(h); continue; } if (!(name.endsWith(".md") || /registry/.test(name) || /^\d+\.json$/.test(name))) continue; try { const f = await h.getFile(); const t = await f.text(); if (name.endsWith(".md") && t.includes(words)) row += ` F:${f.lastModified % 100000},${(t.match(/^status: (.*)$/m) ?? [])[1]},${/memoryObjectIds/.test(t)}`; else if (name.endsWith(".json") && t.includes(id)) { const j = JSON.parse(t); const e = j.files?.[j.records?.[id]]; if (e) row += ` R:${e.mtime % 100000},${e.status}`; } } catch { row += " busy"; } } };
+          await walk(await navigator.storage.getDirectory());
+          const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+          const c: any = await new Promise((res, rej) => { const q = db.transaction("conversations").objectStore("conversations").get(id); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+          const o: any = await new Promise((res, rej) => { const q = db.transaction("vaultOutbox").objectStore("vaultOutbox").get(`conversation:${id}`); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+          db.close();
+          row += ` S:${c?.status},${c?.memoryObjectIds?.length} O:${o?.status},${o?.heldReason}`;
+          if (out[out.length - 1]?.split("|")[1] !== row) out.push(`${Date.now() % 100000}|${row}`);
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        return out;
+      }, { id, words });
+      notice(`diag-${what.length}-timeline`, { line, captures: calls.capture.length, stacks: await page.evaluate(() => (window as any).__writes) });
       notice(`diag-${what.length}-after`, { ...(await dump("after")), captures: calls.capture.length });
       expect(calls.capture.length, "no Capture").toBe(0);
       expect((await memoriesOf(page, id)).length).toBe(0);
