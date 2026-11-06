@@ -22,7 +22,12 @@ import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona 
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
-import { appendTurn, captureConversation, createConversation, persistCapture, persistConversation } from "@/lib/capture";
+import { conversationFileState } from "@/lib/conversationFileCheck";
+import { parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
+import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
+import { isUsableUserKey } from "@/lib/apiKeyHeader";
+import { AUTO_CAPTURE_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, withConversationCapture } from "@/lib/conversationLocks";
+import { appendTurn, captureConversation, createConversation, persistCapture, persistCaptureAtomically, persistConversation } from "@/lib/capture";
 import {
   applyVaultLightCheckCandidates,
   checkVaultIdentity,
@@ -57,6 +62,8 @@ import {
   getConversation,
   getVaultIdentityRecord,
   loadApiKey,
+  loadAutoCaptureRaw,
+  saveAutoCaptureStateRaw,
   loadChatProvider,
   loadVaultHandle,
   restoreConversationIfNotNewer,
@@ -407,15 +414,11 @@ type RestoreScanTrigger = "startup" | "connect" | "reauthorize" | "recovery";
 /** 1回のアプリ起動あたり、未Connect Memoryをまとめて処理する上限（AI呼び出し回数のクォータ保護）。 */
 const STARTUP_CONNECT_LIMIT = 3;
 
-/**
- * 1回のアプリ起動あたり、未Capture Conversation（明示的な終了操作をせずブラウザ/タブを
- * 閉じた等で、status==="active"のまま残ったもの）をまとめて処理する上限。
- * STARTUP_CONNECT_LIMITと同じ考え方（AI呼び出し回数のクォータ保護）。
- */
 /** 会話終了時のCapture結果の区別（表示専用）。"empty"のみが「正常に完了し、保存対象が0件」。 */
-type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed";
+type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed" | "vault-edited";
 
-const STARTUP_CAPTURE_LIMIT = 3;
+/** 起動時のMemory作成は、画面が使えるようになってから始める。 */
+const AUTO_CAPTURE_START_DELAY_MS = 5000;
 
 /** 保存待ち・未確定の整合性確認を、自動で確認し直す回数と間隔（有限。尽きたら「もう一度確認する」で確認し直せる）。 */
 const RECOVERY_RECHECK_LIMIT = 3;
@@ -571,6 +574,9 @@ async function resolveVaultWorldStartupDecision(): Promise<VaultWorldStartupDeci
 
   return { kind: "normal", epoch };
 }
+
+/** 利用者自身のGeminiキーがあるか。空白だけのキーや、ヘッダーで送れないキーは、ないものとして扱う。 */
+const userKeySaved = async () => isUsableUserKey(await loadApiKey("gemini"));
 
 export default function ChatScreen() {
   /**
@@ -804,6 +810,7 @@ export default function ChatScreen() {
   const topPromptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const startupConnectRanRef = useRef(false);
   const startupCaptureRanRef = useRef(false);
+  const autoCaptureScheduledRef = useRef(false);
   const startupRecoveryCheckRanRef = useRef(false);
   /** 保存先の整合性の背景確認（読み取りだけ）。ビルド × Vaultごとに、正常と確定するまで。Settingsを開くこととは無関係。 */
   const recoveryDetectionRanRef = useRef(false);
@@ -1511,7 +1518,7 @@ export default function ChatScreen() {
    * 生成が完了したMemoryはmemoryObjects stateへも反映する（画面に既に表示されている
    * Memoryへ、revisitPromptだけが後から追記される形になる）。
    */
-  function enqueueRevisitPromptGeneration(memories: MemoryObject[]) {
+  function enqueueRevisitPromptGeneration(memories: MemoryObject[], requireUserKey = false) {
     const targets = memories.filter((memory) => !memory.revisitPrompt);
     if (targets.length === 0) return;
     // Vault境界の安全性：Memory Worldへ影響する非同期処理として追跡する
@@ -1521,7 +1528,7 @@ export default function ChatScreen() {
       Promise.all(
         targets.map(async (memory) => {
           try {
-            const revisitPrompt = await generateRevisitPrompt(memory);
+            const revisitPrompt = await generateRevisitPrompt(memory, { requireUserKey });
             if (!revisitPrompt) return;
             // Vault境界の安全性（H4対応）：最新recordへのfield更新をロック＋epoch確認で包む。
             const memoryWithPrompt = await withVaultWorldRead(() => updateMemoryRevisitPrompt(memory.id, revisitPrompt));
@@ -1552,7 +1559,8 @@ export default function ChatScreen() {
    */
   function connectConversationBoundary(
     pendingMemoryObjects: Promise<MemoryObject[]>,
-    priority: VaultWritePriority = "interactive"
+    priority: VaultWritePriority = "interactive",
+    requireUserKey = false
   ) {
     // Vault境界の安全性：Connect自体もMemory Worldへ影響する非同期処理として追跡する
     // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
@@ -1564,7 +1572,7 @@ export default function ChatScreen() {
         try {
           const memories = await pendingMemoryObjects;
           for (const memory of memories) {
-            await connectMemory(vaultHandle, memory, priority);
+            await connectMemory(vaultHandle, memory, priority, { requireUserKey });
           }
         } catch (error) {
           console.error("Failed to connect conversation-boundary memories", error);
@@ -1611,10 +1619,20 @@ export default function ChatScreen() {
     return trackConversationWrite(captureAtConversationBoundary(target, priority, awaitVaultSync));
   }
 
-  async function captureAtConversationBoundary(
+  function captureAtConversationBoundary(
     target: Conversation,
     priority: VaultWritePriority,
     awaitVaultSync: boolean
+  ): Promise<MemoryObject[]> {
+    return withConversationCapture(target.id, () => captureConversationBoundaryBody(target, priority, awaitVaultSync));
+  }
+
+  /** `auto`：起動時の自動処理（呼び出し元が会話のロックを持つ）。画面の状態を変えず、結果はauto.resultへ入れ、失敗はthrowする。 */
+  async function captureConversationBoundaryBody(
+    target: Conversation,
+    priority: VaultWritePriority,
+    awaitVaultSync: boolean,
+    auto?: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult }
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
       boundaryOutcomeRef.current = "empty";
@@ -1628,31 +1646,77 @@ export default function ChatScreen() {
     // pending taskとして待つこと。ここはその保険）。
     const generation = vaultGenerationRef.current;
     try {
-      setCaptureStatus("saving");
+      // 保存先のファイルが外部で編集されていたら、編集前の本文からMemoryを作らない。会話は処理済みにせず、編集を取り込んだ後にもう一度処理できる。
+      const stoppedByVaultEdit = async () => {
+        if (!vaultHandle) return false;
+        const fileState = await conversationFileState(vaultHandle, target);
+        // the end of a conversation also stops when another device finished it: its Memories exist there
+        if (auto ? fileState === "same" : fileState === "same" || fileState === "unknown") return false;
+        if (auto) auto.result = "changed";
+        else {
+          boundaryOutcomeRef.current = "vault-edited";
+          setCaptureStatus("error");
+        }
+        connectConversationBoundary(Promise.resolve([]), priority);
+        return true;
+      };
+      if (!auto) {
+        setCaptureStatus("saving");
+        // 別タブや前回の起動で処理済みの会話には、AIを呼ばない。
+        const processed = await withVaultWorldRead(async () => {
+          const stored = await getConversation(target.id);
+          if (stored?.status === "captured") return stored;
+          return (await getAllMemoryObjects()).some((memory) => memory.conversationId === target.id) ? target : null;
+        });
+        if (processed) {
+          if (processed.status === "captured" && latestConversationRef.current.id === target.id && generation === vaultGenerationRef.current) {
+            latestConversationRef.current = { ...latestConversationRef.current, status: "captured", memoryObjectIds: processed.memoryObjectIds };
+            setConversation(latestConversationRef.current);
+          }
+          boundaryOutcomeRef.current = "empty";
+          setCaptureStatus("idle");
+          connectConversationBoundary(Promise.resolve([]), priority);
+          return [];
+        }
+        if (await stoppedByVaultEdit()) return [];
+      }
       // 境界Captureは会話ごとに1回だけなので、このConversation自身からの
       // 既存Memory（existingMemoryObjects）は常に空でよい（前のターンでのCaptureが
       // 無いため、このConversation発の既存Memoryはまだ存在しない）。
       const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects, outcome: captureOutcome } = await captureConversation(
         target,
-        []
+        [],
+        auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent, requireUserKey: true } : undefined
       );
-      const { conversationFailed, failedMemoryIds, backgroundSyncPromise } = await persistCapture(
-        vaultHandle,
-        capturedDelta,
-        touchedMemoryObjects,
-        priority,
-        awaitVaultSync
-      );
+      if (await stoppedByVaultEdit()) return [];
+      // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
+      let saved: Awaited<ReturnType<typeof persistCaptureAtomically>>;
+      try {
+        saved = await persistCaptureAtomically(vaultHandle, capturedDelta, touchedMemoryObjects, target.updatedAt, priority, awaitVaultSync, !!auto);
+      } catch (error) {
+        if (auto || handleStaleVaultTabError(error)) throw error;
+        console.error("Capture result could not be saved", error);
+        boundaryOutcomeRef.current = "persist-failed";
+        setCaptureStatus("partial");
+        connectConversationBoundary(Promise.resolve([]), priority);
+        return [];
+      }
+      const { commit, backgroundSyncPromise } = saved;
       // H4 Codexレビュー指摘High-2対応：awaitVaultSync=falseのとき、まだ完了していない
       // 背景Vault write（別の共有ロックで自ら保護される）をpendingMemoryTasksRefへ追跡する。
       // 既にトラック中の親task（このrunConversationBoundary自体）の内部から、実行中の
       // 間に登録する子taskであるため、drainPendingMemoryTasksのwhileループが確実に拾う。
       if (backgroundSyncPromise) trackMemoryTask(backgroundSyncPromise);
-      // 保存に成功したMemoryだけを以降の処理へ進める。IndexedDB書き込み自体が
-      // 失敗したMemoryは、成功した他のMemoryを巻き込まないようここで除外する。
-      const persistedMemoryObjects = touchedMemoryObjects.filter(
-        (memory) => !failedMemoryIds.includes(memory.id)
-      );
+      if (commit.outcome !== "committed") {
+        if (auto) auto.result = commit.outcome === "already-captured" ? "already" : "changed";
+        else {
+          boundaryOutcomeRef.current = commit.outcome === "already-captured" ? "empty" : "failed";
+          setCaptureStatus(commit.outcome === "already-captured" ? "idle" : "error");
+        }
+        connectConversationBoundary(Promise.resolve([]), priority);
+        return [];
+      }
+      const persistedMemoryObjects = commit.memories;
 
       // このCaptureが対象にしていたConversationが、実行中に既に別のConversationへ
       // 切り替わっていた場合（fire-and-forget呼び出し元で、切り替え自体は同期的に
@@ -1663,41 +1727,39 @@ export default function ChatScreen() {
       if (!staleGeneration && latestConversationRef.current.id === capturedDelta.id) {
         const merged: Conversation = {
           ...latestConversationRef.current,
-          status: capturedDelta.status,
-          memoryObjectIds: capturedDelta.memoryObjectIds.filter((id) => !failedMemoryIds.includes(id)),
-          updatedAt: capturedDelta.updatedAt,
+          status: commit.conversation.status,
+          memoryObjectIds: commit.conversation.memoryObjectIds,
+          updatedAt: commit.conversation.updatedAt,
         };
         latestConversationRef.current = merged;
         setConversation(merged);
       }
-      if (!staleGeneration) {
-        setMemoryObjects((prev) => {
-          const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
-          return [...prev.filter((memory) => !touchedIds.has(memory.id)), ...persistedMemoryObjects];
-        });
-      }
+      if (auto) {
+        auto.result = captureOutcome.kind;
+      } else {
+        if (!staleGeneration) {
+          setMemoryObjects((prev) => {
+            const touchedIds = new Set(persistedMemoryObjects.map((memory) => memory.id));
+            return [...prev.filter((memory) => !touchedIds.has(memory.id)), ...persistedMemoryObjects];
+          });
+        }
 
-      // 結果の区別（表示専用）：保存失敗＞全drop＞正常0件／保存済み。全dropは「記憶なし」と偽らない。
-      boundaryOutcomeRef.current =
-        conversationFailed || failedMemoryIds.length > 0
-          ? "persist-failed"
-          : captureOutcome.kind === "all-dropped"
+        // 結果の区別（表示専用）：全drop＞正常0件／保存済み。全dropは「記憶なし」と区別する。
+        boundaryOutcomeRef.current =
+          captureOutcome.kind === "all-dropped"
             ? "all-dropped"
             : captureOutcome.kind === "empty"
               ? "empty"
               : "saved";
-      if (conversationFailed || failedMemoryIds.length > 0) {
-        console.error("Partial capture failure", { conversationFailed, failedMemoryIds });
-        setCaptureStatus("partial");
-      } else {
         setCaptureStatus("saved");
         window.setTimeout(() => setCaptureStatus("idle"), 2500);
       }
 
-      enqueueRevisitPromptGeneration(persistedMemoryObjects);
-      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority);
+      enqueueRevisitPromptGeneration(persistedMemoryObjects, !!auto);
+      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority, !!auto);
       return persistedMemoryObjects;
     } catch (error) {
+      if (auto) throw error;
       if (handleStaleVaultTabError(error)) return [];
       console.error("Failed to capture memory at conversation boundary", error);
       boundaryOutcomeRef.current = "failed";
@@ -1706,6 +1768,44 @@ export default function ChatScreen() {
       return [];
     }
   }
+
+  /** 起動時の自動処理と手動の再試行が使う、保存先と画面の現在の状態。 */
+  function autoCaptureDeps(): AutoCaptureDeps {
+    return {
+      loadSettings: async () => parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings),
+      hasUserKey: userKeySaved,
+      online: () => navigator.onLine !== false,
+      blocked: () => vaultStatus !== "connected" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || !(recoveryStatus.kind === "idle" || recoveryStatus.kind === "clean" || recoveryStatus.kind === "done") || !conversationLocksSupported(),
+      withRunLock: async (fn) => {
+        const run = await ifLockFree(AUTO_CAPTURE_RUN_LOCK, fn);
+        return run.ran ? run.value : null;
+      },
+      readConversations: () => withVaultWorldRead(() => getAllConversations()),
+      readConversation: (id) => withVaultWorldRead(() => getConversation(id)),
+      conversationsWithMemory: async () => new Set((await withVaultWorldRead(() => getAllMemoryObjects())).flatMap((memory) => (memory.conversationId ? [memory.conversationId] : []))),
+      readState: async () => parseAutoCaptureState((await loadAutoCaptureRaw()).state),
+      writeState: (state) => saveAutoCaptureStateRaw(JSON.stringify(state)),
+      ifConversationFree,
+      vaultFileUnchanged: async (target) => !vaultHandle || (await conversationFileState(vaultHandle, target)) === "same",
+      capture: async (target, signal, onRequestSent) => {
+        const auto: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult } = { signal, onRequestSent, result: "changed" };
+        await trackConversationWrite(captureConversationBoundaryBody(target, "background", true, auto));
+        return auto.result;
+      },
+      now: () => Date.now(),
+    };
+  }
+
+  async function runAutoCaptureNow(manual: boolean): Promise<string> {
+    try {
+      return await runAutoCapture(autoCaptureDeps(), { manual, shouldCancel: () => isVaultSwitchingRef.current });
+    } catch (error) {
+      if (!handleStaleVaultTabError(error)) console.error("Automatic Memory creation failed", error);
+      return "blocked";
+    }
+  }
+  const autoCaptureRunnerRef = useRef(runAutoCaptureNow);
+  autoCaptureRunnerRef.current = runAutoCaptureNow;
 
   const refreshKeyStatus = () => {
     Promise.all([loadApiKey("gemini"), loadApiKey("openai")]).then(([gemini, openai]) => {
@@ -2261,6 +2361,8 @@ export default function ChatScreen() {
           // のため、ここだけ独立してwithVaultWorldReadで包む（この直後のconnectMemory()は
           // それ自体が内部で共有ロックを取得するため、ここでロックを保持したまま呼ぶと
           // 同名ロックのネストになりデッドロックしうる。vaultWorldLock.ts参照）。
+          // 利用者のAPIキーがない端末では、自動の処理で運営側のキーを使わない。
+          if (!(await userKeySaved())) return;
           const allMemories = await withVaultWorldRead(() => getAllMemoryObjects());
           const unconnected = await filterUnconnected(allMemories);
           const pending = [...unconnected]
@@ -2269,11 +2371,11 @@ export default function ChatScreen() {
           logStartupCatchupStart("connectCatchup", pending.length);
           for (const memory of pending) {
             // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
-            if (cancelled || isVaultSwitchingRef.current || crossTabStale) return;
+            if (cancelled || isVaultSwitchingRef.current || crossTabStale || !(await userKeySaved())) return;
             // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
             // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
             try {
-              await connectMemory(vaultHandle, memory, "background");
+              await connectMemory(vaultHandle, memory, "background", { requireUserKey: true });
             } catch (error) {
               // 実機不具合対応（1件のHOLD/conflictがcatch-up全体を止める問題）：
               // connectMemoryImpl自身は失敗時にclaimを解放したうえで必ず再throwする
@@ -2323,7 +2425,6 @@ export default function ChatScreen() {
   useEffect(() => {
     if (vaultStatus === "checking" || vaultStatus === "incomplete-switch" || vaultStatus === "unsupported-journal-version" || startupCaptureRanRef.current) return;
     startupCaptureRanRef.current = true;
-    let cancelled = false;
     // Vault境界の安全性：起動時キャッチアップもMemory Worldへ影響する非同期処理として
     // 追跡する（Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
     void trackMemoryTask(
@@ -2336,19 +2437,6 @@ export default function ChatScreen() {
           // ここでロックを保持したまま呼ぶとネストになる。vaultWorldLock.ts参照）。
           const allConversations = await withVaultWorldRead(() => getAllConversations());
           setInterruptedConversation(newestInterruptedConversation(allConversations));
-          const uncaptured = allConversations
-            // 途中で止まった応答で終わった会話は、再試行するかを利用者が決めるまでCaptureしない。
-            .filter((conversationRecord) => conversationRecord.status === "active" && conversationRecord.turns.length > 0 && !endsWithInterruptedReply(conversationRecord))
-            .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
-            .slice(0, STARTUP_CAPTURE_LIMIT);
-          logStartupCatchupStart("captureCatchup", uncaptured.length);
-          for (const conversationRecord of uncaptured) {
-            // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
-            if (cancelled || isVaultSwitchingRef.current || crossTabStale) return;
-            // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
-            // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
-            await runConversationBoundary(conversationRecord, "background");
-          }
         } catch (error) {
           if (handleStaleVaultTabError(error)) return;
           console.error("Failed to run startup capture catch-up", error);
@@ -2360,10 +2448,30 @@ export default function ChatScreen() {
         }
       })()
     );
-    return () => {
-      cancelled = true;
-    };
-  }, [vaultStatus, vaultHandle, runConversationBoundary]);
+  }, [vaultStatus, vaultHandle]);
+
+  /**
+   * Memory作成そのものは、設定でオンにした端末だけ、保存先が使えるようになってから、起動ごとに1回だけ始める（lib/autoCaptureRun.ts）。起動時にフォルダの許可が切れていれば、
+   * 再許可で接続されたときに始める。起動後にオンにした場合は、画面の案内どおり次回の起動から動く。
+   */
+  useEffect(() => {
+    if (autoCaptureScheduledRef.current || vaultStatus !== "connected" || !vaultHandle) return;
+    autoCaptureScheduledRef.current = true;
+    void trackMemoryTask(
+      (async () => {
+        try {
+          if (parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings).enabled) {
+            window.setTimeout(() => void trackMemoryTask(autoCaptureRunnerRef.current(false)), AUTO_CAPTURE_START_DELAY_MS);
+          }
+        } catch (error) {
+          console.error("Failed to schedule startup Memory creation", error);
+        }
+      })()
+    );
+  }, [vaultStatus, vaultHandle]);
+
+  /** このタブで開いている会話を、別タブの自動処理の対象にしない（タブが閉じればブラウザが解放する）。 */
+  useEffect(() => holdConversationOpen(conversation.id), [conversation.id]);
 
   /**
    * Vault Recovery Apply：前回セッションで中断した未完了journalが今のVaultに残っていないかを、
@@ -4762,7 +4870,8 @@ export default function ChatScreen() {
       timestamp: new Date().toISOString(),
     };
     // もう一度試すときは、記録済みの発言をそのまま使う（発言を追加しない）。
-    let updated = retryTurns ? baseConversation : appendTurn(baseConversation, userTurn);
+    const providerRecorded = withChatProvider(baseConversation, chatProvider);
+    let updated = retryTurns ? providerRecorded : appendTurn(providerRecorded, userTurn);
     setConversation(updated);
     latestConversationRef.current = updated;
     const saveConversationFile = (target: Conversation) =>
@@ -5793,7 +5902,9 @@ export default function ChatScreen() {
                   ? "記憶の候補は見つかりましたが、発言との照合を通らず保存できませんでした。会話は保存されています。次回起動時に再確認する対象として残しています。"
                   : endedCaptureOutcome === "failed"
                     ? "記憶の保存に失敗しました。会話は保存されています。次回起動時にもう一度試します。"
-                    : endedCaptureOutcome === "persist-failed"
+                    : endedCaptureOutcome === "vault-edited"
+                      ? "保存先のファイルが外部で変更されていたため、記憶は作りませんでした。会話とファイルはそのままです。設定で変更を確認してください。"
+                      : endedCaptureOutcome === "persist-failed"
                       ? "記憶を端末へ保存できませんでした。会話は保存されています。"
                       : "今回は新しく記憶したことはありませんでした。"}
               </p>
@@ -6104,6 +6215,7 @@ export default function ChatScreen() {
             deleteDataFeedback={deleteDataFeedback}
             onExportData={() => void handleExportData()}
             onWipeAllData={handleWipeAllData}
+            onAutoCaptureRetry={() => trackMemoryTask(autoCaptureRunnerRef.current(true))}
             vaultLightCheckStatus={vaultLightCheckStatus}
             onConfirmVaultLightCheck={() => void handleConfirmVaultLightCheck()}
             onApplyVaultLightCheck={() => void handleApplyVaultLightCheck()}

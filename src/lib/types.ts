@@ -136,6 +136,8 @@ export interface Conversation extends Identifiable, Timestamped {
   endedAt?: ISODateString;
   turns: ConversationTurn[];
   status: "active" | "captured" | "archived";
+  /** このConversationの応答を生成したAI（chatの送信ごとに追加）。端末の記録だけに持ち、Markdownには書かない。未設定＝記録がない以前の会話。 */
+  chatProviders?: string[];
   memoryObjectIds: ID[];
   /**
    * 後からConversation Historyの一覧で識別するための短いタイトル（Conversation History

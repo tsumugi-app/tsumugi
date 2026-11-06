@@ -27,6 +27,13 @@ export const API_KEY_HEADER_BY_PROVIDER: Record<AIProviderName, string> = {
 export const AI_PROVIDER_HEADER = "X-AI-Provider";
 
 /**
+ * 自動の処理（起動時Memory作成とそれに続くConnect・問いかけ生成）が付けるヘッダー。
+ * これがある要求には、サーバーは運営側のキーを使わない（src/lib/ai/resolve.ts）。
+ * 通常の会話や明示的な会話終了の要求には付けない。
+ */
+export const USER_KEY_ONLY_HEADER = "X-Tsumugi-User-Key-Only";
+
+/**
  * Beta修正：APIキーをHTTPヘッダー値としてfetch()へ渡す前の検証。
  * ブラウザのFetch API（Headers）はヘッダー値をByteString（ISO-8859-1範囲）としてしか
  * 扱えないため、キーの途中に不可視Unicode文字（ゼロ幅スペース等、copy-paste由来で
@@ -46,4 +53,20 @@ export function isSafeApiKeyHeaderValue(key: string): boolean {
     if (code < 0x20 || code > 0x7e) return false;
   }
   return true;
+}
+
+/** ヘッダーで送れて、サーバーが「キーあり」と扱える値か。空白だけのキーは、サーバーでは「キーなし」になる。 */
+export function isUsableUserKey(key: string | undefined): key is string {
+  return !!key?.trim() && isSafeApiKeyHeaderValue(key);
+}
+
+/** 自動の処理が、送る瞬間に利用者のキーを確認できなかった。何も送っていないので、運営側のキーも使われていない。 */
+export class NoUserKeyError extends Error {
+  constructor() { super("no user key"); this.name = "NoUserKeyError"; }
+}
+
+/** 自動の要求のヘッダー。送る直前に読んだキーをそのまま渡す。使えるキーがなければ、送らずに止める。 */
+export function userKeyOnlyHeaders(key: string | undefined): Record<string, string> {
+  if (!isUsableUserKey(key)) throw new NoUserKeyError();
+  return { [GEMINI_API_KEY_HEADER]: key, [USER_KEY_ONLY_HEADER]: "1" };
 }

@@ -93,8 +93,11 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   const git = (...a: string[]) => execFileSync("git", a, { cwd: ROOT, encoding: "utf8" });
   const range = BASE ? [`${BASE}...HEAD`] : ["HEAD"];
   const changed = git("diff", "--name-only", ...range).split("\n").filter(Boolean);
-  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts", "src/lib/connect.ts"];
+  const untouchable = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/manifest.ts", "next.config.ts"];
   for (const f of untouchable) assert.ok(!changed.includes(f), `${f} must not be modified`);
+  // Reviewed exception (automatic runs never use the server key): connect.ts may gain exactly this and nothing else
+  const connectKeyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedConnectKeyLines.json"), "utf8")).lines);
+  for (const l of git("diff", "-U0", ...range, "--", "src/lib/connect.ts").split("\n").filter((x) => /^[+-]/.test(x) && !/^(\+\+\+|---)/.test(x))) assert.ok(connectKeyLines.has(l[0] + l.slice(1).trim()), `src/lib/connect.ts must not be modified (unreviewed line): ${l}`);
   // Reviewed (startup I/O): the check of every saved record runs once per build and day. These two files may gain exactly that and nothing else
   const doneIntegrityLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedDoneIntegrityLines.json"), "utf8")).lines);
   for (const f of ["src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts"]) {
@@ -111,7 +114,10 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of chatRouteDiff) assert.ok(/synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  for (const l of captureDiff) assert.ok(/turnsForAi|^-\s+conversation\.turns,$|existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  // Reviewed (startup Memory creation): the Capture result is saved in one transaction and the AI call runs outside the Vault world lock; ChatScreen runs it and marks the open conversation. Exact lines only (never a pattern)
+  const startupCaptureLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedStartupCaptureLines.json"), "utf8")).lines);
+  const startupCapture = (l: string) => startupCaptureLines.has(l[0] + l.slice(1).trim());
+  for (const l of captureDiff) assert.ok(startupCapture(l) || /turnsForAi|^-\s+conversation\.turns,$|existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
   // ChatScreen: the only allowed change is the reviewed swap of the three restore-from-Vault writers (never replace newer local data with an older Vault copy)
   // Third reviewed change (startup I/O reduction): the projection engine remembers reads inside ONE reconcile pass (cleared by every write; a write / hold / conflict is always decided again
   // from fresh reads), skips writes that would change nothing, and ChatScreen's fixed startup wait became completion detection. Reviewed as one unit; see vaultProjection.test.ts "Pass reuse".
@@ -132,7 +138,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (Vault consistency check, PR 1): the classified, read-only startup check and the narrowed user 修復する — the exact added / removed lines only
   const vaultConsistencyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedVaultConsistencyLines.json"), "utf8")).lines);
   const vaultConsistencyUi = (l: string) => vaultConsistencyLines.has(l[0] + l.slice(1).trim());
-  for (const l of chatDiff) assert.ok(navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
+  for (const l of chatDiff) assert.ok(startupCapture(l) || navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
   // vaultProjection.ts: the only allowed change is that the startup integrity reconcile skips a done entry whose divergence the user accepted (for that record version)
   const projDiff = git("diff", "-U0", ...range, "--", "src/lib/vaultProjection.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (Vault auto repair, PR 3): a Memory re-queued by the repair (requireLosslessDayFile) is held instead of written when rewriting its day file would lose content. Normal saves pass requireLossless = false. Exact lines only (never a pattern)
@@ -140,7 +146,10 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (write safety): every rewrite of an existing Markdown goes through the shared safety conditions (vaultRewriteSafety.ts). The exact added / removed lines of vaultProjection.ts and vault.ts only (never a pattern)
   const writeSafetyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedWriteSafetyLines.json"), "utf8")).lines);
   const writeSafety = (l: string) => writeSafetyLines.has(l[0] + l.slice(1).trim());
-  for (const l of projDiff) assert.ok(/getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l) || startupIoProjection.test(l) || autoRepairProjectionLines.has(l[0] + l.slice(1).trim()) || writeSafety(l), "unexpected vaultProjection.ts change: " + l);
+  // Reviewed (PR #26, owner approval 2026-11-06): the AI record after adopting a Vault version, and no save taking back what another device finished. Exact lines only
+  const autoCaptureSafetyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedAutoCaptureSafetyLines.json"), "utf8")).lines);
+  const autoCaptureSafety = (l: string) => autoCaptureSafetyLines.has(l[0] + l.slice(1).trim());
+  for (const l of projDiff) assert.ok(autoCaptureSafety(l) || /getAcceptedDivergences|findRecordInVault|const accepted|const entries: VaultOutboxEntry|for \(const e of await getDoneVaultOutboxEntries|return reconcileOutboxEntries\(env, entries\)|^\+\s*\}\s*$|accepted\[e\.id\]|^\+\s*\/\/|^-\s+return reconcileOutboxEntries\(env, await getDoneVaultOutboxEntries\(\)\);|^-import \{ getConversation, getMemoryObject, getSource, getPendingVaultOutboxEntries,/.test(l) || startupIoProjection.test(l) || autoRepairProjectionLines.has(l[0] + l.slice(1).trim()) || writeSafety(l), "unexpected vaultProjection.ts change: " + l);
   const vaultDiff = git("diff", "-U0", ...range, "--", "src/lib/vault.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   if (!BASE) assert.ok(vaultDiff.length > 0);
   // Reviewed storage safety extension: exact lines only, never a blanket exemption.
@@ -155,7 +164,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
     'await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);',
     'await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);',
   ]);
-  for (const l of vaultDiff) assert.ok(writeSafety(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(autoCaptureSafety(l) || writeSafety(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**
@@ -168,7 +177,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
  *   topPrompt: revisit prompt.  vault: applying a user's Vault edit (field merge, conflicts are held).  vaultProductionMigration: one-time migration.
  */
 test("Memory write surface: only the reviewed production files write Memory records or name the raw store", () => {
-  const WRITE = /\b(adoptVaultVersionWithOutbox|putMemoryObject|putMemoryObjectWithOutbox|putCapturedMemoryWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
+  const WRITE = /\b(adoptVaultVersionWithOutbox|commitCaptureResult|putMemoryObject|putMemoryObjectWithOutbox|putCapturedMemoryWithOutbox|putMemoryObjectAndMarkSynced|updateMemoryRevisitPrompt|addMemoryLinkDurably|commitMemoryLinkRestoration|commitMemoryRepairTransaction|commitMaintenanceRestore|importMissingRecordsIfAbsent|restoreMemoryObjectIfNotNewer)\s*\(/g;
   const STORE = /["']memoryObjects["']/;
   const writers: Record<string, string[]> = {}, storeUsers: string[] = [];
   const walk = (d: string) => {
@@ -186,7 +195,7 @@ test("Memory write surface: only the reviewed production files write Memory reco
   walk(SRC);
   assert.deepEqual(writers, {
     "components/ChatScreen.tsx": ["restoreMemoryObjectIfNotNewer", "updateMemoryRevisitPrompt"],
-    "lib/capture.ts": ["putCapturedMemoryWithOutbox"],
+    "lib/capture.ts": ["commitCaptureResult", "putCapturedMemoryWithOutbox"],
     "lib/connect.ts": ["addMemoryLinkDurably"],
     "lib/topPrompt.ts": ["updateMemoryRevisitPrompt"],
     "lib/vault.ts": ["putMemoryObjectAndMarkSynced"],

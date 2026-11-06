@@ -16,6 +16,7 @@ import {
   adoptVaultVersionWithOutbox, getConversation, getMemoryObject, getSource, getTombstone, getVaultOutboxEntry, isMemoryBlockedByTombstone,
   RecoveryPendingError, requeueRecordForVault, VaultVersionChangedError,
 } from "./db";
+import { chatProvidersAfterAdopting } from "./chatProviderRecord";
 import { findRecordInVault } from "./dataLifecycle";
 import { conversationToMarkdown, MEMORY_ENTRY_SEPARATOR, memoryObjectToMarkdown, parseConversationMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown, parseSourceMarkdown, sourceToMarkdown } from "./markdown";
 import type { Conversation, MemoryObject, Source } from "./types";
@@ -182,7 +183,7 @@ function fileWithVersion(located: Located, id: string, next: string): string | n
 // 保存先の版を採用できるか
 // ---------------------------------------------------------------------------
 
-const CONVERSATION_DERIVED_KEYS: ReadonlySet<string> = new Set(["updatedAt", "turnTimes", "interruptedTurns"]);
+const CONVERSATION_DERIVED_KEYS: ReadonlySet<string> = new Set(["updatedAt", "turnTimes", "interruptedTurns", "chatProviders"]);
 
 /** 保存先の版のうち、Markdownが持つ項目だけを端末の記録に重ねる（Markdownに無い項目は端末の値を保つ） */
 function mergedVaultVersion(type: ConflictRecordType, device: LocalRecord, parsed: LocalRecord, updatedAt: string): LocalRecord {
@@ -195,6 +196,7 @@ function mergedVaultVersion(type: ConflictRecordType, device: LocalRecord, parse
         const same = d.turns[i];
         return same && same.role === turn.role && same.content === turn.content ? { ...same, timestamp: turn.timestamp } : turn;
       }),
+      chatProviders: chatProvidersAfterAdopting(d, p.turns),
       metadata: { ...d.metadata, schemaVersion: p.metadata.schemaVersion, source: p.metadata.source, sourceType: p.metadata.sourceType, sourceDetail: p.metadata.sourceDetail, updatedAt },
       updatedAt,
     };

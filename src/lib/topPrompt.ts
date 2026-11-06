@@ -26,7 +26,7 @@ import {
   updateMemoryRevisitPrompt,
   saveLastPromptedMemoryIds,
 } from "./db";
-import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { GEMINI_API_KEY_HEADER, isUsableUserKey, userKeyOnlyHeaders } from "./apiKeyHeader";
 import { getJstTodayDateString } from "./jstDate";
 import { jstDateOf } from "./dateModel";
 import {
@@ -115,13 +115,16 @@ async function resolveOriginalEntryType(memory: MemoryObject): Promise<Conversat
  * 相対時間表現を含む場合はundefinedを返す（呼び出し元は保存しない）。同一試行内での
  * 再生成（API再呼び出し）はしない。
  */
-export async function generateRevisitPrompt(memory: MemoryObject): Promise<string | undefined> {
+export async function generateRevisitPrompt(memory: MemoryObject, options?: { requireUserKey?: boolean }): Promise<string | undefined> {
   const apiKey = await loadApiKey();
+  // 自動の処理でキーがなければ送らない。問いかけのないMemoryは、キーが戻った後にホーム画面の既存の処理で作られる。
+  if (options?.requireUserKey && !isUsableUserKey(apiKey)) return undefined;
+  const keyHeaders = options?.requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};
   const res = await fetch("/api/prompt", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}),
+      ...keyHeaders,
     },
     body: JSON.stringify({
       summary: memory.summary,

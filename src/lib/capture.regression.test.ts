@@ -1147,7 +1147,7 @@ test("M1+: 会話境界のCaptureは、このConversation自身のMemoryが無�
   const raw = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
   const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");   // コメント中の言及は数えない
   const all = (src.match(/\bcaptureConversation\(\s*[^)\s]/g) ?? []).length;
-  const emptyExisting = (src.match(/\bcaptureConversation\(\s*[\w.]+\s*,\s*\[\]\s*\)/g) ?? []).length;
+  const emptyExisting = (src.match(/\bcaptureConversation\(\s*[\w.]+\s*,\s*\[\]\s*(,[^)]*)?\)/g) ?? []).length;
   assert.ok(all >= 1, "呼び出し元が存在する");
   assert.equal(emptyExisting, all, "captureConversationの全呼び出しで、既存Memory引数は空配列（UPDATE対象が構造的に存在しない）");
 });

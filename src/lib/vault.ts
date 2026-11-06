@@ -42,6 +42,7 @@ import {
   saveSourceAndMarkSynced,
   setVaultSyncState,
 } from "./db";
+import { chatProvidersAfterAdopting } from "./chatProviderRecord";
 import { conversationEntryTypeOf } from "./conversationEntryKind";
 import { logTimingEvent } from "./debugTimingLog";
 import { nextMemberHashes, planDayFileMemberWrite, readVaultFileText, VaultFileNotUtf8Error, withMemoryDayFileLock } from "./vaultRewriteSafety";
@@ -6024,6 +6025,7 @@ function mergeConversationForApply(f: Conversation, l: Conversation): Conversati
   return {
     ...f,
     turns,
+    chatProviders: chatProvidersAfterAdopting(l, f.turns),
     promptedMemoryId: l.promptedMemoryId,
     metadata: {
       ...l.metadata,
