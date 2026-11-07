@@ -1491,14 +1491,15 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
 
 /** Why a realtime diary text was not added: the stored record is gone, is not a finished realtime diary, or already has its text (kept; no regeneration). */
 export class RealtimeDiaryTextNotAddedError extends Error {
-  constructor(readonly reason: "missing" | "not-ended" | "already") { super(`realtime-diary-text-${reason}`); this.name = "RealtimeDiaryTextNotAddedError"; }
+  constructor(readonly reason: "missing" | "not-ended" | "already" | "words-changed") { super(`realtime-diary-text-${reason}`); this.name = "RealtimeDiaryTextNotAddedError"; }
 }
 
 /**
  * Realtime diary: adds the diary text to the conversation AS STORED (read inside the same transaction), with its Outbox entry. Only the diary text (and a title when there is none) changes:
  * the words, the Capture result and anything another writer set stay as stored. A text already there is never replaced. A deleted conversation is not recreated.
+ * `from` is the words the text was written from: when the stored words are no longer those (an edit taken in meanwhile), nothing is added.
  */
-export async function addRealtimeDiaryTextWithOutbox(id: string, diary: { text: string; aiProvider: string; title?: string }, now: string = new Date().toISOString()): Promise<Conversation> {
+export async function addRealtimeDiaryTextWithOutbox(id: string, diary: { text: string; aiProvider: string; title?: string }, from: Conversation["turns"], now: string = new Date().toISOString()): Promise<Conversation> {
   let saved: Conversation | undefined;
   const placeholder = { id, updatedAt: now } as Conversation;
   await putCanonicalRecordWithOutboxInternal("conversations", "conversation", placeholder, now, async (tx) => {
@@ -1508,6 +1509,8 @@ export async function addRealtimeDiaryTextWithOutbox(id: string, diary: { text: 
     if (!stored) throw new RealtimeDiaryTextNotAddedError("missing");
     if (!stored.realtimeDiary || !stored.endedAt) throw new RealtimeDiaryTextNotAddedError("not-ended");
     if (stored.realtimeDiary.text) throw new RealtimeDiaryTextNotAddedError("already");
+    // 本文はAIへ送った言葉から書かれている。その間に言葉が変わっていたら（外部の編集の取り込みなど）、古い言葉の本文を付けない
+    if (stored.turns.length !== from.length || stored.turns.some((t, i) => t.role !== from[i].role || t.content !== from[i].content)) throw new RealtimeDiaryTextNotAddedError("words-changed");
     saved = withoutDeletedMemoryRefs({
       ...stored,
       title: stored.title || diary.title || undefined,

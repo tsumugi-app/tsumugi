@@ -390,6 +390,32 @@ test.describe("realtime diary: 終了して日記を生成する", () => {
     expect((await filesWith(page, "外部で書き換えた架空の夜です")).length).toBe(1);
   });
 
+  test("the words changed while the AI was writing (an edit taken in): the text from the old words is not added, the new words stay", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    let release = () => {};
+    const calls = await fakeApi(page, [], [{ hold: new Promise<void>((r) => { release = r; }) }]);
+    await startApp(page);
+    const id = await startDiary(page);
+    await finishButton(page).click();
+    await expect.poll(() => calls.diary.length, { timeout: 30_000 }).toBe(1);
+    // the stored words change while the text is being written
+    await page.evaluate(async (id) => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      await new Promise<void>((res, rej) => {
+        const tx = db.transaction("conversations", "readwrite"); const store = tx.objectStore("conversations"); const q = store.get(id);
+        q.onsuccess = () => store.put({ ...q.result, turns: q.result.turns.map((t: any) => (t.content === "架空の夜の出来事です" ? { ...t, content: "取り込んだ架空の夜です" } : t)) });
+        tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+      });
+      db.close();
+    }, id);
+    release();
+    await expect(page.getByText(/保存先のファイルが外部で変更されていたため、日記を仕上げませんでした。/)).toBeVisible({ timeout: 30_000 });
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.realtimeDiary.text).toBeUndefined();
+    expect(stored.turns.map((t: any) => t.content)).toContain("取り込んだ架空の夜です");
+  });
+
   test("OpenAI chosen: the diary text and the Memory go to OpenAI with its key only", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page, [], { openai: true });

@@ -5427,11 +5427,12 @@ export default function ChatScreen() {
           try {
             const written = await writeRealtimeDiaryText(source, { provider });
             if (await fileChanged(source)) vaultEdited = true;
-            else syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written)));
+            else syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written, source.turns)));
           } catch (error) {
             if (handleStaleVaultTabError(error)) return;
             if (error instanceof NoUserKeyError) noKey = true;
             // 別のタブ・端末が先に本文を書いた（そのまま使う）。それ以外の失敗は、会話を残したまま後でやり直せる
+            else if (error instanceof RealtimeDiaryTextNotAddedError && error.reason === "words-changed") vaultEdited = true;
             else if (!(error instanceof RealtimeDiaryTextNotAddedError)) console.error("Failed to write the realtime diary text", error);
           }
         }
