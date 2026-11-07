@@ -296,6 +296,8 @@ test.describe("realtime diary: 終了して日記を生成する", () => {
     await expect(page.getByText(/記憶をまだ作れていません。会話はすべて保存されています。/)).toBeVisible();
     expect((await memoriesOf(page, id)).length).toBe(0);
     await againButton(page).click();
+    // the button hides while it works: wait for the stored result, not for the button
+    await expect.poll(async () => (await rows(page, "conversations")).find((c) => c.id === id).status, { timeout: 30_000 }).toBe("captured");
     await expect(againButton(page)).toHaveCount(0, { timeout: 30_000 });
     expect(calls.capture.length).toBe(2);
     expect(calls.diary.length).toBe(1);

@@ -325,7 +325,8 @@ test("dot contract: the dot and the Conversation card list use the same logical-
   const panel = fs.readFileSync("src/components/HistoryPanel.tsx", "utf8");
   const dayHas = panel.slice(panel.indexOf("function dayHasRecord("), panel.indexOf("// Memoryの由来会話"));
   assert.ok(dayHas.includes("indexEntryHasConversationOnDay(") && !/normalMemor|reflections|reflectionIds|hasSessionRecordToday/.test(dayHas.replace(/\/\/.*$/gm, "")), "the dot looks at Conversations only (no Memory / Reflection / today's session Memory)");
-  assert.ok(panel.includes("return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay);"), "the card list filters with the same helper");
+  // the same helper; a realtime diary passes its diary day (the dot reads it from the History index through indexEntryHasConversationOnDay)
+  assert.ok(panel.includes("return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay, row.full?.realtimeDiary?.date ?? row.diaryDate);"), "the card list filters with the same helper");
   assert.ok(!panel.includes("hasSessionRecordToday"));
 });
 test("J/O: list cards and 会話 detail keep the first user message as the heading; K: the 日記 detail has no big heading", () => {
