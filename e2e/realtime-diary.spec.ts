@@ -364,6 +364,32 @@ test.describe("realtime diary: 終了して日記を生成する", () => {
     expect(stored.turns.length).toBe(4);
   });
 
+  test("the Vault file edited outside the app: no Memory and no text from the words before the edit, the words and the file stay", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    const id = await startDiary(page);
+    await expect.poll(async () => (await filesWith(page, "架空の夜の出来事です")).length, { timeout: 30_000 }).toBe(1);
+    // edit the words in the file, as another app would
+    await page.evaluate(async () => {
+      const walk = async (d: any): Promise<any> => { for await (const [name, h] of d.entries()) { if (h.kind === "directory") { const f = await walk(h); if (f) return f; } else if (name.endsWith(".md") && (await (await h.getFile()).text()).includes("架空の夜の出来事です")) return h; } };
+      const h = await walk(await navigator.storage.getDirectory());
+      const text = (await (await h.getFile()).text()).replace("架空の夜の出来事です", "外部で書き換えた架空の夜です");
+      const w = await h.createWritable(); await w.write(text); await w.close();
+    });
+    await finishButton(page).click();
+    await expect(page.getByText(/保存先のファイルが外部で変更されていたため、日記を仕上げませんでした。/)).toBeVisible({ timeout: 30_000 });
+    expect(calls.capture.length).toBe(0);
+    expect(calls.diary.length).toBe(0);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.endedAt).toBeTruthy();
+    expect(stored.realtimeDiary.text).toBeUndefined();
+    expect(stored.turns.map((t: any) => t.content)).toContain("架空の夜の出来事です");
+    expect((await memoriesOf(page, id)).length).toBe(0);
+    expect((await filesWith(page, "外部で書き換えた架空の夜です")).length).toBe(1);
+  });
+
   test("OpenAI chosen: the diary text and the Memory go to OpenAI with its key only", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page, [], { openai: true });

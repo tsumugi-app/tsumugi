@@ -737,7 +737,7 @@ export default function ChatScreen() {
   /** 「終了して日記を生成する」の進み具合（画面の表示だけ。何ができたかは保存された記録で判断する） */
   const [diaryFinish, setDiaryFinish] = useState<
     | { kind: "idle" | "working" | "done" | "elsewhere" }
-    | { kind: "partial"; capture: boolean; text: boolean; otherAi: boolean; noKey: boolean }
+    | { kind: "partial"; capture: boolean; text: boolean; otherAi: boolean; noKey: boolean; vaultEdited: boolean }
   >({ kind: "idle" });
   const finishingDiaryRef = useRef(false);
   const onEntryScreen = conversation.turns.length === 0 && !entryConfirmed;
@@ -5400,22 +5400,34 @@ export default function ChatScreen() {
       }
       // 2. Memory（既存のCapture）
       let otherAi = false;
+      let vaultEdited = false;
       if (current.status !== "captured") {
         await runConversationBoundary(current, "interactive", false);
         otherAi = boundaryOutcomeRef.current === "other-ai";
+        vaultEdited = boundaryOutcomeRef.current === "vault-edited";
         current = (await withVaultWorldRead(() => getConversation(id))) ?? current;
       }
       const captureDone = current.status === "captured";
       // 3. 日記本文
       let noKey = false;
-      if (!current.realtimeDiary?.text && !otherAi) {
+      // 保存先のファイルが外部で編集されていたら（Captureと同じ確認。AIへ送る前と保存する前）、編集前の言葉から本文を作らない。編集を取り込んだ後にやり直せる
+      const fileChanged = async (c: Conversation) => {
+        if (!vaultHandle) return false;
+        const state = await conversationFileState(vaultHandle, c);
+        return state !== "same" && state !== "unknown";
+      };
+      if (!current.realtimeDiary?.text && !otherAi && !vaultEdited) {
         const provider = await loadChatProvider();
-        if (!maySendConversationTo(current, provider, parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings))) {
+        const source = current;
+        if (!maySendConversationTo(source, provider, parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings))) {
           otherAi = true;
+        } else if (await fileChanged(source)) {
+          vaultEdited = true;
         } else {
           try {
-            const written = await writeRealtimeDiaryText(current, { provider });
-            syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written)));
+            const written = await writeRealtimeDiaryText(source, { provider });
+            if (await fileChanged(source)) vaultEdited = true;
+            else syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written)));
           } catch (error) {
             if (handleStaleVaultTabError(error)) return;
             if (error instanceof NoUserKeyError) noKey = true;
@@ -5427,7 +5439,7 @@ export default function ChatScreen() {
       }
       show(current);
       const textDone = !!current.realtimeDiary?.text;
-      report(captureDone && textDone ? { kind: "done" } : { kind: "partial", capture: !captureDone, text: !textDone, otherAi, noKey });
+      report(captureDone && textDone ? { kind: "done" } : { kind: "partial", capture: !captureDone, text: !textDone, otherAi, noKey, vaultEdited });
     };
     try {
       const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
@@ -5437,7 +5449,7 @@ export default function ChatScreen() {
       }
     } catch (error) {
       if (!handleStaleVaultTabError(error)) console.error("Failed to finish the realtime diary", error);
-      report({ kind: "partial", capture: true, text: true, otherAi: false, noKey: false });
+      report({ kind: "partial", capture: true, text: true, otherAi: false, noKey: false, vaultEdited: false });
     } finally {
       finishingDiaryRef.current = false;
       endTask();
@@ -5992,6 +6004,8 @@ export default function ChatScreen() {
               <>
                 {diaryFinish.kind === "partial" && diaryFinish.otherAi ? (
                   <p className="text-xs text-stone-500 dark:text-stone-400">この日記には、いま選んでいるAI以外で話した部分があるため、AIへは送っていません。設定の「閉じた会話の記憶」で許可できます。</p>
+                ) : diaryFinish.kind === "partial" && diaryFinish.vaultEdited ? (
+                  <p className="text-xs text-stone-500 dark:text-stone-400">保存先のファイルが外部で変更されていたため、日記を仕上げませんでした。会話とファイルはそのままです。設定で変更を確認してから、もう一度仕上げてください。</p>
                 ) : diaryFinish.kind === "partial" && diaryFinish.noKey ? (
                   <p className="text-xs text-stone-500 dark:text-stone-400">利用するAIのAPIキーが使えないため、日記の本文を作れませんでした。</p>
                 ) : (
