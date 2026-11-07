@@ -18,7 +18,7 @@ import {
 import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
-import { JST_TIME_ZONE, jstDateOf, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
+import { JST_TIME_ZONE, addDaysToDateKey, jstDateOf, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
 import {
   conversationEntryTypeOf,
   conversationEntryTypeLabel,
@@ -173,11 +173,19 @@ function addMonths(year: number, month: number, delta: number): { year: number; 
  * `fileNameFor`/Registryのfallback pathはStorage Bucket基準のため、Logical Date
  * を渡すと誤ったファイル名を組み立ててしまう。
  */
+/** 「11月7日」 */
+function diaryDayLabel(date: string): string {
+  const [, m, d] = date.split("-").map(Number);
+  return `${m}月${d}日`;
+}
+
 interface ConversationRow {
   id: string;
   modeLabel: string;
   turnCount: number;
   bucketDay: string;
+  /** リアルタイム日記の対象日（History Indexか本体から） */
+  diaryDate?: string;
   full?: Conversation;
 }
 
@@ -214,7 +222,7 @@ interface MemoryRow {
  * 表示される」ことを優先する）。
  */
 function logicalDateOfConversationRow(row: ConversationRow): string {
-  return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay);
+  return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay, row.full?.realtimeDiary?.date ?? row.diaryDate);
 }
 
 /**
@@ -652,6 +660,7 @@ export default function HistoryPanel({
           modeLabel: CONVERSATION_ENTRY_KIND_LABEL[c.mode],
           turnCount: c.turnCount,
           bucketDay,
+          ...(c.diaryDate ? { diaryDate: c.diaryDate } : {}),
         }));
         const memories: MemoryRow[] = [
           ...dayEntry.normalMemories.map((m) => ({
@@ -704,6 +713,7 @@ export default function HistoryPanel({
         turnCount: c.turns.length,
         full: c,
         bucketDay,
+        ...(c.realtimeDiary ? { diaryDate: c.realtimeDiary.date } : {}),
       }));
       const memories: MemoryRow[] = [
         ...normalMemoriesFull.map((m) => ({
@@ -738,6 +748,7 @@ export default function HistoryPanel({
             id: c.id,
             mode: conversationEntryTypeOf(c),
             turnCount: c.turns.length,
+            ...(c.realtimeDiary ? { diaryDate: c.realtimeDiary.date } : {}),
           })),
           normalMemories: normalMemoriesFull.map((m) => ({
             id: m.id,
@@ -775,7 +786,8 @@ export default function HistoryPanel({
 
     (async () => {
       try {
-        const bucketDays = [logicalDay, previousDateKey(logicalDay)];
+        // リアルタイム日記は対象日の翌日（午前4時まで）に始まることがあり、端末の時間帯によっては翌日のbucketにある
+        const bucketDays = [addDaysToDateKey(logicalDay, 1), logicalDay, previousDateKey(logicalDay)];
         const perBucket = await Promise.all(bucketDays.map((bucketDay) => resolveBucketDayRecords(bucketDay)));
         if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
 
@@ -1020,7 +1032,7 @@ export default function HistoryPanel({
     // Conversation History v2：ドット ＝ その日にHistoryで表示するConversationが1件以上ある。
     // 日付一覧がConversationの行を絞り込むのと同じ論理日の判定（`conversationLogicalDay`）を使い、
     // 通常Memory・Reflectionだけを理由にはドットを付けない。
-    const buckets = [day, previousDateKey(day)];
+    const buckets = [addDaysToDateKey(day, 1), day, previousDateKey(day)];
     for (const bucketDay of buckets) {
       const bucketMonth = monthKeyOfDateKey(bucketDay);
       const entry =
@@ -1287,6 +1299,19 @@ export default function HistoryPanel({
                         {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
                       </span>
                     </div>
+                    {/* リアルタイム日記：対象日と、日記を終えたときにAIが書いた本文（Memoryとは別） */}
+                    {selectedConversation.realtimeDiary && (
+                      <div data-testid="history-realtime-diary" className="flex flex-col gap-2 pt-2">
+                        <p className="text-xs text-stone-400 dark:text-stone-500">リアルタイム日記（{diaryDayLabel(selectedConversation.realtimeDiary.date)}）</p>
+                        {selectedConversation.realtimeDiary.text ? (
+                          <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">{selectedConversation.realtimeDiary.text}</p>
+                        ) : (
+                          <p className="text-sm text-stone-500 dark:text-stone-400">
+                            {selectedConversation.endedAt ? "日記の本文はまだできていません。ホームの「日記を仕上げる」から作れます。" : "書きかけの日記です。"}
+                          </p>
+                        )}
+                      </div>
+                    )}
                     {/* 会話：最初のユーザー発言を見出しにする。日記では出さない（振り返りと内容が重複して見えるため）。 */}
                     {selectedConversationEntryKind !== "diary" && (
                       <p className="whitespace-pre-wrap text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>

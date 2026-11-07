@@ -56,8 +56,10 @@ export const CONVERSATION_EVOLVING_KEYS: ReadonlySet<string> = new Set(["updated
  * The file says the conversation is finished, or refers to Memories, beyond what this device holds: another device finished it. A save from the older state here must not take that back
  * (the conversation would look unprocessed and get its Memories again), whatever the rule for evolving keys says. Not when Tsumugi wrote that file version itself here.
  */
-export function takesBackFinishedConversation(onDisk: Pick<Conversation, "status" | "memoryObjectIds">, canonical: Pick<Conversation, "status" | "memoryObjectIds">): boolean {
-  return (onDisk.status === "captured" && canonical.status !== "captured") || onDisk.memoryObjectIds.some((id) => !canonical.memoryObjectIds.includes(id));
+export function takesBackFinishedConversation(onDisk: Pick<Conversation, "status" | "memoryObjectIds" | "realtimeDiary">, canonical: Pick<Conversation, "status" | "memoryObjectIds" | "realtimeDiary">): boolean {
+  return (onDisk.status === "captured" && canonical.status !== "captured") || onDisk.memoryObjectIds.some((id) => !canonical.memoryObjectIds.includes(id))
+    // a realtime diary's text written on another device: a save without it would take the diary back
+    || (!!onDisk.realtimeDiary?.text && !canonical.realtimeDiary?.text);
 }
 
 /**

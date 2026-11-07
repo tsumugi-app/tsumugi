@@ -111,7 +111,8 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed exception (Memory Timeline trial): the chat route may only gain the optional memoryTimeline section
   // Reviewed (Memory Synthesis S1): the new, stateless generation route /api/synthesize (it reads and writes no Memory)
   // Reviewed (outdated build notice): /api/build only says which build is deployed (it reads and writes nothing else)
-  const synthesisApi = new Set(["src/app/api/chat/route.ts", "src/app/api/synthesize/route.ts", "src/app/api/build/route.ts"]);
+  // Reviewed (realtime diary PR-B, owner approval 2026-11-07): the new, stateless route /api/diary writes the diary text with the AI the user chose (it reads and writes no record)
+  const synthesisApi = new Set(["src/app/api/chat/route.ts", "src/app/api/synthesize/route.ts", "src/app/api/build/route.ts", "src/app/api/diary/route.ts"]);
   const aiSelectionRoute = (f: string) => diffLines(f).every(aiSelection);
   assert.ok(!changed.some((f) => f.startsWith("src/app/api/") && !synthesisApi.has(f) && !aiSelectionRoute(f)), "API routes must not be modified");
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
@@ -173,7 +174,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
     'await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);',
     'await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);',
   ]);
-  for (const l of vaultDiff) assert.ok(autoCaptureSafety(l) || writeSafety(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(autoCaptureSafety(l) || writeSafety(l) || realtimeDiary(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**

@@ -9,19 +9,23 @@ const bundle = path.join(__dirname, ".build/harness.js");
 const MIN = 60_000;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 type Past = { id: string; ago: number; words: string; diary?: "today" | "yesterday" };
+type Device = { openai?: boolean };
+type Reply = { status?: number; hold?: Promise<void> };
+const DIARY_TEXT = "架空の朝に架空の公園を歩き、夜は架空の本を読んだ。";
 
 /** a device in normal use (a real OPFS Vault with its Registry baseline), with automatic Memory creation turned on and a fictional key of its own */
-async function seed(page: Page, past: Past[] = []) {
+async function seed(page: Page, past: Past[] = [], device: Device = {}) {
   // the automatic run starts 5 s after a start; here 2 s
   await page.addInitScript(() => { const later = window.setTimeout; window.setTimeout = ((fn: any, ms?: number, ...rest: any[]) => later(fn, ms === 5000 ? 2000 : ms, ...rest)) as any; });
   await page.goto(`${BASE}/data`);
   await page.addScriptTag({ path: bundle });
-  await page.evaluate(async (past) => {
+  await page.evaluate(async ({ past, device }) => {
     const { dbm, bootstrap } = (window as any).D; const root = await navigator.storage.getDirectory();
     const OLDEST = new Date(Date.now() - 86_400_000 * 500).toISOString();
     await dbm.saveVaultHandle(root); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated();
     await dbm.saveAutoCaptureSettingsRaw(JSON.stringify({ enabled: true, allowOtherProviders: true }));
     await dbm.saveApiKey("fictional-test-key", "gemini");
+    if (device.openai) { await dbm.saveApiKey("fictional-openai-key", "openai"); await dbm.saveChatProvider("openai"); }
     // the diary day, as the app counts it: local time, a new day from 4:00
     const dayOf = (at: Date) => { const d = new Date(at.getFullYear(), at.getMonth(), at.getDate() - (at.getHours() < 4 ? 1 : 0), 12); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
     for (const c of past) {
@@ -35,12 +39,12 @@ async function seed(page: Page, past: Past[] = []) {
     const d = await root.getDirectoryHandle(".tsumugi", { create: true });
     const w = await (await d.getFileHandle("registry-meta.json", { create: true })).createWritable();
     await w.write(JSON.stringify({ schemaVersion: 1, updatedAt: OLDEST, lastFullResyncAt: null, baselineEstablishedAt: OLDEST })); await w.close();
-  }, past);
+  }, { past, device });
 }
 
-/** fictional AI that records every call */
-async function fakeApi(page: Page) {
-  const calls = { chat: 0, capture: [] as string[], reflect: 0, other: [] as string[] };
+/** fictional AI that records every call. `captureReplies` / `diaryReplies` answer the next calls in turn (then a normal answer) */
+async function fakeApi(page: Page, captureReplies: Reply[] = [], diaryReplies: Reply[] = []) {
+  const calls = { chat: 0, capture: [] as string[], reflect: 0, other: [] as string[], diary: [] as { ai?: string; gemini?: string; openai?: string; words: string }[] };
   await page.route("**/api/**", async (route) => {
     const url = route.request().url();
     if (url.includes("/api/chat")) {
@@ -48,7 +52,15 @@ async function fakeApi(page: Page) {
       await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" });
     } else if (url.includes("/api/capture")) {
       calls.capture.push((JSON.parse(route.request().postData() ?? "{}").turns ?? []).map((t: any) => t.content).join(" "));
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ memories: [MEMORY] }) });
+      const r = captureReplies.shift() ?? {};
+      if (r.hold) await r.hold;
+      await route.fulfill({ status: r.status ?? 200, contentType: "application/json", body: JSON.stringify(r.status ? { error: "fictional" } : { memories: [MEMORY] }) }).catch(() => undefined);
+    } else if (url.includes("/api/diary")) {
+      const h = route.request().headers();
+      calls.diary.push({ ai: h["x-ai-provider"], gemini: h["x-gemini-api-key"], openai: h["x-openai-api-key"], words: (JSON.parse(route.request().postData() ?? "{}").turns ?? []).map((t: any) => t.content).join(" ") });
+      const r = diaryReplies.shift() ?? {};
+      if (r.hold) await r.hold;
+      await route.fulfill({ status: r.status ?? 200, contentType: "application/json", body: JSON.stringify(r.status ? { error: "fictional" } : { diary: DIARY_TEXT, title: "架空の一日" }) }).catch(() => undefined);
     } else if (url.includes("/api/reflect")) {
       calls.reflect++;
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ title: "架空の題", reflection: "架空の振り返りです。" }) });
@@ -186,5 +198,151 @@ test.describe("realtime diary: one conversation for the day, paused and resumed"
     await talk(page, "架空の夕方の出来事です", 2);
     await expect(page.getByTestId("diary-time")).toHaveCount(2);
     expect(calls.reflect).toBe(0);
+  });
+});
+
+const finishButton = (page: Page) => page.getByRole("button", { name: "終了して日記を生成する" });
+const againButton = (page: Page) => page.getByRole("button", { name: "もう一度仕上げる" });
+const homeFinishButton = (page: Page) => page.getByTestId("unfinished-diary").getByRole("button", { name: "日記を仕上げる" });
+const memoriesOf = async (page: Page, id: string) => (await rows(page, "memoryObjects")).filter((m) => m.conversationId === id);
+const nav = (page: Page) => page.getByRole("navigation", { name: "メインナビゲーション" });
+async function reopen(page: Page) {
+  await page.reload();
+  await page.getByRole("button", { name: "tsumugiを開く" }).click({ timeout: 60_000 });
+  await expect(page.getByText("今日は、どう話そう？")).toBeVisible({ timeout: 60_000 });
+}
+async function startDiary(page: Page) {
+  await startButton(page).click();
+  await talk(page, "架空の朝の出来事です", 1);
+  await talk(page, "架空の夜の出来事です", 2);
+  return (await withWords(page, "架空の朝の出来事です"))[0].id as string;
+}
+
+test.describe("realtime diary: 終了して日記を生成する", () => {
+  test("ending writes one Memory with the existing Capture and one diary text, keeps the words, shows the text, and History shows it on its day", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    const id = await startDiary(page);
+    await finishButton(page).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    expect(calls.capture.length).toBe(1);
+    expect(calls.diary.length).toBe(1);
+    expect(calls.diary[0].words).toContain("架空の夜の出来事です");
+    expect(calls.diary[0].ai).toBe("gemini");
+    expect(calls.reflect).toBe(0);
+    await expect(finishButton(page)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "一時保存して閉じる" })).toHaveCount(0);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.status).toBe("captured");
+    expect(stored.endedAt).toBeTruthy();
+    expect(stored.realtimeDiary.text).toBe(DIARY_TEXT);
+    expect(stored.realtimeDiary.aiProvider).toBe("gemini");
+    expect(stored.turns.map((t: any) => t.content)).toEqual(["架空の朝の出来事です", "架空の返答です。", "架空の夜の出来事です", "架空の返答です。"]);
+    expect((await memoriesOf(page, id)).length).toBe(1);
+    await expect.poll(async () => (await filesWith(page, DIARY_TEXT)).length, { timeout: 30_000 }).toBe(1);
+    const [file] = await filesWith(page, DIARY_TEXT);
+    expect(file.indexOf("## Diary")).toBeLessThan(file.indexOf("## Transcript"));
+    // a finished diary is not resumed: the entry starts a new one, and nothing is left to finish
+    await homeButton(page).click();
+    await expect(startButton(page)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId("unfinished-diary")).toHaveCount(0);
+    // History: the diary on its day, with its text
+    await nav(page).getByRole("button", { name: "これまでの記憶を見る" }).click();
+    await page.getByRole("button", { name: /架空の朝の出来事です/ }).first().click({ timeout: 30_000 });
+    await expect(page.getByTestId("history-realtime-diary")).toContainText(DIARY_TEXT);
+    // nothing more was sent after the end
+    await page.waitForTimeout(3_000);
+    expect(calls.capture.length).toBe(1);
+    expect(calls.diary.length).toBe(1);
+  });
+
+  test("Memory made but the text failed: the words and Memory stay, and only the text is written again (from the screen, and from home after a reload)", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page);
+    const calls = await fakeApi(page, [], [{ status: 503 }, { status: 503 }]);
+    await startApp(page);
+    const id = await startDiary(page);
+    await finishButton(page).click();
+    await expect(page.getByText(/日記の本文をまだ作れていません。会話はすべて保存されています。/)).toBeVisible({ timeout: 30_000 });
+    expect(calls.capture.length).toBe(1);
+    await againButton(page).click();
+    await expect(page.getByText(/日記の本文をまだ作れていません。/)).toBeVisible({ timeout: 30_000 });
+    expect(calls.diary.length).toBe(2);
+    let stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.status).toBe("captured");
+    expect(stored.realtimeDiary.text).toBeUndefined();
+    expect(stored.turns.length).toBe(4);
+    // closed and opened again: home offers to finish it; only the text is written
+    await reopen(page);
+    await homeFinishButton(page).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    expect(calls.capture.length).toBe(1);
+    expect(calls.diary.length).toBe(3);
+    stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.realtimeDiary.text).toBe(DIARY_TEXT);
+    expect((await memoriesOf(page, id)).length).toBe(1);
+  });
+
+  test("the text written but the Memory failed: only the Memory is made again, the text is not written twice", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page);
+    const calls = await fakeApi(page, [{ status: 503 }]);
+    await startApp(page);
+    const id = await startDiary(page);
+    await finishButton(page).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    await expect(page.getByText(/記憶をまだ作れていません。会話はすべて保存されています。/)).toBeVisible();
+    expect((await memoriesOf(page, id)).length).toBe(0);
+    await againButton(page).click();
+    await expect(againButton(page)).toHaveCount(0, { timeout: 30_000 });
+    expect(calls.capture.length).toBe(2);
+    expect(calls.diary.length).toBe(1);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.status).toBe("captured");
+    expect(stored.realtimeDiary.text).toBe(DIARY_TEXT);
+    expect((await memoriesOf(page, id)).length).toBe(1);
+  });
+
+  test("closed while the AI was writing: nothing is lost, home offers to finish it, and pressing twice makes one text and one Memory", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page);
+    let release = () => {};
+    const calls = await fakeApi(page, [], [{ hold: new Promise<void>((r) => { release = r; }) }]);
+    await startApp(page);
+    const id = await startDiary(page);
+    await finishButton(page).click();
+    await expect.poll(() => calls.diary.length, { timeout: 30_000 }).toBe(1);
+    await reopen(page);
+    release();
+    let stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.turns.length).toBe(4);
+    expect(stored.endedAt).toBeTruthy();
+    expect(stored.realtimeDiary.text).toBeUndefined();
+    await expect(homeFinishButton(page)).toBeVisible({ timeout: 30_000 });
+    await homeFinishButton(page).click();
+    await finishButton(page).click({ timeout: 1_000 }).catch(() => undefined);   // not offered for an ended diary
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    await expect(againButton(page)).toHaveCount(0);
+    await page.waitForTimeout(2_000);
+    expect(calls.capture.length).toBe(1);
+    expect(calls.diary.length).toBe(2);
+    stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.realtimeDiary.text).toBe(DIARY_TEXT);
+    expect((await memoriesOf(page, id)).length).toBe(1);
+  });
+
+  test("OpenAI chosen: the diary text and the Memory go to OpenAI with its key only", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page, [], { openai: true });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    const id = await startDiary(page);
+    await finishButton(page).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    expect(calls.diary).toEqual([expect.objectContaining({ ai: "openai", openai: "fictional-openai-key", gemini: undefined })]);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.realtimeDiary.aiProvider).toBe("openai");
   });
 });

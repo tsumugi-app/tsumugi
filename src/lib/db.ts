@@ -1489,6 +1489,36 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
   }, skipIfUnchanged);
 }
 
+/** Why a realtime diary text was not added: the stored record is gone, is not a finished realtime diary, or already has its text (kept; no regeneration). */
+export class RealtimeDiaryTextNotAddedError extends Error {
+  constructor(readonly reason: "missing" | "not-ended" | "already") { super(`realtime-diary-text-${reason}`); this.name = "RealtimeDiaryTextNotAddedError"; }
+}
+
+/**
+ * Realtime diary: adds the diary text to the conversation AS STORED (read inside the same transaction), with its Outbox entry. Only the diary text (and a title when there is none) changes:
+ * the words, the Capture result and anything another writer set stay as stored. A text already there is never replaced. A deleted conversation is not recreated.
+ */
+export async function addRealtimeDiaryTextWithOutbox(id: string, diary: { text: string; aiProvider: string; title?: string }, now: string = new Date().toISOString()): Promise<Conversation> {
+  let saved: Conversation | undefined;
+  const placeholder = { id, updatedAt: now } as Conversation;
+  await putCanonicalRecordWithOutboxInternal("conversations", "conversation", placeholder, now, async (tx) => {
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (blockedByTombstone(tombs, "conversation", id)) throw new TombstonedRecordError("conversation", id);
+    const stored = (await tx.objectStore("conversations").get(id)) as Conversation | undefined;
+    if (!stored) throw new RealtimeDiaryTextNotAddedError("missing");
+    if (!stored.realtimeDiary || !stored.endedAt) throw new RealtimeDiaryTextNotAddedError("not-ended");
+    if (stored.realtimeDiary.text) throw new RealtimeDiaryTextNotAddedError("already");
+    saved = withoutDeletedMemoryRefs({
+      ...stored,
+      title: stored.title || diary.title || undefined,
+      realtimeDiary: { ...stored.realtimeDiary, text: diary.text, writtenAt: now, aiProvider: diary.aiProvider },
+      updatedAt: now,
+    }, tombs);
+    return saved;
+  });
+  return saved!;
+}
+
 /** The device record moved on since the user chose the Vault version (another tab saved): nothing is written. */
 export class VaultVersionChangedError extends Error {
   constructor() { super("vault-version-changed"); this.name = "VaultVersionChangedError"; }

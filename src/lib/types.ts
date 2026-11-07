@@ -164,10 +164,15 @@ export interface Conversation extends Identifiable, Timestamped {
 /**
  * `date`：日記の対象日（YYYY-MM-DD）。日記を始めた時点で、端末のローカル時刻・午前4時区切りで確定する。
  * 発言の実際の日時（turn.timestamp）とは別の値で、後から発言時刻で計算し直さない。Markdownには`diaryDate`として書く。
- * 日記本文・完了日時などは、後の段階でこの型に足す（既存の値は変えない）。
+ * `text`：日記を終えたときにAIが会話全体から書いた日記本文（Memoryとは別の役割。Memoryにはしない）。一度書けたら上書きしない
+ * （初期版に作り直しは無い。将来の作り直しは、この値を置き換える別の操作として足す）。Markdownには本文の`## Diary`節と`diaryWrittenAt`。
+ * `aiProvider`：本文を書いたAI。端末の記録だけに持つ。
  */
 export interface RealtimeDiary {
   date: string;
+  text?: string;
+  writtenAt?: ISODateString;
+  aiProvider?: string;
 }
 
 export type MemoryType =

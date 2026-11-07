@@ -25,7 +25,7 @@ import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeRes
 import { sanitizeStoredProfileClaims } from "./profile";
 import { sanitizeStoredPersonMentions } from "./person";
 import { sanitizeStoredTopicEvents } from "./topicEvent";
-import { isDiaryDate } from "./realtimeDiary";
+import { escapeDiaryText, isDiaryDate, unescapeDiaryText } from "./realtimeDiary";
 
 function yamlScalar(value: string): string {
   const looksSpecial =
@@ -134,6 +134,7 @@ export function conversationToMarkdown(conversation: Conversation): string {
     interruptedTurns: conversation.turns.some((turn) => turn.interrupted) ? JSON.stringify(conversation.turns.filter((turn) => turn.interrupted).map((turn) => turn.timestamp)) : undefined,
     // リアルタイム日記の対象日（発言時刻とは別）。通常の会話・日記にはキー自体を書かない。
     diaryDate: conversation.realtimeDiary && isDiaryDate(conversation.realtimeDiary.date) ? conversation.realtimeDiary.date : undefined,
+    diaryWrittenAt: conversation.realtimeDiary?.text ? conversation.realtimeDiary.writtenAt : undefined,
     source: conversation.metadata.source,
     sourceType: conversation.metadata.sourceType,
     sourceDetail: stringifySourceDetail(conversation.metadata.sourceDetail),
@@ -146,7 +147,9 @@ export function conversationToMarkdown(conversation: Conversation): string {
     .map((turn) => `**${turn.role === "user" ? "User" : "Tsumugi"}:** ${turn.content}`)
     .join("\n\n");
 
-  const body = `# Conversation ${conversation.startedAt.slice(0, 10)}\n\n## Transcript\n\n${transcript}\n`;
+  // リアルタイム日記の本文は会話記録の前に置く（会話記録の読み取りは`## Transcript`以降だけを読むので、日記の無い読み手にも会話は同じに見える）
+  const diary = conversation.realtimeDiary?.text ? `## Diary\n\n${escapeDiaryText(conversation.realtimeDiary.text)}\n\n` : "";
+  const body = `# Conversation ${conversation.startedAt.slice(0, 10)}\n\n${diary}## Transcript\n\n${transcript}\n`;
 
   return `${frontmatter}\n${body}`;
 }
@@ -260,6 +263,15 @@ export function asString(value: unknown): string | undefined {
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+/** `## Diary`節（本文の先頭、`## Transcript`の前）の日記本文。無ければundefined */
+function readDiarySection(body: string): string | undefined {
+  const start = body.indexOf("## Diary\n\n");
+  const end = body.indexOf("\n\n## Transcript\n");
+  if (start === -1 || end === -1 || end < start) return undefined;
+  const text = unescapeDiaryText(body.slice(start + "## Diary\n\n".length, end)).trim();
+  return text || undefined;
 }
 
 function extractAfterHeading(body: string, heading: string): string {
@@ -564,6 +576,8 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const turnTimes = parseTurnTimes(frontmatter.turnTimes);
   const interruptedTurns = new Set(parseTurnTimes(frontmatter.interruptedTurns));
   const diaryDate = frontmatter.diaryDate;
+  const diaryText = isDiaryDate(diaryDate) ? readDiarySection(body) : undefined;
+  const diaryWrittenAt = asString(frontmatter.diaryWrittenAt);
 
   return {
     id,
@@ -575,7 +589,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
     title: asString(frontmatter.title),
-    ...(isDiaryDate(diaryDate) ? { realtimeDiary: { date: diaryDate } } : {}),
+    ...(isDiaryDate(diaryDate) ? { realtimeDiary: { date: diaryDate, ...(diaryText ? { text: diaryText, ...(diaryWrittenAt ? { writtenAt: diaryWrittenAt } : {}) } : {}) } } : {}),
     createdAt,
     updatedAt,
     metadata: {

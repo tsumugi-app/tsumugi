@@ -44,6 +44,29 @@ export function resumableRealtimeDiary(conversations: Conversation[], date: stri
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))[0];
 }
 
+/**
+ * Markdownの`## Diary`節に書く日記本文。`#`か`\\`で始まる行は先頭に`\\`を足す（本文の行が見出しとして読まれて会話記録の区切りと
+ * 取り違えられない）。読むときに1つだけ外すので、元の文に戻る。
+ */
+export function escapeDiaryText(text: string): string {
+  return text.split("\n").map((line) => (/^[#\\]/.test(line) ? `\\${line}` : line)).join("\n");
+}
+export function unescapeDiaryText(text: string): string {
+  return text.split("\n").map((line) => (line.startsWith("\\") ? line.slice(1) : line)).join("\n");
+}
+
+/** 日記を終えて、Memory（既存のCapture）と日記本文の両方ができている */
+export function isRealtimeDiaryComplete(conversation: Conversation): boolean {
+  return conversation.realtimeDiary !== undefined && !!conversation.endedAt && conversation.status === "captured" && !!conversation.realtimeDiary.text;
+}
+
+/** 終えたが、Memoryか日記本文がまだの日記（AIの失敗・途中で閉じた等）。ホームから仕上げ直せる。新しいものから */
+export function unfinishedRealtimeDiaries(conversations: Conversation[]): Conversation[] {
+  return conversations
+    .filter((c) => c.realtimeDiary !== undefined && !!c.endedAt && c.status !== "archived" && c.turns.length > 0 && !isRealtimeDiaryComplete(c))
+    .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+}
+
 /** 時刻の表示。対象日と違う暦日の発言（深夜など）には月日も付ける。端末のローカル時刻 */
 export function formatDiaryTime(at: Date, diaryDate: string): string {
   const time = `${at.getHours()}:${pad2(at.getMinutes())}`;

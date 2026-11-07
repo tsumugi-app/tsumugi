@@ -92,3 +92,56 @@ test("an open diary is not taken by the automatic Memory run, nor counted as wai
   assert.deepEqual(selectAutoCaptureTargets([open, finished, normal], new Set(), state, settings, now, "gemini").map((c) => c.id).sort(), ["finished", "normal"]);
   assert.equal(summarizeAutoCapture([open], new Set(), state, settings, "gemini").waiting, 0);
 });
+
+// ---------------------------------------------------------------------------
+// PR-B: the diary text, finishing, and keeping it
+// ---------------------------------------------------------------------------
+import { escapeDiaryText, isRealtimeDiaryComplete, unescapeDiaryText, unfinishedRealtimeDiaries } from "./realtimeDiary";
+import { takesBackFinishedConversation } from "./vaultRewriteSafety";
+import { conversationLogicalDay, indexEntryHasConversationOnDay } from "./historyConversationCard";
+
+const ENDED = T(local(2026, 11, 7, 22, 0));
+
+test("the diary text is kept in Markdown before the transcript and read back exactly; the words are read as before", () => {
+  const text = "朝は架空の公園を歩いた。\n\n## Transcript\n#見出しのような行\n\\円記号で始まる行\n夜は架空の本を読んだ。";
+  assert.equal(unescapeDiaryText(escapeDiaryText(text)), text);
+  const c = diary("written", "2026-11-07", morning, { endedAt: ENDED, status: "captured", realtimeDiary: { date: "2026-11-07", text, writtenAt: ENDED, aiProvider: "openai" } });
+  const md = conversationToMarkdown(c);
+  assert.ok(md.indexOf("## Diary\n\n") < md.indexOf("## Transcript\n\n"));
+  assert.match(md, /^diaryWrittenAt: /m);
+  assert.doesNotMatch(md, /openai/, "which AI wrote it stays on the device");
+  const back = parseConversationMarkdown(md)!;
+  assert.deepEqual(back.realtimeDiary, { date: "2026-11-07", text, writtenAt: ENDED });
+  assert.deepEqual(back.turns.map((t) => t.content), c.turns.map((t) => t.content), "the text is never read as words of the conversation");
+  // a diary not yet written, and words that look like the section, are not read as a diary text
+  const tricky = diary("tricky", "2026-11-07", [turn("user", local(2026, 11, 7, 9, 30), "## Diary\n\n架空の文"), turn("ai", local(2026, 11, 7, 9, 31))]);
+  assert.deepEqual(parseConversationMarkdown(conversationToMarkdown(tricky))!.realtimeDiary, { date: "2026-11-07" });
+});
+
+test("a diary is complete only with both its Memory and its text; any other finished diary can be finished again from home", () => {
+  const both = diary("both", "2026-11-07", morning, { endedAt: ENDED, status: "captured", realtimeDiary: { date: "2026-11-07", text: "架空の日記。" } });
+  const noText = diary("no-text", "2026-11-06", morning, { endedAt: ENDED, status: "captured", updatedAt: T(local(2026, 11, 7, 23, 0)) });
+  const noMemory = diary("no-memory", "2026-11-05", morning, { endedAt: ENDED, realtimeDiary: { date: "2026-11-05", text: "架空の日記。" }, updatedAt: T(local(2026, 11, 7, 22, 30)) });
+  const open = diary("open", "2026-11-07", morning);
+  assert.equal(isRealtimeDiaryComplete(both), true);
+  assert.equal(isRealtimeDiaryComplete(noText), false);
+  assert.equal(isRealtimeDiaryComplete(noMemory), false);
+  assert.deepEqual(unfinishedRealtimeDiaries([both, noText, noMemory, open, diary("normal", undefined, morning, { endedAt: ENDED })]).map((c) => c.id), ["no-text", "no-memory"]);
+});
+
+test("a save without the diary text never replaces a file that has it (another device or tab wrote it)", () => {
+  const withText = { status: "captured" as const, memoryObjectIds: ["m"], realtimeDiary: { date: "2026-11-07", text: "架空の日記。" } };
+  assert.equal(takesBackFinishedConversation(withText, { status: "captured", memoryObjectIds: ["m"], realtimeDiary: { date: "2026-11-07" } }), true);
+  assert.equal(takesBackFinishedConversation(withText, withText), false);
+  assert.equal(takesBackFinishedConversation({ status: "active", memoryObjectIds: [], realtimeDiary: { date: "2026-11-07" } }, withText), false);
+  assert.equal(takesBackFinishedConversation({ status: "active", memoryObjectIds: [] }, { status: "active", memoryObjectIds: [] }), false, "a normal conversation is as before");
+});
+
+test("History puts a realtime diary on its diary day, whatever time it started; other conversations as before", () => {
+  // started 8 Nov 1:00 JST (16:00 UTC on 7 Nov) for the diary of 7 Nov
+  assert.equal(conversationLogicalDay("01JZZZZZZZZZZZZZZZZZZZZZZZ", "2026-11-07T16:00:00.000Z", "2026-11-07", "2026-11-07"), "2026-11-07");
+  assert.equal(conversationLogicalDay("01JZZZZZZZZZZZZZZZZZZZZZZZ", "2026-11-07T16:00:00.000Z", "2026-11-07"), "2026-11-08");
+  assert.equal(conversationLogicalDay("01JZZZZZZZZZZZZZZZZZZZZZZZ", "2026-11-07T16:00:00.000Z", "2026-11-07", "not-a-day"), "2026-11-08");
+  const entry = { conversations: [{ id: "01JZZZZZZZZZZZZZZZZZZZZZZZ", mode: "diary" as const, turnCount: 2, diaryDate: "2026-11-06" }], normalMemories: [], reflections: [] };
+  assert.equal(indexEntryHasConversationOnDay(entry, "2026-11-07", "2026-11-06"), true);
+});
