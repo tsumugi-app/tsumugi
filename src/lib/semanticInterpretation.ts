@@ -1,5 +1,6 @@
 import type { AISchema } from "@/lib/ai/schema";
-import { getProvider, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getProvider, resolveModel } from "@/lib/ai/resolve";
+import type { AIProviderName } from "@/lib/ai/types";
 import type { Fact } from "@/lib/factExtraction";
 
 /**
@@ -50,11 +51,11 @@ function schemaFor(field: string, values: string[]): AISchema {
 
 async function classifyAxis<T extends string>(
   apiKey: string,
+  providerName: AIProviderName,
   field: string,
   values: T[],
   prompt: string
 ): Promise<T> {
-  const providerName = resolveProviderForFeature("semanticInterpret");
   const provider = getProvider(providerName);
 
   const response = await provider.generateStructured({
@@ -69,7 +70,7 @@ async function classifyAxis<T extends string>(
   return (values.includes(value as T) ? value : "unknown") as T;
 }
 
-async function interpretDesire(fact: Fact, apiKey: string): Promise<TriState> {
+async function interpretDesire(fact: Fact, apiKey: string, providerName: AIProviderName): Promise<TriState> {
   const prompt = `対象：${fact.subject}
 
 発言：
@@ -83,10 +84,10 @@ ${buildEvidenceText(fact)}
 
 行動（実際にした／しなかった）から希望を推測してはいけません。行動の記述だけがあり、希望について何も述べられていない場合はunknownとしてください。`;
 
-  return classifyAxis<TriState>(apiKey, "desire", ["true", "false", "unknown"], prompt);
+  return classifyAxis<TriState>(apiKey, providerName, "desire", ["true", "false", "unknown"], prompt);
 }
 
-async function interpretAction(fact: Fact, apiKey: string): Promise<ActionState> {
+async function interpretAction(fact: Fact, apiKey: string, providerName: AIProviderName): Promise<ActionState> {
   const prompt = `対象：${fact.subject}
 
 発言：
@@ -100,10 +101,10 @@ ${buildEvidenceText(fact)}
 
 希望（したい・したくない）から行動の有無を推測してはいけません。希望の記述だけがあり、実際の行動について何も述べられていない場合はunknownとしてください。`;
 
-  return classifyAxis<ActionState>(apiKey, "action", ["done", "not_done", "unknown"], prompt);
+  return classifyAxis<ActionState>(apiKey, providerName, "action", ["done", "not_done", "unknown"], prompt);
 }
 
-async function interpretEvaluation(fact: Fact, apiKey: string): Promise<EvaluationState> {
+async function interpretEvaluation(fact: Fact, apiKey: string, providerName: AIProviderName): Promise<EvaluationState> {
   const prompt = `対象：${fact.subject}
 
 発言：
@@ -117,14 +118,14 @@ ${buildEvidenceText(fact)}
 
 希望や行動の有無から評価を推測してはいけません。評価についての言葉が発言に無い場合はunknownとしてください。`;
 
-  return classifyAxis<EvaluationState>(apiKey, "evaluation", ["positive", "negative", "unknown"], prompt);
+  return classifyAxis<EvaluationState>(apiKey, providerName, "evaluation", ["positive", "negative", "unknown"], prompt);
 }
 
-export async function interpretFact(fact: Fact, apiKey: string): Promise<SemanticInterpretation> {
+export async function interpretFact(fact: Fact, apiKey: string, providerName: AIProviderName): Promise<SemanticInterpretation> {
   const [desire, action, evaluation] = await Promise.all([
-    interpretDesire(fact, apiKey),
-    interpretAction(fact, apiKey),
-    interpretEvaluation(fact, apiKey),
+    interpretDesire(fact, apiKey, providerName),
+    interpretAction(fact, apiKey, providerName),
+    interpretEvaluation(fact, apiKey, providerName),
   ]);
 
   return { factId: fact.id, desire, action, evaluation };

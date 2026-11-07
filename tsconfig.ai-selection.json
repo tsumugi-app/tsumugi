@@ -1,0 +1,27 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/aiSelection.test.ts",
+    "src/lib/selectedAi.ts",
+    "src/app/api/chat/route.ts",
+    "src/app/api/capture/route.ts",
+    "src/app/api/connect/route.ts",
+    "src/app/api/prompt/route.ts",
+    "src/app/api/reflect/route.ts",
+    "src/app/api/synthesize/route.ts",
+    "src/app/api/fact-extract/route.ts",
+    "src/app/api/semantic-interpret/route.ts",
+    "src/app/api/api-key/test/route.ts"
+  ]
+}

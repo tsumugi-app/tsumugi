@@ -24,9 +24,9 @@ All of these must hold:
 4. Not touched for at least 30 minutes (`updatedAt`). There is no upper age limit.
 5. Open in no tab (Web Lock below).
 6. Attempt limit not reached, and the wait after an HTTP failure has passed.
-7. Known to be held only with Gemini (`chatProviders`), or the user has allowed other conversations. A new conversation starts with an empty record, also when its first turn is a past question from the home screen. A conversation from before this record existed counts as unknown and needs the permission.
+7. Known to be held only with the AI the user has chosen now (`chatProviders`, `maySendConversationTo`), or the user has allowed other conversations. A new conversation starts with an empty record, also when its first turn is a past question from the home screen. A conversation from before this record existed counts as unknown and needs the permission.
 
-The run itself needs: the setting on, Vault connected, no recovery journal pending, no Vault switch, online, and a user Gemini key saved on this device. Otherwise it makes no call and records nothing. The server key is kept out at two layers. In the app, each automatic request (Capture, Connect, question) reads the key at the moment it is built, and sends nothing if it is missing, blank or cannot go in a header. Every automatic request also carries `X-Tsumugi-User-Key-Only: 1`, and for those `resolveApiKey` never returns the server key, so the routes answer 401 without reaching a provider. If the key goes before the Capture request, no attempt or daily count is used and the conversation waits for a later start. If it goes during the AI call the Memory is kept; Connect stays not done and catches up at a later start with a key, and a question left unmade is made by the home screen. The startup Connect catch-up carries the same mark. The end of a conversation and ordinary conversations do not carry it and work as before.
+The run itself needs: the setting on, Vault connected, no recovery journal pending, no Vault switch, online, and the user's own key for the chosen AI saved on this device. The AI is read once when the run begins; if the user's choice is different when a request is built, nothing is sent (`AiSelectionChangedError`, no attempt and no daily count used). Otherwise it makes no call and records nothing. The server key is kept out at two layers. In the app, each automatic request (Capture, Connect, question) reads the key at the moment it is built, and sends nothing if it is missing, blank or cannot go in a header. Every automatic request also carries `X-Tsumugi-User-Key-Only: 1`, and for those `resolveApiKey` never returns the server key, so the routes answer 401 without reaching a provider. If the key goes before the Capture request, no attempt or daily count is used and the conversation waits for a later start. If it goes during the AI call the Memory is kept; Connect stays not done and catches up at a later start with a key, and a question left unmade is made by the home screen. The startup Connect catch-up carries the same mark. The end of a conversation and ordinary conversations do not carry it and work as before.
 
 Order: never tried before retried, then oldest first, so a conversation that keeps failing does not hold back the others and no conversation waits forever. 1 conversation per start, at most 5 AI requests per 24 hours on the device.
 
@@ -96,7 +96,7 @@ Cost estimate for `gemini-3.1-flash-lite` at USD 0.25 per million input tokens a
 
 ## What leaves the device
 
-The same as the end action: the conversation's turns and the summaries of related Memories go to the Capture model. Capture always uses Gemini, so a conversation held with another chat provider would go to Gemini without an end action. The new part is that this happens with no action by the user, which is why it is off by default and why conversations of another or unknown AI need a separate permission.
+The same as the end action: the conversation's turns and the summaries of related Memories go to the AI the user has chosen (see `docs/ai-selection.md`), and nowhere else. The new part is that this happens with no action by the user, which is why it is off by default and why conversations of another or unknown AI need a separate permission.
 
 ## Speed
 
@@ -114,4 +114,5 @@ Running this writes to existing data on a device: new Memories, and `status` cha
 
 - A conversation already saved as `captured` without its Memory before this change stays that way; nothing can tell what its Memories were without a new AI call.
 - A conversation with a failed Capture at the end action stays `active`. With the setting off nothing retries it.
-- The end action and other features still fall back to the server key when the device has no user key, as before. Only the automatic runs do not.
+- With Gemini chosen and no user key, the end action and other features use the Beta key Tsumugi provides, as before. Only the automatic runs do not. With another AI chosen there is no provided key: without the user's key nothing is sent.
+- The end of a conversation follows the same rule as the run: a conversation held (partly) with another AI than the one chosen now, or with no record, is not sent without the permission; it stays as it is and the message says so.

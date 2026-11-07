@@ -21,12 +21,11 @@
 import {
   getAllMemoryObjects,
   getConversation,
-  loadApiKey,
   loadLastPromptedMemoryIds,
   updateMemoryRevisitPrompt,
   saveLastPromptedMemoryIds,
 } from "./db";
-import { GEMINI_API_KEY_HEADER, isUsableUserKey, userKeyOnlyHeaders } from "./apiKeyHeader";
+import { selectedAiHeaders, type AiRequestOptions } from "./selectedAi";
 import { getJstTodayDateString } from "./jstDate";
 import { jstDateOf } from "./dateModel";
 import {
@@ -115,11 +114,16 @@ async function resolveOriginalEntryType(memory: MemoryObject): Promise<Conversat
  * 相対時間表現を含む場合はundefinedを返す（呼び出し元は保存しない）。同一試行内での
  * 再生成（API再呼び出し）はしない。
  */
-export async function generateRevisitPrompt(memory: MemoryObject, options?: { requireUserKey?: boolean }): Promise<string | undefined> {
-  const apiKey = await loadApiKey();
-  // 自動の処理でキーがなければ送らない。問いかけのないMemoryは、キーが戻った後にホーム画面の既存の処理で作られる。
-  if (options?.requireUserKey && !isUsableUserKey(apiKey)) return undefined;
-  const keyHeaders = options?.requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};
+export async function generateRevisitPrompt(memory: MemoryObject, options?: AiRequestOptions): Promise<string | undefined> {
+  // 自動の処理でキーがない・選んだAIが変わったときは送らない。問いかけのないMemoryは、後でホーム画面の既存の処理で作られる。
+  let keyHeaders: Record<string, string>;
+  try {
+    keyHeaders = (await selectedAiHeaders(options)).headers;
+  } catch (error) {
+    const name = (error as Error | undefined)?.name;
+    if (name === "NoUserKeyError" || name === "AiSelectionChangedError") return undefined;
+    throw error;
+  }
   const res = await fetch("/api/prompt", {
     method: "POST",
     headers: {

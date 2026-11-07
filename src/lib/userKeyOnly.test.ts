@@ -39,16 +39,16 @@ const ROUTES: Record<string, unknown> = {
 };
 async function call(name: string, headers: Record<string, string>) {
   used.length = 0;
-  const res = await route(name).POST(new Request(`http://localhost/api/${name}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(ROUTES[name]) }));
+  const res = await route(name).POST(new Request(`http://localhost/api/${name}`, { method: "POST", headers: { "Content-Type": "application/json", "X-AI-Provider": "gemini", ...headers }, body: JSON.stringify(ROUTES[name]) }));
   return { status: res.status, used: [...used] };
 }
 
 test("in the app, an automatic request is built only with a usable key, and always with the mark", () => {
   for (const key of [undefined, "", "   ", "架空のキー", "key\u200b"]) {
     assert.equal(keys.isUsableUserKey(key), false);
-    assert.throws(() => keys.userKeyOnlyHeaders(key), { name: "NoUserKeyError" });
+    assert.throws(() => keys.aiRequestHeaders("gemini", key, true), { name: "NoUserKeyError" });
   }
-  assert.deepEqual(keys.userKeyOnlyHeaders(USER_KEY), { "X-Gemini-Api-Key": USER_KEY, [ONLY]: "1" });
+  assert.deepEqual(keys.aiRequestHeaders("gemini", USER_KEY, true), { "X-AI-Provider": "gemini", "X-Gemini-Api-Key": USER_KEY, [ONLY]: "1" });
 });
 
 for (const name of Object.keys(ROUTES)) {

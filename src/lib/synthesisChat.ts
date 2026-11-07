@@ -6,9 +6,9 @@
  *   - runSynthesisAfterSession: after a session / conversation ended, a background generation run (at most once a day; never awaited by the UI)
  * Memories and Conversations are only READ here (getAllMemoryObjects / getAllConversations under the Vault read lock).
  */
-import { getAllConversations, getAllMemoryObjects, loadApiKey } from "./db";
+import { getAllConversations, getAllMemoryObjects } from "./db";
 import { withVaultWorldRead } from "./vaultWorldLock";
-import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
+import { selectedAiHeaders } from "./selectedAi";
 import { memorySynthesisEnabled } from "./memorySynthesisFlag";
 import { safeSelectTimelineForTurn, selectSynthesisForTurn, type SynthesisThemeContext } from "./memorySynthesis";
 import { attachCorrections, usableItemsForChat } from "./synthesisModel";
@@ -48,10 +48,9 @@ export function runSynthesisAfterSession(): void {
     readMemories: () => withVaultWorldRead(() => getAllMemoryObjects()),
     readConversations: () => withVaultWorldRead(() => getAllConversations()),
     callApi: async (payload) => {
-      const apiKey = await loadApiKey();
       const res = await fetch("/api/synthesize", {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}) },
+        headers: { "Content-Type": "application/json", ...(await selectedAiHeaders()).headers },
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(`synthesize request failed with status ${res.status}`);

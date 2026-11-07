@@ -13,7 +13,7 @@ const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content:
 type Past = { id: string; ago: number; status?: "active" | "captured"; turns?: [string, string][]; chatProviders?: string[]; memoryIds?: string[] };
 type CaptureReply = { status?: number; hold?: Promise<void>; abort?: boolean };
 /** on, with permission for conversations of any AI, and a fictional key; each test takes away what it is about */
-type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string; fullStartDelay?: boolean };
+type Device = { enabled?: boolean; allowOtherProviders?: boolean; key?: boolean; recentRuns?: number; revisit?: string; fullStartDelay?: boolean; openaiKey?: boolean; chosen?: "gemini" | "openai" };
 
 /** a device in normal use: a real OPFS Vault with its Registry baseline, holding fictional past conversations */
 async function seed(page: Page, past: Past[] = [], memoryOf?: string | string[], device: Device = {}) {
@@ -47,6 +47,8 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string | string[],
     await dbm.saveVaultHandle(root); await dbm.markVaultEpochCommitted(0); await dbm.markVaultWorldJournalMigrated();
     await dbm.saveAutoCaptureSettingsRaw(JSON.stringify({ enabled: device.enabled ?? true, allowOtherProviders: device.allowOtherProviders ?? true }));
     if (device.key ?? true) await dbm.saveApiKey("fictional-test-key", "gemini");
+    if (device.openaiKey) await dbm.saveApiKey("fictional-openai-key", "openai");
+    if (device.chosen) await dbm.saveChatProvider(device.chosen);
     if (device.recentRuns) await dbm.saveAutoCaptureStateRaw(JSON.stringify({ conversations: {}, recentRuns: Array(device.recentRuns).fill(new Date(Date.now() - 3_600_000).toISOString()) }));
     for (const c of past) {
       const T = new Date(Date.now() - c.ago).toISOString();
@@ -65,11 +67,15 @@ async function seed(page: Page, past: Past[] = [], memoryOf?: string | string[],
 
 /** fictional AI that counts every call. `reply(body)` decides the answer to one Capture; by default it returns one fictional Memory. */
 async function fakeApi(page: Page, reply: (words: string) => CaptureReply = () => ({})) {
-  const calls = { chat: 0, capture: [] as string[], connect: 0, prompt: 0, sent: [] as { api: string; key?: string; only?: string }[], connectAnswers: false };
+  const calls = { chat: 0, capture: [] as string[], connect: 0, prompt: 0, reflect: 0, sent: [] as { api: string; key?: string; only?: string }[], connectAnswers: false,
+    /** every AI request, the chat included: the AI it names and the keys it carries */
+    ai: [] as { api: string; ai?: string; gemini?: string; openai?: string; only?: string }[] };
   await page.route("**/api/**", async (route) => {
     const url = route.request().url();
     const api = ["capture", "connect", "prompt"].find((name) => url.includes(`/api/${name}`));
     if (api) { const h = route.request().headers(); calls.sent.push({ api, key: h["x-gemini-api-key"], only: h["x-tsumugi-user-key-only"] }); }
+    const any = ["chat", "capture", "connect", "prompt", "reflect", "synthesize"].find((name) => url.includes(`/api/${name}`));
+    if (any) { const h = route.request().headers(); calls.ai.push({ api: any, ai: h["x-ai-provider"], gemini: h["x-gemini-api-key"], openai: h["x-openai-api-key"], only: h["x-tsumugi-user-key-only"] }); }
     if (url.includes("/api/chat")) {
       calls.chat++;
       await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" });
@@ -80,6 +86,9 @@ async function fakeApi(page: Page, reply: (words: string) => CaptureReply = () =
       if (r.hold) await r.hold;
       if (r.abort) { await route.abort("failed").catch(() => undefined); return; }
       await route.fulfill({ status: r.status ?? 200, contentType: "application/json", body: JSON.stringify(r.status ? { error: "fictional" } : { memories: [MEMORY] }) }).catch(() => undefined);
+    } else if (url.includes("/api/reflect")) {
+      calls.reflect++;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ title: "架空の題", reflection: "架空の振り返りです。" }) });
     } else {
       if (url.includes("/api/connect")) calls.connect++;
       if (url.includes("/api/prompt")) calls.prompt++;
@@ -729,6 +738,7 @@ test.describe("the end of a conversation: Memory and status are saved together",
     await goHome(page);
     await captureSeen(calls, 1);
     expect(calls.sent.find((r) => r.api === "capture")).toEqual({ api: "capture", key: undefined, only: undefined });
+    expect(calls.ai.find((r) => r.api === "capture")?.ai, "Gemini is the AI chosen on this device").toBe("gemini");
     const c = await withWords(page, said("キーなし終了"));
     await expect.poll(() => statusOf(page, c.id), { timeout: 40_000 }).toBe("captured");
   });
@@ -1419,5 +1429,150 @@ test.describe("startup Memory creation: limits", () => {
     notice("perf-auto-capture", { homeOff: off.home, homeOn: on.home, sendWhileCaptureRuns: send });
     expect(send, "the conversation is not held up").toBeLessThan(30_000);
     expect(await statusOf(page, "slow-1")).toBe("active");
+  });
+});
+
+/** the Settings screen as the user leaves it after choosing an AI */
+const choose = (page: Page, provider: "gemini" | "openai") => page.evaluate(async (p) => {
+  const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(p, "chatProvider"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  db.close();
+}, provider);
+type AiCall = { api: string; ai?: string; gemini?: string; openai?: string; only?: string };
+/** every request named this AI and carried that AI's key only (never the other AI's key) */
+const allTo = (list: AiCall[], ai: "gemini" | "openai") => {
+  expect(list.length, "requests were made").toBeGreaterThan(0);
+  expect(list.filter((r) => r.ai !== ai), "a request to another AI").toEqual([]);
+  if (ai === "openai") expect(list.filter((r) => r.gemini !== undefined || r.openai !== "fictional-openai-key"), "a request without the OpenAI key, or with the Gemini key").toEqual([]);
+  else expect(list.filter((r) => r.openai !== undefined), "a request with the OpenAI key").toEqual([]);
+};
+
+test.describe("the AI the user chose is where everything goes", () => {
+  test("OpenAI key only, OpenAI chosen: the startup run, the chat, the end of a conversation, Connect, the question and the day's reflection all go to OpenAI with its key; a Gemini conversation waits", async ({ page }) => {
+    test.setTimeout(300_000);
+    await seed(page, [{ id: "oa-old", ago: 240 * MIN, chatProviders: ["openai"] }, { id: "gm-old", ago: 300 * MIN, chatProviders: ["gemini"] }], undefined,
+      { key: false, openaiKey: true, chosen: "openai", allowOtherProviders: false });
+    const calls = await fakeApi(page);
+    calls.connectAnswers = true;
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await expect.poll(() => statusOf(page, "oa-old"), { timeout: 40_000 }).toBe("captured");
+    expect(calls.capture[0], "the conversation held with OpenAI").toContain(said("oa-old"));
+    expect(await statusOf(page, "gm-old"), "held with Gemini: not sent to OpenAI without the permission").toBe("active");
+    expect((await memoriesOf(page, "oa-old"))[0]?.metadata?.aiProvider, "the Memory says which AI made it").toBe("openai");
+    // a conversation and its end
+    await talkFromHome(page, said("OpenAI会話"));
+    await goHome(page);
+    await captureSeen(calls, 2);
+    const c = await withWords(page, said("OpenAI会話"));
+    await expect.poll(() => statusOf(page, c.id), { timeout: 40_000 }).toBe("captured");
+    // the diary and the day's reflection
+    await page.getByRole("button", { name: "日記", exact: true }).click();
+    await talk(page, said("OpenAI日記"));
+    await page.getByRole("button", { name: "本日はここまで" }).click();
+    await expect(page.getByText("架空の振り返りです。")).toBeVisible({ timeout: 60_000 });
+    await expect.poll(() => calls.connect, { timeout: 30_000 }).toBeGreaterThan(0);
+    const reflection = (await rows(page, "memoryObjects")).find((m) => m.types?.includes("insight"));
+    expect(reflection?.metadata?.aiProvider).toBe("openai");
+    for (const api of ["chat", "capture", "connect", "reflect"]) expect(calls.ai.some((r) => r.api === api), `${api} was asked`).toBe(true);
+    allTo(calls.ai, "openai");
+    expect(calls.ai.find((r) => r.api === "capture")?.only, "the startup run is marked: never a provided key").toBe("1");
+    expect(await statusOf(page, "gm-old")).toBe("active");
+  });
+
+  test("both keys, OpenAI chosen: the Gemini key is never sent; Gemini chosen: the OpenAI key is never sent", async ({ page }) => {
+    test.setTimeout(240_000);
+    await seed(page, [], undefined, { enabled: false, openaiKey: true, chosen: "openai" });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, said("両方OpenAI"));
+    await goHome(page);
+    await captureSeen(calls, 1);
+    allTo(calls.ai, "openai");
+    await choose(page, "gemini");
+    calls.ai.length = 0;
+    await startApp(page);
+    await talkFromHome(page, said("両方Gemini"));
+    await goHome(page);
+    await captureSeen(calls, 2);
+    allTo(calls.ai, "gemini");
+    expect(calls.ai.find((r) => r.api === "capture")?.gemini).toBe("fictional-test-key");
+  });
+
+  test("OpenAI chosen with no key on the device: the real server refuses, nothing reaches any AI and Gemini's provided key is not used; the run sends nothing", async ({ page }) => {
+    test.setTimeout(240_000);
+    await seed(page, [{ id: "nk-1", ago: 120 * MIN, chatProviders: ["openai"] }], undefined, { key: false, chosen: "openai", allowOtherProviders: false });
+    const statuses: { api: string; status: number }[] = [];
+    page.on("response", (r) => { const m = r.url().match(/\/api\/(chat|capture|connect|prompt|reflect)\b/); if (m) statuses.push({ api: m[1], status: r.status() }); });
+    const requests: AiCall[] = [];
+    page.on("request", (r) => { const m = r.url().match(/\/api\/(chat|capture|connect|prompt|reflect)\b/); if (m) { const h = r.headers(); requests.push({ api: m[1], ai: h["x-ai-provider"], gemini: h["x-gemini-api-key"], openai: h["x-openai-api-key"] }); } });
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(requests.filter((r) => r.api === "capture"), "the startup run sends nothing without the chosen AI's key").toEqual([]);
+    await page.getByRole("button", { name: "会話", exact: true }).click();
+    await page.locator("footer textarea").fill(said("キーなしOpenAI"));
+    await page.locator("footer").getByRole("button", { name: "送る" }).click();
+    await expect.poll(() => statuses.find((s) => s.api === "chat")?.status, { timeout: 30_000 }).toBe(401);
+    await goHome(page);
+    await page.waitForTimeout(SETTLE);
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.filter((r) => r.ai !== "openai" || r.gemini !== undefined || r.openai !== undefined), "every request named OpenAI and carried no key").toEqual([]);
+    expect(statuses.filter((s) => s.status !== 401), "the server refused every one").toEqual([]);
+    expect(await statusOf(page, "nk-1")).toBe("active");
+  });
+
+  test("switching the AI: a conversation held with Gemini is not sent to OpenAI at its end, nor by the run; with the permission it goes to OpenAI once", async ({ page }) => {
+    test.setTimeout(300_000);
+    await seed(page, [], undefined, { enabled: false, allowOtherProviders: false, openaiKey: true });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await talkFromHome(page, said("切替前"));
+    const c = await withWords(page, said("切替前"));
+    expect(c.chatProviders).toEqual(["gemini"]);
+    await choose(page, "openai");
+    const afterSwitch = calls.ai.length;
+    await page.getByRole("button", { name: "この会話を終える" }).click();
+    await expect(page.getByText(/いま選んでいるAI以外で話した部分があるため/)).toBeVisible({ timeout: 30_000 });
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length, "nothing went to OpenAI").toBe(0);
+    expect(await statusOf(page, c.id), "kept as it was, for later").toBe("active");
+    await backdate(page, c.id);
+    await page.goto(`${BASE}/data`);
+    await page.evaluate(async () => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      await new Promise<void>((res, rej) => { const t = db.transaction("settings", "readwrite"); t.objectStore("settings").put(JSON.stringify({ enabled: true, allowOtherProviders: false }), "autoCapture:settings"); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+      db.close();
+    });
+    await startApp(page);
+    await page.waitForTimeout(SETTLE);
+    expect(calls.capture.length, "the run does not send it to OpenAI either").toBe(0);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await expect(page.getByTestId("auto-capture-summary")).toContainText("許可待ち 1 件", { timeout: 30_000 });
+    await expect(page.getByTestId("auto-capture")).toContainText("OpenAI以外のAIでも話した会話");
+    await page.getByTestId("auto-capture-other-providers").check();
+    await startApp(page);
+    await captureSeen(calls, 1);
+    await expect.poll(() => statusOf(page, c.id), { timeout: 40_000 }).toBe("captured");
+    allTo(calls.ai.slice(afterSwitch), "openai");
+    expect((await memoriesOf(page, c.id)).length).toBe(1);
+  });
+
+  test("removing the chosen AI's key does not switch to another AI: requests still name OpenAI, and nothing goes to Gemini", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page, [], undefined, { enabled: false, openaiKey: true, chosen: "openai" });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await nav(page).getByRole("button", { name: "設定" }).click();
+    await page.getByText("OpenAI APIキー：設定済み").locator("..").getByRole("button", { name: "削除" }).click();
+    await expect(page.getByText("OpenAI APIキー：未設定")).toBeVisible({ timeout: 30_000 });
+    const chosen = await page.evaluate(async () => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const q = indexedDB.open("tsumugi"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      const v = await new Promise((res, rej) => { const q = db.transaction("settings").objectStore("settings").get("chatProvider"); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+      db.close(); return v;
+    });
+    expect(chosen, "the choice stays OpenAI").toBe("openai");
+    await startApp(page);
+    await talkFromHome(page, said("削除後"));
+    expect(calls.ai.filter((r) => r.ai !== "openai" || r.gemini !== undefined), "nothing named Gemini or carried its key").toEqual([]);
   });
 });

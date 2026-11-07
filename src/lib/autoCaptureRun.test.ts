@@ -14,6 +14,7 @@ function setup(list: Conversation[], over: Partial<AutoCaptureDeps> = {}, result
   const seen = { captured: [] as string[], statesAtCall: [] as AutoCaptureState[], state: emptyAutoCaptureState() };
   const deps: AutoCaptureDeps = {
     loadSettings: async () => ({ enabled: true, allowOtherProviders: false }),
+    selectedProvider: async () => "gemini",
     hasUserKey: async () => true,
     online: () => true,
     blocked: () => false,
@@ -165,5 +166,33 @@ test("the reference arrives after the list was read: decided again under the loc
   const { deps, seen } = setup([conv("a")], { readConversation: async () => ({ ...conv("a"), memoryObjectIds: ["arrived"] }) as Conversation });
   assert.equal(await runAutoCapture(deps), "nothing");
   assert.deepEqual(seen.captured, []);
+  assert.deepEqual(seen.state, emptyAutoCaptureState());
+});
+
+test("the whole run uses the AI chosen when it began: its key, its conversations, and that AI is passed to the request", async () => {
+  const openaiOnly = { ...conv("o", AUTO_CAPTURE_QUIET_MS * 3), chatProviders: ["openai"] } as Conversation;
+  const geminiOnly = { ...conv("g", AUTO_CAPTURE_QUIET_MS * 4), chatProviders: ["gemini"] } as Conversation;
+  const asked: string[] = [];
+  const sentTo: string[] = [];
+  const { deps, seen } = setup([geminiOnly, openaiOnly], {
+    selectedProvider: async () => "openai",
+    hasUserKey: async (p) => { asked.push(p); return true; },
+    capture: async (c, _s, onRequestSent, provider) => { onRequestSent(); sentTo.push(provider); seen.captured.push(c.id); return "saved"; },
+  });
+  assert.equal(await runAutoCapture(deps), "saved");
+  assert.deepEqual(asked, ["openai"], "the OpenAI key is the one checked, not Gemini's");
+  assert.deepEqual(seen.captured, ["o"], "the older Gemini conversation is not sent to OpenAI without the permission");
+  assert.deepEqual(sentTo, ["openai"]);
+});
+
+test("no key for the chosen AI: nothing is sent, even when a key for another AI exists", async () => {
+  const { deps, seen } = setup([conv("a")], { selectedProvider: async () => "openai", hasUserKey: async (p) => p === "gemini" });
+  assert.equal(await runAutoCapture(deps), "no-key");
+  assert.deepEqual(seen.captured, []);
+});
+
+test("the AI choice changed before the request: nothing sent, the attempt and the 24 hour count are given back", async () => {
+  const { deps, seen } = setup([conv("a")], { capture: async () => { throw Object.assign(new Error("x"), { name: "AiSelectionChangedError" }); } });
+  assert.equal(await runAutoCapture(deps), "key");
   assert.deepEqual(seen.state, emptyAutoCaptureState());
 });

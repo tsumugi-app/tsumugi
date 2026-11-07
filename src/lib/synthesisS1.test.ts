@@ -390,7 +390,7 @@ test("reactions are user data: no generation removes them, and they are kept apa
 
 const ROOT = path.join(__dirname, "..");
 const providerOut = { text: "" };
-const resolveStub = { getProvider: () => ({ async generateStructured() { return { text: providerOut.text }; } }), resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini" };
+const resolveStub = { getProvider: () => ({ async generateStructured() { return { text: providerOut.text }; } }), resolveApiKey: () => "k", resolveModel: () => "m", resolveRequestedProvider: () => "gemini" };
 const mod = Module as unknown as { _load: (r: string, p?: { filename?: string }, m?: boolean) => unknown; _resolveFilename: (r: string, ...rest: unknown[]) => string };
 const origLoad = mod._load;
 mod._load = function (request, parent, isMain) {

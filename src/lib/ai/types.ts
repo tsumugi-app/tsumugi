@@ -1,31 +1,12 @@
 /**
  * AI Provider抽象化レイヤーの型定義（ARCHITECTURE.md想定の拡張）。
  *
- * Tsumugiは将来、「ユーザーが1つのAIを選ぶ」のではなく、機能（AIFeature）ごとに
- * 使うProviderを選べるようにする（例：creative→OpenAI、reflection→Gemini）。
- * そのため、Provider解決の単位は route（エンドポイント）ではなく feature にする。
- * chatエンドポイントは日記/探究/相談・創造の3personaを1つのHTTPエンドポイントで
- * 扱っているが、将来persona単位で別Providerに振り分けられるよう、featureは
- * persona単位（diary/exploration/creative）に分けている。
- *
- * Phase 1では全てGeminiに固定される（resolve.ts参照）。OpenAI/Claudeの実際の
- *呼び出しはまだ実装しない。
+ * 送り先のAIは利用者が選んだ1つで、全ての機能が同じAIを使う（resolve.tsの`resolveRequestedProvider`）。
+ * AIを足すときは、providers/に実装を足してresolve.tsとapiKeyHeader.tsに登録するだけで、機能ごとの変更は要らない。
  */
 import type { AISchema } from "./schema";
 
 export type AIProviderName = "gemini" | "openai" | "claude";
-
-export type AIFeature =
-  | "diary" // companion persona（日記）
-  | "exploration" // coach persona（探究）
-  | "creative" // analyst persona（相談・創造）
-  | "capture"
-  | "connect"
-  | "reflection"
-  | "revisitPrompt" // 過去からの問いかけ生成（/api/prompt）
-  | "apiKeyTest"
-  | "factExtract" // 対象語の発言者判定のみ（Test45〜71参照。quote/Fact組み立てはTsumugi側）
-  | "semanticInterpret"; // Factのevidenceだけを見た6ラベルの意味判定のみ（Test72参照。Fact生成はしない）
 
 /**
  * Gemini固有のthinkingBudget等、他Providerには意味を持たない調整値を渡すための

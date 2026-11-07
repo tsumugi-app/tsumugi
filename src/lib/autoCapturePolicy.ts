@@ -16,7 +16,7 @@ export const AUTO_CAPTURE_TIMEOUT_MS = 60_000;
 export interface AutoCaptureSettings {
   /** off until the user turns it on */
   enabled: boolean;
-  /** a conversation held with another AI, or with no record of which AI, may go to Gemini */
+  /** a conversation held (partly) with another AI than the one now chosen, or with no record of which AI, may go to the chosen AI */
   allowOtherProviders: boolean;
 }
 export const AUTO_CAPTURE_SETTINGS_OFF: AutoCaptureSettings = { enabled: false, allowOtherProviders: false };
@@ -63,9 +63,14 @@ export function withChatProvider(conversation: Conversation, provider: string): 
   const known = conversation.chatProviders ?? (conversation.turns.length > 0 ? [UNKNOWN_CHAT_PROVIDER] : []);
   return known.includes(provider) ? conversation : { ...conversation, chatProviders: [...known, provider] };
 }
-export function heldOnlyWithGemini(conversation: Conversation): boolean {
+/** every reply on record came from `provider` (the AI the user chose): only then may it go there without the permission */
+export function heldOnlyWith(conversation: Conversation, provider: string): boolean {
   const known = conversation.chatProviders ?? [];
-  return known.length > 0 && known.every((p) => p === "gemini");
+  return known.length > 0 && known.every((p) => p === provider);
+}
+/** whether this conversation may be sent to `provider`, the AI the user chose. The same rule for the automatic run and for the end of a conversation. */
+export function maySendConversationTo(conversation: Conversation, provider: string, settings: Pick<AutoCaptureSettings, "allowOtherProviders">): boolean {
+  return settings.allowOtherProviders || heldOnlyWith(conversation, provider);
 }
 
 /** an unfinished conversation with something to remember, which the user has not been asked to decide about */
@@ -95,14 +100,14 @@ const waiting = (state: AutoCaptureState, id: string, now: number) => {
  * within each, so no conversation waits forever. There is no age limit.
  */
 export function selectAutoCaptureTargets(
-  conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, now: number, manual = false,
+  conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, now: number, provider: string, manual = false,
 ): Conversation[] {
   if (!manual && recentRunCount(state, now) >= AUTO_CAPTURE_PER_DAY) return [];
   const attempts = (c: Conversation) => state.conversations[c.id]?.attempts ?? 0;
   return conversations
     .filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id) && !refersToMemories(c))
     .filter((c) => now - ms(c.updatedAt) >= AUTO_CAPTURE_QUIET_MS)
-    .filter((c) => settings.allowOtherProviders || heldOnlyWithGemini(c))
+    .filter((c) => maySendConversationTo(c, provider, settings))
     .filter((c) => (manual ? isStopped(state, c.id) : !isStopped(state, c.id) && !waiting(state, c.id, now)))
     .sort((a, b) => attempts(a) - attempts(b) || ms(a.updatedAt) - ms(b.updatedAt));
 }
@@ -145,7 +150,7 @@ export function classifyAutoCaptureFailure(error: unknown, cancelled: boolean): 
   if (cancelled) return "cancelled";
   const name = (error as Error | undefined)?.name;
   if (name === "TombstonedRecordError") return "deleted";
-  if (name === "NoUserKeyError") return "key";
+  if (name === "NoUserKeyError" || name === "AiSelectionChangedError") return "key";
   if (name === "CaptureRequestError") {
     const status = (error as { status?: number }).status ?? 0;
     return status === 400 || status === 401 || status === 403 ? "key" : "http";
@@ -155,10 +160,10 @@ export function classifyAutoCaptureFailure(error: unknown, cancelled: boolean): 
 }
 
 export interface AutoCaptureSummary { waiting: number; stopped: number; needsPermission: number; heldForMemory: number }
-export function summarizeAutoCapture(conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, storedMemoryIds: ReadonlySet<string> = new Set()): AutoCaptureSummary {
+export function summarizeAutoCapture(conversations: Conversation[], withMemory: ReadonlySet<string>, state: AutoCaptureState, settings: AutoCaptureSettings, provider: string, storedMemoryIds: ReadonlySet<string> = new Set()): AutoCaptureSummary {
   const unprocessed = conversations.filter((c) => isUnprocessedConversation(c) && !withMemory.has(c.id));
   const left = unprocessed.filter((c) => !refersToMemories(c));
-  const allowed = left.filter((c) => settings.allowOtherProviders || heldOnlyWithGemini(c));
+  const allowed = left.filter((c) => maySendConversationTo(c, provider, settings));
   return {
     waiting: allowed.filter((c) => !isStopped(state, c.id)).length,
     stopped: allowed.filter((c) => isStopped(state, c.id)).length,

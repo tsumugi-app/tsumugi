@@ -4,7 +4,7 @@ import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTim
 import { jstDateOf } from "@/lib/dateModel";
 import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
 import type { ConversationTurn, Persona, PersonRelation, RetrievedMemory } from "@/lib/types";
-import type { AIFeature, StreamChunk } from "@/lib/ai/types";
+import type { StreamChunk } from "@/lib/ai/types";
 import { needsWebSearch } from "@/lib/needsWebSearch";
 import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
@@ -18,19 +18,10 @@ import {
   getProvider,
   resolveApiKey,
   resolveModel,
-  resolveProviderForFeature,
   resolveRequestedProvider,
 } from "@/lib/ai/resolve";
 
 export const runtime = "nodejs";
-
-/** chatエンドポイントは3personaを1つのHTTPエンドポイントで扱うが、Provider選択は
- * persona単位（AIFeature）で行う（将来 creative→OpenAI 等に振り分けるため）。 */
-const FEATURE_BY_PERSONA: Record<Persona, AIFeature> = {
-  companion: "diary",
-  coach: "exploration",
-  analyst: "creative",
-};
 
 /**
  * Web検索groundingを使った回答が、実際の現在日時ではなく古い時点（AIの学習知識由来の
@@ -929,12 +920,12 @@ Boundary参照）。`;
 }
 
 export async function POST(request: Request) {
-  // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。クライアントが明示指定
-  // していればそれを最終的なproviderとして使い、無ければ従来通りfeatureベースの
-  // 既定値（＝常にGemini）にフォールバックする。元の実装通り、bodyのJSON解析より
+  // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。元の実装通り、bodyのJSON解析より
   // 前にAPIキーの有無を確認する（不正なbodyでもまずキー未設定エラーを返す挙動を保つ）。
-  const requestedProvider = resolveRequestedProvider(request);
-  const apiKey = resolveApiKey(request, requestedProvider ?? "gemini");
+  // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
+  const providerName = resolveRequestedProvider(request);
+  if (!providerName) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
+  const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
     return Response.json(
       { error: "APIキーが設定されていません。" },
@@ -974,8 +965,6 @@ export async function POST(request: Request) {
     return Response.json({ error: "turns is required" }, { status: 400 });
   }
 
-  const providerName =
-    requestedProvider ?? resolveProviderForFeature(FEATURE_BY_PERSONA[persona] ?? "diary");
 
   const latestUserMessage = [...turns].reverse().find((turn) => turn.role === "user")?.content ?? "";
 

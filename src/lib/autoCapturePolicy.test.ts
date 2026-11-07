@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  AUTO_CAPTURE_DAY_MS, AUTO_CAPTURE_QUIET_MS, AUTO_CAPTURE_WAIT_MS, beginAutoCaptureAttempt, classifyAutoCaptureFailure, emptyAutoCaptureState, finishAutoCaptureAttempt, heldOnlyWithGemini,
+  AUTO_CAPTURE_DAY_MS, AUTO_CAPTURE_QUIET_MS, AUTO_CAPTURE_WAIT_MS, beginAutoCaptureAttempt, classifyAutoCaptureFailure, emptyAutoCaptureState, finishAutoCaptureAttempt, heldOnlyWith, maySendConversationTo,
   isStopped, parseAutoCaptureSettings, parseAutoCaptureState, selectAutoCaptureTargets, summarizeAutoCapture, withChatProvider, type AutoCaptureSettings,
 } from "./autoCapturePolicy";
 import { chatProvidersAfterAdopting } from "./chatProviderRecord";
@@ -14,7 +14,7 @@ const conv = (id: string, agoMs = AUTO_CAPTURE_QUIET_MS, extra: Partial<Conversa
   turns: [{ role: "user", content: "架空", timestamp: "t" }, { role: "ai", content: "架空の返答", timestamp: "t" }], memoryObjectIds: [], ...extra,
 }) as unknown as Conversation;
 const ids = (list: Conversation[]) => list.map((c) => c.id);
-const select = (list: Conversation[], state = emptyAutoCaptureState(), settings = ON, manual = false, memory: Set<string> = new Set()) => ids(selectAutoCaptureTargets(list, memory, state, settings, NOW, manual));
+const select = (list: Conversation[], state = emptyAutoCaptureState(), settings = ON, manual = false, memory: Set<string> = new Set()) => ids(selectAutoCaptureTargets(list, memory, state, settings, NOW, "gemini", manual));
 
 test("off until the user says otherwise, whatever is stored", () => {
   for (const raw of [undefined, "", "not json", "null", "{}", '{"enabled":"true"}']) assert.deepEqual(parseAutoCaptureSettings(raw), { enabled: false, allowOtherProviders: false });
@@ -43,15 +43,15 @@ test("another AI, or no record of which AI, needs the permission", () => {
   assert.deepEqual(select(list, undefined, { enabled: true, allowOtherProviders: false }), ["gemini"]);
   assert.equal(select(list).length, 4);
   const fresh = conv("x", undefined, { turns: [] });
-  assert.equal(heldOnlyWithGemini(withChatProvider(withChatProvider(fresh, "gemini"), "gemini")), true);
+  assert.equal(heldOnlyWith(withChatProvider(withChatProvider(fresh, "gemini"), "gemini"), "gemini"), true);
   assert.deepEqual(withChatProvider(withChatProvider(fresh, "gemini"), "openai").chatProviders, ["gemini", "openai"]);
   const asked = { ...fresh, chatProviders: [], turns: conv("asked").turns };
   assert.deepEqual(withChatProvider(asked, "gemini").chatProviders, ["gemini"], "a new conversation's first turn may be a past question");
-  assert.equal(heldOnlyWithGemini(asked), false, "no AI on record yet");
+  assert.equal(heldOnlyWith(asked, "gemini"), false, "no AI on record yet");
   assert.deepEqual(withChatProvider(asked, "openai").chatProviders, ["openai"]);
   const resumed = withChatProvider(conv("old"), "gemini");
   assert.deepEqual(resumed.chatProviders, ["unknown", "gemini"], "an old conversation that goes on with Gemini is still unknown");
-  assert.equal(heldOnlyWithGemini(resumed), false);
+  assert.equal(heldOnlyWith(resumed, "gemini"), false);
 });
 
 test("5 attempts in 24 hours, older ones no longer count", () => {
@@ -110,7 +110,7 @@ test("the summary counts what waits, what needs permission and what stopped", ()
   let state = emptyAutoCaptureState();
   for (let i = 0; i < 3; i++) state = beginAutoCaptureAttempt(state, "stopped", NOW);
   const list = [conv("stopped", undefined, { chatProviders: ["gemini"] }), conv("ok", undefined, { chatProviders: ["gemini"] }), conv("unknown")];
-  assert.deepEqual(summarizeAutoCapture(list, new Set(), state, { enabled: true, allowOtherProviders: false }), { waiting: 1, stopped: 1, needsPermission: 1, heldForMemory: 0 });
+  assert.deepEqual(summarizeAutoCapture(list, new Set(), state, { enabled: true, allowOtherProviders: false }, "gemini"), { waiting: 1, stopped: 1, needsPermission: 1, heldForMemory: 0 });
 });
 
 test("a conversation that refers to Memories is not sent, automatically or by the manual retry, whether or not they are found", () => {
@@ -124,9 +124,9 @@ test("a conversation that refers to Memories is not sent, automatically or by th
 test("the summary keeps a conversation whose Memories are missing apart: not waiting, not stopped, not finished", () => {
   const settings = { enabled: true, allowOtherProviders: true };
   const missing = conv("missing", undefined, { memoryObjectIds: ["gone"] });
-  assert.deepEqual(summarizeAutoCapture([missing, conv("free")], new Set(), emptyAutoCaptureState(), settings, new Set()), { waiting: 1, stopped: 0, needsPermission: 0, heldForMemory: 1 });
-  assert.deepEqual(summarizeAutoCapture([missing], new Set(), emptyAutoCaptureState(), settings, new Set(["gone"])), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "found, under another or no conversationId: nothing is missing");
-  assert.deepEqual(summarizeAutoCapture([missing], new Set(["missing"]), emptyAutoCaptureState(), settings, new Set()), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "it has a Memory");
+  assert.deepEqual(summarizeAutoCapture([missing, conv("free")], new Set(), emptyAutoCaptureState(), settings, "gemini", new Set()), { waiting: 1, stopped: 0, needsPermission: 0, heldForMemory: 1 });
+  assert.deepEqual(summarizeAutoCapture([missing], new Set(), emptyAutoCaptureState(), settings, "gemini", new Set(["gone"])), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "found, under another or no conversationId: nothing is missing");
+  assert.deepEqual(summarizeAutoCapture([missing], new Set(["missing"]), emptyAutoCaptureState(), settings, "gemini", new Set()), { waiting: 0, stopped: 0, needsPermission: 0, heldForMemory: 0 }, "it has a Memory");
 });
 
 test("adopting a Vault version: the record of the AI stays only while the words are the same", () => {
@@ -138,5 +138,27 @@ test("adopting a Vault version: the record of the AI stays only while the words 
   assert.deepEqual(chatProvidersAfterAdopting({ turns: [], chatProviders: [] }, turns), ["unknown"], "a new record taking in words from elsewhere");
   assert.equal(chatProvidersAfterAdopting({ turns, chatProviders: undefined }, other), undefined, "already unknown");
   assert.deepEqual(chatProvidersAfterAdopting({ turns, chatProviders: ["gemini", "unknown"] }, other), ["gemini", "unknown"]);
-  assert.equal(heldOnlyWithGemini({ ...conv("y"), chatProviders: chatProvidersAfterAdopting({ turns, chatProviders: ["gemini"] }, other) } as Conversation), false);
+  assert.equal(heldOnlyWith({ ...conv("y"), chatProviders: chatProvidersAfterAdopting({ turns, chatProviders: ["gemini"] }, other) } as Conversation, "gemini"), false);
+});
+
+test("the chosen AI decides: a conversation held only with it may go there; one held with another AI, partly or with no record, needs the permission", () => {
+  const held = (...p: string[]) => ({ ...conv("x"), chatProviders: p } as Conversation);
+  const off = { allowOtherProviders: false }, on = { allowOtherProviders: true };
+  assert.equal(maySendConversationTo(held("openai"), "openai", off), true);
+  assert.equal(maySendConversationTo(held("openai", "openai"), "openai", off), true);
+  assert.equal(maySendConversationTo(held("openai"), "gemini", off), false, "made with OpenAI, Gemini chosen now: not without the permission");
+  assert.equal(maySendConversationTo(held("gemini"), "openai", off), false, "made with Gemini, OpenAI chosen now");
+  assert.equal(maySendConversationTo(held("gemini", "openai"), "openai", off), false, "switched during the conversation");
+  assert.equal(maySendConversationTo(held(), "openai", off), false, "no AI on record");
+  assert.equal(maySendConversationTo({ ...conv("x"), chatProviders: undefined } as Conversation, "gemini", off), false, "an earlier conversation with no record");
+  assert.equal(maySendConversationTo(held("gemini", "openai"), "openai", on), true, "the user's permission");
+  const list = [{ ...held("openai"), id: "o" }, { ...held("gemini"), id: "g" }] as Conversation[];
+  const strict: AutoCaptureSettings = { enabled: true, allowOtherProviders: false };
+  assert.deepEqual(ids(selectAutoCaptureTargets(list, new Set(), emptyAutoCaptureState(), strict, NOW, "openai")), ["o"]);
+  assert.deepEqual(ids(selectAutoCaptureTargets(list, new Set(), emptyAutoCaptureState(), strict, NOW, "gemini")), ["g"]);
+  assert.deepEqual(summarizeAutoCapture(list, new Set(), emptyAutoCaptureState(), strict, "openai"), { waiting: 1, stopped: 0, needsPermission: 1, heldForMemory: 0 });
+  assert.deepEqual(ids(selectAutoCaptureTargets(list, new Set(), emptyAutoCaptureState(), ON, NOW, "openai")).sort(), ["g", "o"], "with the permission");
+});
+test("a run stopped because the chosen AI changed costs nothing and uses up no attempt", () => {
+  assert.equal(classifyAutoCaptureFailure(Object.assign(new Error("x"), { name: "AiSelectionChangedError" }), false), "key");
 });

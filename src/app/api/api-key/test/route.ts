@@ -7,11 +7,11 @@ export const runtime = "nodejs";
  * Beta：ユーザーがAPIキー設定画面に入力したキーを、保存する前に検証するためだけの
  * 軽量エンドポイント。/api/chat 等とは違い、会話履歴やMemoryは一切扱わない。
  * 検証に使ったキー自体はレスポンスに含めない・ログに出さない。
- *
- * `X-AI-Provider`が無い場合はGemini（既存クライアントとの後方互換）。
+ * 確かめるAIは`X-AI-Provider`で名指ししたものだけ（名指しが無ければ断る）。
  */
 export async function POST(request: Request) {
-  const providerName = resolveRequestedProvider(request) ?? "gemini";
+  const providerName = resolveRequestedProvider(request);
+  if (!providerName) return Response.json({ ok: false, error: "利用するAIが指定されていません。" }, { status: 400 });
   const apiKey = resolveApiKey(request, providerName, { allowEnvFallback: false });
   if (!apiKey) {
     return Response.json({ ok: false, error: "APIキーが指定されていません。" }, { status: 400 });

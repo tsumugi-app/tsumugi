@@ -8,7 +8,7 @@
 
 import { beginCaptureDebug, bindCaptureDebug, captureDebugId, observeCapture, observeCaptureSave, type CaptureDebugServer } from "./captureDebug";
 import { ulid } from "ulid";
-import { commitCaptureResult, getAllMemoryObjects, loadApiKey, putConversation, putCapturedMemoryWithOutbox, type CaptureCommitResult } from "./db";
+import { commitCaptureResult, getAllMemoryObjects, putConversation, putCapturedMemoryWithOutbox, type CaptureCommitResult } from "./db";
 import { logTimingEvent } from "./debugTimingLog";
 import { isReflectionSummary, writeConversationMarkdown, writeMemoryObjectMarkdown, type VaultWritePriority } from "./vault";
 import type { ConversationEntryKind } from "./conversationEntryKind";
@@ -32,7 +32,7 @@ import {
   sanitizeStoredTopicEvents,
   validateTopicEventQuotes,
 } from "./topicEvent";
-import { GEMINI_API_KEY_HEADER, userKeyOnlyHeaders } from "./apiKeyHeader";
+import { selectedAiHeaders, type AiRequestOptions } from "./selectedAi";
 import { turnsForAi } from "./aiReplyOutcome";
 import { trustedStatedAt } from "./captureEvidence";
 
@@ -361,7 +361,7 @@ export class CaptureRequestError extends Error {
   constructor(public readonly status: number) { super(`capture request failed with status ${status}`); this.name = "CaptureRequestError"; }
 }
 
-type ExtractionResult = { memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics };
+type ExtractionResult = { memories: ExtractedMemory[]; diagnostics?: CaptureDiagnostics; /** the AI that made them */ aiProvider?: string };
 
 async function extractMemories(
   persona: Persona,
@@ -371,11 +371,11 @@ async function extractMemories(
   debugId?: string,
   signal?: AbortSignal,
   onRequestSent?: () => void,
-  requireUserKey?: boolean
+  ai?: AiRequestOptions
 ): Promise<ExtractionResult> {
-  const apiKey = await loadApiKey();
   // an automatic run: no usable key at this moment, no request. The mark makes the server refuse too, so its own key is never used.
-  const keyHeaders = requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};
+  // the AI the user chose, with its own key only; nothing is sent if the choice changed since the run began (`ai.provider`)
+  const { provider: aiProvider, headers: keyHeaders } = await selectedAiHeaders(ai);
   const toRef = (memory: MemoryObject) => ({
     id: memory.id,
     summary: memory.summary,
@@ -422,7 +422,7 @@ async function extractMemories(
     d && typeof d.proposed === "number" && typeof d.accepted === "number"
       ? { proposed: d.proposed, accepted: d.accepted, dropped: typeof d.dropped === "number" ? d.dropped : 0 }
       : undefined;
-  return { memories: data.memories ?? [], diagnostics };
+  return { memories: data.memories ?? [], diagnostics, aiProvider };
 }
 
 export interface CaptureResult {
@@ -454,7 +454,7 @@ export interface CaptureResult {
 export async function captureConversation(
   conversation: Conversation,
   existingMemoryObjects: MemoryObject[],
-  options?: { signal?: AbortSignal; onRequestSent?: () => void; requireUserKey?: boolean }
+  options?: { signal?: AbortSignal; onRequestSent?: () => void } & AiRequestOptions
 ): Promise<CaptureResult> {
   const debugId = beginCaptureDebug(conversation);
   try {
@@ -462,7 +462,7 @@ export async function captureConversation(
     // A switch in the meantime is seen by the second lock's epoch check (another tab) or waits for this tracked task (this tab).
     const ownMemoryObjects = existingMemoryObjects.filter((memory) => isSameConversation(memory.conversationId, conversation.id));
     const relatedMemoryObjects = await withVaultWorldRead(() => findRelatedMemoriesFromOtherConversations(conversation, ownMemoryObjects));
-    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal, options?.onRequestSent, options?.requireUserKey);
+    const extraction = await extractMemories(conversation.persona, turnsForAi(conversation.turns), ownMemoryObjects, relatedMemoryObjects, debugId, options?.signal, options?.onRequestSent, { provider: options?.provider, requireUserKey: options?.requireUserKey });
     return await withVaultWorldRead(() => captureConversationImpl(conversation, ownMemoryObjects, relatedMemoryObjects, extraction, debugId));
   } catch (error) {
     observeCapture(debugId, e => { e.phase += "; capture-failed"; });
@@ -721,7 +721,7 @@ async function captureConversationImpl(
         id: ulid(),
         schemaVersion: SCHEMA_VERSION,
         source: "ai-capture",
-        aiProvider: AI_PROVIDER,
+        aiProvider: extraction.aiProvider ?? AI_PROVIDER,
         confidence: item.confidence,
         createdAt: timestamp,
         updatedAt: timestamp,

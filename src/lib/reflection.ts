@@ -9,29 +9,28 @@
 "use client";
 
 import { ulid } from "ulid";
-import { loadApiKey } from "./db";
 import { SCHEMA_VERSION } from "./types";
 import type { Conversation, MemoryObject, Persona } from "./types";
-import { GEMINI_API_KEY_HEADER } from "./apiKeyHeader";
-
-const AI_PROVIDER = "gemini";
+import { selectedAiHeaders } from "./selectedAi";
 
 export interface SessionReflection {
   /** Conversation History一覧の識別用タイトル（Conversation.titleへ保存する）。Reflection本文の要約ではない。 */
   title: string;
   reflection: string;
+  /** the AI that wrote it (the one the user chose) */
+  aiProvider?: string;
 }
 
 export async function generateSessionReflection(
   persona: Persona,
   sourceMemoryObject: MemoryObject
 ): Promise<SessionReflection> {
-  const apiKey = await loadApiKey();
+  const { provider, headers } = await selectedAiHeaders();
   const res = await fetch("/api/reflect", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {}),
+      ...headers,
     },
     body: JSON.stringify({
       persona,
@@ -44,13 +43,14 @@ export async function generateSessionReflection(
     throw new Error(`reflect request failed with status ${res.status}`);
   }
   const data = (await res.json()) as SessionReflection;
-  return data;
+  return { ...data, aiProvider: provider };
 }
 
 export function createInsightMemoryObject(
   conversation: Conversation,
   sourceMemoryObject: MemoryObject,
-  reflectionText: string
+  reflectionText: string,
+  aiProvider?: string
 ): MemoryObject {
   const timestamp = new Date().toISOString();
   return {
@@ -75,7 +75,7 @@ export function createInsightMemoryObject(
       id: ulid(),
       schemaVersion: SCHEMA_VERSION,
       source: "system-generated",
-      aiProvider: AI_PROVIDER,
+      ...(aiProvider ? { aiProvider } : {}),
       createdAt: timestamp,
       updatedAt: timestamp,
     },

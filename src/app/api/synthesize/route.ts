@@ -1,4 +1,4 @@
-import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getProvider, resolveApiKey, resolveModel, resolveRequestedProvider } from "@/lib/ai/resolve";
 import { renderClustersForModel, SYNTHESIS_LIMITS, validateSynthesisItems, type SynthesisCluster, type SynthesisEvidence } from "@/lib/memorySynthesis";
 import { renderReactionChecksForModel, renderRejectedForModel, SYNTHESIS_S1_INSTRUCTIONS, SYNTHESIS_S1_SCHEMA, SYNTHESIS_SYSTEM_PROMPT } from "@/lib/memorySynthesisPrompt";
 import { gateS1Items, keywordThemeId, SYNTHESIS_S1_LIMITS, textSimilarity, validateReactions, type ReactionCheck } from "@/lib/synthesisModel";
@@ -83,9 +83,11 @@ function sanitizeRejected(raw: unknown): { theme: string; statement: string; use
 }
 
 export async function POST(request: Request) {
-  const providerName = resolveProviderForFeature("reflection");
+  // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
+  const providerName = resolveRequestedProvider(request);
+  if (!providerName) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
   const apiKey = resolveApiKey(request, providerName);
-  if (!apiKey) return Response.json({ error: "Gemini APIキーが設定されていません。" }, { status: 401 });
+  if (!apiKey) return Response.json({ error: "APIキーが設定されていません。" }, { status: 401 });
 
   let body: Record<string, unknown>;
   try {

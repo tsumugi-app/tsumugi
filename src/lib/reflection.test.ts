@@ -41,8 +41,8 @@ const fakeProvider = {
 };
 
 const stubs: Record<string, unknown> = {
-  "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini" },
-  "./db": new Proxy({ loadApiKey: async () => "k" }, { get: (t: Record<string, unknown>, k: string) => (k in t ? t[k] : async () => undefined) }),
+  "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveRequestedProvider: () => "gemini" },
+  "./db": new Proxy({ loadApiKey: async () => "k", loadSelectedAi: async () => ({ provider: "gemini", key: "k" }) }, { get: (t: Record<string, unknown>, k: string) => (k in t ? t[k] : async () => undefined) }),
 };
 
 const mod = Module as unknown as {

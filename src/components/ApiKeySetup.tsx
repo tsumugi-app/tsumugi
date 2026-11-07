@@ -23,7 +23,7 @@ const PROVIDER_INFO: Record<
   gemini: {
     label: "Gemini",
     intro:
-      "Geminiは既定でTsumugiが用意したAPIキーを使うため、あなた自身のAPIキーは必須ではありません。自分のキーを使いたい場合のみ、ここから設定できます。",
+      "Geminiを利用するAIに選んでいる間は、Tsumugiが用意したAPIキーを使えるため、あなた自身のAPIキーは必須ではありません。自分のキーを使いたい場合のみ、ここから設定できます。",
     getKeyUrl: "https://aistudio.google.com/apikey",
     getKeyLabel: "Google AI StudioでAPIキーを取得する",
     inputPlaceholder: "Gemini APIキーを入力（任意）",
@@ -31,7 +31,7 @@ const PROVIDER_INFO: Record<
   },
   openai: {
     label: "OpenAI",
-    intro: "会話の生成にOpenAIのAPIを使う場合、あなた自身のOpenAI APIキーが必要です。",
+    intro: "OpenAIを利用するAIにする場合、あなた自身のOpenAI APIキーが必要です。会話・記憶の作成・振り返りなど、AIを使う全ての機能がこのキーでOpenAIへ送られます（Geminiへは送りません）。",
     getKeyUrl: "https://platform.openai.com/api-keys",
     getKeyLabel: "OpenAI PlatformでAPIキーを取得する",
     inputPlaceholder: "OpenAI APIキーを入力",
@@ -245,7 +245,7 @@ export default function ApiKeySetup({
             <div className="flex flex-col gap-1">
               <p className="text-stone-800 dark:text-stone-100">料金について</p>
               <p>
-                Beta版のGeminiは、既定ではTsumugiが用意したAPIキーで動作するため、
+                Beta版では、Geminiを利用するAIに選んでいる間だけ、Tsumugiが用意したAPIキーで動作するため、
                 自分でAPIキーを用意しなくても利用できます。OpenAIを使う場合や、
                 自分自身のGemini APIキーを使いたい場合は、あなた自身のAPIキーが必要です。
                 その場合、Tsumugiの利用自体に料金は発生しませんが、AIサービス側の利用料金は

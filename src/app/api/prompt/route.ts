@@ -1,4 +1,4 @@
-import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getProvider, resolveApiKey, resolveModel, resolveRequestedProvider } from "@/lib/ai/resolve";
 import { buildRevisitPromptRecord } from "@/lib/revisitPromptSafety";
 
 export const runtime = "nodejs";
@@ -63,11 +63,13 @@ Memory：「公園を散歩した。」（出来事日時：2026-09-16、日精�
 - ユーザーに返すのは問いかけの本文だけにする。前置きの説明や解説を付けない`;
 
 export async function POST(request: Request) {
-  const providerName = resolveProviderForFeature("revisitPrompt");
+  // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
+  const providerName = resolveRequestedProvider(request);
+  if (!providerName) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
     return Response.json(
-      { error: "Gemini APIキーが設定されていません。" },
+      { error: "APIキーが設定されていません。" },
       { status: 401 }
     );
   }

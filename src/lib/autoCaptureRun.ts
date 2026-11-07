@@ -8,8 +8,10 @@ export type AutoCaptureRunOutcome = "off" | "blocked" | "no-key" | "offline" | "
 
 export interface AutoCaptureDeps {
   loadSettings(): Promise<AutoCaptureSettings>;
-  /** only the user's own Gemini key: without one nothing is sent, so the server key is never used. `capture` asks again at the request, as the key can go at any time. */
-  hasUserKey(): Promise<boolean>;
+  /** the AI the user chose now; the whole run sends only there */
+  selectedProvider(): Promise<string>;
+  /** only the user's own key for that AI: without one nothing is sent, so the server key is never used. `capture` asks again at the request, as the key or the choice can change at any time. */
+  hasUserKey(provider: string): Promise<boolean>;
   online(): boolean;
   /** Vault not connected, recovery pending, Vault switch running, stale tab */
   blocked(): boolean;
@@ -23,8 +25,8 @@ export interface AutoCaptureDeps {
   ifConversationFree<T>(id: string, fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: false }>;
   /** false: the Vault file was edited from outside or is held, so the stored words may be old */
   vaultFileUnchanged(conversation: Conversation): Promise<boolean>;
-  /** calls `onRequestSent` just before the AI request starts */
-  capture(conversation: Conversation, signal: AbortSignal, onRequestSent: () => void): Promise<AutoCaptureResult>;
+  /** calls `onRequestSent` just before the AI request starts; sends to `provider` only, and nothing if the user's choice is no longer `provider` */
+  capture(conversation: Conversation, signal: AbortSignal, onRequestSent: () => void, provider: string): Promise<AutoCaptureResult>;
   now(): number;
 }
 
@@ -35,18 +37,19 @@ export async function runAutoCapture(deps: AutoCaptureDeps, options: { manual?: 
   if (!manual && !settings.enabled) return "off";
   if (deps.blocked()) return "blocked";
   if (!deps.online()) return "offline";
-  if (!(await deps.hasUserKey())) return "no-key";
+  const provider = await deps.selectedProvider();
+  if (!(await deps.hasUserKey(provider))) return "no-key";
   const outcome = await deps.withRunLock(async () => {
     const state = await deps.readState();
     const conversations = await deps.readConversations();
     const withMemory = await deps.conversationsWithMemory();
-    for (const candidate of selectAutoCaptureTargets(conversations, withMemory, state, settings, deps.now(), manual)) {
+    for (const candidate of selectAutoCaptureTargets(conversations, withMemory, state, settings, deps.now(), provider, manual)) {
       const run = await deps.ifConversationFree(candidate.id, async (): Promise<AutoCaptureRunOutcome | "not-sent"> => {
         // the lists above were read before the locks: decide again on what is stored now
         const before = await deps.readState();
         const stored = await deps.readConversation(candidate.id);
         const memoriesNow = await deps.conversationsWithMemory();
-        if (!stored || !selectAutoCaptureTargets([stored], memoriesNow, before, settings, deps.now(), manual).length) return "not-sent";
+        if (!stored || !selectAutoCaptureTargets([stored], memoriesNow, before, settings, deps.now(), provider, manual).length) return "not-sent";
         if (!(await deps.vaultFileUnchanged(stored))) return "not-sent";
         await deps.writeState(beginAutoCaptureAttempt(before, stored.id, deps.now(), manual && isStopped(before, stored.id)));
 
@@ -57,7 +60,7 @@ export async function runAutoCapture(deps: AutoCaptureDeps, options: { manual?: 
         const poll = setInterval(() => { if (options.shouldCancel?.()) { cancelledNow = true; controller.abort(); } }, 500);
         let result: AutoCaptureResult;
         try {
-          result = await deps.capture(stored, controller.signal, () => { requested = true; });
+          result = await deps.capture(stored, controller.signal, () => { requested = true; }, provider);
         } catch (error) {
           const name = (error as Error | undefined)?.name;
           if (name === "StaleVaultTabError" || name === "IncompleteVaultWorldError") {

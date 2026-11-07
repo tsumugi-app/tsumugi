@@ -1749,26 +1749,24 @@ const API_KEY_STORAGE_KEY: Record<AIProviderName, string> = {
   claude: "claudeApiKey",
 };
 
-export async function saveApiKey(apiKey: string, provider: AIProviderName = "gemini") {
+export async function saveApiKey(apiKey: string, provider: AIProviderName) {
   const db = await getDB();
   await db.put("settings", apiKey, API_KEY_STORAGE_KEY[provider]);
 }
 
-export async function loadApiKey(provider: AIProviderName = "gemini"): Promise<string | undefined> {
+export async function loadApiKey(provider: AIProviderName): Promise<string | undefined> {
   const db = await getDB();
   return db.get("settings", API_KEY_STORAGE_KEY[provider]);
 }
 
-export async function clearApiKey(provider: AIProviderName = "gemini") {
+export async function clearApiKey(provider: AIProviderName) {
   const db = await getDB();
   await db.delete("settings", API_KEY_STORAGE_KEY[provider]);
 }
 
 /**
- * Beta：「APIキーを登録するprovider」とは別の概念。chatの送信（companion/coach/analyst）に
- * どのproviderを使うかだけを持つ設定値。未設定時はGemini（既存動作を完全に維持するため）。
- * chat以外の機能（Capture/Connect/Reflection/問いかけ生成）はこの設定を参照しない
- * （今回のPhaseでは固定のまま）。
+ * 利用者が選んだAI。会話だけでなく、Capture・Connect・Reflection・問いかけ生成・Synthesis・起動時のMemory作成まで、
+ * AIを使う全ての機能の送り先になる（`loadSelectedAi`）。未設定の端末では、これまでの既定のGemini。
  */
 const CHAT_PROVIDER_KEY = "chatProvider";
 
@@ -1798,6 +1796,12 @@ export async function loadChatProvider(): Promise<AIProviderName> {
   const db = await getDB();
   const value = await db.get("settings", CHAT_PROVIDER_KEY);
   return value === "openai" || value === "claude" ? value : "gemini";
+}
+
+/** 利用者が選んだAIと、そのAIのキーだけ（他のAIのキーは読まない）。全ての機能の送り先とキーはここで決まる。 */
+export async function loadSelectedAi(): Promise<{ provider: AIProviderName; key: string | undefined }> {
+  const provider = await loadChatProvider();
+  return { provider, key: await loadApiKey(provider) };
 }
 
 /**
