@@ -21,7 +21,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
-import { diaryDateOf, diaryTimeLabelAt, isOpenRealtimeDiary, isRealtimeDiaryComplete, needsDiaryDayChange, previousDiaryDate, realtimeDiariesToFinish, resumableRealtimeDiary } from "@/lib/realtimeDiary";
+import { diaryDateOf, diaryTimeLabelAt, isOpenRealtimeDiary, isRealtimeDiaryComplete, keepsEveryTurn, needsDiaryDayChange, previousDiaryDate, realtimeDiariesToFinish, resumableRealtimeDiary } from "@/lib/realtimeDiary";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { conversationFileState } from "@/lib/conversationFileCheck";
 import { classifyAutoCaptureFailure, maySendConversationTo, parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
@@ -4959,6 +4959,8 @@ export default function ChatScreen() {
       const openId = baseConversation.id;
       const stored = await withVaultWorldRead(() => getConversation(openId)).catch(() => undefined);
       if (stored?.endedAt) baseConversation = stored;
+      // 同じ日記を別のタブで書き足していたら、その発言を含む保存済みの記録に続ける（この画面の古い写しで上書きして消さない）
+      else if (stored && !keepsEveryTurn(stored.turns, baseConversation.turns) && keepsEveryTurn(baseConversation.turns, stored.turns)) baseConversation = stored;
     }
     // まだ発言の無いリアルタイム日記は何も保存されていないので、最初の発言の時点の対象日にする（午前4時の前に開いて、後に書き始めた）
     if (baseConversation.realtimeDiary && !baseConversation.endedAt && baseConversation.turns.length === 0 && !retryTurns) {

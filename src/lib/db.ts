@@ -5,6 +5,7 @@
  */
 "use client";
 
+import { keepsEveryTurn } from "./realtimeDiary";
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
 import { isWipePending, WipeInProgressError } from "./wipeState";
@@ -230,8 +231,19 @@ function withoutDeletedMemoryRefs(c: Conversation, map: TombstoneMap | null): Co
  * A realtime diary that another tab or device has ended (its text and Memory are being or were made from those words) is never written back as open by a screen that is behind:
  * whole-record saves of an open diary are refused when the stored one is ended (checked inside the same transaction). Saves that end it, and other conversations, are unchanged.
  */
+/** 書きかけのリアルタイム日記の保存の前に、同じtransactionの中で読んだ記録と比べる（RealtimeDiaryEndedError参照） */
+function assertOpenRealtimeDiarySave(stored: Conversation | undefined, next: Conversation) {
+  if (!stored) return;
+  if (stored.endedAt) throw new RealtimeDiaryEndedError(next.id);
+  if (!keepsEveryTurn(stored.turns, next.turns)) throw new RealtimeDiaryEndedError(next.id, "words-missing");
+}
+
+/**
+ * 書きかけのリアルタイム日記の保存を、保存されている記録の上では断る（画面の写しが古い）。"ended"：別のタブ・端末が既に終えた。
+ * "words-missing"：別のタブで同じ日記に書き足された発言が、この保存には無い（上書きすると消える）。どちらも保存されている記録はそのまま残る。
+ */
 export class RealtimeDiaryEndedError extends Error {
-  constructor(readonly id: string) { super("realtime-diary-ended"); this.name = "RealtimeDiaryEndedError"; }
+  constructor(readonly id: string, readonly reason: "ended" | "words-missing" = "ended") { super(`realtime-diary-${reason}`); this.name = "RealtimeDiaryEndedError"; }
 }
 
 export async function putConversation(conversation: Conversation) {
@@ -240,7 +252,7 @@ export async function putConversation(conversation: Conversation) {
   try {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
-    if (conversation.realtimeDiary && !conversation.endedAt && ((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined)?.endedAt) throw new RealtimeDiaryEndedError(conversation.id);
+    if (conversation.realtimeDiary && !conversation.endedAt) assertOpenRealtimeDiarySave((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined, conversation);
     await tx.objectStore("conversations").put(withoutDeletedMemoryRefs(conversation, tombs));
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
@@ -1494,7 +1506,7 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
   return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
-    if (conversation.realtimeDiary && !conversation.endedAt && ((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined)?.endedAt) throw new RealtimeDiaryEndedError(conversation.id);
+    if (conversation.realtimeDiary && !conversation.endedAt) assertOpenRealtimeDiarySave((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined, conversation);
     return withoutDeletedMemoryRefs(conversation, tombs);
   }, skipIfUnchanged);
 }

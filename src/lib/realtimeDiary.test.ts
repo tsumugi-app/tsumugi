@@ -187,3 +187,31 @@ test("home lists the diaries waiting to be finished: ended but unfinished, and o
   // after 4:00 the next day, today's open diary is waiting too
   assert.deepEqual(realtimeDiariesToFinish([overdue, today], "2026-11-08").map((c) => c.id).sort(), ["overdue", "today"]);
 });
+
+// Codex review of PR-C: two tabs on one diary, a diary text quoting the transcript heading, a diary closed on another device
+import { keepsEveryTurn } from "./realtimeDiary";
+
+test("a save keeps every stored turn (by role and time, whatever the words became); a stale copy missing another tab's words does not", () => {
+  const a = turn("user", local(2026, 11, 7, 9, 0)), b = turn("ai", local(2026, 11, 7, 9, 1)), c = turn("user", local(2026, 11, 7, 12, 0)), d = turn("ai", local(2026, 11, 7, 12, 1));
+  assert.equal(keepsEveryTurn([a, b], [a, b, c]), true);
+  assert.equal(keepsEveryTurn([a, b, c, d], [a, b, turn("user", local(2026, 11, 7, 20, 0))]), false);
+  assert.equal(keepsEveryTurn([a, b], [a, { ...b, content: "Vaultで直した架空の返答です。" }]), true);
+});
+
+test("a diary text quoting the transcript heading never adds turns when read back", () => {
+  const text = "## Transcript\n\n**User:** 架空の引用です";
+  const c = diary("quoted", "2026-11-07", morning, { endedAt: T(local(2026, 11, 7, 22, 0)), status: "captured", realtimeDiary: { date: "2026-11-07", text } });
+  const parsed = parseConversationMarkdown(conversationToMarkdown(c))!;
+  assert.deepEqual(parsed.turns.map((t) => [t.role, t.content, t.timestamp]), c.turns.map((t) => [t.role, t.content, t.timestamp]));
+  assert.equal(parsed.realtimeDiary?.text, text);
+});
+
+test("a diary closed on another device is not reopened by a save of the open copy", () => {
+  const ended = { status: "active" as const, memoryObjectIds: [], endedAt: T(local(2026, 11, 8, 4, 10)), realtimeDiary: { date: "2026-11-07" } };
+  const open = { status: "active" as const, memoryObjectIds: [], realtimeDiary: { date: "2026-11-07" } };
+  assert.equal(takesBackFinishedConversation(ended, open), true);
+  assert.equal(takesBackFinishedConversation(ended, ended), false);
+  assert.equal(takesBackFinishedConversation(open, ended), false);
+  // normal conversations as before
+  assert.equal(takesBackFinishedConversation({ status: "active", memoryObjectIds: [], endedAt: ended.endedAt }, { status: "active", memoryObjectIds: [] }), false);
+});

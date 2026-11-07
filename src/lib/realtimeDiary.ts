@@ -37,6 +37,15 @@ export function isOpenRealtimeDiary(conversation: Conversation): boolean {
   return conversation.realtimeDiary !== undefined && !conversation.endedAt;
 }
 
+/**
+ * `next`が`stored`の発言をすべて含むか（発言と返答を、役割と時刻で見分ける。内容はVaultでの編集で変わりうるので比べない）。
+ * 同じ日記を二つのタブで開いて書いたとき、古い画面の保存が別のタブの発言を消さないための確認（db.tsの保存と、送信前の読み直し）。
+ */
+export function keepsEveryTurn(stored: ConversationTurn[], next: ConversationTurn[]): boolean {
+  const keys = new Set(next.map((t) => `${t.role}|${t.timestamp}`));
+  return stored.every((t) => keys.has(`${t.role}|${t.timestamp}`));
+}
+
 /** 「今日の続きを書く」で開く日記：その対象日の、書きかけで発言のある日記（複数あれば最後に更新されたもの） */
 export function resumableRealtimeDiary(conversations: Conversation[], date: string): Conversation | undefined {
   return conversations

@@ -630,3 +630,30 @@ test.describe("realtime diary PR-C: closed overnight in Auckland at the end of a
     expect((await memoriesOf(page, "rt-november")).length).toBe(1);
   });
 });
+
+test.describe("realtime diary: the same diary written on in two tabs", () => {
+  test("words added by another tab are kept: the stale screen continues from the stored diary instead of writing its old copy over it", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    await fakeApi(page);
+    await startApp(page);
+    await startButton(page).click();
+    await talk(page, "架空の朝の出来事です", 1);
+    const [diary] = await withWords(page, "架空の朝の出来事です");
+    // another tab added words and a reply to the same diary; this screen still shows the morning only
+    await page.evaluate(async (id) => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      await new Promise<void>((res, rej) => {
+        const tx = db.transaction("conversations", "readwrite"); const store = tx.objectStore("conversations"); const q = store.get(id);
+        q.onsuccess = () => { const now = new Date().toISOString(); store.put({ ...q.result, updatedAt: now, turns: [...q.result.turns, { role: "user", content: "別のタブの架空の昼の出来事です", timestamp: now }, { role: "ai", content: "別タブからの返答。", timestamp: now }] }); };
+        tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+      });
+      db.close();
+    }, diary.id);
+    await talk(page, "架空の夜の出来事です", 2);
+    const [after] = await withWords(page, "架空の夜の出来事です");
+    expect(after.id).toBe(diary.id);
+    expect(after.turns.map((t: any) => t.content)).toEqual(["架空の朝の出来事です", "架空の返答です。", "別のタブの架空の昼の出来事です", "別タブからの返答。", "架空の夜の出来事です", "架空の返答です。"]);
+    await expect(page.getByText("別のタブの架空の昼の出来事です")).toBeVisible();
+  });
+});

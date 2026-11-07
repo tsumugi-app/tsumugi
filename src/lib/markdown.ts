@@ -605,8 +605,10 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
 }
 
 function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[]): ConversationTurn[] {
+  // 行頭の見出しだけ（リアルタイム日記の本文中の`\## Transcript`のように、エスケープした行の途中は会話記録の始まりではない）
   const marker = "## Transcript\n\n";
-  const markerIndex = body.indexOf(marker);
+  const markerMatch = /(^|\n)## Transcript\n\n/.exec(body);
+  const markerIndex = markerMatch ? markerMatch.index + markerMatch[1].length : -1;
   const transcriptText = markerIndex === -1 ? "" : body.slice(markerIndex + marker.length);
   if (!transcriptText.trim()) return [];
 
