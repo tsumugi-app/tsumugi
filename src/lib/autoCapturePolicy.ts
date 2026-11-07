@@ -1,5 +1,6 @@
 import { endsWithInterruptedReply, isBlankAiReply } from "./aiReplyOutcome";
 import { UNKNOWN_CHAT_PROVIDER } from "./chatProviderRecord";
+import { isOpenRealtimeDiary } from "./realtimeDiary";
 import type { Conversation } from "./types";
 
 /**
@@ -78,7 +79,9 @@ export function isUnprocessedConversation(c: Conversation): boolean {
   return c.status === "active"
     && c.turns.some((t) => t.role === "user" && t.content.trim() !== "")
     && c.turns.some((t) => t.role === "ai" && !isBlankAiReply(t.content))
-    && !endsWithInterruptedReply(c);
+    && !endsWithInterruptedReply(c)
+    // 書きかけのリアルタイム日記は、本人が終えるまでMemoryにしない（未処理にも数えない）
+    && !isOpenRealtimeDiary(c);
 }
 
 /**

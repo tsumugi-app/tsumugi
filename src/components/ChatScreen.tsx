@@ -21,6 +21,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
+import { diaryDateOf, diaryTimeLabelAt, isOpenRealtimeDiary, resumableRealtimeDiary } from "@/lib/realtimeDiary";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { conversationFileState } from "@/lib/conversationFileCheck";
 import { maySendConversationTo, parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
@@ -724,6 +725,17 @@ export default function ChatScreen() {
   const [sendStatus, setSendStatus] = useState<SendStatus>("idle");
   // 再読み込みの前に途中で止まった応答で終わった会話。ホーム画面から続きを開ける。
   const [interruptedConversation, setInterruptedConversation] = useState<Conversation | null>(null);
+  /** ホームの入口の表示：今日（午前4時区切り）の書きかけのリアルタイム日記があるか（「今日の続きを書く」） */
+  const [todayDiaryOpen, setTodayDiaryOpen] = useState(false);
+  const onEntryScreen = conversation.turns.length === 0 && !entryConfirmed;
+  useEffect(() => {
+    if (!onEntryScreen || vaultStatus === "checking") return;
+    let live = true;
+    void withVaultWorldRead(() => getAllConversations())
+      .then((all) => { if (live) setTodayDiaryOpen(resumableRealtimeDiary(all, diaryDateOf(new Date())) !== undefined); })
+      .catch((error) => { if (!handleStaleVaultTabError(error)) console.error("Failed to look for today's realtime diary", error); });
+    return () => { live = false; };
+  }, [onEntryScreen, vaultStatus]);
   const sendInFlightRef = useRef(false);
   const [reflectionStatus, setReflectionStatus] = useState<ReflectionStatus>("idle");
   const [reflectionText, setReflectionText] = useState("");
@@ -1637,6 +1649,12 @@ export default function ChatScreen() {
     auto?: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult; provider: AIProviderName }
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
+      boundaryOutcomeRef.current = "empty";
+      connectConversationBoundary(Promise.resolve([]), priority);
+      return [];
+    }
+    // 書きかけのリアルタイム日記：ホームへ戻る等の区切りは「一時保存」。AIへは送らず、Memoryは本人が日記を終えたときに作る
+    if (isOpenRealtimeDiary(target)) {
       boundaryOutcomeRef.current = "empty";
       connectConversationBoundary(Promise.resolve([]), priority);
       return [];
@@ -5275,6 +5293,35 @@ export default function ChatScreen() {
     setSendStatus("interrupted");
   }
 
+  /**
+   * リアルタイム日記の入口。今日（端末のローカル時刻、午前4時区切り）の書きかけがあれば、過去の発言とAIの返答ごとその続きを開く。
+   * 無ければ新しく始める（対象日はここで確定。保存は最初の発言から、既存の送信処理のまま）。記録を読めなかったときは、二つ目の日記を作らないよう何もしない。
+   */
+  async function handleOpenRealtimeDiary() {
+    if (busy || isVaultSwitchingRef.current || crossTabStale) return;
+    const date = diaryDateOf(new Date());
+    let resume: Conversation | undefined;
+    try {
+      resume = resumableRealtimeDiary(await withVaultWorldRead(() => getAllConversations()), date);
+    } catch (error) {
+      if (!handleStaleVaultTabError(error)) console.error("Failed to open the realtime diary", error);
+      return;
+    }
+    const target: Conversation = resume ?? { ...createConversation("companion", "diary"), realtimeDiary: { date } };
+    setConversation(target);
+    latestConversationRef.current = target;
+    setPersona("companion");
+    setEntryType("diary");
+    setEntryConfirmed(true);
+    setMemoryObjects([]);
+    setEndedConversationMemories(null);
+    setReflectionStatus("idle");
+    setReflectionText("");
+    setSessionCapturedMemories([]);
+    setStreamingText("");
+    setSendStatus(resume && endsWithInterruptedReply(resume) ? "interrupted" : "idle");
+  }
+
   /** 再試行しないと決めた会話を、通常の会話の区切りと同じ扱いで閉じる（Captureは1回だけ。本文はそのまま残る）。 */
   async function handleLeaveInterruptedConversation() {
     const target = interruptedConversation;
@@ -5714,6 +5761,13 @@ export default function ChatScreen() {
                 日記
               </button>
               <button
+                onClick={() => void handleOpenRealtimeDiary()}
+                disabled={isVaultSwitching || crossTabStale}
+                className="rounded-2xl border border-stone-300/70 px-7 py-5 text-center text-base text-stone-800 transition hover:border-stone-500 hover:bg-stone-100 disabled:opacity-50 dark:border-stone-700/70 dark:text-stone-100 dark:hover:border-stone-400 dark:hover:bg-stone-900"
+              >
+                {todayDiaryOpen ? "今日の続きを書く" : "リアルタイム日記を始める"}
+              </button>
+              <button
                 onClick={() => {
                   const fresh = createConversation("analyst", "conversation");
                   setConversation(fresh);
@@ -5739,6 +5793,10 @@ export default function ChatScreen() {
 
             {conversation.turns.map((turn, index) => (
               <div key={index}>
+                {conversation.realtimeDiary && (() => {
+                  const label = diaryTimeLabelAt(conversation.turns, index, conversation.realtimeDiary.date);
+                  return label && <p data-testid="diary-time" className="pb-2 text-center text-xs text-stone-400 dark:text-stone-500">{label}</p>;
+                })()}
                 <TurnBubble turn={turn} superseded={isSupersededTurn(conversation.turns, index)} />
                 {turn.role === "ai" && <GenerationDebugBadge turnTimestamp={turn.timestamp} />}
               </div>
@@ -5764,7 +5822,21 @@ export default function ChatScreen() {
           会話中に常時表示していた「記憶しました」カードは撤去した（Capture自体・
           IndexedDB/Vaultへの保存は変更なくバックグラウンドで継続する。表示だけをやめた）。
         */}
+        {/* リアルタイム日記：ホームへ戻ると一時保存になる（会話は発言ごとに保存済み）。応答を待つ間は押せない（届いた返答も同じ会話に残すため） */}
+        {conversation.realtimeDiary && !conversation.endedAt && conversation.turns.length > 0 && (
+          <div className="flex flex-col items-center gap-2 pt-4 text-center">
+            <button
+              onClick={() => handleGoToTop()}
+              disabled={busy || isVaultSwitching || crossTabStale}
+              className="text-xs text-stone-400 underline decoration-stone-300 underline-offset-4 transition hover:text-stone-600 disabled:opacity-50 dark:text-stone-500 dark:decoration-stone-700 dark:hover:text-stone-300"
+            >
+              一時保存して閉じる
+            </button>
+          </div>
+        )}
+
         {persona === "companion" &&
+          !conversation.realtimeDiary &&
           conversation.turns[conversation.turns.length - 1]?.role === "ai" &&
           !conversation.endedAt && (
           <div className="flex flex-col items-center gap-2 pt-4 text-center">

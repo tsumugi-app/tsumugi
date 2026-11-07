@@ -25,6 +25,7 @@ import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeRes
 import { sanitizeStoredProfileClaims } from "./profile";
 import { sanitizeStoredPersonMentions } from "./person";
 import { sanitizeStoredTopicEvents } from "./topicEvent";
+import { isDiaryDate } from "./realtimeDiary";
 
 function yamlScalar(value: string): string {
   const looksSpecial =
@@ -131,6 +132,8 @@ export function conversationToMarkdown(conversation: Conversation): string {
     turnTimes: conversation.turns.length > 0 ? JSON.stringify(conversation.turns.map((turn) => turn.timestamp)) : undefined,
     // 途中で止まった応答の時刻（`turnTimes`と同じ形）。本文の形式は変えない。該当が無い会話にはキー自体を書かない。
     interruptedTurns: conversation.turns.some((turn) => turn.interrupted) ? JSON.stringify(conversation.turns.filter((turn) => turn.interrupted).map((turn) => turn.timestamp)) : undefined,
+    // リアルタイム日記の対象日（発言時刻とは別）。通常の会話・日記にはキー自体を書かない。
+    diaryDate: conversation.realtimeDiary && isDiaryDate(conversation.realtimeDiary.date) ? conversation.realtimeDiary.date : undefined,
     source: conversation.metadata.source,
     sourceType: conversation.metadata.sourceType,
     sourceDetail: stringifySourceDetail(conversation.metadata.sourceDetail),
@@ -560,6 +563,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
   const turnTimes = parseTurnTimes(frontmatter.turnTimes);
   const interruptedTurns = new Set(parseTurnTimes(frontmatter.interruptedTurns));
+  const diaryDate = frontmatter.diaryDate;
 
   return {
     id,
@@ -571,6 +575,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
     title: asString(frontmatter.title),
+    ...(isDiaryDate(diaryDate) ? { realtimeDiary: { date: diaryDate } } : {}),
     createdAt,
     updatedAt,
     metadata: {
