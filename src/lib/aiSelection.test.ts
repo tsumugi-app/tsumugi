@@ -13,7 +13,7 @@ const USER_OPENAI = "fictional-user-openai-key";
 
 const ROOT = path.join(__dirname, "..");
 const reached: string[] = [];
-const ANSWER = JSON.stringify({ memories: [], links: [], title: "架空", reflection: "架空の振り返り", userMentioned: false, assistantMentioned: false, desire: "unknown", action: "unknown", evaluation: "unknown", items: [], reactions: [] });
+const ANSWER = JSON.stringify({ memories: [], links: [], title: "架空", reflection: "架空の振り返り", diary: "架空の日記です。", userMentioned: false, assistantMentioned: false, desire: "unknown", action: "unknown", evaluation: "unknown", items: [], reactions: [] });
 
 class GoogleGenAI {
   constructor({ apiKey }: { apiKey: string }) { reached.push(`gemini:${apiKey}`); }
@@ -64,6 +64,7 @@ const ROUTES: Record<string, unknown> = {
   reflect: { persona: "companion", ...MEMORY },
   "fact-extract": { subject: "架空", turns: TURNS },
   "semantic-interpret": { fact: { id: "f", subject: "架空", evidence: [{ quote: "架空の話題です" }] } },
+  diary: { date: "2026-01-01", turns: TURNS },
   "api-key/test": {},
 };
 /** reached only with a non-empty Memory Synthesis plan; its refusals are checked, and it shares the resolver with the others */

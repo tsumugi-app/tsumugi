@@ -906,6 +906,8 @@ export interface HistoryConversationSummary {
   id: string;
   mode: HistoryConversationMode;
   turnCount: number;
+  /** リアルタイム日記の対象日（あれば、Historyはこの日に出す）。追加のみのoptional：無い行は従来どおり */
+  diaryDate?: string;
 }
 
 /**
@@ -1039,7 +1041,7 @@ async function withHistoryIndexLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export type HistoryIndexUpdate =
-  | { kind: "conversation"; id: string; day: string; mode: HistoryConversationMode; turnCount: number }
+  | { kind: "conversation"; id: string; day: string; mode: HistoryConversationMode; turnCount: number; diaryDate?: string }
   | { kind: "reflection"; id: string; day: string; preview: string; createdAt: string }
   /**
    * 通常Memory（day-fileへ統合される形式）専用。`normalMemories`は呼び出し元
@@ -1125,6 +1127,7 @@ function computeUpdatedDayEntryV2(
       id: update.id,
       mode: update.mode,
       turnCount: update.turnCount,
+      ...(update.diaryDate ? { diaryDate: update.diaryDate } : {}),
     });
   } else if (update.kind === "reflection") {
     base.reflections = upsertById(base.reflections, {
@@ -1165,7 +1168,7 @@ function computeUpdatedDayEntry(previous: HistoryDayIndex | undefined, update: H
 }
 
 function isHistoryConversationSummaryEqual(a: HistoryConversationSummary, b: HistoryConversationSummary): boolean {
-  return a.id === b.id && a.mode === b.mode && a.turnCount === b.turnCount;
+  return a.id === b.id && a.mode === b.mode && a.turnCount === b.turnCount && a.diaryDate === b.diaryDate;
 }
 
 function isHistoryMemorySummaryEqual(a: HistoryMemorySummary, b: HistoryMemorySummary): boolean {
@@ -1930,6 +1933,7 @@ async function writeConversationMarkdownImpl(
     day: conversation.startedAt.slice(0, 10),
     mode,
     turnCount: conversation.turns.length,
+    ...(conversation.realtimeDiary ? { diaryDate: conversation.realtimeDiary.date } : {}),
   });
 
   // Vault Registry（Step 2）：Markdown write成功後にのみ更新する（本体が保存されて
@@ -6026,6 +6030,7 @@ function mergeConversationForApply(f: Conversation, l: Conversation): Conversati
     ...f,
     turns,
     chatProviders: chatProvidersAfterAdopting(l, f.turns),
+    realtimeDiary: f.realtimeDiary?.text ? { ...l.realtimeDiary, ...f.realtimeDiary } : (l.realtimeDiary ?? f.realtimeDiary),
     promptedMemoryId: l.promptedMemoryId,
     metadata: {
       ...l.metadata,
@@ -6100,6 +6105,7 @@ async function updateHistoryIndexForSingleRecord(
       day: conversation.startedAt.slice(0, 10),
       mode,
       turnCount: conversation.turns.length,
+      ...(conversation.realtimeDiary ? { diaryDate: conversation.realtimeDiary.date } : {}),
     });
     return;
   }

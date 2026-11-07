@@ -18,7 +18,7 @@ import {
 import type { HistoryDayIndex, HistoryDayIndexV2, HistoryMonthIndex } from "@/lib/vault";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType } from "@/lib/types";
 import { getJstTodayDateString, getJstYearMonth } from "@/lib/jstDate";
-import { JST_TIME_ZONE, jstDateOf, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
+import { JST_TIME_ZONE, addDaysToDateKey, jstDateOf, monthKeyOfDateKey, previousDateKey } from "@/lib/dateModel";
 import {
   conversationEntryTypeOf,
   conversationEntryTypeLabel,
@@ -173,11 +173,19 @@ function addMonths(year: number, month: number, delta: number): { year: number; 
  * `fileNameFor`/Registryのfallback pathはStorage Bucket基準のため、Logical Date
  * を渡すと誤ったファイル名を組み立ててしまう。
  */
+/** 「11月7日」 */
+function diaryDayLabel(date: string): string {
+  const [, m, d] = date.split("-").map(Number);
+  return `${m}月${d}日`;
+}
+
 interface ConversationRow {
   id: string;
   modeLabel: string;
   turnCount: number;
   bucketDay: string;
+  /** リアルタイム日記の対象日（History Indexか本体から） */
+  diaryDate?: string;
   full?: Conversation;
 }
 
@@ -214,7 +222,7 @@ interface MemoryRow {
  * 表示される」ことを優先する）。
  */
 function logicalDateOfConversationRow(row: ConversationRow): string {
-  return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay);
+  return conversationLogicalDay(row.id, row.full?.startedAt, row.bucketDay, row.full?.realtimeDiary?.date ?? row.diaryDate);
 }
 
 /**
@@ -342,6 +350,8 @@ export default function HistoryPanel({
    * effectでペアとして取得・破棄する。
    */
   const [prevMonthIndex, setPrevMonthIndex] = useState<HistoryMonthIndex | null>(null);
+  /** 翌月の月Index：月末日のリアルタイム日記は、端末の時間帯によって翌月1日のStorage Bucketにある（対象日は月末日） */
+  const [nextMonthIndex, setNextMonthIndex] = useState<HistoryMonthIndex | null>(null);
   const [monthLoading, setMonthLoading] = useState(true);
   const [conversationRows, setConversationRows] = useState<ConversationRow[]>([]);
   const [memoryRows, setMemoryRows] = useState<MemoryRow[]>([]);
@@ -440,6 +450,7 @@ export default function HistoryPanel({
       monthRequestRef.current += 1;
       setMonthIndex(null);
       setPrevMonthIndex(null);
+      setNextMonthIndex(null);
       setMonthLoading(false);
       return;
     }
@@ -466,6 +477,7 @@ export default function HistoryPanel({
       setDetailUnavailable(false);
       setMonthIndex(null);
       setPrevMonthIndex(null);
+      setNextMonthIndex(null);
       pendingInitialMemoryIdRef.current = initialMemoryId;
       if (targetYear !== viewYear || targetMonth !== viewMonth) {
         setViewYear(targetYear);
@@ -484,15 +496,18 @@ export default function HistoryPanel({
     // コメント参照）。取得失敗時はその月に記録が無いのと同じ扱い（月末境界のみ影響、
     // 詳細な安全側の扱いは`monthLoading`ガードで既存の日詳細effectに委ねる）。
     const prevYearMonth = addMonths(targetYear, targetMonth, -1);
+    const nextYearMonth = addMonths(targetYear, targetMonth, 1);
     setMonthLoading(true);
     Promise.all([
       readHistoryMonthIndex(handle, monthKeyOf(targetYear, targetMonth)),
       readHistoryMonthIndex(handle, monthKeyOf(prevYearMonth.year, prevYearMonth.month)),
+      readHistoryMonthIndex(handle, monthKeyOf(nextYearMonth.year, nextYearMonth.month)),
     ])
-      .then(([index, prevIndex]) => {
+      .then(([index, prevIndex, nextIndex]) => {
         if (monthRequestRef.current !== requestId) return; // 月移動／Vault切替で既に無効化された要求
         setMonthIndex(index);
         setPrevMonthIndex(prevIndex);
+        setNextMonthIndex(nextIndex);
         setMonthLoading(false);
       })
       .catch((error) => {
@@ -500,6 +515,7 @@ export default function HistoryPanel({
         console.error("Failed to load history month index", error);
         setMonthIndex(null);
         setPrevMonthIndex(null);
+        setNextMonthIndex(null);
         setMonthLoading(false);
       });
     // initialMemoryIdは「vaultHandleが変わった時にリセットする」という目的だけで
@@ -619,6 +635,7 @@ export default function HistoryPanel({
     const logicalDay = selectedDay;
     const monthIndexAtStart = monthIndex;
     const prevMonthIndexAtStart = prevMonthIndex;
+    const nextMonthIndexAtStart = nextMonthIndex;
 
     /** `bucketDay`（Storage Bucket）が属する月Indexのスナップショットを選ぶ。
      *  `HistoryMonthIndex.month`フィールド（そのIndex自身が表す月）で判定するため、
@@ -630,6 +647,10 @@ export default function HistoryPanel({
       }
       if (prevMonthIndexAtStart && prevMonthIndexAtStart.month === bucketMonth) {
         return { snapshot: prevMonthIndexAtStart, isCurrent: false };
+      }
+      // 翌月（月末日のリアルタイム日記だけのため）。lazy upgradeの画面上の反映は行わない（次に開いたときに読み直す）
+      if (nextMonthIndexAtStart && nextMonthIndexAtStart.month === bucketMonth) {
+        return { snapshot: nextMonthIndexAtStart, isCurrent: false };
       }
       return { snapshot: null, isCurrent: true };
     }
@@ -652,6 +673,7 @@ export default function HistoryPanel({
           modeLabel: CONVERSATION_ENTRY_KIND_LABEL[c.mode],
           turnCount: c.turnCount,
           bucketDay,
+          ...(c.diaryDate ? { diaryDate: c.diaryDate } : {}),
         }));
         const memories: MemoryRow[] = [
           ...dayEntry.normalMemories.map((m) => ({
@@ -704,6 +726,7 @@ export default function HistoryPanel({
         turnCount: c.turns.length,
         full: c,
         bucketDay,
+        ...(c.realtimeDiary ? { diaryDate: c.realtimeDiary.date } : {}),
       }));
       const memories: MemoryRow[] = [
         ...normalMemoriesFull.map((m) => ({
@@ -738,6 +761,7 @@ export default function HistoryPanel({
             id: c.id,
             mode: conversationEntryTypeOf(c),
             turnCount: c.turns.length,
+            ...(c.realtimeDiary ? { diaryDate: c.realtimeDiary.date } : {}),
           })),
           normalMemories: normalMemoriesFull.map((m) => ({
             id: m.id,
@@ -775,7 +799,8 @@ export default function HistoryPanel({
 
     (async () => {
       try {
-        const bucketDays = [logicalDay, previousDateKey(logicalDay)];
+        // リアルタイム日記は対象日の翌日（午前4時まで）に始まることがあり、端末の時間帯によっては翌日のbucketにある
+        const bucketDays = [addDaysToDateKey(logicalDay, 1), logicalDay, previousDateKey(logicalDay)];
         const perBucket = await Promise.all(bucketDays.map((bucketDay) => resolveBucketDayRecords(bucketDay)));
         if (dayRequestRef.current !== requestId) return; // 日付切替／Vault切替で既に無効化された要求
 
@@ -802,7 +827,7 @@ export default function HistoryPanel({
         setDayLoading(false);
       }
     })();
-  }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, monthLoading, refreshToken]);
+  }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, nextMonthIndex, monthLoading, refreshToken]);
 
   // Conversation History（STEP 3）：v1 fallback由来の行は`row.full`に本体が既に
   // 入っているため、追加readなしで即座に使える（seed）。純粋な導出値（setStateしない）。
@@ -1020,7 +1045,7 @@ export default function HistoryPanel({
     // Conversation History v2：ドット ＝ その日にHistoryで表示するConversationが1件以上ある。
     // 日付一覧がConversationの行を絞り込むのと同じ論理日の判定（`conversationLogicalDay`）を使い、
     // 通常Memory・Reflectionだけを理由にはドットを付けない。
-    const buckets = [day, previousDateKey(day)];
+    const buckets = [addDaysToDateKey(day, 1), day, previousDateKey(day)];
     for (const bucketDay of buckets) {
       const bucketMonth = monthKeyOfDateKey(bucketDay);
       const entry =
@@ -1028,7 +1053,9 @@ export default function HistoryPanel({
           ? monthIndex.days[bucketDay]
           : prevMonthIndex && prevMonthIndex.month === bucketMonth
             ? prevMonthIndex.days[bucketDay]
-            : undefined;
+            : nextMonthIndex && nextMonthIndex.month === bucketMonth
+              ? nextMonthIndex.days[bucketDay]
+              : undefined;
       if (entry && indexEntryHasConversationOnDay(entry, bucketDay, day)) return true;
     }
     return false;
@@ -1287,6 +1314,19 @@ export default function HistoryPanel({
                         {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
                       </span>
                     </div>
+                    {/* リアルタイム日記：対象日と、日記を終えたときにAIが書いた本文（Memoryとは別） */}
+                    {selectedConversation.realtimeDiary && (
+                      <div data-testid="history-realtime-diary" className="flex flex-col gap-2 pt-2">
+                        <p className="text-xs text-stone-400 dark:text-stone-500">リアルタイム日記（{diaryDayLabel(selectedConversation.realtimeDiary.date)}）</p>
+                        {selectedConversation.realtimeDiary.text ? (
+                          <p className="whitespace-pre-wrap text-sm leading-relaxed text-stone-700 dark:text-stone-300">{selectedConversation.realtimeDiary.text}</p>
+                        ) : (
+                          <p className="text-sm text-stone-500 dark:text-stone-400">
+                            {selectedConversation.endedAt ? "日記の本文はまだできていません。ホームの「日記を仕上げる」から作れます。" : "書きかけの日記です。"}
+                          </p>
+                        )}
+                      </div>
+                    )}
                     {/* 会話：最初のユーザー発言を見出しにする。日記では出さない（振り返りと内容が重複して見えるため）。 */}
                     {selectedConversationEntryKind !== "diary" && (
                       <p className="whitespace-pre-wrap text-lg text-stone-800 dark:text-stone-100">{selectedConversationTitle}</p>
