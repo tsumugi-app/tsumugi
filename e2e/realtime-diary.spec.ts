@@ -335,6 +335,35 @@ test.describe("realtime diary: 終了して日記を生成する", () => {
     expect((await memoriesOf(page, id)).length).toBe(1);
   });
 
+  test("finished meanwhile by another tab: the stale screen does not overwrite the stored text and Memory, and nothing is sent again", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    const id = await startDiary(page);
+    // another tab finished the same diary: its end, Memory reference and text are in the stored record, the screen here still shows it open
+    const OTHER = "別のタブが書いた架空の日記。";
+    await page.evaluate(async ({ id, OTHER }) => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      await new Promise<void>((res, rej) => {
+        const tx = db.transaction("conversations", "readwrite"); const store = tx.objectStore("conversations"); const q = store.get(id);
+        q.onsuccess = () => { const now = new Date().toISOString(); store.put({ ...q.result, endedAt: now, updatedAt: now, status: "captured", memoryObjectIds: ["mem-other-tab"], realtimeDiary: { ...q.result.realtimeDiary, text: OTHER, writtenAt: now, aiProvider: "gemini" } }); };
+        tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+      });
+      db.close();
+    }, { id, OTHER });
+    await finishButton(page).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(OTHER, { timeout: 30_000 });
+    await page.waitForTimeout(2_000);
+    expect(calls.capture.length).toBe(0);
+    expect(calls.diary.length).toBe(0);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.status).toBe("captured");
+    expect(stored.memoryObjectIds).toEqual(["mem-other-tab"]);
+    expect(stored.realtimeDiary.text).toBe(OTHER);
+    expect(stored.turns.length).toBe(4);
+  });
+
   test("OpenAI chosen: the diary text and the Memory go to OpenAI with its key only", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page, [], { openai: true });

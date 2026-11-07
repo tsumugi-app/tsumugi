@@ -350,6 +350,8 @@ export default function HistoryPanel({
    * effectでペアとして取得・破棄する。
    */
   const [prevMonthIndex, setPrevMonthIndex] = useState<HistoryMonthIndex | null>(null);
+  /** 翌月の月Index：月末日のリアルタイム日記は、端末の時間帯によって翌月1日のStorage Bucketにある（対象日は月末日） */
+  const [nextMonthIndex, setNextMonthIndex] = useState<HistoryMonthIndex | null>(null);
   const [monthLoading, setMonthLoading] = useState(true);
   const [conversationRows, setConversationRows] = useState<ConversationRow[]>([]);
   const [memoryRows, setMemoryRows] = useState<MemoryRow[]>([]);
@@ -448,6 +450,7 @@ export default function HistoryPanel({
       monthRequestRef.current += 1;
       setMonthIndex(null);
       setPrevMonthIndex(null);
+      setNextMonthIndex(null);
       setMonthLoading(false);
       return;
     }
@@ -474,6 +477,7 @@ export default function HistoryPanel({
       setDetailUnavailable(false);
       setMonthIndex(null);
       setPrevMonthIndex(null);
+      setNextMonthIndex(null);
       pendingInitialMemoryIdRef.current = initialMemoryId;
       if (targetYear !== viewYear || targetMonth !== viewMonth) {
         setViewYear(targetYear);
@@ -492,15 +496,18 @@ export default function HistoryPanel({
     // コメント参照）。取得失敗時はその月に記録が無いのと同じ扱い（月末境界のみ影響、
     // 詳細な安全側の扱いは`monthLoading`ガードで既存の日詳細effectに委ねる）。
     const prevYearMonth = addMonths(targetYear, targetMonth, -1);
+    const nextYearMonth = addMonths(targetYear, targetMonth, 1);
     setMonthLoading(true);
     Promise.all([
       readHistoryMonthIndex(handle, monthKeyOf(targetYear, targetMonth)),
       readHistoryMonthIndex(handle, monthKeyOf(prevYearMonth.year, prevYearMonth.month)),
+      readHistoryMonthIndex(handle, monthKeyOf(nextYearMonth.year, nextYearMonth.month)),
     ])
-      .then(([index, prevIndex]) => {
+      .then(([index, prevIndex, nextIndex]) => {
         if (monthRequestRef.current !== requestId) return; // 月移動／Vault切替で既に無効化された要求
         setMonthIndex(index);
         setPrevMonthIndex(prevIndex);
+        setNextMonthIndex(nextIndex);
         setMonthLoading(false);
       })
       .catch((error) => {
@@ -508,6 +515,7 @@ export default function HistoryPanel({
         console.error("Failed to load history month index", error);
         setMonthIndex(null);
         setPrevMonthIndex(null);
+        setNextMonthIndex(null);
         setMonthLoading(false);
       });
     // initialMemoryIdは「vaultHandleが変わった時にリセットする」という目的だけで
@@ -627,6 +635,7 @@ export default function HistoryPanel({
     const logicalDay = selectedDay;
     const monthIndexAtStart = monthIndex;
     const prevMonthIndexAtStart = prevMonthIndex;
+    const nextMonthIndexAtStart = nextMonthIndex;
 
     /** `bucketDay`（Storage Bucket）が属する月Indexのスナップショットを選ぶ。
      *  `HistoryMonthIndex.month`フィールド（そのIndex自身が表す月）で判定するため、
@@ -638,6 +647,10 @@ export default function HistoryPanel({
       }
       if (prevMonthIndexAtStart && prevMonthIndexAtStart.month === bucketMonth) {
         return { snapshot: prevMonthIndexAtStart, isCurrent: false };
+      }
+      // 翌月（月末日のリアルタイム日記だけのため）。lazy upgradeの画面上の反映は行わない（次に開いたときに読み直す）
+      if (nextMonthIndexAtStart && nextMonthIndexAtStart.month === bucketMonth) {
+        return { snapshot: nextMonthIndexAtStart, isCurrent: false };
       }
       return { snapshot: null, isCurrent: true };
     }
@@ -814,7 +827,7 @@ export default function HistoryPanel({
         setDayLoading(false);
       }
     })();
-  }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, monthLoading, refreshToken]);
+  }, [vaultHandle, selectedDay, monthIndex, prevMonthIndex, nextMonthIndex, monthLoading, refreshToken]);
 
   // Conversation History（STEP 3）：v1 fallback由来の行は`row.full`に本体が既に
   // 入っているため、追加readなしで即座に使える（seed）。純粋な導出値（setStateしない）。
@@ -1040,7 +1053,9 @@ export default function HistoryPanel({
           ? monthIndex.days[bucketDay]
           : prevMonthIndex && prevMonthIndex.month === bucketMonth
             ? prevMonthIndex.days[bucketDay]
-            : undefined;
+            : nextMonthIndex && nextMonthIndex.month === bucketMonth
+              ? nextMonthIndex.days[bucketDay]
+              : undefined;
       if (entry && indexEntryHasConversationOnDay(entry, bucketDay, day)) return true;
     }
     return false;

@@ -79,6 +79,7 @@ import {
   restoreSourceIfNotNewer,
   saveVaultHandle,
   addRealtimeDiaryTextWithOutbox,
+  endRealtimeDiaryWithOutbox,
   RealtimeDiaryTextNotAddedError,
 } from "@/lib/db";
 import { createZipBlob } from "@/lib/zip";
@@ -5363,6 +5364,14 @@ export default function ChatScreen() {
     const onScreen = () => latestConversationRef.current.id === id;
     const show = (next: Conversation) => { if (!onScreen()) return; latestConversationRef.current = next; setConversation(next); };
     const report = (next: Parameters<typeof setDiaryFinish>[0]) => { if (onScreen()) setDiaryFinish(next); };
+    // 端末の記録（Outbox付き）は保存済み。Vaultへの反映は待たない（失敗しても次の反映で書き直される）
+    const syncDiaryToVault = (saved: Conversation) => {
+      if (!vaultHandle) return;
+      const handle = vaultHandle;
+      trackMemoryTask(withVaultWorldRead(() => writeConversationMarkdown(handle, saved, "interactive")).catch((error) => {
+        if (!handleStaleVaultTabError(error)) console.error("[Tsumugi] diary markdown write failed (will retry on next vault flush):", error);
+      }));
+    };
     const run = async () => {
       let current: Conversation | undefined = fromHome ? await withVaultWorldRead(() => getConversation(id)) : latestConversationRef.current;
       if (!current?.realtimeDiary) { report({ kind: "idle" }); return; }
@@ -5381,13 +5390,11 @@ export default function ChatScreen() {
         setStreamingText("");
         setSendStatus("idle");
       }
-      // 1. 終了
+      // 1. 終了：保存されている記録に終了日時だけを付ける（別のタブ・端末が先に終えていれば、その記録をそのまま使う。画面の古い写しで上書きしない）
       if (!current.endedAt) {
-        const now = new Date().toISOString();
-        const ended: Conversation = { ...current, endedAt: now, updatedAt: now };
-        const { conversationFailed, backgroundSyncPromise } = await trackConversationWrite(persistConversation(vaultHandle, ended, "interactive", false));
-        if (backgroundSyncPromise) trackMemoryTask(backgroundSyncPromise);
-        if (conversationFailed) { report({ kind: "partial", capture: true, text: true, otherAi: false, noKey: false }); return; }
+        const snapshot = current;
+        const ended = await trackConversationWrite(withVaultWorldRead(() => endRealtimeDiaryWithOutbox(snapshot)));
+        syncDiaryToVault(ended);
         current = ended;
         show(ended);
       }
@@ -5408,13 +5415,7 @@ export default function ChatScreen() {
         } else {
           try {
             const written = await writeRealtimeDiaryText(current, { provider });
-            const saved = await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written));
-            if (vaultHandle) {
-              const handle = vaultHandle;
-              trackMemoryTask(withVaultWorldRead(() => writeConversationMarkdown(handle, saved, "interactive")).catch((error) => {
-                if (!handleStaleVaultTabError(error)) console.error("[Tsumugi] diary markdown write failed (will retry on next vault flush):", error);
-              }));
-            }
+            syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written)));
           } catch (error) {
             if (handleStaleVaultTabError(error)) return;
             if (error instanceof NoUserKeyError) noKey = true;

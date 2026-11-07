@@ -1519,6 +1519,34 @@ export async function addRealtimeDiaryTextWithOutbox(id: string, diary: { text: 
   return saved!;
 }
 
+/**
+ * Realtime diary: ends it (sets `endedAt`) on the record AS STORED, read inside the same transaction, with its Outbox entry. Already ended (another tab or device finished it):
+ * nothing is written and the stored record is returned, so a screen's older copy never takes back its text, its Capture result or its Memory references.
+ * The screen's copy is used only for words the store does not have yet (a turn's own save still on its way); what Capture or the diary text set on the stored record stays.
+ */
+class RealtimeDiaryAlreadyEndedError extends Error {
+  constructor() { super("realtime-diary-already-ended"); this.name = "RealtimeDiaryAlreadyEndedError"; }
+}
+export async function endRealtimeDiaryWithOutbox(snapshot: Conversation, now: string = new Date().toISOString()): Promise<Conversation> {
+  let result: Conversation | undefined;
+  try {
+    await putCanonicalRecordWithOutboxInternal("conversations", "conversation", { ...snapshot, updatedAt: now }, now, async (tx) => {
+      const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+      if (blockedByTombstone(tombs, "conversation", snapshot.id)) throw new TombstonedRecordError("conversation", snapshot.id);
+      const stored = (await tx.objectStore("conversations").get(snapshot.id)) as Conversation | undefined;
+      if (stored?.endedAt) { result = stored; throw new RealtimeDiaryAlreadyEndedError(); }
+      const base: Conversation = stored && stored.turns.length >= snapshot.turns.length
+        ? stored
+        : { ...snapshot, status: stored?.status ?? snapshot.status, memoryObjectIds: stored?.memoryObjectIds ?? snapshot.memoryObjectIds, realtimeDiary: stored?.realtimeDiary ?? snapshot.realtimeDiary, title: stored?.title ?? snapshot.title };
+      result = withoutDeletedMemoryRefs({ ...base, endedAt: now, updatedAt: now }, tombs);
+      return result;
+    });
+  } catch (error) {
+    if (!(error instanceof RealtimeDiaryAlreadyEndedError)) throw error;
+  }
+  return result!;
+}
+
 /** The device record moved on since the user chose the Vault version (another tab saved): nothing is written. */
 export class VaultVersionChangedError extends Error {
   constructor() { super("vault-version-changed"); this.name = "VaultVersionChangedError"; }
