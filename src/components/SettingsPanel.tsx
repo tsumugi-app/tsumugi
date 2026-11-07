@@ -1,6 +1,7 @@
 "use client";
 
 import AutoCaptureSettings from "./AutoCaptureSettings";
+import RealtimeDiaryAutoSettings from "./RealtimeDiaryAutoSettings";
 import { APP_BUILD_ID } from "@/lib/recoveryBackgroundCheck";
 import { useCallback, useEffect, useState } from "react";
 import RecoveryMemoryDiagnosticPanel from "./RecoveryMemoryDiagnosticPanel";
@@ -1617,6 +1618,7 @@ export default function SettingsPanel({
         </section>
 
         <AutoCaptureSettings onRetry={onAutoCaptureRetry} selectedProvider={chatProvider} />
+        <RealtimeDiaryAutoSettings selectedProvider={chatProvider} />
 
         {/*
           データ管理。「データ」セクションは全プラットフォームで表示する。

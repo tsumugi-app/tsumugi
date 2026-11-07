@@ -9,7 +9,7 @@ const bundle = path.join(__dirname, ".build/harness.js");
 const MIN = 60_000;
 const MEMORY = { topicDecision: "newTopic", summary: "架空の要約", content: "架空の記憶", keywords: ["架空"], types: ["conversation"], confidence: 0.9 };
 type Past = { id: string; ago: number; words: string; diary?: "today" | "yesterday" };
-type Device = { openai?: boolean };
+type Device = { openai?: boolean; autoFinish?: boolean; openaiWithoutKey?: boolean };
 type Reply = { status?: number; hold?: Promise<void> };
 const DIARY_TEXT = "架空の朝に架空の公園を歩き、夜は架空の本を読んだ。";
 
@@ -26,6 +26,9 @@ async function seed(page: Page, past: Past[] = [], device: Device = {}) {
     await dbm.saveAutoCaptureSettingsRaw(JSON.stringify({ enabled: true, allowOtherProviders: true }));
     await dbm.saveApiKey("fictional-test-key", "gemini");
     if (device.openai) { await dbm.saveApiKey("fictional-openai-key", "openai"); await dbm.saveChatProvider("openai"); }
+    // PR-C: OpenAI chosen, but only the Gemini key registered
+    if (device.openaiWithoutKey) await dbm.saveChatProvider("openai");
+    if (device.autoFinish) await dbm.saveRealtimeDiaryAutoSettingsRaw(JSON.stringify({ enabled: true }));
     // the diary day, as the app counts it: local time, a new day from 4:00
     const dayOf = (at: Date) => { const d = new Date(at.getFullYear(), at.getMonth(), at.getDate() - (at.getHours() < 4 ? 1 : 0), 12); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
     for (const c of past) {
@@ -43,13 +46,15 @@ async function seed(page: Page, past: Past[] = [], device: Device = {}) {
 }
 
 /** fictional AI that records every call. `captureReplies` / `diaryReplies` answer the next calls in turn (then a normal answer) */
-async function fakeApi(page: Page, captureReplies: Reply[] = [], diaryReplies: Reply[] = []) {
+async function fakeApi(page: Page, captureReplies: Reply[] = [], diaryReplies: Reply[] = [], chatReplies: Reply[] = []) {
   const calls = { chat: 0, capture: [] as string[], reflect: 0, other: [] as string[], diary: [] as { ai?: string; gemini?: string; openai?: string; words: string }[] };
   await page.route("**/api/**", async (route) => {
     const url = route.request().url();
     if (url.includes("/api/chat")) {
       calls.chat++;
-      await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" });
+      const r = chatReplies.shift() ?? {};
+      if (r.hold) await r.hold;
+      await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" }).catch(() => undefined);
     } else if (url.includes("/api/capture")) {
       calls.capture.push((JSON.parse(route.request().postData() ?? "{}").turns ?? []).map((t: any) => t.content).join(" "));
       const r = captureReplies.shift() ?? {};
@@ -190,7 +195,8 @@ test.describe("realtime diary: one conversation for the day, paused and resumed"
       expect(c.status).toBe("active");
       expect(c.memoryObjectIds).toEqual([]);
     }
-    // only today's diary is offered to continue; yesterday's waits for its own step (a later PR)
+    // only today's diary is offered to continue; yesterday's waits to be finished (PR-C: the automatic finishing is off here, so nothing was sent)
+    await expect(page.getByTestId("unfinished-diary").getByRole("button", { name: "昨日の日記を仕上げる" })).toBeVisible();
     await continueButton(page).click();
     await expect(page.getByText("架空の書きかけの日記です")).toBeVisible();
     await expect(page.getByText("架空の昨日の書きかけです")).toHaveCount(0);
@@ -459,5 +465,166 @@ test.describe("realtime diary: 終了して日記を生成する", () => {
     expect(calls.diary).toEqual([expect.objectContaining({ ai: "openai", openai: "fictional-openai-key", gemini: undefined })]);
     const stored = (await rows(page, "conversations")).find((c) => c.id === id);
     expect(stored.realtimeDiary.aiProvider).toBe("openai");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR-C: the 4:00 day change and the finishing of past diaries. The clock is set with page.clock; the time zones are not the CI machine's.
+// ---------------------------------------------------------------------------
+const sendWords = async (page: Page, words: string) => {
+  await page.locator("footer textarea").fill(words);
+  await page.locator("footer").getByRole("button", { name: "送る" }).click();
+};
+const stored = async (page: Page, id: string) => (await rows(page, "conversations")).find((c) => c.id === id);
+
+test.describe("realtime diary PR-C: crossing 4:00 in New York at the end of the year", () => {
+  test.use({ timezoneId: "America/New_York" });
+  test("a reply in progress at 4:00 stays in its diary; new words after 4:00 are held with a notice, the typed text is kept, and the switch closes the old diary and starts the new day", async ({ page }) => {
+    test.setTimeout(300_000);
+    await page.clock.install({ time: new Date("2027-01-01T03:40:00-05:00") });
+    await seed(page);
+    let release = () => {};
+    const calls = await fakeApi(page, [], [], [{}, { hold: new Promise<void>((r) => { release = r; }) }]);
+    await startApp(page);
+    await startButton(page).click();
+    await talk(page, "架空の大晦日の出来事です", 1);
+    const [old] = await withWords(page, "架空の大晦日の出来事です");
+    expect(old.realtimeDiary).toEqual({ date: "2026-12-31" });
+    // the AI is still answering when 4:00 passes: the reply is not cut and stays in the old diary
+    await sendWords(page, "架空の夜更けの出来事です");
+    await expect.poll(() => calls.chat, { timeout: 30_000 }).toBe(2);
+    await page.clock.fastForward("30:00");
+    release();
+    await expect(page.getByText("架空の返答です。")).toHaveCount(2, { timeout: 30_000 });
+    await expect(page.locator("footer textarea")).toBeEnabled();
+    const before = await stored(page, old.id);
+    expect(before.turns.map((t: any) => t.content)).toEqual(["架空の大晦日の出来事です", "架空の返答です。", "架空の夜更けの出来事です", "架空の返答です。"]);
+    expect(before.realtimeDiary.date).toBe("2026-12-31");
+
+    // 4:10: new words are not sent and not moved; the notice offers the switch and the typed text stays
+    await sendWords(page, "架空の元日の出来事です");
+    await expect(page.getByTestId("diary-day-change")).toContainText("12月31日の日記はここで締め切り、1月1日の日記として続けます");
+    await expect(page.locator("footer textarea")).toHaveValue("架空の元日の出来事です");
+    await page.waitForTimeout(1_000);
+    expect(calls.chat).toBe(2);
+    expect((await stored(page, old.id)).turns).toEqual(before.turns);
+    expect((await stored(page, old.id)).endedAt).toBeUndefined();
+
+    await page.getByRole("button", { name: "1月1日の日記へ切り替える" }).click();
+    await expect(page.getByTestId("diary-day-change")).toHaveCount(0);
+    await expect(page.getByText("架空の大晦日の出来事です")).toHaveCount(0);
+    await expect(page.locator("footer textarea")).toHaveValue("架空の元日の出来事です");
+    await page.locator("footer").getByRole("button", { name: "送る" }).click();
+    await expect(page.getByText("架空の返答です。")).toHaveCount(1, { timeout: 30_000 });
+    const [fresh] = await withWords(page, "架空の元日の出来事です");
+    expect(fresh.id).not.toBe(old.id);
+    expect(fresh.realtimeDiary).toEqual({ date: "2027-01-01" });
+    // the old diary is closed as it was: every word and its real time kept, nothing sent (the automatic finishing is off)
+    const closed = await stored(page, old.id);
+    expect(closed.endedAt).toBeTruthy();
+    expect(closed.turns).toEqual(before.turns);
+    expect(closed.realtimeDiary.date).toBe("2026-12-31");
+    await page.waitForTimeout(3_000);
+    expect(calls.diary.length).toBe(0);
+    expect(calls.capture.length).toBe(0);
+
+    // home: today's diary goes on, yesterday's waits; finishing it writes from the old day's words only
+    await homeButton(page).click();
+    await expect(continueButton(page)).toBeVisible({ timeout: 30_000 });
+    const waiting = page.getByTestId("unfinished-diary");
+    await expect(waiting).toContainText("12月31日");
+    await waiting.getByRole("button", { name: "昨日の日記を仕上げる" }).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    expect(calls.diary.length).toBe(1);
+    expect(calls.diary[0].words).toContain("架空の夜更けの出来事です");
+    expect(calls.diary[0].words).not.toContain("架空の元日の出来事です");
+    expect(calls.capture.length).toBe(1);
+    expect((await memoriesOf(page, old.id)).length).toBe(1);
+    expect((await memoriesOf(page, fresh.id)).length).toBe(0);
+    expect((await stored(page, fresh.id)).endedAt).toBeUndefined();
+  });
+});
+
+test.describe("realtime diary PR-C: closed overnight in Auckland at the end of a month", () => {
+  test.use({ timezoneId: "Pacific/Auckland" });
+  test("with the permission: the next start finishes yesterday's diary with the chosen AI and the user's own key, once; the conversation Capture does not take it too", async ({ page }) => {
+    test.setTimeout(240_000);
+    await page.clock.install({ time: new Date("2026-12-01T09:00:00+13:00") });
+    await seed(page, [{ id: "rt-november", ago: 11 * 60 * MIN, words: "架空の月末の出来事です", diary: "yesterday" }], { autoFinish: true });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await expect.poll(async () => (await stored(page, "rt-november")).realtimeDiary.text, { timeout: 60_000 }).toBe(DIARY_TEXT);
+    const done = await stored(page, "rt-november");
+    expect(done.realtimeDiary.date).toBe("2026-11-30");
+    expect(done.status).toBe("captured");
+    expect(done.endedAt).toBeTruthy();
+    expect(done.turns.map((t: any) => t.content)).toEqual(["架空の月末の出来事です", "架空の返答です。"]);
+    expect(calls.diary.length).toBe(1);
+    expect(calls.diary[0].ai).toBe("gemini");
+    expect(calls.diary[0].gemini).toBe("fictional-test-key");
+    expect(calls.capture.length).toBe(1);
+    expect((await memoriesOf(page, "rt-november")).length).toBe(1);
+    await expect(page.getByTestId("unfinished-diary")).toHaveCount(0, { timeout: 30_000 });
+    // the next start sends nothing again
+    await reopen(page);
+    await page.waitForTimeout(6_000);
+    expect(calls.diary.length).toBe(1);
+    expect(calls.capture.length).toBe(1);
+    expect((await memoriesOf(page, "rt-november")).length).toBe(1);
+  });
+
+  test("without the permission nothing is sent at a start (even with the automatic Memory creation on); home offers 昨日の日記を仕上げる and today's diary can be started", async ({ page }) => {
+    test.setTimeout(180_000);
+    await page.clock.install({ time: new Date("2026-12-01T09:00:00+13:00") });
+    await seed(page, [{ id: "rt-november", ago: 11 * 60 * MIN, words: "架空の月末の出来事です", diary: "yesterday" }]);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await expect(page.getByTestId("unfinished-diary").getByRole("button", { name: "昨日の日記を仕上げる" })).toBeVisible({ timeout: 30_000 });
+    await page.waitForTimeout(6_000);
+    expect(calls.diary.length).toBe(0);
+    expect(calls.capture.length).toBe(0);
+    expect((await stored(page, "rt-november")).endedAt).toBeUndefined();
+    await startButton(page).click();
+    await talk(page, "架空の師走の出来事です", 1);
+    const [december] = await withWords(page, "架空の師走の出来事です");
+    expect(december.id).not.toBe("rt-november");
+    expect(december.realtimeDiary).toEqual({ date: "2026-12-01" });
+    const november = await stored(page, "rt-november");
+    expect(november.turns.map((t: any) => t.content)).toEqual(["架空の月末の出来事です", "架空の返答です。"]);
+    expect(november.endedAt).toBeUndefined();
+  });
+
+  test("with the permission but no key of the chosen AI: nothing is sent and nothing goes to the other AI; the diary keeps waiting", async ({ page }) => {
+    test.setTimeout(180_000);
+    await page.clock.install({ time: new Date("2026-12-01T09:00:00+13:00") });
+    await seed(page, [{ id: "rt-november", ago: 11 * 60 * MIN, words: "架空の月末の出来事です", diary: "yesterday" }], { autoFinish: true, openaiWithoutKey: true });
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await page.waitForTimeout(6_000);
+    expect(calls.diary.length).toBe(0);
+    expect(calls.capture.length).toBe(0);
+    const november = await stored(page, "rt-november");
+    expect(november.endedAt).toBeUndefined();
+    expect(november.turns.length).toBe(2);
+    await expect(page.getByTestId("unfinished-diary").getByRole("button", { name: "昨日の日記を仕上げる" })).toBeVisible();
+  });
+
+  test("the app closed while the automatic finishing was writing: nothing is lost, and the next start finishes it with one Memory and one text", async ({ page }) => {
+    test.setTimeout(240_000);
+    await page.clock.install({ time: new Date("2026-12-01T09:00:00+13:00") });
+    await seed(page, [{ id: "rt-november", ago: 11 * 60 * MIN, words: "架空の月末の出来事です", diary: "yesterday" }], { autoFinish: true });
+    let release = () => {};
+    const calls = await fakeApi(page, [], [{ hold: new Promise<void>((r) => { release = r; }) }]);
+    await startApp(page);
+    await expect.poll(() => calls.diary.length, { timeout: 60_000 }).toBe(1);
+    await reopen(page);
+    release();
+    await expect.poll(async () => (await stored(page, "rt-november")).realtimeDiary.text, { timeout: 60_000 }).toBe(DIARY_TEXT);
+    const done = await stored(page, "rt-november");
+    expect(done.status).toBe("captured");
+    expect(done.turns.map((t: any) => t.content)).toEqual(["架空の月末の出来事です", "架空の返答です。"]);
+    expect(calls.capture.length).toBe(1);
+    expect(calls.diary.length).toBe(2);
+    expect((await memoriesOf(page, "rt-november")).length).toBe(1);
   });
 });

@@ -28,6 +28,16 @@ export async function ifConversationFree<T>(id: string, fn: () => Promise<T>): P
   return open.ran ? open.value : open;
 }
 
+/** 「終了して日記を生成する」・ホームの「日記を仕上げる」・自動の仕上げ（PR-C）が同じ日記を同時に進めない */
+export const realtimeDiaryFinishLock = (id: string) => `tsumugi-realtime-diary-finish:${id}`;
+export const REALTIME_DIARY_AUTO_RUN_LOCK = "tsumugi-realtime-diary-auto-run";
+
+/** for the automatic diary finishing: as ifConversationFree, and no finishing of the same diary is running */
+export async function ifRealtimeDiaryFree<T>(id: string, fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: false }> {
+  const free = await ifConversationFree(id, () => ifLockFree(realtimeDiaryFinishLock(id), fn));
+  return free.ran ? free.value : free;
+}
+
 /** for the end of a conversation: waits for a Capture of it in another tab, so the state can be read again before calling the AI */
 export async function withConversationCapture<T>(id: string, fn: () => Promise<T>): Promise<T> {
   if (!conversationLocksSupported()) return fn();

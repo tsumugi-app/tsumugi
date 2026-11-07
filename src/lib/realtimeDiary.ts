@@ -67,6 +67,40 @@ export function unfinishedRealtimeDiaries(conversations: Conversation[]): Conver
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
 }
 
+/** その対象日の前日（YYYY-MM-DD）。ホームの「昨日の日記を仕上げる」の判定に使う */
+export function previousDiaryDate(date: string): string {
+  const [y, m, d] = date.split("-").map(Number);
+  return localDateKey(new Date(y, m - 1, d - 1, 12));
+}
+
+/**
+ * 午前4時を過ぎて対象日が終わった、書きかけの日記（PR-C）。`today`は今の対象日（diaryDateOf(now)）。文字列の大小で比べる（YYYY-MM-DD）。
+ * 端末の時計が戻った・西へ移動した等で対象日が今日より後の日記は、締め切らずにそのまま書き続ける。
+ */
+export function isOverdueRealtimeDiary(conversation: Conversation, today: string): boolean {
+  return isOpenRealtimeDiary(conversation) && conversation.realtimeDiary!.date < today;
+}
+
+/**
+ * 書きかけの日記へ新しい発言を送ろうとしたとき、日付の切り替えを案内するか。発言のある日記の対象日が過ぎていたら案内する
+ * （発言は勝手に別の日記へ移さない。本人が切り替えを選ぶ）。発言の無い日記は、まだ何も保存されていないので案内しない（呼び出し側が今日の日付にする）。
+ */
+export function needsDiaryDayChange(conversation: Conversation, now: Date): { from: string; to: string } | null {
+  if (!isOpenRealtimeDiary(conversation) || conversation.turns.length === 0) return null;
+  const to = diaryDateOf(now);
+  return isOverdueRealtimeDiary(conversation, to) ? { from: conversation.realtimeDiary!.date, to } : null;
+}
+
+/**
+ * ホームに出す「仕上げ待ち」の日記：終えたがMemoryか日記本文がまだの日記と、午前4時を過ぎた書きかけの日記（発言のあるもの）。
+ * 前日分が残っていても、今日の日記は別に始められる（「リアルタイム日記を始める」は今日の対象日だけを見る）。新しいものから。
+ */
+export function realtimeDiariesToFinish(conversations: Conversation[], today: string): Conversation[] {
+  const overdue = conversations.filter((c) => isOverdueRealtimeDiary(c, today) && c.status === "active" && c.turns.length > 0);
+  return [...unfinishedRealtimeDiaries(conversations), ...overdue]
+    .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+}
+
 /** 時刻の表示。対象日と違う暦日の発言（深夜など）には月日も付ける。端末のローカル時刻 */
 export function formatDiaryTime(at: Date, diaryDate: string): string {
   const time = `${at.getHours()}:${pad2(at.getMinutes())}`;

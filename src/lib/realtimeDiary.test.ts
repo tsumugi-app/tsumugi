@@ -79,7 +79,7 @@ test("Markdown keeps the diary day apart from the times of the words, and a norm
   assert.equal("realtimeDiary" in parseConversationMarkdown(md.replace(/^diaryDate: .*$/m, "diaryDate: 2026-02-30"))!, false, "an impossible day is not read as a diary");
 });
 
-test("an open diary is not taken by the automatic Memory run, nor counted as waiting; a finished one and normal conversations are as before", () => {
+test("no realtime diary is taken by the automatic Memory run (an open one waits for its writer, a finished one for the diary's own finishing, PR-C); normal conversations are as before", () => {
   const now = local(2026, 11, 8, 12, 0).getTime();
   const settings = { enabled: true, allowOtherProviders: false };
   const state = { conversations: {}, recentRuns: [] };
@@ -87,10 +87,10 @@ test("an open diary is not taken by the automatic Memory run, nor counted as wai
   const finished = diary("finished", "2026-11-07", morning, { endedAt: T(local(2026, 11, 7, 22, 0)) });
   const normal = diary("normal", undefined, morning);
   assert.equal(isUnprocessedConversation(open), false);
-  assert.equal(isUnprocessedConversation(finished), true);
+  assert.equal(isUnprocessedConversation(finished), false);
   assert.equal(isUnprocessedConversation(normal), true);
-  assert.deepEqual(selectAutoCaptureTargets([open, finished, normal], new Set(), state, settings, now, "gemini").map((c) => c.id).sort(), ["finished", "normal"]);
-  assert.equal(summarizeAutoCapture([open], new Set(), state, settings, "gemini").waiting, 0);
+  assert.deepEqual(selectAutoCaptureTargets([open, finished, normal], new Set(), state, settings, now, "gemini").map((c) => c.id).sort(), ["normal"]);
+  assert.equal(summarizeAutoCapture([open, finished], new Set(), state, settings, "gemini").waiting, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -144,4 +144,46 @@ test("History puts a realtime diary on its diary day, whatever time it started; 
   assert.equal(conversationLogicalDay("01JZZZZZZZZZZZZZZZZZZZZZZZ", "2026-11-07T16:00:00.000Z", "2026-11-07", "not-a-day"), "2026-11-08");
   const entry = { conversations: [{ id: "01JZZZZZZZZZZZZZZZZZZZZZZZ", mode: "diary" as const, turnCount: 2, diaryDate: "2026-11-06" }], normalMemories: [], reflections: [] };
   assert.equal(indexEntryHasConversationOnDay(entry, "2026-11-07", "2026-11-06"), true);
+});
+
+// ---------------------------------------------------------------------------
+// PR-C: the 4:00 day change and the diaries waiting to be finished
+// ---------------------------------------------------------------------------
+import { isOverdueRealtimeDiary, needsDiaryDayChange, previousDiaryDate, realtimeDiariesToFinish } from "./realtimeDiary";
+
+test("the day before a diary day, across a month, a year and a leap day", () => {
+  assert.equal(previousDiaryDate("2026-11-08"), "2026-11-07");
+  assert.equal(previousDiaryDate("2026-12-01"), "2026-11-30");
+  assert.equal(previousDiaryDate("2027-01-01"), "2026-12-31");
+  assert.equal(previousDiaryDate("2028-03-01"), "2028-02-29");
+});
+
+test("an open diary is overdue from 4:00 of the next day only; a diary dated later than today (the clock moved back) is not", () => {
+  const open = diary("open", "2026-12-31", [turn("user", local(2026, 12, 31, 23, 50)), turn("ai", local(2026, 12, 31, 23, 51))]);
+  assert.equal(needsDiaryDayChange(open, local(2027, 1, 1, 0, 30)), null, "after midnight, before 4:00: still the same diary");
+  assert.equal(needsDiaryDayChange(open, local(2027, 1, 1, 3, 59)), null);
+  assert.deepEqual(needsDiaryDayChange(open, local(2027, 1, 1, 4, 0)), { from: "2026-12-31", to: "2027-01-01" });
+  assert.equal(isOverdueRealtimeDiary(open, "2027-01-01"), true);
+  assert.equal(isOverdueRealtimeDiary(open, "2026-12-31"), false);
+  assert.equal(isOverdueRealtimeDiary(open, "2026-12-30"), false, "dated after today: written on, never closed");
+  // nothing is offered for an ended diary, an empty one (nothing saved yet) or a normal conversation
+  assert.equal(needsDiaryDayChange(diary("ended", "2026-12-31", open.turns, { endedAt: T(local(2026, 12, 31, 23, 55)) }), local(2027, 1, 1, 5, 0)), null);
+  assert.equal(needsDiaryDayChange(diary("empty", "2026-12-31", []), local(2027, 1, 1, 5, 0)), null);
+  assert.equal(needsDiaryDayChange(diary("normal", undefined, open.turns), local(2027, 1, 1, 5, 0)), null);
+  // the end of a month
+  const november = diary("nov", "2026-11-30", [turn("user", local(2026, 11, 30, 22, 0))]);
+  assert.equal(needsDiaryDayChange(november, local(2026, 12, 1, 3, 0)), null);
+  assert.deepEqual(needsDiaryDayChange(november, local(2026, 12, 1, 4, 0)), { from: "2026-11-30", to: "2026-12-01" });
+});
+
+test("home lists the diaries waiting to be finished: ended but unfinished, and open ones past 4:00; today's open diary and complete ones are not listed", () => {
+  const ENDED_AT = T(local(2026, 11, 7, 22, 0));
+  const overdue = diary("overdue", "2026-11-06", [turn("user", local(2026, 11, 6, 21, 0))]);
+  const today = diary("today", "2026-11-07", morning);
+  const ended = diary("ended", "2026-11-07", morning, { endedAt: ENDED_AT, status: "captured" });
+  const done = diary("done", "2026-11-05", morning, { endedAt: ENDED_AT, status: "captured", realtimeDiary: { date: "2026-11-05", text: "架空の日記。" } });
+  const archived = diary("archived", "2026-11-04", morning, { status: "archived" });
+  assert.deepEqual(realtimeDiariesToFinish([overdue, today, ended, done, archived], "2026-11-07").map((c) => c.id), ["ended", "overdue"]);
+  // after 4:00 the next day, today's open diary is waiting too
+  assert.deepEqual(realtimeDiariesToFinish([overdue, today], "2026-11-08").map((c) => c.id).sort(), ["overdue", "today"]);
 });

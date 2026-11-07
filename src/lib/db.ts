@@ -1863,6 +1863,23 @@ export async function saveAutoCaptureStateRaw(json: string) {
   await db.put("settings", json, AUTO_CAPTURE_STATE_KEY);
 }
 
+const REALTIME_DIARY_AUTO_SETTINGS_KEY = "realtimeDiaryAuto:settings";
+const REALTIME_DIARY_AUTO_STATE_KEY = "realtimeDiaryAuto:state";
+
+/** リアルタイム日記の自動の仕上げ（PR-C、realtimeDiaryAuto.ts）の許可と試行回数。端末だけの値でVaultには書かない。標準はオフ */
+export async function loadRealtimeDiaryAutoRaw(): Promise<{ settings: string | undefined; state: string | undefined }> {
+  const db = await getDB();
+  return { settings: await db.get("settings", REALTIME_DIARY_AUTO_SETTINGS_KEY), state: await db.get("settings", REALTIME_DIARY_AUTO_STATE_KEY) };
+}
+export async function saveRealtimeDiaryAutoSettingsRaw(json: string) {
+  const db = await getDB();
+  await db.put("settings", json, REALTIME_DIARY_AUTO_SETTINGS_KEY);
+}
+export async function saveRealtimeDiaryAutoStateRaw(json: string) {
+  const db = await getDB();
+  await db.put("settings", json, REALTIME_DIARY_AUTO_STATE_KEY);
+}
+
 export async function loadChatProvider(): Promise<AIProviderName> {
   const db = await getDB();
   const value = await db.get("settings", CHAT_PROVIDER_KEY);

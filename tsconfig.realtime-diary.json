@@ -11,5 +11,5 @@
     "plugins": []
   },
   "include": [],
-  "files": ["src/lib/realtimeDiary.test.ts"]
+  "files": ["src/lib/realtimeDiary.test.ts", "src/lib/realtimeDiaryAuto.test.ts"]
 }

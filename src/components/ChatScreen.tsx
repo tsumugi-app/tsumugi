@@ -21,16 +21,17 @@ import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
 import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
-import { diaryDateOf, diaryTimeLabelAt, isOpenRealtimeDiary, isRealtimeDiaryComplete, resumableRealtimeDiary, unfinishedRealtimeDiaries } from "@/lib/realtimeDiary";
+import { diaryDateOf, diaryTimeLabelAt, isOpenRealtimeDiary, isRealtimeDiaryComplete, needsDiaryDayChange, previousDiaryDate, realtimeDiariesToFinish, resumableRealtimeDiary } from "@/lib/realtimeDiary";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { conversationFileState } from "@/lib/conversationFileCheck";
-import { maySendConversationTo, parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
+import { classifyAutoCaptureFailure, maySendConversationTo, parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
+import { parseRealtimeDiaryAutoSettings, parseRealtimeDiaryAutoState, runRealtimeDiaryAutoFinish, type RealtimeDiaryAutoOutcome } from "@/lib/realtimeDiaryAuto";
 import type { AiRequestOptions } from "@/lib/selectedAi";
 import type { AIProviderName } from "@/lib/ai/types";
 import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
 import { NoUserKeyError, isUsableUserKey } from "@/lib/apiKeyHeader";
 import { writeRealtimeDiaryText } from "@/lib/realtimeDiaryText";
-import { AUTO_CAPTURE_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, withConversationCapture } from "@/lib/conversationLocks";
+import { AUTO_CAPTURE_RUN_LOCK, REALTIME_DIARY_AUTO_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, ifRealtimeDiaryFree, realtimeDiaryFinishLock, withConversationCapture } from "@/lib/conversationLocks";
 import { appendTurn, captureConversation, createConversation, persistCapture, persistCaptureAtomically, persistConversation } from "@/lib/capture";
 import {
   applyVaultLightCheckCandidates,
@@ -69,6 +70,8 @@ import {
   loadApiKey,
   loadAutoCaptureRaw,
   saveAutoCaptureStateRaw,
+  loadRealtimeDiaryAutoRaw,
+  saveRealtimeDiaryAutoStateRaw,
   loadChatProvider,
   loadVaultHandle,
   restoreConversationIfNotNewer,
@@ -732,8 +735,16 @@ export default function ChatScreen() {
   const [interruptedConversation, setInterruptedConversation] = useState<Conversation | null>(null);
   /** ホームの入口の表示：今日（午前4時区切り）の書きかけのリアルタイム日記があるか（「今日の続きを書く」） */
   const [todayDiaryOpen, setTodayDiaryOpen] = useState(false);
-  /** ホーム：終えたが、Memoryか日記本文がまだのリアルタイム日記（AIの失敗・途中で閉じた等）。「日記を仕上げる」で残りだけ進める */
+  /**
+   * ホーム：仕上げ待ちのリアルタイム日記。終えたがMemoryか日記本文がまだのもの（AIの失敗・途中で閉じた等）と、午前4時を過ぎた書きかけのもの（PR-C）。
+   * 「日記を仕上げる」で残りだけ進める。`others`：ほかに仕上げ待ちの日記の数
+   */
   const [unfinishedDiary, setUnfinishedDiary] = useState<Conversation | null>(null);
+  const [otherUnfinishedDiaries, setOtherUnfinishedDiaries] = useState(0);
+  /** 自動の仕上げが終わったら、ホームの案内を読み直す */
+  const [diaryListToken, setDiaryListToken] = useState(0);
+  /** 書きかけの日記の対象日が過ぎてから送ろうとした（PR-C）。入力中の文章は入力欄に残したまま、切り替えを案内する */
+  const [diaryDayChange, setDiaryDayChange] = useState<{ id: string; from: string; to: string } | null>(null);
   /** 「終了して日記を生成する」の進み具合（画面の表示だけ。何ができたかは保存された記録で判断する） */
   const [diaryFinish, setDiaryFinish] = useState<
     | { kind: "idle" | "working" | "done" | "elsewhere" }
@@ -747,12 +758,15 @@ export default function ChatScreen() {
     void withVaultWorldRead(() => getAllConversations())
       .then((all) => {
         if (!live) return;
-        setTodayDiaryOpen(resumableRealtimeDiary(all, diaryDateOf(new Date())) !== undefined);
-        setUnfinishedDiary(unfinishedRealtimeDiaries(all)[0] ?? null);
+        const today = diaryDateOf(new Date());
+        setTodayDiaryOpen(resumableRealtimeDiary(all, today) !== undefined);
+        const waiting = realtimeDiariesToFinish(all, today);
+        setUnfinishedDiary(waiting[0] ?? null);
+        setOtherUnfinishedDiaries(Math.max(0, waiting.length - 1));
       })
       .catch((error) => { if (!handleStaleVaultTabError(error)) console.error("Failed to look for today's realtime diary", error); });
     return () => { live = false; };
-  }, [onEntryScreen, vaultStatus]);
+  }, [onEntryScreen, vaultStatus, diaryListToken]);
   const sendInFlightRef = useRef(false);
   const [reflectionStatus, setReflectionStatus] = useState<ReflectionStatus>("idle");
   const [reflectionText, setReflectionText] = useState("");
@@ -1853,6 +1867,47 @@ export default function ChatScreen() {
   const autoCaptureRunnerRef = useRef(runAutoCaptureNow);
   autoCaptureRunnerRef.current = runAutoCaptureNow;
 
+  /**
+   * リアルタイム日記の自動の仕上げ（PR-C、lib/realtimeDiaryAuto.ts）。設定で許可した端末だけ。起動時の自動Captureと同じ条件（保存先・復旧・古いタブ）でだけ動き、
+   * 送り先は選んでいるAI、キーは利用者自身のそのAIのキーだけ。手順は手動の「日記を仕上げる」と同じ（advanceRealtimeDiary）。
+   */
+  async function runRealtimeDiaryAutoFinishNow(onlyId?: string): Promise<RealtimeDiaryAutoOutcome> {
+    const base = autoCaptureDeps();
+    try {
+      return await runRealtimeDiaryAutoFinish({
+        loadSettings: async () => parseRealtimeDiaryAutoSettings((await loadRealtimeDiaryAutoRaw()).settings),
+        loadSendSettings: base.loadSettings,
+        selectedProvider: base.selectedProvider,
+        hasUserKey: base.hasUserKey,
+        online: base.online,
+        blocked: base.blocked,
+        withRunLock: async (fn) => {
+          const run = await ifLockFree(REALTIME_DIARY_AUTO_RUN_LOCK, fn);
+          return run.ran ? run.value : null;
+        },
+        readConversations: base.readConversations,
+        readConversation: base.readConversation,
+        readState: async () => parseRealtimeDiaryAutoState((await loadRealtimeDiaryAutoRaw()).state),
+        writeState: (state) => saveRealtimeDiaryAutoStateRaw(JSON.stringify(state)),
+        ifDiaryFree: ifRealtimeDiaryFree,
+        vaultFileUnchanged: base.vaultFileUnchanged,
+        finish: async (target, provider, signal) => {
+          const progress = await advanceRealtimeDiary(target, () => undefined, { provider: provider as AIProviderName, signal });
+          return !!progress && progress.captureDone && progress.textDone;
+        },
+        today: () => diaryDateOf(new Date()),
+        now: () => Date.now(),
+      }, { onlyId, shouldCancel: () => isVaultSwitchingRef.current });
+    } catch (error) {
+      if (!handleStaleVaultTabError(error)) console.error("Automatic realtime diary finishing failed", error);
+      return "blocked";
+    } finally {
+      setDiaryListToken((token) => token + 1);
+    }
+  }
+  const realtimeDiaryAutoRunnerRef = useRef(runRealtimeDiaryAutoFinishNow);
+  realtimeDiaryAutoRunnerRef.current = runRealtimeDiaryAutoFinishNow;
+
   const refreshKeyStatus = () => {
     Promise.all([loadApiKey("gemini"), loadApiKey("openai")]).then(([gemini, openai]) => {
       setKeyStatusByProvider({ gemini: !!gemini, openai: !!openai });
@@ -2509,6 +2564,10 @@ export default function ChatScreen() {
         try {
           if (parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings).enabled) {
             window.setTimeout(() => void trackMemoryTask(autoCaptureRunnerRef.current(false)), AUTO_CAPTURE_START_DELAY_MS);
+          }
+          // 午前4時を過ぎた日記の自動の仕上げ（PR-C）：許可した端末だけ。閉じている間に日付が変わった日記も、ここ（次の起動）で仕上げる
+          if (parseRealtimeDiaryAutoSettings((await loadRealtimeDiaryAutoRaw()).settings).enabled) {
+            window.setTimeout(() => void trackMemoryTask(realtimeDiaryAutoRunnerRef.current()), AUTO_CAPTURE_START_DELAY_MS);
           }
         } catch (error) {
           console.error("Failed to schedule startup Memory creation", error);
@@ -4901,6 +4960,11 @@ export default function ChatScreen() {
       const stored = await withVaultWorldRead(() => getConversation(openId)).catch(() => undefined);
       if (stored?.endedAt) baseConversation = stored;
     }
+    // まだ発言の無いリアルタイム日記は何も保存されていないので、最初の発言の時点の対象日にする（午前4時の前に開いて、後に書き始めた）
+    if (baseConversation.realtimeDiary && !baseConversation.endedAt && baseConversation.turns.length === 0 && !retryTurns) {
+      const date = diaryDateOf(new Date());
+      if (baseConversation.realtimeDiary.date !== date) baseConversation = { ...baseConversation, realtimeDiary: { date } };
+    }
     if (baseConversation.endedAt) {
       void trackMemoryTask(runConversationBoundary(baseConversation));
 
@@ -5352,6 +5416,28 @@ export default function ChatScreen() {
   }
 
   /**
+   * 日付の切り替え（PR-C）：対象日の過ぎた書きかけの日記を、保存されている記録に終了日時を付けて締め切り（別のタブ・端末が先に終えていればその記録のまま）、
+   * 今日の日記（書きかけがあればその続き、無ければ新しく）を開く。入力中の文章は入力欄に残る（送るのは本人）。締め切った日記は仕上げ待ちになり、
+   * 自動の仕上げを許可していればこのあと裏で仕上げ、許可していなければホームの「昨日の日記を仕上げる」から仕上げる。
+   */
+  async function handleSwitchDiaryDay() {
+    const change = diaryDayChange;
+    if (!change || busy || finishingDiaryRef.current || isVaultSwitchingRef.current || crossTabStale) return;
+    const open = latestConversationRef.current;
+    setDiaryDayChange(null);
+    if (open.id !== change.id || !isOpenRealtimeDiary(open)) return;
+    try {
+      syncDiaryToVault(await trackConversationWrite(withVaultWorldRead(() => endRealtimeDiaryWithOutbox(open))));
+    } catch (error) {
+      if (!handleStaleVaultTabError(error)) console.error("Failed to close the realtime diary at the day change", error);
+      return;
+    }
+    await handleOpenRealtimeDiary();
+    // このタブが開いていた印（holdConversationOpen）が外れてから
+    window.setTimeout(() => void trackMemoryTask(realtimeDiaryAutoRunnerRef.current(open.id)), 1500);
+  }
+
+  /**
    * 「終了して日記を生成する」（ホームの「日記を仕上げる」も同じ）。残っている段階だけを、保存された記録を見て進める。何度押しても、途中で閉じても、
    * 会話本文は消えず、Memoryも日記本文も二重にはできない：
    *   1. 終了日時を付けて保存する（以後この日記には書き足さない。ここまでの会話は保存済み）
@@ -5370,16 +5456,8 @@ export default function ChatScreen() {
     const onScreen = () => latestConversationRef.current.id === id;
     const show = (next: Conversation) => { if (!onScreen()) return; latestConversationRef.current = next; setConversation(next); };
     const report = (next: Parameters<typeof setDiaryFinish>[0]) => { if (onScreen()) setDiaryFinish(next); };
-    // 端末の記録（Outbox付き）は保存済み。Vaultへの反映は待たない（失敗しても次の反映で書き直される）
-    const syncDiaryToVault = (saved: Conversation) => {
-      if (!vaultHandle) return;
-      const handle = vaultHandle;
-      trackMemoryTask(withVaultWorldRead(() => writeConversationMarkdown(handle, saved, "interactive")).catch((error) => {
-        if (!handleStaleVaultTabError(error)) console.error("[Tsumugi] diary markdown write failed (will retry on next vault flush):", error);
-      }));
-    };
     const run = async () => {
-      let current: Conversation | undefined = fromHome ? await withVaultWorldRead(() => getConversation(id)) : latestConversationRef.current;
+      const current: Conversation | undefined = fromHome ? await withVaultWorldRead(() => getConversation(id)) : latestConversationRef.current;
       if (!current?.realtimeDiary) { report({ kind: "idle" }); return; }
       if (fromHome) {
         setUnfinishedDiary(null);
@@ -5396,62 +5474,16 @@ export default function ChatScreen() {
         setStreamingText("");
         setSendStatus("idle");
       }
-      // 1. 終了：保存されている記録に終了日時だけを付ける（別のタブ・端末が先に終えていれば、その記録をそのまま使う。画面の古い写しで上書きしない）
-      if (!current.endedAt) {
-        const snapshot = current;
-        const ended = await trackConversationWrite(withVaultWorldRead(() => endRealtimeDiaryWithOutbox(snapshot)));
-        syncDiaryToVault(ended);
-        current = ended;
-        show(ended);
-      }
-      // 2. Memory（既存のCapture）
-      let otherAi = false;
-      let vaultEdited = false;
-      if (current.status !== "captured") {
-        await runConversationBoundary(current, "interactive", false);
-        otherAi = boundaryOutcomeRef.current === "other-ai";
-        vaultEdited = boundaryOutcomeRef.current === "vault-edited";
-        current = (await withVaultWorldRead(() => getConversation(id))) ?? current;
-      }
-      const captureDone = current.status === "captured";
-      // 3. 日記本文
-      let noKey = false;
-      // 保存先のファイルが外部で編集されていたら（Captureと同じ確認。AIへ送る前と保存する前）、編集前の言葉から本文を作らない。編集を取り込んだ後にやり直せる
-      const fileChanged = async (c: Conversation) => {
-        if (!vaultHandle) return false;
-        const state = await conversationFileState(vaultHandle, c);
-        return state !== "same" && state !== "unknown";
-      };
-      if (!current.realtimeDiary?.text && !otherAi && !vaultEdited) {
-        const provider = await loadChatProvider();
-        const source = current;
-        if (!maySendConversationTo(source, provider, parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings))) {
-          otherAi = true;
-        } else if (await fileChanged(source)) {
-          vaultEdited = true;
-        } else {
-          try {
-            const written = await writeRealtimeDiaryText(source, { provider });
-            if (await fileChanged(source)) vaultEdited = true;
-            else syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written, source.turns)));
-          } catch (error) {
-            if (handleStaleVaultTabError(error)) return;
-            if (error instanceof NoUserKeyError) noKey = true;
-            // 別のタブ・端末が先に本文を書いた（そのまま使う）。それ以外の失敗は、会話を残したまま後でやり直せる
-            else if (error instanceof RealtimeDiaryTextNotAddedError && error.reason === "words-changed") vaultEdited = true;
-            else if (!(error instanceof RealtimeDiaryTextNotAddedError)) console.error("Failed to write the realtime diary text", error);
-          }
-        }
-        current = (await withVaultWorldRead(() => getConversation(id))) ?? current;
-      }
-      show(current);
-      const textDone = !!current.realtimeDiary?.text;
+      const progress = await advanceRealtimeDiary(current, show);
+      if (!progress) return;
+      show(progress.current);
+      const { captureDone, textDone, otherAi, noKey, vaultEdited } = progress;
       report(captureDone && textDone ? { kind: "done" } : { kind: "partial", capture: !captureDone, text: !textDone, otherAi, noKey, vaultEdited });
     };
     try {
       const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
       if (!locks) await run();
-      else if (!(await locks.request(`tsumugi-realtime-diary-finish:${id}`, { ifAvailable: true }, async (lock) => (lock ? (await run(), true) : false)))) {
+      else if (!(await locks.request(realtimeDiaryFinishLock(id), { ifAvailable: true }, async (lock) => (lock ? (await run(), true) : false)))) {
         report({ kind: "elsewhere" });
       }
     } catch (error) {
@@ -5461,6 +5493,94 @@ export default function ChatScreen() {
       finishingDiaryRef.current = false;
       endTask();
     }
+  }
+
+  /** 端末の記録（Outbox付き）は保存済み。Vaultへの反映は待たない（失敗しても次の反映で書き直される） */
+  function syncDiaryToVault(saved: Conversation) {
+    if (!vaultHandle) return;
+    const handle = vaultHandle;
+    trackMemoryTask(withVaultWorldRead(() => writeConversationMarkdown(handle, saved, "interactive")).catch((error) => {
+      if (!handleStaleVaultTabError(error)) console.error("[Tsumugi] diary markdown write failed (will retry on next vault flush):", error);
+    }));
+  }
+
+  /**
+   * 日記の仕上げの手順（手動の「終了して日記を生成する」「日記を仕上げる」と、許可した自動の仕上げ：PR-Cで共通）。残っている段階だけを、保存された記録を見て進める：
+   *   1. 終了日時を付けて保存する（保存されている記録に付ける。別のタブ・端末が先に終えていれば、その記録をそのまま使う）
+   *   2. Memory：既存のCapture（済みなら何もしない）
+   *   3. 日記本文：選んでいるAIが会話全体から書き、保存されている記録に本文だけを足す（既にあれば上書きしない）
+   * `auto`：自動の仕上げ。送り先は`auto.provider`だけ、キーは利用者自身のものだけ（無ければ送らない）。画面の状態は変えない。呼び出し側がこの日記のロックを持つ。
+   * 古いタブなど、続けられないときはnull。
+   */
+  async function advanceRealtimeDiary(start: Conversation, show: (next: Conversation) => void, auto?: { provider: AIProviderName; signal: AbortSignal }) {
+    const id = start.id;
+    let current = start;
+    // 1. 終了：保存されている記録に終了日時だけを付ける（画面の古い写しで上書きしない）
+    if (!current.endedAt) {
+      const snapshot = current;
+      const ended = await trackConversationWrite(withVaultWorldRead(() => endRealtimeDiaryWithOutbox(snapshot)));
+      syncDiaryToVault(ended);
+      current = ended;
+      show(ended);
+    }
+    // 2. Memory（既存のCapture）
+    let otherAi = false;
+    let vaultEdited = false;
+    if (current.status !== "captured") {
+      if (!auto) {
+        await runConversationBoundary(current, "interactive", false);
+        otherAi = boundaryOutcomeRef.current === "other-ai";
+        vaultEdited = boundaryOutcomeRef.current === "vault-edited";
+      } else {
+        // 起動時の自動Captureと同じ経路（利用者自身のキーだけ、ファイルが同じときだけ）。既にこの日記のMemoryがあれば作らない（Vaultから戻るのを待つ）
+        const target = current;
+        const known = target.memoryObjectIds.length > 0 || (await withVaultWorldRead(() => getAllMemoryObjects())).some((memory) => memory.conversationId === id);
+        if (!known) {
+          const capture: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult; provider: AIProviderName } = { signal: auto.signal, onRequestSent: () => undefined, result: "changed", provider: auto.provider };
+          try {
+            await trackConversationWrite(captureConversationBoundaryBody(target, "background", true, capture));
+          } catch (error) {
+            const name = (error as Error | undefined)?.name;
+            if (name === "StaleVaultTabError" || name === "IncompleteVaultWorldError") throw error;
+            capture.result = classifyAutoCaptureFailure(error, auto.signal.aborted);
+          }
+          if (capture.result === "changed") vaultEdited = true;
+        }
+      }
+      current = (await withVaultWorldRead(() => getConversation(id))) ?? current;
+    }
+    const captureDone = current.status === "captured";
+    // 3. 日記本文
+    let noKey = false;
+    // 保存先のファイルが外部で編集されていたら（Captureと同じ確認。AIへ送る前と保存する前）、編集前の言葉から本文を作らない。編集を取り込んだ後にやり直せる
+    const fileChanged = async (c: Conversation) => {
+      if (!vaultHandle) return false;
+      const state = await conversationFileState(vaultHandle, c);
+      return auto ? state !== "same" : state !== "same" && state !== "unknown";
+    };
+    if (!current.realtimeDiary?.text && !otherAi && !vaultEdited) {
+      const provider = auto?.provider ?? (await loadChatProvider());
+      const source = current;
+      if (!maySendConversationTo(source, provider, parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings))) {
+        otherAi = true;
+      } else if (await fileChanged(source)) {
+        vaultEdited = true;
+      } else {
+        try {
+          const written = await writeRealtimeDiaryText(source, auto ? { provider, requireUserKey: true } : { provider }, auto?.signal);
+          if (await fileChanged(source)) vaultEdited = true;
+          else syncDiaryToVault(await withVaultWorldRead(() => addRealtimeDiaryTextWithOutbox(id, written, source.turns)));
+        } catch (error) {
+          if (handleStaleVaultTabError(error)) return null;
+          if (error instanceof NoUserKeyError) noKey = true;
+          // 別のタブ・端末が先に本文を書いた（そのまま使う）。それ以外の失敗は、会話を残したまま後でやり直せる
+          else if (error instanceof RealtimeDiaryTextNotAddedError && error.reason === "words-changed") vaultEdited = true;
+          else if (!(error instanceof RealtimeDiaryTextNotAddedError)) console.error("Failed to write the realtime diary text", error);
+        }
+      }
+      current = (await withVaultWorldRead(() => getConversation(id))) ?? current;
+    }
+    return { current, captureDone, textDone: !!current.realtimeDiary?.text, otherAi, noKey, vaultEdited };
   }
 
   /** 再試行しないと決めた会話を、通常の会話の区切りと同じ扱いで閉じる（Captureは1回だけ。本文はそのまま残る）。 */
@@ -5826,19 +5946,28 @@ export default function ChatScreen() {
                 </div>
               </div>
             )}
-            {unfinishedDiary?.realtimeDiary && (
-              <div data-testid="unfinished-diary" className="flex flex-col items-center gap-3 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
-                <p>{Number(unfinishedDiary.realtimeDiary.date.slice(5, 7))}月{Number(unfinishedDiary.realtimeDiary.date.slice(8, 10))}日の日記の仕上げが終わっていません。会話は保存されています。</p>
-                <button
-                  type="button"
-                  onClick={() => void handleFinishRealtimeDiary(unfinishedDiary)}
-                  disabled={isVaultSwitching || crossTabStale}
-                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/5"
-                >
-                  日記を仕上げる
-                </button>
-              </div>
-            )}
+            {unfinishedDiary?.realtimeDiary && (() => {
+              const date = unfinishedDiary.realtimeDiary.date;
+              const today = diaryDateOf(new Date());
+              const day = `${Number(date.slice(5, 7))}月${Number(date.slice(8, 10))}日`;
+              const label = date === previousDiaryDate(today) ? "昨日の日記を仕上げる" : date < today ? `${day}の日記を仕上げる` : "日記を仕上げる";
+              return (
+                <div data-testid="unfinished-diary" className="flex flex-col items-center gap-3 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+                  <p>
+                    {unfinishedDiary.endedAt ? `${day}の日記の仕上げが終わっていません。` : `${day}の日記は日付が変わったため、仕上げを待っています。`}会話は保存されています。
+                    {otherUnfinishedDiaries > 0 && <>（ほかに{otherUnfinishedDiaries}件）</>}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void handleFinishRealtimeDiary(unfinishedDiary)}
+                    disabled={isVaultSwitching || crossTabStale}
+                    className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/5"
+                  >
+                    {label}
+                  </button>
+                </div>
+              );
+            })()}
             {topPrompt && (
               <div className="flex w-full flex-col items-center gap-3 border-b border-black/5 pb-8 dark:border-white/10">
                 <p className="whitespace-pre-wrap text-base text-stone-600 dark:text-stone-300">
@@ -6320,6 +6449,31 @@ export default function ChatScreen() {
       >
       {!showEntryScreen && (
       <footer className="mx-auto w-full max-w-2xl px-5">
+        {diaryDayChange && diaryDayChange.id === conversation.id && (() => {
+          const md = (d: string) => `${Number(d.slice(5, 7))}月${Number(d.slice(8, 10))}日`;
+          return (
+            <div data-testid="diary-day-change" role="status" className="mb-2 flex flex-col gap-2 rounded-xl bg-amber-50/60 px-4 py-3 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              <p>日付が変わりました（午前4時）。{md(diaryDayChange.from)}の日記はここで締め切り、{md(diaryDayChange.to)}の日記として続けます。入力中の文章はそのまま残ります。</p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleSwitchDiaryDay()}
+                  disabled={busy || isVaultSwitching || crossTabStale}
+                  className="shrink-0 rounded-full border border-stone-400/60 px-3 py-1 text-xs text-stone-700 transition hover:bg-stone-900/5 disabled:opacity-50 dark:border-stone-500/60 dark:text-stone-300 dark:hover:bg-white/5"
+                >
+                  {md(diaryDayChange.to)}の日記へ切り替える
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDiaryDayChange(null)}
+                  className="shrink-0 rounded-full px-3 py-1 text-xs text-stone-500 transition hover:bg-stone-900/5 dark:text-stone-400 dark:hover:bg-white/5"
+                >
+                  閉じる
+                </button>
+              </div>
+            </div>
+          );
+        })()}
         <div className="flex items-end gap-2 rounded-2xl border border-stone-300/70 bg-white/70 p-2 shadow-sm dark:border-stone-700/70 dark:bg-stone-900/60">
           {/*
             入力欄（textarea・自動リサイズ・↺/＋/送るボタン）はChatInputへ切り出して
@@ -6337,7 +6491,14 @@ export default function ChatScreen() {
             placeholder={
               PERSONAS.find((p) => p.value === persona)?.placeholder ?? "話しかけてみてください"
             }
-            onSend={(text) => void handleSend(text)}
+            onSend={(text) => {
+              // 書きかけの日記の対象日が過ぎていたら（午前4時を越えた）、送らずに切り替えを案内する。発言を勝手に別の日記へ移さない
+              const open = latestConversationRef.current;
+              const change = needsDiaryDayChange(open, new Date());
+              if (change) { setDiaryDayChange({ id: open.id, ...change }); return false; }
+              setDiaryDayChange(null);
+              void handleSend(text);
+            }}
           />
         </div>
 
@@ -6768,7 +6929,8 @@ function ChatInput({
 }: {
   disabled: boolean;
   placeholder: string;
-  onSend: (text: string) => void;
+  /** falseを返したら送らなかった：入力中の文章を消さない（リアルタイム日記の日付の切り替えの案内など） */
+  onSend: (text: string) => boolean | void;
 }) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -6790,7 +6952,7 @@ function ChatInput({
   function handleSendClick() {
     const text = value.trim();
     if (!text || disabled) return;
-    onSend(text);
+    if (onSend(text) === false) return;
     setValue("");
   }
 
