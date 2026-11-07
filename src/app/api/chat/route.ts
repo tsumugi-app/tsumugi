@@ -4,7 +4,7 @@ import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTim
 import { jstDateOf } from "@/lib/dateModel";
 import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
 import type { ConversationTurn, Persona, PersonRelation, RetrievedMemory } from "@/lib/types";
-import type { StreamChunk } from "@/lib/ai/types";
+import type { AIProviderName, StreamChunk } from "@/lib/ai/types";
 import { needsWebSearch } from "@/lib/needsWebSearch";
 import { LeadingTimeLabelStripper, stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { sanitizeProfileContext, type ProfileContext } from "@/lib/profile";
@@ -923,8 +923,10 @@ export async function POST(request: Request) {
   // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。元の実装通り、bodyのJSON解析より
   // 前にAPIキーの有無を確認する（不正なbodyでもまずキー未設定エラーを返す挙動を保つ）。
   // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
-  const providerName = resolveRequestedProvider(request);
-  if (!providerName) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
+  const requestedProvider = resolveRequestedProvider(request);
+  if (!requestedProvider) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
+  // 応答ストリームのクロージャでも使うため、undefinedを含まない型として確定させる。
+  const providerName: AIProviderName = requestedProvider;
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
     return Response.json(
