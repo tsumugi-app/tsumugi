@@ -227,8 +227,8 @@ async function startDiary(page: Page) {
 test.describe("realtime diary: 終了して日記を生成する", () => {
   test("ending writes one Memory with the existing Capture and one diary text, keeps the words, shows the text, and History shows it on its day", async ({ page }) => {
     test.setTimeout(180_000);
-    // History opens on today in JST, the diary day is the device's (UTC on CI): a time when both are the same day, so the run does not depend on the hour
-    await page.clock.install({ time: new Date("2026-11-07T03:00:00Z") });
+    // History opens on today in JST, the diary day is the device's (UTC on CI, 4:00 boundary): 06:00 UTC = 15:00 JST is the same day for both, so the run does not depend on the hour
+    await page.clock.install({ time: new Date("2026-11-07T06:00:00Z") });
     await seed(page);
     const calls = await fakeApi(page);
     await startApp(page);
