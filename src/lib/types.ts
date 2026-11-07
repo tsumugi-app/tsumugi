@@ -153,7 +153,21 @@ export interface Conversation extends Identifiable, Timestamped {
    * （実行時・IndexedDBの補助情報にとどめ、既存のfrontmatterスキーマは変更しない）。
    */
   promptedMemoryId?: ID;
+  /**
+   * リアルタイム日記（一日につき一つの会話を、一時保存・再開しながら続ける）。未設定＝通常の日記・会話。
+   * 終了日時（endedAt）が無い間は「書きかけ」で、会話の区切り・起動時の自動処理でMemoryを作らない（realtimeDiary.ts）。
+   */
+  realtimeDiary?: RealtimeDiary;
   metadata: Metadata;
+}
+
+/**
+ * `date`：日記の対象日（YYYY-MM-DD）。日記を始めた時点で、端末のローカル時刻・午前4時区切りで確定する。
+ * 発言の実際の日時（turn.timestamp）とは別の値で、後から発言時刻で計算し直さない。Markdownには`diaryDate`として書く。
+ * 日記本文・完了日時などは、後の段階でこの型に足す（既存の値は変えない）。
+ */
+export interface RealtimeDiary {
+  date: string;
 }
 
 export type MemoryType =
