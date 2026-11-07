@@ -1616,7 +1616,7 @@ export default function SettingsPanel({
           )}
         </section>
 
-        <AutoCaptureSettings onRetry={onAutoCaptureRetry} />
+        <AutoCaptureSettings onRetry={onAutoCaptureRetry} selectedProvider={chatProvider} />
 
         {/*
           データ管理。「データ」セクションは全プラットフォームで表示する。

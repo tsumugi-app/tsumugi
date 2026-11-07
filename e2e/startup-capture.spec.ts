@@ -1559,10 +1559,20 @@ test.describe("the AI the user chose is where everything goes", () => {
 
   test("removing the chosen AI's key does not switch to another AI: requests still name OpenAI, and nothing goes to Gemini", async ({ page }) => {
     test.setTimeout(180_000);
-    await seed(page, [], undefined, { enabled: false, openaiKey: true, chosen: "openai" });
+    await seed(page, [{ id: "sw-g", ago: 120 * MIN, chatProviders: ["gemini"] }], undefined, { enabled: false, allowOtherProviders: false, openaiKey: true, chosen: "openai" });
     const calls = await fakeApi(page);
     await startApp(page);
     await nav(page).getByRole("button", { name: "設定" }).click();
+    // the permission text and the counts follow the AI chosen, also when it is switched with Settings open
+    const auto = page.getByTestId("auto-capture");
+    await expect(auto).toContainText("OpenAI以外のAIでも話した会話", { timeout: 30_000 });
+    await expect(page.getByTestId("auto-capture-summary")).toContainText("未処理 0 件 ／ 許可待ち 1 件", { timeout: 30_000 });
+    await page.getByRole("button", { name: "Gemini", exact: true }).click();
+    await expect(auto).toContainText("Gemini以外のAIでも話した会話", { timeout: 30_000 });
+    await expect(page.getByTestId("auto-capture-summary")).toContainText("未処理 1 件 ／ 許可待ち 0 件", { timeout: 30_000 });
+    await page.getByRole("button", { name: "OpenAI", exact: true }).click();
+    await expect(auto).toContainText("OpenAI以外のAIでも話した会話", { timeout: 30_000 });
+    await expect(page.getByTestId("auto-capture-summary")).toContainText("許可待ち 1 件", { timeout: 30_000 });
     await page.getByText("OpenAI APIキー：設定済み").locator("..").getByRole("button", { name: "削除" }).click();
     await expect(page.getByText("OpenAI APIキー：未設定")).toBeVisible({ timeout: 30_000 });
     const chosen = await page.evaluate(async () => {

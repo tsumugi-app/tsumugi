@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { parseAutoCaptureSettings, parseAutoCaptureState, summarizeAutoCapture, type AutoCaptureSettings as Settings, type AutoCaptureSummary } from "@/lib/autoCapturePolicy";
-import { getAllConversations, getAllMemoryObjects, loadAutoCaptureRaw, loadChatProvider, saveAutoCaptureSettingsRaw } from "@/lib/db";
+import { getAllConversations, getAllMemoryObjects, loadAutoCaptureRaw, saveAutoCaptureSettingsRaw } from "@/lib/db";
 import { withVaultWorldRead } from "@/lib/vaultWorldLock";
 
 /** 利用するAIの表示名（設定画面の「使用するAI」と同じ） */
@@ -18,28 +18,31 @@ const RETRY_MESSAGE: Record<string, string> = {
 };
 
 /** 会話を終了しなかったときのMemory作成。標準はオフで、ここでオンにした端末だけ自動で動く。 */
-export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promise<string> }) {
+/** `selectedProvider`：設定画面で今選ばれているAI。切り替えたら、許可の文言と件数をそのAIで数え直す（開いたままでも古いAIの表示を残さない）。 */
+export default function AutoCaptureSettings({ onRetry, selectedProvider }: { onRetry: () => Promise<string>; selectedProvider: string }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [summary, setSummary] = useState<AutoCaptureSummary | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const [provider, setProvider] = useState<string | null>(null);
+  const latest = useRef(0);
 
   const refresh = async (current?: Settings) => {
+    const run = ++latest.current;
+    const chosen = selectedProvider;
     const raw = await loadAutoCaptureRaw();
     const loaded = current ?? parseAutoCaptureSettings(raw.settings);
     setSettings(loaded);
-    const chosen = await loadChatProvider();
-    setProvider(chosen);
     const { conversations, memories } = await withVaultWorldRead(async () => ({ conversations: await getAllConversations(), memories: await getAllMemoryObjects() }));
     const withMemory = new Set(memories.flatMap((m) => (m.conversationId ? [m.conversationId] : [])));
+    // a newer refresh (another AI chosen meanwhile) decides what is shown
+    if (run !== latest.current) return;
     setSummary(summarizeAutoCapture(conversations, withMemory, parseAutoCaptureState(raw.state), loaded, chosen, new Set(memories.map((m) => m.id))));
   };
 
   useEffect(() => {
     void refresh().catch(() => setSettings((s) => s ?? parseAutoCaptureSettings(undefined)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [selectedProvider]);
 
   const change = async (next: Settings) => {
     setSettings(next);
@@ -59,7 +62,7 @@ export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promis
   };
 
   if (!settings) return null;
-  const ai = provider ? AI_LABEL[provider] ?? provider : "利用するAI";
+  const ai = AI_LABEL[selectedProvider] ?? selectedProvider;
   return (
     <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10" data-testid="auto-capture">
       <p className="text-sm text-stone-500 dark:text-stone-400">閉じた会話の記憶</p>
