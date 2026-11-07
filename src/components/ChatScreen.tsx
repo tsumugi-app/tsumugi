@@ -23,7 +23,9 @@ import type { ConversationEntryKind } from "@/lib/conversationEntryKind";
 import { endsWithInterruptedReply, isBlankAiReply, isSupersededTurn, newestInterruptedConversation, retryableTurns, turnsForAi } from "@/lib/aiReplyOutcome";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { conversationFileState } from "@/lib/conversationFileCheck";
-import { parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
+import { maySendConversationTo, parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from "@/lib/autoCapturePolicy";
+import type { AiRequestOptions } from "@/lib/selectedAi";
+import type { AIProviderName } from "@/lib/ai/types";
 import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
 import { isUsableUserKey } from "@/lib/apiKeyHeader";
 import { AUTO_CAPTURE_RUN_LOCK, conversationLocksSupported, holdConversationOpen, ifConversationFree, ifLockFree, withConversationCapture } from "@/lib/conversationLocks";
@@ -415,7 +417,7 @@ type RestoreScanTrigger = "startup" | "connect" | "reauthorize" | "recovery";
 const STARTUP_CONNECT_LIMIT = 3;
 
 /** 会話終了時のCapture結果の区別（表示専用）。"empty"のみが「正常に完了し、保存対象が0件」。 */
-type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed" | "vault-edited";
+type BoundaryCaptureOutcome = "saved" | "empty" | "all-dropped" | "failed" | "persist-failed" | "vault-edited" | "other-ai";
 
 /** 起動時のMemory作成は、画面が使えるようになってから始める。 */
 const AUTO_CAPTURE_START_DELAY_MS = 5000;
@@ -575,8 +577,8 @@ async function resolveVaultWorldStartupDecision(): Promise<VaultWorldStartupDeci
   return { kind: "normal", epoch };
 }
 
-/** 利用者自身のGeminiキーがあるか。空白だけのキーや、ヘッダーで送れないキーは、ないものとして扱う。 */
-const userKeySaved = async () => isUsableUserKey(await loadApiKey("gemini"));
+/** 利用者が選んだAIについて、利用者自身のキーがあるか。空白だけのキーや、ヘッダーで送れないキーは、ないものとして扱う。 */
+const userKeySaved = async (provider: AIProviderName) => isUsableUserKey(await loadApiKey(provider));
 
 export default function ChatScreen() {
   /**
@@ -1518,7 +1520,7 @@ export default function ChatScreen() {
    * 生成が完了したMemoryはmemoryObjects stateへも反映する（画面に既に表示されている
    * Memoryへ、revisitPromptだけが後から追記される形になる）。
    */
-  function enqueueRevisitPromptGeneration(memories: MemoryObject[], requireUserKey = false) {
+  function enqueueRevisitPromptGeneration(memories: MemoryObject[], ai: AiRequestOptions = {}) {
     const targets = memories.filter((memory) => !memory.revisitPrompt);
     if (targets.length === 0) return;
     // Vault境界の安全性：Memory Worldへ影響する非同期処理として追跡する
@@ -1528,7 +1530,7 @@ export default function ChatScreen() {
       Promise.all(
         targets.map(async (memory) => {
           try {
-            const revisitPrompt = await generateRevisitPrompt(memory, { requireUserKey });
+            const revisitPrompt = await generateRevisitPrompt(memory, ai);
             if (!revisitPrompt) return;
             // Vault境界の安全性（H4対応）：最新recordへのfield更新をロック＋epoch確認で包む。
             const memoryWithPrompt = await withVaultWorldRead(() => updateMemoryRevisitPrompt(memory.id, revisitPrompt));
@@ -1560,7 +1562,7 @@ export default function ChatScreen() {
   function connectConversationBoundary(
     pendingMemoryObjects: Promise<MemoryObject[]>,
     priority: VaultWritePriority = "interactive",
-    requireUserKey = false
+    ai: AiRequestOptions = {}
   ) {
     // Vault境界の安全性：Connect自体もMemory Worldへ影響する非同期処理として追跡する
     // （Vault切替時、この完了を待ってからIndexedDBをclearする。H2/H3対応）。
@@ -1572,7 +1574,7 @@ export default function ChatScreen() {
         try {
           const memories = await pendingMemoryObjects;
           for (const memory of memories) {
-            await connectMemory(vaultHandle, memory, priority, { requireUserKey });
+            await connectMemory(vaultHandle, memory, priority, ai);
           }
         } catch (error) {
           console.error("Failed to connect conversation-boundary memories", error);
@@ -1632,7 +1634,7 @@ export default function ChatScreen() {
     target: Conversation,
     priority: VaultWritePriority,
     awaitVaultSync: boolean,
-    auto?: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult }
+    auto?: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult; provider: AIProviderName }
   ): Promise<MemoryObject[]> {
     if (target.status === "captured" || target.turns.length === 0) {
       boundaryOutcomeRef.current = "empty";
@@ -1680,13 +1682,21 @@ export default function ChatScreen() {
         }
         if (await stoppedByVaultEdit()) return [];
       }
+      // 送り先は利用者が選んだAIだけ。会話の終了でも、選んでいるAI以外でも話した会話は、起動時の自動処理と同じ許可がなければ送らない。
+      const ai: AiRequestOptions = auto ? { provider: auto.provider, requireUserKey: true } : { provider: await loadChatProvider() };
+      if (!auto && !maySendConversationTo(target, ai.provider!, parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings))) {
+        boundaryOutcomeRef.current = "other-ai";
+        setCaptureStatus("error");
+        connectConversationBoundary(Promise.resolve([]), priority);
+        return [];
+      }
       // 境界Captureは会話ごとに1回だけなので、このConversation自身からの
       // 既存Memory（existingMemoryObjects）は常に空でよい（前のターンでのCaptureが
       // 無いため、このConversation発の既存Memoryはまだ存在しない）。
       const { conversation: capturedDelta, memoryObjects: touchedMemoryObjects, outcome: captureOutcome } = await captureConversation(
         target,
         [],
-        auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent, requireUserKey: true } : undefined
+        auto ? { signal: auto.signal, onRequestSent: auto.onRequestSent, ...ai } : ai
       );
       if (await stoppedByVaultEdit()) return [];
       // 会話の状態とMemoryは1つのtransactionで保存する。失敗すれば何も変わらず、会話は次の機会にもう一度処理できる。
@@ -1755,8 +1765,8 @@ export default function ChatScreen() {
         window.setTimeout(() => setCaptureStatus("idle"), 2500);
       }
 
-      enqueueRevisitPromptGeneration(persistedMemoryObjects, !!auto);
-      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority, !!auto);
+      enqueueRevisitPromptGeneration(persistedMemoryObjects, ai);
+      connectConversationBoundary(Promise.resolve(persistedMemoryObjects), priority, ai);
       return persistedMemoryObjects;
     } catch (error) {
       if (auto) throw error;
@@ -1773,7 +1783,8 @@ export default function ChatScreen() {
   function autoCaptureDeps(): AutoCaptureDeps {
     return {
       loadSettings: async () => parseAutoCaptureSettings((await loadAutoCaptureRaw()).settings),
-      hasUserKey: userKeySaved,
+      selectedProvider: loadChatProvider,
+      hasUserKey: (provider) => userKeySaved(provider as AIProviderName),
       online: () => navigator.onLine !== false,
       blocked: () => vaultStatus !== "connected" || !vaultHandle || isVaultSwitchingRef.current || crossTabStale || appOutdated || !(recoveryStatus.kind === "idle" || recoveryStatus.kind === "clean" || recoveryStatus.kind === "done") || !conversationLocksSupported(),
       withRunLock: async (fn) => {
@@ -1787,8 +1798,8 @@ export default function ChatScreen() {
       writeState: (state) => saveAutoCaptureStateRaw(JSON.stringify(state)),
       ifConversationFree,
       vaultFileUnchanged: async (target) => !vaultHandle || (await conversationFileState(vaultHandle, target)) === "same",
-      capture: async (target, signal, onRequestSent) => {
-        const auto: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult } = { signal, onRequestSent, result: "changed" };
+      capture: async (target, signal, onRequestSent, provider) => {
+        const auto: { signal: AbortSignal; onRequestSent: () => void; result: AutoCaptureResult; provider: AIProviderName } = { signal, onRequestSent, result: "changed", provider: provider as AIProviderName };
         await trackConversationWrite(captureConversationBoundaryBody(target, "background", true, auto));
         return auto.result;
       },
@@ -2362,7 +2373,8 @@ export default function ChatScreen() {
           // それ自体が内部で共有ロックを取得するため、ここでロックを保持したまま呼ぶと
           // 同名ロックのネストになりデッドロックしうる。vaultWorldLock.ts参照）。
           // 利用者のAPIキーがない端末では、自動の処理で運営側のキーを使わない。
-          if (!(await userKeySaved())) return;
+          const provider = await loadChatProvider();
+          if (!(await userKeySaved(provider))) return;
           const allMemories = await withVaultWorldRead(() => getAllMemoryObjects());
           const unconnected = await filterUnconnected(allMemories);
           const pending = [...unconnected]
@@ -2371,11 +2383,11 @@ export default function ChatScreen() {
           logStartupCatchupStart("connectCatchup", pending.length);
           for (const memory of pending) {
             // Vault切替中に新規のキャッチアップ継続をしない（新規Memory系処理の停止）。
-            if (cancelled || isVaultSwitchingRef.current || crossTabStale || !(await userKeySaved())) return;
+            if (cancelled || isVaultSwitchingRef.current || crossTabStale || !(await userKeySaved(provider))) return;
             // 起動時キャッチアップ由来のVault writeはbackground優先度にし、
             // ユーザー操作由来のwriteを待たせないようにする（処理内容・順序は無変更）。
             try {
-              await connectMemory(vaultHandle, memory, "background", { requireUserKey: true });
+              await connectMemory(vaultHandle, memory, "background", { provider, requireUserKey: true });
             } catch (error) {
               // 実機不具合対応（1件のHOLD/conflictがcatch-up全体を止める問題）：
               // connectMemoryImpl自身は失敗時にclaimを解放したうえで必ず再throwする
@@ -2545,13 +2557,9 @@ export default function ChatScreen() {
   }, []);
 
   async function handleDeleteApiKey(deleteTarget: SupportedChatProvider) {
-    // Beta：Geminiキーを削除してもTsumugi提供のサーバー側キーへ自動フォールバックする
-    // ため、以前のようにオンボーディング（全画面）へ戻す必要はない。
+    // 利用するAIはそのまま（別のAIへ勝手に切り替えない）。そのAIのキーがなければ、要求は送られずに止まる。
     await clearApiKey(deleteTarget);
     refreshKeyStatus();
-    if (chatProvider === deleteTarget) {
-      handleSelectChatProvider("gemini");
-    }
   }
 
   /**
@@ -4602,8 +4610,8 @@ export default function ChatScreen() {
 
         // STEP 2-B：title専用の追加LLM callは行わない。同じgenerateSessionReflection
         // call（/api/reflectの1回のgenerateStructured call）がtitle/reflectionを同時に返す。
-        const { title, reflection: text } = await generateSessionReflection(persona, reflectionSource);
-        const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text);
+        const { title, reflection: text, aiProvider } = await generateSessionReflection(persona, reflectionSource);
+        const insightMemory = createInsightMemoryObject(conversation, reflectionSource, text, aiProvider);
         const endedConversation: Conversation = {
           ...latestConversationRef.current,
           title,
@@ -5046,8 +5054,7 @@ export default function ChatScreen() {
           : null,
       });
 
-      // chatだけは選択中provider（既定Gemini）を使う。他機能（Capture/Connect/Reflection/
-      // 問いかけ生成）はloadApiKey()を引数なしで呼ぶため、常にGeminiのままである。
+      // 会話も、他の機能（Capture/Connect/Reflection/問いかけ生成）と同じく、利用者が選んだAIとそのAIのキーだけを使う。
       const storedApiKey = await loadApiKey(chatProvider);
       // Conversation Debugger v1（開発専用）：`?debugLog=1`のときだけgenerationIdを発行する。
       // これはrequest→response→debug entry→対応するAI返答を紐付けるためだけの、
@@ -5904,6 +5911,8 @@ export default function ChatScreen() {
                     ? "記憶の保存に失敗しました。会話は保存されています。次回起動時にもう一度試します。"
                     : endedCaptureOutcome === "vault-edited"
                       ? "保存先のファイルが外部で変更されていたため、記憶は作りませんでした。会話とファイルはそのままです。設定で変更を確認してください。"
+                      : endedCaptureOutcome === "other-ai"
+                      ? "この会話には、いま選んでいるAI以外で話した部分があるため、記憶を作るためにAIへは送っていません。会話は保存されています。設定の「閉じた会話の記憶」で許可できます。"
                       : endedCaptureOutcome === "persist-failed"
                       ? "記憶を端末へ保存できませんでした。会話は保存されています。"
                       : "今回は新しく記憶したことはありませんでした。"}

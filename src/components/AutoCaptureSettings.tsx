@@ -1,39 +1,48 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { parseAutoCaptureSettings, parseAutoCaptureState, summarizeAutoCapture, type AutoCaptureSettings as Settings, type AutoCaptureSummary } from "@/lib/autoCapturePolicy";
 import { getAllConversations, getAllMemoryObjects, loadAutoCaptureRaw, saveAutoCaptureSettingsRaw } from "@/lib/db";
 import { withVaultWorldRead } from "@/lib/vaultWorldLock";
 
+/** 利用するAIの表示名（設定画面の「使用するAI」と同じ） */
+const AI_LABEL: Record<string, string> = { gemini: "Gemini", openai: "OpenAI" };
+
 const RETRY_MESSAGE: Record<string, string> = {
   saved: "Memoryを作成しました。",
   empty: "残す内容はありませんでした。処理は完了しています。",
-  "no-key": "GeminiのAPIキーを登録すると試せます。",
+  "no-key": "利用するAIのAPIキーを登録すると試せます。",
   offline: "通信できるときに試してください。",
   blocked: "今は実行できません。保存先の状態を確認してください。",
   nothing: "今は試せる会話がありません。",
 };
 
 /** 会話を終了しなかったときのMemory作成。標準はオフで、ここでオンにした端末だけ自動で動く。 */
-export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promise<string> }) {
+/** `selectedProvider`：設定画面で今選ばれているAI。切り替えたら、許可の文言と件数をそのAIで数え直す（開いたままでも古いAIの表示を残さない）。 */
+export default function AutoCaptureSettings({ onRetry, selectedProvider }: { onRetry: () => Promise<string>; selectedProvider: string }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [summary, setSummary] = useState<AutoCaptureSummary | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const latest = useRef(0);
 
   const refresh = async (current?: Settings) => {
+    const run = ++latest.current;
+    const chosen = selectedProvider;
     const raw = await loadAutoCaptureRaw();
     const loaded = current ?? parseAutoCaptureSettings(raw.settings);
     setSettings(loaded);
     const { conversations, memories } = await withVaultWorldRead(async () => ({ conversations: await getAllConversations(), memories: await getAllMemoryObjects() }));
     const withMemory = new Set(memories.flatMap((m) => (m.conversationId ? [m.conversationId] : [])));
-    setSummary(summarizeAutoCapture(conversations, withMemory, parseAutoCaptureState(raw.state), loaded, new Set(memories.map((m) => m.id))));
+    // a newer refresh (another AI chosen meanwhile) decides what is shown
+    if (run !== latest.current) return;
+    setSummary(summarizeAutoCapture(conversations, withMemory, parseAutoCaptureState(raw.state), loaded, chosen, new Set(memories.map((m) => m.id))));
   };
 
   useEffect(() => {
     void refresh().catch(() => setSettings((s) => s ?? parseAutoCaptureSettings(undefined)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [selectedProvider]);
 
   const change = async (next: Settings) => {
     setSettings(next);
@@ -53,6 +62,7 @@ export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promis
   };
 
   if (!settings) return null;
+  const ai = AI_LABEL[selectedProvider] ?? selectedProvider;
   return (
     <section className="flex flex-col gap-3 border-t border-black/5 pt-6 dark:border-white/10" data-testid="auto-capture">
       <p className="text-sm text-stone-500 dark:text-stone-400">閉じた会話の記憶</p>
@@ -67,7 +77,7 @@ export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promis
         <span>終了操作をしなかった会話からも、次回の起動時にMemoryを作成する</span>
       </label>
       <p className="text-xs text-stone-500 dark:text-stone-400">
-        最後の更新から30分以上経った会話を、起動ごとに1件、24時間で5件まで、登録済みのGemini APIキーでGeminiへ送ります。APIキーがなければ何も送りません。失敗した会話は3回まで試します。
+        最後の更新から30分以上経った会話を、起動ごとに1件、24時間で5件まで、利用するAI（いまは{ai}）へ、登録済みの{ai} APIキーで送ります。APIキーがなければ何も送りません。失敗した会話は3回まで試します。
       </p>
       <label className="flex items-start gap-2 text-sm">
         <input
@@ -77,7 +87,7 @@ export default function AutoCaptureSettings({ onRetry }: { onRetry: () => Promis
           data-testid="auto-capture-other-providers"
           onChange={(e) => void change({ ...settings, allowOtherProviders: e.target.checked })}
         />
-        <span>Gemini以外で話した会話と、どのAIで話したか記録がない以前の会話もGeminiへ送る</span>
+        <span>{ai}以外のAIでも話した会話と、どのAIで話したか記録がない以前の会話も{ai}へ送る</span>
       </label>
       {summary && (
         <p className="text-xs text-stone-500 dark:text-stone-400" data-testid="auto-capture-summary">

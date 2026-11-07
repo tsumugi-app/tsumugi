@@ -61,8 +61,8 @@ const fakeProvider = {
 };
 let debugEpoch = 1;
 const stubs: Record<string, unknown> = {
-  "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini" },
-  "./db": new Proxy({ loadApiKey: async () => "k", getAllMemoryObjects: async () => rec.allMemories }, { get: (t: Record<string, unknown>, k: string) => (k in t ? t[k] : async () => undefined) }),
+  "@/lib/ai/resolve": { getProvider: () => fakeProvider, resolveApiKey: () => "k", resolveModel: () => "m", resolveRequestedProvider: () => "gemini" },
+  "./db": new Proxy({ loadApiKey: async () => "k", loadSelectedAi: async () => ({ provider: "gemini", key: "k" }), getAllMemoryObjects: async () => rec.allMemories }, { get: (t: Record<string, unknown>, k: string) => (k in t ? t[k] : async () => undefined) }),
   "./vault": { isReflectionSummary: (m: { metadata: { source: string } }) => m.metadata.source === "system-generated" },
   "./vaultWorldLock": { getTabVaultEpoch: () => debugEpoch, withVaultWorldRead: async <T,>(fn: () => Promise<T>) => fn() },
   "./debugTimingLog": { logTimingEvent: () => {} },

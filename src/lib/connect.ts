@@ -17,13 +17,13 @@ import { withVaultSaveLock } from "./vaultSaveLock";
 import { assertNoPendingRecovery } from "./vaultRecoveryJournal";
 import { reconcileMemoryOutboxEntry, reconcileReflectionOutboxEntry } from "./vaultProjection";
 import { ulid } from "ulid";
-import { getAllMemoryObjects, getMemoryObject, loadApiKey, addMemoryLinkDurably, getVaultIdentityRecord, getVaultOutboxEntry, markMemoryProjectionSynced } from "./db";
+import { getAllMemoryObjects, getMemoryObject, addMemoryLinkDurably, getVaultIdentityRecord, getVaultOutboxEntry, markMemoryProjectionSynced } from "./db";
 import { type VaultWritePriority } from "./vault";
 import { retrieveRelevantMemoriesImpl } from "./retrieval";
 import { IncompleteVaultWorldError, StaleVaultTabError, withVaultWorldRead } from "./vaultWorldLock";
 import { markMemoryConnected, releaseMemoryConnectClaim, tryClaimMemoryForConnect } from "./connectState";
 import type { Link, LinkAxis, MemoryObject } from "./types";
-import { GEMINI_API_KEY_HEADER, userKeyOnlyHeaders } from "./apiKeyHeader";
+import { selectedAiHeaders, type AiRequestOptions } from "./selectedAi";
 
 const CANDIDATE_LIMIT = 5;
 const MAX_LINKS_PER_MEMORY = 2;
@@ -40,10 +40,9 @@ interface ConnectJudgment {
 async function judgeCandidates(
   newMemory: MemoryObject,
   candidates: { id: string; date: string; summary: string; keywords: string[] }[],
-  requireUserKey?: boolean
+  ai?: AiRequestOptions
 ): Promise<ConnectJudgment[]> {
-  const apiKey = await loadApiKey();
-  const keyHeaders = requireUserKey ? userKeyOnlyHeaders(apiKey) : apiKey ? { [GEMINI_API_KEY_HEADER]: apiKey } : {};
+  const { headers: keyHeaders } = await selectedAiHeaders(ai);
   const res = await fetch("/api/connect", {
     method: "POST",
     headers: {
@@ -87,7 +86,7 @@ export async function connectMemory(
   vaultHandle: FileSystemDirectoryHandle | null,
   newMemory: MemoryObject,
   priority: VaultWritePriority = "interactive",
-  options?: { requireUserKey?: boolean }
+  options?: AiRequestOptions
 ): Promise<void> {
   return withVaultWorldRead(() => connectMemoryImpl(vaultHandle, newMemory, priority, options));
 }
@@ -96,7 +95,7 @@ async function connectMemoryImpl(
   vaultHandle: FileSystemDirectoryHandle | null,
   newMemory: MemoryObject,
   _priority: VaultWritePriority = "interactive",
-  options?: { requireUserKey?: boolean }
+  options?: AiRequestOptions
 ): Promise<void> {
   // Projection now uses the serialized durable outbox path; keep the public
   // priority parameter compatible with existing callers.
@@ -123,7 +122,7 @@ async function connectMemoryImpl(
       return;
     }
 
-    const judgments = await judgeCandidates(newMemory, candidates, options?.requireUserKey);
+    const judgments = await judgeCandidates(newMemory, candidates, options);
 
     const accepted = judgments
       .filter((judgment) => judgment.strength >= STRENGTH_THRESHOLD && judgment.reason?.trim())

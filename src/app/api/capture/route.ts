@@ -2,7 +2,8 @@ import { resolveStatedAtFromEvidence, validateMemoryEvidenceIndexes, type Eviden
 import type { CaptureDebugAttempt } from "@/lib/captureDebug";
 import { PERSON_RELATIONS, type ConversationTurn, type MemoryType, type Persona } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
-import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getProvider, resolveApiKey, resolveModel, resolveRequestedProvider } from "@/lib/ai/resolve";
+import type { AIProviderName } from "@/lib/ai/types";
 import { stripLeadingTimeLabels } from "@/lib/timeLabel";
 import { finalizeEventTimeForMemory } from "@/lib/captureEventTime";
 import { PROFILE_LIMITS, draftsToCandidates, validateProfileCandidates, type ProfileDropReason } from "@/lib/profile";
@@ -751,7 +752,11 @@ function finalizeTopicEventsForMemory(
 }
 
 export async function POST(request: Request) {
-  const providerName = resolveProviderForFeature("capture");
+  // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
+  const requestedProvider = resolveRequestedProvider(request);
+  if (!requestedProvider) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
+  // attemptExtraction()（下のクロージャ）で使うため、undefinedを含まない型として確定させる。
+  const providerName: AIProviderName = requestedProvider;
   // TEMP-TEST：公開ベータで稀に発生する20〜40秒の異常遅延の原因切り分け用に、
   // Function内部処理／Gemini呼び出し／後処理の3区間だけを計測する。会話内容・
   // transcript・Memory本文・summary・keyword・prompt本文・APIキー・個人情報は
@@ -762,7 +767,7 @@ export async function POST(request: Request) {
   const resolvedApiKey = resolveApiKey(request, providerName);
   if (!resolvedApiKey) {
     return Response.json(
-      { error: "Gemini APIキーが設定されていません。" },
+      { error: "APIキーが設定されていません。" },
       { status: 401 }
     );
   }

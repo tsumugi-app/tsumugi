@@ -20,9 +20,8 @@ export const API_KEY_HEADER_BY_PROVIDER: Record<AIProviderName, string> = {
 };
 
 /**
- * クライアントが「今回どのproviderとして呼び出したいか」をサーバーへ伝えるヘッダー。
- * このヘッダーが無い場合、サーバー側は常にGeminiとして扱う（既存クライアント・
- * chat以外の機能との後方互換のため）。
+ * 利用者が選んだAI（送り先）をサーバーへ伝えるヘッダー。AIを使う全ての要求に付ける。
+ * このヘッダーが無い要求は、サーバーが何も送らずに断る（既定のAIは無い）。
  */
 export const AI_PROVIDER_HEADER = "X-AI-Provider";
 
@@ -65,8 +64,19 @@ export class NoUserKeyError extends Error {
   constructor() { super("no user key"); this.name = "NoUserKeyError"; }
 }
 
-/** 自動の要求のヘッダー。送る直前に読んだキーをそのまま渡す。使えるキーがなければ、送らずに止める。 */
-export function userKeyOnlyHeaders(key: string | undefined): Record<string, string> {
-  if (!isUsableUserKey(key)) throw new NoUserKeyError();
-  return { [GEMINI_API_KEY_HEADER]: key, [USER_KEY_ONLY_HEADER]: "1" };
+/** 送る直前に、利用者の選んだAIが、その処理を始めたときのAIから変わっていた。何も送っていない。 */
+export class AiSelectionChangedError extends Error {
+  constructor() { super("the selected AI changed"); this.name = "AiSelectionChangedError"; }
+}
+
+/**
+ * AIへの要求のヘッダー。送り先は利用者が選んだ`provider`だけで、キーもそのAIのものだけを付ける（他のAIのキーは付けない）。
+ * `requireUserKey`（自動の処理）：送る直前に読んだ利用者自身のキーがなければ、送らずに止める。サーバーも提供キーを使わない。
+ */
+export function aiRequestHeaders(provider: AIProviderName, key: string | undefined, requireUserKey = false): Record<string, string> {
+  if (requireUserKey) {
+    if (!isUsableUserKey(key)) throw new NoUserKeyError();
+    return { [AI_PROVIDER_HEADER]: provider, [API_KEY_HEADER_BY_PROVIDER[provider]]: key, [USER_KEY_ONLY_HEADER]: "1" };
+  }
+  return { [AI_PROVIDER_HEADER]: provider, ...(key ? { [API_KEY_HEADER_BY_PROVIDER[provider]]: key } : {}) };
 }

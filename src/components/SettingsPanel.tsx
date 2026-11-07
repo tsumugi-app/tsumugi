@@ -244,7 +244,7 @@ export default function SettingsPanel({
 
           <div className="flex flex-col gap-2 text-xs text-stone-500 dark:text-stone-400">
             <div className="flex items-center justify-between gap-4">
-              <span>Gemini APIキー：{keyStatusByProvider.gemini ? "設定済み" : "未設定（Tsumugi提供のキーを使用中）"}</span>
+              <span>Gemini APIキー：{keyStatusByProvider.gemini ? "設定済み" : chatProvider === "gemini" ? "未設定（Tsumugi提供のキーを使用中）" : "未設定"}</span>
               <div className="flex shrink-0 gap-3">
                 <button
                   onClick={() => onOpenApiKeySetup("gemini")}
@@ -264,7 +264,7 @@ export default function SettingsPanel({
             </div>
             {!keyStatusByProvider.gemini && (
               <p className="text-[11px] text-stone-400 dark:text-stone-500">
-                Geminiは、APIキーを設定しなくてもTsumugiが用意したキーで利用できます。自分のAPIキーを使いたい場合のみ設定してください。
+                Geminiを選んでいるときは、APIキーを設定しなくてもTsumugiが用意したキーで利用できます（起動時の自動の処理は、自分のキーがあるときだけ動きます）。自分のAPIキーを使いたい場合のみ設定してください。
               </p>
             )}
 
@@ -290,7 +290,7 @@ export default function SettingsPanel({
           </div>
 
           <div className="flex items-center justify-between gap-4 pt-1 text-xs text-stone-500 dark:text-stone-400">
-            <span>チャットで使うAI</span>
+            <span>利用するAI（会話・記憶の作成・振り返りなど全て）</span>
             <div className="flex shrink-0 gap-2">
               <button
                 onClick={() => onSelectChatProvider("gemini")}
@@ -1616,7 +1616,7 @@ export default function SettingsPanel({
           )}
         </section>
 
-        <AutoCaptureSettings onRetry={onAutoCaptureRetry} />
+        <AutoCaptureSettings onRetry={onAutoCaptureRetry} selectedProvider={chatProvider} />
 
         {/*
           データ管理。「データ」セクションは全プラットフォームで表示する。

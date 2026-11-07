@@ -1,5 +1,5 @@
 import type { Fact } from "@/lib/factExtraction";
-import { resolveApiKey, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { resolveApiKey, resolveRequestedProvider } from "@/lib/ai/resolve";
 import { interpretFact } from "@/lib/semanticInterpretation";
 
 export const runtime = "nodejs";
@@ -9,10 +9,12 @@ export const runtime = "nodejs";
  * ここが失敗しても通常の会話生成には一切影響しない。
  */
 export async function POST(request: Request) {
-  const providerName = resolveProviderForFeature("semanticInterpret");
+  // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
+  const providerName = resolveRequestedProvider(request);
+  if (!providerName) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
-    return Response.json({ error: "Gemini APIキーが設定されていません。" }, { status: 401 });
+    return Response.json({ error: "APIキーが設定されていません。" }, { status: 401 });
   }
 
   const { fact } = (await request.json()) as { fact: Fact };
@@ -21,7 +23,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const interpretation = await interpretFact(fact, apiKey);
+    const interpretation = await interpretFact(fact, apiKey, providerName);
     return Response.json({ interpretation });
   } catch (error) {
     console.error("[Tsumugi SemanticInterpretation] failed:", error);

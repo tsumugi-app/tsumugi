@@ -390,7 +390,7 @@ test("reactions are user data: no generation removes them, and they are kept apa
 
 const ROOT = path.join(__dirname, "..");
 const providerOut = { text: "" };
-const resolveStub = { getProvider: () => ({ async generateStructured() { return { text: providerOut.text }; } }), resolveApiKey: () => "k", resolveModel: () => "m", resolveProviderForFeature: () => "gemini" };
+const resolveStub = { getProvider: () => ({ async generateStructured() { return { text: providerOut.text }; } }), resolveApiKey: () => "k", resolveModel: () => "m", resolveRequestedProvider: () => "gemini" };
 const mod = Module as unknown as { _load: (r: string, p?: { filename?: string }, m?: boolean) => unknown; _resolveFilename: (r: string, ...rest: unknown[]) => string };
 const origLoad = mod._load;
 mod._load = function (request, parent, isMain) {
@@ -491,9 +491,13 @@ test("static boundary: Synthesis code reads Memories / Conversations only, never
       assert.ok(!/vault|outbox|capture|connect|sync|recordAdapter|dataLifecycle|memoryRepair/i.test(spec), `${f} imports ${m[1]}`);
     }
     const dbImport = text.match(/import \{([^}]+)\} from "\.\/db"/);
-    if (dbImport) assert.deepEqual(dbImport[1].split(",").map((x) => x.trim()).sort(), ["getAllConversations", "getAllMemoryObjects", "loadApiKey"], `${f} may only read from db.ts`);
+    if (dbImport) assert.deepEqual(dbImport[1].split(",").map((x) => x.trim()).sort(), ["getAllConversations", "getAllMemoryObjects"], `${f} may only read from db.ts`);
     assert.ok(!/putMemoryObject|deleteMemory|putConversation|enqueue|writeMemoryObjectMarkdown|persistCapture/.test(text), `${f} must not write Memories / Conversations / the Vault`);
   }
+  // the AI and its key come from the shared request helper, which reads only the chosen AI and that AI's key
+  assert.match(src("lib/synthesisChat.ts"), /from "\.\/selectedAi"/);
+  const helper = src("lib/selectedAi.ts").match(/import \{([^}]+)\} from "\.\/db"/);
+  assert.deepEqual(helper?.[1].split(",").map((x) => x.trim()), ["loadSelectedAi"]);
   const store = src("lib/synthesisStore.ts");
   assert.ok(/openDB\(SYNTHESIS_DB_NAME/.test(store) && !/openDB\("tsumugi"/.test(store), "its own database, never the Memory database");
   assert.ok(/isWipePending\(\)/.test(store), "never opened while the device wipe is pending");

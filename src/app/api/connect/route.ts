@@ -1,6 +1,6 @@
 import type { LinkAxis } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
-import { getProvider, resolveApiKey, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getProvider, resolveApiKey, resolveModel, resolveRequestedProvider } from "@/lib/ai/resolve";
 import { jstDateOf } from "@/lib/dateModel";
 
 export const runtime = "nodejs";
@@ -100,11 +100,13 @@ const LINKS_SCHEMA: AISchema = {
 };
 
 export async function POST(request: Request) {
-  const providerName = resolveProviderForFeature("connect");
+  // 送り先は、利用者が選んで要求が名指ししたAIだけ。名指しが無ければ何も送らない（既定のAIは無い）。
+  const providerName = resolveRequestedProvider(request);
+  if (!providerName) return Response.json({ error: "利用するAIが指定されていません。" }, { status: 400 });
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
     return Response.json(
-      { error: "Gemini APIキーが設定されていません。" },
+      { error: "APIキーが設定されていません。" },
       { status: 401 }
     );
   }

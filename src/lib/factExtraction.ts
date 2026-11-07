@@ -1,6 +1,7 @@
 import type { ConversationTurn } from "@/lib/types";
 import type { AISchema } from "@/lib/ai/schema";
-import { getProvider, resolveModel, resolveProviderForFeature } from "@/lib/ai/resolve";
+import { getProvider, resolveModel } from "@/lib/ai/resolve";
+import type { AIProviderName } from "@/lib/ai/types";
 
 /**
  * Test45〜71で確認した分業を実装する（/api/chatの会話生成とは独立した処理）。
@@ -65,9 +66,9 @@ export interface MentionResult {
 export async function checkSubjectMentions(
   subject: string,
   turns: ConversationTurn[],
-  apiKey: string
+  apiKey: string,
+  providerName: AIProviderName
 ): Promise<MentionResult> {
-  const providerName = resolveProviderForFeature("factExtract");
   const provider = getProvider(providerName);
 
   const transcript = buildTurnsTranscript(turns);
