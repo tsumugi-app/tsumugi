@@ -1,5 +1,5 @@
 {
-"note": "Realtime diary PR-A (owner approval 2026-11-07): a separate home entry opens today's open realtime diary (4:00 local day) or starts one; going home pauses it (no Capture, no AI request); a time is shown at the start and after a pause. The normal diary and conversation are unchanged. PR-B: 終了して日記を生成する (end, existing Capture, the diary text written by the chosen AI and added to the stored record only), the home notice to finish an unfinished diary, and in vault.ts the diary text kept when a Vault version is taken in and the diary day in the History index. PR-C: the 4:00 day change (new words to a past diary are held with a notice and a switch that closes it and opens today's diary, the typed text kept), home lists past diaries waiting to be finished, the finishing steps shared by the manual and the permitted automatic finishing (chosen AI, the user's own key only), and the automatic finishing at a start.",
+"note": "Realtime diary PR-A (owner approval 2026-11-07): a separate home entry opens today's open realtime diary (4:00 local day) or starts one; going home pauses it (no Capture, no AI request); a time is shown at the start and after a pause. The normal diary and conversation are unchanged. PR-B: 終了して日記を生成する (end, existing Capture, the diary text written by the chosen AI and added to the stored record only), the home notice to finish an unfinished diary, and in vault.ts the diary text kept when a Vault version is taken in and the diary day in the History index. PR-C: the 4:00 day change (new words to a past diary are held with a notice and a switch that closes it and opens today's diary, the typed text kept), home lists past diaries waiting to be finished, the finishing steps shared by the manual and the permitted automatic finishing (chosen AI, the user's own key only), and the automatic finishing at a start; in vaultProjection.ts the History update carries the diary day.",
 "lines": [
 "+import { diaryDateOf, diaryTimeLabelAt, isOpenRealtimeDiary, isRealtimeDiaryComplete, keepsEveryTurn, needsDiaryDayChange, previousDiaryDate, realtimeDiariesToFinish, resumableRealtimeDiary } from \"@/lib/realtimeDiary\";",
 "-import { maySendConversationTo, parseAutoCaptureSettings, parseAutoCaptureState, withChatProvider, type AutoCaptureResult } from \"@/lib/autoCapturePolicy\";",
@@ -348,6 +348,8 @@
 "-return a.id === b.id && a.mode === b.mode && a.turnCount === b.turnCount;",
 "+return a.id === b.id && a.mode === b.mode && a.turnCount === b.turnCount && a.diaryDate === b.diaryDate;",
 "+...(conversation.realtimeDiary ? { diaryDate: conversation.realtimeDiary.date } : {}),",
-"+realtimeDiary: f.realtimeDiary?.text ? { ...l.realtimeDiary, ...f.realtimeDiary } : (l.realtimeDiary ?? f.realtimeDiary),"
+"+realtimeDiary: f.realtimeDiary?.text ? { ...l.realtimeDiary, ...f.realtimeDiary } : (l.realtimeDiary ?? f.realtimeDiary),",
+"-const update: HistoryIndexUpdate = { kind: \"conversation\", id: canonical.id, day, mode, turnCount: canonical.turns.length };",
+"+const update: HistoryIndexUpdate = { kind: \"conversation\", id: canonical.id, day, mode, turnCount: canonical.turns.length, ...(canonical.realtimeDiary ? { diaryDate: canonical.realtimeDiary.date } : {}) };"
 ]
 }

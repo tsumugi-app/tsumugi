@@ -322,7 +322,7 @@ async function decideAndProjectHistory(env: ProjectionEnv, canonical: Conversati
   const metaRead = await readJsonAt(env, HISTORY_META_PATH);
   if (metaRead.state === "error") throw new ProjectionConflictError("history-meta-unreadable");
   const mode = conversationEntryTypeOf(canonical);
-  const update: HistoryIndexUpdate = { kind: "conversation", id: canonical.id, day, mode, turnCount: canonical.turns.length };
+  const update: HistoryIndexUpdate = { kind: "conversation", id: canonical.id, day, mode, turnCount: canonical.turns.length, ...(canonical.realtimeDiary ? { diaryDate: canonical.realtimeDiary.date } : {}) };
   if (historyAlreadyExact(monthRead, metaRead, update)) return;
   try {
     await writing(env, () => vaultProjectionPrimitives.updateHistoryIndex(env.root, update));
