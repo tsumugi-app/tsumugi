@@ -364,6 +364,38 @@ test.describe("realtime diary: 終了して日記を生成する", () => {
     expect(stored.turns.length).toBe(4);
   });
 
+  test("finished by another tab, then words sent from the stale screen: the finished diary stays as it is, the words start a new diary", async ({ page }) => {
+    test.setTimeout(120_000);
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    const id = await startDiary(page);
+    const OTHER = "別のタブが書いた架空の日記。";
+    await page.evaluate(async ({ id, OTHER }) => {
+      const db: IDBDatabase = await new Promise((res, rej) => { const r = indexedDB.open("tsumugi"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      await new Promise<void>((res, rej) => {
+        const tx = db.transaction("conversations", "readwrite"); const store = tx.objectStore("conversations"); const q = store.get(id);
+        q.onsuccess = () => { const now = new Date().toISOString(); store.put({ ...q.result, endedAt: now, updatedAt: now, status: "captured", memoryObjectIds: ["mem-other-tab"], realtimeDiary: { ...q.result.realtimeDiary, text: OTHER, writtenAt: now, aiProvider: "gemini" } }); };
+        tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+      });
+      db.close();
+    }, { id, OTHER });
+    await talk(page, "架空の続きの言葉です", 1);
+    const stored = (await rows(page, "conversations")).find((c) => c.id === id);
+    expect(stored.endedAt).toBeTruthy();
+    expect(stored.status).toBe("captured");
+    expect(stored.memoryObjectIds).toEqual(["mem-other-tab"]);
+    expect(stored.realtimeDiary.text).toBe(OTHER);
+    expect(stored.turns.length).toBe(4);
+    const [next] = await withWords(page, "架空の続きの言葉です");
+    expect(next.id).not.toBe(id);
+    expect(next.realtimeDiary.date).toBeTruthy();
+    expect(next.endedAt).toBeUndefined();
+    await page.waitForTimeout(2_000);
+    expect(calls.capture.length).toBe(0);
+    expect(calls.diary.length).toBe(0);
+  });
+
   test("the Vault file edited outside the app: no Memory and no text from the words before the edit, the words and the file stay", async ({ page }) => {
     test.setTimeout(120_000);
     await seed(page);

@@ -4895,6 +4895,12 @@ export default function ChatScreen() {
     // 再レンダーを挟まずこの関数を呼ぶため、closure変数のconversationはまだ古い値のまま
     // （問いかけ自体のturnが乗っていない）参照してしまう。
     let baseConversation = latestConversationRef.current;
+    // 別のタブ・端末がこのリアルタイム日記を終えていたら、終えた記録を基にする（下で新しい日記として続ける。終えた日記は上書きしない）
+    if (baseConversation.realtimeDiary && !baseConversation.endedAt && !retryTurns) {
+      const openId = baseConversation.id;
+      const stored = await withVaultWorldRead(() => getConversation(openId)).catch(() => undefined);
+      if (stored?.endedAt) baseConversation = stored;
+    }
     if (baseConversation.endedAt) {
       void trackMemoryTask(runConversationBoundary(baseConversation));
 

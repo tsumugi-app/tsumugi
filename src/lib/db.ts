@@ -226,12 +226,21 @@ function withoutDeletedMemoryRefs(c: Conversation, map: TombstoneMap | null): Co
   return kept.length === (c.memoryObjectIds ?? []).length ? c : { ...c, memoryObjectIds: kept };
 }
 
+/**
+ * A realtime diary that another tab or device has ended (its text and Memory are being or were made from those words) is never written back as open by a screen that is behind:
+ * whole-record saves of an open diary are refused when the stored one is ended (checked inside the same transaction). Saves that end it, and other conversations, are unchanged.
+ */
+export class RealtimeDiaryEndedError extends Error {
+  constructor(readonly id: string) { super("realtime-diary-ended"); this.name = "RealtimeDiaryEndedError"; }
+}
+
 export async function putConversation(conversation: Conversation) {
   const db = await getDB();
   const tx = db.transaction(["conversations", "settings"], "readwrite");
   try {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    if (conversation.realtimeDiary && !conversation.endedAt && ((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined)?.endedAt) throw new RealtimeDiaryEndedError(conversation.id);
     await tx.objectStore("conversations").put(withoutDeletedMemoryRefs(conversation, tombs));
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
@@ -1485,6 +1494,7 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
   return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    if (conversation.realtimeDiary && !conversation.endedAt && ((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined)?.endedAt) throw new RealtimeDiaryEndedError(conversation.id);
     return withoutDeletedMemoryRefs(conversation, tombs);
   }, skipIfUnchanged);
 }

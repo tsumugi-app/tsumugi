@@ -891,6 +891,8 @@ async function persistConversationImpl(
   } catch (error) {
     // ユーザーが削除した会話（tombstone）は作り直さず、Vaultにも書かない（実行中のCaptureが削除を黙って取り消さない）
     if ((error as Error)?.name === "TombstonedRecordError") return { conversationFailed: true, startBackgroundSync: null };
+    // 別のタブ・端末が終えたリアルタイム日記を、遅れた画面の写しで開き直さない（Vaultにも書かない）
+    if ((error as Error)?.name === "RealtimeDiaryEndedError") return { conversationFailed: true, startBackgroundSync: null };
     console.error("[Tsumugi] conversation IndexedDB write failed:", error);
     conversationFailed = true;
   }
