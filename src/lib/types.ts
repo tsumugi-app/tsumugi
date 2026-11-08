@@ -521,6 +521,12 @@ export interface RetrievedMemory {
    * （buildRetrievedMemoriesSection）には現時点では渡していない、調査・表示用の内部情報。
    */
   matchType?: "direct" | "divergent";
+  /**
+   * 会話品質改善 第1段階（memoryContext.ts）。会話のRetrievalが`includeContext`で求めたときだけ付く、送信用の一時的な値（保存しない）。
+   * `persons`：その記録で本人が話題にした人（personMentionsの呼び方のまま）。`quote`：要約に無い、本人の発言（evidenceQuotes）の一文。
+   */
+  persons?: string[];
+  quote?: string;
 }
 
 export const SCHEMA_VERSION = "0.1";

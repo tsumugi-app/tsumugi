@@ -5034,6 +5034,8 @@ export default function ChatScreen() {
         persona: activePersona,
         promptedMemoryId: baseConversation.promptedMemoryId,
         recentUserTurnsTexts,
+        // 会話品質改善 第1段階：選ばれたMemoryに、話題の人物と、要約に無い本人の発言の一文を添える（memoryContext.ts）
+        includeContext: true,
       });
 
       // Recent Conversation Context（Current Conversation → Recent Conversation → Memory Retrieval

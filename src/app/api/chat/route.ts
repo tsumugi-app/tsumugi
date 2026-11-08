@@ -1,4 +1,5 @@
 import { conversationVoice } from "@/lib/conversationVoice";
+import { isTimeDependentMemory, MEMORY_CONTEXT_NOTE, MEMORY_PAST_VIEW_NOTE, memoryContextLines, sanitizeMemoryContext, withoutOutsideFactQuote } from "@/lib/memoryContext";
 import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
@@ -577,38 +578,9 @@ ${buildMemoryTimeLabel(origin)} ${origin.summary}
 }
 
 /**
- * needsWebSearch()（ユーザーの今回の発言に検索が必要か）とは別の、Retrieved Memory専用の
- * 保守的な判定。このMemoryのsummary/keywordsが、時間経過で変わる外部事実（現在の状態・
- * ラインナップ・価格・在庫・営業時間・開催予定・最新情報など）を含んでいそうかを見る。
- * needsWebSearch.tsは変更しない方針のため、独立した最小限のワードリストとしてここに置く
- * （運用対象も判定基準も異なるため、共有・統合はしない）。誤検出（無関係なMemoryを弾く）は
- * 許容し、時間依存情報の見逃しを優先的に防ぐ。RetrievedMemoryはcontentを持たないため
- * （トークン節約のため。types.ts参照）、判定にはsummaryとkeywordsだけを使う。
+ * Retrieved Memory専用の、時間経過で変わる外部事実の判定（isTimeDependentMemory）は memoryContext.ts へ移した
+ * （会話品質改善 第1段階：「今は」「現在」などだけを含む記録は、本人の考え・気持ち・判断であれば外さない）。
  */
-const TIME_DEPENDENT_MEMORY_MARKERS = [
-  "現在",
-  "今の",
-  "今は",
-  "次は",
-  "次回",
-  "最新",
-  "ラインナップ",
-  "販売中",
-  "発売予定",
-  "開催中",
-  "開催予定",
-  "在庫",
-  "価格",
-  "値段",
-  "営業時間",
-  "営業中",
-  "キャンペーン",
-];
-
-function isTimeDependentMemory(memory: RetrievedMemory): boolean {
-  const text = `${memory.summary} ${memory.keywords.join(" ")}`;
-  return TIME_DEPENDENT_MEMORY_MARKERS.some((marker) => text.includes(marker));
-}
 
 /**
  * Explicit Memory Search Phase 1（memorySearch.ts）。ユーザーが「自分の保存済みの過去」を明示的に探している発言のときだけ、
@@ -706,7 +678,7 @@ function buildRetrievedMemoriesSection(memories: RetrievedMemory[]): string {
       const keywords = memory.keywords.length > 0 ? `keywords: ${memory.keywords.join(", ")}` : "";
       const source = memory.source ? `source: ${memory.source}` : "";
       const meta = [keywords, source].filter(Boolean).join(" / ");
-      return `- ${buildMemoryTimeLabel(memory)}\n${memory.summary}${meta ? `（${meta}）` : ""}`;
+      return `- ${buildMemoryTimeLabel(memory)}\n${memory.summary}${meta ? `（${meta}）` : ""}${memoryContextLines(memory)}`;
     })
     .join("\n");
 
@@ -718,7 +690,7 @@ ${lines}
 
 これは、ユーザーが以前の会話で話した内容の記録（AIによる要約を含みうる）であり、確認済みの
 現在の外部事実ではない（Evidence Boundary参照）。現在の外部事実が必要なら今のターンのWeb検索
-結果にのみ基づく。${buildLinkReasonSection(memories)}${buildOriginMemorySection(memories)}`;
+結果にのみ基づく。${MEMORY_PAST_VIEW_NOTE}${memories.some((memory) => memory.quote || (memory.persons?.length ?? 0) > 0) ? MEMORY_CONTEXT_NOTE : ""}${buildLinkReasonSection(memories)}${buildOriginMemorySection(memories)}`;
 }
 
 /**
@@ -1001,12 +973,12 @@ export async function POST(request: Request) {
   // Explicit Memory Searchの結果にあるMemoryは、通常のRetrieved Memoriesから外す（同じMemoryを要約だけで二重に渡さない）。
   const sanitizedExplicitSearch = sanitizeExplicitSearchContext(explicitSearch);
   const explicitSearchIds = new Set((sanitizedExplicitSearch?.results ?? []).map((memory) => memory.id));
-  const retrievedForContext = (retrievedMemories ?? []).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));
+  const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : []).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));
   const memoriesForContext = searchNeeded
     ? retrievedForContext
     : retrievedForContext.filter(
         (memory) => memory.isOriginMemory === true || !isTimeDependentMemory(memory)
-      );
+      ).map(withoutOutsideFactQuote);
 
   const retrievedMemoriesSection = buildRetrievedMemoriesSection(memoriesForContext);
   // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。プロンプトのみで、取得・保存・AI呼び出し回数・thinking budgetは変えない。
