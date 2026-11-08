@@ -28,6 +28,7 @@
 import { getAllMemoryObjects, getMemoryObject } from "./db";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import type { MemoryObject, Persona, RetrievedMemory } from "./types";
+import { limitMemoryQuotes, memoryContextOf } from "./memoryContext";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
 export const KEYWORD_WEIGHT = 3;
@@ -812,7 +813,8 @@ async function retrieveCreativeMemories(
     /** Conversation Retrieval用。直近の同一Conversation内user turns本文（最新発言含む）。
      * 未指定時は空配列扱い＝anchorボーナス無しでgenericKeywordPenaltyのみ効く。 */
     recentUserTurnsTexts?: string[];
-  }
+  },
+  context?: string[]
 ): Promise<RetrievedMemory[]> {
   const directLimit = options.limit ?? DEFAULT_LIMIT;
   const all = await getAllMemoryObjects();
@@ -837,12 +839,13 @@ async function retrieveCreativeMemories(
   }
 
   return [
-    ...directMatches.map((memory) => toRetrievedMemory(memory, undefined, "direct")),
-    ...divergentMatches.map((memory) => toRetrievedMemory(memory, undefined, "divergent")),
+    ...directMatches.map((memory) => toRetrievedMemory(memory, undefined, "direct", context)),
+    ...divergentMatches.map((memory) => toRetrievedMemory(memory, undefined, "divergent", context)),
   ];
 }
 
-function toRetrievedMemory(memory: MemoryObject, linkReason?: string, matchType?: "direct" | "divergent"): RetrievedMemory {
+/** `context`：会話のRetrievalが`includeContext`で求めたときだけ、今の発言（と直前の発言）。人物と本人の発言の一文を添える（memoryContext.ts） */
+function toRetrievedMemory(memory: MemoryObject, linkReason?: string, matchType?: "direct" | "divergent", context?: string[]): RetrievedMemory {
   return {
     id: memory.id,
     date: memory.date,
@@ -853,6 +856,7 @@ function toRetrievedMemory(memory: MemoryObject, linkReason?: string, matchType?
     linkReason,
     source: memory.metadata.source,
     matchType,
+    ...(context ? memoryContextOf(memory, context) : {}),
   };
 }
 
@@ -910,7 +914,8 @@ function pickLinkedAdditions(
  */
 async function ensureOriginMemoryIncluded(
   results: RetrievedMemory[],
-  promptedMemoryId: string
+  promptedMemoryId: string,
+  context?: string[]
 ): Promise<RetrievedMemory[]> {
   const alreadyIncluded = results.some((memory) => memory.id === promptedMemoryId);
   if (alreadyIncluded) {
@@ -922,7 +927,7 @@ async function ensureOriginMemoryIncluded(
   const originMemory = await getMemoryObject(promptedMemoryId);
   if (!originMemory) return results;
 
-  return [...results, { ...toRetrievedMemory(originMemory), isOriginMemory: true }];
+  return [...results, { ...toRetrievedMemory(originMemory, undefined, undefined, context), isOriginMemory: true }];
 }
 
 export interface RetrieveRelevantMemoriesOptions {
@@ -944,6 +949,11 @@ export interface RetrieveRelevantMemoriesOptions {
    * このフィールドを読まないため、渡しても渡さなくても挙動に影響しない。
    */
   recentUserTurnsTexts?: string[];
+  /**
+   * 会話品質改善 第1段階（会話画面だけが渡す）。選ばれたMemoryに、その記録で本人が話題にした人と、要約に無い本人の発言の一文を添える
+   * （1ターンに最大3件。memoryContext.ts）。未指定（Connect等）は従来どおり何も添えない。選ばれるMemory自体は変わらない。
+   */
+  includeContext?: boolean;
 }
 
 /**
@@ -965,14 +975,16 @@ export async function retrieveRelevantMemoriesImpl(
 ): Promise<RetrievedMemory[]> {
   const trimmed = queryText.trim();
   if (!trimmed) return [];
+  const context = options.includeContext ? [trimmed, ...(options.recentUserTurnsTexts ?? []).slice(-3)] : undefined;
+  const withContext = (memories: RetrievedMemory[]) => (context ? limitMemoryQuotes(memories) : memories);
 
   // クリエイト（analyst）だけ別ロジックへ委譲する。companion/coachはこの下の
   // 既存ロジックをそのまま通る（挙動は一切変えていない）。
   if (options.persona === "analyst") {
-    const creativeResults = await retrieveCreativeMemories(trimmed, options);
-    return options.promptedMemoryId
-      ? ensureOriginMemoryIncluded(creativeResults, options.promptedMemoryId)
-      : creativeResults;
+    const creativeResults = await retrieveCreativeMemories(trimmed, options, context);
+    return withContext(options.promptedMemoryId
+      ? await ensureOriginMemoryIncluded(creativeResults, options.promptedMemoryId, context)
+      : creativeResults);
   }
 
   const limit = options.limit ?? DEFAULT_LIMIT;
@@ -988,7 +1000,7 @@ export async function retrieveRelevantMemoriesImpl(
     .slice(0, limit);
 
   const directMatches = scored.map((entry) => entry.memory);
-  const results: RetrievedMemory[] = directMatches.map((memory) => toRetrievedMemory(memory));
+  const results: RetrievedMemory[] = directMatches.map((memory) => toRetrievedMemory(memory, undefined, undefined, context));
 
   // Link経由の追加は、直接一致がlimitを埋めているかどうかに関係なく常に探索する
   // （直接一致件数とは独立の別枠。直接一致のスコアリングやpickLinkedAdditions自体のロジックは変更しない）。
@@ -1003,10 +1015,10 @@ export async function retrieveRelevantMemoriesImpl(
       options.excludeConversationId
     );
     for (const addition of additions) {
-      results.push(toRetrievedMemory(addition.memory, addition.reason));
+      results.push(toRetrievedMemory(addition.memory, addition.reason, undefined, context));
     }
   }
 
   const capped = results.slice(0, limit + maxLinkedAdditions);
-  return options.promptedMemoryId ? ensureOriginMemoryIncluded(capped, options.promptedMemoryId) : capped;
+  return withContext(options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped);
 }
