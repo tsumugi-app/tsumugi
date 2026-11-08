@@ -19,6 +19,7 @@
     "src/app/api/connect/route.ts",
     "src/app/api/prompt/route.ts",
     "src/app/api/reflect/route.ts",
+    "src/app/api/diary/route.ts",
     "src/app/api/synthesize/route.ts",
     "src/app/api/fact-extract/route.ts",
     "src/app/api/semantic-interpret/route.ts",

@@ -5,6 +5,7 @@
  */
 "use client";
 
+import { keepsEveryTurn } from "./realtimeDiary";
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import { hiddenFlag, logTimingEvent } from "./debugTimingLog";
 import { isWipePending, WipeInProgressError } from "./wipeState";
@@ -226,12 +227,32 @@ function withoutDeletedMemoryRefs(c: Conversation, map: TombstoneMap | null): Co
   return kept.length === (c.memoryObjectIds ?? []).length ? c : { ...c, memoryObjectIds: kept };
 }
 
+/**
+ * A realtime diary that another tab or device has ended (its text and Memory are being or were made from those words) is never written back as open by a screen that is behind:
+ * whole-record saves of an open diary are refused when the stored one is ended (checked inside the same transaction). Saves that end it, and other conversations, are unchanged.
+ */
+/** 書きかけのリアルタイム日記の保存の前に、同じtransactionの中で読んだ記録と比べる（RealtimeDiaryEndedError参照） */
+function assertOpenRealtimeDiarySave(stored: Conversation | undefined, next: Conversation) {
+  if (!stored) return;
+  if (stored.endedAt) throw new RealtimeDiaryEndedError(next.id);
+  if (!keepsEveryTurn(stored.turns, next.turns)) throw new RealtimeDiaryEndedError(next.id, "words-missing");
+}
+
+/**
+ * 書きかけのリアルタイム日記の保存を、保存されている記録の上では断る（画面の写しが古い）。"ended"：別のタブ・端末が既に終えた。
+ * "words-missing"：別のタブで同じ日記に書き足された発言が、この保存には無い（上書きすると消える）。どちらも保存されている記録はそのまま残る。
+ */
+export class RealtimeDiaryEndedError extends Error {
+  constructor(readonly id: string, readonly reason: "ended" | "words-missing" = "ended") { super(`realtime-diary-${reason}`); this.name = "RealtimeDiaryEndedError"; }
+}
+
 export async function putConversation(conversation: Conversation) {
   const db = await getDB();
   const tx = db.transaction(["conversations", "settings"], "readwrite");
   try {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    if (conversation.realtimeDiary && !conversation.endedAt) assertOpenRealtimeDiarySave((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined, conversation);
     await tx.objectStore("conversations").put(withoutDeletedMemoryRefs(conversation, tombs));
   } catch (error) { await abortAndSettleTransaction(tx, error); }
   await tx.done;
@@ -1485,8 +1506,70 @@ export async function putConversationWithOutbox(conversation: Conversation, now:
   return putCanonicalRecordWithOutboxInternal("conversations", "conversation", conversation, now, async (tx) => {
     const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
     if (blockedByTombstone(tombs, "conversation", conversation.id)) throw new TombstonedRecordError("conversation", conversation.id);
+    if (conversation.realtimeDiary && !conversation.endedAt) assertOpenRealtimeDiarySave((await tx.objectStore("conversations").get(conversation.id)) as Conversation | undefined, conversation);
     return withoutDeletedMemoryRefs(conversation, tombs);
   }, skipIfUnchanged);
+}
+
+/** Why a realtime diary text was not added: the stored record is gone, is not a finished realtime diary, or already has its text (kept; no regeneration). */
+export class RealtimeDiaryTextNotAddedError extends Error {
+  constructor(readonly reason: "missing" | "not-ended" | "already" | "words-changed") { super(`realtime-diary-text-${reason}`); this.name = "RealtimeDiaryTextNotAddedError"; }
+}
+
+/**
+ * Realtime diary: adds the diary text to the conversation AS STORED (read inside the same transaction), with its Outbox entry. Only the diary text (and a title when there is none) changes:
+ * the words, the Capture result and anything another writer set stay as stored. A text already there is never replaced. A deleted conversation is not recreated.
+ * `from` is the words the text was written from: when the stored words are no longer those (an edit taken in meanwhile), nothing is added.
+ */
+export async function addRealtimeDiaryTextWithOutbox(id: string, diary: { text: string; aiProvider: string; title?: string }, from: Conversation["turns"], now: string = new Date().toISOString()): Promise<Conversation> {
+  let saved: Conversation | undefined;
+  const placeholder = { id, updatedAt: now } as Conversation;
+  await putCanonicalRecordWithOutboxInternal("conversations", "conversation", placeholder, now, async (tx) => {
+    const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+    if (blockedByTombstone(tombs, "conversation", id)) throw new TombstonedRecordError("conversation", id);
+    const stored = (await tx.objectStore("conversations").get(id)) as Conversation | undefined;
+    if (!stored) throw new RealtimeDiaryTextNotAddedError("missing");
+    if (!stored.realtimeDiary || !stored.endedAt) throw new RealtimeDiaryTextNotAddedError("not-ended");
+    if (stored.realtimeDiary.text) throw new RealtimeDiaryTextNotAddedError("already");
+    // 本文はAIへ送った言葉から書かれている。その間に言葉が変わっていたら（外部の編集の取り込みなど）、古い言葉の本文を付けない
+    if (stored.turns.length !== from.length || stored.turns.some((t, i) => t.role !== from[i].role || t.content !== from[i].content)) throw new RealtimeDiaryTextNotAddedError("words-changed");
+    saved = withoutDeletedMemoryRefs({
+      ...stored,
+      title: stored.title || diary.title || undefined,
+      realtimeDiary: { ...stored.realtimeDiary, text: diary.text, writtenAt: now, aiProvider: diary.aiProvider },
+      updatedAt: now,
+    }, tombs);
+    return saved;
+  });
+  return saved!;
+}
+
+/**
+ * Realtime diary: ends it (sets `endedAt`) on the record AS STORED, read inside the same transaction, with its Outbox entry. Already ended (another tab or device finished it):
+ * nothing is written and the stored record is returned, so a screen's older copy never takes back its text, its Capture result or its Memory references.
+ * The screen's copy is used only for words the store does not have yet (a turn's own save still on its way); what Capture or the diary text set on the stored record stays.
+ */
+class RealtimeDiaryAlreadyEndedError extends Error {
+  constructor() { super("realtime-diary-already-ended"); this.name = "RealtimeDiaryAlreadyEndedError"; }
+}
+export async function endRealtimeDiaryWithOutbox(snapshot: Conversation, now: string = new Date().toISOString()): Promise<Conversation> {
+  let result: Conversation | undefined;
+  try {
+    await putCanonicalRecordWithOutboxInternal("conversations", "conversation", { ...snapshot, updatedAt: now }, now, async (tx) => {
+      const tombs = parseTombstoneMap(await tx.objectStore("settings").get(TOMBSTONES_KEY));
+      if (blockedByTombstone(tombs, "conversation", snapshot.id)) throw new TombstonedRecordError("conversation", snapshot.id);
+      const stored = (await tx.objectStore("conversations").get(snapshot.id)) as Conversation | undefined;
+      if (stored?.endedAt) { result = stored; throw new RealtimeDiaryAlreadyEndedError(); }
+      const base: Conversation = stored && stored.turns.length >= snapshot.turns.length
+        ? stored
+        : { ...snapshot, status: stored?.status ?? snapshot.status, memoryObjectIds: stored?.memoryObjectIds ?? snapshot.memoryObjectIds, realtimeDiary: stored?.realtimeDiary ?? snapshot.realtimeDiary, title: stored?.title ?? snapshot.title };
+      result = withoutDeletedMemoryRefs({ ...base, endedAt: now, updatedAt: now }, tombs);
+      return result;
+    });
+  } catch (error) {
+    if (!(error instanceof RealtimeDiaryAlreadyEndedError)) throw error;
+  }
+  return result!;
 }
 
 /** The device record moved on since the user chose the Vault version (another tab saved): nothing is written. */
@@ -1790,6 +1873,23 @@ export async function saveAutoCaptureSettingsRaw(json: string) {
 export async function saveAutoCaptureStateRaw(json: string) {
   const db = await getDB();
   await db.put("settings", json, AUTO_CAPTURE_STATE_KEY);
+}
+
+const REALTIME_DIARY_AUTO_SETTINGS_KEY = "realtimeDiaryAuto:settings";
+const REALTIME_DIARY_AUTO_STATE_KEY = "realtimeDiaryAuto:state";
+
+/** リアルタイム日記の自動の仕上げ（PR-C、realtimeDiaryAuto.ts）の許可と試行回数。端末だけの値でVaultには書かない。標準はオフ */
+export async function loadRealtimeDiaryAutoRaw(): Promise<{ settings: string | undefined; state: string | undefined }> {
+  const db = await getDB();
+  return { settings: await db.get("settings", REALTIME_DIARY_AUTO_SETTINGS_KEY), state: await db.get("settings", REALTIME_DIARY_AUTO_STATE_KEY) };
+}
+export async function saveRealtimeDiaryAutoSettingsRaw(json: string) {
+  const db = await getDB();
+  await db.put("settings", json, REALTIME_DIARY_AUTO_SETTINGS_KEY);
+}
+export async function saveRealtimeDiaryAutoStateRaw(json: string) {
+  const db = await getDB();
+  await db.put("settings", json, REALTIME_DIARY_AUTO_STATE_KEY);
 }
 
 export async function loadChatProvider(): Promise<AIProviderName> {

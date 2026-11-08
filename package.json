@@ -33,6 +33,7 @@
     "test:memory-repair": "tsc -p tsconfig.memory-repair.json && node --test .test-out/lib/memoryRepair.test.js .test-out/lib/memoryRepairPrecheck.test.js .test-out/lib/memoryRepairPrivacy.test.js",
     "test:maintenance": "tsc -p tsconfig.maintenance.json && node --test .test-out/lib/maintenance/maintenanceAuth.test.js .test-out/lib/maintenance/maintenanceInvariants.test.js .test-out/lib/maintenance/maintenanceSync.test.js .test-out/lib/maintenance/maintenanceBoundary.test.js .test-out/lib/maintenance/maintenanceGuard.test.js .test-out/lib/maintenance/precheckScope.test.js .test-out/lib/maintenance/maintenanceGate.test.js .test-out/lib/maintenance/restore.test.js .test-out/lib/maintenance/repairSession.test.js .test-out/lib/maintenance/dataLifecycle.test.js",
     "test:ai-selection": "tsc -p tsconfig.ai-selection.json && node --test .test-out/lib/aiSelection.test.js",
+    "test:realtime-diary": "tsc -p tsconfig.realtime-diary.json && node --test .test-out/lib/realtimeDiary.test.js .test-out/lib/realtimeDiaryAuto.test.js",
     "test:auto-capture": "tsc -p tsconfig.auto-capture.json && node --test .test-out/lib/autoCapturePolicy.test.js .test-out/lib/autoCaptureRun.test.js .test-out/lib/userKeyOnly.test.js",
     "test:recovery-memory-diagnostic": "tsc -p tsconfig.recovery-memory-diagnostic.json && node --test .test-out/lib/recoveryMemoryDiagnostic.test.js"
   },

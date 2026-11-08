@@ -197,6 +197,8 @@ function mergedVaultVersion(type: ConflictRecordType, device: LocalRecord, parse
         return same && same.role === turn.role && same.content === turn.content ? { ...same, timestamp: turn.timestamp } : turn;
       }),
       chatProviders: chatProvidersAfterAdopting(d, p.turns),
+      // リアルタイム日記：保存先の版に日記本文があればそれを（本文を書いたAIは端末の記録にだけある）。無ければ端末の値を保つ
+      realtimeDiary: p.realtimeDiary?.text ? { ...d.realtimeDiary, ...p.realtimeDiary } : (d.realtimeDiary ?? p.realtimeDiary),
       metadata: { ...d.metadata, schemaVersion: p.metadata.schemaVersion, source: p.metadata.source, sourceType: p.metadata.sourceType, sourceDetail: p.metadata.sourceDetail, updatedAt },
       updatedAt,
     };

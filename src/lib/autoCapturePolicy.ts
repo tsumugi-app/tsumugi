@@ -1,5 +1,6 @@
 import { endsWithInterruptedReply, isBlankAiReply } from "./aiReplyOutcome";
 import { UNKNOWN_CHAT_PROVIDER } from "./chatProviderRecord";
+import { isOpenRealtimeDiary } from "./realtimeDiary";
 import type { Conversation } from "./types";
 
 /**
@@ -78,7 +79,11 @@ export function isUnprocessedConversation(c: Conversation): boolean {
   return c.status === "active"
     && c.turns.some((t) => t.role === "user" && t.content.trim() !== "")
     && c.turns.some((t) => t.role === "ai" && !isBlankAiReply(t.content))
-    && !endsWithInterruptedReply(c);
+    && !endsWithInterruptedReply(c)
+    // リアルタイム日記は、ここ（会話の自動Capture）では扱わない。書きかけは本人が終えるまでMemoryにしない（未処理にも数えない）。
+    // 終えた日記・午前4時を過ぎた日記のMemoryは、日記の仕上げ（手動、または許可した自動の仕上げ：realtimeDiaryAuto.ts）が作る。同じ日記を二重に処理しない
+    && !isOpenRealtimeDiary(c)
+    && c.realtimeDiary === undefined;
 }
 
 /**

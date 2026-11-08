@@ -5,6 +5,7 @@
  */
 import { isHistoryDayIndexV2, isReflectionSummary, truncateHistoryPreview, type HistoryDayIndex } from "./vault";
 import { jstDateOf, jstDateOfUlid } from "./dateModel";
+import { isDiaryDate } from "./realtimeDiary";
 import type { Conversation, MemoryObject } from "./types";
 
 /**
@@ -142,7 +143,9 @@ export async function resolveConversationMemories(
  * 本体（`startedAt`）を読み終えていればそのJST日付、未読（History Indexの行だけ）ならULID（生成時刻）から、
  * どちらも失敗した場合はStorage Bucketの日付へfail-softにfallbackする。
  */
-export function conversationLogicalDay(id: string, startedAt: string | undefined, bucketDay: string): string {
+export function conversationLogicalDay(id: string, startedAt: string | undefined, bucketDay: string, diaryDate?: string): string {
+  // リアルタイム日記は、始めた時刻ではなく対象日（端末のローカル時刻・午前4時区切りで確定済み）の日に出す
+  if (isDiaryDate(diaryDate)) return diaryDate;
   const fromStartedAt = startedAt ? jstDateOf(startedAt) : null;
   return fromStartedAt ?? jstDateOfUlid(id) ?? bucketDay;
 }
@@ -154,6 +157,6 @@ export function conversationLogicalDay(id: string, startedAt: string | undefined
  * `conversationLogicalDay`（ULID基準）で判定する。v1の日も`conversationIds`だけを見る。
  */
 export function indexEntryHasConversationOnDay(entry: HistoryDayIndex, bucketDay: string, day: string): boolean {
-  const ids = isHistoryDayIndexV2(entry) ? entry.conversations.map((c) => c.id) : entry.conversationIds;
-  return ids.some((id) => conversationLogicalDay(id, undefined, bucketDay) === day);
+  if (isHistoryDayIndexV2(entry)) return entry.conversations.some((c) => conversationLogicalDay(c.id, undefined, bucketDay, c.diaryDate) === day);
+  return entry.conversationIds.some((id) => conversationLogicalDay(id, undefined, bucketDay) === day);
 }
