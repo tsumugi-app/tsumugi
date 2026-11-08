@@ -154,5 +154,12 @@ test("time filter without web search: outside, changing facts stay out; the user
   assert.equal(mc.isTimeDependentMemory({ summary: "最新モデルが欲しいと思う", keywords: [] }), true);
   assert.equal(mc.isTimeDependentMemory({ summary: "次回の打ち合わせは月曜", keywords: [] }), true);
   assert.equal(mc.isTimeDependentMemory({ summary: "次回はもっと早く寝ようと決めた", keywords: [] }), false);
-  assert.equal(mc.isTimeDependentMemory({ summary: "今の関係のままでいい", keywords: [], quote: "今はこのままでいいと思う" }), false);
+  // the own-view exemption belongs to the sentence that says "now": an opinion elsewhere (another sentence, the quote) does not exempt a present-tense fact (Codex on PR #31)
+  assert.equal(mc.isTimeDependentMemory({ summary: "今の関係のままでいいと思うと話した。", keywords: [] }), false);
+  assert.equal(mc.isTimeDependentMemory({ summary: "近所のカフェは今はランチが千円だと話した。", keywords: ["カフェ"] }), true);
+  assert.equal(mc.isTimeDependentMemory({ summary: "店の雰囲気が好き。今はランチが千円。", keywords: [] }), true);
+  assert.equal(mc.isTimeDependentMemory({ summary: "仕事の話をした。", keywords: ["今の会社"] }), true);
+  const unrelated = await prompt(chatBody(latest, [toRet(PRICE, { summary: "近所のカフェは今はランチが千円だと話した。", keywords: ["カフェ"], quote: "この店の雰囲気が好き。" })]));
+  assert.ok(!unrelated.includes("ランチが千円") && !unrelated.includes("雰囲気が好き"), unrelated);
+  assert.equal(mc.withoutOutsideFactQuote({ quote: "雰囲気が好き。今はランチが千円。" }).quote, undefined);
 });

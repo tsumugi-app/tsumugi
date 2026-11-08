@@ -118,16 +118,24 @@ const PRESENT_MARKERS = ["現在", "今の", "今は", "次は", "次回"];
 /** the user's own thought, feeling or judgment */
 const OWN_VIEW = /思う|思っ|思い|感じ|気持ち|気がする|考え|不安|迷っ|迷い|悩|諦め|あきらめ|後悔|納得|期待|望ん|願っ|信じ|好き|嫌い|怖い|寂し|さみし|つらい|辛い|嬉し|うれし|悲し|決め|決心|つもり|自信|絶望|希望/;
 
-export function isOwnViewMemory(memory: Pick<RetrievedMemory, "summary" | "quote">): boolean {
-  return OWN_VIEW.test(`${memory.summary ?? ""} ${memory.quote ?? ""}`);
+/**
+ * a text says "now" only as the user's own view: every sentence with 現在 / 今の / 今は / 次は / 次回 also holds a thought, feeling or judgment word
+ * (an opinion in another sentence, or in the quote, does not exempt a present-tense fact: Codex on PR #31)
+ */
+export function presentOnlyAsOwnView(text: string): boolean {
+  const sentences = sentencesOf(text).filter((sentence) => PRESENT_MARKERS.some((marker) => sentence.includes(marker)));
+  return sentences.length > 0 && sentences.every((sentence) => OWN_VIEW.test(sentence));
 }
 
-/** kept out of a turn without web search: an outside, changing fact (a present-tense record that is not the user's own view counts as one) */
-export function isTimeDependentMemory(memory: Pick<RetrievedMemory, "summary" | "keywords" | "quote">): boolean {
-  const text = `${memory.summary ?? ""} ${(memory.keywords ?? []).join(" ")}`;
-  if (OUTSIDE_STATE_MARKERS.some((marker) => text.includes(marker))) return true;
-  if (!PRESENT_MARKERS.some((marker) => text.includes(marker))) return false;
-  return !isOwnViewMemory(memory);
+/** kept out of a turn without web search: an outside, changing fact (a present-tense summary sentence that is not the user's own view counts as one) */
+export function isTimeDependentMemory(memory: Pick<RetrievedMemory, "summary" | "keywords">): boolean {
+  const summary = memory.summary ?? "";
+  const keywords = (memory.keywords ?? []).join(" ");
+  if (OUTSIDE_STATE_MARKERS.some((marker) => `${summary} ${keywords}`.includes(marker))) return true;
+  // a present-tense keyword (「今の会社」) is not a sentence that can show a view: kept out, as before
+  if (PRESENT_MARKERS.some((marker) => keywords.includes(marker))) return true;
+  if (!PRESENT_MARKERS.some((marker) => summary.includes(marker))) return false;
+  return !presentOnlyAsOwnView(summary);
 }
 
 /**
@@ -137,7 +145,7 @@ export function isTimeDependentMemory(memory: Pick<RetrievedMemory, "summary" | 
 export function withoutOutsideFactQuote<T extends Pick<RetrievedMemory, "quote">>(memory: T): T {
   const quote = memory.quote;
   if (!quote) return memory;
-  const outside = OUTSIDE_STATE_MARKERS.some((marker) => quote.includes(marker)) || (PRESENT_MARKERS.some((marker) => quote.includes(marker)) && !OWN_VIEW.test(quote));
+  const outside = OUTSIDE_STATE_MARKERS.some((marker) => quote.includes(marker)) || (PRESENT_MARKERS.some((marker) => quote.includes(marker)) && !presentOnlyAsOwnView(quote));
   if (!outside) return memory;
   const rest: Pick<RetrievedMemory, "quote"> = { ...memory };
   delete rest.quote;
