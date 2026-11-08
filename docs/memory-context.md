@@ -14,7 +14,7 @@ Which Memories are selected does not change. Only the chat screen asks for the e
 ## The time filter (turn without web search)
 - Unchanged: a Memory whose summary or keywords name an outside, changing fact (最新, ラインナップ, 販売中, 発売予定, 開催中, 開催予定, 在庫, 価格, 値段, 営業時間, 営業中, キャンペーン) is kept out.
 - Changed: a Memory that only says 現在 / 今の / 今は / 次は / 次回 is kept out only when it is not the user's own view (no thought, feeling or judgment word such as 思う, 感じ, 気持ち, 考え, 不安, 迷い, 決めた, 好き). Before, it was always kept out.
-- New: a quote naming an outside, changing fact is not sent (the Memory stays with its summary).
+- New: a quote is checked like a summary: one naming an outside, changing fact, or saying 現在 / 今の / 今は / 次は / 次回 without being the user's own view, is not sent (the Memory stays with its summary).
 - Turns with web search: nothing is filtered, as before.
 
 ## Open points

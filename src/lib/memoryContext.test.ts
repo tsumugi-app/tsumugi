@@ -146,6 +146,11 @@ test("time filter without web search: outside, changing facts stay out; the user
   assert.ok(si.includes(OWN_NOW.summary), "the user's own past view");
   assert.ok(si.includes(FUTURE.summary) && !si.includes("あの店の価格"), "the Memory stays, the quote naming a price goes");
   assert.ok(si.includes(mc.MEMORY_PAST_VIEW_NOTE));
+  // a quote is checked like a summary: a present-tense outside fact goes, the user's own present-tense view stays (Codex on PR #31)
+  const cafe = await prompt(chatBody(latest, [toRet(PRICE, { summary: "近所のカフェについて話した。", keywords: ["カフェ"], quote: "今はランチが千円。" }), toRet(OWN_NOW, { summary: "一人で過ごした週末の話をした。", keywords: ["週末"], quote: "今は一人の時間が一番大事だと感じる。" })]));
+  assert.ok(cafe.includes("近所のカフェについて話した。") && !cafe.includes("今はランチが千円"), cafe);
+  assert.ok(cafe.includes("「今は一人の時間が一番大事だと感じる。」"));
+  assert.equal(mc.withoutOutsideFactQuote({ quote: "次回の上映は土曜。" }).quote, undefined);
   assert.equal(mc.isTimeDependentMemory({ summary: "最新モデルが欲しいと思う", keywords: [] }), true);
   assert.equal(mc.isTimeDependentMemory({ summary: "次回の打ち合わせは月曜", keywords: [] }), true);
   assert.equal(mc.isTimeDependentMemory({ summary: "次回はもっと早く寝ようと決めた", keywords: [] }), false);

@@ -130,9 +130,15 @@ export function isTimeDependentMemory(memory: Pick<RetrievedMemory, "summary" | 
   return !isOwnViewMemory(memory);
 }
 
-/** in a turn without web search, a quote that names an outside, changing fact is not sent (the Memory itself stays, with its summary) */
+/**
+ * in a turn without web search, a quote is checked like a summary (the Memory itself stays, with its summary): a quote naming an outside, changing fact
+ * is not sent, nor one that says 今は / 現在 / 次は… without being the user's own view (「今はランチが千円。」)
+ */
 export function withoutOutsideFactQuote<T extends Pick<RetrievedMemory, "quote">>(memory: T): T {
-  if (!memory.quote || !OUTSIDE_STATE_MARKERS.some((marker) => memory.quote!.includes(marker))) return memory;
+  const quote = memory.quote;
+  if (!quote) return memory;
+  const outside = OUTSIDE_STATE_MARKERS.some((marker) => quote.includes(marker)) || (PRESENT_MARKERS.some((marker) => quote.includes(marker)) && !OWN_VIEW.test(quote));
+  if (!outside) return memory;
   const rest: Pick<RetrievedMemory, "quote"> = { ...memory };
   delete rest.quote;
   return rest as T;
