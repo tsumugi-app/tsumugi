@@ -4,6 +4,7 @@ import { isSupersededTurn } from "@/lib/aiReplyOutcome";
 import { InterruptedTurn } from "@/components/InterruptedTurn";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { decodeTime } from "ulid";
+import { formatDiaryStarted, formatDiaryTime } from "@/lib/realtimeDiary";
 import DeleteConversationDialog, { type DeleteRequest } from "@/components/DeleteConversationDialog";
 import {
   isHistoryDayIndexV2,
@@ -101,6 +102,15 @@ function jstTimeOfUlid(id: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** リアルタイム日記のカードの時刻：始めた時刻（本体が無ければULIDの生成時刻）を端末のローカル時刻で */
+function diaryCardTime(full: Conversation | undefined, id: string, diaryDate: string): string | null {
+  let at = full ? Date.parse(full.startedAt) : NaN;
+  if (!Number.isFinite(at)) {
+    try { at = decodeTime(id); } catch { return null; }
+  }
+  return formatDiaryTime(new Date(at), diaryDate);
 }
 
 // fallbackConversationTitle・buildReflectionMap（要件4/7）は、`node --test`で検証できる
@@ -1310,8 +1320,13 @@ export default function HistoryPanel({
                         </span>
                       )}
                       <span className="text-stone-400 dark:text-stone-500">
-                        {jstDateOf(selectedConversation.startedAt) ?? selectedConversation.startedAt.slice(0, 10)}
-                        {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
+                        {selectedConversation.realtimeDiary && Number.isFinite(Date.parse(selectedConversation.startedAt))
+                          ? // リアルタイム日記は端末のローカル時刻（対象日を決めたのと同じ時計）。通常の会話は日本時間のまま
+                            formatDiaryStarted(new Date(selectedConversation.startedAt))
+                          : <>
+                              {jstDateOf(selectedConversation.startedAt) ?? selectedConversation.startedAt.slice(0, 10)}
+                              {jstTimeOf(selectedConversation.startedAt) ? `・${jstTimeOf(selectedConversation.startedAt)}` : ""}
+                            </>}
                       </span>
                     </div>
                     {/* リアルタイム日記：対象日と、日記を終えたときにAIが書いた本文（Memoryとは別） */}
@@ -1507,7 +1522,9 @@ function ConversationCard({
   loading: boolean;
   onClick: () => void;
 }) {
-  const time = (full ? jstTimeOf(full.startedAt) : null) ?? jstTimeOfUlid(row.id);
+  // リアルタイム日記は端末のローカル時刻で（対象日と違う暦日に始めたものは月日も）。通常の会話は日本時間のまま
+  const diaryDate = full?.realtimeDiary?.date ?? row.diaryDate;
+  const time = diaryDate ? diaryCardTime(full, row.id, diaryDate) : (full ? jstTimeOf(full.startedAt) : null) ?? jstTimeOfUlid(row.id);
   const entryKind = full ? conversationEntryTypeOf(full) : null;
   const accent = entryKind ? ENTRY_KIND_ACCENT[entryKind] : null;
   // 見出しは最初のユーザー発言（Conversation History v2）。保存データは書き換えない。

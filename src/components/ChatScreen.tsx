@@ -5191,6 +5191,8 @@ export default function ChatScreen() {
         },
         body: JSON.stringify({
           persona: activePersona,
+          // リアルタイム日記の会話だけ、専用の返し方（conversationVoice.ts）。通常の日記・会話は送らない（これまでと同じ指示）
+          ...(updated.realtimeDiary ? { conversationVoiceMode: "realtime-diary" } : {}),
           turns: turnsForAi(retryTurns ?? updated.turns),
           retrievedMemories,
           ...(recentConversation ? { recentConversation } : {}),

@@ -112,6 +112,8 @@
 "+baseConversation = baseConversation.realtimeDiary",
 "+? { ...createConversation(activePersona, activeEntryType), realtimeDiary: { date: diaryDateOf(new Date()) } }",
 "+: createConversation(activePersona, activeEntryType);",
+"+// リアルタイム日記の会話だけ、専用の返し方（conversationVoice.ts）。通常の日記・会話は送らない（これまでと同じ指示）",
+"+...(updated.realtimeDiary ? { conversationVoiceMode: \"realtime-diary\" } : {}),",
 "+* リアルタイム日記の入口。今日（端末のローカル時刻、午前4時区切り）の書きかけがあれば、過去の発言とAIの返答ごとその続きを開く。",
 "+* 無ければ新しく始める（対象日はここで確定。保存は最初の発言から、既存の送信処理のまま）。記録を読めなかったときは、二つ目の日記を作らないよう何もしない。",
 "+async function handleOpenRealtimeDiary() {",

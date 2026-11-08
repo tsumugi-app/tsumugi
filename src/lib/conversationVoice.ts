@@ -49,6 +49,29 @@ export const NO_PAST_CONTEXT_NOTE = `
 ## このターンの過去の情報
 このターンには、この人の過去についての情報（記憶・過去の会話・プロフィールなど）が渡されていない。この会話の中で話したこと以外の、この人の過去・これまでの話・以前の様子には触れない（「以前も」「これまでのお話でも」などを使わない）。今の発言だけから、具体的な見解を述べる。`;
 
+/**
+ * F. realtime diary (owner decision 2026-11-08): the user writes down the day as it goes, in one conversation for the day. Replaces the companion persona text
+ * and adds its own section after A, which it takes precedence over where they differ. Only when the client says the conversation is a realtime diary
+ * (`conversationVoiceMode: "realtime-diary"`) and the persona is companion; the normal diary and conversations keep A–C exactly as before.
+ */
+export const REALTIME_DIARY_PERSONA_PROMPT = `あなたはTsumugiという個人向けAIの「Companion」ペルソナです（リアルタイム日記モード）。
+ユーザーは一日の中で、出来事や気持ちをその都度書き留めています。この会話は同じ日の日記で、前の発言はその日のうちに書かれたものです。
+書き留める相手として、落ち着いたトーンで自然に応じてください。`;
+
+export const REALTIME_DIARY_VOICE_SECTION = `
+
+## リアルタイム日記での返し方（上の「会話の進め方」と違うところは、こちらを優先する）
+- ユーザーが自分のペースで一日を記録することを優先する。話を広げたり、書く量を増やさせたりしない。
+- 返答は通常3〜5文くらいを目安にする。短く済むときはもっと短くてよく、文の数を数えて合わせることはしない。自然な会話を優先する。
+- 質問は控えめにする。毎回質問で終えない。聞くのは、本当に知りたいことがあるときに一つまで。
+- 書かれたことをそのまま言い換えて返さない。不自然な共感や、大げさに褒めることもしない。
+- 思ったことや感想、意見があれば、自分の言葉で添えてよい。
+- 相談されたときや、詳しい意見・説明を求められたときは、文の数にこだわらず、必要なだけ答える。
+- 同じ日のこれまでの発言（朝や昼に書いたことなど）を踏まえ、つながりがあれば自然に触れる。前の話を毎回まとめ直さない。
+- 求められない限り、一日のまとめや振り返りはしない（日記の本文は一日の終わりに別に作る）。`;
+
+export type ConversationVoiceMode = "realtime-diary";
+
 export interface ConversationVoice {
   /** persona prompt overrides (undefined: keep the route's own text) */
   persona: Partial<Record<"companion" | "coach" | "analyst", string>>;
@@ -58,10 +81,12 @@ export interface ConversationVoice {
   noPastContextNote(hasNoPastContext: boolean): string;
 }
 
-export function conversationVoice(): ConversationVoice {
+/** `mode`：リアルタイム日記の会話だけ（companionのとき）。それ以外の値・未指定は、これまでと同じ */
+export function conversationVoice(mode?: unknown, persona?: string): ConversationVoice {
+  const realtimeDiary = mode === "realtime-diary" && persona === "companion";
   return {
-    persona: { analyst: ANALYST_PERSONA_PROMPT, companion: COMPANION_PERSONA_PROMPT },
-    section: CONVERSATION_VOICE_SECTION,
+    persona: { analyst: ANALYST_PERSONA_PROMPT, companion: realtimeDiary ? REALTIME_DIARY_PERSONA_PROMPT : COMPANION_PERSONA_PROMPT },
+    section: realtimeDiary ? CONVERSATION_VOICE_SECTION + REALTIME_DIARY_VOICE_SECTION : CONVERSATION_VOICE_SECTION,
     evidenceNote: EVIDENCE_TOPIC_REFERENCE_NOTE,
     analystMemoryNote: ANALYST_MEMORY_USE_NOTE,
     noPastContextNote: (hasNoPastContext) => (hasNoPastContext ? NO_PAST_CONTEXT_NOTE : ""),

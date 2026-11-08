@@ -215,3 +215,11 @@ test("a diary closed on another device is not reopened by a save of the open cop
   // normal conversations as before
   assert.equal(takesBackFinishedConversation({ status: "active", memoryObjectIds: [], endedAt: ended.endedAt }, { status: "active", memoryObjectIds: [] }), false);
 });
+
+// History shows a realtime diary at the device's local time (the clock that set its day)
+import { formatDiaryStarted } from "./realtimeDiary";
+test("the start of a diary is shown in local time with its local date", () => {
+  assert.equal(formatDiaryStarted(local(2026, 12, 31, 20, 5)), "2026-12-31・20:05");
+  assert.equal(formatDiaryStarted(local(2027, 1, 1, 2, 0)), "2027-01-01・2:00");
+  assert.equal(formatDiaryTime(local(2027, 1, 1, 2, 0), "2026-12-31"), "1/1 2:00");
+});

@@ -88,3 +88,40 @@ test("a turn without any past context says so; a turn with Memories or a recent 
   assert.ok(withRecent.systemInstruction.includes("姉と出かけた"), "the recent conversation reached the prompt");
   assert.ok(!withRecent.systemInstruction.includes("## このターンの過去の情報"));
 });
+
+// ---------------------------------------------------------------------------
+// Realtime diary voice (owner decision 2026-11-08): only for a realtime diary conversation; the normal diary and conversations are unchanged
+// ---------------------------------------------------------------------------
+const diaryTurn = (extra: Record<string, unknown> = {}) => ({ persona: "companion", turns: [{ role: "user", content: "架空の朝の出来事です", timestamp: T }], ...extra });
+
+test("a realtime diary gets its own persona text and section, after the shared voice", async () => {
+  const r = await call(diaryTurn({ conversationVoiceMode: "realtime-diary" }));
+  assert.ok(r.systemInstruction.includes(voice.REALTIME_DIARY_PERSONA_PROMPT));
+  assert.ok(!r.systemInstruction.includes(voice.COMPANION_PERSONA_PROMPT));
+  assert.ok(r.systemInstruction.includes(voice.CONVERSATION_VOICE_SECTION + voice.REALTIME_DIARY_VOICE_SECTION));
+  assert.ok(r.systemInstruction.includes(voice.EVIDENCE_TOPIC_REFERENCE_NOTE));
+  assert.equal(r.thinkingBudget, 128, "the thinking budget is not changed");
+});
+
+test("the normal diary, conversations and any other value keep exactly the previous instructions", async () => {
+  const normal = await call(diaryTurn());
+  assert.ok(normal.systemInstruction.includes(voice.COMPANION_PERSONA_PROMPT));
+  for (const r of [normal, await call(diaryTurn({ conversationVoiceMode: "something-else" })), await call(diaryTurn({ conversationVoiceMode: true }))]) {
+    assert.ok(!r.systemInstruction.includes(voice.REALTIME_DIARY_VOICE_SECTION));
+    assert.ok(!r.systemInstruction.includes(voice.REALTIME_DIARY_PERSONA_PROMPT));
+  }
+  // another persona with the mode (not sent by the app): unchanged
+  for (const persona of ["analyst", "coach"]) {
+    const r = await call({ ...diaryTurn({ conversationVoiceMode: "realtime-diary" }), persona });
+    assert.ok(!r.systemInstruction.includes(voice.REALTIME_DIARY_VOICE_SECTION), persona);
+  }
+  assert.deepEqual(voice.conversationVoice(undefined, "companion"), voice.conversationVoice());
+  assert.equal(voice.conversationVoice("realtime-diary", "analyst").section, voice.CONVERSATION_VOICE_SECTION);
+});
+
+test("the realtime diary section says what the owner decided, without a fixed count", () => {
+  const s = voice.REALTIME_DIARY_VOICE_SECTION;
+  for (const words of ["3〜5文くらいを目安", "文の数を数えて合わせることはしない", "毎回質問で終えない", "言い換えて返さない", "不自然な共感", "大げさに褒める",
+    "感想、意見があれば", "文の数にこだわらず、必要なだけ答える", "同じ日のこれまでの発言", "自分のペースで一日を記録することを優先"]) assert.ok(s.includes(words), words);
+  assert.ok(s.includes("こちらを優先する"));
+});

@@ -935,7 +935,9 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId, conversationVoiceMode } = (await request.json()) as {
+    /** リアルタイム日記の会話だけ"realtime-diary"（conversationVoice.ts）。返し方の指示だけを変える */
+    conversationVoiceMode?: unknown;
     persona: Persona;
     turns: ConversationTurn[];
     retrievedMemories?: RetrievedMemory[];
@@ -1008,7 +1010,7 @@ export async function POST(request: Request) {
 
   const retrievedMemoriesSection = buildRetrievedMemoriesSection(memoriesForContext);
   // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。プロンプトのみで、取得・保存・AI呼び出し回数・thinking budgetは変えない。
-  const voice = conversationVoice();
+  const voice = conversationVoice(conversationVoiceMode, persona);
   const memoriesSectionForPersona =
     persona === "analyst" && retrievedMemoriesSection
       ? `

@@ -47,11 +47,12 @@ async function seed(page: Page, past: Past[] = [], device: Device = {}) {
 
 /** fictional AI that records every call. `captureReplies` / `diaryReplies` answer the next calls in turn (then a normal answer) */
 async function fakeApi(page: Page, captureReplies: Reply[] = [], diaryReplies: Reply[] = [], chatReplies: Reply[] = []) {
-  const calls = { chat: 0, capture: [] as string[], reflect: 0, other: [] as string[], diary: [] as { ai?: string; gemini?: string; openai?: string; words: string }[] };
+  const calls = { chatModes: [] as (string | undefined)[], chat: 0, capture: [] as string[], reflect: 0, other: [] as string[], diary: [] as { ai?: string; gemini?: string; openai?: string; words: string }[] };
   await page.route("**/api/**", async (route) => {
     const url = route.request().url();
     if (url.includes("/api/chat")) {
       calls.chat++;
+      calls.chatModes.push(JSON.parse(route.request().postData() ?? "{}").conversationVoiceMode);
       const r = chatReplies.shift() ?? {};
       if (r.hold) await r.hold;
       await route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: "架空の返答です。" }).catch(() => undefined);
@@ -655,5 +656,61 @@ test.describe("realtime diary: the same diary written on in two tabs", () => {
     expect(after.id).toBe(diary.id);
     expect(after.turns.map((t: any) => t.content)).toEqual(["架空の朝の出来事です", "架空の返答です。", "別のタブの架空の昼の出来事です", "別タブからの返答。", "架空の夜の出来事です", "架空の返答です。"]);
     await expect(page.getByText("別のタブの架空の昼の出来事です")).toBeVisible();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Before the integration (owner 2026-11-08): the realtime diary's own reply style, and History in the device's time zone
+// ---------------------------------------------------------------------------
+test.describe("realtime diary: its own reply style", () => {
+  test("only the realtime diary asks for its reply style; the normal diary and the conversation do not", async ({ page }) => {
+    test.setTimeout(180_000);
+    await seed(page);
+    const calls = await fakeApi(page);
+    await startApp(page);
+    await startButton(page).click();
+    await talk(page, "架空の朝の出来事です", 1);
+    await talk(page, "架空の昼の出来事です", 2);
+    await homeButton(page).click();
+    await expect(continueButton(page)).toBeVisible({ timeout: 30_000 });
+    await page.getByRole("button", { name: "日記", exact: true }).click();
+    await talk(page, "架空のふつうの日記です", 1);
+    await homeButton(page).click();
+    await expect(page.getByText("今日は、どう話そう？")).toBeVisible({ timeout: 30_000 });
+    await page.getByRole("button", { name: "会話", exact: true }).click();
+    await talk(page, "架空の相談です", 1);
+    expect(calls.chatModes).toEqual(["realtime-diary", "realtime-diary", undefined, undefined]);
+  });
+});
+
+test.describe("realtime diary: History in New York", () => {
+  test.use({ timezoneId: "America/New_York" });
+  test("a diary written on the evening of 31 December in New York is on 31 December in the calendar, at its local time, while it is already 1 January in Japan", async ({ page }) => {
+    test.setTimeout(240_000);
+    await page.clock.install({ time: new Date("2026-12-31T20:00:00-05:00") });
+    await seed(page);
+    await fakeApi(page);
+    await startApp(page);
+    await startButton(page).click();
+    await talk(page, "架空の大晦日の夜の出来事です", 1);
+    await finishButton(page).click();
+    await expect(page.getByTestId("realtime-diary-text")).toHaveText(DIARY_TEXT, { timeout: 30_000 });
+    await nav(page).getByRole("button", { name: "これまでの記憶を見る" }).click();
+    // History opens on today in Japan (1 January 2027); the diary is on its own day
+    await expect(page.getByText("2027年1月", { exact: true }).first()).toBeVisible({ timeout: 30_000 });
+    await page.getByRole("button", { name: "前月" }).click();
+    await expect(page.getByText("2026年12月", { exact: true }).first()).toBeVisible();
+    const day31 = page.getByRole("button", { name: "31", exact: true });
+    await expect(day31.locator("span").nth(1)).toHaveClass(/bg-stone-500/, { timeout: 30_000 });
+    await day31.click();
+    const card = page.getByRole("button", { name: /架空の大晦日の夜の出来事です/ }).first();
+    await expect(card).toContainText("20:00", { timeout: 30_000 });
+    await card.click();
+    await expect(page.getByText("2026-12-31・20:00")).toBeVisible();
+    await expect(page.getByTestId("history-realtime-diary")).toContainText("12月31日");
+    await expect(page.getByTestId("history-realtime-diary")).toContainText(DIARY_TEXT);
+    // nothing on 1 January
+    await page.getByRole("button", { name: "翌月" }).click();
+    await expect(page.getByRole("button", { name: "1", exact: true }).first().locator("span").nth(1)).not.toHaveClass(/bg-stone-500/);
   });
 });

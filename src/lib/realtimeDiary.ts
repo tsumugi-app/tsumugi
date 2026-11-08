@@ -116,6 +116,11 @@ export function formatDiaryTime(at: Date, diaryDate: string): string {
   return localDateKey(at) === diaryDate ? time : `${at.getMonth() + 1}/${at.getDate()} ${time}`;
 }
 
+/** 始めた日時の表示（端末のローカル時刻）。History・カレンダーでリアルタイム日記を対象日の時刻のまま見せる：「2026-12-31・20:00」 */
+export function formatDiaryStarted(at: Date): string {
+  return `${localDateKey(at)}・${at.getHours()}:${pad2(at.getMinutes())}`;
+}
+
 /** この発言の前に出す時刻。書き始めの発言と、前の発言から間が空いた発言だけ（AIの返答には出さない） */
 export function diaryTimeLabelAt(turns: ConversationTurn[], index: number, diaryDate: string): string | null {
   const turn = turns[index];
