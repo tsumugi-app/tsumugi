@@ -116,7 +116,7 @@ test("the chat route checks what the client sent: strings only, clipped, at most
     { ...base, id: "e", quote: "four" },
   ]);
   assert.equal(Array.from(cleaned[0].quote!).length, mc.MEMORY_CONTEXT_QUOTE_MAX_CHARS + 1);
-  assert.deepEqual(cleaned[0].persons, ["a", "b"]);
+  assert.deepEqual((cleaned[0] as RetrievedMemory).persons, ["a", "b"]);
   assert.ok(!("quote" in cleaned[1]));
   assert.deepEqual(cleaned.map((m) => m.quote ? "q" : "-"), ["q", "-", "q", "q", "-"]);
 });
