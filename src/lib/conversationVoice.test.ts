@@ -115,7 +115,9 @@ test("the normal diary, conversations and any other value keep exactly the previ
     const r = await call({ ...diaryTurn({ conversationVoiceMode: "realtime-diary" }), persona });
     assert.ok(!r.systemInstruction.includes(voice.REALTIME_DIARY_VOICE_SECTION), persona);
   }
-  assert.deepEqual(voice.conversationVoice(undefined, "companion"), voice.conversationVoice());
+  const plain = voice.conversationVoice(), companion = voice.conversationVoice(undefined, "companion");
+  for (const key of ["persona", "section", "evidenceNote", "analystMemoryNote"] as const) assert.deepEqual(companion[key], plain[key], key);
+  for (const none of [true, false]) assert.equal(companion.noPastContextNote(none), plain.noPastContextNote(none));
   assert.equal(voice.conversationVoice("realtime-diary", "analyst").section, voice.CONVERSATION_VOICE_SECTION);
 });
 
