@@ -329,6 +329,10 @@ test("the kind of a statement comes from its form: a question or a request is no
     ["みなとにDMするのは控えてる", "state"],
     ["みなとさん", "other"],
     ["みなとさんは友人だよ", "judgment"],
+    ["みなとさんとはもう会わないかも", "thought"],
+    ["みなとさんとはもう話さないと思う", "thought"],
+    ["みなとさんとはもう会わない", "judgment"],
+    ["やめようと思う", "thought"],
     ["みなとさんは友人だね。", "judgment"],
   ];
   for (const [sentence, role] of cases) assert.equal(classifyStatement(sentence).role, role, sentence);

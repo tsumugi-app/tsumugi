@@ -44,7 +44,7 @@ const ASK_FORM = /(ですか|ますか|でしょうか|ませんか|ないです
 const ASK_LISTENER = /(どう思う|どう思います|どう見える|どう考える|どうしたらいい|どうすればいい|どうしたら良い|どうすれば良い|覚えてる|覚えてます|合ってる|あってる)$/;
 const REQUEST = /(教えて|調べて|まとめて|聞かせて|手伝って|説明して|書いて|探して|考えて|整理して|見て)(ください|下さい|くれ|くれる|くれない|くれますか|もらえる|もらえない|もらえますか|ほしい|欲しい)?$|お願い(します|ね)?$|頼む$|頼みます$/;
 const HEDGE = /(と思う|と思った|と思ってる|と思っている|と思います|思える|気がする|気がした|かもしれない|かもしれません|かも|かな|かなあ|だろう|でしょう|みたい|ようだ|ような|らしい)$/;
-const DECISION = /(決めた|決めている|決めてる|決心した|諦めた|あきらめた|やめた|やめる|やめよう|やめます|ことにした|ことにする|ことにしよう|ことにします|しないことにした|もう(?:会わ|連絡しな|関わらな|話さな)[^。]{0,4})$/;
+const DECISION = /(決めた|決めている|決めてる|決心した|諦めた|あきらめた|やめた|やめる|やめよう|やめます|ことにした|ことにする|ことにしよう|ことにします|しないことにした|もう(?:会わな|連絡しな|関わらな|話さな)い)$/;
 const WISH = /(たい|たくない|たかった|てほしい|て欲しい|てほしかった)$/;
 const PAST = /(た|だった|でした|ました|ませんでした|なかった)$/;
 const PAST_EVALUATION = /[^な]かった$|よかった$/;
@@ -68,8 +68,9 @@ export function classifyStatement(sentence: string): StatementClass {
   }
   if (ASK_FORM.test(body)) return { role: "question", reason: "相手に尋ねる形（〜ですか／〜ますか）" };
   if (ASK_LISTENER.test(body)) return { role: "question", reason: "相手の意見や記憶を尋ねる形（どう思う／覚えてる）" };
-  if (DECISION.test(body)) return { role: "judgment", reason: "決めたことを言う形（決めた／やめる／〜ことにした）" };
+  // a hedge at the end wins over a decision inside (もう会わないかも / やめようと思う are not decided yet: Codex on PR #33)
   if (HEDGE.test(body)) return { role: "thought", reason: "推量・思いの形（〜と思う／〜かも／〜気がする）" };
+  if (DECISION.test(body)) return { role: "judgment", reason: "決めたことを言う形（決めた／やめる／〜ことにした）" };
   if (WISH.test(body)) return { role: "thought", reason: "望みを言う形（〜たい／〜てほしい）" };
   if (OWN_VIEW.test(body) && !PAST.test(body)) return { role: "thought", reason: "気持ち・考えを表す言葉がある" };
   if (PAST.test(body)) {
