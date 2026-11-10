@@ -179,7 +179,8 @@ test("building the sheet changes nothing in the Memories", () => {
 });
 
 test("the reader skips records of an unexpected shape and fills absent lists; a missing database is not created", async () => {
-  const { memories, skipped } = normalizeSheetMemories([null, { id: 1 }, { id: "a", summary: "s", date: "2026-01-01" }]);
+  const { memories, skipped, droppedItems } = normalizeSheetMemories([null, { id: 1 }, { id: "a", summary: "s", date: "2026-01-01" }]);
+  assert.equal(droppedItems, 0);
   assert.equal(skipped, 2);
   assert.deepEqual(memories[0].keywords, []);
   assert.deepEqual(memories[0].links, []);
@@ -251,4 +252,23 @@ test("Codex on PR #32: a one-character person is someone else; a relation added 
   const w3 = world().map((m) => m.id === "m2" ? { ...m, topicId: "topic-new", topicEvents: [...(m.topicEvents ?? []), topicEvent("topic-old", "前の話題でのみなとの話", "2026-07-01T10:00:00.000Z")] } : m);
   const s3 = buildPersonSheet(w3, "みなと");
   assert.ok(s3.topics.some((t) => t.topicId === "topic-old" && t.events.some((e) => e.quote === "前の話題でのみなとの話")));
+});
+
+test("Codex on PR #32: a malformed person mention, quote, link or topic quote is left out instead of breaking the sheet", () => {
+  const bad = {
+    ...mem("b1", "2026-09-05", "みなとさんの記録。"),
+    keywords: ["みなとさん", 7],
+    evidenceQuotes: ["ふつうの発言", { x: 1 }],
+    personMentions: [{ displayName: "みなとさん", quote: 17, assertion: "mention" }, mention("みなとさん", "みなとさんと会った", "2026-09-05T10:00:00.000Z"), { displayName: "みなとさん", quote: "x", assertion: "mention", relation: "rival" }],
+    links: [{ id: "lx", sourceId: "b1", targetId: "m1" }],
+    topicEvents: [{ topicId: "t", quote: null, statedAt: "2026-09-05T10:00:00.000Z" }],
+  };
+  const { memories, skipped, droppedItems } = normalizeSheetMemories([...world(), bad]);
+  assert.equal(skipped, 0);
+  assert.equal(droppedItems, 6);
+  const b1 = memories.find((m) => m.id === "b1")!;
+  assert.equal(b1.personMentions!.length, 1);
+  const sheet = buildPersonSheet(memories, "みなと");
+  assert.ok(sheet.records.some((r) => r.memoryId === "b1"));
+  assert.doesNotThrow(() => renderPersonSheetText(sheet));
 });

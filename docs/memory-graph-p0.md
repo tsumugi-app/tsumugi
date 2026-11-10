@@ -12,6 +12,7 @@
 ## 守っていること
 
 - 保存形式・既存Memory・Vaultは変更しない。読み込みは、この端末のIndexedDBを読み取り専用で開くだけ（`src/lib/personSheetRead.ts`）。
+- 形が想定外の記憶や項目（文字でない発言など）は表示から除き、件数を読み込み結果に示す（保存データは直さない）。
 - AIは呼ばない。シートは保存しない。開くたびに組み立て直す（`src/lib/personSheet.ts`）。
 - 会話の返答・Retrievalには使われない（チャット画面・`/api/chat`・`retrieval.ts`は変更なし。どこからもimportされないことをテストで確認）。
 - アプリ本体（ChatScreen）をmountしないので、起動時の処理・Capture・Connectは走らない。

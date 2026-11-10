@@ -6,7 +6,7 @@
  * 件数・文字数の上限は設けない（長い節は折りたたむ）。
  */
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { buildPersonSheet, listSheetPersons, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetText } from "@/lib/personSheet";
+import { buildPersonSheet, listSheetPersons, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetText } from "@/lib/personSheet";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
 import type { MemoryObject } from "@/lib/types";
 
@@ -69,14 +69,23 @@ export default function PersonSheetDiagnostics() {
       setMemories(result.memories);
       setSelected(null);
       setOpenMemoryId(null);
-      setStatus(result.missing ? "この端末に保存データがありません。" : `記憶 ${result.memories.length}件を読み込みました${result.skipped > 0 ? `（形が想定外のため除外：${result.skipped}件）` : ""}。`);
+      setStatus(result.missing ? "この端末に保存データがありません。" : `記憶 ${result.memories.length}件を読み込みました${result.skipped > 0 ? `（形が想定外のため除外した記憶：${result.skipped}件）` : ""}${result.droppedItems > 0 ? `（形が想定外のため除外した項目：${result.droppedItems}件）` : ""}。`);
     } catch (error) {
       setStatus(`読み込めませんでした：${String(error)}`);
     }
   }
 
   const persons: PersonListEntry[] = useMemo(() => (memories ? listSheetPersons(memories) : []), [memories]);
-  const sheet = useMemo(() => (memories && selected ? buildPersonSheet(memories, selected) : null), [memories, selected]);
+  // building the sheet must never take the page down: an unexpected record shows an error instead
+  const built = useMemo((): { sheet: PersonSheet | null; error?: string } => {
+    if (!memories || !selected) return { sheet: null };
+    try {
+      return { sheet: buildPersonSheet(memories, selected) };
+    } catch (error) {
+      return { sheet: null, error: String(error) };
+    }
+  }, [memories, selected]);
+  const sheet = built.sheet;
   const byId = useMemo(() => new Map((memories ?? []).map((m) => [m.id, m] as const)), [memories]);
 
   async function copySheet() {
@@ -154,6 +163,7 @@ export default function PersonSheetDiagnostics() {
         </div>
       )}
 
+      {built.error && <p className="rounded-xl border border-rose-400/60 p-2 text-xs text-rose-700 dark:text-rose-300">この人物のシートを組み立てられませんでした：{built.error}</p>}
       {sheet && (
         <div className="flex flex-col gap-3">
           {sheet.similarNames.length > 0 && (
