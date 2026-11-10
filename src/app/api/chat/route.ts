@@ -1,6 +1,7 @@
 import { conversationVoice } from "@/lib/conversationVoice";
 import { isTimeDependentMemory, MEMORY_CONTEXT_NOTE, MEMORY_PAST_VIEW_NOTE, memoryContextLines, sanitizeMemoryContext, withoutOutsideFactQuote } from "@/lib/memoryContext";
 import { buildSynthesisSection, sanitizeSynthesisContext } from "@/lib/memorySynthesis";
+import { buildPersonContextSection, sanitizePersonContext } from "@/lib/personContextPrompt";
 import { isValidEventTimePrecision, isValidEventTimeValue } from "@/lib/eventTimeResolver";
 import { jstDateOf } from "@/lib/dateModel";
 import type { TopicContinuityMemoryRef } from "@/lib/topicContinuity";
@@ -907,7 +908,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId, conversationVoiceMode } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, personContext, debugGenerationId, conversationVoiceMode } = (await request.json()) as {
     /** リアルタイム日記の会話だけ"realtime-diary"（conversationVoice.ts）。返し方の指示だけを変える */
     conversationVoiceMode?: unknown;
     persona: Persona;
@@ -927,6 +928,8 @@ export async function POST(request: Request) {
     memoryAnalytics?: MemoryAnalyticsContext;
     /** Memory Timeline（試験接続・既定OFF、optional）。今回の話題に関係し、通常のRetrievalに不足する経緯だけ（最大2テーマ）。無ければ従来とバイト単位で同じプロンプト。Synthesis（実験）の整理も同じ形で載せられる。 */
     memoryTimeline?: unknown;
+    /** Memory Graph P1-A（試験接続・既定OFF、optional）。話題の人物の背景（personContext.ts）。無ければ従来とバイト単位で同じプロンプト。 */
+    personContext?: unknown;
     /**
      * Conversation Debugger v1（開発専用、optional）。クライアントが`?debugLog=1`のときだけ
      * 送る、このリクエスト1回限りの一時識別子。存在する場合のみ、応答ストリームの末尾に
@@ -1060,6 +1063,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const personViewSection = buildPersonViewSection(sanitizedPersonView);
   // Memory Timeline（試験接続）＋Memory Synthesis（実験）：複数の会話にまたがる経緯（コードが作る事実）と、あれば整理（仮説）。今回の話題に関係するものだけがクライアントから届く。
   const synthesisSection = buildSynthesisSection(sanitizeSynthesisContext(memoryTimeline));
+  const personContextSection = buildPersonContextSection(sanitizePersonContext(personContext));
 
   const sanitizedProfile = sanitizeProfileContext(profile);
   const profileSection = buildProfileSection(sanitizedProfile);
@@ -1067,7 +1071,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
   const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${personContextSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, personContextSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /

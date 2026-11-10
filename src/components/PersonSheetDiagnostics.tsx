@@ -11,6 +11,8 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 import { buildPersonSheet, findInPersonSheet, listSheetPersons, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_MATCH_LABEL, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetPlan, type SheetText } from "@/lib/personSheet";
 import { STATEMENT_ROLE_LABEL } from "@/lib/personStatement";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
+import { buildPersonContext } from "@/lib/personContext";
+import { buildPersonContextSection } from "@/lib/personContextPrompt";
 import type { MemoryObject } from "@/lib/types";
 
 const shortId = (id: string) => `#${id.slice(-6)}`;
@@ -93,6 +95,16 @@ export default function PersonSheetDiagnostics() {
     }
   }, [memories, selected, withKeys]);
   const sheet = built.sheet;
+  // Memory Graph P1-A: the background the chat would receive for this person (flag ON), with the names shown together on this page as confirmed aliases
+  const chatPreview = useMemo((): string | null => {
+    if (!memories || !selected) return null;
+    try {
+      const context = buildPersonContext(memories, selected, { aliases: withKeys.length > 0 ? [[selected, ...withKeys]] : [] });
+      return buildPersonContextSection([context]) || "（会話に渡す背景はありません）";
+    } catch (error) {
+      return `作れませんでした：${String(error)}`;
+    }
+  }, [memories, selected, withKeys]);
   const byId = useMemo(() => new Map((memories ?? []).map((m) => [m.id, m] as const)), [memories]);
   const found = useMemo(() => {
     if (!memories || !sheet || !findWords.trim()) return null;
@@ -352,6 +364,10 @@ export default function PersonSheetDiagnostics() {
                 {tp.otherRecords.map((o) => <p key={o.memoryId} className="text-xs text-rose-600 dark:text-rose-300">この話題の、この人の記録ではないもの：{day(o.saidAt)} <Id id={o.memoryId} />{o.persons.length ? `（${o.persons.join("、")}）` : ""}</p>)}
               </div>
             ))}
+          </Section>
+
+          <Section title="会話に渡す背景（Memory Graph・試験）" note="?memoryGraph=1 で会話をONにしたとき、この人が話題になると会話AIに渡す内容。いっしょに表示している名前は、確定した別名として扱う（この画面だけ・保存しない）。" open={false}>
+            <pre className="whitespace-pre-wrap break-words text-xs">{chatPreview}</pre>
           </Section>
 
           <Section title={`Connectの推測（${sheet.links.length}）`} note="AIが判定したつながり。事実ではない。" open={false}>

@@ -2,6 +2,8 @@
 
 import { memoryTimelineEnabled } from "@/lib/memoryTimelineFlag";
 import { memorySynthesisEnabled } from "@/lib/memorySynthesisFlag";
+import { memoryGraphEnabled } from "@/lib/memoryGraphFlag";
+import { selectPersonContextsForTurn, withoutCoveredPersonViews, type PersonContext } from "@/lib/personContext";
 import { recordSynthesisShown, runSynthesisAfterSession, synthesisContextForTurn } from "@/lib/synthesisChat";
 import { safeSelectTimelineForTurn, type SynthesisThemeContext } from "@/lib/memorySynthesis";
 import { waitUntilIdle } from "@/lib/waitUntilIdle";
@@ -5080,6 +5082,8 @@ export default function ChatScreen() {
       let memoryAnalyticsContext: MemoryAnalyticsContext | null = null;
       // Memory Timeline（試験接続・既定OFF）：関連があり、通常のRetrievalに不足する経緯だけ。同じMemory一覧を再利用（追加のIDB読み込み・API呼び出し・保存は無い）。
       let memoryTimelineContext: SynthesisThemeContext[] = [];
+      // Memory Graph P1-A（試験・既定OFF）：話題の人物の背景（結論・理由・後からの説明・予定と結果）。同じMemory一覧から端末内で組み立てる（AI呼び出し・保存は無い）
+      let personGraphContext: PersonContext[] = [];
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
         try {
@@ -5125,6 +5129,11 @@ export default function ChatScreen() {
           }
         } catch (personTopicError) {
           console.error("Failed to build person view / topic timeline context", personTopicError);
+        }
+        if (memoryGraphEnabled()) {
+          // 失敗しても空配列（personContext.ts）。この人物のPersonViewは背景に含まれるので二重に送らない
+          personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id) });
+          personViewContext = withoutCoveredPersonViews(personViewContext, personGraphContext);
         }
         if (memorySynthesisEnabled()) {
           // Memory Synthesis S1（試験・既定OFF）：経緯に、そのテーマのTsumugiの仮説（端末内キャッシュ）を添える。AI呼び出しは無い。失敗時は経緯だけ（synthesisChat.ts）。
@@ -5205,6 +5214,7 @@ export default function ChatScreen() {
           ...(explicitSearchContext ? { explicitSearch: explicitSearchContext } : {}),
           ...(memoryAnalyticsContext ? { memoryAnalytics: memoryAnalyticsContext } : {}),
           ...(memoryTimelineContext.length > 0 ? { memoryTimeline: memoryTimelineContext } : {}),
+          ...(personGraphContext.length > 0 ? { personContext: personGraphContext } : {}),
           ...(generationId ? { debugGenerationId: generationId } : {}),
         }),
       });

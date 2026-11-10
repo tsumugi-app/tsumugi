@@ -1,0 +1,23 @@
+{
+"note": "Memory Graph P1-A (trial, default OFF: ?memoryGraph=1): the chat screen builds, on the device and from the Memories it already loaded, the background of the people the user is talking about (personContext.ts: conclusions with the user's later reasons, plans and outcomes, events, nameless candidates; no AI call, nothing stored) and sends it as the optional personContext; the PersonView of a covered person is not sent twice. The chat route checks the payload again (personContextPrompt.ts) and adds one section; without it the prompt is byte-for-byte the same.",
+"lines": [
+"+import { buildPersonContextSection, sanitizePersonContext } from \"@/lib/personContextPrompt\";",
+"-const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, debugGenerationId, conversationVoiceMode } = (await request.json()) as {",
+"+const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, personContext, debugGenerationId, conversationVoiceMode } = (await request.json()) as {",
+"+/** Memory Graph P1-A（試験接続・既定OFF、optional）。話題の人物の背景（personContext.ts）。無ければ従来とバイト単位で同じプロンプト。 */",
+"+personContext?: unknown;",
+"+const personContextSection = buildPersonContextSection(sanitizePersonContext(personContext));",
+"-const systemInstruction = `${buildCurrentDateTimeContext()}\\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;",
+"+const systemInstruction = `${buildCurrentDateTimeContext()}\\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${personContextSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, personContextSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;",
+"+import { memoryGraphEnabled } from \"@/lib/memoryGraphFlag\";",
+"+import { selectPersonContextsForTurn, withoutCoveredPersonViews, type PersonContext } from \"@/lib/personContext\";",
+"+// Memory Graph P1-A（試験・既定OFF）：話題の人物の背景（結論・理由・後からの説明・予定と結果）。同じMemory一覧から端末内で組み立てる（AI呼び出し・保存は無い）",
+"+let personGraphContext: PersonContext[] = [];",
+"+if (memoryGraphEnabled()) {",
+"+// 失敗しても空配列（personContext.ts）。この人物のPersonViewは背景に含まれるので二重に送らない",
+"+personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id) });",
+"+personViewContext = withoutCoveredPersonViews(personViewContext, personGraphContext);",
+"+}",
+"+...(personGraphContext.length > 0 ? { personContext: personGraphContext } : {}),"
+]
+}
