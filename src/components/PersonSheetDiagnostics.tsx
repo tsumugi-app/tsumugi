@@ -4,9 +4,12 @@
  * Memory Graph P0（試作）：人物シートの閲覧画面。読み込みはボタンを押したときだけ（READ ONLY）。
  * 各行に「本人の発言／AIの要約／Connectの推測」の区別と、根拠のMemory（末尾6桁のid）を出す。idを押すと、そのMemoryの保存内容を表示する。
  * 件数・文字数の上限は設けない（長い節は折りたたむ）。
+ * 別名の候補は「この画面だけ一緒に見る」で一時的にまとめて表示できる（保存しない。ページを開き直すと戻る）。
+ * 「記憶を探す」は、言葉を含むMemoryについて、このシートに出ているか・出ていないならなぜかを示す。
  */
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { buildPersonSheet, listSheetPersons, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetText } from "@/lib/personSheet";
+import { buildPersonSheet, findInPersonSheet, listSheetPersons, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_MATCH_LABEL, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetPlan, type SheetText } from "@/lib/personSheet";
+import { STATEMENT_ROLE_LABEL } from "@/lib/personStatement";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
 import type { MemoryObject } from "@/lib/types";
 
@@ -61,6 +64,9 @@ export default function PersonSheetDiagnostics() {
   const [status, setStatus] = useState<string>("");
   const [selected, setSelected] = useState<string | null>(null);
   const [openMemoryId, setOpenMemoryId] = useState<string | null>(null);
+  /** other names shown together with the selected one, on this page only (never stored) */
+  const [withKeys, setWithKeys] = useState<string[]>([]);
+  const [findWords, setFindWords] = useState("");
 
   async function load() {
     setStatus("読み込んでいます…");
@@ -68,6 +74,7 @@ export default function PersonSheetDiagnostics() {
       const result = await readMemoriesForPersonSheet();
       setMemories(result.memories);
       setSelected(null);
+      setWithKeys([]);
       setOpenMemoryId(null);
       setStatus(result.missing ? "この端末に保存データがありません。" : `記憶 ${result.memories.length}件を読み込みました${result.skipped > 0 ? `（形が想定外のため除外した記憶：${result.skipped}件）` : ""}${result.droppedItems > 0 ? `（形が想定外のため除外した項目：${result.droppedItems}件）` : ""}。`);
     } catch (error) {
@@ -80,13 +87,31 @@ export default function PersonSheetDiagnostics() {
   const built = useMemo((): { sheet: PersonSheet | null; error?: string } => {
     if (!memories || !selected) return { sheet: null };
     try {
-      return { sheet: buildPersonSheet(memories, selected) };
+      return { sheet: buildPersonSheet(memories, selected, { withKeys }) };
     } catch (error) {
       return { sheet: null, error: String(error) };
     }
-  }, [memories, selected]);
+  }, [memories, selected, withKeys]);
   const sheet = built.sheet;
   const byId = useMemo(() => new Map((memories ?? []).map((m) => [m.id, m] as const)), [memories]);
+  const found = useMemo(() => {
+    if (!memories || !sheet || !findWords.trim()) return null;
+    try {
+      return { hits: findInPersonSheet(memories, sheet, findWords) };
+    } catch (error) {
+      return { hits: [], error: String(error) };
+    }
+  }, [memories, sheet, findWords]);
+  const toggleWith = (key: string) => setWithKeys((list) => (list.includes(key) ? list.filter((k) => k !== key) : [...list, key]));
+  // plans grouped by their topic (a plan without a topic stands alone)
+  const planGroups = useMemo(() => {
+    const groups = new Map<string, SheetPlan[]>();
+    for (const p of sheet?.plans ?? []) {
+      const g = p.record.topicId ?? `record:${p.record.memoryId}`;
+      groups.set(g, [...(groups.get(g) ?? []), p]);
+    }
+    return [...groups.entries()];
+  }, [sheet]);
 
   async function copySheet() {
     if (!sheet) return;
@@ -134,7 +159,7 @@ export default function PersonSheetDiagnostics() {
           {persons.length === 0 && <None />}
           <div className="flex flex-wrap gap-2">
             {persons.map((p) => (
-              <button key={p.key} type="button" onClick={() => { setSelected(p.key); setOpenMemoryId(null); }}
+              <button key={p.key} type="button" onClick={() => { setSelected(p.key); setWithKeys([]); setOpenMemoryId(null); }}
                 className={`rounded-full border px-3 py-1 text-sm ${selected === p.key ? "border-sky-500 bg-sky-500/10" : "border-stone-300 dark:border-stone-600"}`}>
                 {p.names.join(" / ")}（記録 {p.mentionRecords}{p.keywordOnlyRecords > 0 ? `＋キーワードのみ ${p.keywordOnlyRecords}` : ""}）
               </button>
@@ -171,9 +196,65 @@ export default function PersonSheetDiagnostics() {
               似た名前があります（別人として扱っています。取り違えに注意）：{sheet.similarNames.join("、")}
             </p>
           )}
+          <Section title={`同じ人かもしれない別の名前（${sheet.aliasCandidates.length}）`} note="同じ話題・Connectのつながりなどがある別の名前。推測で、まとめてはいない。「この画面だけ一緒に見る」は保存せず、ページを開き直すと戻る。同じ人かどうかは本人が判断する。">
+            {sheet.keys.length > 1 && (
+              <p className="rounded-xl border border-amber-500/60 p-2 text-xs text-amber-700 dark:text-amber-300">
+                この画面だけ一緒に表示中（同じ人とは確定していない）：{sheet.keys.join("、")}
+                <button type="button" onClick={() => setWithKeys([])} className="ml-2 underline">元に戻す</button>
+              </p>
+            )}
+            {sheet.aliasCandidates.length === 0 && <None />}
+            {sheet.aliasCandidates.map((c) => (
+              <label key={c.key} className="flex flex-wrap items-baseline gap-2 text-sm">
+                <input type="checkbox" checked={withKeys.includes(c.key)} onChange={() => toggleWith(c.key)} />
+                <span>{c.names.join(" / ")}（記録 {c.records}）</span>
+                <span className="text-[11px] text-stone-500">
+                  同じ話題 {c.sharedTopics}・Connectのつながり {c.links}
+                  {c.sharedCoPersons.length > 0 && `・共通して出てくる人 ${c.sharedCoPersons.join("、")}`}
+                  {c.similarName && "・名前が似ている"}
+                  {c.bothInOneRecord > 0 && <span className="text-rose-600 dark:text-rose-300">・同じ記録に両方の名前 {c.bothInOneRecord}件（別人の可能性）</span>}
+                </span>
+                <span className="text-[11px] text-stone-400">この画面だけ一緒に見る</span>
+              </label>
+            ))}
+            <label className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
+              ほかの名前を一緒に見る：
+              <select value="" onChange={(e) => { if (e.target.value) toggleWith(e.target.value); }} className="rounded border border-stone-300 bg-transparent px-1 py-0.5 dark:border-stone-600">
+                <option value="">選ぶ</option>
+                {persons.filter((p) => p.key !== selected && !withKeys.includes(p.key)).map((p) => <option key={p.key} value={p.key}>{p.names.join(" / ")}</option>)}
+              </select>
+            </label>
+          </Section>
+
+          <Section title="記憶を探す（このシートに出ない理由を確かめる）" note="すべての記憶から言葉を探し、このシートに出ているか、出ていないならなぜか、文がどう扱われたかを示す。">
+            <input type="search" value={findWords} onChange={(e) => setFindWords(e.target.value)} placeholder="例：探したい言葉"
+              className="w-full rounded-xl border border-stone-300 bg-transparent px-3 py-1.5 text-sm dark:border-stone-600" />
+            {found?.error && <p className="text-xs text-rose-600">探せませんでした：{found.error}</p>}
+            {found && !found.error && <p className="text-xs text-stone-500">見つかった記憶：{found.hits.length}件</p>}
+            {found?.hits.map((h) => (
+              <div key={h.memoryId} className="flex flex-col gap-1 border-l-2 border-stone-300 pl-2 text-xs dark:border-stone-600">
+                <p>
+                  {day(h.saidAt)} <Id id={h.memoryId} />{" "}
+                  {h.onSheet ? <span className="text-emerald-700 dark:text-emerald-300">このシートに出ている（{SHEET_MATCH_LABEL[h.onSheet]}）</span> : <span className="text-rose-600 dark:text-rose-300">このシートに出ていない</span>}
+                  {h.persons.length > 0 && <span className="text-stone-500">　この記録の人物：{h.persons.join("、")}</span>}
+                </p>
+                <p className="text-stone-500">ある場所：{h.where.join("、")}</p>
+                {h.whyNotOnSheet && <p className="text-rose-600 dark:text-rose-300">理由：{h.whyNotOnSheet}</p>}
+                {h.sentences.map((x, i) => (
+                  <div key={i} className="pl-2">
+                    <span className="text-stone-500">{x.source}：</span>「{x.text}」
+                    <div className="text-stone-500">
+                      {x.role && <>文の形：{STATEMENT_ROLE_LABEL[x.role]}（{x.reason}）／</>}扱い：{x.fateNote}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </Section>
+
           <Section title="関係の概要">
             <p className="text-sm">
-              記録 {sheet.overview.records}件（人物として記録 {sheet.overview.mentionRecords}件・名前がキーワードにあるだけ {sheet.overview.keywordOnlyRecords}件）
+              記録 {sheet.overview.records}件（人物として記録 {sheet.overview.mentionRecords}件・名前がキーワードにあるだけ {sheet.overview.keywordOnlyRecords}件・本文での言及だけ {sheet.overview.textOnlyRecords}件）
               {sheet.overview.firstSaidAt && `　${day(sheet.overview.firstSaidAt)}〜${day(sheet.overview.lastSaidAt)}`}
             </p>
             {sheet.overview.relation && (
@@ -193,7 +274,7 @@ export default function PersonSheetDiagnostics() {
               <div key={r.memoryId} className="flex flex-col gap-1 border-l-2 border-stone-300 pl-2 dark:border-stone-600">
                 <div className="flex flex-wrap gap-1.5 text-[11px] text-stone-500">
                   <span>{day(r.saidAt)}（{r.saidAtIsRecordDate ? "記録日" : "話した日"}）</span>
-                  {r.match === "keyword" && <span className="text-rose-600 dark:text-rose-300">名前がキーワードにあるだけ</span>}
+                  {r.match !== "mention" && <span className="text-rose-600 dark:text-rose-300">{SHEET_MATCH_LABEL[r.match]}</span>}
                   {r.eventTime && <span>出来事 {r.eventTime}</span>}
                   {r.status && <span>記録の言葉「{r.status}」</span>}
                   {r.retrospective && <span>以前の出来事を後から話した</span>}
@@ -208,9 +289,20 @@ export default function PersonSheetDiagnostics() {
             ))}
           </Section>
 
-          <Section title={`過去の考え・結論（${sheet.views.length}）`} note="考え・気持ち・判断の言葉を含む文。記録した時点のもので、今も同じとは限らない。本人の発言が無い記録だけAIの要約から出す。">
+          <Section title={`過去の考え・結論（${sheet.views.length}）`} note="本人の発言を文ごとに、文の形で分けたもの（言い切り・決めたことは「判断・結論」、推量・気持ち・望みは「考え・気持ち」）。古い順で、同じ文は1回。記録した時点のもので、今も同じとは限らない。本人の発言に考えの文が無い記録だけAIの要約から出す。">
             {sheet.views.length === 0 && <None />}
-            {sheet.views.map((v, i) => <Text key={i} t={v.text} note={v.aboutOther ? "別の人についての考えかもしれない" : undefined} />)}
+            {sheet.views.map((v, i) => (
+              <div key={i} className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-stone-500">{STATEMENT_ROLE_LABEL[v.role]}（{v.reason}）</span>
+                <Text t={v.text} note={v.aboutOther ? "別の人についての考えかもしれない" : undefined} />
+                {v.alsoIn.length > 0 && <p className="text-[11px] text-stone-400">同じ文がある記録：{v.alsoIn.map((id) => <Id key={id} id={id} />)}</p>}
+              </div>
+            ))}
+          </Section>
+
+          <Section title={`質問・依頼（${sheet.asked.length}）`} note="相手（AI）に尋ねた・確かめた・頼んだ文。本人の考えとは分けて示す。" open={false}>
+            {sheet.asked.length === 0 && <None />}
+            {sheet.asked.map((a, i) => <Text key={i} t={a.text} note={STATEMENT_ROLE_LABEL[a.role]} />)}
           </Section>
 
           <Section title="最後に確認できた記録" note="今の状態ではなく、最後に記録された内容とその日付。">
@@ -220,21 +312,33 @@ export default function PersonSheetDiagnostics() {
               <div>
                 <p className="text-xs text-stone-500">状態の言葉（「{sheet.last.status.status}」）がある最後の記録</p>
                 <Text t={sheet.last.status.summary} />
-                {(sheet.last.statusLater ?? []).map((l) => <p key={l.memoryId} className="text-xs text-rose-600 dark:text-rose-300">同じ話題の後の記録（この人の記録とは限らない）：{day(l.saidAt)} <Id id={l.memoryId} /> 「{l.status}」 {l.summary}</p>)}
+                {(sheet.last.statusLater ?? []).map((l) => <p key={l.memoryId} className="text-xs text-rose-600 dark:text-rose-300">同じ話題で共通の言葉（{l.sharedTerms.join("、")}）がある後の記録（この人の記録とは限らない）：{day(l.saidAt)} <Id id={l.memoryId} /> 「{l.status}」 {l.summary}</p>)}
               </div>
             )}
             {sheet.last.relation && <div><p className="text-xs text-stone-500">最後に述べた関係（{PERSON_RELATION_LABEL_JA[sheet.last.relation.relation]}）</p><Text t={sheet.last.relation} /></div>}
+            {sheet.last.judgment && <div><p className="text-xs text-stone-500">本人の言葉での最後の判断・結論</p><Text t={sheet.last.judgment.text} /></div>}
             {sheet.last.ownView && <div><p className="text-xs text-stone-500">本人の言葉での最後の考え</p><Text t={sheet.last.ownView.text} /></div>}
           </Section>
 
-          <Section title={`予定とその後（${sheet.plans.length}）`} note="同じ話題（話題番号が同じ）の後の記録だけを「その後」とする。キーワードが同じだけの記録は候補で、結果かどうかは未確認。">
+          <Section title={`予定とその後（${sheet.plans.length}）`} note="結果の候補は、後の記録のうち「中止・保留・実施済み」の言葉があり、予定と共通の言葉（名前以外）があるものだけ。同じ話題というだけの記録は結果としない（件数だけ示す）。">
             {sheet.plans.length === 0 && <None />}
-            {sheet.plans.map((p) => (
-              <div key={p.record.memoryId} className="flex flex-col gap-1 border-l-2 border-stone-300 pl-2 dark:border-stone-600">
-                <Text t={p.record.summary} note={p.why === "status" ? `記録の言葉「${p.record.status}」` : `出来事 ${p.record.eventTime} が話した日より後`} />
-                {p.sameTopicLater.length === 0 && p.keywordLater.length === 0 && <p className="text-xs text-stone-500">その後の記録なし（結果は不明）</p>}
-                {p.sameTopicLater.map((l) => <p key={l.memoryId} className="text-xs">同じ話題の後の記録：{day(l.saidAt)} <Id id={l.memoryId} />{l.status ? ` 「${l.status}」` : ""} {l.summary}</p>)}
-                {p.keywordLater.map((l) => <p key={l.memoryId} className="text-xs text-stone-500">候補（同じキーワード：{l.sharedKeywords.join("、")}）：{day(l.saidAt)} <Id id={l.memoryId} />{l.status ? ` 「${l.status}」` : ""} {l.summary}</p>)}
+            {planGroups.map(([group, plans]) => (
+              <div key={group} className="flex flex-col gap-2 border-l-2 border-stone-300 pl-2 dark:border-stone-600">
+                <p className="font-mono text-[11px] text-stone-500">{plans[0].record.topicId ? `話題 ${shortId(plans[0].record.topicId)}` : "話題番号なし"}</p>
+                {plans.map((p) => (
+                  <div key={p.record.memoryId} className="flex flex-col gap-1">
+                    <Text t={p.record.summary} note={p.why === "status" ? `記録の言葉「${p.record.status}」` : `出来事 ${p.record.eventTime} が話した日より後`} />
+                    {p.outcome
+                      ? <p className="text-xs">結果の候補：{day(p.outcome.saidAt)} <Id id={p.outcome.memoryId} /> 「{p.outcome.status}」（共通の言葉：{p.outcome.sharedTerms.join("、")}{p.outcome.sameTopic ? "・同じ話題" : "・別の話題"}） {p.outcome.summary}</p>
+                      : <p className="text-xs text-stone-500">結果の候補なし（結果は不明）</p>}
+                    {p.laterSameTopic.length > 0 && (
+                      <details className="text-xs text-stone-500">
+                        <summary>同じ話題の後の記録 {p.laterSameTopic.length}件（結果とはしていない）</summary>
+                        {p.laterSameTopic.map((l) => <p key={l.memoryId}>{day(l.saidAt)} <Id id={l.memoryId} />{l.status ? ` 「${l.status}」` : ""}{l.sharedTerms.length ? `（共通：${l.sharedTerms.join("、")}）` : ""} {l.summary}</p>)}
+                      </details>
+                    )}
+                  </div>
+                ))}
               </div>
             ))}
           </Section>

@@ -1,9 +1,10 @@
 /**
- * Memory Graph P0: the person sheet (debug view). Fictional people and events only (みなとさん / ゆきのさん / まなとさん / 妻 are invented).
+ * Memory Graph P0: the person sheet (debug view). Fictional people and events only (みなとさん / ゆきのさん / まなとさん / さきさん / 咲さん / 妻 are invented).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildPersonSheet, listSheetPersons, personSheetKey, renderPersonSheetText } from "./personSheet";
+import { buildPersonSheet, findInPersonSheet, listSheetPersons, personSheetKey, renderPersonSheetText } from "./personSheet";
+import { classifyStatement } from "./personStatement";
 import { normalizeSheetMemories, readMemoriesForPersonSheet } from "./personSheetRead";
 import type { Link, MemoryObject, PersonMention, TopicEvent } from "./types";
 
@@ -130,14 +131,28 @@ test("the last records are shown with their dates and are not called the present
   assert.doesNotMatch(text, /現在の状態：/);
 });
 
-test("a plan is followed only by a later record of the same topic; nothing later means the result is unknown", () => {
+test("a plan's outcome is a later record with an outcome word that shares a word of the plan; nothing later means the result is unknown", () => {
   const sheet = buildPersonSheet(world(), "みなと");
   const plan = sheet.plans.find((p) => p.record.memoryId === "m4");
   assert.ok(plan);
-  assert.deepEqual(plan!.sameTopicLater.map((l) => [l.memoryId, l.status]), [["m5", "中止"]]);
+  assert.equal(plan!.outcome?.memoryId, "m5");
+  assert.equal(plan!.outcome?.status, "中止");
+  assert.deepEqual(plan!.outcome?.sharedTerms, ["勉強会"]);
+  assert.equal(plan!.outcome?.sameTopic, true);
   const lone = buildPersonSheet(world().filter((m) => m.id !== "m5"), "みなと").plans.find((p) => p.record.memoryId === "m4")!;
-  assert.equal(lone.sameTopicLater.length, 0);
-  assert.match(renderPersonSheetText(buildPersonSheet(world().filter((m) => m.id !== "m5"), "みなと")), /その後の記録なし（結果は不明）/);
+  assert.equal(lone.outcome, undefined);
+  assert.match(renderPersonSheetText(buildPersonSheet(world().filter((m) => m.id !== "m5"), "みなと")), /結果の候補なし（結果は不明）/);
+});
+
+test("a later record that only shares the topic is not the outcome of a plan, even with an outcome word", () => {
+  const w = [...world(), mem("m9", "2026-09-10", "映画の上映会は中止になった。", { keywords: ["映画"], topicId: "topic-study" })];
+  const plan = buildPersonSheet(w, "みなと").plans.find((p) => p.record.memoryId === "m4")!;
+  assert.equal(plan.outcome?.memoryId, "m5", "m9 says 中止 in the same topic but shares nothing with the plan");
+  assert.deepEqual(plan.laterSameTopic.map((l) => l.memoryId), ["m9"]);
+  const w2 = w.filter((m) => m.id !== "m5");
+  const plan2 = buildPersonSheet(w2, "みなと").plans.find((p) => p.record.memoryId === "m4")!;
+  assert.equal(plan2.outcome, undefined);
+  assert.deepEqual(plan2.laterSameTopic.map((l) => l.memoryId), ["m9"]);
 });
 
 test("a topic shared with another person: the user's words of the topic are shown, and the other person's record of the topic is marked", () => {
@@ -206,6 +221,17 @@ test("the person sheet is a debug view only: no chat, Retrieval or write path im
   };
   walk(src);
   assert.deepEqual(importers.sort(), ["components/PersonSheetDiagnostics.tsx"]);
+  const statementImporters: string[] = [];
+  const walk2 = (d: string) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { walk2(p); continue; }
+      if (!/\.(ts|tsx)$/.test(e.name) || /\.test\.ts$/.test(e.name)) continue;
+      if (/from ["'](@\/lib\/|\.\/)personStatement["']/.test(fs.readFileSync(p, "utf8"))) statementImporters.push(path.relative(src, p).split(path.sep).join("/"));
+    }
+  };
+  walk2(src);
+  assert.deepEqual(statementImporters.sort(), ["components/PersonSheetDiagnostics.tsx", "lib/personSheet.ts"]);
   const reader = fs.readFileSync(path.join(src, "lib", "personSheetRead.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   assert.doesNotMatch(reader, /readwrite|\.put\(|\.add\(|\.delete\(|\.clear\(|deleteDatabase|fetch\(|localStorage|from ["'].*\/(db|vault)["']/);
   const sheet = fs.readFileSync(path.join(src, "lib", "personSheet.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
@@ -222,7 +248,7 @@ test("the same words are not shown twice; the relation category stays apart from
   assert.equal(sheet.overview.relation!.basis[0].relation, "colleague");
   assert.equal(sheet.last.status?.memoryId, "m4");
   assert.deepEqual(sheet.last.statusLater?.map((l) => [l.memoryId, l.status]), [["m5", "中止"]]);
-  assert.match(renderPersonSheetText(sheet), /同じ話題の後の記録（この人の記録とは限らない）：2026-09-20 #m5 「中止」/);
+  assert.match(renderPersonSheetText(sheet), /同じ話題で共通の言葉（勉強会）がある後の記録（この人の記録とは限らない）：2026-09-20 #m5 「中止」/);
 });
 
 test("Codex on PR #32: a one-character person is someone else; a relation added later counts at its own date; a kept topic quote keeps its topic", () => {
@@ -284,4 +310,151 @@ test("Codex on PR #32: a shorter person's name inside the selected name is still
   assert.equal(o5.evidence.find((q) => q.text.startsWith("みなとさんとは"))!.aboutOther, true);
   assert.equal(o5.evidence.find((q) => q.text.startsWith("みなとこさんとは"))!.aboutOther, false);
   assert.ok(!s.last.ownView || !s.last.ownView.text.text.startsWith("みなとさんとは"));
+});
+
+test("the kind of a statement comes from its form: a question or a request is not a view; a judgment stated outright is", () => {
+  const cases: [string, string][] = [
+    ["みなとさんとは、正直もう未来はない", "judgment"],
+    ["もう会わないことにした", "judgment"],
+    ["みなとさんのこと、どう思う？", "question"],
+    ["それって合ってるかな？", "thought"],
+    ["なんであんなこと言ったんだろう？", "thought"],
+    ["前に話したこと覚えてる？", "question"],
+    ["この関係について整理してください", "request"],
+    ["どうすればいいか教えて", "request"],
+    ["距離が近すぎるのかもと思った", "thought"],
+    ["もっと話を聞いてほしかった", "thought"],
+    ["会議室でみなとさんと進め方の話をした", "report"],
+    ["あの日は楽しかった", "thought"],
+    ["みなとにDMするのは控えてる", "state"],
+    ["みなとさん", "other"],
+    ["好き", "thought"],
+    ["怖い", "thought"],
+    ["決めた", "judgment"],
+    ["諦めた", "judgment"],
+    ["はい", "other"],
+    ["みなとさんとは会わないことにしました", "judgment"],
+    ["みなとさんとは会わないと決めました", "judgment"],
+    ["連絡するのはやめました", "judgment"],
+    ["みなとさんとはもう会いません", "judgment"],
+    ["みなとさんにまた会いたいです", "thought"],
+    ["みなとさんには幸せになってほしいです", "thought"],
+    ["本当は会いたいんだ", "thought"],
+    ["もう会わないかもです", "thought"],
+    ["みなとさんは友人です", "judgment"],
+    ["みなとさんは友人だよ", "judgment"],
+    ["みなとさんとはもう会わないかも", "thought"],
+    ["みなとさんとはもう話さないと思う", "thought"],
+    ["みなとさんとはもう会わない", "judgment"],
+    ["やめようと思う", "thought"],
+    ["みなとさんは友人だね。", "judgment"],
+  ];
+  for (const [sentence, role] of cases) assert.equal(classifyStatement(sentence).role, role, sentence);
+});
+
+test("views: questions and requests to the listener are kept apart, each sentence is shown once, the judgments are told from the thoughts", () => {
+  const w = [
+    ...world(),
+    mem("q1", "2026-10-12", "みなとさんについてAIに相談した。", {
+      keywords: ["みなとさん"],
+      personMentions: [mention("みなとさん", "みなとさんのこと、どう思う？", "2026-10-12T10:00:00.000Z")],
+      evidenceQuotes: ["みなとさんのこと、どう思う？", "前に話したこと覚えてる？", "みなとさんとは、正直もう未来はない。整理してください。"],
+    }),
+    mem("q2", "2026-10-13", "みなとさんとの今後を考えた。", {
+      keywords: ["みなとさん"],
+      personMentions: [mention("みなとさん", "みなとさんとは、正直もう未来はない", "2026-10-13T10:00:00.000Z")],
+    }),
+  ];
+  const sheet = buildPersonSheet(w, "みなと");
+  assert.ok(!sheet.views.some((v) => v.text.text.includes("どう思う")), "a question is not a view");
+  assert.deepEqual(sheet.asked.map((a) => [a.role, a.text.memoryId]), [["question", "q1"], ["question", "q1"], ["request", "q1"]]);
+  const judgment = sheet.views.filter((v) => v.text.text.startsWith("みなとさんとは、正直もう未来はない。") || v.text.text === "みなとさんとは、正直もう未来はない");
+  assert.equal(judgment.length, 1, "the same words are shown once");
+  assert.equal(judgment[0].role, "judgment");
+  assert.deepEqual(judgment[0].alsoIn, ["q2"]);
+  assert.equal(sheet.last.judgment?.text.memoryId, "q1");
+  assert.ok(sheet.statements.some((s) => s.text.memoryId === "q2" && s.fate === "duplicate"));
+  // q1 has a view in the user's words, so its AI summary is not used as a view
+  assert.ok(!sheet.views.some((v) => v.text.memoryId === "q1" && v.text.kind === "summary"));
+  const text = renderPersonSheetText(sheet);
+  assert.match(text, /〔判断・結論（言い切り）〕\[本人の発言 2026-10-12 #q1\] みなとさんとは、正直もう未来はない。（同じ文：#q2）/);
+  assert.match(text, /■ 質問・依頼（考えとは分けたもの：3件）/);
+});
+
+test("another name of the same person: listed as a candidate with what points to it, never joined; the page can show both together", () => {
+  const w = [
+    ...world(),
+    mem("s1", "2026-06-01", "さきさんと会議室で話した。", {
+      keywords: ["さきさん", "会議室"], topicId: "topic-saki",
+      personMentions: [mention("さきさん", "さきさんと会議室で話した", "2026-06-01T10:00:00.000Z", "colleague")],
+      evidenceQuotes: ["さきさんと会議室で話した"],
+      links: [link("ls", "s1", "s2", "同じ人の話")],
+    }),
+    mem("s2", "2026-06-20", "咲さんとの関係について話した。", {
+      keywords: ["咲さん", "関係"], topicId: "topic-saki",
+      personMentions: [mention("咲さん", "咲さんとは、もう未来はない", "2026-06-20T10:00:00.000Z")],
+      evidenceQuotes: ["咲さんとは、もう未来はない", "咲さんのことどう思う？"],
+    }),
+    mem("s3", "2026-06-25", "昼に、さきさんの話を少しした。", { keywords: ["昼"] }),
+  ];
+  assert.equal(personSheetKey("咲さん"), "咲さん", "a one-character name keeps its honorific");
+  const sheet = buildPersonSheet(w, "さき");
+  assert.ok(!sheet.records.some((r) => r.memoryId === "s2"), "咲さん is not joined");
+  const cand = sheet.aliasCandidates.find((c) => c.key === "咲さん");
+  assert.ok(cand);
+  assert.equal(cand!.sharedTopics, 1);
+  assert.equal(cand!.links, 1);
+  assert.equal(sheet.records.find((r) => r.memoryId === "s3")?.match, "text", "a name only in the text is found and marked");
+  assert.equal(sheet.overview.textOnlyRecords, 1);
+
+  // why 「未来はない」 is not on the sheet of さき
+  const hits = findInPersonSheet(w, sheet, "未来はない");
+  const s2hit = hits.find((h) => h.memoryId === "s2")!;
+  assert.equal(s2hit.onSheet, null);
+  assert.match(s2hit.whyNotOnSheet ?? "", /咲さん/);
+  const m3hit = hits.find((h) => h.memoryId === "m3")!;
+  assert.equal(m3hit.onSheet, null, "みなとさん's record is someone else's");
+
+  // shown together on the page only: the judgment of s2 is now a view, the question of s2 is kept apart
+  const together = buildPersonSheet(w, "さき", { withKeys: ["咲さん"] });
+  assert.deepEqual(together.keys, ["さき", "咲さん"]);
+  assert.ok(together.records.some((r) => r.memoryId === "s2"));
+  assert.equal(together.last.judgment?.text.text, "咲さんとは、もう未来はない");
+  assert.ok(together.asked.some((a) => a.text.memoryId === "s2"));
+  const again = findInPersonSheet(w, together, "未来はない").find((h) => h.memoryId === "s2")!;
+  assert.equal(again.onSheet, "mention");
+  assert.match(again.sentences[0].fateNote, /「過去の考え・結論」に出した（判断・結論（言い切り））/);
+  const q = findInPersonSheet(w, together, "どう思う").find((h) => h.memoryId === "s2")!;
+  assert.match(q.sentences[0].fateNote, /「質問・依頼」に分けた/);
+  assert.match(renderPersonSheetText(together), /この画面だけ一緒に表示している名前（同じ人とは確定していない）：さき、咲さん/);
+  // nothing is changed in the Memories
+  assert.equal(w.find((m) => m.id === "s2")!.personMentions![0].displayName, "咲さん");
+});
+
+test("Codex on PR #33: a question and a judgment that differ only by ？ and 。 are two statements", () => {
+  const w = [
+    ...world(),
+    mem("d1", "2026-10-20", "みなとさんについて尋ねた。", { keywords: ["みなとさん"], evidenceQuotes: ["みなとさんはもう来ない？"] }),
+    mem("d2", "2026-10-21", "みなとさんについて話した。", { keywords: ["みなとさん"], evidenceQuotes: ["みなとさんはもう来ない。"] }),
+  ];
+  const sheet = buildPersonSheet(w, "みなと");
+  assert.ok(sheet.asked.some((a) => a.text.memoryId === "d1"));
+  assert.ok(sheet.views.some((v) => v.text.memoryId === "d2" && v.role === "judgment"));
+  assert.equal(sheet.last.judgment?.text.memoryId, "d2");
+  const hit = findInPersonSheet(w, sheet, "もう来ない").find((h) => h.memoryId === "d2")!;
+  assert.match(hit.sentences[0].fateNote, /「過去の考え・結論」に出した/);
+});
+
+test("Codex on PR #33: on a person's sheet, the person's own thing is followed to its outcome", () => {
+  const w = [
+    ...world(),
+    mem("w1", "2026-09-01", "妻の引っ越しは来月の予定。", { keywords: ["妻", "引っ越し"], topicId: "topic-move", personMentions: [mention("妻", "妻の引っ越しは来月", "2026-09-01T10:00:00.000Z", "spouse")] }),
+    mem("w2", "2026-09-15", "妻の引っ越しは中止になった。", { keywords: ["引っ越し"], topicId: "topic-move" }),
+  ];
+  const plan = buildPersonSheet(w, "妻").plans.find((p) => p.record.memoryId === "w1")!;
+  assert.equal(plan.outcome?.memoryId, "w2");
+  assert.equal(plan.outcome?.status, "中止");
+  // on someone else's sheet the same words stay someone else's thing
+  const other = buildPersonSheet([...w, mem("w3", "2026-09-02", "みなとさんと引っ越しの予定を話した。", { keywords: ["みなとさん", "引っ越し"], topicId: "topic-move" })], "みなと").plans.find((p) => p.record.memoryId === "w3");
+  assert.equal(other?.outcome, undefined);
 });
