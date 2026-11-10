@@ -82,6 +82,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   // the user's own views, oldest first: only from records where Capture recorded this person (a keyword or a name in the text is not enough), and,
   // when the record also names other people, only the sentences that name this person (independent review)
   const recordOf = new Map(sheet.records.map((r) => [r.memoryId, r] as const));
+  const byId = new Map(pool.map((m) => [m.id, m] as const));
   const eligible = (id: string, sentence: string) => {
     const r = recordOf.get(id);
     return r?.match === "mention" && (r.otherPersons.length === 0 || personKeysInText(sentence, sheet.keys).length > 0);
@@ -96,7 +97,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   }).sort((a, b) => timeOf(a.text.saidAt) - timeOf(b.text.saidAt));
   // records without any name that may be about this person: two kinds of evidence must meet
   const onSheet = new Set(sheet.records.filter((r) => r.match === "mention").map((r) => r.memoryId));
-  const named = sheet.records.filter((r) => r.match === "mention").map((r) => pool.find((m) => m.id === r.memoryId)!).filter(Boolean);
+  const named = sheet.records.filter((r) => r.match === "mention").map((r) => byId.get(r.memoryId)).filter((m): m is MemoryObject => m !== undefined);
   const convs = new Set(named.map((m) => m.conversationId).filter(Boolean));
   const topicsOf = (m: MemoryObject) => [m.topicId, ...(m.topicEvents ?? []).map((e) => e.topicId)].filter(Boolean) as string[];
   const topics = new Set(named.flatMap(topicsOf));
@@ -150,7 +151,11 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   // explanation like 「〜理由は、〜だから。」 is not a view of its own: Codex on PR #34); each sentence once
   const seenExplanation = new Set<string>();
   const explanations = sheet.records.filter((r) => r.match === "mention")
-    .flatMap((r) => [...r.mentionQuotes, ...r.evidence.filter((e) => !e.aboutOther)])
+    .flatMap((r) => [
+      ...r.mentionQuotes, ...r.evidence.filter((e) => !e.aboutOther),
+      // the topic quotes too, each with its own time (as the sheet reads them: Codex on PR #34)
+      ...(byId.get(r.memoryId)?.topicEvents ?? []).filter((e) => e.quote).map((e) => ({ text: e.quote, memoryId: r.memoryId, saidAt: e.statedAt || r.saidAt })),
+    ])
     .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
     .filter((t) => fits(t.text) && REASON_FORM.test(t.text) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
     .filter((t) => { const k = statementKey(t.text); if (seenExplanation.has(k)) return false; seenExplanation.add(k); return true; })

@@ -286,3 +286,19 @@ test("Codex on PR #34: a later explanation of any sentence form is attached; ano
   assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => r.memoryId), ["a3"]);
   assert.ok(!c.aiReadings.some((r) => r.memoryId === "a2"), "みなとさん's sentence is not a reading of はるかさん's conclusion");
 });
+
+test("Codex on PR #34: a later explanation kept only as a topic quote is attached, with its own time", () => {
+  const memories: MemoryObject[] = [
+    mem("b1", "2026-09-01", "はるかさんとの関係について話した。", {
+      personMentions: [mention("はるかさん", "はるかさんとの関係に未来はない", "2026-09-01T10:00:00.000Z")], evidenceQuotes: ["はるかさんとの関係に未来はない。"],
+    }),
+    mem("b2", "2026-09-01", "はるかさんについて話した。", {
+      statedAt: "2026-09-01T08:00:00.000Z",
+      personMentions: [mention("はるかさん", "はるかさんの話", "2026-09-01T08:00:00.000Z")],
+      topicEvents: [{ id: "te-b2", topicId: "topic-h", quote: "はるかさんとの関係に未来がない理由は、自分が既婚者だから。", statedAt: "2026-09-09T10:00:00.000Z", sourceConversationId: "c", recordedAt: "2026-09-09T10:00:00.000Z", origin: "ai-extracted", schemaVersion: 1 }],
+    }),
+  ];
+  const c = buildPersonContext(memories, "はるか").conclusions.find((x) => x.statement.memoryId === "b1");
+  assert.ok(c);
+  assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => [r.memoryId, r.day]), [["b2", "2026-09-09"]]);
+});
