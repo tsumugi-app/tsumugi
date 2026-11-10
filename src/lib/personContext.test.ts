@@ -320,3 +320,17 @@ test("Codex on PR #34: an explanation repeated after the conclusion is attached;
   assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => [r.memoryId, r.day]), [["c3", "2026-09-20"]]);
   assert.equal(context.lastDay, "2026-09-20");
 });
+
+test("Codex on PR #34: a question is not an explanation; overlapping names are matched together", () => {
+  const at = (d: string) => `${d}T10:00:00.000Z`;
+  const memories: MemoryObject[] = [
+    mem("e1", "2026-09-01", "まさきさんとの関係について話した。", { personMentions: [mention("まさきさん", "まさきさんとの関係に未来はない", at("2026-09-01"))] }),
+    mem("e2", "2026-09-05", "まさきさんについて聞いた。", { personMentions: [mention("まさきさん", "まさきさんとの関係に未来がない理由は何だと思う？", at("2026-09-05"))] }),
+    mem("e3", "2026-09-09", "まさきさんとさきさんの話をした。", {
+      personMentions: [mention("まさきさん", "まさきさんとの関係に未来がない理由は、自分が既婚者だから。", at("2026-09-09")), mention("さきさん", "さきさんとも会った", at("2026-09-09"))],
+    }),
+  ];
+  const c = buildPersonContext(memories, "まさき").conclusions.find((x) => x.statement.memoryId === "e1");
+  assert.ok(c);
+  assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => r.memoryId), ["e3"]);
+});

@@ -81,11 +81,18 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
 
   // the user's own views, oldest first: only from records where Capture recorded this person (a keyword or a name in the text is not enough), and,
   // when the record also names other people, only the sentences that name this person (independent review)
+  // every other known name, one character too (妻 / 母), as the sheet does
+  const otherNameKeys = listSheetPersons(pool).map((p) => p.key).filter((k) => !sheet.keys.includes(k));
+  // the names in a text, this person's and the others' matched TOGETHER, the longest first (さき inside まさきさん is not さき: Codex on PR #34)
+  const namesIn = (text: string) => {
+    const found = personKeysInText(text, [...sheet.keys, ...otherNameKeys]);
+    return { mine: found.some((k) => sheet.keys.includes(k)), others: found.some((k) => !sheet.keys.includes(k)) };
+  };
   const recordOf = new Map(sheet.records.map((r) => [r.memoryId, r] as const));
   const byId = new Map(pool.map((m) => [m.id, m] as const));
   const eligible = (id: string, sentence: string) => {
     const r = recordOf.get(id);
-    return r?.match === "mention" && (r.otherPersons.length === 0 || personKeysInText(sentence, sheet.keys).length > 0);
+    return r?.match === "mention" && (r.otherPersons.length === 0 || namesIn(sentence).mine);
   };
   // the sheet shows the same words once (the earliest record, the others in alsoIn): take the earliest record that is eligible (Codex on PR #34)
   const own = sheet.views.flatMap((v) => {
@@ -103,13 +110,12 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   const topics = new Set(named.flatMap(topicsOf));
   const namedIds = new Set(named.map((m) => m.id));
   const personWords = [...new Set(own.flatMap((v) => contentWords(v.text.text, nameWords)))];
-  // every other known name, one character too (妻 / 母), as the sheet does
-  const otherNameKeys = listSheetPersons(pool).map((p) => p.key).filter((k) => !sheet.keys.includes(k));
   // a sentence of a record that also names other people counts for this person only when it names this person and no one else (Codex on PR #34)
   const aboutThisOne = (memoryId: string, sentence: string) => {
     const r = recordOf.get(memoryId);
-    if (!r || r.otherPersons.length === 0) return personKeysInText(sentence, otherNameKeys).length === 0 || personKeysInText(sentence, sheet.keys).length > 0;
-    return personKeysInText(sentence, sheet.keys).length > 0 && personKeysInText(sentence, otherNameKeys).length === 0;
+    const n = namesIn(sentence);
+    if (!r || r.otherPersons.length === 0) return !n.others || n.mine;
+    return n.mine && !n.others;
   };
   const candidates: PersonContext["candidates"] = [];
   const candidateSaidAt = new Map<string, string>();
@@ -118,7 +124,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
     const n = namesOf(m);
     if (n.mention.length + n.keyword.length > 0) continue; // a record that names someone is that someone's (or the user's confirmed alias)
     // a record whose words name another known person is not taken for this one
-    if (personKeysInText([m.summary ?? "", m.content ?? "", ...(m.evidenceQuotes ?? []), ...(m.topicEvents ?? []).map((e) => e.quote ?? "")].join(" "), otherNameKeys).length > 0) continue;
+    if (namesIn([m.summary ?? "", m.content ?? "", ...(m.evidenceQuotes ?? []), ...(m.topicEvents ?? []).map((e) => e.quote ?? "")].join(" ")).others) continue;
     const userSentences = (m.evidenceQuotes ?? []).flatMap(statementSentences).filter((s) => fits(s) && ["judgment", "thought"].includes(classifyStatement(s).role));
     if (userSentences.length === 0) continue;
     const signals: string[] = [];
@@ -156,7 +162,8 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
       ...(byId.get(r.memoryId)?.topicEvents ?? []).filter((e) => e.quote).map((e) => ({ text: e.quote, memoryId: r.memoryId, saidAt: e.statedAt || r.saidAt })),
     ])
     .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
-    .filter((t) => fits(t.text) && REASON_FORM.test(t.text) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
+    // a question or a request asks for a reason, it does not give one (Codex on PR #34)
+    .filter((t) => fits(t.text) && REASON_FORM.test(t.text) && !["question", "request"].includes(classifyStatement(t.text).role) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
     .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: contentWords(t.text, nameWords) }));
   const all: PersonContextConclusion[] = sources.map((x) => {
     if (x.role === "thought") return { statement: text(x.kind, x), role: "thought", reasons: isReason(x) ? [{ ...text(x.kind, x), when: "same" as const }] : [], aiReadings: [] };
