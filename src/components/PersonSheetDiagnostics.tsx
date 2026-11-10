@@ -160,7 +160,7 @@ export default function PersonSheetDiagnostics() {
             {sheet.overview.relation && (
               <div className="flex flex-col gap-1">
                 <p className="text-sm">関係（記憶を作ったAIの分類）：{sheet.overview.relation.label}</p>
-                {sheet.overview.relation.basis.map((b, i) => <Text key={i} t={b} />)}
+                {sheet.overview.relation.basis.map((b, i) => <Text key={i} t={b} note={`分類：${PERSON_RELATION_LABEL_JA[b.relation]}${b.correction ? "・訂正" : ""}`} />)}
               </div>
             )}
             {sheet.overview.coPersons.length > 0 && (
@@ -197,7 +197,13 @@ export default function PersonSheetDiagnostics() {
           <Section title="最後に確認できた記録" note="今の状態ではなく、最後に記録された内容とその日付。">
             {!sheet.last.said && <None />}
             {sheet.last.said && <div><p className="text-xs text-stone-500">最後に話した記録</p><Text t={sheet.last.said.summary} /></div>}
-            {sheet.last.status && <div><p className="text-xs text-stone-500">状態の言葉（「{sheet.last.status.status}」）がある最後の記録</p><Text t={sheet.last.status.summary} /></div>}
+            {sheet.last.status && (
+              <div>
+                <p className="text-xs text-stone-500">状態の言葉（「{sheet.last.status.status}」）がある最後の記録</p>
+                <Text t={sheet.last.status.summary} />
+                {(sheet.last.statusLater ?? []).map((l) => <p key={l.memoryId} className="text-xs text-rose-600 dark:text-rose-300">同じ話題の後の記録（この人の記録とは限らない）：{day(l.saidAt)} <Id id={l.memoryId} /> 「{l.status}」 {l.summary}</p>)}
+              </div>
+            )}
             {sheet.last.relation && <div><p className="text-xs text-stone-500">最後に述べた関係（{PERSON_RELATION_LABEL_JA[sheet.last.relation.relation]}）</p><Text t={sheet.last.relation} /></div>}
             {sheet.last.ownView && <div><p className="text-xs text-stone-500">本人の言葉での最後の考え</p><Text t={sheet.last.ownView.text} /></div>}
           </Section>

@@ -210,3 +210,16 @@ test("the person sheet is a debug view only: no chat, Retrieval or write path im
   const sheet = fs.readFileSync(path.join(src, "lib", "personSheet.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   assert.doesNotMatch(sheet, /fetch\(|indexedDB|localStorage|from ["'].*\/(db|vault|selectedAi|retrieval)["']/);
 });
+
+test("the same words are not shown twice; the relation category stays apart from the user's words; a later record of the same topic follows the last status", () => {
+  const sheet = buildPersonSheet(world(), "みなと");
+  const m3 = sheet.records.find((r) => r.memoryId === "m3")!;
+  assert.equal(m3.mentionQuotes.length, 1);
+  assert.equal(m3.evidence.length, 0, "the evidence quote equal to the mention quote is not repeated");
+  assert.equal(sheet.records.find((r) => r.memoryId === "m1")!.evidence.length, 1);
+  assert.equal(sheet.overview.relation!.basis[0].text, "会議室でみなとさんと進め方の話をした");
+  assert.equal(sheet.overview.relation!.basis[0].relation, "colleague");
+  assert.equal(sheet.last.status?.memoryId, "m4");
+  assert.deepEqual(sheet.last.statusLater?.map((l) => [l.memoryId, l.status]), [["m5", "中止"]]);
+  assert.match(renderPersonSheetText(sheet), /同じ話題の後の記録（この人の記録とは限らない）：2026-09-20 #m5 「中止」/);
+});

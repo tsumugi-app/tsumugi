@@ -176,7 +176,7 @@ export interface PersonSheet {
     firstSaidAt?: string;
     lastSaidAt?: string;
     /** PersonView of the mentions (relation as Capture classified it, or contested) */
-    relation?: { label: string; contested: boolean; basis: SheetText[] };
+    relation?: { label: string; contested: boolean; basis: (SheetText & { relation: PersonRelation; correction: boolean })[] };
     /** people who appear in the same records, with how many records */
     coPersons: { name: string; records: number }[];
   };
@@ -188,6 +188,8 @@ export interface PersonSheet {
     said?: SheetRecord;
     /** the last record with a status word in its summary */
     status?: SheetRecord;
+    /** later records of the same topic as `status` that carry a status word (they may be about the same plan; not merged) */
+    statusLater?: { memoryId: string; saidAt: string; status: TimelineStatus; summary: string }[];
     /** the last relation the user stated */
     relation?: SheetText & { relation: PersonRelation };
     /** the last view in the user's own words */
@@ -249,7 +251,8 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
       match,
       summary: { kind: "summary", text: m.summary ?? "", memoryId: m.id, saidAt: said.at },
       mentionQuotes: mine.filter((p) => p.quote).map((p) => ({ kind: "user" as const, text: p.quote, memoryId: m.id, saidAt: p.statedAt || said.at })),
-      evidence: (m.evidenceQuotes ?? []).filter((q) => typeof q === "string" && q.trim()).map((q) => ({
+      // the same words already shown as a mention quote are not repeated
+      evidence: (m.evidenceQuotes ?? []).filter((q) => typeof q === "string" && q.trim() && !mine.some((p) => (p.quote ?? "").trim() === q.trim())).map((q) => ({
         kind: "user" as const, text: q.trim(), memoryId: m.id, saidAt: said.at,
         aboutOther: !namesThis(q, key, otherKeys) && othersNamedIn(q, key, otherKeys).length > 0,
       })),
@@ -268,7 +271,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
 
   // relation: the PersonView of each grouping key of this person (Capture's classification, contested when the user's words disagree)
   const views = computePersonViews(about.map((x) => x.m)).filter((v) => personSheetKey(v.displayName) === key);
-  const relationBasis: SheetText[] = records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: `${rel.quote}（${PERSON_RELATION_LABEL_JA[rel.relation]}${rel.assertion === "correction" ? "・訂正" : ""}）`, memoryId: r.memoryId, saidAt: r.saidAt })));
+  const relationBasis = records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: r.saidAt, relation: rel.relation, correction: rel.assertion === "correction" })));
   const contested = views.some((v) => v.relationContested) || new Set(views.map((v) => v.relation).filter(Boolean)).size > 1;
   const current = views.map((v) => v.relation).find(Boolean);
   const relation = relationBasis.length > 0 || views.length > 0
@@ -301,7 +304,17 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
   const lastRelation = lastBy(records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: r.saidAt, relation: rel.relation }))), (x) => x.saidAt);
   const last = {
     ...(() => { const s = lastBy(records, (r) => r.saidAt); return s ? { said: s } : {}; })(),
-    ...(() => { const s = lastBy(nonRetro.filter((r) => r.status), (r) => r.saidAt); return s ? { status: s } : {}; })(),
+    ...(() => {
+      const s = lastBy(nonRetro.filter((r) => r.status), (r) => r.saidAt);
+      if (!s) return {};
+      const later = s.topicId
+        ? all.filter((m) => m.id !== s.memoryId && m.topicId === s.topicId && timeOf(saidAtOf(m).at) > timeOf(s.saidAt))
+          .map((m) => ({ memoryId: m.id, saidAt: saidAtOf(m).at, status: statusOf(m.summary ?? ""), summary: m.summary ?? "" }))
+          .filter((x): x is { memoryId: string; saidAt: string; status: TimelineStatus; summary: string } => x.status !== undefined)
+          .sort((a, b) => timeOf(a.saidAt) - timeOf(b.saidAt))
+        : [];
+      return { status: s, ...(later.length > 0 ? { statusLater: later } : {}) };
+    })(),
     ...(lastRelation ? { relation: lastRelation } : {}),
     ...(() => { const v = lastBy(viewsOut.filter((x) => x.text.kind === "user" && !x.aboutOther), (x) => x.text.saidAt); return v ? { ownView: v } : {}; })(),
   };
@@ -401,7 +414,7 @@ export function renderPersonSheetText(sheet: PersonSheet): string {
   out.push(`記録 ${sheet.overview.records}件（人物として記録 ${sheet.overview.mentionRecords}件・キーワードのみ ${sheet.overview.keywordOnlyRecords}件）${sheet.overview.firstSaidAt ? ` ${dayOf(sheet.overview.firstSaidAt)}〜${dayOf(sheet.overview.lastSaidAt)}` : ""}`);
   if (sheet.overview.relation) {
     out.push(`関係（Captureの分類）：${sheet.overview.relation.label}`);
-    for (const b of sheet.overview.relation.basis) out.push(`  ${t(b)}`);
+    for (const b of sheet.overview.relation.basis) out.push(`  ${t(b)}（分類：${PERSON_RELATION_LABEL_JA[b.relation]}${b.correction ? "・訂正" : ""}）`);
   }
   if (sheet.overview.coPersons.length > 0) out.push(`同じ記録に出てくる人：${sheet.overview.coPersons.map((p) => `${p.name}(${p.records})`).join("、")}`);
   out.push("", "■ 出来事（記録の時系列。話した日の順）");
@@ -418,6 +431,7 @@ export function renderPersonSheetText(sheet: PersonSheet): string {
   out.push("", "■ 最後に確認できた記録（今も同じとは限らない）");
   if (sheet.last.said) out.push(`- 最後に話した記録：${t(sheet.last.said.summary)}`);
   if (sheet.last.status) out.push(`- 状態の言葉がある最後の記録：「${sheet.last.status.status}」 ${t(sheet.last.status.summary)}`);
+  for (const l of sheet.last.statusLater ?? []) out.push(`  同じ話題の後の記録（この人の記録とは限らない）：${dayOf(l.saidAt)} ${id(l.memoryId)} 「${l.status}」 ${l.summary}`);
   if (sheet.last.relation) out.push(`- 最後に述べた関係：${PERSON_RELATION_LABEL_JA[sheet.last.relation.relation]} ${t(sheet.last.relation)}`);
   if (sheet.last.ownView) out.push(`- 本人の言葉での最後の考え：${t(sheet.last.ownView.text)}`);
   out.push("", "■ 予定とその後");
