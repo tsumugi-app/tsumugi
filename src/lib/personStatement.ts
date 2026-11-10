@@ -60,7 +60,6 @@ export function classifyStatement(sentence: string): StatementClass {
   const asked = QUESTION_MARK.test(noTrail);
   const core = noTrail.replace(QUESTION_MARK, "").replace(TRAIL, "");
   const body = core.replace(PARTICLES, "");
-  if (Array.from(body).length < MIN_PREDICATE_CHARS && !asked) return { role: "other", reason: "短すぎて文の形が分からない" };
   if (REQUEST.test(body)) return { role: "request", reason: "相手にしてほしいことを頼む形（〜して／お願い）" };
   if (asked) {
     if (SELF_WONDER.test(body)) return { role: "thought", reason: "自分に問う形（〜だろう？／〜のかな？）" };
@@ -73,6 +72,8 @@ export function classifyStatement(sentence: string): StatementClass {
   if (DECISION.test(body)) return { role: "judgment", reason: "決めたことを言う形（決めた／やめる／〜ことにした）" };
   if (WISH.test(body)) return { role: "thought", reason: "望みを言う形（〜たい／〜てほしい）" };
   if (OWN_VIEW.test(body) && !PAST.test(body)) return { role: "thought", reason: "気持ち・考えを表す言葉がある" };
+  // a short text with none of the forms above (はい / そう / みなと) says too little to be a view; a short 好き / 怖い / 決めた is kept above (Codex on PR #33)
+  if (Array.from(body).length < MIN_PREDICATE_CHARS) return { role: "other", reason: "短すぎて文の形が分からない" };
   if (PAST.test(body)) {
     if (PAST_EVALUATION.test(body)) return { role: "thought", reason: "過去の出来事への評価・感想（〜かった）" };
     if (OWN_VIEW.test(body)) return { role: "thought", reason: "過去形だが、気持ち・考えを表す言葉がある" };

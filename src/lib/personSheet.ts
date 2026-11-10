@@ -455,9 +455,12 @@ export function buildPersonSheet(memories: MemoryObject[], key: string, options:
 
   const lastBy = <T,>(items: T[], at: (x: T) => string) => items.reduce<T | undefined>((a, b) => (a === undefined || timeOf(at(b)) >= timeOf(at(a)) ? b : a), undefined);
   const later = (m: MemoryObject, after: string) => timeOf(saidAtOf(m).at) > timeOf(after);
+  // statusOf leaves out "<someone>の<thing>" as not the user's own; on this sheet, this person's thing (妻の引っ越し on 妻's sheet) is the one followed (Codex on PR #33)
+  const ownNames = [...new Set([...names, ...keys])].filter(Boolean).sort((a, b) => b.length - a.length);
+  const withoutOwnName = (summary: string) => ownNames.reduce((t, n) => t.split(`${n}の`).join(""), summary);
   const laterOf = (m: MemoryObject, terms: string[]): SheetLater => ({
     memoryId: m.id, saidAt: saidAtOf(m).at, summary: m.summary ?? "", sharedTerms: sharedTerms(terms, m),
-    ...(() => { const s = statusOf(m.summary ?? "", terms); return s ? { status: s } : {}; })(),
+    ...(() => { const s = statusOf(withoutOwnName(m.summary ?? ""), terms); return s ? { status: s } : {}; })(),
   });
   const nonRetro = records.filter((r) => !r.retrospective);
   const lastRelation = lastBy(records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: rel.statedAt, relation: rel.relation }))), (x) => x.saidAt);

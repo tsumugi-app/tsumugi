@@ -328,6 +328,11 @@ test("the kind of a statement comes from its form: a question or a request is no
     ["あの日は楽しかった", "thought"],
     ["みなとにDMするのは控えてる", "state"],
     ["みなとさん", "other"],
+    ["好き", "thought"],
+    ["怖い", "thought"],
+    ["決めた", "judgment"],
+    ["諦めた", "judgment"],
+    ["はい", "other"],
     ["みなとさんは友人だよ", "judgment"],
     ["みなとさんとはもう会わないかも", "thought"],
     ["みなとさんとはもう話さないと思う", "thought"],
@@ -429,4 +434,18 @@ test("Codex on PR #33: a question and a judgment that differ only by ？ and 。
   assert.equal(sheet.last.judgment?.text.memoryId, "d2");
   const hit = findInPersonSheet(w, sheet, "もう来ない").find((h) => h.memoryId === "d2")!;
   assert.match(hit.sentences[0].fateNote, /「過去の考え・結論」に出した/);
+});
+
+test("Codex on PR #33: on a person's sheet, the person's own thing is followed to its outcome", () => {
+  const w = [
+    ...world(),
+    mem("w1", "2026-09-01", "妻の引っ越しは来月の予定。", { keywords: ["妻", "引っ越し"], topicId: "topic-move", personMentions: [mention("妻", "妻の引っ越しは来月", "2026-09-01T10:00:00.000Z", "spouse")] }),
+    mem("w2", "2026-09-15", "妻の引っ越しは中止になった。", { keywords: ["引っ越し"], topicId: "topic-move" }),
+  ];
+  const plan = buildPersonSheet(w, "妻").plans.find((p) => p.record.memoryId === "w1")!;
+  assert.equal(plan.outcome?.memoryId, "w2");
+  assert.equal(plan.outcome?.status, "中止");
+  // on someone else's sheet the same words stay someone else's thing
+  const other = buildPersonSheet([...w, mem("w3", "2026-09-02", "みなとさんと引っ越しの予定を話した。", { keywords: ["みなとさん", "引っ越し"], topicId: "topic-move" })], "みなと").plans.find((p) => p.record.memoryId === "w3");
+  assert.equal(other?.outcome, undefined);
 });
