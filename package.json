@@ -16,6 +16,7 @@
     "test:memory-synthesis": "tsc -p tsconfig.memory-synthesis.json && node --test .test-out/lib/memorySynthesis.test.js .test-out/lib/memoryTimelineFlag.test.js",
     "test:synthesis-s1": "tsc -p tsconfig.synthesis-s1.json && node --test .test-out/lib/synthesisS1.test.js",
     "test:memory-context": "tsc -p tsconfig.memory-context.json && node --test .test-out/lib/memoryContext.test.js",
+    "test:person-sheet": "tsc -p tsconfig.person-sheet.json && node --test .test-out/lib/personSheet.test.js",
     "test:memory-search": "tsc -p tsconfig.memory-search.json && node --test .test-out/lib/memorySearch.test.js",
     "test:capture": "tsc -p tsconfig.test.json && node --test .test-out/lib/capture.regression.test.js",
     "test:recovery-diagnostic": "tsc -p tsconfig.recovery-diagnostic.json && node --test .test-out/lib/vaultRecovery.test.js",

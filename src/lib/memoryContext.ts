@@ -116,7 +116,7 @@ const OUTSIDE_STATE_MARKERS = ["最新", "ラインナップ", "販売中", "発
 /** words that only say "now" / "next": an outside fact or the user's own view of that day */
 const PRESENT_MARKERS = ["現在", "今の", "今は", "次は", "次回"];
 /** the user's own thought, feeling or judgment */
-const OWN_VIEW = /思う|思っ|思い|感じ|気持ち|気がする|考え|不安|迷っ|迷い|悩|諦め|あきらめ|後悔|納得|期待|望ん|願っ|信じ|好き|嫌い|怖い|寂し|さみし|つらい|辛い|嬉し|うれし|悲し|決め|決心|つもり|自信|絶望|希望/;
+export const OWN_VIEW = /思う|思っ|思い|感じ|気持ち|気がする|考え|不安|迷っ|迷い|悩|諦め|あきらめ|後悔|納得|期待|望ん|願っ|信じ|好き|嫌い|怖い|寂し|さみし|つらい|辛い|嬉し|うれし|悲し|決め|決心|つもり|自信|絶望|希望/;
 
 /**
  * a text says "now" only as the user's own view: every sentence with 現在 / 今の / 今は / 次は / 次回 also holds a thought, feeling or judgment word

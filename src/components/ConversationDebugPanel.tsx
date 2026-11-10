@@ -119,6 +119,10 @@ export default function ConversationDebugPanel() {
         <button onClick={() => setExpanded(false)} style={{ border: "1px solid #7dd3fc", padding: "2px 6px" }}>
           閉じる
         </button>
+        {/* Memory Graph P0（試作）：保存済みMemoryから人物シートを組み立てる、読み取り専用の別ページ */}
+        <a href="/diagnostics/person-sheet" target="_blank" rel="noopener" style={{ border: "1px solid #7dd3fc", padding: "2px 6px" }}>
+          人物シート（試作）
+        </a>
         <span>{entries.length}件</span>
         {feedback && <span>{feedback}</span>}
       </div>
