@@ -5,7 +5,7 @@
  * 各行に「本人の発言／AIの要約／Connectの推測」の区別と、根拠のMemory（末尾6桁のid）を出す。idを押すと、そのMemoryの保存内容を表示する。
  * 件数・文字数の上限は設けない（長い節は折りたたむ）。
  */
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { buildPersonSheet, listSheetPersons, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetText } from "@/lib/personSheet";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
 import type { MemoryObject } from "@/lib/types";
@@ -90,10 +90,14 @@ export default function PersonSheetDiagnostics() {
   }
 
   const openMemory = openMemoryId ? byId.get(openMemoryId) : undefined;
-  // the stored record opens above the sheet: bring it into view (an id may be pressed far down the page)
+  // the stored record opens above the sheet: bring it into view once it is rendered (an id may be pressed far down the page)
+  const [scrollRequest, setScrollRequest] = useState(0);
+  useEffect(() => {
+    if (scrollRequest > 0) document.getElementById("person-sheet-memory")?.scrollIntoView({ block: "start" });
+  }, [scrollRequest]);
   function showMemory(id: string) {
     setOpenMemoryId(id);
-    window.requestAnimationFrame(() => document.getElementById("person-sheet-memory")?.scrollIntoView({ block: "start" }));
+    setScrollRequest((n) => n + 1);
   }
 
   return (
