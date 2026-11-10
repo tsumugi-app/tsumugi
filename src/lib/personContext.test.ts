@@ -206,3 +206,34 @@ test("speed: 1,500 Memories, one turn, well under the time of a reply", () => {
   assert.ok(ms < 3000, `took ${ms} ms`);
   for (const c of contexts) assert.ok(c.candidates.length <= PERSON_CONTEXT_LIMITS.maxCandidates && c.conclusions.length <= PERSON_CONTEXT_LIMITS.maxConclusions);
 });
+
+test("independent review: から as 'from' is not a reason; a sentence of a record that only names the person in its text is not the person's own words", () => {
+  const memories = world();
+  memories.push(mem("r2", "2026-09-12", "はるかさんと会う頻度を減らすことにした。", {
+    keywords: ["はるかさん"], personMentions: [mention("はるかさん", "来週から、この関係は少し距離をおくことにした", "2026-09-12T10:00:00.000Z")],
+    evidenceQuotes: ["来週から、この関係は少し距離をおくことにした。"],
+  }));
+  // a record of みなとさん whose text names はるかさん in passing: its nameless sentences are not はるかさん's
+  memories.push(mem("x1", "2026-09-13", "みなとさんと話していて、はるかさんの名前も出た。", {
+    conversationId: "conv-X", personMentions: [mention("みなとさん", "みなとさんと話した", "2026-09-13T10:00:00.000Z")], evidenceQuotes: ["この関係はもう限界だ。"],
+  }));
+  const context = buildPersonContext(memories, "はるか", { aliases: ALIAS });
+  const n1 = context.conclusions.find((c) => c.statement.memoryId === "n1");
+  assert.ok(n1);
+  assert.deepEqual(n1.reasons.filter((r) => r.when === "later").map((r) => r.memoryId), ["r1"], "「来週から」 is not a reason");
+  assert.ok(context.conclusions.some((c) => c.statement.memoryId === "r2"), "the decision stays a conclusion of its own");
+  assert.ok(!context.memoryIds.includes("x1"));
+});
+
+test("independent review: a one-character known name (妻) keeps a nameless record out; days are in Japan time", () => {
+  const memories = world();
+  memories.push(mem("w1", "2026-08-01", "妻と買い物に行った。", { personMentions: [mention("妻", "妻と買い物に行った", "2026-08-01T10:00:00.000Z", "spouse")] }));
+  memories.push(mem("n5", "2026-09-07", "妻とのこの関係に未来はないと話した。", { conversationId: "conv-A", evidenceQuotes: ["妻とはこの関係に未来はない。"] }));
+  memories.push(mem("h6", "2026-09-20", "はるかさんと電話した。", {
+    statedAt: "2026-09-20T20:00:00.000Z", personMentions: [mention("はるかさん", "はるかさんと電話した", "2026-09-20T20:00:00.000Z")],
+  }));
+  const context = buildPersonContext(memories, "はるか");
+  assert.ok(!context.memoryIds.includes("n5"));
+  assert.equal(context.events.find((e) => e.memoryId === "h6")?.day, "2026-09-21");
+  assert.equal(context.lastDay, "2026-09-21");
+});

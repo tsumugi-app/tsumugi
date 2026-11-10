@@ -12,7 +12,7 @@ import { buildPersonSheet, findInPersonSheet, listSheetPersons, type PersonSheet
 import { STATEMENT_ROLE_LABEL } from "@/lib/personStatement";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
 import { buildPersonContext } from "@/lib/personContext";
-import { buildPersonContextSection } from "@/lib/personContextPrompt";
+import { buildPersonContextSection, sanitizePersonContext } from "@/lib/personContextPrompt";
 import type { MemoryObject } from "@/lib/types";
 
 const shortId = (id: string) => `#${id.slice(-6)}`;
@@ -100,7 +100,9 @@ export default function PersonSheetDiagnostics() {
     if (!memories || !selected) return null;
     try {
       const context = buildPersonContext(memories, selected, { aliases: withKeys.length > 0 ? [[selected, ...withKeys]] : [] });
-      return buildPersonContextSection([context]) || "（会話に渡す背景はありません）";
+      // as the chat sends it (an empty context is not sent) and as the route checks it again
+      const sent = context.memoryIds.length > 0 || context.relation ? sanitizePersonContext([context]) : [];
+      return buildPersonContextSection(sent) || "（会話に渡す背景はありません）";
     } catch (error) {
       return `作れませんでした：${String(error)}`;
     }

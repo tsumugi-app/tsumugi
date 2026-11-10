@@ -1,6 +1,7 @@
 /**
  * Memory Graph P0: the person sheet (a debug view, owner request 2026-11-10). It is DERIVED from the saved Memories every time it is opened.
- * Nothing is stored, no Memory is changed and no AI is called. The sheet is never sent to the chat; normal Retrieval does not read it.
+ * Nothing is stored, no Memory is changed and no AI is called. The sheet itself is never sent to the chat (the Memory Graph P1 trial builds its
+ * person context from it: personContext.ts); normal Retrieval does not read it.
  *
  * What the sheet gathers for one person, each line carrying its kind and the Memories it rests on:
  *   本人の発言  (user)    the user's own words, verbatim: personMentions.quote, evidenceQuotes, topicEvents.quote
