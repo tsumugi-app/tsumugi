@@ -16,7 +16,7 @@
  * a guess by the sheet or a pronoun alone never join two people.
  */
 import { buildPersonSheet, listSheetPersons, namesOf, personSheetKey, type PersonSheet } from "./personSheet";
-import { classifyStatement, statementSentences } from "./personStatement";
+import { classifyStatement, statementKey, statementSentences } from "./personStatement";
 import { personKeysInText } from "./retrieval";
 import { PERSON_CONTEXT_LIMITS, type PersonContext, type PersonContextConclusion, type PersonContextKind, type PersonContextText } from "./personContextPrompt";
 import { jstDateOf } from "./dateModel";
@@ -104,6 +104,12 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   const personWords = [...new Set(own.flatMap((v) => contentWords(v.text.text, nameWords)))];
   // every other known name, one character too (妻 / 母), as the sheet does
   const otherNameKeys = listSheetPersons(pool).map((p) => p.key).filter((k) => !sheet.keys.includes(k));
+  // a sentence of a record that also names other people counts for this person only when it names this person and no one else (Codex on PR #34)
+  const aboutThisOne = (memoryId: string, sentence: string) => {
+    const r = recordOf.get(memoryId);
+    if (!r || r.otherPersons.length === 0) return personKeysInText(sentence, otherNameKeys).length === 0 || personKeysInText(sentence, sheet.keys).length > 0;
+    return personKeysInText(sentence, sheet.keys).length > 0 && personKeysInText(sentence, otherNameKeys).length === 0;
+  };
   const candidates: PersonContext["candidates"] = [];
   const candidateSaidAt = new Map<string, string>();
   for (const m of pool) {
@@ -138,12 +144,21 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   const summaries = [
     ...sheet.records.filter((r) => r.match === "mention").map((r) => r.summary),
     ...pool.filter((m) => candidateIds.has(m.id)).map((m) => ({ text: m.summary ?? "", memoryId: m.id, saidAt: m.statedAt && Number.isFinite(Date.parse(m.statedAt)) ? m.statedAt : m.date })),
-  ].flatMap((r) => statementSentences(r.text).map((s) => ({ ...r, text: s }))).filter((s) => fits(s.text) && REASON_FORM.test(s.text))
+  ].flatMap((r) => statementSentences(r.text).map((s) => ({ ...r, text: s }))).filter((s) => fits(s.text) && REASON_FORM.test(s.text) && aboutThisOne(s.memoryId, s.text))
     .map((s) => ({ ...s, words: contentWords(s.text, nameWords) }));
+  // the user's later explanations: every sentence of the user's words in the person's records that gives a reason, whatever its form (an
+  // explanation like 「〜理由は、〜だから。」 is not a view of its own: Codex on PR #34); each sentence once
+  const seenExplanation = new Set<string>();
+  const explanations = sheet.records.filter((r) => r.match === "mention")
+    .flatMap((r) => [...r.mentionQuotes, ...r.evidence.filter((e) => !e.aboutOther)])
+    .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
+    .filter((t) => fits(t.text) && REASON_FORM.test(t.text) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
+    .filter((t) => { const k = statementKey(t.text); if (seenExplanation.has(k)) return false; seenExplanation.add(k); return true; })
+    .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: contentWords(t.text, nameWords) }));
   const all: PersonContextConclusion[] = sources.map((x) => {
     if (x.role === "thought") return { statement: text(x.kind, x), role: "thought", reasons: isReason(x) ? [{ ...text(x.kind, x), when: "same" as const }] : [], aiReadings: [] };
     // a later explanation is the user's own words only, said after the conclusion, giving a reason, and sharing a content word with it
-    const later = sources.filter((r) => r !== x && r.kind === "user" && isReason(r) && timeOf(r.saidAt) > timeOf(x.saidAt) && shares(r.words, x.words));
+    const later = explanations.filter((r) => statementKey(r.text) !== statementKey(x.text) && timeOf(r.saidAt) > timeOf(x.saidAt) && shares(r.words, x.words));
     const aiReadings = summaries.filter((s) => (!candidateIds.has(s.memoryId) || s.memoryId === x.memoryId) && shares(s.words, x.words));
     return {
       statement: text(x.kind, x),
@@ -156,7 +171,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
     };
   });
   // a statement shown as the later reason of a conclusion is not shown again on its own
-  const idOf = (t: PersonContextText) => `${t.memoryId}:${t.text}`;
+  const idOf = (t: PersonContextText) => `${t.memoryId}:${statementKey(t.text)}`;
   const hasLater = (c: PersonContextConclusion) => c.reasons.some((r) => r.when === "later");
   const shownAsLater = new Set(all.flatMap((c) => c.reasons.filter((r) => r.when === "later").map(idOf)));
   const rank = (c: PersonContextConclusion) => (hasLater(c) ? 0 : c.role === "judgment" ? 1 : 2);
@@ -180,7 +195,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
 
   const events = sheet.records.filter((r) => r.match === "mention" && !given.has(r.memoryId) && fits(r.summary.text)).slice(-L.maxEvents).map((r) => text("summary", r.summary));
 
-  const keptCandidates = candidates.filter((c) => !conclusionCandidateTexts.has(`${c.memoryId}:${c.text}`)).sort((a, b) => b.signals.length - a.signals.length || timeOf(b.day) - timeOf(a.day)).slice(0, L.maxCandidates);
+  const keptCandidates = candidates.filter((c) => !conclusionCandidateTexts.has(`${c.memoryId}:${statementKey(c.text)}`)).sort((a, b) => b.signals.length - a.signals.length || timeOf(b.day) - timeOf(a.day)).slice(0, L.maxCandidates);
 
   const relation = sheet.overview.relation;
   const basis = relation?.basis[relation.basis.length - 1];

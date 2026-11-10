@@ -265,3 +265,24 @@ test("Codex on PR #34: over the limit within one day, the latest conclusions are
   const kept = buildPersonContext(memories, "みなと").conclusions.map((c) => c.statement.memoryId);
   assert.deepEqual(kept, ["d2", "d3", "d4", "d5", "d6", "d7"]);
 });
+
+test("Codex on PR #34: a later explanation of any sentence form is attached; another person's sentence is not taken as the AI's reading", () => {
+  const at = (d: string) => `${d}T10:00:00.000Z`;
+  const memories: MemoryObject[] = [
+    mem("a1", "2026-09-01", "はるかさんとの関係について話した。", {
+      personMentions: [mention("はるかさん", "はるかさんとの関係に未来はない", at("2026-09-01"))], evidenceQuotes: ["はるかさんとの関係に未来はない。"],
+    }),
+    mem("a2", "2026-09-03", "はるかさんと話した。みなとさんとの関係は、仕事が忙しいので諦めることにした。", {
+      personMentions: [mention("はるかさん", "はるかさんと話した", at("2026-09-03")), mention("みなとさん", "みなとさんとは諦めた", at("2026-09-03"))],
+    }),
+    mem("a3", "2026-09-09", "はるかさんについて理由を話した。", {
+      personMentions: [mention("はるかさん", "はるかさんとの関係に未来がない理由は、自分が既婚者だから。", at("2026-09-09"))],
+      evidenceQuotes: ["はるかさんとの関係に未来がない理由は、自分が既婚者だから。"],
+    }),
+  ];
+  const context = buildPersonContext(memories, "はるか");
+  const c = context.conclusions.find((x) => x.statement.memoryId === "a1");
+  assert.ok(c);
+  assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => r.memoryId), ["a3"]);
+  assert.ok(!c.aiReadings.some((r) => r.memoryId === "a2"), "みなとさん's sentence is not a reading of はるかさん's conclusion");
+});
