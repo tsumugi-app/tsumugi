@@ -26,7 +26,7 @@ function mem(id: string, day: string, summary: string, extra: Partial<MemoryObje
   } as MemoryObject;
 }
 function link(id: string, sourceId: string, targetId: string, reason: string): Link {
-  return { id, sourceId, targetId, axis: "person", reason, contrast: false, strength: 0.8, createdBy: "ai-suggested", createdAt: "2026-08-01T00:00:00.000Z" } as Link;
+  return { id, sourceId, targetId, axis: "person", reason, contrast: false, strength: 0.8, createdBy: "ai-inference", createdAt: "2026-08-01T00:00:00.000Z" };
 }
 
 const T1 = "topic-meeting";
