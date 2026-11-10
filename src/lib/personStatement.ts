@@ -47,6 +47,7 @@ const HEDGE = /(と思う|と思った|と思ってる|と思っている|と思
 // plain and polite endings alike (ことにしました / 決めました: Codex on PR #33)
 const DECISION = /(決めた|決めました|決めている|決めてる|決めています|決心した|決心しました|諦めた|諦めました|あきらめた|あきらめました|やめた|やめました|やめる|やめよう|やめます|やめましょう|ことにした|ことにしました|ことにする|ことにしよう|ことにします|ことにしましょう|もう(?:会わな|連絡しな|関わらな|話さな)い|もう(?:会いませ|連絡しませ|関わりませ|話しませ)ん)$/;
 const WISH = /(たい|たくない|たかった|てほしい|て欲しい|てほしかった)$/;
+const POLITE_END = /(なんです|なのです|んです|のです|です|なんだ|なのだ|んだ|のだ)$/;
 const PAST = /(た|だった|でした|ました|ませんでした|なかった)$/;
 const PAST_EVALUATION = /[^な]かった$|よかった$/;
 const STATE = /(ている|ていない|てる|てない|ています|ていません|いる|いない|ある|あります|います|いません)$/;
@@ -61,6 +62,8 @@ export function classifyStatement(sentence: string): StatementClass {
   const asked = QUESTION_MARK.test(noTrail);
   const core = noTrail.replace(QUESTION_MARK, "").replace(TRAIL, "");
   const body = core.replace(PARTICLES, "");
+  // a polite or explanatory ending (〜です / 〜んです / 〜んだ) does not change a wish or a hedge into a judgment (会いたいです: Codex on PR #33)
+  const plain = body.replace(POLITE_END, "");
   if (REQUEST.test(body)) return { role: "request", reason: "相手にしてほしいことを頼む形（〜して／お願い）" };
   if (asked) {
     if (SELF_WONDER.test(body)) return { role: "thought", reason: "自分に問う形（〜だろう？／〜のかな？）" };
@@ -69,9 +72,9 @@ export function classifyStatement(sentence: string): StatementClass {
   if (ASK_FORM.test(body)) return { role: "question", reason: "相手に尋ねる形（〜ですか／〜ますか）" };
   if (ASK_LISTENER.test(body)) return { role: "question", reason: "相手の意見や記憶を尋ねる形（どう思う／覚えてる）" };
   // a hedge at the end wins over a decision inside (もう会わないかも / やめようと思う are not decided yet: Codex on PR #33)
-  if (HEDGE.test(body)) return { role: "thought", reason: "推量・思いの形（〜と思う／〜かも／〜気がする）" };
+  if (HEDGE.test(body) || HEDGE.test(plain)) return { role: "thought", reason: "推量・思いの形（〜と思う／〜かも／〜気がする）" };
   if (DECISION.test(body)) return { role: "judgment", reason: "決めたことを言う形（決めた／やめる／〜ことにした）" };
-  if (WISH.test(body)) return { role: "thought", reason: "望みを言う形（〜たい／〜てほしい）" };
+  if (WISH.test(body) || WISH.test(plain)) return { role: "thought", reason: "望みを言う形（〜たい／〜てほしい）" };
   if (OWN_VIEW.test(body) && !PAST.test(body)) return { role: "thought", reason: "気持ち・考えを表す言葉がある" };
   // a short text with none of the forms above (はい / そう / みなと) says too little to be a view; a short 好き / 怖い / 決めた is kept above (Codex on PR #33)
   if (Array.from(body).length < MIN_PREDICATE_CHARS) return { role: "other", reason: "短すぎて文の形が分からない" };
