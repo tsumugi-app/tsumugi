@@ -35,7 +35,8 @@ export interface StatementClass {
 
 /** closing marks and sentence-final particles that do not change what the sentence does */
 const TRAIL = /[。．.!！…〜~ー\s」』）)♪w笑]+$/;
-const PARTICLES = /(よね|よな|けどね|けど|けれど|のに|だよ|だね|よ|ね|ぞ|ぜ|わ|さ)$/;
+// only the particle goes: the copula stays (友人だよ → 友人だ, a judgment; Codex on PR #33)
+const PARTICLES = /(よね|よな|けどね|けど|けれど|のに|よ|ね|ぞ|ぜ|わ|さ)$/;
 const QUESTION_MARK = /[?？]+$/;
 /** a question the user asks themself: 〜だろう？ / 〜のかな？ (a view, not a question to the listener) */
 const SELF_WONDER = /(だろう|だろうか|んだろう|のだろう|のかな|かな|かなあ|かなぁ)$/;

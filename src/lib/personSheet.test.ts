@@ -328,6 +328,8 @@ test("the kind of a statement comes from its form: a question or a request is no
     ["あの日は楽しかった", "thought"],
     ["みなとにDMするのは控えてる", "state"],
     ["みなとさん", "other"],
+    ["みなとさんは友人だよ", "judgment"],
+    ["みなとさんは友人だね。", "judgment"],
   ];
   for (const [sentence, role] of cases) assert.equal(classifyStatement(sentence).role, role, sentence);
 });
@@ -409,4 +411,18 @@ test("another name of the same person: listed as a candidate with what points to
   assert.match(renderPersonSheetText(together), /この画面だけ一緒に表示している名前（同じ人とは確定していない）：さき、咲さん/);
   // nothing is changed in the Memories
   assert.equal(w.find((m) => m.id === "s2")!.personMentions![0].displayName, "咲さん");
+});
+
+test("Codex on PR #33: a question and a judgment that differ only by ？ and 。 are two statements", () => {
+  const w = [
+    ...world(),
+    mem("d1", "2026-10-20", "みなとさんについて尋ねた。", { keywords: ["みなとさん"], evidenceQuotes: ["みなとさんはもう来ない？"] }),
+    mem("d2", "2026-10-21", "みなとさんについて話した。", { keywords: ["みなとさん"], evidenceQuotes: ["みなとさんはもう来ない。"] }),
+  ];
+  const sheet = buildPersonSheet(w, "みなと");
+  assert.ok(sheet.asked.some((a) => a.text.memoryId === "d1"));
+  assert.ok(sheet.views.some((v) => v.text.memoryId === "d2" && v.role === "judgment"));
+  assert.equal(sheet.last.judgment?.text.memoryId, "d2");
+  const hit = findInPersonSheet(w, sheet, "もう来ない").find((h) => h.memoryId === "d2")!;
+  assert.match(hit.sentences[0].fateNote, /「過去の考え・結論」に出した/);
 });

@@ -408,7 +408,8 @@ export function buildPersonSheet(memories: MemoryObject[], key: string, options:
         const text = { ...t, text: sentence };
         const other = aboutOther(sentence);
         if (cls.role === "judgment" || cls.role === "thought") userView = true;
-        const k = statementKey(sentence);
+        // the same words with the same kind are one statement; a question and a judgment that differ only by ？/。 stay apart (Codex on PR #33)
+        const k = `${cls.role}:${statementKey(sentence)}`;
         const seen = firstSeen.get(k);
         if (seen) {
           if (seen.memoryId !== m.id) {
@@ -636,14 +637,16 @@ export function findInPersonSheet(memories: MemoryObject[], sheet: PersonSheet, 
     const { mention, keyword } = namesOf(m);
     const persons = [...new Set([...mention, ...keyword])];
     const where = [...new Set([...quotes.map((x) => x.source), ...(inSummary ? ["AIの要約"] : []), ...(inContent ? ["AIの本文"] : []), ...(inKeywords ? ["キーワード"] : [])])];
-    const fateOf = (sentence: string, sources: SheetStatement["source"][]) =>
-      sheet.statements.find((s) => s.text.memoryId === m.id && sources.includes(s.source) && statementKey(s.text.text) === statementKey(sentence));
+    const fateOf = (sentence: string, sources: SheetStatement["source"][]) => {
+      const role = sources.includes("summary") ? undefined : classifyStatement(sentence).role;
+      return sheet.statements.find((s) => s.text.memoryId === m.id && sources.includes(s.source) && (role === undefined || s.role === role) && statementKey(s.text.text) === statementKey(sentence));
+    };
     const sentences: SheetFindHit["sentences"] = [];
     const seen = new Set<string>();
     for (const { t, source } of quotes) {
       for (const sentence of statementSentences(t).filter(has)) {
-        if (seen.has(statementKey(sentence))) continue;
-        seen.add(statementKey(sentence));
+        if (seen.has(sentence)) continue;
+        seen.add(sentence);
         const st = fateOf(sentence, ["mention", "evidence", "topic"]);
         const cls = st ? { role: st.role, reason: st.reason } : classifyStatement(sentence);
         sentences.push({
