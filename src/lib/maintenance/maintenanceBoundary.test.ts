@@ -217,7 +217,8 @@ test("Memory write surface: only the reviewed production files write Memory reco
     "lib/vaultConflictResolution.ts": ["adoptVaultVersionWithOutbox"],
     "lib/vaultProductionMigration.ts": ["putMemoryObjectWithOutbox"],
   }, "a Memory write path was added or changed: review it (see the comment above this test) and update the list");
-  assert.deepEqual(storeUsers.sort(), ["components/ChatScreen.tsx", "lib/androidDiagnostics.ts", "lib/vaultRecovery.ts"],
+  // Reviewed (Memory Graph P0, owner request 2026-11-10): lib/personSheetRead.ts reads the store READ ONLY for the person sheet debug page (no version, readonly, getAll)
+  assert.deepEqual(storeUsers.sort(), ["components/ChatScreen.tsx", "lib/androidDiagnostics.ts", "lib/personSheetRead.ts", "lib/vaultRecovery.ts"],
     "a new file names the raw memoryObjects store: review it and update the list");
 });
 
