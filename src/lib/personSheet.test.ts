@@ -231,7 +231,7 @@ test("the person sheet is a debug view only: no chat, Retrieval or write path im
     }
   };
   walk2(src);
-  assert.deepEqual(statementImporters.sort(), ["lib/personSheet.ts"]);
+  assert.deepEqual(statementImporters.sort(), ["components/PersonSheetDiagnostics.tsx", "lib/personSheet.ts"]);
   const reader = fs.readFileSync(path.join(src, "lib", "personSheetRead.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   assert.doesNotMatch(reader, /readwrite|\.put\(|\.add\(|\.delete\(|\.clear\(|deleteDatabase|fetch\(|localStorage|from ["'].*\/(db|vault)["']/);
   const sheet = fs.readFileSync(path.join(src, "lib", "personSheet.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
