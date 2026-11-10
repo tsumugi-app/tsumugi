@@ -212,8 +212,9 @@ function isAboutKey(m: MemoryObject, key: string): "mention" | "keyword" | null 
 function othersNamedIn(text: string, key: string, otherKeys: string[]): string[] {
   const t = text.normalize("NFKC").replace(/\s+/g, "");
   const masked = t.split(key).join("■");
-  // a longer name that holds this one (さきこ for さき) is looked for in the text as it is; any other name with this person's name masked out
-  return otherKeys.filter((k) => k !== key && !key.includes(k) && (k.includes(key) ? t.includes(k) : masked.includes(k)));
+  // a longer name that holds this one (さきこ for さき) is looked for in the text as it is; any other name, including a shorter one inside this
+  // person's name (さき for さきこ), with this person's name masked out, and outside any longer known name that holds it (Codex on PR #32)
+  return otherKeys.filter((k) => k !== key && (k.includes(key) ? t.includes(k) : namesThis(masked, k, otherKeys)));
 }
 
 /** the text names this person: the name occurs outside any longer known name that holds it (さき inside さきこ is not さき) */

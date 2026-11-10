@@ -272,3 +272,16 @@ test("Codex on PR #32: a malformed person mention, quote, link or topic quote is
   assert.ok(sheet.records.some((r) => r.memoryId === "b1"));
   assert.doesNotThrow(() => renderPersonSheetText(sheet));
 });
+
+test("Codex on PR #32: a shorter person's name inside the selected name is still another person when it stands alone", () => {
+  const w = [...world(), mem("o5", "2026-09-06", "みなとこさんとみなとさんの話。", {
+    keywords: ["みなとこさん", "みなとさん"],
+    personMentions: [mention("みなとこさん", "みなとこさんと話した", "2026-09-06T10:00:00.000Z"), mention("みなとさん", "みなとさんとも話した", "2026-09-06T10:00:00.000Z")],
+    evidenceQuotes: ["みなとさんとは未来がないと思う", "みなとこさんとはまた会いたいと思う"],
+  })];
+  const s = buildPersonSheet(w, "みなとこ");
+  const o5 = s.records.find((r) => r.memoryId === "o5")!;
+  assert.equal(o5.evidence.find((q) => q.text.startsWith("みなとさんとは"))!.aboutOther, true);
+  assert.equal(o5.evidence.find((q) => q.text.startsWith("みなとこさんとは"))!.aboutOther, false);
+  assert.ok(!s.last.ownView || !s.last.ownView.text.text.startsWith("みなとさんとは"));
+});
