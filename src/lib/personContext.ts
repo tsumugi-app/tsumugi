@@ -82,11 +82,18 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   // the user's own views, oldest first: only from records where Capture recorded this person (a keyword or a name in the text is not enough), and,
   // when the record also names other people, only the sentences that name this person (independent review)
   const recordOf = new Map(sheet.records.map((r) => [r.memoryId, r] as const));
-  const own = sheet.views.filter((v) => {
-    const r = recordOf.get(v.text.memoryId);
-    return v.text.kind === "user" && !v.aboutOther && fits(v.text.text) && r?.match === "mention"
-      && (r.otherPersons.length === 0 || personKeysInText(v.text.text, sheet.keys).length > 0);
-  });
+  const eligible = (id: string, sentence: string) => {
+    const r = recordOf.get(id);
+    return r?.match === "mention" && (r.otherPersons.length === 0 || personKeysInText(sentence, sheet.keys).length > 0);
+  };
+  // the sheet shows the same words once (the earliest record, the others in alsoIn): take the earliest record that is eligible (Codex on PR #34)
+  const own = sheet.views.flatMap((v) => {
+    if (v.text.kind !== "user" || v.aboutOther || !fits(v.text.text)) return [];
+    if (eligible(v.text.memoryId, v.text.text)) return [v];
+    const alt = v.alsoIn.map((id) => recordOf.get(id)).filter((r) => r !== undefined && eligible(r.memoryId, v.text.text))
+      .sort((x, y) => timeOf(x!.saidAt) - timeOf(y!.saidAt))[0];
+    return alt ? [{ ...v, text: { ...v.text, memoryId: alt.memoryId, saidAt: alt.saidAt } }] : [];
+  }).sort((a, b) => timeOf(a.text.saidAt) - timeOf(b.text.saidAt));
   // records without any name that may be about this person: two kinds of evidence must meet
   const onSheet = new Set(sheet.records.filter((r) => r.match === "mention").map((r) => r.memoryId));
   const named = sheet.records.filter((r) => r.match === "mention").map((r) => pool.find((m) => m.id === r.memoryId)!).filter(Boolean);
@@ -164,7 +171,8 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
 
   const given = new Set(options.alreadyGivenIds ?? []);
   // a plan whose record Retrieval already gives this turn is not repeated
-  const plans = sheet.plans.filter((p) => !given.has(p.record.memoryId) && fits(p.record.summary.text)).slice(-L.maxPlans).map((p) => ({
+  // only plans of records where Capture recorded this person (a passing mention in the text is someone else's plan: Codex on PR #34)
+  const plans = sheet.plans.filter((p) => p.record.match === "mention" && !given.has(p.record.memoryId) && fits(p.record.summary.text)).slice(-L.maxPlans).map((p) => ({
     plan: text("summary", p.record.summary),
     ...(p.outcome && fits(p.outcome.summary) ? { outcome: { kind: "summary" as const, text: p.outcome.summary, day: dayOf(p.outcome.saidAt), memoryId: p.outcome.memoryId, status: p.outcome.status } } : {}),
   }));

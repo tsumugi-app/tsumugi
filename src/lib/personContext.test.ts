@@ -237,3 +237,19 @@ test("independent review: a one-character known name (妻) keeps a nameless reco
   assert.equal(context.events.find((e) => e.memoryId === "h6")?.day, "2026-09-21");
   assert.equal(context.lastDay, "2026-09-21");
 });
+
+test("Codex on PR #34: the same words in an earlier text-only record do not hide the person's own conclusion; another person's plan is not hers", () => {
+  const memories = world();
+  memories.push(mem("t1", "2026-09-02", "はるかさんの話も少し出た。", { conversationId: "conv-T", evidenceQuotes: ["もう諦めることにした。"] }));
+  memories.push(mem("h7", "2026-09-15", "はるかさんとのことを話した。", {
+    personMentions: [mention("はるかさん", "はるかさんのことは、もう諦めることにした", "2026-09-15T10:00:00.000Z")], evidenceQuotes: ["もう諦めることにした。"],
+  }));
+  memories.push(mem("p1", "2026-09-16", "みなとさんは来月引っ越す予定。", {
+    eventTime: "2026-10", content: "みなとさんは来月引っ越す予定。はるかさんにも伝えた。", personMentions: [mention("みなとさん", "みなとさんは来月引っ越す予定", "2026-09-16T10:00:00.000Z")],
+  }));
+  const context = buildPersonContext(memories, "はるか");
+  const decided = context.conclusions.find((c) => c.statement.text === "もう諦めることにした。");
+  assert.ok(decided, "kept from the record where Capture recorded はるかさん");
+  assert.equal(decided.statement.memoryId, "h7");
+  assert.ok(!context.plans.some((p) => p.plan.memoryId === "p1"));
+});
