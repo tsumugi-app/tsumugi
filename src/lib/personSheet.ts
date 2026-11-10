@@ -106,7 +106,7 @@ export interface SheetRecord {
   /** the user's words the record rests on (evidenceQuotes). `aboutOther`: names someone else and not this person */
   evidence: (SheetText & { aboutOther: boolean })[];
   /** the relation category Capture recorded with the mention (AI's classification of the user's words) */
-  relations: { relation: PersonRelation; assertion: "mention" | "correction"; quote: string }[];
+  relations: { relation: PersonRelation; assertion: "mention" | "correction"; quote: string; /** when the user stated it (a mention added later by a Capture UPDATE keeps its own date) */ statedAt: string }[];
   /** other people named in the same record */
   otherPersons: string[];
   topicId?: string;
@@ -226,9 +226,10 @@ function namesThis(text: string, key: string, otherKeys: string[] = []): boolean
 export function buildPersonSheet(memories: MemoryObject[], key: string): PersonSheet {
   const all = memories.filter((m) => m && typeof m.id === "string");
   const persons = listSheetPersons(all);
-  const otherKeys = persons.map((p) => p.key).filter((k) => k !== key && Array.from(k).length >= 2);
+  // every other known person, one-character names (妻, 母) included: a statement about them must not be attributed to this person (Codex on PR #32)
+  const otherKeys = persons.map((p) => p.key).filter((k) => k !== key && k.length > 0);
   const names = persons.find((p) => p.key === key)?.names ?? [];
-  const similarNames = otherKeys.filter((k) => k.includes(key) || key.includes(k));
+  const similarNames = otherKeys.filter((k) => Array.from(k).length >= 2 && (k.includes(key) || key.includes(k)));
   const byId = new Map(all.map((m) => [m.id, m] as const));
 
   const about = all
@@ -256,7 +257,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
         kind: "user" as const, text: q.trim(), memoryId: m.id, saidAt: said.at,
         aboutOther: !namesThis(q, key, otherKeys) && othersNamedIn(q, key, otherKeys).length > 0,
       })),
-      relations: mine.filter((p) => p.relation).map((p) => ({ relation: p.relation as PersonRelation, assertion: p.assertion, quote: p.quote })),
+      relations: mine.filter((p) => p.relation).map((p) => ({ relation: p.relation as PersonRelation, assertion: p.assertion, quote: p.quote, statedAt: p.statedAt && Number.isFinite(Date.parse(p.statedAt)) ? p.statedAt : said.at })),
       otherPersons: others,
       ...(m.topicId ? { topicId: m.topicId } : {}),
       ...(() => { const s = statusOf(m.summary ?? ""); return s ? { status: s } : {}; })(),
@@ -271,7 +272,8 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
 
   // relation: the PersonView of each grouping key of this person (Capture's classification, contested when the user's words disagree)
   const views = computePersonViews(about.map((x) => x.m)).filter((v) => personSheetKey(v.displayName) === key);
-  const relationBasis = records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: r.saidAt, relation: rel.relation, correction: rel.assertion === "correction" })));
+  const relationBasis = records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: rel.statedAt, relation: rel.relation, correction: rel.assertion === "correction" })))
+    .sort((a, b) => timeOf(a.saidAt) - timeOf(b.saidAt));
   const contested = views.some((v) => v.relationContested) || new Set(views.map((v) => v.relation).filter(Boolean)).size > 1;
   const current = views.map((v) => v.relation).find(Boolean);
   const relation = relationBasis.length > 0 || views.length > 0
@@ -301,7 +303,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
 
   const lastBy = <T,>(items: T[], at: (x: T) => string) => items.reduce<T | undefined>((a, b) => (a === undefined || timeOf(at(b)) >= timeOf(at(a)) ? b : a), undefined);
   const nonRetro = records.filter((r) => !r.retrospective);
-  const lastRelation = lastBy(records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: r.saidAt, relation: rel.relation }))), (x) => x.saidAt);
+  const lastRelation = lastBy(records.flatMap((r) => r.relations.map((rel) => ({ kind: "user" as const, text: rel.quote, memoryId: r.memoryId, saidAt: rel.statedAt, relation: rel.relation }))), (x) => x.saidAt);
   const last = {
     ...(() => { const s = lastBy(records, (r) => r.saidAt); return s ? { said: s } : {}; })(),
     ...(() => {
@@ -341,7 +343,11 @@ export function buildPersonSheet(memories: MemoryObject[], key: string): PersonS
   }
 
   // topics of the person's records: the user's words of the whole topic, and the records of the topic about someone else
-  const topicIds = [...new Set(records.map((r) => r.topicId).filter((x): x is string => Boolean(x)))];
+  // the record's topic and every topic its kept quotes belong to (a Capture UPDATE may change topicId and keep the earlier topic's quotes: Codex on PR #32)
+  const topicIds = [...new Set([
+    ...records.map((r) => r.topicId),
+    ...about.flatMap((x) => (x.m.topicEvents ?? []).map((e) => e.topicId)),
+  ].filter((x): x is string => Boolean(x)))];
   const topics: SheetTopic[] = topicIds.map((topicId) => {
     const inTopic = all.filter((m) => m.topicId === topicId || (m.topicEvents ?? []).some((e) => e.topicId === topicId));
     const events = inTopic.flatMap((m) => (m.topicEvents ?? []).filter((e) => e.topicId === topicId && e.quote).map((e) => ({

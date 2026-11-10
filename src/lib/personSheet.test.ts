@@ -223,3 +223,32 @@ test("the same words are not shown twice; the relation category stays apart from
   assert.deepEqual(sheet.last.statusLater?.map((l) => [l.memoryId, l.status]), [["m5", "中止"]]);
   assert.match(renderPersonSheetText(sheet), /同じ話題の後の記録（この人の記録とは限らない）：2026-09-20 #m5 「中止」/);
 });
+
+test("Codex on PR #32: a one-character person is someone else; a relation added later counts at its own date; a kept topic quote keeps its topic", () => {
+  const w = [
+    ...world(),
+    mem("m8", "2026-10-10", "みなとさんと妻の話をした。", {
+      keywords: ["みなとさん", "妻"],
+      personMentions: [mention("みなとさん", "みなとさんにも話した", "2026-10-10T10:00:00.000Z"), mention("妻", "妻のことが心配で不安に思う", "2026-10-10T10:00:00.000Z", "spouse")],
+      evidenceQuotes: ["妻のことが心配で不安に思う"],
+    }),
+  ];
+  const sheet = buildPersonSheet(w, "みなと");
+  const m8 = sheet.records.find((r) => r.memoryId === "m8")!;
+  assert.equal(m8.evidence[0].aboutOther, true, "a statement about 妻 is not this person's");
+  assert.notEqual(sheet.last.ownView?.text.memoryId, "m8");
+  assert.ok(!sheet.similarNames.includes("妻"));
+
+  // an older Memory that gained a relation mention later (Capture UPDATE keeps the Memory's statedAt)
+  const w2 = world().map((m) => m.id === "m1"
+    ? { ...m, personMentions: [...(m.personMentions ?? []), mention("みなとさん", "みなとさんは今は友達", "2026-10-20T10:00:00.000Z", "friend")] }
+    : m);
+  const s2 = buildPersonSheet(w2, "みなと");
+  assert.equal(s2.last.relation?.relation, "friend");
+  assert.equal(s2.last.relation?.saidAt.slice(0, 10), "2026-10-20");
+
+  // a Memory whose topicId changed but kept quotes of its earlier topic
+  const w3 = world().map((m) => m.id === "m2" ? { ...m, topicId: "topic-new", topicEvents: [...(m.topicEvents ?? []), topicEvent("topic-old", "前の話題でのみなとの話", "2026-07-01T10:00:00.000Z")] } : m);
+  const s3 = buildPersonSheet(w3, "みなと");
+  assert.ok(s3.topics.some((t) => t.topicId === "topic-old" && t.events.some((e) => e.quote === "前の話題でのみなとの話")));
+});
