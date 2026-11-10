@@ -253,3 +253,15 @@ test("Codex on PR #34: the same words in an earlier text-only record do not hide
   assert.equal(decided.statement.memoryId, "h7");
   assert.ok(!context.plans.some((p) => p.plan.memoryId === "p1"));
 });
+
+test("Codex on PR #34: over the limit within one day, the latest conclusions are kept", () => {
+  const memories: MemoryObject[] = [];
+  for (let i = 0; i < 8; i++) {
+    const at = `2026-09-01T0${i}:30:00.000Z`;
+    memories.push(mem(`d${i}`, "2026-09-01", `みなとさんの件${i}。`, {
+      statedAt: at, personMentions: [mention("みなとさん", `みなとさんの件${i}`, at)], evidenceQuotes: [`第${i}案はやめることにした。`],
+    }));
+  }
+  const kept = buildPersonContext(memories, "みなと").conclusions.map((c) => c.statement.memoryId);
+  assert.deepEqual(kept, ["d2", "d3", "d4", "d5", "d6", "d7"]);
+});

@@ -164,7 +164,8 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   // under it), then the other conclusions, then thoughts, the latest first; then back to the order they were said
   const keptConclusions = all
     .filter((c) => !shownAsLater.has(idOf(c.statement)) || hasLater(c))
-    .sort((a, b) => rank(a) - rank(b) || timeOf(b.statement.day) - timeOf(a.statement.day))
+    // `all` is oldest first by the full time said: the later index is the later statement, also within one day (Codex on PR #34)
+    .sort((a, b) => rank(a) - rank(b) || all.indexOf(b) - all.indexOf(a))
     .slice(0, L.maxConclusions)
     .sort((a, b) => all.indexOf(a) - all.indexOf(b));
   const conclusionCandidateTexts = new Set(keptConclusions.filter((c) => c.statement.kind === "candidate").map((c) => idOf(c.statement)));
