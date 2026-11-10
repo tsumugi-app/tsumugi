@@ -90,9 +90,14 @@ export default function PersonSheetDiagnostics() {
   }
 
   const openMemory = openMemoryId ? byId.get(openMemoryId) : undefined;
+  // the stored record opens above the sheet: bring it into view (an id may be pressed far down the page)
+  function showMemory(id: string) {
+    setOpenMemoryId(id);
+    window.requestAnimationFrame(() => document.getElementById("person-sheet-memory")?.scrollIntoView({ block: "start" }));
+  }
 
   return (
-    <OpenMemoryContext.Provider value={setOpenMemoryId}>
+    <OpenMemoryContext.Provider value={showMemory}>
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 bg-stone-50 px-4 py-6 text-stone-800 dark:bg-stone-950 dark:text-stone-100">
       <h1 className="text-lg">人物シート（試作）</h1>
       <p className="text-xs leading-relaxed text-stone-500 dark:text-stone-400">
@@ -126,7 +131,7 @@ export default function PersonSheetDiagnostics() {
       )}
 
       {openMemory && (
-        <div className="rounded-2xl border border-sky-500/50 p-3 text-sm">
+        <div id="person-sheet-memory" className="rounded-2xl border border-sky-500/50 p-3 text-sm">
           <div className="flex items-center justify-between">
             <span className="font-mono text-xs">根拠のMemory {shortId(openMemory.id)}（{day(openMemory.statedAt ?? openMemory.date)}）</span>
             <button type="button" onClick={() => setOpenMemoryId(null)} className="text-xs underline">閉じる</button>
