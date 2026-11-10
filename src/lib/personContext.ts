@@ -148,8 +148,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   ].flatMap((r) => statementSentences(r.text).map((s) => ({ ...r, text: s }))).filter((s) => fits(s.text) && REASON_FORM.test(s.text) && aboutThisOne(s.memoryId, s.text))
     .map((s) => ({ ...s, words: contentWords(s.text, nameWords) }));
   // the user's later explanations: every sentence of the user's words in the person's records that gives a reason, whatever its form (an
-  // explanation like 「〜理由は、〜だから。」 is not a view of its own: Codex on PR #34); each sentence once
-  const seenExplanation = new Set<string>();
+  // explanation like 「〜理由は、〜だから。」 is not a view of its own: Codex on PR #34). Repeated words are made one per conclusion, after the time check
   const explanations = sheet.records.filter((r) => r.match === "mention")
     .flatMap((r) => [
       ...r.mentionQuotes, ...r.evidence.filter((e) => !e.aboutOther),
@@ -158,12 +157,14 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
     ])
     .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
     .filter((t) => fits(t.text) && REASON_FORM.test(t.text) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
-    .filter((t) => { const k = statementKey(t.text); if (seenExplanation.has(k)) return false; seenExplanation.add(k); return true; })
     .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: contentWords(t.text, nameWords) }));
   const all: PersonContextConclusion[] = sources.map((x) => {
     if (x.role === "thought") return { statement: text(x.kind, x), role: "thought", reasons: isReason(x) ? [{ ...text(x.kind, x), when: "same" as const }] : [], aiReadings: [] };
     // a later explanation is the user's own words only, said after the conclusion, giving a reason, and sharing a content word with it
-    const later = explanations.filter((r) => statementKey(r.text) !== statementKey(x.text) && timeOf(r.saidAt) > timeOf(x.saidAt) && shares(r.words, x.words));
+    const laterAll = explanations.filter((r) => statementKey(r.text) !== statementKey(x.text) && timeOf(r.saidAt) > timeOf(x.saidAt) && shares(r.words, x.words))
+      .sort((p, q) => timeOf(p.saidAt) - timeOf(q.saidAt));
+    // the same words said again after the conclusion: the latest occurrence (Codex on PR #34)
+    const later = laterAll.filter((r, i) => !laterAll.slice(i + 1).some((q) => statementKey(q.text) === statementKey(r.text)));
     const aiReadings = summaries.filter((s) => (!candidateIds.has(s.memoryId) || s.memoryId === x.memoryId) && shares(s.words, x.words));
     return {
       statement: text(x.kind, x),
@@ -211,7 +212,7 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
     conclusions: keptConclusions,
     plans,
     events,
-    ...(sheet.overview.lastSaidAt ? { lastDay: dayOf(sheet.overview.lastSaidAt) } : {}),
+
     candidates: keptCandidates,
     memoryIds: [],
   };
@@ -222,6 +223,15 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
     ...context.events.map((e) => e.memoryId),
     ...context.candidates.map((c) => c.memoryId),
   ])];
+  // the last day the records reach: the person's records and every statement shown (a quote may carry its own, later time: Codex on PR #34)
+  const days = [
+    ...(sheet.overview.lastSaidAt ? [dayOf(sheet.overview.lastSaidAt)] : []),
+    ...context.conclusions.flatMap((c) => [c.statement.day, ...c.reasons.map((r) => r.day), ...c.aiReadings.map((r) => r.day)]),
+    ...context.plans.flatMap((p) => [p.plan.day, ...(p.outcome ? [p.outcome.day] : [])]),
+    ...context.events.map((e) => e.day),
+    ...context.candidates.map((c) => c.day),
+  ].filter(Boolean).sort();
+  if (days.length > 0) context.lastDay = days[days.length - 1];
   return context;
 }
 

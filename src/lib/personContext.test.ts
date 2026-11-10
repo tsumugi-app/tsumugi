@@ -302,3 +302,21 @@ test("Codex on PR #34: a later explanation kept only as a topic quote is attache
   assert.ok(c);
   assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => [r.memoryId, r.day]), [["b2", "2026-09-09"]]);
 });
+
+test("Codex on PR #34: an explanation repeated after the conclusion is attached; the last day includes the times of the statements shown", () => {
+  const at = (d: string) => `${d}T10:00:00.000Z`;
+  const why = "はるかさんとの関係に未来がない理由は、自分が既婚者だから。";
+  const memories: MemoryObject[] = [
+    mem("c1", "2026-09-01", "理由を話した。", { personMentions: [mention("はるかさん", why, at("2026-09-01"))], evidenceQuotes: [why] }),
+    mem("c2", "2026-09-05", "関係について話した。", { personMentions: [mention("はるかさん", "はるかさんとの関係に未来はない", at("2026-09-05"))] }),
+    mem("c3", "2026-09-06", "また理由を話した。", {
+      personMentions: [mention("はるかさん", "はるかさんの話", at("2026-09-06"))],
+      topicEvents: [{ id: "te-c3", topicId: "topic-h", quote: why, statedAt: at("2026-09-20"), sourceConversationId: "c", recordedAt: at("2026-09-20"), origin: "ai-extracted", schemaVersion: 1 }],
+    }),
+  ];
+  const context = buildPersonContext(memories, "はるか");
+  const c = context.conclusions.find((x) => x.statement.memoryId === "c2");
+  assert.ok(c);
+  assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => [r.memoryId, r.day]), [["c3", "2026-09-20"]]);
+  assert.equal(context.lastDay, "2026-09-20");
+});
