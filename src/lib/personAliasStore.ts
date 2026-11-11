@@ -92,7 +92,7 @@ export async function recordPersonDecisions(env: PeopleStoreEnv, personId: strin
  * it is when the decisions are written, never against an earlier read (a sync in another tab may have changed it).
  */
 export async function confirmPeopleInStore(env: PeopleStoreEnv, names: string[], ids: { newDecisionId: () => string; newPersonId: () => string }, now: string): Promise<ConfirmPlan> {
-  return env.updateState((state) => {
+  return env.updateState<ConfirmPlan>((state) => {
     const plan = planConfirm(state.people, names, ids, now);
     if (!plan.ok) return { state, result: plan };
     const existing = state.people.find((p) => p.id === plan.personId);
@@ -105,7 +105,7 @@ export async function confirmPeopleInStore(env: PeopleStoreEnv, names: string[],
 
 /** the user's revoke of one name, planned and recorded in one transaction (false when the name is no longer active in that person) */
 export async function revokeNameInStore(env: PeopleStoreEnv, personId: string, name: string, newDecisionId: () => string, now: string): Promise<boolean> {
-  return env.updateState((state) => {
+  return env.updateState<boolean>((state) => {
     const person = state.people.find((p) => p.id === personId);
     const decision = person ? planRevoke(person, name, newDecisionId, now) : null;
     if (!person || !decision) return { state, result: false };
