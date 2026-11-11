@@ -65,8 +65,10 @@ export interface CandidateLinkTrace { fromId: string; toId: string; axis: string
  * P1-E: words that say when or how in general, not what about someone (time words such as 最近 / 今日 / 先週 / 毎日, and a few general words):
  * a common word of this kind never ties a nameless record to a person through a Connect link. A rule on the word's form, not on a person or a topic.
  */
-const TIME_WORD = /^(?:[今昨明先来毎前次翌本近当同去昔後]+[日週月年朝昼夜晩度回時期頃]+|[日週月年朝昼夜晩度回時期頃々]+|最近|近頃|以前|以後|今後|将来|当時|普段|時間|時々|一昨日|明後日|週末|平日|休日)$/;
-const GENERAL_WORDS = new Set(["自分", "気持", "本当", "一緒", "全部", "普通", "結局", "色々", "感じ", "場合", "部分", "一番", "全然", "大丈夫", "仕方"]);
+const TIME_WORD = /^(?:[今昨明先来毎前次翌本近当去昔後]+[日週月年朝昼夜晩度回時頃]+|[日週月年朝昼夜晩度回時頃々]+|[今先来毎]?週末|年末|月末|週明|[一数]?[日年]間?|週間|期間|年間|午前|午後|夕方|深夜|夜中|[日月火水木金土]曜|時期|現在|当初|昨今|以来|数日|最近|近頃|以前|以後|今後|将来|当時|普段|時間|時々|一昨日|明後日|平日|休日)$/;
+// words of judging or of the talk itself (大事 / 無理 / 理由 …): the words a conclusion is made of, not what it is about
+const GENERAL_WORDS = new Set(["自分", "気持", "本当", "一緒", "全部", "普通", "結局", "色々", "場合", "部分", "一番", "全然", "大丈夫", "仕方",
+  "大事", "大切", "必要", "無理", "意味", "問題", "関係", "理由", "最初", "最後", "多分", "絶対"]);
 const isGenericWord = (w: string) => TIME_WORD.test(w) || GENERAL_WORDS.has(w);
 
 // a question or a request to the AI, and a look back, as the AI summary words them (the sentence that carries the plan's status word)
@@ -327,26 +329,33 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const trace: PersonContextTrace = { statements: [], plans: [], candidates: [] };
   // P1-D: the user's sentences of the sheet left out because nothing shows they are about this person
   for (const x of left.filter((y) => recordOf.get(y.memoryId)?.match === "mention")) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: stanceOf(x.text, x.role).stance, score: 0, kept: false, why: `この人の話と確かめられないので入れない：${relevanceOf(x.memoryId, x.text).why}` });
-  // P1-E: the records of this person (Capture recorded the person) a record is linked to by Connect, either end of the link, each link once
-  const linkedPersonRecords = (m: MemoryObject): { link: Link; other: MemoryObject }[] => {
+  // P1-E: the Connect links between a record and the records of this person (Capture recorded the person), either end, each link once
+  const linksToPerson = new Map<string, { link: Link; other: MemoryObject }[]>();
+  {
     const seen = new Set<string>();
-    const out: { link: Link; other: MemoryObject }[] = [];
     const add = (l: Link) => {
-      const otherId = l.sourceId === m.id ? l.targetId : l.targetId === m.id ? l.sourceId : undefined;
-      const other = otherId && namedIds.has(otherId) ? byId.get(otherId) : undefined;
       const k = l.id || `${l.sourceId}>${l.targetId}`;
-      if (!other || seen.has(k)) return;
-      seen.add(k);
-      out.push({ link: l, other });
+      if (seen.has(k)) return;
+      for (const [self, otherId] of [[l.sourceId, l.targetId], [l.targetId, l.sourceId]]) {
+        const other = namedIds.has(otherId) && !namedIds.has(self) ? byId.get(otherId) : undefined;
+        if (!other) continue;
+        seen.add(k);
+        linksToPerson.set(self, [...(linksToPerson.get(self) ?? []), { link: l, other }]);
+      }
     };
-    for (const l of m.links ?? []) add(l);
-    for (const x of named) for (const l of x.links ?? []) add(l);
+    for (const m of pool) for (const l of m.links ?? []) add(l);
+  }
+  // the user's own sentences of a record of this person that are about this person (the P1-D check), once per record
+  const aboutCache = new Map<string, string[]>();
+  const aboutPersonSentencesOf = (x: MemoryObject): string[] => {
+    const hit = aboutCache.get(x.id);
+    if (hit) return hit;
+    const out = [...new Set([
+      ...mentionsOf(x).map((p) => p.quote ?? ""), ...(x.evidenceQuotes ?? []), ...(x.topicEvents ?? []).map((e) => e.quote ?? ""),
+    ].flatMap(statementSentences))].filter((t) => t.length > 0 && eligible(x.id, t));
+    aboutCache.set(x.id, out);
     return out;
   };
-  // the user's own sentences of a record of this person that are about this person (the P1-D check)
-  const aboutPersonSentencesOf = (x: MemoryObject): string[] => [...new Set([
-    ...mentionsOf(x).map((p) => p.quote ?? ""), ...(x.evidenceQuotes ?? []), ...(x.topicEvents ?? []).map((e) => e.quote ?? ""),
-  ].flatMap(statementSentences))].filter((s) => s.length > 0 && eligible(x.id, s));
   const candidates: PersonContext["candidates"] = [];
   const candidateSaidAt = new Map<string, string>();
   for (const m of pool) {
@@ -375,7 +384,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     // own words about this person (P1-D) and they share a telling word with this record's own words: the words of THAT record, not of all the
     // person's records, and never a time word or a general word.
     const linkWords = new Set<string>();
-    linkTraces = linkedPersonRecords(m).map(({ link, other }): CandidateLinkTrace => {
+    linkTraces = (linksToPerson.get(m.id) ?? []).map(({ link, other }): CandidateLinkTrace => {
       const base = { fromId: link.sourceId, toId: link.targetId, axis: String(link.axis ?? ""), strength: Number(link.strength ?? 0), reason: String(link.reason ?? "") };
       const about = aboutPersonSentencesOf(other);
       if (about.length === 0) return { ...base, used: false, why: "つながった記録に、この人についての本人の発言が無い" };
@@ -390,8 +399,9 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
       return { ...base, used: false, why: "つながった記録のこの人についての本人の発言と、共通の言葉が無い" };
     });
     if (linkWords.size > 0) signals.push("Connectのつながり");
-    // the same conversation or the same topic: as before P1-E (a word of the person's views); a Connect link alone: a word of the linked record
-    const sharedWords = viaConvOrTopic ? mine.filter((w) => personWords.includes(w)) : [...linkWords];
+    // the same conversation or the same topic: a word of the person's views, as before P1-E, and the words of a link that was used (adding the same
+    // topic never turns away a record a link alone would take: independent review); a Connect link alone: a word of the linked record only
+    const sharedWords = viaConvOrTopic ? [...new Set([...mine.filter((w) => personWords.includes(w)), ...linkWords])] : [...linkWords];
     if (!viaConvOrTopic && linkWords.size === 0) {
       const anyShared = mine.some((w) => personWords.includes(w));
       const withShared = anyShared ? [...signals, "共通の言葉"] : signals;
