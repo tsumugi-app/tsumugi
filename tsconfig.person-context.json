@@ -13,6 +13,8 @@
   "include": [],
   "files": [
     "src/lib/personContext.test.ts",
+    "src/lib/personContextSelection.test.ts",
+    "src/lib/personStance.ts",
     "src/lib/personContext.ts",
     "src/lib/personContextPrompt.ts",
     "src/lib/personSheet.ts",

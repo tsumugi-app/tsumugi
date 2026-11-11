@@ -13,7 +13,8 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 import { buildPersonSheet, findInPersonSheet, listSheetPersons, personSheetKey, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_MATCH_LABEL, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetPlan, type SheetText } from "@/lib/personSheet";
 import { STATEMENT_ROLE_LABEL } from "@/lib/personStatement";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
-import { buildPersonContext } from "@/lib/personContext";
+import { explainPersonContext, type PersonContextTrace } from "@/lib/personContext";
+import { STANCE_LABEL } from "@/lib/personStance";
 import { buildPersonContextSection, sanitizePersonContext } from "@/lib/personContextPrompt";
 import { aliasGroupsOf, contestedKeys, personOfName, type PersonRecord } from "@/lib/personAlias";
 import { confirmSamePerson, loadConfirmedPeople, revokeName } from "@/lib/personAliasDevice";
@@ -143,17 +144,20 @@ export default function PersonSheetDiagnostics() {
   }, [memories, selected, shownWith]);
   const sheet = built.sheet;
   // Memory Graph P1-A: the background the chat would receive for this person (flag ON), with the names shown together on this page as confirmed aliases
-  const chatPreview = useMemo((): string | null => {
+  // P1-C: and why each statement, plan and nameless record was or was not passed (the trace is never sent)
+  const chatBuilt = useMemo((): { text: string; trace: PersonContextTrace | null } | null => {
     if (!memories || !selected) return null;
     try {
-      const context = buildPersonContext(memories, selected, { aliases: shownWith.length > 0 ? [[selected, ...shownWith]] : [] });
+      const { context, trace } = explainPersonContext(memories, selected, { aliases: shownWith.length > 0 ? [[selected, ...shownWith]] : [] });
       // as the chat sends it (an empty context is not sent) and as the route checks it again
       const sent = context.memoryIds.length > 0 || context.relation ? sanitizePersonContext([context]) : [];
-      return buildPersonContextSection(sent) || "（会話に渡す背景はありません）";
+      return { text: buildPersonContextSection(sent) || "（会話に渡す背景はありません）", trace };
     } catch (error) {
-      return `作れませんでした：${String(error)}`;
+      return { text: `作れませんでした：${String(error)}`, trace: null };
     }
   }, [memories, selected, shownWith]);
+  const chatPreview = chatBuilt?.text ?? null;
+  const chatTrace = chatBuilt?.trace ?? null;
   const byId = useMemo(() => new Map((memories ?? []).map((m) => [m.id, m] as const)), [memories]);
   const found = useMemo(() => {
     if (!memories || !sheet || !findWords.trim()) return null;
@@ -449,6 +453,32 @@ export default function PersonSheetDiagnostics() {
           <Section title="会話に渡す背景（Memory Graph・試験）" note="?memoryGraph=1 で会話をONにしたとき、この人が話題になると会話AIに渡す内容。いっしょに表示している名前は、確定した別名として扱う（この画面だけ・保存しない）。" open={false}>
             <pre className="whitespace-pre-wrap break-words text-xs">{chatPreview}</pre>
           </Section>
+
+          {chatTrace && (
+            <Section title="背景に入れた理由・入れなかった理由（Memory Graph・試験）" note="会話に渡す背景を選んだ根拠。考え・結論の種類と重み、予定の扱い、名前の無い記録の取得根拠。会話には送らない。" open={false}>
+              <div className="text-xs font-semibold">考え・結論（{chatTrace.statements.filter((x) => x.kept).length} / {chatTrace.statements.length}）</div>
+              {chatTrace.statements.length === 0 && <None />}
+              {chatTrace.statements.map((x, i) => (
+                <div key={`s${i}`} className="text-xs">
+                  {x.kept ? "○" : "×"} <Id id={x.memoryId} /> {STANCE_LABEL[x.stance]}・重み{x.score}：{x.text}<span className="opacity-70">（{x.why}{x.linkedReasons ? `、後からの説明 ${x.linkedReasons.map((id) => `#${id.slice(-6)}`).join(" ")}` : ""}）</span>
+                </div>
+              ))}
+              <div className="mt-2 text-xs font-semibold">予定（{chatTrace.plans.length}）</div>
+              {chatTrace.plans.length === 0 && <None />}
+              {chatTrace.plans.map((x, i) => (
+                <div key={`p${i}`} className="text-xs">
+                  {x.kind === "ask-ai" || x.kind === "retrospective" ? "×" : "○"} <Id id={x.memoryId} /> {x.text}<span className="opacity-70">（{x.why}）</span>
+                </div>
+              ))}
+              <div className="mt-2 text-xs font-semibold">名前の無い記録（{chatTrace.candidates.length}）</div>
+              {chatTrace.candidates.length === 0 && <None />}
+              {chatTrace.candidates.map((x, i) => (
+                <div key={`c${i}`} className="text-xs">
+                  {x.accepted ? "○" : "×"} <Id id={x.memoryId} /> {x.text}<span className="opacity-70">（根拠：{x.signals.join("・") || "なし"}。{x.why}）</span>
+                </div>
+              ))}
+            </Section>
+          )}
 
           <Section title={`Connectの推測（${sheet.links.length}）`} note="AIが判定したつながり。事実ではない。" open={false}>
             {sheet.links.length === 0 && <None />}
