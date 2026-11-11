@@ -149,3 +149,25 @@ test("case 7: with other people and a confirmed alias, a link joins only through
   assert.ok(!contextIds(memories).includes("r4"));
   assert.equal(candidateOf(memories, "r4", "みお", [["みおさん", "美緒さん"]])?.accepted, true);
 });
+
+test("independent review: the same topic added to a link a record was taken by does not turn it away; 同期 is a telling word, 大事 is not", () => {
+  // ランチ is in her record p1, which is not one of her views: before the fix, adding the same topic dropped the link's word
+  const linked = connect([...base(), mem("r6", "2026-09-22", "ランチの話。", { evidenceQuotes: ["ランチはもっと増やすべきだ。"] })], "r6", "p1", "ランチの話でつながっているようです。");
+  assert.equal(candidateOf(linked, "r6")?.accepted, true);
+  const withTopic = linked.map((m) => (m.id === "r6" || m.id === "p1" ? { ...m, topicId: "topic-lunch" } : m));
+  const c = candidateOf(withTopic, "r6");
+  assert.equal(c?.accepted, true);
+  assert.deepEqual(c?.signals, ["同じ話題", "Connectのつながり", "共通の言葉"]);
+  // a word of a colleague (同期) ties the records; a word of judging (大事) does not
+  let more: MemoryObject[] = [
+    ...base(),
+    mem("p6", "2026-09-23", "みおさんの話。", { personMentions: [mention("みおさん", "みおさんは同期で、一緒にいる時間は大事だと思う", "2026-09-23")] }),
+    mem("r7", "2026-09-24", "同期の話。", { evidenceQuotes: ["同期の中で一番頼れると思う。"] }),
+    mem("r8", "2026-09-25", "家族の話。", { evidenceQuotes: ["家族は大事だと思う。"] }),
+  ];
+  more = connect(more, "r7", "p6", "同期の話でつながっているようです。");
+  more = connect(more, "r8", "p6", "大事なものの話でつながっているようです。");
+  assert.equal(candidateOf(more, "r7")?.accepted, true);
+  assert.equal(candidateOf(more, "r8")?.accepted, false);
+  assert.match(candidateOf(more, "r8")?.links?.[0]?.why ?? "", /時間・一般的な言葉（大事）だけ/);
+});
