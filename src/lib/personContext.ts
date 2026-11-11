@@ -284,6 +284,15 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: wordsOf(t.text), topics: t.topicId ? [t.topicId] : byId.get(t.memoryId)?.topicId ? [byId.get(t.memoryId)!.topicId as string] : [] }));
   // a later explanation is linked to a conclusion, a wish or a view (not to a passing feeling or a doubt) only when it shares a word that tells
   // something about this person; the link is "topic" when Capture also put both records in one topic, otherwise only a guess from the words ("word")
+  // the topic of the conclusion's own words, as for the explanations: the topic of the topic quote it was said in, otherwise the record's topic.
+  // Not every topic the record was ever in (Capture UPDATE keeps older topic events while replacing topicId: Codex on PR #36)
+  const ownTopicsOf = (memoryId: string, sentence: string): string[] => {
+    const m = byId.get(memoryId);
+    if (!m) return [];
+    const key = statementKey(sentence);
+    const fromQuotes = (m.topicEvents ?? []).filter((e) => e.quote && e.topicId && statementSentences(e.quote).some((q) => statementKey(q) === key)).map((e) => e.topicId as string);
+    return fromQuotes.length > 0 ? fromQuotes : m.topicId ? [m.topicId] : [];
+  };
   const linkable = (x: Source) => x.stance === "decision" || x.stance === "wish" || x.stance === "view";
   const all: PersonContextConclusion[] = sources.map((x) => {
     // situations are out of `sources`: the stance is one the payload knows
@@ -294,7 +303,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
       .sort((p, q) => timeOf(p.saidAt) - timeOf(q.saidAt));
     // the same words said again after the conclusion: the latest occurrence (Codex on PR #34)
     const later = laterAll.filter((r, i) => !laterAll.slice(i + 1).some((q) => statementKey(q.text) === statementKey(r.text)));
-    const xTopics = topicsOf(byId.get(x.memoryId));
+    const xTopics = ownTopicsOf(x.memoryId, x.text);
     const aiReadings = x.role === "judgment" ? summaries.filter((s) => (!candidateIds.has(s.memoryId) || s.memoryId === x.memoryId) && shares(s.words, x.words)) : [];
     return {
       ...base,

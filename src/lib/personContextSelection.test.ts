@@ -134,6 +134,12 @@ test("case 3: the user's later explanation stays with the earlier conclusion, is
   const noTopic = memories.map((m) => ({ ...m, topicId: undefined }));
   const guessed = statementsOf(noTopic).find((x) => x.statement.text === CONCLUSION);
   assert.deepEqual(guessed?.reasons.filter((r) => r.when === "later").map((r) => r.link), ["word"]);
+  // a topic the conclusion's record was once in (an older topic event of another quote, kept by Capture UPDATE) is not the conclusion's topic
+  const movedTopic = memories.map((m) => m.id === "s3"
+    ? { ...m, topicId: "topic-other", topicEvents: [{ id: "te-s3", topicId: "topic-sora", quote: "そらさんの話を前にもした。", statedAt: at("2026-06-30"), sourceConversationId: "c", recordedAt: at("2026-06-30"), origin: "ai-extracted" as const, schemaVersion: 1 as const }] }
+    : m);
+  const moved = statementsOf(movedTopic).find((x) => x.statement.text === CONCLUSION);
+  assert.deepEqual(moved?.reasons.filter((r) => r.when === "later").map((r) => r.link), ["word"], "another quote's old topic is not a shared topic");
   const section = buildPersonContextSection(sanitizePersonContext([buildPersonContext(noTopic, "そら")]));
   assert.match(section, /後から本人が説明した理由 \[本人の発言 2026-10-10\] .*（関連は推測：共通の言葉から）/);
   // a word that is also in the user's words about someone else (関係) links nothing on its own
