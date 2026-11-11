@@ -98,9 +98,12 @@ export function buildPersonContext(memories: MemoryObject[], key: string, option
   const own = sheet.views.flatMap((v) => {
     if (v.text.kind !== "user" || v.aboutOther || !fits(v.text.text)) return [];
     if (eligible(v.text.memoryId, v.text.text)) return [v];
-    const alt = v.alsoIn.map((id) => recordOf.get(id)).filter((r) => r !== undefined && eligible(r.memoryId, v.text.text))
-      .sort((x, y) => timeOf(x!.saidAt) - timeOf(y!.saidAt))[0];
-    return alt ? [{ ...v, text: { ...v.text, memoryId: alt.memoryId, saidAt: alt.saidAt } }] : [];
+    // the duplicate occurrence keeps its own time (a mention or topic quote may be later than its record: Codex on PR #34)
+    const key = statementKey(v.text.text);
+    const alt = sheet.statements
+      .filter((st) => st.text.kind === "user" && v.alsoIn.includes(st.text.memoryId) && statementKey(st.text.text) === key && eligible(st.text.memoryId, v.text.text))
+      .sort((x, y) => timeOf(x.text.saidAt) - timeOf(y.text.saidAt))[0];
+    return alt ? [{ ...v, text: { ...v.text, memoryId: alt.text.memoryId, saidAt: alt.text.saidAt } }] : [];
   }).sort((a, b) => timeOf(a.text.saidAt) - timeOf(b.text.saidAt));
   // records without any name that may be about this person: two kinds of evidence must meet
   const onSheet = new Set(sheet.records.filter((r) => r.match === "mention").map((r) => r.memoryId));

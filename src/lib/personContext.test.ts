@@ -334,3 +334,19 @@ test("Codex on PR #34: a question is not an explanation; overlapping names are m
   assert.ok(c);
   assert.deepEqual(c.reasons.filter((r) => r.when === "later").map((r) => r.memoryId), ["e3"]);
 });
+
+test("Codex on PR #34: a conclusion recovered from a duplicate keeps the time of that occurrence", () => {
+  const at = (d: string) => `${d}T10:00:00.000Z`;
+  const memories: MemoryObject[] = [
+    mem("f1", "2026-09-01", "はるかさんの話も出た。", { conversationId: "conv-F", evidenceQuotes: ["もう諦めることにした。"] }),
+    mem("f2", "2026-09-02", "はるかさんとのこと。", {
+      personMentions: [mention("はるかさん", "はるかさんの話", at("2026-09-02"))],
+      topicEvents: [{ id: "te-f2", topicId: "topic-f", quote: "もう諦めることにした。", statedAt: at("2026-09-09"), sourceConversationId: "c", recordedAt: at("2026-09-09"), origin: "ai-extracted", schemaVersion: 1 }],
+    }),
+    mem("f3", "2026-09-05", "はるかさんについて。", { personMentions: [mention("はるかさん", "はるかさんを諦める理由は、自分が既婚者だから。", at("2026-09-05"))] }),
+  ];
+  const c = buildPersonContext(memories, "はるか").conclusions.find((x) => x.statement.text === "もう諦めることにした。");
+  assert.ok(c);
+  assert.deepEqual([c.statement.memoryId, c.statement.day], ["f2", "2026-09-09"]);
+  assert.deepEqual(c.reasons.filter((r) => r.when === "later"), [], "the 9/5 explanation came before the 9/9 conclusion");
+});
