@@ -206,7 +206,7 @@ test("the reader skips records of an unexpected shape and fills absent lists; a 
   assert.equal(opened, false);
 });
 
-test("the person sheet is a debug view only: no chat, Retrieval or write path imports it, and its reader never writes", async () => {
+test("the person sheet is read only by the debug view and the Memory Graph person context (flagged), never by Retrieval or a write path, and its reader never writes", async () => {
   const fs = await import("node:fs");
   const path = await import("node:path");
   const src = path.join(process.cwd(), "src");
@@ -220,7 +220,7 @@ test("the person sheet is a debug view only: no chat, Retrieval or write path im
     }
   };
   walk(src);
-  assert.deepEqual(importers.sort(), ["components/PersonSheetDiagnostics.tsx"]);
+  assert.deepEqual(importers.sort(), ["components/PersonSheetDiagnostics.tsx", "lib/personContext.ts"]);
   const statementImporters: string[] = [];
   const walk2 = (d: string) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
@@ -231,7 +231,7 @@ test("the person sheet is a debug view only: no chat, Retrieval or write path im
     }
   };
   walk2(src);
-  assert.deepEqual(statementImporters.sort(), ["components/PersonSheetDiagnostics.tsx", "lib/personSheet.ts"]);
+  assert.deepEqual(statementImporters.sort(), ["components/PersonSheetDiagnostics.tsx", "lib/personContext.ts", "lib/personSheet.ts"]);
   const reader = fs.readFileSync(path.join(src, "lib", "personSheetRead.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
   assert.doesNotMatch(reader, /readwrite|\.put\(|\.add\(|\.delete\(|\.clear\(|deleteDatabase|fetch\(|localStorage|from ["'].*\/(db|vault)["']/);
   const sheet = fs.readFileSync(path.join(src, "lib", "personSheet.ts"), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");

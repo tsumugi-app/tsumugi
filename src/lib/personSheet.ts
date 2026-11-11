@@ -1,6 +1,7 @@
 /**
  * Memory Graph P0: the person sheet (a debug view, owner request 2026-11-10). It is DERIVED from the saved Memories every time it is opened.
- * Nothing is stored, no Memory is changed and no AI is called. The sheet is never sent to the chat; normal Retrieval does not read it.
+ * Nothing is stored, no Memory is changed and no AI is called. The sheet itself is never sent to the chat (the Memory Graph P1 trial builds its
+ * person context from it: personContext.ts); normal Retrieval does not read it.
  *
  * What the sheet gathers for one person, each line carrying its kind and the Memories it rests on:
  *   本人の発言  (user)    the user's own words, verbatim: personMentions.quote, evidenceQuotes, topicEvents.quote
@@ -66,7 +67,7 @@ export interface PersonListEntry {
 }
 
 /** every person a record names: personMentions, plus keywords that are a name with an honorific (as Retrieval counts them) */
-function namesOf(m: MemoryObject): { mention: string[]; keyword: string[] } {
+export function namesOf(m: MemoryObject): { mention: string[]; keyword: string[] } {
   const mention = (m.personMentions ?? []).map((p) => (p.displayName || p.groupingKey || "").trim()).filter(Boolean);
   const keyword = (m.keywords ?? []).filter((k) => HONORIFIC.test(k.normalize("NFKC").replace(/\s+/g, "")));
   return { mention, keyword };
@@ -321,8 +322,10 @@ function isAbout(m: MemoryObject, keys: string[], otherKeys: string[]): SheetMat
 const OUTCOME_STATUSES = new Set<TimelineStatus>(["中止", "保留", "実施済み"]);
 
 export interface PersonSheetOptions {
-  /** other name keys to show together with `key` on this page only (nothing is stored; the user decides whether they are one person) */
+  /** other name keys to show together with `key` (the debug page: for the moment only; the chat: names the user confirmed as one person) */
   withKeys?: string[];
+  /** only what the chat context reads (records, statements, views, last, plans, relation): no topics, Connect list, themes or alias candidates */
+  lite?: boolean;
 }
 
 export function buildPersonSheet(memories: MemoryObject[], key: string, options: PersonSheetOptions = {}): PersonSheet {
@@ -508,7 +511,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string, options:
   // topics of the person's records: the user's words of the whole topic, and the records of the topic about someone else
   // the record's topic and every topic its kept quotes belong to (a Capture UPDATE may change topicId and keep the earlier topic's quotes: Codex on PR #32)
   const topicIdsOf = (m: MemoryObject) => [m.topicId, ...(m.topicEvents ?? []).map((e) => e.topicId)].filter((x): x is string => Boolean(x));
-  const topicIds = [...new Set(about.flatMap((x) => topicIdsOf(x.m)))];
+  const topicIds = options.lite ? [] : [...new Set(about.flatMap((x) => topicIdsOf(x.m)))];
   const topics: SheetTopic[] = topicIds.map((topicId) => {
     const inTopic = all.filter((m) => m.topicId === topicId || (m.topicEvents ?? []).some((e) => e.topicId === topicId));
     const events = inTopic.flatMap((m) => (m.topicEvents ?? []).filter((e) => e.topicId === topicId && e.quote).map((e) => ({
@@ -521,7 +524,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string, options:
   // Connect: every link of the person's records (a reading of Connect's AI, not a fact)
   const links: SheetLink[] = [];
   const seenLinks = new Set<string>();
-  for (const x of about) {
+  for (const x of options.lite ? [] : about) {
     for (const l of x.m.links ?? []) {
       if (seenLinks.has(l.id)) continue;
       seenLinks.add(l.id);
@@ -537,7 +540,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string, options:
 
   // Memory Timeline themes that the person's records belong to (the theme may hold records about other people too)
   const personKeywords = new Set(records.flatMap((r) => r.keywords));
-  const themes: SheetTheme[] = timelineThemes(all.filter(isSynthesisSource)).filter((t) => personKeywords.has(t)).map((theme) => {
+  const themes: SheetTheme[] = (options.lite ? [] : timelineThemes(all.filter(isSynthesisSource))).filter((t) => personKeywords.has(t)).map((theme) => {
     const { state, points } = buildThemeTimeline(theme, all);
     return {
       theme,
@@ -553,7 +556,7 @@ export function buildPersonSheet(memories: MemoryObject[], key: string, options:
   const myTopics = new Set(about.filter((x) => x.match !== "text").flatMap((x) => topicIdsOf(x.m)));
   const myCo = new Set([...coCount.keys()].map(personSheetKey));
   const aliasCandidates: SheetAliasCandidate[] = [];
-  for (const p of persons) {
+  for (const p of options.lite ? [] : persons) {
     if (keys.includes(p.key)) continue;
     const ids = all.filter((m) => { const n = namesOf(m); return [...n.mention, ...n.keyword].some((x) => personSheetKey(x) === p.key); });
     const idSet = new Set(ids.map((m) => m.id));

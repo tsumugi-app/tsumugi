@@ -119,10 +119,13 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // and shows them, and the time filter keeps the user's own past views. Exact added / removed lines of ChatScreen.tsx and the chat route only (never a pattern)
   const memoryContextLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedMemoryContextLines.json"), "utf8")).lines);
   const memoryContext = (l: string) => memoryContextLines.has(l[0] + l.slice(1).trim());
+  // Reviewed (Memory Graph P1-A, trial default OFF): the optional person context of the chat. Exact added / removed lines of ChatScreen.tsx and the chat route only (never a pattern)
+  const memoryGraphLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedMemoryGraphLines.json"), "utf8")).lines);
+  const memoryGraph = (l: string) => memoryGraphLines.has(l[0] + l.slice(1).trim());
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (conversation voice): prompt text lives in lib/conversationVoice.ts; the route only resolves it, appends it, and may raise the thinking floor
   const conversationVoiceLine = /conversationVoice|voice\.|Conversation voice|^-\$\{sanitizedExplicitSearch && sanitizedMemoryAnalytics \?/;
-  for (const l of chatRouteDiff) assert.ok(aiSelection(l) || memoryContext(l) || /synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
+  for (const l of chatRouteDiff) assert.ok(aiSelection(l) || memoryContext(l) || memoryGraph(l) || /synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (startup Memory creation): the Capture result is saved in one transaction and the AI call runs outside the Vault world lock; ChatScreen runs it and marks the open conversation. Exact lines only (never a pattern)
@@ -152,7 +155,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (realtime diary PR-A, owner approval 2026-11-07): the separate entry, the pause (going home makes no Memory and sends nothing) and the time labels — exact lines only
   const realtimeDiaryLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedRealtimeDiaryLines.json"), "utf8")).lines);
   const realtimeDiary = (l: string) => realtimeDiaryLines.has(l[0] + l.slice(1).trim());
-  for (const l of chatDiff) assert.ok(startupCapture(l) || aiSelection(l) || realtimeDiary(l) || memoryContext(l) || navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
+  for (const l of chatDiff) assert.ok(startupCapture(l) || aiSelection(l) || realtimeDiary(l) || memoryContext(l) || memoryGraph(l) || navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
   // vaultProjection.ts: the only allowed change is that the startup integrity reconcile skips a done entry whose divergence the user accepted (for that record version)
   const projDiff = git("diff", "-U0", ...range, "--", "src/lib/vaultProjection.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (Vault auto repair, PR 3): a Memory re-queued by the repair (requireLosslessDayFile) is held instead of written when rewriting its day file would lose content. Normal saves pass requireLossless = false. Exact lines only (never a pattern)
