@@ -22,11 +22,13 @@ import {
 } from "./personAlias";
 import { personSheetKey } from "./personSheet";
 import {
+  confirmPeopleInStore,
   emptyPeopleState,
   fileToWrite,
   parsePeopleState,
   readVaultPeople,
   recordPersonDecisions,
+  revokeNameInStore,
   syncPeopleWithVault,
   type PeopleState,
   type PeopleStoreEnv,
@@ -83,7 +85,7 @@ test("refused: one name, the same name twice (honorific aside), names of two dif
   assert.deepEqual(planConfirm([], ["りこさん"], ids, T0), { ok: false, reason: "too-few-names" });
   assert.deepEqual(planConfirm([], ["りこさん", "りこ"], ids, T0), { ok: false, reason: "same-name" });
   let people = confirm([], ["りこさん", "りっちゃん"]);
-  people = confirm(people, ["はるさん", "はるちゃん"], later(1));
+  people = confirm(people, ["はるさん", "ハル"], later(1));
   const both = planConfirm(people, ["りこさん", "はるさん"], ids, later(2));
   assert.equal(both.ok, false);
   assert.equal(!both.ok && both.reason, "in-other-person", "two people are never joined in one step");
@@ -109,8 +111,8 @@ test("a name confirmed for two people (two devices) is contested: it joins neith
 test("merge is a union of decisions (order does not matter, nothing lost)", () => {
   const base: PersonRecord = { id: "01PERSONMERGE1", fileName: "m.md", createdAt: T0, decisions: [] };
   const d = (id: string, min: number, kind: PersonDecision["kind"], name: string): PersonDecision => ({ id, at: later(min), kind, name });
-  const x = { ...base, decisions: [d("a", 0, "confirm", "そら"), d("b", 0, "confirm", "そらちゃん")] };
-  const y = { ...base, decisions: [d("a", 0, "confirm", "そら"), d("c", 5, "revoke", "そらちゃん")] };
+  const x = { ...base, decisions: [d("a", 0, "confirm", "そら"), d("b", 0, "confirm", "ソラ")] };
+  const y = { ...base, decisions: [d("a", 0, "confirm", "そら"), d("c", 5, "revoke", "ソラ")] };
   assert.deepEqual(mergePerson(x, y), mergePerson(y, x));
   assert.deepEqual(mergePerson(x, y).decisions.map((e) => e.id), ["a", "b", "c"]);
   assert.deepEqual(activeNames(mergePerson(x, y)), ["そら"]);
@@ -195,7 +197,7 @@ test("a decision is pending until the Vault holds it; written once, read back, t
 test("save failure, a write that did not land whole, an unpaired Vault: the decision stays pending and is written later", async () => {
   const store = new FakeStore();
   const vault = new FakeVault();
-  const p = await deviceConfirm(store, ["はるさん", "はるちゃん"]);
+  const p = await deviceConfirm(store, ["はるさん", "ハル"]);
   vault.failWrites = true;
   assert.equal((await syncPeopleWithVault(store, vault)).stillPending, 1);
   vault.failWrites = false; vault.truncateWrites = true;
@@ -229,13 +231,13 @@ test("the device cache is rebuilt from the Vault (lost IndexedDB, a new device)"
 test("two devices: decisions on both are united in the Vault; a sync tool's conflicted copy is merged, never deleted", async () => {
   const vault = new FakeVault();
   const a = new FakeStore();
-  const p = await deviceConfirm(a, ["そらさん", "そらちゃん"]);
+  const p = await deviceConfirm(a, ["そらさん", "そっちゃん"]);
   await syncPeopleWithVault(a, vault);
   const b = new FakeStore();
   await syncPeopleWithVault(b, vault);
   // device B revokes, device A adds a name, before either syncs
   const person = (await b.readState()).people[0];
-  await recordPersonDecisions(b, p.id, [planRevoke(person, "そらちゃん", nextId, later(10))!]);
+  await recordPersonDecisions(b, p.id, [planRevoke(person, "そっちゃん", nextId, later(10))!]);
   const pa = (await a.readState()).people[0];
   const add = planConfirm([pa], ["そらさん", "ソラ"], { newDecisionId: nextId, newPersonId: nextId }, later(11));
   assert.ok(add.ok); if (!add.ok) return;
@@ -265,7 +267,7 @@ test("a person removed from the Vault (the note deleted) is removed here only af
   assert.equal((await syncPeopleWithVault(store, vault)).removed, 1);
   assert.deepEqual((await store.readState()).people, []);
   // a new decision that is still pending is not lost when the note is missing: it is written
-  const q = await deviceConfirm(store, ["はるさん", "はるちゃん"]);
+  const q = await deviceConfirm(store, ["はるさん", "ハル"]);
   assert.equal((await syncPeopleWithVault(store, vault)).written, 1);
   assert.ok(vault.files.has(q.fileName));
 });
@@ -286,7 +288,7 @@ test("a note edited by hand, another file of the same name, an unlisted folder: 
   // the user's own note that happens to have the person's file name
   const s2 = new FakeStore();
   const v2 = new FakeVault();
-  const q = await deviceConfirm(s2, ["はるさん", "はるちゃん"]);
+  const q = await deviceConfirm(s2, ["はるさん", "ハル"]);
   v2.files.set(q.fileName, "# 自分のメモ\n");
   await syncPeopleWithVault(s2, v2);
   assert.equal(v2.files.get(q.fileName), "# 自分のメモ\n");
@@ -298,6 +300,35 @@ test("a note edited by hand, another file of the same name, an unlisted folder: 
   const r = await syncPeopleWithVault(s3, v3);
   assert.equal(v3.writes.length, 0);
   assert.equal(r.stillPending, 1);
+});
+
+test("a person note broken by hand never makes the person disappear from the device", async () => {
+  const store = new FakeStore();
+  const vault = new FakeVault();
+  const p = await deviceConfirm(store, ["りこさん", "りっちゃん"]);
+  await syncPeopleWithVault(store, vault);
+  vault.files.set(p.fileName, vault.files.get(p.fileName)!.replace(/"kind":"confirm"/, '"kind":'));
+  const r = await syncPeopleWithVault(store, vault);
+  assert.deepEqual(r.unreadable, [p.fileName]);
+  assert.equal(r.removed, 0);
+  assert.deepEqual(aliasNameLists((await store.readState()).people), [["りこさん", "りっちゃん"]]);
+});
+
+test("confirm and revoke are checked against the cache when they are recorded (one transaction)", async () => {
+  const store = new FakeStore();
+  const ids = { newDecisionId: nextId, newPersonId: nextId };
+  assert.ok((await confirmPeopleInStore(store, ["りこさん", "りっちゃん"], ids, T0)).ok);
+  // meanwhile another tab's sync brought はる and ハル as another person: joining りこ with はる is refused, nothing recorded
+  assert.ok((await confirmPeopleInStore(store, ["はるさん", "ハル"], ids, later(1))).ok);
+  const before = store.raw;
+  const refused = await confirmPeopleInStore(store, ["りこさん", "はるさん"], ids, later(2));
+  assert.equal(!refused.ok && refused.reason, "in-other-person");
+  assert.equal(store.raw, before);
+  const person = (await store.readState()).people.find((x) => activeNames(x).includes("ハル"))!;
+  assert.equal(await revokeNameInStore(store, person.id, "ハル", nextId, later(3)), true);
+  assert.equal(await revokeNameInStore(store, person.id, "ハル", nextId, later(4)), false, "already revoked");
+  assert.deepEqual(aliasNameLists((await store.readState()).people), [["りこさん", "りっちゃん"]]);
+  assert.equal((await store.readState()).pending.length, 2);
 });
 
 test("a malformed device cache is dropped (the Vault has the decisions)", () => {
@@ -327,7 +358,7 @@ test("person context: confirmed names are one person; unconfirmed (or after a re
   assert.deepEqual(personsForTurn(memories, "りこさんとりっちゃんの話", [], []).length, 2);
   const joined = buildPersonContext(memories, "りこ", { aliases });
   const apart = buildPersonContext(memories, "りこ", { aliases: [] });
-  const idsOf = (c: unknown) => JSON.stringify(c).match(/"a[12]"/g) ?? [];
+  const idsOf = (c: unknown): string[] => [...(JSON.stringify(c).match(/"a[12]"/g) ?? [])];
   assert.ok(idsOf(joined).includes('"a2"'));
   assert.ok(!idsOf(apart).includes('"a2"'));
 });

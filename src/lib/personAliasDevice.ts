@@ -6,10 +6,11 @@
 
 import { ulid } from "ulid";
 import { getVaultIdentityRecord, readPeopleStateRaw, updatePeopleStateRaw } from "./db";
-import { aliasNameLists, planConfirm, planRevoke, personFileName, type PersonRecord } from "./personAlias";
-import { PEOPLE_DIR, parsePeopleState, recordPersonDecisions, syncPeopleWithVault, type PeopleState, type PeopleStoreEnv, type PeopleSyncResult, type PeopleVaultEnv } from "./personAliasStore";
+import { aliasNameLists, type ConfirmPlan, type PersonRecord } from "./personAlias";
+import { PEOPLE_DIR, confirmPeopleInStore, parsePeopleState, revokeNameInStore, syncPeopleWithVault, type PeopleState, type PeopleStoreEnv, type PeopleSyncResult, type PeopleVaultEnv } from "./personAliasStore";
 import { vaultProjectionPrimitives } from "./vault";
 import { isRecoveryBlockingNormalWrites } from "./vaultRecoveryJournal";
+import { withVaultSaveLock } from "./vaultSaveLock";
 
 export const devicePeopleStore: PeopleStoreEnv = {
   async readState() {
@@ -37,27 +38,16 @@ export async function loadConfirmedAliasLists(): Promise<string[][]> {
   return aliasNameLists(await loadConfirmedPeople());
 }
 
-export type ConfirmOutcome = ReturnType<typeof planConfirm>;
+export type ConfirmOutcome = ConfirmPlan;
 
-/** the user confirmed on the page that these names are one person */
-export async function confirmSamePerson(names: string[]): Promise<ConfirmOutcome> {
-  const people = (await devicePeopleStore.readState()).people;
-  const now = new Date().toISOString();
-  const plan = planConfirm(people, names, { newDecisionId: ulid, newPersonId: ulid }, now);
-  if (!plan.ok) return plan;
-  const first = names.find((n) => n.trim()) ?? "person";
-  await recordPersonDecisions(devicePeopleStore, plan.personId, plan.decisions, plan.isNew ? { fileName: personFileName(first, plan.personId), createdAt: now } : undefined);
-  return plan;
+/** the user confirmed on the page that these names are one person (checked and recorded in one transaction) */
+export function confirmSamePerson(names: string[]): Promise<ConfirmOutcome> {
+  return confirmPeopleInStore(devicePeopleStore, names, { newDecisionId: ulid, newPersonId: ulid }, new Date().toISOString());
 }
 
 /** the user undid one name of a person */
-export async function revokeName(personId: string, name: string): Promise<boolean> {
-  const person = (await devicePeopleStore.readState()).people.find((p) => p.id === personId);
-  if (!person) return false;
-  const decision = planRevoke(person, name, ulid, new Date().toISOString());
-  if (!decision) return false;
-  await recordPersonDecisions(devicePeopleStore, personId, [decision]);
-  return true;
+export function revokeName(personId: string, name: string): Promise<boolean> {
+  return revokeNameInStore(devicePeopleStore, personId, name, ulid, new Date().toISOString());
 }
 
 const isNotFound = (e: unknown) => e instanceof DOMException && (e.name === "NotFoundError" || e.name === "TypeMismatchError");
@@ -123,11 +113,12 @@ export function vaultPeopleEnv(root: FileSystemDirectoryHandle): PeopleVaultEnv 
 const PEOPLE_LOCK = "tsumugi-people-sync";
 
 /**
- * Read the People/ notes into this device and write the decisions made here. Called after the save-foundation bootstrap (inside its Vault world lock);
+ * Read the People/ notes into this device and write the decisions made here. Called after the save-foundation bootstrap, under the Vault save lock;
  * one at a time across tabs. Never throws: a failure leaves the decisions pending for the next start.
  */
 export async function syncPeopleOnStartup(root: FileSystemDirectoryHandle): Promise<PeopleSyncResult | null> {
-  const run = () => syncPeopleWithVault(devicePeopleStore, vaultPeopleEnv(root));
+  // under the Vault save lock, as every save: no repair, restore or other save of this Vault runs while People/ is read and written
+  const run = () => withVaultSaveLock(() => syncPeopleWithVault(devicePeopleStore, vaultPeopleEnv(root)));
   try {
     if (typeof navigator !== "undefined" && navigator.locks) return await navigator.locks.request(PEOPLE_LOCK, run);
     return await run();

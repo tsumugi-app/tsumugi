@@ -10,7 +10,7 @@
  * Source. A person row there would break other devices that run an older build and mislabel findings. People notes are therefore found by reading
  * People/ (they are few), and the merge is a union of decisions, which can not lose one.
  *
- * Sync (`syncPeopleWithVault`), run after the save-foundation bootstrap of the app's startup (inside its Vault world lock), never in parallel (Web Lock):
+ * Sync (`syncPeopleWithVault`), run after the save-foundation bootstrap of the app's startup, under the Vault save lock (as every save), one at a time:
  *   1. the Vault must be the paired one (the identity file matches this device's pairing) and no repair may be in progress; otherwise nothing is read
  *      or written
  *   2. read every People/*.md; a person note that can not be read whole is never written over (its name is reported)
@@ -18,11 +18,11 @@
  *   4. write the person's note when the Vault lacks a decision (over a note the app wrote and nobody edited since; a note edited by hand or any other file
  *      is never written over: a new file is written next to it); read it back; only a note that holds every decision clears `pending`
  *   5. a person that is in the device cache but not in the Vault and has nothing pending was removed from the Vault: it is removed here too (only after a
- *      complete read of People/)
+ *      complete read of People/ in which every person note could be read: a note broken by hand never makes its person disappear)
  *   6. the device cache is updated in one transaction, merged again with anything decided meanwhile
  * Nothing else in the Vault is touched; no Memory, Conversation or keyword is read for this or changed.
  */
-import { isPersonRecord, mergePerson, parsePersonMarkdown, personCovers, personToMarkdown, type PersonRecord } from "./personAlias";
+import { isPersonRecord, mergePerson, parsePersonMarkdown, personCovers, personFileName, personToMarkdown, planConfirm, planRevoke, type ConfirmPlan, type PersonRecord } from "./personAlias";
 
 export const PEOPLE_STORE_KEY = "people:v1";
 export const PEOPLE_DIR = "People";
@@ -84,6 +84,33 @@ export async function recordPersonDecisions(env: PeopleStoreEnv, personId: strin
       state: { people: [...state.people.filter((p) => p.id !== personId), next], pending: [...new Set([...state.pending, personId])] },
       result: next,
     };
+  });
+}
+
+/**
+ * The user's confirm, planned and recorded in ONE transaction: the refusals (another person, contested, already confirmed) are checked against the cache as
+ * it is when the decisions are written, never against an earlier read (a sync in another tab may have changed it).
+ */
+export async function confirmPeopleInStore(env: PeopleStoreEnv, names: string[], ids: { newDecisionId: () => string; newPersonId: () => string }, now: string): Promise<ConfirmPlan> {
+  return env.updateState((state) => {
+    const plan = planConfirm(state.people, names, ids, now);
+    if (!plan.ok) return { state, result: plan };
+    const existing = state.people.find((p) => p.id === plan.personId);
+    const first = names.find((n) => n.trim()) ?? "person";
+    const base: PersonRecord = existing ?? { id: plan.personId, fileName: personFileName(first, plan.personId), createdAt: now, decisions: [] };
+    const next = mergePerson(base, { ...base, decisions: plan.decisions });
+    return { state: { people: [...state.people.filter((p) => p.id !== plan.personId), next], pending: [...new Set([...state.pending, plan.personId])] }, result: plan };
+  });
+}
+
+/** the user's revoke of one name, planned and recorded in one transaction (false when the name is no longer active in that person) */
+export async function revokeNameInStore(env: PeopleStoreEnv, personId: string, name: string, newDecisionId: () => string, now: string): Promise<boolean> {
+  return env.updateState((state) => {
+    const person = state.people.find((p) => p.id === personId);
+    const decision = person ? planRevoke(person, name, newDecisionId, now) : null;
+    if (!person || !decision) return { state, result: false };
+    const next = mergePerson(person, { ...person, decisions: [decision] });
+    return { state: { people: [...state.people.filter((p) => p.id !== personId), next], pending: [...new Set([...state.pending, personId])] }, result: true };
   });
 }
 
@@ -186,7 +213,7 @@ export async function syncPeopleWithVault(store: PeopleStoreEnv, vault: PeopleVa
     for (const id of all) {
       const mine = state.people.find((p) => p.id === id);
       const theirs = vaultNow.get(id);
-      if (mine && !theirs && !state.pending.includes(id) && listing.complete && !local.pending.includes(id)) { removed += 1; continue; }
+      if (mine && !theirs && !state.pending.includes(id) && listing.complete && result.unreadable.length === 0 && !local.pending.includes(id)) { removed += 1; continue; }
       const merged = mine && theirs ? mergePerson(mine, theirs) : (mine ?? theirs)!;
       people.push(merged);
       if (!theirs || !personCovers(theirs, merged)) pending.push(id);
