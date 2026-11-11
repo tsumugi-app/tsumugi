@@ -348,6 +348,15 @@ test("an exported copy is accepted only if it is byte-identical to the verified 
   assert.deepEqual(await backup.verifyExportedBackup(other.zip, r), { ok: false, reason: "different-file" });
 });
 
+test("Memory Graph P1-B: the People/ notes (confirmed names) are in the backup, and the device cache of them is in the device snapshot", async () => {
+  const note = "---\nid: 01PERSONFICTION0001\ntsumugi: true\ntype: person\n---\n架空の人物メモ\n";
+  const r = await backup.createVaultBackup(env(new MemVault({ ...VAULT_FILES, "People/架空 (on0001).md": note }), () => device({ settings: [{ key: "people:v1", value: "{\"people\":[],\"pending\":[]}" }] } as never)));
+  assert.equal(r.ok, true, JSON.stringify(r)); if (!r.ok) return;
+  const entries = new Map(zip.readZipEntries(r.zip).map((e) => [e.path, e]));
+  assert.ok(entries.has("vault/People/架空 (on0001).md"));
+  assert.equal(backup.isBackedUpVaultPath("People/架空 (on0001).md"), true);
+});
+
 test("which Vault paths are backed up", () => {
   for (const p of ["Memories/a.md", "x/y/z.MD", ".tsumugi/index.json", ".tsumugi/registry/0a.json", ".tsumugi-archive/a/b.md", ".tsumugi/.x/y.json"]) assert.equal(backup.isBackedUpVaultPath(p), true, p);
   for (const p of [".tsumugi/repair-backup/x.zip", ".tsumugi/repair-backup", ".obsidian/a.json", "Memories/.hidden.md", "Memories/photo.png", ".trash/a.md"]) assert.equal(backup.isBackedUpVaultPath(p), false, p);

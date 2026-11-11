@@ -3,6 +3,7 @@
 import { memoryTimelineEnabled } from "@/lib/memoryTimelineFlag";
 import { memorySynthesisEnabled } from "@/lib/memorySynthesisFlag";
 import { memoryGraphEnabled } from "@/lib/memoryGraphFlag";
+import { loadConfirmedAliasLists } from "@/lib/personAliasDevice";
 import { selectPersonContextsForTurn, withoutCoveredPersonViews, type PersonContext } from "@/lib/personContext";
 import { recordSynthesisShown, runSynthesisAfterSession, synthesisContextForTurn } from "@/lib/synthesisChat";
 import { safeSelectTimelineForTurn, type SynthesisThemeContext } from "@/lib/memorySynthesis";
@@ -5029,6 +5030,8 @@ export default function ChatScreen() {
         .filter((turn) => turn.role === "user")
         .map((turn) => turn.content.trim())
         .filter(Boolean);
+      // Memory Graph P1-B（試験フラグONのときだけ）：本人が確定した同じ人物の名前の組（端末内。読めなければ空＝従来どおり）
+      const personAliases = memoryGraphEnabled() ? await loadConfirmedAliasLists() : [];
       const retrievedMemories = await retrieveRelevantMemories(text, {
         excludeConversationId: baseConversation.id,
         limit: reflective ? REFLECTIVE_LIMIT : undefined,
@@ -5038,6 +5041,7 @@ export default function ChatScreen() {
         recentUserTurnsTexts,
         // 会話品質改善 第1段階：選ばれたMemoryに、話題の人物と、要約に無い本人の発言の一文を添える（memoryContext.ts）
         includeContext: true,
+        personAliases,
       });
 
       // Recent Conversation Context（Current Conversation → Recent Conversation → Memory Retrieval
@@ -5132,7 +5136,7 @@ export default function ChatScreen() {
         }
         if (memoryGraphEnabled()) {
           // 失敗しても空配列（personContext.ts）。この人物のPersonViewは背景に含まれるので二重に送らない
-          personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id) });
+          personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id), aliases: personAliases });
           personViewContext = withoutCoveredPersonViews(personViewContext, personGraphContext);
         }
         if (memorySynthesisEnabled()) {

@@ -1875,6 +1875,31 @@ export async function saveAutoCaptureStateRaw(json: string) {
   await db.put("settings", json, AUTO_CAPTURE_STATE_KEY);
 }
 
+/**
+ * Memory Graph P1-B（personAliasStore.ts）：本人が確定した人物の別名の、端末側の写し（Vaultの`People/`が正本）。値の解釈はpersonAliasStore.ts。
+ * 読み書きは1つのtransactionで行う（同じ端末の別タブの確定と混ざっても、どちらも失わない）。
+ */
+// Vaultごとに別のキー（別のVaultへ切り替えても、前のVaultの確定は混ざらない。戻せば前の確定と未保存の決定がそのまま使える）
+const peopleStateKey = (vaultId: string) => `people:v1:${vaultId}`;
+export async function readPeopleStateRaw(vaultId: string): Promise<unknown> {
+  const db = await getDB();
+  return db.get("settings", peopleStateKey(vaultId));
+}
+export async function updatePeopleStateRaw<T>(vaultId: string, fn: (raw: unknown) => { value: string; result: T }): Promise<T> {
+  const db = await getDB();
+  const tx = db.transaction(["settings"], "readwrite");
+  let result: T;
+  try {
+    const out = fn(await tx.objectStore("settings").get(peopleStateKey(vaultId)));
+    await tx.objectStore("settings").put(out.value, peopleStateKey(vaultId));
+    result = out.result;
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return result!;
+}
+
 const REALTIME_DIARY_AUTO_SETTINGS_KEY = "realtimeDiaryAuto:settings";
 const REALTIME_DIARY_AUTO_STATE_KEY = "realtimeDiaryAuto:state";
 

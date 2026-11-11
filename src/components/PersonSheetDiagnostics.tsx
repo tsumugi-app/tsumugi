@@ -5,14 +5,18 @@
  * 各行に「本人の発言／AIの要約／Connectの推測」の区別と、根拠のMemory（末尾6桁のid）を出す。idを押すと、そのMemoryの保存内容を表示する。
  * 件数・文字数の上限は設けない（長い節は折りたたむ）。
  * 別名の候補は「この画面だけ一緒に見る」で一時的にまとめて表示できる（保存しない。ページを開き直すと戻る）。
+ * Memory Graph P1-B：一緒に表示した名前は、本人が確認して「同じ人物として確定」できる（personAliasDevice.ts。保存はPeople/の人物ノートと
+ * その端末側の写しだけ。記憶は書き換えない）。確定した名前は常に一緒に表示し、名前ごとに外せる。
  * 「記憶を探す」は、言葉を含むMemoryについて、このシートに出ているか・出ていないならなぜかを示す。
  */
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { buildPersonSheet, findInPersonSheet, listSheetPersons, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_MATCH_LABEL, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetPlan, type SheetText } from "@/lib/personSheet";
+import { buildPersonSheet, findInPersonSheet, listSheetPersons, personSheetKey, type PersonSheet, PERSON_RELATION_LABEL_JA, renderPersonSheetText, SHEET_MATCH_LABEL, SHEET_SOURCE_LABEL, type PersonListEntry, type SheetPlan, type SheetText } from "@/lib/personSheet";
 import { STATEMENT_ROLE_LABEL } from "@/lib/personStatement";
 import { readMemoriesForPersonSheet } from "@/lib/personSheetRead";
 import { buildPersonContext } from "@/lib/personContext";
 import { buildPersonContextSection, sanitizePersonContext } from "@/lib/personContextPrompt";
+import { aliasGroupsOf, contestedKeys, personOfName, type PersonRecord } from "@/lib/personAlias";
+import { confirmSamePerson, loadConfirmedPeople, revokeName } from "@/lib/personAliasDevice";
 import type { MemoryObject } from "@/lib/types";
 
 const shortId = (id: string) => `#${id.slice(-6)}`;
@@ -69,11 +73,15 @@ export default function PersonSheetDiagnostics() {
   /** other names shown together with the selected one, on this page only (never stored) */
   const [withKeys, setWithKeys] = useState<string[]>([]);
   const [findWords, setFindWords] = useState("");
+  /** Memory Graph P1-B: the people the user confirmed (saved; the Vault's People/ notes are the source) */
+  const [people, setPeople] = useState<PersonRecord[]>([]);
+  const [peopleStatus, setPeopleStatus] = useState("");
 
   async function load() {
     setStatus("読み込んでいます…");
     try {
       const result = await readMemoriesForPersonSheet();
+      setPeople(await loadConfirmedPeople());
       setMemories(result.memories);
       setSelected(null);
       setWithKeys([]);
@@ -85,28 +93,67 @@ export default function PersonSheetDiagnostics() {
   }
 
   const persons: PersonListEntry[] = useMemo(() => (memories ? listSheetPersons(memories) : []), [memories]);
+  // the confirmed group of the selected name (shown together always), and the names shown together on this page only
+  const confirmedGroup = useMemo(() => {
+    const group = selected ? aliasGroupsOf(people).find((g) => g.names.some((n) => personSheetKey(n) === selected)) : undefined;
+    return group ? { ...group, keys: group.names.map(personSheetKey) } : null;
+  }, [people, selected]);
+  const contested = useMemo(() => [...contestedKeys(people)], [people]);
+  const shownWith = useMemo(() => [...new Set([...(confirmedGroup?.keys ?? []).filter((k) => k !== selected), ...withKeys])], [confirmedGroup, selected, withKeys]);
+  const nameOf = (key: string) => persons.find((p) => p.key === key)?.names[0] ?? key;
+  async function confirmShownTogether() {
+    if (!selected || withKeys.length === 0) return;
+    const names = [nameOf(selected), ...withKeys.map(nameOf)];
+    if (!window.confirm(`次の名前を、同じ人物として保存します。\n\n${names.map((n) => `「${n}」`).join("\n")}\n\n記憶の本文や名前は書き換えません。あとで解除できます。`)) return;
+    try {
+      const outcome = await confirmSamePerson(names);
+      if (!outcome.ok) {
+        const named = ("names" in outcome ? outcome.names : undefined) ?? [];
+        setPeopleStatus(outcome.reason === "no-vault" ? "Vaultが選ばれていないため確定できません。アプリでVaultを選んでから確定してください。"
+          : outcome.reason === "in-other-person" ? `別の人物として確定済みの名前があります（${named.join("、")}）。先にそちらを解除してください。`
+          : outcome.reason === "contested" ? `ほかの端末と食い違っている名前があります（${named.join("、")}）。先に解除してください。`
+            : outcome.reason === "already-confirmed" ? "すでに同じ人物として確定しています。" : "2つ以上の違う名前を選んでください。");
+        return;
+      }
+      setPeople(await loadConfirmedPeople());
+      setWithKeys([]);
+      setPeopleStatus("同じ人物として保存しました。保存先（People/）には、次にアプリを開いたときに書き込みます。");
+    } catch (error) {
+      setPeopleStatus(`保存できませんでした：${String(error)}`);
+    }
+  }
+  async function undoName(personId: string, name: string) {
+    if (!window.confirm(`「${name}」を、この人物から外します。外した名前は、元どおり別の名前として扱います。`)) return;
+    try {
+      const done = await revokeName(personId, name);
+      setPeople(await loadConfirmedPeople());
+      setPeopleStatus(done ? `「${name}」を外しました。保存先（People/）には、次にアプリを開いたときに書き込みます。` : "すでに外れています。");
+    } catch (error) {
+      setPeopleStatus(`解除できませんでした：${String(error)}`);
+    }
+  }
   // building the sheet must never take the page down: an unexpected record shows an error instead
   const built = useMemo((): { sheet: PersonSheet | null; error?: string } => {
     if (!memories || !selected) return { sheet: null };
     try {
-      return { sheet: buildPersonSheet(memories, selected, { withKeys }) };
+      return { sheet: buildPersonSheet(memories, selected, { withKeys: shownWith }) };
     } catch (error) {
       return { sheet: null, error: String(error) };
     }
-  }, [memories, selected, withKeys]);
+  }, [memories, selected, shownWith]);
   const sheet = built.sheet;
   // Memory Graph P1-A: the background the chat would receive for this person (flag ON), with the names shown together on this page as confirmed aliases
   const chatPreview = useMemo((): string | null => {
     if (!memories || !selected) return null;
     try {
-      const context = buildPersonContext(memories, selected, { aliases: withKeys.length > 0 ? [[selected, ...withKeys]] : [] });
+      const context = buildPersonContext(memories, selected, { aliases: shownWith.length > 0 ? [[selected, ...shownWith]] : [] });
       // as the chat sends it (an empty context is not sent) and as the route checks it again
       const sent = context.memoryIds.length > 0 || context.relation ? sanitizePersonContext([context]) : [];
       return buildPersonContextSection(sent) || "（会話に渡す背景はありません）";
     } catch (error) {
       return `作れませんでした：${String(error)}`;
     }
-  }, [memories, selected, withKeys]);
+  }, [memories, selected, shownWith]);
   const byId = useMemo(() => new Map((memories ?? []).map((m) => [m.id, m] as const)), [memories]);
   const found = useMemo(() => {
     if (!memories || !sheet || !findWords.trim()) return null;
@@ -153,7 +200,7 @@ export default function PersonSheetDiagnostics() {
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 bg-stone-50 px-4 py-6 text-stone-800 dark:bg-stone-950 dark:text-stone-100">
       <h1 className="text-lg">人物シート（試作）</h1>
       <p className="text-xs leading-relaxed text-stone-500 dark:text-stone-400">
-        この端末に保存された記憶から、人物ごとの情報をその場で組み立てます。読み取りだけで、保存・変更・AIの呼び出しはしません。会話の返答には使われません。
+        この端末に保存された記憶から、人物ごとの情報をその場で組み立てます。記憶の保存・変更・AIの呼び出しはしません。保存するのは、本人が「同じ人物」と確定した名前だけです（保存先のPeople/）。
         「本人の発言」は保存された逐語、「AIの要約」は記憶を作ったAIの文、「Connectの推測」はAIが判定したつながりです。現在の状態や因果関係は断定しません。
       </p>
       <div className="flex flex-wrap items-center gap-2">
@@ -210,12 +257,43 @@ export default function PersonSheetDiagnostics() {
               似た名前があります（別人として扱っています。取り違えに注意）：{sheet.similarNames.join("、")}
             </p>
           )}
-          <Section title={`同じ人かもしれない別の名前（${sheet.aliasCandidates.length}）`} note="同じ話題・Connectのつながりなどがある別の名前。推測で、まとめてはいない。「この画面だけ一緒に見る」は保存せず、ページを開き直すと戻る。同じ人かどうかは本人が判断する。">
-            {sheet.keys.length > 1 && (
-              <p className="rounded-xl border border-amber-500/60 p-2 text-xs text-amber-700 dark:text-amber-300">
-                この画面だけ一緒に表示中（同じ人とは確定していない）：{sheet.keys.join("、")}
-                <button type="button" onClick={() => setWithKeys([])} className="ml-2 underline">元に戻す</button>
+          <Section title="同じ人物として確定した名前" note="本人が確定した呼び方だけをまとめる（推測ではまとめない）。保存先のPeople/に残り、会話の背景（Memory Graph）と記憶の選び方で同じ人物として使う。記憶の本文や名前は書き換えない。">
+            {confirmedGroup ? (
+              <div className="flex flex-col gap-1 text-sm">
+                {confirmedGroup.names.map((n) => (
+                  <p key={n} className="flex flex-wrap items-center gap-2">
+                    <span>「{n}」</span>
+                    <button type="button" onClick={() => void undoName(confirmedGroup.personId, n)} className="text-xs underline">この名前を外す</button>
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-stone-400">（確定した別の名前はありません。下の候補を一緒に表示して、確定できます）</p>
+            )}
+            {(() => {
+              // a name of the selected person that is no longer in a group (one name left) is shown so it can still be undone
+              const own = selected && !confirmedGroup ? personOfName(people, selected) : undefined;
+              return own ? <p className="text-xs text-stone-500">この名前は確定済みの人物に入っています（ほかの名前は外れています）。<button type="button" onClick={() => void undoName(own.id, nameOf(selected!))} className="underline">外す</button></p> : null;
+            })()}
+            {contested.length > 0 && (
+              <p className="rounded-xl border border-rose-400/60 p-2 text-xs text-rose-700 dark:text-rose-300">
+                別々の人物として確定されている名前があります（別の端末での確定と食い違い）。この名前はどちらにもまとめていません：{contested.join("、")}
               </p>
+            )}
+            {peopleStatus && <p className="text-xs text-stone-500">{peopleStatus}</p>}
+          </Section>
+
+          <Section title={`同じ人かもしれない別の名前（${sheet.aliasCandidates.length}）`} note="同じ話題・Connectのつながりなどがある別の名前。推測で、まとめてはいない。「この画面だけ一緒に見る」は保存せず、ページを開き直すと戻る。同じ人かどうかは本人が判断する。">
+            {withKeys.length > 0 && (
+              <div className="rounded-xl border border-amber-500/60 p-2 text-xs text-amber-700 dark:text-amber-300">
+                <p>
+                  この画面だけ一緒に表示中（同じ人とは確定していない）：{[selected ?? "", ...withKeys].map(nameOf).join("、")}
+                  <button type="button" onClick={() => setWithKeys([])} className="ml-2 underline">元に戻す</button>
+                </p>
+                <button type="button" onClick={() => void confirmShownTogether()} className="mt-1 rounded-full border border-amber-600/60 px-3 py-1 text-xs">
+                  これらを同じ人物として確定する
+                </button>
+              </div>
             )}
             {sheet.aliasCandidates.length === 0 && <None />}
             {sheet.aliasCandidates.map((c) => (
