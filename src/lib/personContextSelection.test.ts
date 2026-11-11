@@ -165,7 +165,8 @@ test("case 5: a question or a request to the AI, saved with a plan word in its s
   const section = buildPersonContextSection(sanitizePersonContext([context]));
   assert.match(section, /- 予定 \[AIの要約 2026-10-14\] 来週そらさんと映画に行く予定。/);
   assert.match(section, /- 希望（予定ではない） \[AIの要約 2026-10-15\]/);
-  assert.doesNotMatch(section, /整理したい/);
+  assert.doesNotMatch(section, /整理したい/, "neither a plan nor an event");
+  assert.ok(!context.events.some((e) => e.memoryId === "q1"));
 });
 
 test("case 6: nameless records of the same conversation or topic are candidates only with a telling shared word AND a structural link", () => {
@@ -193,6 +194,9 @@ test("case 6: nameless records of the same conversation or topic are candidates 
   assert.equal(why("n6")?.why, "会話・話題のつながりだけで、この人の話と分かる言葉が無い");
   assert.match(why("n5")?.why ?? "", /ほかの人物の話もある会話/);
   assert.match(why("n4")?.why ?? "", /共通の言葉だけ/);
+  // the user's later explanation is shown once, under the user's own conclusion (not again under the candidate)
+  const under = context.conclusions.filter((c) => c.reasons.some((r) => r.memoryId === "x9")).map((c) => c.statement.memoryId);
+  assert.deepEqual(under, ["s3"]);
   // a candidate is never turned into a fact: marked as one wherever it is shown
   const shown = [...context.conclusions.map((c) => c.statement), ...context.candidates].filter((t) => t.memoryId === "n1");
   assert.ok(shown.length > 0 && shown.every((t) => t.kind === "candidate"));

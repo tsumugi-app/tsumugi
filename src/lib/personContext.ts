@@ -336,6 +336,18 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   }
   const finalCovered = new Set(picked.flatMap((c) => c.reasons.filter((r) => r.when === "later").map(idOf)));
   const keptConclusions = picked.sort((a, b) => all.indexOf(a) - all.indexOf(b));
+  // one later explanation is shown under one conclusion only: the user's own words before a candidate, a shared topic before shared words, then
+  // the earlier conclusion
+  const rankOf = (c: PersonContextConclusion, r: PersonContextConclusion["reasons"][number]) => (c.statement.kind === "user" ? 0 : 2) + (r.link === "topic" ? 0 : 1);
+  const ownerOf = new Map<string, { c: PersonContextConclusion; rank: number }>();
+  for (const c of keptConclusions) {
+    for (const r of c.reasons) {
+      if (r.when !== "later") continue;
+      const cur = ownerOf.get(idOf(r));
+      if (!cur || rankOf(c, r) < cur.rank) ownerOf.set(idOf(r), { c, rank: rankOf(c, r) });
+    }
+  }
+  for (const c of keptConclusions) c.reasons = c.reasons.filter((r) => r.when !== "later" || ownerOf.get(idOf(r))?.c === c);
   for (const c of all) {
     const x = sourceOf.get(c)!;
     const kept = keptConclusions.includes(c);
@@ -361,7 +373,9 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     }];
   }).slice(-L.maxPlans);
 
-  const events = sheet.records.filter((r) => r.match === "mention" && !given.has(r.memoryId) && fits(r.summary.text)).slice(-L.maxEvents).map((r) => text("summary", r.summary));
+  // a record that only asked or requested something of the AI is not an event of this person either
+  const askedAi = new Set(trace.plans.filter((p) => p.kind === "ask-ai").map((p) => p.memoryId));
+  const events = sheet.records.filter((r) => r.match === "mention" && !given.has(r.memoryId) && !askedAi.has(r.memoryId) && fits(r.summary.text)).slice(-L.maxEvents).map((r) => text("summary", r.summary));
   const keptCandidates = candidates.filter((c) => !conclusionCandidateTexts.has(`${c.memoryId}:${statementKey(c.text)}`)).sort((a, b) => b.signals.length - a.signals.length || timeOf(b.day) - timeOf(a.day)).slice(0, L.maxCandidates);
 
   const relation = sheet.overview.relation;
