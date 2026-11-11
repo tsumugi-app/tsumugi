@@ -12,22 +12,32 @@ import { vaultProjectionPrimitives } from "./vault";
 import { isRecoveryBlockingNormalWrites } from "./vaultRecoveryJournal";
 import { withVaultSaveLock } from "./vaultSaveLock";
 
-export const devicePeopleStore: PeopleStoreEnv = {
-  async readState() {
-    return parsePeopleState(await readPeopleStateRaw());
-  },
-  updateState<T>(fn: (state: PeopleState) => { state: PeopleState; result: T }) {
-    return updatePeopleStateRaw((raw) => {
-      const out = fn(parsePeopleState(raw));
-      return { value: JSON.stringify(out.state), result: out.result };
-    });
-  },
-};
+/** the device cache of one Vault (every Vault has its own: confirmations of one Vault never join people in another) */
+export function devicePeopleStore(vaultId: string): PeopleStoreEnv {
+  return {
+    async readState() {
+      return parsePeopleState(await readPeopleStateRaw(vaultId));
+    },
+    updateState<T>(fn: (state: PeopleState) => { state: PeopleState; result: T }) {
+      return updatePeopleStateRaw(vaultId, (raw) => {
+        const out = fn(parsePeopleState(raw));
+        return { value: JSON.stringify(out.state), result: out.result };
+      });
+    },
+  };
+}
 
-/** the confirmed people of this device (never throws: [] when the cache can not be read) */
+/** the Vault this device is paired with now (null when none) */
+async function currentVaultId(): Promise<string | null> {
+  const id = (await getVaultIdentityRecord())?.vaultId;
+  return typeof id === "string" && id ? id : null;
+}
+
+/** the confirmed people of the current Vault (never throws: [] when there is none or the cache can not be read) */
 export async function loadConfirmedPeople(): Promise<PersonRecord[]> {
   try {
-    return (await devicePeopleStore.readState()).people;
+    const vaultId = await currentVaultId();
+    return vaultId ? (await devicePeopleStore(vaultId).readState()).people : [];
   } catch {
     return [];
   }
@@ -41,18 +51,22 @@ export async function loadConfirmedAliasLists(): Promise<string[][]> {
 export type ConfirmOutcome = ConfirmPlan;
 
 /** the user confirmed on the page that these names are one person (checked and recorded in one transaction) */
-export function confirmSamePerson(names: string[]): Promise<ConfirmOutcome> {
-  return confirmPeopleInStore(devicePeopleStore, names, { newDecisionId: ulid, newPersonId: ulid }, new Date().toISOString());
+export async function confirmSamePerson(names: string[]): Promise<ConfirmOutcome | { ok: false; reason: "no-vault" }> {
+  const vaultId = await currentVaultId();
+  if (!vaultId) return { ok: false, reason: "no-vault" };
+  return confirmPeopleInStore(devicePeopleStore(vaultId), names, { newDecisionId: ulid, newPersonId: ulid }, new Date().toISOString());
 }
 
 /** the user undid one name of a person */
-export function revokeName(personId: string, name: string): Promise<boolean> {
-  return revokeNameInStore(devicePeopleStore, personId, name, ulid, new Date().toISOString());
+export async function revokeName(personId: string, name: string): Promise<boolean> {
+  const vaultId = await currentVaultId();
+  if (!vaultId) return false;
+  return revokeNameInStore(devicePeopleStore(vaultId), personId, name, ulid, new Date().toISOString());
 }
 
 const isNotFound = (e: unknown) => e instanceof DOMException && (e.name === "NotFoundError" || e.name === "TypeMismatchError");
 
-export function vaultPeopleEnv(root: FileSystemDirectoryHandle): PeopleVaultEnv {
+export function vaultPeopleEnv(root: FileSystemDirectoryHandle, vaultId: string): PeopleVaultEnv {
   return {
     async listPeopleFiles() {
       let dir: FileSystemDirectoryHandle;
@@ -98,7 +112,7 @@ export function vaultPeopleEnv(root: FileSystemDirectoryHandle): PeopleVaultEnv 
         // a repair or maintenance of this Vault in progress: nothing is read or written (as every normal save)
         if (await isRecoveryBlockingNormalWrites()) return false;
         const paired = (await getVaultIdentityRecord())?.vaultId;
-        if (!paired) return false;
+        if (!paired || paired !== vaultId) return false;
         const dir = await root.getDirectoryHandle(".tsumugi", { create: false });
         const text = await (await (await dir.getFileHandle("vault-identity.json", { create: false })).getFile()).text();
         const onDisk = (JSON.parse(text) as { vaultId?: unknown }).vaultId;
@@ -118,7 +132,11 @@ const PEOPLE_LOCK = "tsumugi-people-sync";
  */
 export async function syncPeopleOnStartup(root: FileSystemDirectoryHandle): Promise<PeopleSyncResult | null> {
   // under the Vault save lock, as every save: no repair, restore or other save of this Vault runs while People/ is read and written
-  const run = () => withVaultSaveLock(() => syncPeopleWithVault(devicePeopleStore, vaultPeopleEnv(root)));
+  const run = () => withVaultSaveLock(async () => {
+    const vaultId = await currentVaultId();
+    if (!vaultId) return null;
+    return syncPeopleWithVault(devicePeopleStore(vaultId), vaultPeopleEnv(root, vaultId));
+  });
   try {
     if (typeof navigator !== "undefined" && navigator.locks) return await navigator.locks.request(PEOPLE_LOCK, run);
     return await run();

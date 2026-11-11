@@ -643,6 +643,14 @@ export function personKeysInText(text: string, keys: string[]): string[] {
   return found;
 }
 
+/** 発言の中の名前を、確定した組の最初の名前に置き換える（長い名前から伏せるので、「まりこ」の中の「りこ」は置き換えない） */
+function withCanonicalNames(text: string, keys: string[], canonical: (key: string) => string): string {
+  const sorted = [...keys].sort((a, b) => Array.from(b).length - Array.from(a).length);
+  let masked = nfkcCompact(text);
+  sorted.forEach((key, index) => { masked = masked.split(key).join(`\u0001${index}\u0002`); });
+  return masked.replace(/\u0001(\d+)\u0002/g, (_, index: string) => canonical(sorted[Number(index)]));
+}
+
 export function isAboutPerson(memory: MemoryObject, key: string): boolean {
   if ((memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? mention.groupingKey ?? "") === key)) return true;
   return (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key);
@@ -718,11 +726,13 @@ export function selectConversationWithPersons(
     person = { key: named[0], how: "named" };
   } else if (named.length === 0) {
     // 従来の人物継続を、キーワードが名前と一致する記録（と、確定した同じ人物の別の名前の記録）もその人物の記録として扱った写しの上で使う
+    // 確定した名前の組は、組の最初の名前1つとして読む（発言の別名を置き換え、組のどの名前の記録もその名前の記録として扱う）。組が無ければ従来どおり
+    const canonical = (key: string) => groupKeys(key)[0];
     const linked = pool.map((memory) => {
-      const extra = keys.filter((key) => !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && groupKeys(key).some((k) => (k === key ? (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key) : isAboutPerson(memory, k))));
+      const extra = keys.filter((key) => canonical(key) === key && !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && groupKeys(key).some((k) => (k === key ? (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key) : isAboutPerson(memory, k))));
       return extra.length === 0 ? memory : ({ ...memory, personMentions: [...(memory.personMentions ?? []), ...extra.map((key) => ({ displayName: key, groupingKey: key }))] } as unknown as MemoryObject);
     });
-    const focus = deriveConversationPersonFocus(turns, linked);
+    const focus = deriveConversationPersonFocus(groupOf.size === 0 ? turns : turns.map((text) => withCanonicalNames(text, keys, canonical)), linked);
     if (focus) person = { key: personNameKey(focus.displayName), how: "carried" };
   }
   if (!person) return fallback();

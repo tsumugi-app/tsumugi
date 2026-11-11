@@ -23,11 +23,12 @@
 | 場所 | 内容 | 役割 |
 | --- | --- | --- |
 | Vault `People/<名前> (<id末尾6桁>).md` | 人物1人につき1ファイル。frontmatter（id・type: person・displayName・aliases・作成/更新日時）、読める履歴、確定/取り消しの記録（JSON1行、HTMLコメント内） | **正（source of truth）** |
-| IndexedDB `settings` ストア、キー `people:v1` | Vault の写しと、この端末でまだ Vault に書けていない決定（`pending`） | 派生。消えても次の同期で Vault から作り直す |
+| IndexedDB `settings` ストア、キー `people:v1:<vaultId>`（Vaultごと） | Vault の写しと、この端末でまだ Vault に書けていない決定（`pending`） | 派生。消えても次の同期で Vault から作り直す |
 
 - 記録は**追記のみ**。「確定」「取り消し」を1件ずつ id・日時付きで残し、現在の名前はそれを順に畳み込んで得る。訂正は「取り消し→確定」。履歴は消さない。
 - 2つの写し（2台の端末、Vault と端末）は、決定の和集合（id 単位）でまとめる。順序に依存せず、決定は失われない。
 - IndexedDB のバージョンは上げない（既存の `settings` ストアを使う）。
+- 端末の写しは Vault ごとに別。別の Vault に切り替えても、前の Vault の確定は会話に混ざらない（戻せば前の確定と未保存の決定がそのまま使える）。Vault が選ばれていない間は確定できない。
 - バックアップ／Export：`People/*.md` は既存の Vault バックアップの対象（`isBackedUpVaultPath`）。端末の写しも `settings` ストアとして端末スナップショットに入る。
 
 ### Registry / outbox を使わない理由
@@ -60,7 +61,7 @@
 - ChatScreen は毎ターン、端末の写しから確定した名前の組（`loadConfirmedAliasLists`）を読む。読めなければ空で、従来どおり。
   - Retrieval（`personAliases`）と、人物背景（P1-A の `aliases`）に渡す。
 - Retrieval（`selectConversationWithPersons`）：
-  - 組の名前は同じ人物として数える。両方の名前が出ても「2人」にしない。
+  - 組の名前は同じ人物として数える。両方の名前が出ても「2人」にしない（前の発言からの持ち越しでも同じ）。
   - 組のどの名前の記録も、その人物の記録として扱う。各 Memory は1回だけ。
   - 組に含まれない名前の記録は、従来どおり別の人物として外す。
   - 使う組は、既知の名前を1つ以上含み、キーが2つ以上あるものだけ。

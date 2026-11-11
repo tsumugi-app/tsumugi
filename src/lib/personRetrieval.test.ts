@@ -198,3 +198,12 @@ test("P1-B: a carried person keeps the confirmed group; another person's record 
   assert.equal(r.person?.how, "carried");
   assert.ok(!ids(r).includes("mr"));
 });
+
+test("P1-B: an earlier turn with two confirmed names of one person still carries that person (unconfirmed: two people, nothing carried)", () => {
+  const turns = ["りこさん、昔はりっちゃんって呼ばれてた", "新居はどのあたりなんだろう"];
+  assert.equal(select(ALIAS_POOL, turns[1], turns).person, null);
+  const r = selectWith(ALIAS_POOL, turns[1], [["りこさん", "りっちゃん"]], turns);
+  assert.equal(r.person?.how, "carried");
+  assert.ok(ids(r).includes("r2"));
+  assert.ok(!ids(r).includes("mr"));
+});

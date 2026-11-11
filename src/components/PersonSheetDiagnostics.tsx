@@ -108,8 +108,10 @@ export default function PersonSheetDiagnostics() {
     try {
       const outcome = await confirmSamePerson(names);
       if (!outcome.ok) {
-        setPeopleStatus(outcome.reason === "in-other-person" ? `別の人物として確定済みの名前があります（${(outcome.names ?? []).join("、")}）。先にそちらを解除してください。`
-          : outcome.reason === "contested" ? `ほかの端末と食い違っている名前があります（${(outcome.names ?? []).join("、")}）。先に解除してください。`
+        const named = ("names" in outcome ? outcome.names : undefined) ?? [];
+        setPeopleStatus(outcome.reason === "no-vault" ? "Vaultが選ばれていないため確定できません。アプリでVaultを選んでから確定してください。"
+          : outcome.reason === "in-other-person" ? `別の人物として確定済みの名前があります（${named.join("、")}）。先にそちらを解除してください。`
+          : outcome.reason === "contested" ? `ほかの端末と食い違っている名前があります（${named.join("、")}）。先に解除してください。`
             : outcome.reason === "already-confirmed" ? "すでに同じ人物として確定しています。" : "2つ以上の違う名前を選んでください。");
         return;
       }
