@@ -71,6 +71,16 @@ test("stances: a situation, a doubt and a passing feeling are told apart from a 
   assert.notEqual(s("態度が冷たい。"), "wish", "冷たい is an adjective, not a wish");
   assert.equal(s("これからも連絡を取り合うと思う。"), "view");
   assert.equal(s("楽しかった。"), "feeling");
+  // independent review: polite and hedged decisions, a decision after a doubt, が-ない situations, kana adjectives, unlisted judgments
+  assert.equal(s("もう連絡するのはやめます。"), "decision");
+  assert.equal(s("もう会いません。"), "decision");
+  assert.equal(s("やめようと思う。"), "view", "hedged: not decided yet");
+  assert.equal(s("どうしたらいいのか分からなかったけど、もう会わないことにした。"), "decision");
+  assert.notEqual(s("返事がない。"), "decision");
+  assert.notEqual(s("じれったい。"), "wish");
+  assert.notEqual(s("つめたい。"), "wish");
+  assert.equal(s("あの人は信用できない。"), "view");
+  assert.equal(stanceOf("実は来月引っ越すことになった。", "report").explains, false);
   assert.equal(stanceOf("未来がないと言ったのは、家庭があるからだ。", "judgment").explains, true);
   assert.equal(stanceOf("未来がないと言ったのは、家庭があるからだ。", "judgment").stance, "view", "an explanation is a view of its own");
 });
@@ -81,12 +91,14 @@ test("case 1: short situations and passing feelings no longer push out the user'
   const texts = kept.map((c) => c.statement.text);
   assert.ok(kept.length <= PERSON_CONTEXT_LIMITS.maxConclusions);
   for (const t of [WISH_1, WISH_2, CONCLUSION]) assert.ok(texts.includes(t), t);
-  for (const t of ["もう半年だよ。", "もう遅い。", "やっぱりつらい。", "今日は雨だった。"]) assert.ok(!texts.includes(t), t);
+  for (const t of ["もう半年だよ。", "やっぱりつらい。", "今日は雨だった。"]) assert.ok(!texts.includes(t), t);
   // what each passed view is, in the prompt
   const section = buildPersonContextSection(sanitizePersonContext([buildPersonContext(memories, "そら")]));
   assert.match(section, /- 願い \[本人の発言 2026-06-05\] そらさんのことは大切にしたい。/);
   assert.match(section, /- 結論 \[本人の発言 2026-07-01\] そらさんとの関係に未来はない。/);
-  assert.match(section, /- その時の気持ち \[本人の発言 2026-10-03\]/);
+  assert.match(section, /- その時の気持ち \[本人の発言 2026-10-07\]/);
+  // an outright sentence without a listed word is a view, not dropped as a situation (independent review)
+  assert.match(section, /- 考え \[本人の発言 2026-10-05\] もう遅い。/);
   assert.match(section, /「その時の気持ち」「迷い」はその時点の気持ちで、結論ではありません/);
   assert.doesNotMatch(section, /結論 \[本人の発言 2026-10-01\] もう半年だよ/);
   // the debug trace says why the situations are out
