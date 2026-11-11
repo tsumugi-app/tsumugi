@@ -213,10 +213,12 @@ export async function syncPeopleWithVault(store: PeopleStoreEnv, vault: PeopleVa
     for (const id of all) {
       const mine = state.people.find((p) => p.id === id);
       const theirs = vaultNow.get(id);
-      if (mine && !theirs && !state.pending.includes(id) && listing.complete && result.unreadable.length === 0 && !local.pending.includes(id)) { removed += 1; continue; }
+      const notInVault = mine && !theirs && !state.pending.includes(id) && !local.pending.includes(id);
+      if (notInVault && listing.complete && result.unreadable.length === 0) { removed += 1; continue; }
       const merged = mine && theirs ? mergePerson(mine, theirs) : (mine ?? theirs)!;
       people.push(merged);
-      if (!theirs || !personCovers(theirs, merged)) pending.push(id);
+      // a person kept only because People/ could not be read whole is not made pending (that would write a removed note back)
+      if (!notInVault && (!theirs || !personCovers(theirs, merged))) pending.push(id);
     }
     const out = { ...result, removed, stillPending: pending.length };
     return { state: { people, pending }, result: out };
