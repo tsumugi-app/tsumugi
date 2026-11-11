@@ -26,9 +26,9 @@ function mem(id: string, day: string, summary: string, extra: Partial<MemoryObje
     createdAt: at(day), updatedAt: at(day), ...extra,
   } as MemoryObject;
 }
-/** a record where Capture recorded そらさん, with the user's words */
+/** a record where Capture recorded そらさん, with the user's words about her (as Capture keeps them: the mention quote and the evidence) */
 const sora = (id: string, day: string, words: string, extra: Partial<MemoryObject> = {}) =>
-  mem(id, day, extra.summary ?? "そらさんのことを話した。", { personMentions: [mention("そらさん", "そらさんの話", day)], evidenceQuotes: [words], ...extra });
+  mem(id, day, extra.summary ?? "そらさんのことを話した。", { personMentions: [mention("そらさん", words, day)], evidenceQuotes: [words], ...extra });
 
 const WISH_1 = "そらさんのことは大切にしたい。";
 const WISH_2 = "そらさんにとって特別な存在でありたい。";

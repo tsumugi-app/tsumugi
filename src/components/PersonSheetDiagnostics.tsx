@@ -455,12 +455,12 @@ export default function PersonSheetDiagnostics() {
           </Section>
 
           {chatTrace && (
-            <Section title="背景に入れた理由・入れなかった理由（Memory Graph・試験）" note="会話に渡す背景を選んだ根拠。考え・結論の種類と重み、予定の扱い、名前の無い記録の取得根拠。会話には送らない。" open={false}>
+            <Section title="背景に入れた理由・入れなかった理由（Memory Graph・試験）" note="会話に渡す背景を選んだ根拠。考え・結論の種類と重み、この人の話とした根拠（または確かめられず入れなかった理由）、予定の扱い、名前の無い記録の取得根拠。会話には送らない。" open={false}>
               <div className="text-xs font-semibold">考え・結論（{chatTrace.statements.filter((x) => x.kept).length} / {chatTrace.statements.length}）</div>
               {chatTrace.statements.length === 0 && <None />}
               {chatTrace.statements.map((x, i) => (
                 <div key={`s${i}`} className="text-xs">
-                  {x.kept ? "○" : "×"} <Id id={x.memoryId} /> {STANCE_LABEL[x.stance]}・重み{x.score}：{x.text}<span className="opacity-70">（{x.why}{x.linkedReasons ? `、後からの説明 ${x.linkedReasons.map((id) => `#${id.slice(-6)}`).join(" ")}` : ""}）</span>
+                  {x.kept ? "○" : "×"} <Id id={x.memoryId} /> {STANCE_LABEL[x.stance]}・重み{x.score}：{x.text}<span className="opacity-70">（{x.why}{x.linkedReasons ? `、後からの説明 ${x.linkedReasons.map((id) => `#${id.slice(-6)}`).join(" ")}` : ""}{x.basis ? `／この人の話とした根拠：${x.basis}` : ""}）</span>
                 </div>
               ))}
               <div className="mt-2 text-xs font-semibold">予定（{chatTrace.plans.length}）</div>

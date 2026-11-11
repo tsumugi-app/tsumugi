@@ -48,7 +48,8 @@ const MIN_WEIGHT = 1;
 
 /** what the debug page shows of how the context was chosen (never sent to the chat) */
 export interface PersonContextTrace {
-  statements: { memoryId: string; text: string; stance: Stance; score: number; kept: boolean; why: string; linkedReasons?: string[] }[];
+  /** basis: why the sentence was taken as about this person (P1-D) */
+  statements: { memoryId: string; text: string; stance: Stance; score: number; kept: boolean; why: string; basis?: string; linkedReasons?: string[] }[];
   plans: { memoryId: string; text: string; kind: PersonContextPlanType | "ask-ai" | "retrospective"; why: string }[];
   candidates: { memoryId: string; text: string; signals: string[]; accepted: boolean; why: string }[];
 }
@@ -161,22 +162,6 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   };
   const recordOf = new Map(sheet.records.map((r) => [r.memoryId, r] as const));
   const byId = new Map(pool.map((m) => [m.id, m] as const));
-  const eligible = (id: string, sentence: string) => {
-    const r = recordOf.get(id);
-    return r?.match === "mention" && (r.otherPersons.length === 0 || namesIn(sentence).mine);
-  };
-  // the sheet shows the same words once (the earliest record, the others in alsoIn): take the earliest record that is eligible (Codex on PR #34)
-  const own = sheet.views.flatMap((v) => {
-    if (v.text.kind !== "user" || v.aboutOther || !fits(v.text.text)) return [];
-    if (eligible(v.text.memoryId, v.text.text)) return [v];
-    // the duplicate occurrence of the same form keeps its own time (a mention or topic quote may be later than its record; a question with the same
-    // words is another statement: Codex on PR #34)
-    const key = statementKey(v.text.text);
-    const alt = sheet.statements
-      .filter((st) => st.text.kind === "user" && st.role === v.role && v.alsoIn.includes(st.text.memoryId) && statementKey(st.text.text) === key && eligible(st.text.memoryId, v.text.text))
-      .sort((x, y) => timeOf(x.text.saidAt) - timeOf(y.text.saidAt))[0];
-    return alt ? [{ ...v, text: { ...v.text, memoryId: alt.text.memoryId, saidAt: alt.text.saidAt } }] : [];
-  }).sort((a, b) => timeOf(a.text.saidAt) - timeOf(b.text.saidAt));
   // records without any name that may be about this person (P1-C: stricter). A candidate needs a word of the person's own views that tells
   // something about THIS person (not a word that is also in the user's words about other people), AND a structural link: the same topic,
   // a Connect link, or the same conversation when that conversation is about no one else. One of the two alone is never enough.
@@ -216,6 +201,101 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const genericWords = new Set([...peopleByWord].filter(([, people]) => people.size >= 2).map(([w]) => w));
   const telling = (words: string[]) => words.filter((w) => !genericWords.has(w));
   const wordsOf = (t: string) => telling(contentWords(t, nameWords));
+  // P1-D: which of the user's sentences in a record where Capture recorded this person are about THIS person. One Memory gathers all the quotes of
+  // its conversation (evidenceQuotes, topicEvents), so a record with the person's name can also hold another matter of that day (work, another
+  // topic): being in the record, in the same topic, or said at the same time is not enough. A sentence is about the person when
+  //   - it is in the person's own mention quote (Capture wrote it as what the user said about this person), or
+  //   - it names the person (a confirmed name or alias), and no one else in a record that also names someone else, or
+  //   - it speaks of someone (彼女 / その人 …) in a record about no one else, and is said with the person's name (the same quote, or the same
+  //     utterance as the person's mention) or shares a word that tells something about the person, or
+  //   - it is said with the person's name (the same quote / utterance) AND shares such a word: neither alone is enough (another matter of the
+  //     same utterance; a common word).
+  // Anything else stays out of the chat's person context; why is shown on the debug page.
+  // 彼 / 彼女, and その人 / あの人 / この子 … followed by a particle (この人生 / その方がいい are not about someone; 彼氏 is the user's own partner)
+  const PRONOUN = /彼女|彼(?![ら岸方氏])|(?:その|あの|この)(?:人|子)(?=[はがにとのをもへ、,])|あの方(?=[はがにとのをもへ、,])/;
+  const mentionsOf = (m: MemoryObject) => (m.personMentions ?? []).filter((p) => sheet.keys.includes(personSheetKey(p.displayName || p.groupingKey || "")));
+  const keysOfQuote = (q: string) => new Set(statementSentences(q).map(statementKey));
+  const anchorCache = new Map<string, { sentences: Set<string>; words: string[]; times: Set<number> }>();
+  const anchorsOf = (m: MemoryObject) => {
+    let a = anchorCache.get(m.id);
+    if (a) return a;
+    const quotes = [...(m.evidenceQuotes ?? []), ...(m.topicEvents ?? []).map((e) => e.quote ?? ""), ...mentionsOf(m).map((p) => p.quote ?? "")];
+    const sentences = [...mentionsOf(m).flatMap((p) => statementSentences(p.quote ?? "")), ...quotes.flatMap(statementSentences).filter((t) => namesIn(t).mine)];
+    // the time of the user's turn where the person was mentioned (only a time Capture recorded: a missing one never matches)
+    const times = new Set(mentionsOf(m).map((p) => Date.parse(p.statedAt ?? "")).filter(Number.isFinite));
+    a = { sentences: new Set(sentences.map(statementKey)), words: [...new Set(sentences.flatMap(wordsOf))], times };
+    anchorCache.set(m.id, a);
+    return a;
+  };
+  const relevanceCache = new Map<string, { ok: boolean; why: string }>();
+  const relevanceOf = (id: string, sentence: string): { ok: boolean; why: string } => {
+    const ck = `${id}\n${sentence}`;
+    const hit = relevanceCache.get(ck);
+    if (hit) return hit;
+    const result = ((): { ok: boolean; why: string } => {
+      const r = recordOf.get(id);
+      const m = byId.get(id);
+      if (!r || !m || r.match !== "mention") return { ok: false, why: "この人物の名前が記録の人物に無い（キーワード・本文だけ）" };
+      const n = namesIn(sentence);
+      if (n.mine && (!n.others || r.otherPersons.length === 0)) return { ok: true, why: "この人の名前（確定した別名を含む）がある" };
+      if (n.mine) return { ok: false, why: "ほかの人物の名前も並ぶ文" };
+      if (n.others) return { ok: false, why: "ほかの人物についての文" };
+      const key = statementKey(sentence);
+      if (mentionsOf(m).some((p) => keysOfQuote(p.quote ?? "").has(key))) return { ok: true, why: "この人についての発言として記録された引用" };
+      // a part of the person's mention quote kept on its own as evidence (「はるかさんのことは、もう諦めることにした」 → 「もう諦めることにした」)
+      // (at least half of the quote: a short common ending such as 「大事だと思う」 of another matter is not taken from a longer quote)
+      const bare = key.replace(/[、,]/g, "");
+      if (Array.from(bare).length >= 6 && mentionsOf(m).some((p) => {
+        const q = statementKey(p.quote ?? "").replace(/[、,]/g, "");
+        return q.includes(bare) && Array.from(bare).length * 2 >= Array.from(q).length;
+      })) {
+        return { ok: true, why: "この人についての発言として記録された引用の一部" };
+      }
+      if (r.otherPersons.length > 0) return { ok: false, why: "ほかの人物も出てくる記録で、この人の名前が無い" };
+      const anchors = anchorsOf(m);
+      // said with the person's name: in the same quote as a sentence about the person, or a topic quote of the same turn as the mention
+      const inQuote = [...(m.evidenceQuotes ?? []), ...(m.topicEvents ?? []).map((e) => e.quote ?? "")].some((q) => {
+        const ks = keysOfQuote(q);
+        return ks.has(key) && [...ks].some((k) => k !== key && anchors.sentences.has(k));
+      });
+      const sameTurn = (m.topicEvents ?? []).some((e) => keysOfQuote(e.quote ?? "").has(key) && anchors.times.has(Date.parse(e.statedAt ?? "")));
+      const withName = inQuote || sameTurn;
+      const where = inQuote ? "この人の名前を出した文と同じ引用" : "この人について話したのと同じ発言";
+      const shared = wordsOf(sentence).filter((w) => anchors.words.includes(w));
+      const pronoun = PRONOUN.exec(sentence)?.[0];
+      if (pronoun && withName) return { ok: true, why: `「${pronoun}」で話していて、${where}` };
+      if (pronoun && shared.length > 0) return { ok: true, why: `「${pronoun}」で話していて、この人についての発言と共通の言葉（${shared.slice(0, 3).join("・")}）` };
+      if (withName && shared.length > 0) return { ok: true, why: `${where}で、この人についての発言と共通の言葉（${shared.slice(0, 3).join("・")}）` };
+      if (pronoun) return { ok: false, why: `「${pronoun}」が誰のことか確かめられない（この人の名前と同じ発言でも、共通の言葉も無い）` };
+      if (withName) return { ok: false, why: `${where}だが、この人の話と分かる言葉が無い（同じ発言の別の話の可能性）` };
+      if (shared.length > 0) return { ok: false, why: `共通の言葉（${shared.slice(0, 3).join("・")}）だけで、この人の話と確かめられない` };
+      return { ok: false, why: "この人の名前も、この人の話とつながる根拠も無い（同じ記録の別の話）" };
+    })();
+    relevanceCache.set(ck, result);
+    return result;
+  };
+  const eligible = (id: string, sentence: string) => relevanceOf(id, sentence).ok;
+  /** the rule before P1-D: any sentence of a record of the person (only the plans' kind reads it) */
+  const inPersonRecord = (id: string, sentence: string) => {
+    const r = recordOf.get(id);
+    return r?.match === "mention" && (r.otherPersons.length === 0 || namesIn(sentence).mine);
+  };
+  // the sheet shows the same words once (the earliest record, the others in alsoIn): take the earliest record that is eligible (Codex on PR #34)
+  const left: { memoryId: string; text: string; role: "judgment" | "thought" }[] = [];
+  const own = sheet.views.flatMap((v) => {
+    if (v.text.kind !== "user" || v.aboutOther || !fits(v.text.text)) return [];
+    if (eligible(v.text.memoryId, v.text.text)) return [v];
+    // the duplicate occurrence of the same form keeps its own time (a mention or topic quote may be later than its record; a question with the same
+    // words is another statement: Codex on PR #34)
+    const key = statementKey(v.text.text);
+    const alt = sheet.statements
+      .filter((st) => st.text.kind === "user" && st.role === v.role && v.alsoIn.includes(st.text.memoryId) && statementKey(st.text.text) === key && eligible(st.text.memoryId, v.text.text))
+      .sort((x, y) => timeOf(x.text.saidAt) - timeOf(y.text.saidAt))[0];
+    if (!alt) left.push({ memoryId: v.text.memoryId, text: v.text.text, role: v.role });
+    return alt ? [{ ...v, text: { ...v.text, memoryId: alt.text.memoryId, saidAt: alt.text.saidAt } }] : [];
+  }).sort((a, b) => timeOf(a.text.saidAt) - timeOf(b.text.saidAt));
+  /** why a sentence was taken as about this person (the debug page) */
+  const basisOf = (id: string, sentence: string) => (recordOf.has(id) ? relevanceOf(id, sentence).why : undefined);
   // a conversation that is also about someone else says little about whom a nameless record of it is about
   const mixedConvs = new Set([
     ...othersRecords.map((m) => m.conversationId),
@@ -230,6 +310,8 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     return n.mine && !n.others;
   };
   const trace: PersonContextTrace = { statements: [], plans: [], candidates: [] };
+  // P1-D: the user's sentences of the sheet left out because nothing shows they are about this person
+  for (const x of left.filter((y) => recordOf.get(y.memoryId)?.match === "mention")) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: stanceOf(x.text, x.role).stance, score: 0, kept: false, why: `この人の話と確かめられないので入れない：${relevanceOf(x.memoryId, x.text).why}` });
   const candidates: PersonContext["candidates"] = [];
   const candidateSaidAt = new Map<string, string>();
   for (const m of pool) {
@@ -276,7 +358,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
       .filter((x) => x.stance === "decision" || x.stance === "wish"),
   ].sort((a, b) => timeOf(a.saidAt) - timeOf(b.saidAt));
   // a description of a situation is not a view (it is among the events): never passed as a conclusion
-  for (const x of allSources.filter((s) => s.stance === "situation")) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: x.stance, score: 0, kept: false, why: "状況の説明なので、考え・結論には入れない" });
+  for (const x of allSources.filter((s) => s.stance === "situation")) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: x.stance, score: 0, kept: false, why: "状況の説明なので、考え・結論には入れない", ...(x.kind === "user" ? { basis: basisOf(x.memoryId, x.text) } : {}) });
   const sources = allSources.filter((s) => s.stance !== "situation");
   const isReason = (x: Source) => x.explains && REASON_FORM.test(x.text);
   // the AI summaries of the records where Capture recorded the person; a candidate record's summary is read only for that candidate's own conclusion
@@ -295,7 +377,16 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     ] as { text: string; memoryId: string; saidAt: string; topicId?: string }[])
     .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
     // a question or a request asks for a reason, it does not give one (Codex on PR #34)
-    .filter((t) => fits(t.text) && (REASON_FORM.test(t.text) || CORRECTION_FORM.test(t.text)) && !["question", "request"].includes(classifyStatement(t.text).role) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
+    .filter((t) => fits(t.text) && (REASON_FORM.test(t.text) || CORRECTION_FORM.test(t.text)) && !["question", "request"].includes(classifyStatement(t.text).role))
+    // P1-D: an explanation not shown to be about this person is not attached; why is on the debug page (once per sentence)
+    .filter((t) => {
+      if (eligible(t.memoryId, t.text)) return aboutThisOne(t.memoryId, t.text);
+      if (!trace.statements.some((x) => x.memoryId === t.memoryId && statementKey(x.text) === statementKey(t.text))) {
+        const role = classifyStatement(t.text).role;
+        trace.statements.push({ memoryId: t.memoryId, text: t.text, stance: stanceOf(t.text, role === "thought" ? "thought" : "judgment").stance, score: 0, kept: false, why: `後からの説明に使わない（この人の話と確かめられない）：${relevanceOf(t.memoryId, t.text).why}` });
+      }
+      return false;
+    })
     // the topic of the words themselves: a topic quote's own topic, otherwise the record's topic
     .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: wordsOf(t.text), topics: t.topicId ? [t.topicId] : byId.get(t.memoryId)?.topicId ? [byId.get(t.memoryId)!.topicId as string] : [] }));
   // a later explanation is linked to a conclusion, a wish or a view (not to a passing feeling or a doubt) only when it shares a word that tells
@@ -392,7 +483,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     const why = kept ? "背景に入れた"
       : dropped.get(c) ?? (finalCovered.has(idOf(c.statement)) ? "別の結論の「後からの説明」として出した"
         : weightOf(c) < MIN_WEIGHT ? "短い一時的な気持ち・迷いなので入れない" : "件数の上限（より重いもの・時期や内容の違うものを先に入れた）");
-    trace.statements.push({ memoryId: c.statement.memoryId, text: c.statement.text, stance: x.stance, score: weightOf(c), kept, why, ...(hasLater(c) ? { linkedReasons: c.reasons.filter((r) => r.when === "later").map((r) => r.memoryId) } : {}) });
+    trace.statements.push({ memoryId: c.statement.memoryId, text: c.statement.text, stance: x.stance, score: weightOf(c), kept, why, ...(x.kind === "user" ? { basis: basisOf(x.memoryId, x.text) } : {}), ...(hasLater(c) ? { linkedReasons: c.reasons.filter((r) => r.when === "later").map((r) => r.memoryId) } : {}) });
   }
   const conclusionCandidateTexts = new Set(keptConclusions.filter((c) => c.statement.kind === "candidate").map((c) => idOf(c.statement)));
 
@@ -401,7 +492,8 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   // plan: a question or a request to the AI, or a look back at the past, is left out; a wish is passed as a wish; a plan the user's words never
   // state is passed as the AI summary's reading only
   const plans = sheet.plans.filter((p) => p.record.match === "mention" && !given.has(p.record.memoryId) && fits(p.record.summary.text)).flatMap((p) => {
-    const kind = planKindOf(p, byId.get(p.record.memoryId), (id, s) => eligible(id, s) && aboutThisOne(id, s));
+    // a plan is a record of the person, told apart by all the user's words of that record (P1-D does not narrow it: no sentence is passed from here)
+    const kind = planKindOf(p, byId.get(p.record.memoryId), (id, s) => inPersonRecord(id, s) && aboutThisOne(id, s));
     trace.plans.push({ memoryId: p.record.memoryId, text: p.record.summary.text, kind: kind.kind, why: kind.why });
     if (kind.kind === "ask-ai" || kind.kind === "retrospective") return [];
     return [{
