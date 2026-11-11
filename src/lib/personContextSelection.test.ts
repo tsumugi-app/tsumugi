@@ -37,10 +37,11 @@ const EXPLANATION = "そらさんとの関係に未来がないと言ったの�
 
 /** the world of cases 1–3: three important views in June–July, then many short words in October, and the user's later explanation */
 const world = (): MemoryObject[] => [
-  // another person: the words 仕事 / 関係 are also in the user's words about someone else, so they tell nothing about そらさん
+  // two other people: the words 仕事 / 関係 are also in the user's words about them, so they tell nothing about そらさん
   mem("o1", "2026-05-01", "あおいさんと打ち合わせをした。", {
     personMentions: [mention("あおいさん", "あおいさんとの仕事の関係は順調だ", "2026-05-01")], evidenceQuotes: ["仕事の関係で、今日も打ち合わせをした。"],
   }),
+  mem("o2", "2026-05-02", "うみさんと電話した。", { personMentions: [mention("うみさん", "うみさんとは仕事の関係だけだ", "2026-05-02")] }),
   sora("s1", "2026-06-05", WISH_1, { topicId: "topic-sora" }),
   sora("s2", "2026-06-20", WISH_2),
   sora("s3", "2026-07-01", CONCLUSION, { topicId: "topic-sora" }),
@@ -67,9 +68,19 @@ test("stances: a situation, a doubt and a passing feeling are told apart from a 
   assert.equal(s("大切にしたいと思う。"), "wish");
   assert.equal(s("この関係に未来はない。"), "decision");
   assert.equal(s("もう会わないことにした。"), "decision");
-  assert.equal(s("態度が冷たい。"), "situation", "冷たい is an adjective, not a wish");
+  assert.notEqual(s("態度が冷たい。"), "wish", "冷たい is an adjective, not a wish");
   assert.equal(s("これからも連絡を取り合うと思う。"), "view");
   assert.equal(s("楽しかった。"), "feeling");
+  // independent review: polite and hedged decisions, a decision after a doubt, が-ない situations, kana adjectives, unlisted judgments
+  assert.equal(s("もう連絡するのはやめます。"), "decision");
+  assert.equal(s("もう会いません。"), "decision");
+  assert.equal(s("やめようと思う。"), "view", "hedged: not decided yet");
+  assert.equal(s("どうしたらいいのか分からなかったけど、もう会わないことにした。"), "decision");
+  assert.notEqual(s("返事がない。"), "decision");
+  assert.notEqual(s("じれったい。"), "wish");
+  assert.notEqual(s("つめたい。"), "wish");
+  assert.equal(s("あの人は信用できない。"), "view");
+  assert.equal(stanceOf("実は来月引っ越すことになった。", "report").explains, false);
   assert.equal(stanceOf("未来がないと言ったのは、家庭があるからだ。", "judgment").explains, true);
   assert.equal(stanceOf("未来がないと言ったのは、家庭があるからだ。", "judgment").stance, "view", "an explanation is a view of its own");
 });
@@ -80,12 +91,14 @@ test("case 1: short situations and passing feelings no longer push out the user'
   const texts = kept.map((c) => c.statement.text);
   assert.ok(kept.length <= PERSON_CONTEXT_LIMITS.maxConclusions);
   for (const t of [WISH_1, WISH_2, CONCLUSION]) assert.ok(texts.includes(t), t);
-  for (const t of ["もう半年だよ。", "もう遅い。", "やっぱりつらい。", "今日は雨だった。"]) assert.ok(!texts.includes(t), t);
+  for (const t of ["もう半年だよ。", "やっぱりつらい。", "今日は雨だった。"]) assert.ok(!texts.includes(t), t);
   // what each passed view is, in the prompt
   const section = buildPersonContextSection(sanitizePersonContext([buildPersonContext(memories, "そら")]));
   assert.match(section, /- 願い \[本人の発言 2026-06-05\] そらさんのことは大切にしたい。/);
   assert.match(section, /- 結論 \[本人の発言 2026-07-01\] そらさんとの関係に未来はない。/);
-  assert.match(section, /- その時の気持ち \[本人の発言 2026-10-03\]/);
+  assert.match(section, /- その時の気持ち \[本人の発言 2026-10-07\]/);
+  // an outright sentence without a listed word is a view, not dropped as a situation (independent review)
+  assert.match(section, /- 考え \[本人の発言 2026-10-05\] もう遅い。/);
   assert.match(section, /「その時の気持ち」「迷い」はその時点の気持ちで、結論ではありません/);
   assert.doesNotMatch(section, /結論 \[本人の発言 2026-10-01\] もう半年だよ/);
   // the debug trace says why the situations are out
@@ -164,7 +177,8 @@ test("case 5: a question or a request to the AI, saved with a plan word in its s
   const section = buildPersonContextSection(sanitizePersonContext([context]));
   assert.match(section, /- 予定 \[AIの要約 2026-10-14\] 来週そらさんと映画に行く予定。/);
   assert.match(section, /- 希望（予定ではない） \[AIの要約 2026-10-15\]/);
-  assert.doesNotMatch(section, /整理したい/);
+  assert.doesNotMatch(section, /整理したい/, "neither a plan nor an event");
+  assert.ok(!context.events.some((e) => e.memoryId === "q1"));
 });
 
 test("case 6: nameless records of the same conversation or topic are candidates only with a telling shared word AND a structural link", () => {
@@ -192,6 +206,9 @@ test("case 6: nameless records of the same conversation or topic are candidates 
   assert.equal(why("n6")?.why, "会話・話題のつながりだけで、この人の話と分かる言葉が無い");
   assert.match(why("n5")?.why ?? "", /ほかの人物の話もある会話/);
   assert.match(why("n4")?.why ?? "", /共通の言葉だけ/);
+  // the user's later explanation is shown once, under the user's own conclusion (not again under the candidate)
+  const under = context.conclusions.filter((c) => c.reasons.some((r) => r.memoryId === "x9")).map((c) => c.statement.memoryId);
+  assert.deepEqual(under, ["s3"]);
   // a candidate is never turned into a fact: marked as one wherever it is shown
   const shown = [...context.conclusions.map((c) => c.statement), ...context.candidates].filter((t) => t.memoryId === "n1");
   assert.ok(shown.length > 0 && shown.every((t) => t.kind === "candidate"));

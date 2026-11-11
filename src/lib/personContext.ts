@@ -57,7 +57,8 @@ export interface PersonContextTrace {
 const ASK_AI_WORDS = /依頼|頼ん|頼み|質問|尋ね|聞いた|聞きたい|求め|整理|まとめ|教えて|AI|アシスタント/;
 const LOOK_BACK_WORDS = /振り返|以前の|前に(?:言|話|考え)|当時の|過去の/;
 /** what the user's words of the record say a plan is: a plan, a wish, or nothing (the AI summary's reading) */
-const PLAN_WORDS = /予約|申し込|予定|つもり|ことにした|ことにする|行く|会う|行きます|会います/;
+// 行く / 会う only as the end of a clause about doing it (会うことはない / 会うたびに are not plans)
+const PLAN_WORDS = /予約|申し込|予定|つもり|ことにした|ことにする|(?:行く|会う|行きます|会います)(?:予定|つもり|ことに|んだ|んです|けど|から|。|、|$)/;
 
 /**
  * P1-C: a plan of the sheet (a status word of the AI summary, or an event date later than the day said) as the context passes it:
@@ -81,9 +82,13 @@ function planKindOf(p: SheetPlan, m: MemoryObject | undefined, mine: (memoryId: 
   const ev = r.eventTime ? Date.parse(r.eventTime.length === 4 ? `${r.eventTime}-12-31` : r.eventTime.length === 7 ? `${r.eventTime}-28` : r.eventTime) : NaN;
   const futureEvent = p.why === "event-later-than-said" || (Number.isFinite(ev) && ev > timeOf(r.saidAt));
   const said = userSentences.filter((s, i) => roles[i] !== "question" && roles[i] !== "request");
-  const statesPlan = said.some((s) => PLAN_WORDS.test(s.normalize("NFKC").replace(/[。．.!！…\s]+$/, "")) && stanceOf(s, roles[userSentences.indexOf(s)]).stance !== "wish");
+  // a plan may be told inside a question too (来週会うんだけど、何を着ていけばいい？)
+  const statesPlan = userSentences.some((s) => {
+    const role = roles[userSentences.indexOf(s)];
+    return PLAN_WORDS.test(s.normalize("NFKC").replace(/[。．.!！…\s]+$/, "")) && (role === "question" || role === "request" || stanceOf(s, role).stance !== "wish");
+  });
   if (r.retrospective) return { kind: "retrospective", why: "過去の出来事を後から話した記録（振り返り）" };
-  if (userSentences.length > 0 && asks === userSentences.length && !futureEvent) return { kind: "ask-ai", why: "本人の発言がAIへの質問・依頼だけ（要約が依頼を意図として書いた）" };
+  if (userSentences.length > 0 && asks === userSentences.length && !futureEvent && !statesPlan) return { kind: "ask-ai", why: "本人の発言がAIへの質問・依頼だけ（要約が依頼を意図として書いた）" };
   if (asks > 0 && ASK_AI_WORDS.test(statusSentence) && !statesPlan) return { kind: "ask-ai", why: "要約の予定の文がAIへの質問・依頼のこと" };
   if (LOOK_BACK_WORDS.test(statusSentence) && !futureEvent && !statesPlan) return { kind: "retrospective", why: "要約の予定の文が以前の考え・過去の振り返りのこと" };
   if (ASK_AI_WORDS.test(statusSentence) && userSentences.length === 0 && !futureEvent) return { kind: "ask-ai", why: "本人の発言が無く、要約の予定の文がAIへの依頼のこと" };
@@ -176,7 +181,18 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const namedIds = new Set(named.map((m) => m.id));
   // the records about other people (Capture recorded someone else, not this person)
   const othersRecords = pool.filter((m) => !recordOf.has(m.id) && namesOf(m).mention.length > 0);
-  const genericWords = new Set(othersRecords.flatMap((m) => contentWords([...(m.personMentions ?? []).map((p) => p.quote ?? ""), ...(m.evidenceQuotes ?? [])].join(" "), nameWords)));
+  // a word the user uses about two other people or more says nothing about this one (one other person is not enough: an unconfirmed second
+  // name of this person is "another person" to the sheet)
+  const peopleByWord = new Map<string, Set<string>>();
+  for (const m of othersRecords) {
+    const who = namesOf(m).mention.map(personSheetKey);
+    for (const w of contentWords([...(m.personMentions ?? []).map((p) => p.quote ?? ""), ...(m.evidenceQuotes ?? [])].join(" "), nameWords)) {
+      const set = peopleByWord.get(w) ?? new Set<string>();
+      for (const k of who) set.add(k);
+      peopleByWord.set(w, set);
+    }
+  }
+  const genericWords = new Set([...peopleByWord].filter(([, people]) => people.size >= 2).map(([w]) => w));
   const telling = (words: string[]) => words.filter((w) => !genericWords.has(w));
   const wordsOf = (t: string) => telling(contentWords(t, nameWords));
   // a conversation that is also about someone else says little about whom a nameless record of it is about
@@ -229,9 +245,9 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   }
   const candidateIds = new Set(candidates.map((c) => c.memoryId));
   // conclusions and thoughts: the user's own views, and the conclusions and wishes of the candidate records without a name (marked as candidates)
-  interface Source { kind: PersonContextKind; text: string; memoryId: string; saidAt: string; role: "judgment" | "thought"; stance: Stance; explains: boolean; words: string[] }
+  interface Source { kind: PersonContextKind; text: string; memoryId: string; saidAt: string; day: string; role: "judgment" | "thought"; stance: Stance; explains: boolean; words: string[] }
   const toSource = (kind: PersonContextKind, t: { text: string; memoryId: string; saidAt: string }, role: "judgment" | "thought"): Source =>
-    ({ kind, text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, role, ...stanceOf(t.text, role), words: wordsOf(t.text) });
+    ({ kind, text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, day: dayOf(t.saidAt), role, ...stanceOf(t.text, role), words: wordsOf(t.text) });
   const allSources: Source[] = [
     ...own.map((v) => toSource("user", v.text, v.role)),
     ...candidates.map((c) => toSource("candidate", { text: c.text, memoryId: c.memoryId, saidAt: candidateSaidAt.get(c.memoryId) ?? "" }, classifyStatement(c.text).role === "judgment" ? "judgment" : "thought"))
@@ -253,12 +269,13 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     .flatMap((r) => [
       ...r.mentionQuotes, ...r.evidence.filter((e) => !e.aboutOther),
       // the topic quotes too, each with its own time (as the sheet reads them: Codex on PR #34)
-      ...(byId.get(r.memoryId)?.topicEvents ?? []).filter((e) => e.quote).map((e) => ({ text: e.quote, memoryId: r.memoryId, saidAt: e.statedAt || r.saidAt })),
-    ])
+      ...(byId.get(r.memoryId)?.topicEvents ?? []).filter((e) => e.quote).map((e) => ({ text: e.quote, memoryId: r.memoryId, saidAt: e.statedAt || r.saidAt, topicId: e.topicId })),
+    ] as { text: string; memoryId: string; saidAt: string; topicId?: string }[])
     .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
     // a question or a request asks for a reason, it does not give one (Codex on PR #34)
     .filter((t) => fits(t.text) && (REASON_FORM.test(t.text) || CORRECTION_FORM.test(t.text)) && !["question", "request"].includes(classifyStatement(t.text).role) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
-    .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: wordsOf(t.text) }));
+    // the topic of the words themselves: a topic quote's own topic, otherwise the record's topic
+    .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: wordsOf(t.text), topics: t.topicId ? [t.topicId] : byId.get(t.memoryId)?.topicId ? [byId.get(t.memoryId)!.topicId as string] : [] }));
   // a later explanation is linked to a conclusion, a wish or a view (not to a passing feeling or a doubt) only when it shares a word that tells
   // something about this person; the link is "topic" when Capture also put both records in one topic, otherwise only a guess from the words ("word")
   const linkable = (x: Source) => x.stance === "decision" || x.stance === "wish" || x.stance === "view";
@@ -279,7 +296,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
         ...same,
         ...later.slice(-L.maxReasonsPerConclusion).map((r) => ({
           ...text("user", r), when: "later" as const,
-          link: topicsOf(byId.get(r.memoryId)).some((t) => xTopics.includes(t)) ? "topic" as const : "word" as const,
+          link: r.topics.some((t) => xTopics.includes(t)) ? "topic" as const : "word" as const,
         })),
       ],
       aiReadings: aiReadings.slice(-L.maxAiReadingsPerConclusion).map((s) => text("summary", s)),
@@ -289,7 +306,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const sourceOf = new Map(all.map((c, i) => [c, sources[i]] as const));
   for (const c of all) {
     const x = sourceOf.get(c)!;
-    if (x.kind === "user" && sources.some((y) => y !== x && y.kind === "user" && dayOf(y.saidAt) !== dayOf(x.saidAt) && shares(y.words, x.words))) c.repeated = true;
+    if (x.kind === "user" && sources.some((y) => y !== x && y.kind === "user" && y.day !== x.day && shares(y.words, x.words))) c.repeated = true;
   }
   // over the limit (a size bound): the weight of what the view does (personStance.ts), more for a view with the user's later explanation, one
   // the user came back to, and one that explains; less for a very short sentence and for a candidate. Picked one by one, a view of a month or of
@@ -305,12 +322,13 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const monthOf = (c: PersonContextConclusion) => c.statement.day.slice(0, 7);
   const picked: PersonContextConclusion[] = [];
   const dropped = new Map<PersonContextConclusion, string>();
-  while (picked.length < L.maxConclusions) {
+  for (;;) {
     const covered = new Set(picked.flatMap((c) => c.reasons.filter((r) => r.when === "later").map(idOf)));
-    // a statement shown as the later reason of a conclusion is not shown again on its own
+    // a statement shown as the later reason of a conclusion is not shown again on its own (also after the last pick: independent review)
     for (let i = picked.length - 1; i >= 0; i--) {
       if (covered.has(idOf(picked[i].statement)) && !hasLater(picked[i])) { dropped.set(picked[i], "別の結論の「後からの説明」として出した"); picked.splice(i, 1); }
     }
+    if (picked.length >= L.maxConclusions) break;
     let best: PersonContextConclusion | undefined;
     let bestScore = -Infinity;
     for (const c of all) {
@@ -325,6 +343,18 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   }
   const finalCovered = new Set(picked.flatMap((c) => c.reasons.filter((r) => r.when === "later").map(idOf)));
   const keptConclusions = picked.sort((a, b) => all.indexOf(a) - all.indexOf(b));
+  // one later explanation is shown under one conclusion only: the user's own words before a candidate, a shared topic before shared words, then
+  // the earlier conclusion
+  const rankOf = (c: PersonContextConclusion, r: PersonContextConclusion["reasons"][number]) => (c.statement.kind === "user" ? 0 : 2) + (r.link === "topic" ? 0 : 1);
+  const ownerOf = new Map<string, { c: PersonContextConclusion; rank: number }>();
+  for (const c of keptConclusions) {
+    for (const r of c.reasons) {
+      if (r.when !== "later") continue;
+      const cur = ownerOf.get(idOf(r));
+      if (!cur || rankOf(c, r) < cur.rank) ownerOf.set(idOf(r), { c, rank: rankOf(c, r) });
+    }
+  }
+  for (const c of keptConclusions) c.reasons = c.reasons.filter((r) => r.when !== "later" || ownerOf.get(idOf(r))?.c === c);
   for (const c of all) {
     const x = sourceOf.get(c)!;
     const kept = keptConclusions.includes(c);
@@ -350,7 +380,9 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     }];
   }).slice(-L.maxPlans);
 
-  const events = sheet.records.filter((r) => r.match === "mention" && !given.has(r.memoryId) && fits(r.summary.text)).slice(-L.maxEvents).map((r) => text("summary", r.summary));
+  // a record that only asked or requested something of the AI is not an event of this person either
+  const askedAi = new Set(trace.plans.filter((p) => p.kind === "ask-ai").map((p) => p.memoryId));
+  const events = sheet.records.filter((r) => r.match === "mention" && !given.has(r.memoryId) && !askedAi.has(r.memoryId) && fits(r.summary.text)).slice(-L.maxEvents).map((r) => text("summary", r.summary));
   const keptCandidates = candidates.filter((c) => !conclusionCandidateTexts.has(`${c.memoryId}:${statementKey(c.text)}`)).sort((a, b) => b.signals.length - a.signals.length || timeOf(b.day) - timeOf(a.day)).slice(0, L.maxCandidates);
 
   const relation = sheet.overview.relation;
