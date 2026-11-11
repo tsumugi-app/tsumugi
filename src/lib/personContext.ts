@@ -19,6 +19,10 @@
  * in one topic. A plan the AI summary read into a question or a request to the AI, or into a look back, is not passed as a plan. A nameless record
  * needs such a word AND a structural link. `explainPersonContext` gives the debug page why each item was or was not passed.
  *
+ * P1-E: a Connect link (the AI's guess from two summaries) is a structural link only when the person's record it links to has the user's own words
+ * about the person and they share a telling word (not a time word or a general word) with the nameless record's own words. The link's axis,
+ * strength and reason are shown on the debug page, never used as evidence. Such a record stays a candidate.
+ *
  * Names: a person is the name key of the sheet (honorific aside), joined only with names the user CONFIRMED as the same person (`aliases`). Similar names,
  * a guess by the sheet or a pronoun alone never join two people.
  */
@@ -29,7 +33,7 @@ import { statusOf } from "./memorySynthesis";
 import { personKeysInText } from "./retrieval";
 import { PERSON_CONTEXT_LIMITS, type PersonContext, type PersonContextConclusion, type PersonContextKind, type PersonContextPlanType, type PersonContextStance, type PersonContextText } from "./personContextPrompt";
 import { jstDateOf } from "./dateModel";
-import type { MemoryObject } from "./types";
+import type { Link, MemoryObject } from "./types";
 
 export type { PersonContext, PersonContextConclusion, PersonContextKind, PersonContextText } from "./personContextPrompt";
 /** the day in Japan time, as the chat route shows the Memories (dateModel.ts) */
@@ -51,8 +55,19 @@ export interface PersonContextTrace {
   /** basis: why the sentence was taken as about this person (P1-D) */
   statements: { memoryId: string; text: string; stance: Stance; score: number; kept: boolean; why: string; basis?: string; linkedReasons?: string[] }[];
   plans: { memoryId: string; text: string; kind: PersonContextPlanType | "ask-ai" | "retrospective"; why: string }[];
-  candidates: { memoryId: string; text: string; signals: string[]; accepted: boolean; why: string }[];
+  /** links: the Connect links of a nameless record to a record of this person, as saved (the reason is the AI's words, never the user's) (P1-E) */
+  candidates: { memoryId: string; text: string; signals: string[]; accepted: boolean; why: string; links?: CandidateLinkTrace[] }[];
 }
+/** a Connect link the candidate check read: what is saved of it, and whether it was used (P1-E) */
+export interface CandidateLinkTrace { fromId: string; toId: string; axis: string; strength: number; reason: string; used: boolean; why: string }
+
+/**
+ * P1-E: words that say when or how in general, not what about someone (time words such as 最近 / 今日 / 先週 / 毎日, and a few general words):
+ * a common word of this kind never ties a nameless record to a person through a Connect link. A rule on the word's form, not on a person or a topic.
+ */
+const TIME_WORD = /^(?:[今昨明先来毎前次翌本近当同去昔後]+[日週月年朝昼夜晩度回時期頃]+|[日週月年朝昼夜晩度回時期頃々]+|最近|近頃|以前|以後|今後|将来|当時|普段|時間|時々|一昨日|明後日|週末|平日|休日)$/;
+const GENERAL_WORDS = new Set(["自分", "気持", "本当", "一緒", "全部", "普通", "結局", "色々", "感じ", "場合", "部分", "一番", "全然", "大丈夫", "仕方"]);
+const isGenericWord = (w: string) => TIME_WORD.test(w) || GENERAL_WORDS.has(w);
 
 // a question or a request to the AI, and a look back, as the AI summary words them (the sentence that carries the plan's status word)
 const ASK_AI_WORDS = /依頼|頼ん|頼み|質問|尋ね|聞いた|聞きたい|求め|整理|まとめ|教えて|AI|アシスタント/;
@@ -312,6 +327,26 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const trace: PersonContextTrace = { statements: [], plans: [], candidates: [] };
   // P1-D: the user's sentences of the sheet left out because nothing shows they are about this person
   for (const x of left.filter((y) => recordOf.get(y.memoryId)?.match === "mention")) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: stanceOf(x.text, x.role).stance, score: 0, kept: false, why: `この人の話と確かめられないので入れない：${relevanceOf(x.memoryId, x.text).why}` });
+  // P1-E: the records of this person (Capture recorded the person) a record is linked to by Connect, either end of the link, each link once
+  const linkedPersonRecords = (m: MemoryObject): { link: Link; other: MemoryObject }[] => {
+    const seen = new Set<string>();
+    const out: { link: Link; other: MemoryObject }[] = [];
+    const add = (l: Link) => {
+      const otherId = l.sourceId === m.id ? l.targetId : l.targetId === m.id ? l.sourceId : undefined;
+      const other = otherId && namedIds.has(otherId) ? byId.get(otherId) : undefined;
+      const k = l.id || `${l.sourceId}>${l.targetId}`;
+      if (!other || seen.has(k)) return;
+      seen.add(k);
+      out.push({ link: l, other });
+    };
+    for (const l of m.links ?? []) add(l);
+    for (const x of named) for (const l of x.links ?? []) add(l);
+    return out;
+  };
+  // the user's own sentences of a record of this person that are about this person (the P1-D check)
+  const aboutPersonSentencesOf = (x: MemoryObject): string[] => [...new Set([
+    ...mentionsOf(x).map((p) => p.quote ?? ""), ...(x.evidenceQuotes ?? []), ...(x.topicEvents ?? []).map((e) => e.quote ?? ""),
+  ].flatMap(statementSentences))].filter((s) => s.length > 0 && eligible(x.id, s));
   const candidates: PersonContext["candidates"] = [];
   const candidateSaidAt = new Map<string, string>();
   for (const m of pool) {
@@ -321,7 +356,9 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     const userSentences = (m.evidenceQuotes ?? []).flatMap(statementSentences)
       .filter((s) => fits(s) && ["judgment", "thought"].includes(classifyStatement(s).role) && stanceOf(s, classifyStatement(s).role).stance !== "situation");
     if (userSentences.length === 0) continue;
-    const note = (why: string, signals: string[], accepted: boolean) => trace.candidates.push({ memoryId: m.id, text: userSentences[0], signals, accepted, why });
+    let linkTraces: CandidateLinkTrace[] = [];
+    const note = (why: string, signals: string[], accepted: boolean) =>
+      trace.candidates.push({ memoryId: m.id, text: userSentences[0], signals, accepted, why, ...(linkTraces.length > 0 ? { links: linkTraces } : {}) });
     // a record whose words name another known person is not taken for this one
     if (namesIn([m.summary ?? "", m.content ?? "", ...(m.evidenceQuotes ?? []), ...(m.topicEvents ?? []).map((e) => e.quote ?? "")].join(" ")).others) {
       if (m.conversationId && convs.has(m.conversationId)) note("ほかの人物の名前がある", [], false);
@@ -331,18 +368,44 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     const sameConv = Boolean(m.conversationId && convs.has(m.conversationId));
     if (sameConv && !mixedConvs.has(m.conversationId)) signals.push("同じ会話");
     if (topicsOf(m).some((t) => topics.has(t))) signals.push("同じ話題");
-    if ((m.links ?? []).some((l) => namedIds.has(l.sourceId === m.id ? l.targetId : l.sourceId))
-      || named.some((x) => (x.links ?? []).some((l) => (l.sourceId === m.id || l.targetId === m.id)))) signals.push("Connectのつながり");
-    const structural = signals.length > 0;
-    const sharedWords = wordsOf(userSentences.join(" ")).filter((w) => personWords.includes(w));
-    if (sharedWords.length > 0) signals.push("共通の言葉");
-    if (!structural && sharedWords.length === 0) {
-      if (sameConv) note("同じ会話だが、ほかの人物の話もある会話で、共通の言葉も無い", signals, false);
+    const viaConvOrTopic = signals.length > 0;
+    const mine = wordsOf(userSentences.join(" "));
+    // P1-E: a Connect link is the AI's guess from the two records' summaries (it never sees who said what, nor the AI's own questions). Its being
+    // there, its axis, its strength or its reason never tie a record to this person. It counts only when the record it links to has the user's
+    // own words about this person (P1-D) and they share a telling word with this record's own words: the words of THAT record, not of all the
+    // person's records, and never a time word or a general word.
+    const linkWords = new Set<string>();
+    linkTraces = linkedPersonRecords(m).map(({ link, other }): CandidateLinkTrace => {
+      const base = { fromId: link.sourceId, toId: link.targetId, axis: String(link.axis ?? ""), strength: Number(link.strength ?? 0), reason: String(link.reason ?? "") };
+      const about = aboutPersonSentencesOf(other);
+      if (about.length === 0) return { ...base, used: false, why: "つながった記録に、この人についての本人の発言が無い" };
+      const theirs = new Set(about.flatMap(wordsOf));
+      const common = mine.filter((w) => theirs.has(w));
+      const told = common.filter((w) => !isGenericWord(w));
+      if (told.length > 0) {
+        for (const w of told) linkWords.add(w);
+        return { ...base, used: true, why: `つながった記録のこの人についての本人の発言と共通の言葉（${told.slice(0, 3).join("・")}）` };
+      }
+      if (common.length > 0) return { ...base, used: false, why: `共通するのは時間・一般的な言葉（${common.slice(0, 3).join("・")}）だけ` };
+      return { ...base, used: false, why: "つながった記録のこの人についての本人の発言と、共通の言葉が無い" };
+    });
+    if (linkWords.size > 0) signals.push("Connectのつながり");
+    // the same conversation or the same topic: as before P1-E (a word of the person's views); a Connect link alone: a word of the linked record
+    const sharedWords = viaConvOrTopic ? mine.filter((w) => personWords.includes(w)) : [...linkWords];
+    if (!viaConvOrTopic && linkWords.size === 0) {
+      const anyShared = mine.some((w) => personWords.includes(w));
+      const withShared = anyShared ? [...signals, "共通の言葉"] : signals;
+      if (linkTraces.length > 0) { note("Connectのつながりはあるが、この人の話と確かめられない（Connectがあるだけでは根拠にしない）", withShared, false); continue; }
+      if (!anyShared) {
+        if (sameConv) note("同じ会話だが、ほかの人物の話もある会話で、共通の言葉も無い", signals, false);
+        continue;
+      }
+      note(sameConv ? "共通の言葉だけ（同じ会話だが、ほかの人物の話もある会話）" : "共通の言葉だけ（会話・話題・Connectのつながりが無い）", withShared, false);
       continue;
     }
-    if (!structural) { note(sameConv ? "共通の言葉だけ（同じ会話だが、ほかの人物の話もある会話）" : "共通の言葉だけ（会話・話題・Connectのつながりが無い）", signals, false); continue; }
+    if (sharedWords.length > 0) signals.push("共通の言葉");
     if (sharedWords.length === 0) { note("会話・話題のつながりだけで、この人の話と分かる言葉が無い", signals, false); continue; }
-    note(`候補にした（共通の言葉：${sharedWords.slice(0, 3).join("・")}）`, signals, true);
+    note(viaConvOrTopic ? `候補にした（共通の言葉：${sharedWords.slice(0, 3).join("・")}）` : `候補にした（Connectでつながった記録の、この人についての発言との共通の言葉：${sharedWords.slice(0, 3).join("・")}。この人のこととは確定しない）`, signals, true);
     const said = m.statedAt && Number.isFinite(Date.parse(m.statedAt)) ? m.statedAt : m.date;
     for (const s of userSentences) { candidates.push({ kind: "candidate", text: s, day: dayOf(said), memoryId: m.id, signals }); candidateSaidAt.set(m.id, said); }
   }
