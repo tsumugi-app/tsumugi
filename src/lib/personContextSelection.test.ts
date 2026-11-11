@@ -266,6 +266,18 @@ test("Codex on PR #36: the same words on two days count as coming back to them; 
   assert.ok(buildPersonContext(memories, "そら", { aliases: [["あおいさん", "青井さん"]] }).memoryIds.includes("t4"));
 });
 
+test("Codex on PR #36: a request about plans is not a plan; a plan told inside a question is", () => {
+  const memories = [
+    ...world(),
+    mem("q3", "2026-10-20", "そらさんとの予定を整理したいとAIに依頼した。", { personMentions: [mention("そらさん", "そらさんとの予定を整理してほしい。", "2026-10-20")] }),
+    mem("q4", "2026-10-21", "来週そらさんと会う予定で、服装を相談した。", { personMentions: [mention("そらさん", "来週そらさんと会うんだけど、何を着ていけばいい？", "2026-10-21")] }),
+  ];
+  const { context, trace } = explainPersonContext(memories, "そら");
+  assert.equal(trace.plans.find((p) => p.memoryId === "q3")?.kind, "ask-ai");
+  assert.ok(!context.events.some((e) => e.memoryId === "q3"));
+  assert.equal(trace.plans.find((p) => p.memoryId === "q4")?.kind, "plan");
+});
+
 test("the route keeps the new fields only in their known shapes", () => {
   const good = buildPersonContext(world(), "そら");
   const [clean] = sanitizePersonContext([good]);

@@ -59,6 +59,8 @@ const LOOK_BACK_WORDS = /振り返|以前の|前に(?:言|話|考え)|当時の|
 /** what the user's words of the record say a plan is: a plan, a wish, or nothing (the AI summary's reading) */
 // 行く / 会う only as the end of a clause about doing it (会うことはない / 会うたびに are not plans)
 const PLAN_WORDS = /予約|申し込|予定|つもり|ことにした|ことにする|(?:行く|会う|行きます|会います)(?:予定|つもり|ことに|んだ|んです|けど|から|。|、|$)/;
+/** inside a question or a request, only a plan TOLD before a clause break counts (来週会うんだけど、〜？); 「予定を整理してほしい」 asks about plans (Codex on PR #36) */
+const PLAN_TOLD_IN_QUESTION = /(?:予約した|申し込んだ|予定|つもり|行く|会う|行きます|会います)(?:だ|です|なんだ|なんです|んだ|んです)?(?:けど|けれど|が[、,]|から[、,])/;
 
 /**
  * P1-C: a plan of the sheet (a status word of the AI summary, or an event date later than the day said) as the context passes it:
@@ -85,7 +87,9 @@ function planKindOf(p: SheetPlan, m: MemoryObject | undefined, mine: (memoryId: 
   // a plan may be told inside a question too (来週会うんだけど、何を着ていけばいい？)
   const statesPlan = userSentences.some((s) => {
     const role = roles[userSentences.indexOf(s)];
-    return PLAN_WORDS.test(s.normalize("NFKC").replace(/[。．.!！…\s]+$/, "")) && (role === "question" || role === "request" || stanceOf(s, role).stance !== "wish");
+    const t = s.normalize("NFKC").replace(/[。．.!！…\s]+$/, "");
+    if (role === "question" || role === "request") return PLAN_TOLD_IN_QUESTION.test(t);
+    return PLAN_WORDS.test(t) && stanceOf(s, role).stance !== "wish";
   });
   if (r.retrospective) return { kind: "retrospective", why: "過去の出来事を後から話した記録（振り返り）" };
   if (userSentences.length > 0 && asks === userSentences.length && !futureEvent && !statesPlan) return { kind: "ask-ai", why: "本人の発言がAIへの質問・依頼だけ（要約が依頼を意図として書いた）" };
