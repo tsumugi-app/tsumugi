@@ -137,6 +137,18 @@ test("case 5: a sentence that does not name the person stays when something ties
   assert.match(whyOf(memories, "あの人のやり方は信用できない。")?.why ?? "", /「あの人」が誰のことか確かめられない/);
 });
 
+test("case 5b (independent review): 彼は is a pronoun; その方がいい / この人生 are not; a short common ending is not taken as a part of the person's quote", () => {
+  const memories = [
+    mem("k1", "2026-09-20", "けんたさんと話した。", {
+      personMentions: [mention("けんたさん", "けんたさんの企画は大事だと思う", at("2026-09-20"))],
+      evidenceQuotes: ["けんたさんと話した。彼は本当に頼りになると思う。", "けんたさんと会った。その方が早いと思う。", "けんたさんと話した。この人生は短いと思う。", "大事だと思う。"],
+    }),
+  ];
+  const kept = buildPersonContext(memories, "けんた").conclusions.map((c) => c.statement.text);
+  assert.ok(kept.includes("彼は本当に頼りになると思う。"));
+  for (const t of ["その方が早いと思う。", "この人生は短いと思う。", "大事だと思う。"]) assert.ok(!kept.includes(t), t);
+});
+
 test("case 6: in a record that also names another person, only the sentences that name this person alone are hers", () => {
   const memories = world();
   const all = contextText(memories);

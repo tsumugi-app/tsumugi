@@ -211,7 +211,8 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   //   - it is said with the person's name (the same quote / utterance) AND shares such a word: neither alone is enough (another matter of the
   //     same utterance; a common word).
   // Anything else stays out of the chat's person context; why is shown on the debug page.
-  const PRONOUN = /彼女|彼氏|彼(?![らは岸方])|その人|あの人|この人|あの子|その子|この子|あの方|その方/;
+  // 彼 / 彼女, and その人 / あの人 / この子 … followed by a particle (この人生 / その方がいい are not about someone; 彼氏 is the user's own partner)
+  const PRONOUN = /彼女|彼(?![ら岸方氏])|(?:その|あの|この)(?:人|子)(?=[はがにとのをもへ、,])|あの方(?=[はがにとのをもへ、,])/;
   const mentionsOf = (m: MemoryObject) => (m.personMentions ?? []).filter((p) => sheet.keys.includes(personSheetKey(p.displayName || p.groupingKey || "")));
   const keysOfQuote = (q: string) => new Set(statementSentences(q).map(statementKey));
   const anchorCache = new Map<string, { sentences: Set<string>; words: string[]; times: Set<number> }>();
@@ -242,7 +243,12 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
       const key = statementKey(sentence);
       if (mentionsOf(m).some((p) => keysOfQuote(p.quote ?? "").has(key))) return { ok: true, why: "この人についての発言として記録された引用" };
       // a part of the person's mention quote kept on its own as evidence (「はるかさんのことは、もう諦めることにした」 → 「もう諦めることにした」)
-      if (Array.from(key).length >= 6 && mentionsOf(m).some((p) => statementKey(p.quote ?? "").replace(/[、,]/g, "").includes(key.replace(/[、,]/g, "")))) {
+      // (at least half of the quote: a short common ending such as 「大事だと思う」 of another matter is not taken from a longer quote)
+      const bare = key.replace(/[、,]/g, "");
+      if (Array.from(bare).length >= 6 && mentionsOf(m).some((p) => {
+        const q = statementKey(p.quote ?? "").replace(/[、,]/g, "");
+        return q.includes(bare) && Array.from(bare).length * 2 >= Array.from(q).length;
+      })) {
         return { ok: true, why: "この人についての発言として記録された引用の一部" };
       }
       if (r.otherPersons.length > 0) return { ok: false, why: "ほかの人物も出てくる記録で、この人の名前が無い" };
@@ -305,7 +311,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   };
   const trace: PersonContextTrace = { statements: [], plans: [], candidates: [] };
   // P1-D: the user's sentences of the sheet left out because nothing shows they are about this person
-  for (const x of left) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: stanceOf(x.text, x.role).stance, score: 0, kept: false, why: `この人の話と確かめられないので入れない：${relevanceOf(x.memoryId, x.text).why}` });
+  for (const x of left.filter((y) => recordOf.get(y.memoryId)?.match === "mention")) trace.statements.push({ memoryId: x.memoryId, text: x.text, stance: stanceOf(x.text, x.role).stance, score: 0, kept: false, why: `この人の話と確かめられないので入れない：${relevanceOf(x.memoryId, x.text).why}` });
   const candidates: PersonContext["candidates"] = [];
   const candidateSaidAt = new Map<string, string>();
   for (const m of pool) {
@@ -371,7 +377,16 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
     ] as { text: string; memoryId: string; saidAt: string; topicId?: string }[])
     .flatMap((t) => statementSentences(t.text).map((sentence) => ({ ...t, text: sentence })))
     // a question or a request asks for a reason, it does not give one (Codex on PR #34)
-    .filter((t) => fits(t.text) && (REASON_FORM.test(t.text) || CORRECTION_FORM.test(t.text)) && !["question", "request"].includes(classifyStatement(t.text).role) && eligible(t.memoryId, t.text) && aboutThisOne(t.memoryId, t.text))
+    .filter((t) => fits(t.text) && (REASON_FORM.test(t.text) || CORRECTION_FORM.test(t.text)) && !["question", "request"].includes(classifyStatement(t.text).role))
+    // P1-D: an explanation not shown to be about this person is not attached; why is on the debug page (once per sentence)
+    .filter((t) => {
+      if (eligible(t.memoryId, t.text)) return aboutThisOne(t.memoryId, t.text);
+      if (!trace.statements.some((x) => x.memoryId === t.memoryId && statementKey(x.text) === statementKey(t.text))) {
+        const role = classifyStatement(t.text).role;
+        trace.statements.push({ memoryId: t.memoryId, text: t.text, stance: stanceOf(t.text, role === "thought" ? "thought" : "judgment").stance, score: 0, kept: false, why: `後からの説明に使わない（この人の話と確かめられない）：${relevanceOf(t.memoryId, t.text).why}` });
+      }
+      return false;
+    })
     // the topic of the words themselves: a topic quote's own topic, otherwise the record's topic
     .map((t) => ({ text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, words: wordsOf(t.text), topics: t.topicId ? [t.topicId] : byId.get(t.memoryId)?.topicId ? [byId.get(t.memoryId)!.topicId as string] : [] }));
   // a later explanation is linked to a conclusion, a wish or a view (not to a passing feeling or a doubt) only when it shares a word that tells
