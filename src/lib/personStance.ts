@@ -16,7 +16,8 @@
  * 〜と言ったのは …); it is a property, not a kind: an explanation is also a decision or a view.
  */
 import { OWN_VIEW } from "./memoryContext";
-import type { StatementRole } from "./personStatement";
+/** the form classes of personStatement.ts (only the names: this file does not read the sheet's classifier) */
+type StatementRole = "judgment" | "thought" | "question" | "request" | "report" | "state" | "other";
 
 export type Stance = "decision" | "wish" | "view" | "feeling" | "uncertain" | "situation";
 

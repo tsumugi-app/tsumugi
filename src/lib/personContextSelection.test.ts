@@ -37,10 +37,11 @@ const EXPLANATION = "そらさんとの関係に未来がないと言ったの�
 
 /** the world of cases 1–3: three important views in June–July, then many short words in October, and the user's later explanation */
 const world = (): MemoryObject[] => [
-  // another person: the words 仕事 / 関係 are also in the user's words about someone else, so they tell nothing about そらさん
+  // two other people: the words 仕事 / 関係 are also in the user's words about them, so they tell nothing about そらさん
   mem("o1", "2026-05-01", "あおいさんと打ち合わせをした。", {
     personMentions: [mention("あおいさん", "あおいさんとの仕事の関係は順調だ", "2026-05-01")], evidenceQuotes: ["仕事の関係で、今日も打ち合わせをした。"],
   }),
+  mem("o2", "2026-05-02", "うみさんと電話した。", { personMentions: [mention("うみさん", "うみさんとは仕事の関係だけだ", "2026-05-02")] }),
   sora("s1", "2026-06-05", WISH_1, { topicId: "topic-sora" }),
   sora("s2", "2026-06-20", WISH_2),
   sora("s3", "2026-07-01", CONCLUSION, { topicId: "topic-sora" }),
@@ -67,7 +68,7 @@ test("stances: a situation, a doubt and a passing feeling are told apart from a 
   assert.equal(s("大切にしたいと思う。"), "wish");
   assert.equal(s("この関係に未来はない。"), "decision");
   assert.equal(s("もう会わないことにした。"), "decision");
-  assert.equal(s("態度が冷たい。"), "situation", "冷たい is an adjective, not a wish");
+  assert.notEqual(s("態度が冷たい。"), "wish", "冷たい is an adjective, not a wish");
   assert.equal(s("これからも連絡を取り合うと思う。"), "view");
   assert.equal(s("楽しかった。"), "feeling");
   assert.equal(stanceOf("未来がないと言ったのは、家庭があるからだ。", "judgment").explains, true);

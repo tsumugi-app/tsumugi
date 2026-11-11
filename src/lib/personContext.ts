@@ -176,7 +176,18 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const namedIds = new Set(named.map((m) => m.id));
   // the records about other people (Capture recorded someone else, not this person)
   const othersRecords = pool.filter((m) => !recordOf.has(m.id) && namesOf(m).mention.length > 0);
-  const genericWords = new Set(othersRecords.flatMap((m) => contentWords([...(m.personMentions ?? []).map((p) => p.quote ?? ""), ...(m.evidenceQuotes ?? [])].join(" "), nameWords)));
+  // a word the user uses about two other people or more says nothing about this one (one other person is not enough: an unconfirmed second
+  // name of this person is "another person" to the sheet)
+  const peopleByWord = new Map<string, Set<string>>();
+  for (const m of othersRecords) {
+    const who = namesOf(m).mention.map(personSheetKey);
+    for (const w of contentWords([...(m.personMentions ?? []).map((p) => p.quote ?? ""), ...(m.evidenceQuotes ?? [])].join(" "), nameWords)) {
+      const set = peopleByWord.get(w) ?? new Set<string>();
+      for (const k of who) set.add(k);
+      peopleByWord.set(w, set);
+    }
+  }
+  const genericWords = new Set([...peopleByWord].filter(([, people]) => people.size >= 2).map(([w]) => w));
   const telling = (words: string[]) => words.filter((w) => !genericWords.has(w));
   const wordsOf = (t: string) => telling(contentWords(t, nameWords));
   // a conversation that is also about someone else says little about whom a nameless record of it is about
@@ -229,9 +240,9 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   }
   const candidateIds = new Set(candidates.map((c) => c.memoryId));
   // conclusions and thoughts: the user's own views, and the conclusions and wishes of the candidate records without a name (marked as candidates)
-  interface Source { kind: PersonContextKind; text: string; memoryId: string; saidAt: string; role: "judgment" | "thought"; stance: Stance; explains: boolean; words: string[] }
+  interface Source { kind: PersonContextKind; text: string; memoryId: string; saidAt: string; day: string; role: "judgment" | "thought"; stance: Stance; explains: boolean; words: string[] }
   const toSource = (kind: PersonContextKind, t: { text: string; memoryId: string; saidAt: string }, role: "judgment" | "thought"): Source =>
-    ({ kind, text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, role, ...stanceOf(t.text, role), words: wordsOf(t.text) });
+    ({ kind, text: t.text, memoryId: t.memoryId, saidAt: t.saidAt, day: dayOf(t.saidAt), role, ...stanceOf(t.text, role), words: wordsOf(t.text) });
   const allSources: Source[] = [
     ...own.map((v) => toSource("user", v.text, v.role)),
     ...candidates.map((c) => toSource("candidate", { text: c.text, memoryId: c.memoryId, saidAt: candidateSaidAt.get(c.memoryId) ?? "" }, classifyStatement(c.text).role === "judgment" ? "judgment" : "thought"))
@@ -289,7 +300,7 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const sourceOf = new Map(all.map((c, i) => [c, sources[i]] as const));
   for (const c of all) {
     const x = sourceOf.get(c)!;
-    if (x.kind === "user" && sources.some((y) => y !== x && y.kind === "user" && dayOf(y.saidAt) !== dayOf(x.saidAt) && shares(y.words, x.words))) c.repeated = true;
+    if (x.kind === "user" && sources.some((y) => y !== x && y.kind === "user" && y.day !== x.day && shares(y.words, x.words))) c.repeated = true;
   }
   // over the limit (a size bound): the weight of what the view does (personStance.ts), more for a view with the user's later explanation, one
   // the user came back to, and one that explains; less for a very short sentence and for a candidate. Picked one by one, a view of a month or of
