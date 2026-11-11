@@ -125,3 +125,7 @@ P0 の人物シート（`personSheet.ts`）を軽量モード（`lite`）で使�
 ## P1-B
 
 実装と保存方式は `docs/memory-graph-p1b.md`。当初の案（新しいレコード種別として Registry / outbox を通す）は、古いビルドの端末を壊すため採らなかった。理由は同文書に記載。
+
+## P1-C（選定精度）
+
+背景に入れる考え・結論の選び方、理由の関連づけ、予定の分類、名前の無い記録の条件は [memory-graph-p1c.md](memory-graph-p1c.md)。

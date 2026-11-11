@@ -13,12 +13,25 @@ export interface PersonContextText {
   memoryId: string;
 }
 
+/** P1-C: what the view does (personStance.ts); the same names here, as the route must not import the device side */
+export type PersonContextStance = "decision" | "wish" | "view" | "feeling" | "uncertain";
+export const PERSON_CONTEXT_STANCE_LABEL: Record<PersonContextStance, string> = { decision: "結論", wish: "願い", view: "考え", feeling: "その時の気持ち", uncertain: "迷い" };
+/** P1-C: a plan as the user's words state it (personContext.ts planKindOf) */
+export type PersonContextPlanType = "plan" | "wish" | "summary";
+
 export interface PersonContextConclusion {
   /** a conclusion or a thought in the user's words (or, for a record without a name, a candidate) */
   statement: PersonContextText;
   role: "judgment" | "thought";
-  /** the user's reasons for it: in the statement itself ("same"), or said later and sharing a word with it ("later") */
-  reasons: (PersonContextText & { when: "same" | "later" })[];
+  /** P1-C: what it does; without it (an older payload) the line reads 結論 / 考え by its role */
+  stance?: PersonContextStance;
+  /** P1-C: the user came back to it on another day */
+  repeated?: boolean;
+  /**
+   * the user's reasons for it: in the statement itself ("same"), or said later and sharing a word with it ("later"). A later reason's `link` is
+   * "topic" when Capture also put both in one topic, "word" when only the shared words point to it (a guess, said so in the prompt)
+   */
+  reasons: (PersonContextText & { when: "same" | "later"; link?: "topic" | "word" })[];
   /** sentences of the AI summaries that give a reason for the same words (the AI's reading, below the user's own explanation) */
   aiReadings: PersonContextText[];
 }
@@ -28,7 +41,7 @@ export interface PersonContext {
   names: string[];
   relation?: { label: string; basis?: PersonContextText };
   conclusions: PersonContextConclusion[];
-  plans: { plan: PersonContextText; outcome?: PersonContextText & { status: string }; }[];
+  plans: { plan: PersonContextText; type?: PersonContextPlanType; outcome?: PersonContextText & { status: string }; }[];
   events: PersonContextText[];
   lastDay?: string;
   /** records without a name that may be about this person, with the evidence that points to it */
@@ -77,16 +90,22 @@ export function sanitizePersonContext(raw: unknown): PersonContext[] {
     const conclusions = list(p.conclusions).filter(isObj).slice(0, L.maxConclusions).map((c) => {
       const statement = cleanText(c.statement);
       if (!statement || (c.role !== "judgment" && c.role !== "thought")) return null;
-      const reasons = list(c.reasons).filter(isObj).map((r) => { const t = cleanText(r); return t && (r.when === "same" || r.when === "later") ? { ...t, when: r.when as "same" | "later" } : null; }).filter(nonNull).slice(0, L.maxReasonsPerConclusion + 1);
+      const reasons = list(c.reasons).filter(isObj).map((r) => {
+        const t = cleanText(r);
+        if (!t || (r.when !== "same" && r.when !== "later")) return null;
+        return { ...t, when: r.when as "same" | "later", ...(r.when === "later" && (r.link === "topic" || r.link === "word") ? { link: r.link as "topic" | "word" } : {}) };
+      }).filter(nonNull).slice(0, L.maxReasonsPerConclusion + 1);
       const aiReadings = list(c.aiReadings).map(cleanText).filter(nonNull).filter((t) => t.kind === "summary").slice(0, L.maxAiReadingsPerConclusion);
-      return { statement, role: c.role as "judgment" | "thought", reasons, aiReadings };
+      const stance = typeof c.stance === "string" && Object.prototype.hasOwnProperty.call(PERSON_CONTEXT_STANCE_LABEL, c.stance) ? c.stance as PersonContextStance : undefined;
+      return { statement, role: c.role as "judgment" | "thought", ...(stance ? { stance } : {}), ...(c.repeated === true ? { repeated: true } : {}), reasons, aiReadings };
     }).filter(nonNull);
     const plans = list(p.plans).filter(isObj).slice(0, L.maxPlans).map((x) => {
       const plan = cleanText(x.plan);
       if (!plan) return null;
       const o = isObj(x.outcome) ? cleanText(x.outcome) : null;
       const status = isObj(x.outcome) && typeof x.outcome.status === "string" && x.outcome.status.length <= 10 ? x.outcome.status : null;
-      return { plan, ...(o && status ? { outcome: { ...o, status } } : {}) };
+      const type = x.type === "plan" || x.type === "wish" || x.type === "summary" ? x.type as PersonContextPlanType : undefined;
+      return { plan, ...(type ? { type } : {}), ...(o && status ? { outcome: { ...o, status } } : {}) };
     }).filter(nonNull);
     const events = list(p.events).map(cleanText).filter(nonNull).slice(0, L.maxEvents);
     const candidates = list(p.candidates).filter(isObj).slice(0, L.maxCandidates).map((c) => {
@@ -104,6 +123,7 @@ export function sanitizePersonContext(raw: unknown): PersonContext[] {
 }
 
 const LABEL: Record<PersonContextKind, string> = { user: "本人の発言", summary: "AIの要約", candidate: "候補・名前の無い記録" };
+const PLAN_LABEL: Record<PersonContextPlanType, string> = { plan: "予定", wish: "希望（予定ではない）", summary: "AIの要約上の意図（本人が予定と言った記録は無い）" };
 const line = (t: PersonContextText) => `[${LABEL[t.kind]} ${t.day}] ${t.text}`;
 
 /** the system instruction section ("" when there is nothing: the prompt is then exactly as without the trial) */
@@ -116,6 +136,8 @@ export function buildPersonContextSection(contexts: PersonContext[]): string {
     "- 「本人の発言」はその日に本人が言った言葉、「AIの要約」は記録を作ったAIの文、「候補・名前の無い記録」は人物名が無く、この人の話かどうか確定していない記録です。",
     "- 過去の考えや結論は、その時点のものです。今もそうだと決めつけず、事実としても扱わないでください。",
     "- 本人が後から説明した理由や訂正は、AIの要約の解釈より優先してください。ただし、新しい記録だというだけで以前の本人の言葉を否定しないでください。",
+    "- 「その時の気持ち」「迷い」はその時点の気持ちで、結論ではありません。「願い」は本人の望みで、予定や事実ではありません。",
+    "- 「関連は推測」と書いた理由は、共通の言葉からつないだもので、同じ話かどうか確かではありません。",
     "- 候補は確定した事実として扱わず、必要なら本人に確かめてください。",
     "- 今の話に必要なときだけ使い、関係のない過去を持ち出さないでください。",
   ];
@@ -125,14 +147,14 @@ export function buildPersonContextSection(contexts: PersonContext[]): string {
     if (c.conclusions.length > 0) {
       out.push("過去の考え・結論（古い順）：");
       for (const k of c.conclusions) {
-        out.push(`- ${k.role === "judgment" ? "結論" : "考え"} ${line(k.statement)}`);
-        for (const r of k.reasons) if (r.when === "later") out.push(`  - 後から本人が説明した理由 ${line(r)}`);
+        out.push(`- ${k.stance ? PERSON_CONTEXT_STANCE_LABEL[k.stance] : k.role === "judgment" ? "結論" : "考え"} ${line(k.statement)}${k.repeated ? "（別の日にも同じことに触れている）" : ""}`);
+        for (const r of k.reasons) if (r.when === "later") out.push(`  - 後から本人が説明した理由 ${line(r)}${r.link === "word" ? "（関連は推測：共通の言葉から）" : ""}`);
         for (const a of k.aiReadings) out.push(`  - AIの要約の解釈（本人の説明とは違うかもしれない） ${line(a)}`);
       }
     }
     if (c.plans.length > 0) {
       out.push("予定と、その後の候補：");
-      for (const p of c.plans) out.push(`- 予定 ${line(p.plan)}${p.outcome ? `\n  - 結果の候補「${p.outcome.status}」 ${line(p.outcome)}` : "\n  - その後は記録に無い（結果は不明）"}`);
+      for (const p of c.plans) out.push(`- ${PLAN_LABEL[p.type ?? "plan"]} ${line(p.plan)}${p.outcome ? `\n  - 結果の候補「${p.outcome.status}」 ${line(p.outcome)}` : "\n  - その後は記録に無い（結果は不明）"}`);
     }
     if (c.events.length > 0) {
       out.push("最近の出来事：");
