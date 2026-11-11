@@ -241,6 +241,10 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
       if (n.others) return { ok: false, why: "ほかの人物についての文" };
       const key = statementKey(sentence);
       if (mentionsOf(m).some((p) => keysOfQuote(p.quote ?? "").has(key))) return { ok: true, why: "この人についての発言として記録された引用" };
+      // a part of the person's mention quote kept on its own as evidence (「はるかさんのことは、もう諦めることにした」 → 「もう諦めることにした」)
+      if (Array.from(key).length >= 6 && mentionsOf(m).some((p) => statementKey(p.quote ?? "").replace(/[、,]/g, "").includes(key.replace(/[、,]/g, "")))) {
+        return { ok: true, why: "この人についての発言として記録された引用の一部" };
+      }
       if (r.otherPersons.length > 0) return { ok: false, why: "ほかの人物も出てくる記録で、この人の名前が無い" };
       const anchors = anchorsOf(m);
       // said with the person's name: in the same quote as a sentence about the person, or a topic quote of the same turn as the mention
