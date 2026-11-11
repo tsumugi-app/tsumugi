@@ -284,6 +284,30 @@ test("Codex on PR #36: a request about plans is not a plan; a plan told inside a
   assert.equal(trace.plans.find((p) => p.memoryId === "q4")?.kind, "plan");
 });
 
+test("Codex on PR #36: a word goes to the person its sentence names; a denied plan is not a plan", () => {
+  // one record about two other people: 旅行 is said of あおいさん only, so it still tells something about そらさん
+  const memories = [
+    sora("t1", "2026-06-01", "そらさんとの旅行は大事だ。"),
+    mem("t2", "2026-06-02", "二人の話。", {
+      personMentions: [mention("あおいさん", "あおいさんの話", "2026-06-02"), mention("うみさん", "うみさんの話", "2026-06-02")],
+      evidenceQuotes: ["あおいさんとは旅行に行きたい。うみさんには電話する。"],
+    }),
+    mem("t4", "2026-06-01", "旅行の話。", { conversationId: "conv-t1", evidenceQuotes: ["旅行はやめることにした。"] }),
+  ];
+  assert.ok(buildPersonContext(memories, "そら").memoryIds.includes("t4"), "旅行 is not used about two other people");
+  // 「会う予定はない」 denies a plan: with a request to sort out plans, the record is a request to the AI, not the user's plan
+  const denied = [
+    ...world(),
+    mem("q5", "2026-10-22", "そらさんとの予定を整理するつもりでAIに相談した。", {
+      personMentions: [mention("そらさん", "そらさんと会う予定はない。そらさんとの予定を整理してほしい。", "2026-10-22")],
+    }),
+  ];
+  const { context, trace } = explainPersonContext(denied, "そら");
+  assert.equal(trace.plans.find((p) => p.memoryId === "q5")?.kind, "ask-ai");
+  assert.ok(!context.plans.some((p) => p.plan.memoryId === "q5"));
+  assert.ok(!context.events.some((e) => e.memoryId === "q5"));
+});
+
 test("the route keeps the new fields only in their known shapes", () => {
   const good = buildPersonContext(world(), "そら");
   const [clean] = sanitizePersonContext([good]);

@@ -59,6 +59,9 @@ const LOOK_BACK_WORDS = /振り返|以前の|前に(?:言|話|考え)|当時の|
 /** what the user's words of the record say a plan is: a plan, a wish, or nothing (the AI summary's reading) */
 // 行く / 会う only as the end of a clause about doing it (会うことはない / 会うたびに are not plans)
 const PLAN_WORDS = /予約|申し込|予定|つもり|ことにした|ことにする|(?:行く|会う|行きます|会います)(?:予定|つもり|ことに|んだ|んです|けど|から|。|、|$)/;
+/** a plan word that is not denied right after it (会う予定はない / 行くつもりはない / 予約してない are not plans: Codex on PR #36) */
+const PLAN_DENIED_AFTER = /^[はもがを]?.{0,3}?(?:ない|無い|なかった|なし|せず|しない|ません|じゃない|ではない)/;
+const affirmsPlan = (t: string) => [...t.matchAll(new RegExp(PLAN_WORDS.source, "g"))].some((m) => !PLAN_DENIED_AFTER.test(t.slice((m.index ?? 0) + m[0].length)));
 /** inside a question or a request, only a plan TOLD before a clause break counts (来週会うんだけど、〜？); 「予定を整理してほしい」 asks about plans (Codex on PR #36) */
 const PLAN_TOLD_IN_QUESTION = /(?:予約した|申し込んだ|予定|つもり|行く|会う|行きます|会います)(?:だ|です|なんだ|なんです|んだ|んです)?(?:けど|けれど|が[、,]|から[、,])/;
 
@@ -89,7 +92,7 @@ function planKindOf(p: SheetPlan, m: MemoryObject | undefined, mine: (memoryId: 
     const role = roles[userSentences.indexOf(s)];
     const t = s.normalize("NFKC").replace(/[。．.!！…\s]+$/, "");
     if (role === "question" || role === "request") return PLAN_TOLD_IN_QUESTION.test(t);
-    return PLAN_WORDS.test(t) && stanceOf(s, role).stance !== "wish";
+    return affirmsPlan(t) && stanceOf(s, role).stance !== "wish";
   });
   if (r.retrospective) return { kind: "retrospective", why: "過去の出来事を後から話した記録（振り返り）" };
   if (userSentences.length > 0 && asks === userSentences.length && !futureEvent && !statesPlan) return { kind: "ask-ai", why: "本人の発言がAIへの質問・依頼だけ（要約が依頼を意図として書いた）" };
@@ -190,11 +193,24 @@ export function explainPersonContext(memories: MemoryObject[], key: string, opti
   const peopleByWord = new Map<string, Set<string>>();
   for (const m of othersRecords) {
     // a person with confirmed aliases is one person (Codex on PR #36)
-    const who = [...new Set(namesOf(m).mention.map((n) => groupOf(personSheetKey(n), options.aliases ?? [])[0]))];
-    for (const w of contentWords([...(m.personMentions ?? []).map((p) => p.quote ?? ""), ...(m.evidenceQuotes ?? [])].join(" "), nameWords)) {
-      const set = peopleByWord.get(w) ?? new Set<string>();
-      for (const k of who) set.add(k);
-      peopleByWord.set(w, set);
+    const canon = (k: string) => groupOf(k, options.aliases ?? [])[0];
+    const keys = [...new Set(namesOf(m).mention.map(personSheetKey))].filter(Boolean);
+    const everyone = [...new Set(keys.map(canon))];
+    // each word goes to the person its words describe (Codex on PR #36): a mention quote to its person, a sentence of the evidence to the
+    // people it names; a sentence naming no one could be about any of them
+    const said: { text: string; who: string[] }[] = [
+      ...(m.personMentions ?? []).map((p) => ({ text: p.quote ?? "", who: [canon(personSheetKey((p.displayName || p.groupingKey || "").trim()))].filter(Boolean) })),
+      ...(m.evidenceQuotes ?? []).flatMap((q) => statementSentences(q)).map((t) => {
+        const named = [...new Set(personKeysInText(t, keys).map(canon))];
+        return { text: t, who: named.length > 0 ? named : everyone };
+      }),
+    ];
+    for (const { text: t, who } of said) {
+      for (const w of contentWords(t, nameWords)) {
+        const set = peopleByWord.get(w) ?? new Set<string>();
+        for (const k of who) set.add(k);
+        peopleByWord.set(w, set);
+      }
     }
   }
   const genericWords = new Set([...peopleByWord].filter(([, people]) => people.size >= 2).map(([w]) => w));
