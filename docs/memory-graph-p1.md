@@ -129,3 +129,4 @@ P0 の人物シート（`personSheet.ts`）を軽量モード（`lite`）で使�
 ## P1-C（選定精度）
 
 背景に入れる考え・結論の選び方、理由の関連づけ、予定の分類、名前の無い記録の条件は [memory-graph-p1c.md](memory-graph-p1c.md)。
+- P1-D（人物に無関係な発言の混入防止）：[memory-graph-p1d.md](memory-graph-p1d.md)

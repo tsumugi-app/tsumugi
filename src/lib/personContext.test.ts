@@ -259,7 +259,7 @@ test("Codex on PR #34: over the limit within one day, the latest conclusions are
   for (let i = 0; i < 8; i++) {
     const at = `2026-09-01T0${i}:30:00.000Z`;
     memories.push(mem(`d${i}`, "2026-09-01", `みなとさんの件${i}。`, {
-      statedAt: at, personMentions: [mention("みなとさん", `みなとさんの件${i}`, at)], evidenceQuotes: [`第${i}案はやめることにした。`],
+      statedAt: at, personMentions: [mention("みなとさん", `第${i}案はやめることにした`, at)], evidenceQuotes: [`第${i}案はやめることにした。`],
     }));
   }
   const kept = buildPersonContext(memories, "みなと").conclusions.map((c) => c.statement.memoryId);
@@ -340,7 +340,8 @@ test("Codex on PR #34: a conclusion recovered from a duplicate keeps the time of
   const memories: MemoryObject[] = [
     mem("f1", "2026-09-01", "はるかさんの話も出た。", { conversationId: "conv-F", evidenceQuotes: ["もう関係を諦めることにした。"] }),
     mem("f2", "2026-09-02", "はるかさんとのこと。", {
-      personMentions: [mention("はるかさん", "はるかさんの話", at("2026-09-02"))],
+      // the topic quote is about the person: said in the same turn as the mention, with a word of it (P1-D)
+      personMentions: [mention("はるかさん", "はるかさんとの関係のこと", at("2026-09-09"))],
       topicEvents: [{ id: "te-f2", topicId: "topic-f", quote: "もう関係を諦めることにした。", statedAt: at("2026-09-09"), sourceConversationId: "c", recordedAt: at("2026-09-09"), origin: "ai-extracted", schemaVersion: 1 }],
     }),
     mem("f3", "2026-09-05", "はるかさんについて。", { personMentions: [mention("はるかさん", "はるかさんとの関係を諦める理由は、自分が既婚者だから。", at("2026-09-05"))] }),
