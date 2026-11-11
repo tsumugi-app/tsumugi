@@ -149,3 +149,52 @@ test("a name inside an ordinary word is not a person; a name with a particle or 
   assert.equal(r.person, null);
   assert.deepEqual(ids(r), before);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+// Memory Graph P1-B: names the user CONFIRMED as one person (fictional names)
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+const ALIAS_POOL = [
+  mem("r1", "2026-09-01", ["りこさん", "引っ越し"], "りこさんが引っ越しを考えていると話した。", "りこさん"),
+  mem("r2", "2026-10-01", ["りっちゃん", "新居"], "りっちゃんの新居を見に行く約束をしたと話した。", "りっちゃん"),
+  mem("mr", "2026-10-05", ["まりこさん", "引っ越し"], "まりこさんも引っ越しをしたと話した。", "まりこさん"),
+  mem("x2", "2026-08-05", ["旅行", "行き先"], "夏休みの行き先を決めたと話した。"),
+];
+const selectWith = (pool: MemoryObject[], latest: string, aliases: string[][], turns: string[] = [latest]) =>
+  selectConversationWithPersons(pool, latest, turns, computeKeywordFrequency(pool), DEFAULT_LIMIT, NOW, aliases);
+
+test("P1-B: confirmed names are one person (both names' records, once each); unconfirmed they stay apart", () => {
+  const q = "りこさんの引っ越しの話をしたい";
+  const apart = select(ALIAS_POOL, q);
+  assert.equal(apart.person?.key, "りこ");
+  assert.ok(!ids(apart).includes("r2"), "unconfirmed: the other name's record is not joined");
+  const joined = selectWith(ALIAS_POOL, q, [["りこさん", "りっちゃん"]]);
+  assert.ok(ids(joined).includes("r1") && ids(joined).includes("r2"));
+  assert.equal(new Set(ids(joined)).size, ids(joined).length, "no Memory twice");
+  assert.ok(!ids(joined).includes("mr"), "a name containing the confirmed one is another person");
+  // both names in one turn: one person when confirmed, two people (the previous selection) when not
+  const both = "りこさん、昔はりっちゃんって呼ばれてた";
+  assert.equal(select(ALIAS_POOL, both).person, null);
+  assert.notEqual(selectWith(ALIAS_POOL, both, [["りこさん", "りっちゃん"]]).person, null);
+});
+
+test("P1-B: no aliases or unusable aliases change nothing; a revoked name (not in the list) is apart again; similar names never join", () => {
+  for (const q of ["りこさんの引っ越しの話をしたい", "りっちゃんの新居", "まりこさんの引っ越し", "夏休みの行き先"]) {
+    const before = select(ALIAS_POOL, q);
+    assert.deepEqual(selectWith(ALIAS_POOL, q, []), before, q);
+    // a group whose names are not known people, a group of one key, a one-character name
+    assert.deepEqual(selectWith(ALIAS_POOL, q, [["ゆうさん", "はるさん"], ["ゆうさん", "ゆうちゃん"], ["りこさん", "りこ"], ["り", "りこさん"]]), before, q);
+  }
+  // after a revoke the list no longer holds the pair: the same as never confirmed
+  assert.deepEqual(selectWith(ALIAS_POOL, "りこさんの引っ越しの話をしたい", []), select(ALIAS_POOL, "りこさんの引っ越しの話をしたい"));
+  // まりこ is never joined through りこ (partial match), even when りこ is confirmed with りっちゃん
+  const m = selectWith(ALIAS_POOL, "まりこさんの引っ越し", [["りこさん", "りっちゃん"]]);
+  assert.equal(m.person?.key, "まりこ");
+  assert.ok(!ids(m).includes("r1") && !ids(m).includes("r2"));
+});
+
+test("P1-B: a carried person keeps the confirmed group; another person's record is still kept out", () => {
+  const turns = ["りっちゃんの新居を見に行く", "新居はどのあたりなんだろう"];
+  const r = selectWith(ALIAS_POOL, turns[1], [["りこさん", "りっちゃん"]], turns);
+  assert.equal(r.person?.how, "carried");
+  assert.ok(!ids(r).includes("mr"));
+});

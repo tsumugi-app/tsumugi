@@ -105,8 +105,11 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   for (const l of git("diff", "-U0", ...range, "--", "src/lib/connect.ts").split("\n").filter((x) => /^[+-]/.test(x) && !/^(\+\+\+|---)/.test(x))) assert.ok(connectKeyLines.has(l[0] + l.slice(1).trim()) || aiSelection(l), `src/lib/connect.ts must not be modified (unreviewed line): ${l}`);
   // Reviewed (startup I/O): the check of every saved record runs once per build and day. These two files may gain exactly that and nothing else
   const doneIntegrityLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedDoneIntegrityLines.json"), "utf8")).lines);
+  // Reviewed (Memory Graph P1-B): the startup sync of the confirmed names (People/) after the save-foundation bootstrap; and the chat screen passes the confirmed names (trial flag ON only). Exact lines only
+  const peopleLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedPeopleLines.json"), "utf8")).lines);
+  const people = (l: string) => peopleLines.has(l[0] + l.slice(1).trim());
   for (const f of ["src/lib/productionBootstrap.ts", "src/lib/saveFoundationBootstrap.ts"]) {
-    for (const l of git("diff", "-U0", ...range, "--", f).split("\n").filter((x) => /^[+-]/.test(x) && !/^(\+\+\+|---)/.test(x))) assert.ok(doneIntegrityLines.has(l[0] + l.slice(1).trim()), `${f} must not be modified (unreviewed line): ${l}`);
+    for (const l of git("diff", "-U0", ...range, "--", f).split("\n").filter((x) => /^[+-]/.test(x) && !/^(\+\+\+|---)/.test(x))) assert.ok(doneIntegrityLines.has(l[0] + l.slice(1).trim()) || (f === "src/lib/productionBootstrap.ts" && people(l)), `${f} must not be modified (unreviewed line): ${l}`);
   }
   // Reviewed exception (Memory Timeline trial): the chat route may only gain the optional memoryTimeline section
   // Reviewed (Memory Synthesis S1): the new, stateless generation route /api/synthesize (it reads and writes no Memory)
@@ -155,7 +158,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (realtime diary PR-A, owner approval 2026-11-07): the separate entry, the pause (going home makes no Memory and sends nothing) and the time labels — exact lines only
   const realtimeDiaryLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedRealtimeDiaryLines.json"), "utf8")).lines);
   const realtimeDiary = (l: string) => realtimeDiaryLines.has(l[0] + l.slice(1).trim());
-  for (const l of chatDiff) assert.ok(startupCapture(l) || aiSelection(l) || realtimeDiary(l) || memoryContext(l) || memoryGraph(l) || navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
+  for (const l of chatDiff) assert.ok(startupCapture(l) || aiSelection(l) || realtimeDiary(l) || memoryContext(l) || memoryGraph(l) || people(l) || navigationUi(l) || vaultConsistencyUi(l) || /restore(Conversation|MemoryObject|Source)IfNotNewer|^-\s+(putConversation|putMemoryObject|saveSource)(,|\()|^-\s+await (putConversation|putMemoryObject|saveSource)\(/.test(l) || calendarDeleteCallback.test(l) || startupIoChat.test(l) || memoryTimelineChat.test(l) || memorySynthesisChat.test(l), "unexpected ChatScreen.tsx change: " + l);
   // vaultProjection.ts: the only allowed change is that the startup integrity reconcile skips a done entry whose divergence the user accepted (for that record version)
   const projDiff = git("diff", "-U0", ...range, "--", "src/lib/vaultProjection.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (Vault auto repair, PR 3): a Memory re-queued by the repair (requireLosslessDayFile) is held instead of written when rewriting its day file would lose content. Normal saves pass requireLossless = false. Exact lines only (never a pattern)

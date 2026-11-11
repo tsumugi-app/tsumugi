@@ -686,7 +686,9 @@ export function selectConversationWithPersons(
   recentUserTurnsTexts: string[],
   keywordFrequency: Map<string, number>,
   limit: number,
-  now: number
+  now: number,
+  /** Memory Graph P1-B：本人が確定した同じ人物の名前の組（未指定・空なら従来どおり。名前の推測では束ねない） */
+  aliases: string[][] = []
 ): PersonAwareSelection {
   // 人物の話でなければ、元の入力のままの従来の選定（「2人」の読み替えも人物の話のときだけ）
   const fallback = (): PersonAwareSelection => ({
@@ -698,30 +700,40 @@ export function selectConversationWithPersons(
   });
   const latest = normalizeTwoPeople(trimmed);
   const turns = recentUserTurnsTexts.map(normalizeTwoPeople);
-  const keys = knownPersonKeys(pool);
-  if (keys.length === 0) return fallback();
+  const known = knownPersonKeys(pool);
+  if (known.length === 0) return fallback();
+  // 確定した名前の組：既知の名前を1つでも含む組だけ。組の名前はどれも既知の人物の名前として扱い、同じ組の名前は1人と数える
+  const groupOf = new Map<string, string[]>();
+  for (const list of aliases) {
+    const group = [...new Set(list.map(personNameKey).filter((key) => Array.from(key).length >= 2 && !GENERIC_PERSON_WORDS.includes(key)))];
+    if (group.length < 2 || !group.some((key) => known.includes(key)) || group.some((key) => groupOf.has(key))) continue;
+    for (const key of group) groupOf.set(key, group);
+  }
+  const keys = [...new Set([...known, ...groupOf.keys()])];
+  const groupKeys = (key: string) => groupOf.get(key) ?? [key];
 
-  const named = personKeysInText(trimmed, keys);
+  const named = [...new Map(personKeysInText(trimmed, keys).map((key) => [groupKeys(key)[0], key])).values()];
   let person: PersonAwareSelection["person"] = null;
   if (named.length === 1) {
     person = { key: named[0], how: "named" };
   } else if (named.length === 0) {
-    // 従来の人物継続を、キーワードが名前と一致する記録もその人物の記録として扱った写しの上で使う
+    // 従来の人物継続を、キーワードが名前と一致する記録（と、確定した同じ人物の別の名前の記録）もその人物の記録として扱った写しの上で使う
     const linked = pool.map((memory) => {
-      const extra = keys.filter((key) => !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key));
+      const extra = keys.filter((key) => !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && groupKeys(key).some((k) => (k === key ? (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key) : isAboutPerson(memory, k))));
       return extra.length === 0 ? memory : ({ ...memory, personMentions: [...(memory.personMentions ?? []), ...extra.map((key) => ({ displayName: key, groupingKey: key }))] } as unknown as MemoryObject);
     });
     const focus = deriveConversationPersonFocus(turns, linked);
     if (focus) person = { key: personNameKey(focus.displayName), how: "carried" };
   }
   if (!person) return fallback();
-  const target = person.key;
+  const targetKeys = groupKeys(person.key);
+  const isAboutTarget = (memory: MemoryObject) => targetKeys.some((key) => isAboutPerson(memory, key));
   const base = selectConversationDirectMatches(pool, latest, turns, keywordFrequency, limit).kept.map((entry) => entry.memory);
-  const aboutOther = (memory: MemoryObject) => keys.some((key) => key !== target && isAboutPerson(memory, key));
+  const aboutOther = (memory: MemoryObject) => keys.some((key) => !targetKeys.includes(key) && isAboutPerson(memory, key));
 
   const dropped: string[] = [];
   const kept = base.filter((memory) => {
-    if (aboutOther(memory) && !isAboutPerson(memory, target)) {
+    if (aboutOther(memory) && !isAboutTarget(memory)) {
       dropped.push(memory.id);
       return false;
     }
@@ -733,7 +745,7 @@ export function selectConversationWithPersons(
   const ownKeywordHits = (memory: MemoryObject) => (memory.keywords ?? []).filter((keyword) => !keys.includes(personNameKey(keyword)) && query.includes(nfkcCompact(keyword))).length;
 
   const included = new Set(kept.map((memory) => memory.id));
-  const candidates = pool.filter((memory) => isAboutPerson(memory, target) && !aboutOther(memory) && !included.has(memory.id));
+  const candidates = pool.filter((memory) => isAboutTarget(memory) && !aboutOther(memory) && !included.has(memory.id));
   const added: MemoryObject[] = [];
   const newest = [...candidates].sort((a, b) => memoryTime(b) - memoryTime(a))[0];
   if (newest) added.push(newest);
@@ -749,7 +761,7 @@ export function selectConversationWithPersons(
   let feeling: MemoryObject | undefined;
   if (isRelationshipTalk(trimmed, turns.length >= 2 ? turns[turns.length - 2] : undefined)) {
     const eligible = pool
-      .filter((memory) => isAboutPerson(memory, target) && isFeelingRecord(memory) && !aboutOther(memory))
+      .filter((memory) => isAboutTarget(memory) && isFeelingRecord(memory) && !aboutOther(memory))
       .filter((memory) => now - memoryTime(memory) <= FEELING_MAX_AGE_DAYS * DAY_MS_RETRIEVAL);
     const matched = eligible
       .filter((memory) => !included.has(memory.id))
@@ -813,6 +825,7 @@ async function retrieveCreativeMemories(
     /** Conversation Retrieval用。直近の同一Conversation内user turns本文（最新発言含む）。
      * 未指定時は空配列扱い＝anchorボーナス無しでgenericKeywordPenaltyのみ効く。 */
     recentUserTurnsTexts?: string[];
+    personAliases?: string[][];
   },
   context?: string[]
 ): Promise<RetrievedMemory[]> {
@@ -828,7 +841,8 @@ async function retrieveCreativeMemories(
     options.recentUserTurnsTexts ?? [],
     keywordFrequency,
     directLimit,
-    Date.now()
+    Date.now(),
+    options.personAliases ?? []
   ).memories;
 
   let divergentMatches: MemoryObject[] = [];
@@ -954,6 +968,11 @@ export interface RetrieveRelevantMemoriesOptions {
    * （1ターンに最大3件。memoryContext.ts）。未指定（Connect等）は従来どおり何も添えない。選ばれるMemory自体は変わらない。
    */
   includeContext?: boolean;
+  /**
+   * Memory Graph P1-B（会話画面が試験フラグONのときだけ渡す）。本人が確定した同じ人物の名前の組。人物を選ぶときに組を1人として扱う
+   * （selectConversationWithPersons）。未指定・空なら従来どおり。
+   */
+  personAliases?: string[][];
 }
 
 /**

@@ -27,11 +27,18 @@ import { runSaveFoundationBootstrap, type SaveFoundationBootstrapResult } from "
 import { getStoragePersistenceDiagnostics } from "./storagePersistence";
 import { debugLogEnabled } from "./generationDebugLog";
 import { APP_BUILD_ID } from "./recoveryBackgroundCheck";
+import { syncPeopleOnStartup } from "./personAliasDevice";
 
 type BootstrapFn = (root: FileSystemDirectoryHandle) => Promise<SaveFoundationBootstrapResult>;
 
 const DONE_INTEGRITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const defaultBootstrapFn: BootstrapFn = (root) => runSaveFoundationBootstrap({ root, doneIntegrity: { build: APP_BUILD_ID, maxAgeMs: DONE_INTEGRITY_MAX_AGE_MS } });
+const defaultBootstrapFn: BootstrapFn = async (root) => {
+  const result = await runSaveFoundationBootstrap({ root, doneIntegrity: { build: APP_BUILD_ID, maxAgeMs: DONE_INTEGRITY_MAX_AGE_MS } });
+  // Memory Graph P1-B: the confirmed names (People/) are read into this device and the decisions made here are written, after the records' own sync and
+  // inside the same Vault world lock. It never throws and touches nothing but People/ and its own device cache (personAliasDevice.ts).
+  await syncPeopleOnStartup(root);
+  return result;
+};
 
 let inFlight: Promise<SaveFoundationBootstrapResult | null> | null = null;
 

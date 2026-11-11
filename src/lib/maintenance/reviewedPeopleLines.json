@@ -1,0 +1,20 @@
+{
+"note": "Memory Graph P1-B (trial, default OFF: ?memoryGraph=1): the chat screen reads the names the user confirmed as one person (device cache of People/, personAliasDevice.ts) and passes them to Retrieval and to the person context; the startup bootstrap syncs People/ with the device after the save-foundation bootstrap, inside the same Vault world lock (never throws, touches only People/ and its cache).",
+"lines": [
+"+import { loadConfirmedAliasLists } from \"@/lib/personAliasDevice\";",
+"+// Memory Graph P1-B（試験フラグONのときだけ）：本人が確定した同じ人物の名前の組（端末内。読めなければ空＝従来どおり）",
+"+const personAliases = memoryGraphEnabled() ? await loadConfirmedAliasLists() : [];",
+"+personAliases,",
+"-personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id) });",
+"+personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id), aliases: personAliases });",
+"+import { syncPeopleOnStartup } from \"./personAliasDevice\";",
+"-const defaultBootstrapFn: BootstrapFn = (root) => runSaveFoundationBootstrap({ root, doneIntegrity: { build: APP_BUILD_ID, maxAgeMs: DONE_INTEGRITY_MAX_AGE_MS } });",
+"+const defaultBootstrapFn: BootstrapFn = async (root) => {",
+"+const result = await runSaveFoundationBootstrap({ root, doneIntegrity: { build: APP_BUILD_ID, maxAgeMs: DONE_INTEGRITY_MAX_AGE_MS } });",
+"+// Memory Graph P1-B: the confirmed names (People/) are read into this device and the decisions made here are written, after the records' own sync and",
+"+// inside the same Vault world lock. It never throws and touches nothing but People/ and its own device cache (personAliasDevice.ts).",
+"+await syncPeopleOnStartup(root);",
+"+return result;",
+"+};"
+]
+}

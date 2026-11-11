@@ -1875,6 +1875,30 @@ export async function saveAutoCaptureStateRaw(json: string) {
   await db.put("settings", json, AUTO_CAPTURE_STATE_KEY);
 }
 
+/**
+ * Memory Graph P1-B（personAliasStore.ts）：本人が確定した人物の別名の、端末側の写し（Vaultの`People/`が正本）。値の解釈はpersonAliasStore.ts。
+ * 読み書きは1つのtransactionで行う（同じ端末の別タブの確定と混ざっても、どちらも失わない）。
+ */
+const PEOPLE_STATE_KEY = "people:v1";
+export async function readPeopleStateRaw(): Promise<unknown> {
+  const db = await getDB();
+  return db.get("settings", PEOPLE_STATE_KEY);
+}
+export async function updatePeopleStateRaw<T>(fn: (raw: unknown) => { value: string; result: T }): Promise<T> {
+  const db = await getDB();
+  const tx = db.transaction(["settings"], "readwrite");
+  let result: T;
+  try {
+    const out = fn(await tx.objectStore("settings").get(PEOPLE_STATE_KEY));
+    await tx.objectStore("settings").put(out.value, PEOPLE_STATE_KEY);
+    result = out.result;
+  } catch (error) {
+    await abortAndSettleTransaction(tx, error);
+  }
+  await tx.done;
+  return result!;
+}
+
 const REALTIME_DIARY_AUTO_SETTINGS_KEY = "realtimeDiaryAuto:settings";
 const REALTIME_DIARY_AUTO_STATE_KEY = "realtimeDiaryAuto:state";
 
