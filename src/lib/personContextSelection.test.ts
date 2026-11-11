@@ -250,6 +250,22 @@ test("a simple question Retrieval answers: the context does not repeat the answe
   assert.deepEqual(selectPersonContextsForTurn(memories, { userText: "映画は何時からだっけ？", earlierUserTurns: [] }), []);
 });
 
+test("Codex on PR #36: the same words on two days count as coming back to them; another person's confirmed aliases are one person", () => {
+  const twice = [...world(), sora("s1b", "2026-09-01", WISH_1)];
+  const c = statementsOf(twice).find((x) => x.statement.text === WISH_1);
+  assert.ok(c && c.repeated === true);
+  assert.ok(!statementsOf(world()).find((x) => x.statement.text === WISH_1)?.repeated);
+  // 旅行 is used about あおいさん and 青井さん only: one person when confirmed, so the word still tells something about そらさん
+  const memories = [
+    sora("t1", "2026-06-01", "そらさんとの旅行は大事だ。"),
+    mem("t2", "2026-06-02", "あおいさんの話。", { personMentions: [mention("あおいさん", "あおいさんと旅行の話をした", "2026-06-02")] }),
+    mem("t3", "2026-06-03", "青井さんの話。", { personMentions: [mention("青井さん", "青井さんと旅行の話をした", "2026-06-03")] }),
+    mem("t4", "2026-06-01", "旅行の話。", { conversationId: "conv-t1", evidenceQuotes: ["旅行はやめることにした。"] }),
+  ];
+  assert.ok(!buildPersonContext(memories, "そら").memoryIds.includes("t4"), "unconfirmed: two other people use 旅行");
+  assert.ok(buildPersonContext(memories, "そら", { aliases: [["あおいさん", "青井さん"]] }).memoryIds.includes("t4"));
+});
+
 test("the route keeps the new fields only in their known shapes", () => {
   const good = buildPersonContext(world(), "そら");
   const [clean] = sanitizePersonContext([good]);
