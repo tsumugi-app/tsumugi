@@ -22,6 +22,7 @@ import type { PersonView } from "./person";
 import type { TopicTimeline } from "./topicEvent";
 import type { TopicContinuityMemoryRef } from "./topicContinuity";
 import type { RetrievedMemory } from "./types";
+import type { ContextProvenance } from "./chatContextProvenance";
 
 export const DEBUG_ENVELOPE_DELIMITER = "\u0000TSUMUGI_DEBUG_ENVELOPE_V1\u0000";
 
@@ -103,4 +104,9 @@ export interface GenerationDebugEnvelope {
   generation: GenerationDebugGeneration;
   /** サーバー側の`sanitize*Context()`通過後、実際にsystemInstructionへ使われた値。 */
   serverAccepted: GenerationDebugContext;
+  /**
+   * P1-F：経路ごとの由来（chatContextProvenance.ts。短い抜粋だけ）。localStorageへは保存しない
+   * （appendGenerationDebugEntryはserverAccepted・generationだけを保存する）。クライアントはタブのメモリにだけ置く。
+   */
+  provenance?: ContextProvenance;
 }

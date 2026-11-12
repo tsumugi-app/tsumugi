@@ -19,6 +19,8 @@ import { buildMemoryAnalyticsContext, type MemoryAnalyticsContext } from "@/lib/
 import { computeTopicTimelines, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { appendGenerationDebugEntry, createGenerationId, debugLogEnabled as generationDebugLogEnabled } from "@/lib/generationDebugLog";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
+import { buildContextProvenance, type ContextProvenance, type ReflectionTrace } from "@/lib/chatContextProvenance";
+import { rememberContextProvenance } from "@/lib/contextProvenanceStore";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
@@ -5032,6 +5034,8 @@ export default function ChatScreen() {
         .filter(Boolean);
       // Memory Graph P1-B（試験フラグONのときだけ）：本人が確定した同じ人物の名前の組（端末内。読めなければ空＝従来どおり）
       const personAliases = memoryGraphEnabled() ? await loadConfirmedAliasLists() : [];
+      // P1-F：診断（?debugLog=1）のときだけ、RetrievalがReflectionをどう扱ったかを受け取る（結果は変わらない）
+      let reflectionTrace: ReflectionTrace | null = null;
       const retrievedMemories = await retrieveRelevantMemories(text, {
         excludeConversationId: baseConversation.id,
         limit: reflective ? REFLECTIVE_LIMIT : undefined,
@@ -5042,6 +5046,9 @@ export default function ChatScreen() {
         // 会話品質改善 第1段階：選ばれたMemoryに、話題の人物と、要約に無い本人の発言の一文を添える（memoryContext.ts）
         includeContext: true,
         personAliases,
+        // P1-F：AIが書いた日記の振り返り（Reflection）は、本人の記録の後に回す（会話の画面だけ。Connect等は従来どおり）
+        deferReflections: true,
+        ...(generationDebugLogEnabled() ? { onReflectionTrace: (trace: ReflectionTrace) => { reflectionTrace = trace; } } : {}),
       });
 
       // Recent Conversation Context（Current Conversation → Recent Conversation → Memory Retrieval
@@ -5088,8 +5095,11 @@ export default function ChatScreen() {
       let memoryTimelineContext: SynthesisThemeContext[] = [];
       // Memory Graph P1-A（試験・既定OFF）：話題の人物の背景（結論・理由・後からの説明・予定と結果）。同じMemory一覧から端末内で組み立てる（AI呼び出し・保存は無い）
       let personGraphContext: PersonContext[] = [];
+      // P1-F：診断のときだけ、ID を持たない経路（話題の候補・経緯）の記録を探すために使う（同じ一覧。追加の読み込みは無い）
+      let memoriesForProvenance: MemoryObject[] = [];
       try {
         const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
+        if (generationDebugLogEnabled()) memoriesForProvenance = allMemoriesForTopicContinuity;
         try {
           memoryAnalyticsContext = buildMemoryAnalyticsContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
         } catch (analyticsError) {
@@ -5197,6 +5207,21 @@ export default function ChatScreen() {
         topicContinuity: topicContext ? topicContext.map((t) => ({ topicId: t.topicId, memories: t.memories })) : null,
         retrievedMemory: retrievedMemories,
       };
+      // P1-F：送信する値の経路ごとの由来（?debugLog=1のときだけ。保存しない。失敗しても送信は止めない）
+      let sentProvenance: ContextProvenance | null = null;
+      if (generationId) {
+        try {
+          sentProvenance = buildContextProvenance(
+            { retrievedMemories, topicContinuity: topicContext, topicTimeline: topicTimelineContext, memoryTimeline: memoryTimelineContext, personContext: personGraphContext, explicitSearch: explicitSearchContext },
+            {
+              topicContinuityId: (ref) => memoriesForProvenance.find((m) => m.summary === ref.summary && m.date === ref.date)?.id,
+              topicTimelineId: (event) => memoriesForProvenance.find((m) => (m.topicEvents ?? []).some((e) => e.quote === event.quote && e.statedAt === event.time && e.sourceConversationId === event.sourceConversationId))?.id,
+            }
+          );
+        } catch (error) {
+          console.warn("[GenerationDebug] context provenance skipped", error);
+        }
+      }
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -5341,6 +5366,8 @@ export default function ChatScreen() {
           serverAccepted: debugEnvelope.serverAccepted,
           generation: debugEnvelope.generation,
         });
+        // P1-F：経路ごとの由来は、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
+        if (sentProvenance) rememberContextProvenance(aiTurn.timestamp, { sent: sentProvenance, accepted: debugEnvelope.provenance ?? null, reflection: reflectionTrace });
         // Explicit Memory Search P0.5：サーバーが受け取ったExplicit Searchの状態を、Conversation Debuggerの「全てコピー」
         // （conversationDebugLog）にも1行残す。観測専用（?debugLog=1のときだけ。promptにも検索にも影響しない）。
         const explicitSearchAccepted = debugEnvelope.serverAccepted.explicitSearchServerAccepted;
