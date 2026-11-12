@@ -141,7 +141,13 @@ test("the recall question and its topic: question-form words are not the topic; 
   assert.deepEqual(rq.matchRecallTopic({ summary: "x", keywords: ["車選び"] }, topic, Q_ABSTRACT).matched, ["車"]);
   assert.deepEqual(rq.matchRecallTopic({ summary: "車について考えた", keywords: [] }, topic, Q_ABSTRACT).matched, ["車"]);
   // a single kanji matches a summary only as a word of its own (a summary 「本当に…」 is not about 「本」)
-  assert.deepEqual(rq.matchRecallTopic({ summary: "車種で迷う", keywords: [] }, topic, Q_ABSTRACT).matched, []);
+  assert.deepEqual(rq.matchRecallTopic({ summary: "車種で迷う", keywords: [] }, topic, Q_ABSTRACT).matched, []);});
+
+test("a topic that appears only in a record's content (not its summary or keywords) is still found, as scoreMemory reads the content too", async () => {
+  const q = "前にアウトランダーについて何て言ったっけ？";
+  const contentOnly = { ...mem("cc", "2026-10-20", "購入候補を比較した", ["購入", "検討"]), content: "新しく買う車を検討した。アウトランダーは広くて良さそうだと感じた。" } as MemoryObject;
+  pool = [contentOnly, ...seiri, ...unrelated];
+  for (const persona of ["analyst", "companion"] as const) assert.ok((await retrieve(q, persona, true)).includes("cc"), persona);
 });
 
 test("ordinary sentences are not recall questions; verb / adjective stems are not topics; a shorter keyword stands for a longer topic only when no record has the topic", () => {

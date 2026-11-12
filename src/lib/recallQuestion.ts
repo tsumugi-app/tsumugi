@@ -76,22 +76,26 @@ export function recallTopicOf(text: string): RecallTopic | null {
   return terms.length > 0 ? { terms } : null;
 }
 
+/** what a record offers to the topic match: the same fields scoreMemory reads (keywords, summary, content) */
+export type TopicSource = { keywords?: string[]; summary?: string; content?: string };
+
 const keywordsOf = (memory: { keywords?: string[] }) => (memory.keywords ?? []).filter((k): k is string => typeof k === "string" && k.trim().length > 0);
 
 /**
- * A record matches a topic term directly when one of its keyword runs is the term or starts with it (keyword 「車選び」 for 「車」), or one of its summary
- * runs is the term (a single kanji) or starts with it (two or more letters). A run that only ENDS with the term (「電車」「自転車」「駐車場」) or is shorter
+ * A record matches a topic term directly when one of its keyword runs is the term or starts with it (keyword 「車選び」 for 「車」), or one of its summary /
+ * content runs is the term (a single kanji) or starts with it (two or more letters). A run that only ENDS with the term (「電車」「自転車」「駐車場」) or is shorter
  * than it (「日本」 for 「日本酒」) is not a direct match.
  */
-function matchesDirectly(memory: { keywords?: string[]; summary?: string }, term: string): boolean {
+function matchesDirectly(memory: TopicSource, term: string): boolean {
   const keywords = keywordsOf(memory).map((k) => k.normalize("NFKC").trim());
   if ([...keywords, ...keywords.flatMap(runsOf)].some((run) => run.startsWith(term))) return true;
   const single = isSingleKanji(term);
-  return runsOf(memory.summary ?? "").some((run) => (single ? run === term : run.startsWith(term)));
+  // the summary and the content (scoreMemory reads both)
+  return runsOf(`${memory.summary ?? ""} ${memory.content ?? ""}`).some((run) => (single ? run === term : run.startsWith(term)));
 }
 
 /** the topic with the terms the pool matches directly (see `RecallTopic.direct`) */
-export function withPoolEvidence(topic: RecallTopic | null, memories: readonly { keywords?: string[]; summary?: string }[]): RecallTopic | null {
+export function withPoolEvidence(topic: RecallTopic | null, memories: readonly TopicSource[]): RecallTopic | null {
   if (!topic) return null;
   return { terms: topic.terms, direct: topic.terms.filter((term) => memories.some((memory) => matchesDirectly(memory, term))) };
 }
@@ -108,7 +112,7 @@ export interface RecallTopicMatch {
   coveredByKeyword: string[];
 }
 
-export function matchRecallTopic(memory: { keywords?: string[]; summary?: string }, topic: RecallTopic, questionText: string): RecallTopicMatch {
+export function matchRecallTopic(memory: TopicSource, topic: RecallTopic, questionText: string): RecallTopicMatch {
   // the same raw comparison as scoreMemory: a keyword is "covered" only where the normal scoring counted it
   const keywordHits = keywordsOf(memory).filter((k) => (questionText ?? "").includes(k));
   const matched: string[] = [];
