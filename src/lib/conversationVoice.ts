@@ -90,8 +90,8 @@ export const REALTIME_DIARY_VOICE_SECTION = `
 
 /**
  * A recall question (「過去にどんな車がいいって言ったっけ？」, recallQuestion.ts) for which the Memory search of this turn found nothing: the search has limits,
- * so the answer must not turn "not found" into "never said", and must not become an apology. Only in such a turn (no retrieved Memory, no explicit search
- * or analytics result); other turns get nothing.
+ * so the answer must not turn "not found" into "never said", and must not become an apology. Only in such a turn (the client sent no Memory, no explicit
+ * search or analytics result, no web search this turn); other turns get nothing.
  */
 export const RECALL_NOT_FOUND_NOTE = `
 
@@ -99,7 +99,7 @@ export const RECALL_NOT_FOUND_NOTE = `
 本人が自分の過去の発言や出来事を尋ねている。このターンの記憶の検索では、その質問に一致する記録が見つからなかった。これは検索の限界で、記録が無いという意味ではない（上の節にこの質問に関係する記録があれば、それは使ってよい）。
 - 「記録が無い」「話していない」「言っていない」と断定しない。「今回参照できた記録では確認できなかった」と短く一度だけ伝える。
 - 謝罪や検索の仕組みの説明を重ねない。必要なら思い出す手がかり（具体的な名前や時期）を一つだけ尋ねるか、今の話の続きに応じる。
-- この節は、上の「このターンの過去の情報」より優先する。`;
+- 「このターンの過去の情報」の節があっても、確認できなかったことはこの形で短く伝えてよい。`;
 
 export type ConversationVoiceMode = "realtime-diary";
 

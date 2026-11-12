@@ -1176,7 +1176,11 @@ export async function retrieveRelevantMemoriesImpl(
   const searchable = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
   const topic = withPoolEvidence(recall, searchable);
   const candidates = searchable
-    .map((memory) => ({ memory, score: scoreMemory(memory, trimmed) + recallTopicBonus(memory, topic, trimmed), onTopic: topic ? matchRecallTopic(memory, topic, trimmed).matched.length > 0 : false }))
+    .map((memory) => {
+      const match = topic ? matchRecallTopic(memory, topic, trimmed) : null;
+      const bonus = match ? (match.matched.length - match.coveredByKeyword.length) * KEYWORD_WEIGHT : 0;
+      return { memory, score: scoreMemory(memory, trimmed) + bonus, onTopic: (match?.matched.length ?? 0) > 0 };
+    })
     // スコア0（関連なし）は返さない。無理に件数を埋めない（MEMORY_ENGINE.md 7.4）。
     .filter((entry) => entry.score > 0);
   // 過去を尋ねる質問（話題の語があるとき）：話題に一致せず、analystの最低点にも届かない弱い記録（文字の偶然の重なりだけ）は入れない（analystと同じ基準）

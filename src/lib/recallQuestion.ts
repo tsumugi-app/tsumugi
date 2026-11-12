@@ -3,14 +3,14 @@
  * Pure functions, no AI, no storage. Used only by the chat (Retrieval with `recallTopic`, the Memory Timeline theme choice, the chat prompt).
  *
  * The TOPIC of such a question is what is left of its kanji / katakana / latin runs after the words that only shape the question
- * (過去・以前・前・言…). Matching the topic with a Memory is by those runs too, so 「車」「車種」 match 「車」「車種」「車選び」 without a synonym list
- * and without naming any topic in the code.
+ * (過去・以前・前・言…) and the single-kanji stems of verbs and adjectives (好き・決めた…). Matching the topic with a Memory is by those runs too,
+ * so a topic matches the same word and longer words that start with it, without a synonym list and without naming any topic in the code.
  */
 
 /** words that only shape a question about the past (when, asked how), never its topic */
 export const QUESTION_FORM_TERMS: ReadonlySet<string> = new Set([
-  "過去", "以前", "前", "前回", "昔", "今", "今回", "今日", "昨日", "最近", "当時", "最初", "最後", "一番",
-  "話", "言", "何", "事", "時", "頃", "方", "自分", "私", "僕", "俺", "思", "考", "気", "感", "感じ", "結局",
+  "過去", "以前", "前", "前回", "昔", "今", "今回", "今日", "昨日", "最近", "当時", "最初", "最後", "一番", "名前",
+  "話", "言", "何", "事", "時", "頃", "方", "自分", "私", "僕", "俺", "思", "考", "気", "感", "感じ", "結局", "覚", "教",
 ]);
 
 /** single kanji that are a stem of a common adjective or a direction more often than a topic (「新しい」「大きい」「上の」): not a topic on their own */
@@ -26,22 +26,44 @@ const isNotTopic = (term: string) => QUESTION_FORM_TERMS.has(term) || SINGLE_KAN
 
 const RUNS = /[一-鿿々]+|[ァ-ヺー]{2,}|[A-Za-z0-9]{2,}/g;
 const runsOf = (text: string): string[] => text.normalize("NFKC").match(RUNS) ?? [];
+const isSingleKanji = (run: string) => Array.from(run).length === 1 && /[一-鿿々]/.test(run);
+/** hiragana right after a single kanji that is NOT a particle: the kanji is the stem of a verb or adjective (好き・決めた・欲しい), not a noun (車が・本を) */
+const STEM_FOLLOWER = /^[ぁ-ゖ]/;
+const PARTICLE_FOLLOWER = /^(?:の|が|を|は|に|で|と|も|へ|や|か|っ)/;
 
-/** pointing back at something earlier (「っけ」 alone also does: 「言ったっけ」「どこだっけ」) */
-const RECALL_ANCHOR = /過去|以前|前に|前は|前回|昔|これまで|今まで|この前|当時|っけ/;
-const QUESTION = /[?？]|っけ|かな|かしら|でしょうか|ですか|だった\s*$/;
+/** the question's own runs that can be its topic */
+function questionTopicRuns(text: string): string[] {
+  const t = text.normalize("NFKC");
+  const out: string[] = [];
+  for (const m of t.matchAll(RUNS)) {
+    const run = m[0];
+    if (isNotTopic(run)) continue;
+    const after = t.slice((m.index ?? 0) + run.length);
+    if (isSingleKanji(run) && STEM_FOLLOWER.test(after) && !PARTICLE_FOLLOWER.test(after)) continue;
+    out.push(run);
+  }
+  return [...new Set(out)];
+}
+
+/** pointing back at the user's own earlier words or days (「前に」 only on its own: not 名前は・目の前に・事前に・寝る前に) */
+const RECALL_ANCHOR = /過去|以前|(?<![名目事直手寝る午最生戦建空以食])前(?:に|は|回)|昔|これまで|今まで|この前|当時/;
+/** what the user said / thought / did, asked back (「言ったっけ」「話をしたっけ」「考えてた」); 「だっけ」 alone (「何メートルだっけ」) is not */
+const RECALL_VERB = /言っ|言わ|話し|話さ|話を|思っ|考え|書い|決め|選ん|たっけ|てた|ていた/;
+/** a question (「かな」 only at the end: not 「かなり」) */
+const QUESTION = /[?？]|っけ|かな[?？。!！]?$|かしら|でしょうか|ですか/;
 
 export function isRecallQuestion(text: string): boolean {
   const t = (text ?? "").normalize("NFKC").trim();
-  return t.length > 0 && RECALL_ANCHOR.test(t) && QUESTION.test(t);
+  if (!t || !QUESTION.test(t) || !RECALL_VERB.test(t)) return false;
+  return RECALL_ANCHOR.test(t) || /たっけ/.test(t);
 }
 
 export interface RecallTopic {
-  /** the topic runs of the question (no question-form words), e.g. ["車"], ["車種"], ["アウトランダー"] */
+  /** the topic runs of the question (no question-form words, no verb / adjective stems), e.g. ["車"], ["車種"], ["アウトランダー"] */
   terms: string[];
   /**
    * the terms some record of the searched pool matches directly (a run that is the term or starts with it). Set by `withPoolEvidence`.
-   * For a term no record matches directly (「自動車」 when no record says 自動車), a shorter keyword inside it (「車」) stands for it.
+   * For a term no record matches directly (「自動車」「車種」 when no record says so), a shorter keyword inside it (「車」) stands for it.
    * Absent: every term counts as matched directly (no fallback).
    */
   direct?: string[];
@@ -50,23 +72,22 @@ export interface RecallTopic {
 /** the topic of a recall question; null when the text is not a recall question or has no topic left (「前に何て言ったっけ？」) */
 export function recallTopicOf(text: string): RecallTopic | null {
   if (!isRecallQuestion(text)) return null;
-  const terms = [...new Set(runsOf(text).filter((run) => !isNotTopic(run)))];
+  const terms = questionTopicRuns(text);
   return terms.length > 0 ? { terms } : null;
 }
 
-const prefixRelated = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
-const keywordsOf = (memory: { keywords?: string[] }) =>
-  (memory.keywords ?? []).filter((k) => typeof k === "string" && k.trim().length > 0).map((k) => k.normalize("NFKC").trim());
+const keywordsOf = (memory: { keywords?: string[] }) => (memory.keywords ?? []).filter((k): k is string => typeof k === "string" && k.trim().length > 0);
 
 /**
- * A record matches a topic term directly when one of its keyword runs is the term, starts with it or begins the term (「車」→「車種」「車選び」, 「車種」→「車」),
- * or one of its summary runs is the term or starts with it. Runs that only END with the term are not matches (「電車」「自転車」「駐車場」 are not about 「車」).
+ * A record matches a topic term directly when one of its keyword runs is the term or starts with it (keyword 「車選び」 for 「車」), or one of its summary
+ * runs is the term (a single kanji) or starts with it (two or more letters). A run that only ENDS with the term (「電車」「自転車」「駐車場」) or is shorter
+ * than it (「日本」 for 「日本酒」) is not a direct match.
  */
 function matchesDirectly(memory: { keywords?: string[]; summary?: string }, term: string): boolean {
-  const keywords = keywordsOf(memory);
-  const keywordRuns = [...new Set([...keywords, ...keywords.flatMap(runsOf)])].filter((run) => !isNotTopic(run));
-  if (keywordRuns.some((run) => prefixRelated(run, term))) return true;
-  return runsOf(memory.summary ?? "").some((run) => !isNotTopic(run) && run.startsWith(term));
+  const keywords = keywordsOf(memory).map((k) => k.normalize("NFKC").trim());
+  if ([...keywords, ...keywords.flatMap(runsOf)].some((run) => run.startsWith(term))) return true;
+  const single = isSingleKanji(term);
+  return runsOf(memory.summary ?? "").some((run) => (single ? run === term : run.startsWith(term)));
 }
 
 /** the topic with the terms the pool matches directly (see `RecallTopic.direct`) */
@@ -76,8 +97,8 @@ export function withPoolEvidence(topic: RecallTopic | null, memories: readonly {
 }
 
 const isDirect = (topic: RecallTopic, term: string) => topic.direct === undefined || topic.direct.includes(term);
-/** a keyword of the question that stands for the term: prefix-related to it, or (when no record matches the term directly) inside it */
-const standsFor = (keyword: string, term: string, topic: RecallTopic) => prefixRelated(keyword, term) || (!isDirect(topic, term) && term.includes(keyword));
+/** a keyword of the question that stands for the term: it starts with the term, or (only when no record matches the term directly) it is inside it */
+const standsFor = (keyword: string, term: string, topic: RecallTopic) => keyword.startsWith(term) || (!isDirect(topic, term) && term.includes(keyword));
 
 /** how a Memory touches the topic: the terms it matches (each once) and whether a keyword hit of the normal scoring already counts the term */
 export interface RecallTopicMatch {
@@ -88,12 +109,12 @@ export interface RecallTopicMatch {
 }
 
 export function matchRecallTopic(memory: { keywords?: string[]; summary?: string }, topic: RecallTopic, questionText: string): RecallTopicMatch {
-  const question = (questionText ?? "").normalize("NFKC");
-  const keywordHits = keywordsOf(memory).filter((k) => question.includes(k));
+  // the same raw comparison as scoreMemory: a keyword is "covered" only where the normal scoring counted it
+  const keywordHits = keywordsOf(memory).filter((k) => (questionText ?? "").includes(k));
   const matched: string[] = [];
   const coveredByKeyword: string[] = [];
   for (const term of topic.terms) {
-    const covered = keywordHits.some((k) => standsFor(k, term, topic));
+    const covered = keywordHits.some((k) => standsFor(k.normalize("NFKC").trim(), term, topic));
     if (!covered && !matchesDirectly(memory, term)) continue;
     matched.push(term);
     if (covered) coveredByKeyword.push(term);

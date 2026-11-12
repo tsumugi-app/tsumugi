@@ -139,7 +139,25 @@ test("the recall question and its topic: question-form words are not the topic; 
   const topic = rq.recallTopicOf(Q_ABSTRACT)!;
   for (const [summary, keywords] of [["電車で通勤", ["電車"]], ["自転車を修理", ["自転車"]], ["駐車場が混む", ["駐車場"]]] as const) assert.deepEqual(rq.matchRecallTopic({ summary, keywords: [...keywords] }, topic, Q_ABSTRACT).matched, [], summary);
   assert.deepEqual(rq.matchRecallTopic({ summary: "x", keywords: ["車選び"] }, topic, Q_ABSTRACT).matched, ["車"]);
-  assert.deepEqual(rq.matchRecallTopic({ summary: "車種で迷う", keywords: [] }, topic, Q_ABSTRACT).matched, ["車"]);
+  assert.deepEqual(rq.matchRecallTopic({ summary: "車について考えた", keywords: [] }, topic, Q_ABSTRACT).matched, ["車"]);
+  // a single kanji matches a summary only as a word of its own (a summary 「本当に…」 is not about 「本」)
+  assert.deepEqual(rq.matchRecallTopic({ summary: "車種で迷う", keywords: [] }, topic, Q_ABSTRACT).matched, []);
+});
+
+test("ordinary sentences are not recall questions; verb / adjective stems are not topics; a shorter keyword stands for a longer topic only when no record has the topic", () => {
+  for (const text of ["名前は何がいいかな？", "寝る前に何をすればいいかな？", "事前に準備することは？", "前はかなり忙しかった", "昔はピアノが好きだった", "富士山って何メートルだっけ？", "目の前に海がある場所に行きたいかな", "かなり前に買った本を読んだ"]) {
+    assert.equal(rq.isRecallQuestion(text), false, text);
+  }
+  assert.deepEqual(rq.recallTopicOf("前にどんな本が好きって言ったっけ？")?.terms, ["本"], "好き is not a topic");
+  assert.deepEqual(rq.recallTopicOf("以前、何を決めたって話したっけ？"), null, "決めた is not a topic");
+  assert.deepEqual(rq.recallTopicOf("前に欲しいって言ってた時計、何だったっけ？")?.terms, ["時計"]);
+  const sake = rq.recallTopicOf("前にどんな日本酒が好きって言ったっけ？")!;
+  assert.deepEqual(sake.terms, ["日本酒"]);
+  const withSake = rq.withPoolEvidence(sake, [{ keywords: ["日本酒"], summary: "日本酒を飲んだ" }, { keywords: ["日本"], summary: "日本の歴史" }])!;
+  assert.equal(rq.isTopicKeyword("日本", withSake), false, "a record says 日本酒: the generic 日本 keeps its discount");
+  assert.deepEqual(rq.matchRecallTopic({ keywords: ["日本"], summary: "日本の歴史" }, withSake, "前にどんな日本酒が好きって言ったっけ？").matched, []);
+  const noSake = rq.withPoolEvidence(sake, [{ keywords: ["日本"], summary: "日本の歴史" }])!;
+  assert.equal(rq.isTopicKeyword("日本", noSake), true, "no record says 日本酒: the nearest keyword stands for it");
 });
 
 test("1 an abstract category (「車」「車種」「自動車」), the keyword 「車」 on 3 records: before analyst found nothing; after both find the car records first", async () => {
@@ -203,7 +221,7 @@ test("4 many records unrelated to the question but sharing its letters (過去�
   for (const persona of ["analyst", "companion"] as const) assert.deepEqual(await retrieve(Q_ABSTRACT, persona, true), [], persona);
 });
 
-test("5 analyst and companion return the same records for the recall questions after (before they differed)", async () => {
+test("5 analyst and companion return the same records for the recall questions after", async () => {
   for (const world of [carA, carC, manyCars]) {
     pool = [...world, ...seiri, ...unrelated];
     for (const q of [Q_ABSTRACT, Q_NAME, Q_KIND, Q_AUTO]) {
@@ -242,7 +260,7 @@ test("7 a recall question whose Memory search found nothing: the prompt says the
     const retrieved = await r.retrieveRelevantMemoriesImpl(Q_ABSTRACT, { persona: persona as Persona, recallTopic: true, recentUserTurnsTexts: [Q_ABSTRACT] });
     assert.ok(retrieved.length > 0);
     assert.ok(!(await systemFor({ ...ask(Q_ABSTRACT, persona), retrievedMemories: retrieved })).includes(NOTE_HEAD), `${persona}: found`);
-    assert.ok(!(await systemFor(ask("今日はいい天気だった", persona))).includes(NOTE_HEAD), `${persona}: not a recall question`);
+    for (const text of ["今日はいい天気だった", "昔はピアノが好きだった", "名前は何がいいかな？"]) assert.ok(!(await systemFor(ask(text, persona))).includes(NOTE_HEAD), `${persona}: not a recall question: ${text}`);
   }
   const v = voice.conversationVoice(undefined, "analyst");
   assert.equal(v.recallNotFoundNote(Q_ABSTRACT, false), "", "an explicit search / analytics result or a found Memory: no note");
