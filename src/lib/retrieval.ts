@@ -887,34 +887,49 @@ export function isReflectionMemory(memory: Pick<MemoryObject, "metadata">): bool
   return memory.metadata?.source === "system-generated";
 }
 
-/** 発言が振り返り・日記そのものを尋ねている（このときは従来どおり、本人の記録と同じ順位で選ぶ） */
-const ASKS_ABOUT_REFLECTION = /振り返り|ふりかえり|日記/;
+/**
+ * 発言が振り返り・日記に書いたことそのものを尋ねている（このときは従来どおり、本人の記録と同じ順位で選ぶ）。
+ * 「振り返り」「日記」という語だけでは尋ねたことにしない（「今年の振り返り」「今日の日記」は日記を書いている・話しているだけ）
+ */
+const ASKS_ABOUT_REFLECTION = /(?:振り返り|ふりかえり|日記)[^。？?！!]*(?:書い|書か|残っ|残し|あっ|見せ|読み|読ん|教え|何て|なんて|どんな)/;
 export function asksAboutReflection(text: string): boolean {
   return ASKS_ABOUT_REFLECTION.test(text.normalize("NFKC"));
 }
 
 /**
- * 会話のRetrieval（`deferReflections`）だけ：Reflectionは本人の記録の代わりにならない。順位を保ったまま本人の記録を先に並べ、Reflectionはその後に回す。
- * 同じ会話の本人の記録が先頭`limit`件に入っていれば、そのReflectionは入れない（同じ会話をAIの文章で重ねて渡さない）。件数・スコア・他の記録の順は変えない。
+ * 会話のRetrieval（`deferReflections`）だけ：Reflectionは本人の記録の代わりにならない。
+ * - 順位：スコアがあるとき（companion/coach）、Reflectionは自分のスコアの半分か1キーワード一致分（KEYWORD_WEIGHT）の低い方として並べる。
+ *   キーワードが一致する本人の記録はその前に来るが、文字の偶然の重なりだけの弱い記録がReflectionを押し出すことはない。
+ *   スコアが無いとき（analystの選定済みの一覧）は、本人の記録の後に回すだけ（埋め直さない）。
+ * - 同じ会話の本人の記録が先頭`limit`件に入っていれば、そのReflectionは入れない（同じ会話をAIの文章で重ねて渡さない）。
+ * スコア・本人の記録どうしの順は変えない。
  */
-export function deferReflectionItems<T>(items: T[], memoryOf: (item: T) => MemoryObject, limit: number): { items: T[]; trace: ReflectionTrace } {
-  const own = items.filter((item) => !isReflectionMemory(memoryOf(item)));
-  const ownConversations = new Set(own.slice(0, limit).map((item) => memoryOf(item).conversationId).filter((id): id is string => Boolean(id)));
-  const kept: T[] = [];
+export function deferReflectionItems<T>(items: T[], memoryOf: (item: T) => MemoryObject, limit: number, scoreOf?: (item: T) => number): { items: T[]; trace: ReflectionTrace } {
+  const keyOf = (item: T) => {
+    if (!scoreOf) return isReflectionMemory(memoryOf(item)) ? 0 : 1;
+    const score = scoreOf(item);
+    return isReflectionMemory(memoryOf(item)) ? Math.min(score * 0.5, KEYWORD_WEIGHT) : score;
+  };
+  const order = (list: T[]) => list.map((item, index) => ({ item, index, key: keyOf(item), reflection: isReflectionMemory(memoryOf(item)) }))
+    // 同じ値なら本人の記録を先に、あとは元の順
+    .sort((a, b) => b.key - a.key || Number(a.reflection) - Number(b.reflection) || a.index - b.index)
+    .map((x) => x.item);
   const trace: ReflectionTrace = { asksAboutReflection: false, deferred: [], dropped: [] };
-  for (const item of items) {
+  const first = order(items);
+  const ownConversations = new Set(first.slice(0, limit).filter((item) => !isReflectionMemory(memoryOf(item))).map((item) => memoryOf(item).conversationId).filter((id): id is string => Boolean(id)));
+  const kept = first.filter((item) => {
     const memory = memoryOf(item);
-    if (!isReflectionMemory(memory)) continue;
-    if (memory.conversationId && ownConversations.has(memory.conversationId)) trace.dropped.push({ memoryId: memory.id, why: "同じ会話の本人の記録が選ばれている" });
-    else kept.push(item);
-  }
-  const ordered = [...own, ...kept];
-  for (const item of kept) {
+    if (!isReflectionMemory(memory) || !memory.conversationId || !ownConversations.has(memory.conversationId)) return true;
+    trace.dropped.push({ memoryId: memory.id, why: "同じ会話の本人の記録が選ばれている" });
+    return false;
+  });
+  kept.forEach((item, index) => {
     const memory = memoryOf(item);
-    if (ordered.indexOf(item) < limit) trace.deferred.push(memory.id);
+    if (!isReflectionMemory(memory)) return;
+    if (index < limit) trace.deferred.push(memory.id);
     else trace.dropped.push({ memoryId: memory.id, why: "本人の記録で枠が埋まった" });
-  }
-  return { items: ordered, trace };
+  });
+  return { items: kept, trace };
 }
 
 /** `context`：会話のRetrievalが`includeContext`で求めたときだけ、今の発言（と直前の発言）。人物と本人の発言の一文を添える（memoryContext.ts） */
@@ -1096,7 +1111,7 @@ export async function retrieveRelevantMemoriesImpl(
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score);
   // P1-F：会話のRetrievalだけ、Reflectionを本人の記録の後に回す（未指定なら従来の順のまま）
-  const deferred = deferReflections ? deferReflectionItems(ranked, (entry) => entry.memory, limit) : null;
+  const deferred = deferReflections ? deferReflectionItems(ranked, (entry) => entry.memory, limit, (entry) => entry.score) : null;
   if (deferred) report(deferred.trace);
   else if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
   const scored = (deferred ? deferred.items : ranked).slice(0, limit);
@@ -1116,7 +1131,8 @@ export async function retrieveRelevantMemoriesImpl(
       excludeIds,
       maxLinkedAdditions,
       options.excludeConversationId,
-      deferReflections ? (candidate) => isReflectionMemory(candidate) && Boolean(candidate.conversationId) && ownConversations.has(candidate.conversationId) : undefined
+      // Link経由でも、同じ会話の本人の記録がある・枠から外したReflectionは入れない（診断の表示と食い違わないように）
+      deferReflections ? (candidate) => isReflectionMemory(candidate) && ((Boolean(candidate.conversationId) && ownConversations.has(candidate.conversationId)) || (deferred?.trace.dropped.some((d) => d.memoryId === candidate.id) ?? false)) : undefined
     );
     for (const addition of additions) {
       results.push(toRetrievedMemory(addition.memory, addition.reason, undefined, context));

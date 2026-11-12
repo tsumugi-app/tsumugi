@@ -89,9 +89,13 @@ test("1 a reflection that reads another motive into the user's explicit conclusi
   const list = ids(got);
   assert.ok(list.includes("own-conclusion") && list.includes("own-later-reason"), list.join(","));
   assert.ok(!list.includes("refl-same-day"), "the reflection of the same conversation is not sent with the user's own record");
+  // reflections come after every record of the user whose keywords match (score ≥ one keyword), but a record that only shares a few characters
+  // (d3, about someone else) does not push a relevant reflection out
   const firstReflection = got.findIndex((m) => m.source === "system-generated");
-  const lastOwn = got.map((m) => m.source).lastIndexOf("ai-capture");
-  assert.ok(firstReflection === -1 || firstReflection > lastOwn, "reflections only after the user's records");
+  const strongOwn = got.map((m, i) => ({ m, i })).filter(({ m }) => m.source === "ai-capture" && r.scoreMemory(POOL.find((x) => x.id === m.id)!, QA) >= r.KEYWORD_WEIGHT);
+  assert.ok(firstReflection === -1 || strongOwn.every(({ i }) => i < firstReflection), list.join(","));
+  assert.ok(list.includes("refl-other-day"), "a relevant reflection of another day keeps a slot");
+  if (list.includes("d3")) assert.ok(list.indexOf("d3") > list.indexOf("refl-other-day"), "a weak record does not go before it");
   assert.ok(trace !== null);
   const t = trace as unknown as import("./chatContextProvenance").ReflectionTrace;
   assert.equal(t.asksAboutReflection, false);
@@ -120,11 +124,13 @@ test("3 asking about the reflection itself still finds it (the old order)", asyn
   assert.ok(got.some((id) => id.startsWith("refl-")));
   assert.equal((trace as unknown as { asksAboutReflection: boolean }).asksAboutReflection, true);
   assert.ok(r.asksAboutReflection("日記に何て書いた？") && !r.asksAboutReflection("みおさんのことどう思う？"));
+  assert.ok(!r.asksAboutReflection("今日の日記：みおさんとランチに行った") && !r.asksAboutReflection("今年の振り返りをしたい"), "the word alone is not asking about a reflection");
 });
 
 test("4 the analyst path (person-aware selection) also puts reflections after the user's records, without refilling", async () => {
   pool = POOL;
   const before = ids(await r.retrieveRelevantMemoriesImpl(QA, { persona: "analyst", limit: 6 }));
+  assert.ok(before.some((id) => id.startsWith("refl-")), `before: a reflection is selected (${before.join(",")})`);
   const after = ids(await r.retrieveRelevantMemoriesImpl(QA, { persona: "analyst", limit: 6, deferReflections: true }));
   assert.ok(!after.includes("refl-same-day") || !after.includes("own-conclusion"));
   assert.ok(after.length <= before.length, "no record is added");
@@ -279,4 +285,26 @@ test("14 the client keeps the provenance in the tab's memory only, and the chat 
   const screen = fs.readFileSync(path.join(ROOT, "../src/components/ChatScreen.tsx"), "utf8");
   assert.equal(screen.match(/deferReflections: true/g)?.length, 1);
   assert.ok(/generationDebugLogEnabled\(\) \? \{ onReflectionTrace/.test(screen), "the trace only with the debug");
+});
+
+test("15 the debug view: a Retrieval item moved to the Explicit Search is not shown as lost; the client's ids are shown for routes without ids", async () => {
+  const explicitSearch = { terms: ["みおさん"], total: 1, results: [{ id: "own-conclusion", date: own.date, summary: own.summary, keywords: own.keywords, detail: own.content, evidenceQuotes: ["みおさんとの関係に未来がないと思う。"], matchedOn: ["person"] }] };
+  const got = await call({ ...ask("みおさんについて何話した？"), retrievedMemories: retrieved, explicitSearch, topicTimeline, debugGenerationId: "gen-test" });
+  const accepted = got.envelope!.provenance!;
+  const sent = prov.buildContextProvenance({ retrievedMemories: retrieved as never, explicitSearch: explicitSearch as never, topicTimeline }, { topicTimelineId: () => "own-later-reason" });
+  const missing = prov.notAccepted(sent, accepted);
+  const moved = missing.filter((e) => e.path === "Retrieval" && e.memoryIds.includes("own-conclusion"));
+  assert.ok(accepted.entries.some((e) => e.path === "Explicit Search" && e.memoryIds.includes("own-conclusion")), "the search result reached the AI");
+  assert.ok(moved.length > 0 && moved.every((e) => (e.note ?? "").includes("Explicit Search")), JSON.stringify(missing));
+  // the server has no id for the Topic Timeline; the shown view takes the client's
+  assert.ok(accepted.entries.some((e) => e.path === "Topic Timeline" && e.memoryIds.length === 0));
+  const shown = prov.withSentIds(accepted, sent);
+  assert.ok(shown.entries.some((e) => e.path === "Topic Timeline" && e.memoryIds.includes("own-later-reason")));
+  assert.ok(shown.explanations.some((x) => x.path === "Topic Timeline" && x.memoryIds.includes("own-later-reason")));
+});
+
+test("16 a nameless candidate in the Graph is not listed as the user's reason for this person", () => {
+  const p = prov.buildContextProvenance({ personContext: [{ key: "みお", names: ["みおさん"], conclusions: [], plans: [], events: [], memoryIds: [], candidates: [{ kind: "candidate", text: "忙しいから行けないと思う。", day: "2026-03-01", memoryId: "nameless", signals: ["同じ話題", "共通の言葉"] }] }] as never });
+  assert.equal(p.explanations.length, 0);
+  assert.ok(p.entries.some((e) => e.memoryIds.includes("nameless") && e.candidate === true));
 });
