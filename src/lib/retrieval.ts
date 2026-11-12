@@ -915,14 +915,19 @@ export function deferReflectionItems<T>(items: T[], memoryOf: (item: T) => Memor
     .sort((a, b) => b.key - a.key || Number(a.reflection) - Number(b.reflection) || a.index - b.index)
     .map((x) => x.item);
   const trace: ReflectionTrace = { asksAboutReflection: false, deferred: [], dropped: [] };
-  const first = order(items);
-  const ownConversations = new Set(first.slice(0, limit).filter((item) => !isReflectionMemory(memoryOf(item))).map((item) => memoryOf(item).conversationId).filter((id): id is string => Boolean(id)));
-  const kept = first.filter((item) => {
-    const memory = memoryOf(item);
-    if (!isReflectionMemory(memory) || !memory.conversationId || !ownConversations.has(memory.conversationId)) return true;
-    trace.dropped.push({ memoryId: memory.id, why: "同じ会話の本人の記録が選ばれている" });
-    return false;
-  });
+  let kept = order(items);
+  // Reflectionを外すと次の本人の記録が枠に入るので、その会話のReflectionも外す。枠が変わらなくなるまで繰り返す（毎回1件以上減るので止まる）
+  for (;;) {
+    const ownConversations = new Set(kept.slice(0, limit).filter((item) => !isReflectionMemory(memoryOf(item))).map((item) => memoryOf(item).conversationId).filter((id): id is string => Boolean(id)));
+    const next = kept.filter((item) => {
+      const memory = memoryOf(item);
+      if (!isReflectionMemory(memory) || !memory.conversationId || !ownConversations.has(memory.conversationId)) return true;
+      trace.dropped.push({ memoryId: memory.id, why: "同じ会話の本人の記録が選ばれている" });
+      return false;
+    });
+    if (next.length === kept.length) break;
+    kept = next;
+  }
   kept.forEach((item, index) => {
     const memory = memoryOf(item);
     if (!isReflectionMemory(memory)) return;

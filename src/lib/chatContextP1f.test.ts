@@ -174,6 +174,21 @@ test("5b two Connect additions: the user's record and a reflection of the same c
   assert.ok(!chat.includes("refl-same-day"), chat.join(","));
 });
 
+test("5c a user's record that enters the window after a reflection is removed also removes the reflection of its conversation", () => {
+  const ownA = mem({ id: "ownA", conv: "c-A", summary: "A", keywords: ["a"] });
+  const reflB = mem({ id: "reflB", conv: "c-B", summary: "B", keywords: ["b"], reflection: true });
+  const reflA = mem({ id: "reflA", conv: "c-A", summary: "A", keywords: ["a"], reflection: true });
+  const ownB = mem({ id: "ownB", conv: "c-B", summary: "B", keywords: ["b"] });
+  const scores: Record<string, number> = { ownA: 4, reflB: 6, reflA: 4, ownB: 1 };
+  const limit = 3;
+  const { items, trace } = r.deferReflectionItems([ownA, reflB, reflA, ownB], (m) => m, limit, (m) => scores[m.id]);
+  const window = items.slice(0, limit);
+  const ownConvs = new Set(window.filter((m) => !r.isReflectionMemory(m)).map((m) => m.conversationId));
+  assert.ok(window.every((m) => !r.isReflectionMemory(m) || !ownConvs.has(m.conversationId)), ids(window).join(","));
+  assert.ok(ids(window).includes("ownA") && ids(window).includes("ownB"), ids(window).join(","));
+  assert.deepEqual(trace.dropped.map((d) => d.memoryId).sort(), ["reflA", "reflB"]);
+});
+
 test("6 the debug trace does not change what retrieval returns", async () => {
   pool = POOL;
   for (const q of [QA, QB]) {
