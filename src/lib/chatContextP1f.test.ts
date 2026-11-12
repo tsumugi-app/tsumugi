@@ -188,6 +188,22 @@ test("5d a reflection picked directly is removed when a Connect link adds the us
   assert.ok(t.dropped.some((d) => d.memoryId === "refl-same-day") && !t.deferred.includes("refl-same-day"));
 });
 
+test("5e a conversation started from a past record: that record (the origin) removes the reflection of its conversation, and stays", async () => {
+  pool = [own, reflection];
+  const q = "自分が本当は何を望んでいるのか、その考え方が少しずつ変わってきた";
+  for (const persona of ["companion", "analyst"] as const) {
+    const old = ids(await r.retrieveRelevantMemoriesImpl(q, { persona, limit: 1, promptedMemoryId: "own-conclusion" }));
+    if (persona === "companion") assert.ok(old.includes("refl-same-day") && old.includes("own-conclusion"), `${persona}: other callers keep both: ${old.join(",")}`);
+    else if (!old.includes("refl-same-day")) continue; // the analyst selection did not pick the reflection: nothing to check
+    let trace: import("./chatContextProvenance").ReflectionTrace | null = null;
+    const chat = await r.retrieveRelevantMemoriesImpl(q, { persona, limit: 1, promptedMemoryId: "own-conclusion", deferReflections: true, onReflectionTrace: (t) => { trace = t; } });
+    assert.deepEqual(ids(chat), ["own-conclusion"], persona);
+    assert.ok(chat[0].isOriginMemory, persona);
+    const t = trace as unknown as import("./chatContextProvenance").ReflectionTrace;
+    assert.ok(t.dropped.some((d) => d.memoryId === "refl-same-day") && !t.deferred.includes("refl-same-day"), persona);
+  }
+});
+
 test("5c a user's record that enters the window after a reflection is removed also removes the reflection of its conversation", () => {
   const ownA = mem({ id: "ownA", conv: "c-A", summary: "A", keywords: ["a"] });
   const reflB = mem({ id: "reflB", conv: "c-B", summary: "B", keywords: ["b"], reflection: true });

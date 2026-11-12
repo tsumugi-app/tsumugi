@@ -1034,6 +1034,26 @@ async function ensureOriginMemoryIncluded(
   return [...results, { ...toRetrievedMemory(originMemory, undefined, undefined, context), isOriginMemory: true }];
 }
 
+/**
+ * P1-F：会話のRetrievalの最後に、結果全体（Link経由・きっかけの記憶も含む）で同じ会話の本人の記録があるReflectionを外す。
+ * きっかけの記憶（isOriginMemory）は外さない。結果は数件なので、Memoryは1件ずつ読む。
+ */
+async function dropReflectionsCoveredByOwnRecords(results: RetrievedMemory[], trace: ReflectionTrace): Promise<RetrievedMemory[]> {
+  if (!results.some((r) => r.source === "system-generated")) return results;
+  const memories = await Promise.all(results.map((r) => getMemoryObject(r.id)));
+  const ownConversations = new Set(memories.filter((m): m is MemoryObject => Boolean(m) && !isReflectionMemory(m as MemoryObject)).map((m) => m.conversationId).filter(Boolean));
+  const removed = new Set<string>();
+  results.forEach((r, i) => {
+    const m = memories[i];
+    if (m && isReflectionMemory(m) && !r.isOriginMemory && m.conversationId && ownConversations.has(m.conversationId)) removed.add(r.id);
+  });
+  if (removed.size === 0) return results;
+  trace.deferred = trace.deferred.filter((id) => !removed.has(id));
+  const already = new Set(trace.dropped.map((d) => d.memoryId));
+  for (const id of removed) if (!already.has(id)) trace.dropped.push({ memoryId: id, why: "同じ会話の本人の記録が選ばれている" });
+  return results.filter((r) => !removed.has(r.id));
+}
+
 export interface RetrieveRelevantMemoriesOptions {
   excludeConversationId?: string;
   limit?: number;
@@ -1107,10 +1127,16 @@ export async function retrieveRelevantMemoriesImpl(
 
   if (options.persona === "analyst") {
     if (options.deferReflections && !deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
-    const creativeResults = await retrieveCreativeMemories(trimmed, options, context, deferReflections ? report : undefined);
-    return withContext(options.promptedMemoryId
+    let analystTrace: ReflectionTrace | null = null;
+    const creativeResults = await retrieveCreativeMemories(trimmed, options, context, deferReflections ? (trace) => { analystTrace = trace; } : undefined);
+    const withOrigin = options.promptedMemoryId
       ? await ensureOriginMemoryIncluded(creativeResults, options.promptedMemoryId, context)
-      : creativeResults);
+      : creativeResults;
+    if (!analystTrace) return withContext(withOrigin);
+    const trace: ReflectionTrace = analystTrace;
+    const final = await dropReflectionsCoveredByOwnRecords(withOrigin, trace);
+    report(trace);
+    return withContext(final);
   }
 
   const limit = options.limit ?? DEFAULT_LIMIT;
@@ -1159,9 +1185,13 @@ export async function retrieveRelevantMemoriesImpl(
       }
     }
   }
-  if (deferred) report(deferred.trace);
-  else if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
-
   const capped = results.slice(0, limit + maxLinkedAdditions);
-  return withContext(options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped);
+  const withOrigin = options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped;
+  if (deferred) {
+    const final = await dropReflectionsCoveredByOwnRecords(withOrigin, deferred.trace);
+    report(deferred.trace);
+    return withContext(final);
+  }
+  if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
+  return withContext(withOrigin);
 }
