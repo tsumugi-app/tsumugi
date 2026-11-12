@@ -52,13 +52,16 @@ import {
   CONVERSATION_MIN_SCORE,
   CONVERSATION_RECENT_TURNS_WINDOW,
   DEFAULT_LIMIT,
+  REFLECTIVE_LIMIT,
   computeKeywordFrequency,
+  isReflectiveQuery,
   isSameConversation,
   scoreMemory,
   selectConversationDirectMatches,
   type ConversationCandidateScore,
 } from "./retrieval";
 import { needsWebSearch } from "./needsWebSearch";
+import { recallTopicOf, withPoolEvidence } from "./recallQuestion";
 import {
   getActiveVaultEpoch,
   getCommittedVaultEpoch,
@@ -389,11 +392,12 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
           .map((turn) => turn.content.trim())
           .filter(Boolean);
 
-        const selection = selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, DEFAULT_LIMIT);
+        // 会話の画面と同じく、過去を尋ねる質問ならその話題を渡す（recallTopic）。件数も実際の選定と同じ（振り返りの質問は REFLECTIVE_LIMIT）
+        const selection = selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, isReflectiveQuery(trimmed) ? REFLECTIVE_LIMIT : DEFAULT_LIMIT, withPoolEvidence(recallTopicOf(trimmed), pool));
 
         const fmt = (entry: ConversationCandidateScore) =>
           `id=${entry.memory.id} conversationScore=${entry.conversationScore.toFixed(2)} ` +
-          `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)} personBonus=+${entry.personBonus.toFixed(2)}) ` +
+          `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)} personBonus=+${entry.personBonus.toFixed(2)} recallBonus=+${entry.recallBonus.toFixed(2)}) ` +
           `summary="${entry.memory.summary}"`;
 
         conversationRetrievalLines = [

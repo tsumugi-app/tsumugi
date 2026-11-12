@@ -5,6 +5,7 @@
  * a view or a hypothesis is offered as Tsumugi's own.
  * Chosen by comparing the previous prompt and this one on Preview with fictional Memories (opinion requests, ordinary turns, diary, record mode).
  */
+import { isRecallQuestion } from "./recallQuestion";
 
 /** A. shared: how to move a conversation forward (all personas; record mode keeps its own stricter rules) */
 export const CONVERSATION_VOICE_SECTION = `
@@ -87,6 +88,19 @@ export const REALTIME_DIARY_VOICE_SECTION = `
 - 同じ日のこれまでの発言（朝や昼に書いたことなど）を踏まえ、つながりがあれば自然に触れる。前の話を毎回まとめ直さない。
 - 求められない限り、一日のまとめや振り返りはしない（日記の本文は一日の終わりに別に作る）。`;
 
+/**
+ * A recall question (「過去にどんな車がいいって言ったっけ？」, recallQuestion.ts) for which the Memory search of this turn found nothing: the search has limits,
+ * so the answer must not turn "not found" into "never said", and must not become an apology. Only in such a turn (no retrieved Memory, no explicit search
+ * or analytics result); other turns get nothing.
+ */
+export const RECALL_NOT_FOUND_NOTE = `
+
+## 過去を尋ねられたが、このターンの記憶の検索で一致する記録が見つからなかったとき
+本人が自分の過去の発言や出来事を尋ねている。このターンの記憶の検索では、その質問に一致する記録が見つからなかった。これは検索の限界で、記録が無いという意味ではない（上の節にこの質問に関係する記録があれば、それは使ってよい）。
+- 「記録が無い」「話していない」「言っていない」と断定しない。「今回参照できた記録では確認できなかった」と短く一度だけ伝える。
+- 謝罪や検索の仕組みの説明を重ねない。必要なら思い出す手がかり（具体的な名前や時期）を一つだけ尋ねるか、今の話の続きに応じる。
+- この節は、上の「このターンの過去の情報」より優先する。`;
+
 export type ConversationVoiceMode = "realtime-diary";
 
 export interface ConversationVoice {
@@ -98,6 +112,8 @@ export interface ConversationVoice {
   noPastContextNote(hasNoPastContext: boolean): string;
   /** P1-F: the order of the material for questions about the user's own past ("" in a turn without any past context) */
   ownPastPriorityNote(hasPastContext: boolean): string;
+  /** a recall question whose Memory search found nothing ("" otherwise): the search has limits, never "no record" */
+  recallNotFoundNote(latestUserMessage: string, nothingFound: boolean): string;
 }
 
 /** `mode`：リアルタイム日記の会話だけ（companionのとき）。それ以外の値・未指定は、これまでと同じ */
@@ -110,5 +126,6 @@ export function conversationVoice(mode?: unknown, persona?: string): Conversatio
     analystMemoryNote: ANALYST_MEMORY_USE_NOTE,
     noPastContextNote: (hasNoPastContext) => (hasNoPastContext ? NO_PAST_CONTEXT_NOTE : ""),
     ownPastPriorityNote: (hasPastContext) => (hasPastContext ? OWN_PAST_PRIORITY_NOTE : ""),
+    recallNotFoundNote: (latestUserMessage, nothingFound) => (nothingFound && isRecallQuestion(latestUserMessage) ? RECALL_NOT_FOUND_NOTE : ""),
   };
 }
