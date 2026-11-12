@@ -350,6 +350,22 @@ test("15 the debug view: a Retrieval item moved to the Explicit Search is not sh
   assert.ok(shown.explanations.some((x) => x.path === "Topic Timeline" && x.memoryIds.includes("own-later-reason")));
 });
 
+test("15b the debug view: the same words on two days keep their own ids; texts that share the first 40 characters too", () => {
+  const long = "みおさんとの関係について、来年の転勤のことを考えると、どうしても距離を置くしかないと思った。";
+  const events = [
+    { time: "2026-03-01T12:00:00.000Z", quote: "距離を置くことにした。", sourceConversationId: "c-1" },
+    { time: "2026-04-01T12:00:00.000Z", quote: "距離を置くことにした。", sourceConversationId: "c-2" },
+    { time: "2026-05-01T12:00:00.000Z", quote: `${long}A`, sourceConversationId: "c-3" },
+    { time: "2026-06-01T12:00:00.000Z", quote: `${long}B`, sourceConversationId: "c-4" },
+  ];
+  const input = { topicTimeline: [{ topicId: "t1", events }] } as unknown as import("./chatContextProvenance").ProvenanceInput;
+  const idOf: Record<string, string> = { "c-1": "m1", "c-2": "m2", "c-3": "m3", "c-4": "m4" };
+  const sent = prov.buildContextProvenance(input, { topicTimelineId: (e) => idOf[e.sourceConversationId] });
+  const accepted = prov.buildContextProvenance(input);
+  assert.deepEqual(accepted.entries.map((e) => e.memoryIds), [[], [], [], []], "the server has no ids for this route");
+  assert.deepEqual(prov.withSentIds(accepted, sent).entries.map((e) => e.memoryIds), [["m1"], ["m2"], ["m3"], ["m4"]]);
+});
+
 test("16 a nameless candidate in the Graph is not listed as the user's reason for this person", () => {
   const p = prov.buildContextProvenance({ personContext: [{ key: "みお", names: ["みおさん"], conclusions: [], plans: [], events: [], memoryIds: [], candidates: [{ kind: "candidate", text: "忙しいから行けないと思う。", day: "2026-03-01", memoryId: "nameless", signals: ["同じ話題", "共通の言葉"] }] }] as never });
   assert.equal(p.explanations.length, 0);

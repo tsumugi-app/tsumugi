@@ -44,6 +44,8 @@ export interface ProvenanceEntry {
   candidate?: boolean;
   /** the user's words in the form of a reason or a correction (read on the whole text, before the clip) */
   explanationForm?: boolean;
+  /** routes without an id on the server (Topic Continuity / Topic Timeline): which item this is (date, conversation, whole text), to match the client's id to it */
+  ref?: string;
 }
 
 export interface ContextProvenance {
@@ -115,11 +117,11 @@ export function buildContextProvenance(input: ProvenanceInput, lookup: Provenanc
   }
 
   for (const topic of input.topicContinuity ?? []) {
-    for (const ref of topic.memories) add({ path: "Topic Continuity", memoryIds: ids(lookup.topicContinuityId?.(ref)), kind: "AIの要約", why: "続きを指す言い回しがあり、同じ話題の候補", text: ref.summary });
+    for (const ref of topic.memories) add({ path: "Topic Continuity", memoryIds: ids(lookup.topicContinuityId?.(ref)), kind: "AIの要約", why: "続きを指す言い回しがあり、同じ話題の候補", text: ref.summary, ref: JSON.stringify([ref.date, ref.summary]) });
   }
 
   for (const timeline of input.topicTimeline ?? []) {
-    for (const event of timeline.events) add({ path: "Topic Timeline", memoryIds: ids(lookup.topicTimelineId?.(event)), kind: "本人の発言", why: "取得した記録と同じ話題の経緯（逐語）", text: event.quote });
+    for (const event of timeline.events) add({ path: "Topic Timeline", memoryIds: ids(lookup.topicTimelineId?.(event)), kind: "本人の発言", why: "取得した記録と同じ話題の経緯（逐語）", text: event.quote, ref: JSON.stringify([event.time, event.sourceConversationId, event.quote]) });
   }
 
   for (const ctx of input.memoryTimeline ?? []) {
@@ -173,9 +175,11 @@ function summarize(all: ProvenanceEntry[]): ContextProvenance {
  * of the same route, kind and text. Then the duplicates and the explanations are counted again.
  */
 export function withSentIds(accepted: ContextProvenance, sent: ContextProvenance): ContextProvenance {
+  // the item's own identity (date, conversation, whole text) first: the same words on another day are another item; the clip only when there is none
+  const keyOf = (e: ProvenanceEntry) => (e.ref !== undefined ? `${e.path}\n${e.ref}` : `${e.path}\n${e.kind}\n${e.text}`);
   const idsOf = new Map<string, string[]>();
-  for (const e of sent.entries) if (e.memoryIds.length > 0) idsOf.set(`${e.path}\n${e.kind}\n${e.text}`, e.memoryIds);
-  const entries = accepted.entries.map((e) => (e.memoryIds.length > 0 ? e : { ...e, memoryIds: idsOf.get(`${e.path}\n${e.kind}\n${e.text}`) ?? [] }));
+  for (const e of sent.entries) if (e.memoryIds.length > 0) idsOf.set(keyOf(e), e.memoryIds);
+  const entries = accepted.entries.map((e) => (e.memoryIds.length > 0 ? e : { ...e, memoryIds: idsOf.get(keyOf(e)) ?? [] }));
   const merged = summarize(entries);
   // the server may have more entries than it listed: keep its counts
   return { ...merged, counts: accepted.counts, truncated: accepted.truncated, explanations: merged.explanations.length > 0 || accepted.explanations.length === 0 ? merged.explanations : accepted.explanations };
