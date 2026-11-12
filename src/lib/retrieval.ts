@@ -29,6 +29,7 @@ import { getAllMemoryObjects, getMemoryObject } from "./db";
 import { withVaultWorldRead } from "./vaultWorldLock";
 import type { MemoryObject, Persona, RetrievedMemory } from "./types";
 import { limitMemoryQuotes, memoryContextOf } from "./memoryContext";
+import type { ReflectionTrace } from "./chatContextProvenance";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
 export const KEYWORD_WEIGHT = 3;
@@ -837,7 +838,9 @@ async function retrieveCreativeMemories(
     recentUserTurnsTexts?: string[];
     personAliases?: string[][];
   },
-  context?: string[]
+  context?: string[],
+  /** P1-F：会話のRetrievalだけ。Reflectionを本人の記録の後に回し、その扱いを知らせる */
+  deferReflectionsAndReport?: (trace: ReflectionTrace) => void
 ): Promise<RetrievedMemory[]> {
   const directLimit = options.limit ?? DEFAULT_LIMIT;
   const all = await getAllMemoryObjects();
@@ -845,7 +848,7 @@ async function retrieveCreativeMemories(
   const keywordFrequency = computeKeywordFrequency(all);
 
   // 人物が話題のターンだけ、その人物の記録を整える（selectConversationWithPersons。人物が出てこないターンは従来の選定そのまま）
-  const directMatches = selectConversationWithPersons(
+  const selected = selectConversationWithPersons(
     pool,
     trimmed,
     options.recentUserTurnsTexts ?? [],
@@ -854,6 +857,13 @@ async function retrieveCreativeMemories(
     Date.now(),
     options.personAliases ?? []
   ).memories;
+  // P1-F：本人の記録で枠を埋め直すことはしない（analystの選定はそのまま）。同じ会話の本人の記録と重なるReflectionを外し、残りを後ろに回すだけ
+  let directMatches = selected;
+  if (deferReflectionsAndReport) {
+    const deferred = deferReflectionItems(selected, (memory) => memory, selected.length);
+    directMatches = deferred.items;
+    deferReflectionsAndReport(deferred.trace);
+  }
 
   let divergentMatches: MemoryObject[] = [];
   if (options.includeDivergent) {
@@ -866,6 +876,45 @@ async function retrieveCreativeMemories(
     ...directMatches.map((memory) => toRetrievedMemory(memory, undefined, "direct", context)),
     ...divergentMatches.map((memory) => toRetrievedMemory(memory, undefined, "divergent", context)),
   ];
+}
+
+// ---------------------------------------------------------------------------
+// P1-F：会話のRetrievalでの、AIが書いた日記の振り返り（Reflection）の扱い
+// ---------------------------------------------------------------------------
+
+/** AIが書いた日記の振り返り（reflection.ts。本文も要約もAIの文章で、キーワードは元の記録と同じ） */
+export function isReflectionMemory(memory: Pick<MemoryObject, "metadata">): boolean {
+  return memory.metadata?.source === "system-generated";
+}
+
+/** 発言が振り返り・日記そのものを尋ねている（このときは従来どおり、本人の記録と同じ順位で選ぶ） */
+const ASKS_ABOUT_REFLECTION = /振り返り|ふりかえり|日記/;
+export function asksAboutReflection(text: string): boolean {
+  return ASKS_ABOUT_REFLECTION.test(text.normalize("NFKC"));
+}
+
+/**
+ * 会話のRetrieval（`deferReflections`）だけ：Reflectionは本人の記録の代わりにならない。順位を保ったまま本人の記録を先に並べ、Reflectionはその後に回す。
+ * 同じ会話の本人の記録が先頭`limit`件に入っていれば、そのReflectionは入れない（同じ会話をAIの文章で重ねて渡さない）。件数・スコア・他の記録の順は変えない。
+ */
+export function deferReflectionItems<T>(items: T[], memoryOf: (item: T) => MemoryObject, limit: number): { items: T[]; trace: ReflectionTrace } {
+  const own = items.filter((item) => !isReflectionMemory(memoryOf(item)));
+  const ownConversations = new Set(own.slice(0, limit).map((item) => memoryOf(item).conversationId).filter((id): id is string => Boolean(id)));
+  const kept: T[] = [];
+  const trace: ReflectionTrace = { asksAboutReflection: false, deferred: [], dropped: [] };
+  for (const item of items) {
+    const memory = memoryOf(item);
+    if (!isReflectionMemory(memory)) continue;
+    if (memory.conversationId && ownConversations.has(memory.conversationId)) trace.dropped.push({ memoryId: memory.id, why: "同じ会話の本人の記録が選ばれている" });
+    else kept.push(item);
+  }
+  const ordered = [...own, ...kept];
+  for (const item of kept) {
+    const memory = memoryOf(item);
+    if (ordered.indexOf(item) < limit) trace.deferred.push(memory.id);
+    else trace.dropped.push({ memoryId: memory.id, why: "本人の記録で枠が埋まった" });
+  }
+  return { items: ordered, trace };
 }
 
 /** `context`：会話のRetrievalが`includeContext`で求めたときだけ、今の発言（と直前の発言）。人物と本人の発言の一文を添える（memoryContext.ts） */
@@ -904,7 +953,9 @@ function pickLinkedAdditions(
   allById: Map<string, MemoryObject>,
   excludeIds: Set<string>,
   maxAdditions: number,
-  excludeConversationId?: string
+  excludeConversationId?: string,
+  /** P1-F：会話のRetrievalだけ。Link経由でも入れない記録（同じ会話の本人の記録がすでにあるReflection） */
+  skip?: (candidate: MemoryObject) => boolean
 ): LinkedAddition[] {
   const bestByCandidateId = new Map<string, { memory: MemoryObject; strength: number; reason: string }>();
 
@@ -915,6 +966,7 @@ function pickLinkedAdditions(
       const candidate = allById.get(candidateId);
       if (!candidate) continue;
       if (isSameConversation(candidate.conversationId, excludeConversationId)) continue;
+      if (skip?.(candidate)) continue;
       const existing = bestByCandidateId.get(candidateId);
       if (!existing || link.strength > existing.strength) {
         bestByCandidateId.set(candidateId, { memory: candidate, strength: link.strength, reason: link.reason });
@@ -983,6 +1035,13 @@ export interface RetrieveRelevantMemoriesOptions {
    * （selectConversationWithPersons）。未指定・空なら従来どおり。
    */
   personAliases?: string[][];
+  /**
+   * P1-F（会話画面だけが渡す）：AIが書いた日記の振り返り（Reflection）を、本人の記録の後に回す（deferReflectionItems）。
+   * 発言が振り返り・日記そのものを尋ねているときは従来どおり。未指定（Connect等）は従来どおり。
+   */
+  deferReflections?: boolean;
+  /** P1-F：診断（`?debugLog=1`）のときだけ会話画面が渡す。結果は変えず、Reflectionの扱いを知らせる */
+  onReflectionTrace?: (trace: ReflectionTrace) => void;
 }
 
 /**
@@ -1009,8 +1068,18 @@ export async function retrieveRelevantMemoriesImpl(
 
   // クリエイト（analyst）だけ別ロジックへ委譲する。companion/coachはこの下の
   // 既存ロジックをそのまま通る（挙動は一切変えていない）。
+  const deferReflections = options.deferReflections === true && !asksAboutReflection(trimmed);
+  const report = (trace: ReflectionTrace) => {
+    try {
+      options.onReflectionTrace?.(trace);
+    } catch {
+      // 診断の失敗で会話を止めない
+    }
+  };
+
   if (options.persona === "analyst") {
-    const creativeResults = await retrieveCreativeMemories(trimmed, options, context);
+    if (options.deferReflections && !deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
+    const creativeResults = await retrieveCreativeMemories(trimmed, options, context, deferReflections ? report : undefined);
     return withContext(options.promptedMemoryId
       ? await ensureOriginMemoryIncluded(creativeResults, options.promptedMemoryId, context)
       : creativeResults);
@@ -1020,13 +1089,17 @@ export async function retrieveRelevantMemoriesImpl(
   const maxLinkedAdditions = options.maxLinkedAdditions ?? MAX_LINKED_ADDITIONS;
   const all = await getAllMemoryObjects();
 
-  const scored = all
+  const ranked = all
     .filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId))
     .map((memory) => ({ memory, score: scoreMemory(memory, trimmed) }))
     // スコア0（関連なし）は返さない。無理に件数を埋めない（MEMORY_ENGINE.md 7.4）。
     .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    .sort((a, b) => b.score - a.score);
+  // P1-F：会話のRetrievalだけ、Reflectionを本人の記録の後に回す（未指定なら従来の順のまま）
+  const deferred = deferReflections ? deferReflectionItems(ranked, (entry) => entry.memory, limit) : null;
+  if (deferred) report(deferred.trace);
+  else if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
+  const scored = (deferred ? deferred.items : ranked).slice(0, limit);
 
   const directMatches = scored.map((entry) => entry.memory);
   const results: RetrievedMemory[] = directMatches.map((memory) => toRetrievedMemory(memory, undefined, undefined, context));
@@ -1036,12 +1109,14 @@ export async function retrieveRelevantMemoriesImpl(
   {
     const allById = new Map(all.map((memory) => [memory.id, memory]));
     const excludeIds = new Set(directMatches.map((memory) => memory.id));
+    const ownConversations = new Set(directMatches.filter((memory) => !isReflectionMemory(memory)).map((memory) => memory.conversationId).filter(Boolean));
     const additions = pickLinkedAdditions(
       directMatches,
       allById,
       excludeIds,
       maxLinkedAdditions,
-      options.excludeConversationId
+      options.excludeConversationId,
+      deferReflections ? (candidate) => isReflectionMemory(candidate) && Boolean(candidate.conversationId) && ownConversations.has(candidate.conversationId) : undefined
     );
     for (const addition of additions) {
       results.push(toRetrievedMemory(addition.memory, addition.reason, undefined, context));

@@ -12,6 +12,8 @@
  */
 import { useEffect, useState } from "react";
 import { debugLogEnabled, getGenerationDebugLog, type StoredGenerationDebugEntry } from "@/lib/generationDebugLog";
+import { formatContextProvenance } from "@/lib/chatContextProvenance";
+import { contextProvenanceFor } from "@/lib/contextProvenanceStore";
 
 export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp: string }) {
   const [enabled] = useState(() => debugLogEnabled());
@@ -32,6 +34,8 @@ export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp:
   }, [enabled, turnTimestamp]);
 
   if (!enabled || !entry) return null;
+  // P1-F：経路ごとの由来（このタブのメモリにだけある。再読み込みの後は無い）
+  const provenance = open ? contextProvenanceFor(turnTimestamp) : undefined;
 
   return (
     <div style={{ marginTop: 2 }}>
@@ -67,6 +71,7 @@ export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp:
             wordBreak: "break-all",
           }}
         >
+          {provenance ? `${formatContextProvenance(provenance)}\n\n――― 以下、従来の記録 ―――\n` : open ? "（経路ごとの由来は、このタブで送ったターンだけ表示できる。再読み込みの後は無い）\n\n" : ""}
           {JSON.stringify(
             {
               generationId: entry.generationId,

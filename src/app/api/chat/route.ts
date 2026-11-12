@@ -15,6 +15,7 @@ import { sanitizeExplicitSearchContext, type ExplicitSearchContext } from "@/lib
 import { sanitizeMemoryAnalyticsContext, type MemoryAnalyticsContext } from "@/lib/memoryAnalytics";
 import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
+import { buildContextProvenance } from "@/lib/chatContextProvenance";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -677,7 +678,8 @@ function buildRetrievedMemoriesSection(memories: RetrievedMemory[]): string {
   const lines = memories
     .map((memory) => {
       const keywords = memory.keywords.length > 0 ? `keywords: ${memory.keywords.join(", ")}` : "";
-      const source = memory.source ? `source: ${memory.source}` : "";
+      // P1-F：AIが書いた日記の振り返り（Reflection）は、本人の発言でないことを明示する（ほかの出典の表示は従来どおり）
+      const source = memory.source === "system-generated" ? "出典: Tsumugiが書いた日記の振り返り（AIの文章。本人の発言ではない）" : memory.source ? `source: ${memory.source}` : "";
       const meta = [keywords, source].filter(Boolean).join(" / ");
       return `- ${buildMemoryTimeLabel(memory)}\n${memory.summary}${meta ? `（${meta}）` : ""}${memoryContextLines(memory)}`;
     })
@@ -892,6 +894,16 @@ ${blocks}
 Boundary参照）。`;
 }
 
+/** P1-F: the debug view's provenance must never stop a reply */
+function debugProvenance<T>(build: () => T): T | undefined {
+  try {
+    return build();
+  } catch (error) {
+    console.warn("[GenerationDebug] context provenance skipped", error instanceof Error ? error.name : "error");
+    return undefined;
+  }
+}
+
 export async function POST(request: Request) {
   // `X-AI-Provider`はヘッダーなのでbody解析より前に読める。元の実装通り、bodyのJSON解析より
   // 前にAPIキーの有無を確認する（不正なbodyでもまずキー未設定エラーを返す挙動を保つ）。
@@ -1062,8 +1074,10 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const sanitizedPersonView = sanitizePersonViewContext(personView);
   const personViewSection = buildPersonViewSection(sanitizedPersonView);
   // Memory Timeline（試験接続）＋Memory Synthesis（実験）：複数の会話にまたがる経緯（コードが作る事実）と、あれば整理（仮説）。今回の話題に関係するものだけがクライアントから届く。
-  const synthesisSection = buildSynthesisSection(sanitizeSynthesisContext(memoryTimeline));
-  const personContextSection = buildPersonContextSection(sanitizePersonContext(personContext));
+  const sanitizedMemoryTimeline = sanitizeSynthesisContext(memoryTimeline);
+  const synthesisSection = buildSynthesisSection(sanitizedMemoryTimeline);
+  const sanitizedPersonContext = sanitizePersonContext(personContext);
+  const personContextSection = buildPersonContextSection(sanitizedPersonContext);
 
   const sanitizedProfile = sanitizeProfileContext(profile);
   const profileSection = buildProfileSection(sanitizedProfile);
@@ -1071,7 +1085,9 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const explicitSearchSection = buildExplicitSearchSection(sanitizedExplicitSearch);
   const memoryAnalyticsSection = buildMemoryAnalyticsSection(sanitizedMemoryAnalytics);
 
-  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${personContextSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote([retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, personContextSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection].every((section) => section.length === 0))}${webSearchInstruction}${recordFormatResetInstruction}`;
+  const pastContextSections = [retrievedMemoriesSection, recentConversationSection, topicContinuitySection, topicTimelineSection, personViewSection, personContextSection, synthesisSection, profileSection, explicitSearchSection, memoryAnalyticsSection];
+  const hasNoPastContext = pastContextSections.every((section) => section.length === 0);
+  const systemInstruction = `${buildCurrentDateTimeContext()}\n${voice.persona[persona] ?? PERSONA_SYSTEM_PROMPT[persona] ?? PERSONA_SYSTEM_PROMPT.companion}\n${buildSharedSystemPrompt(searchNeeded, sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.section}${MEMORY_TIME_INSTRUCTIONS}${buildEvidenceBoundarySection(sanitizedExplicitSearch !== null, sanitizedMemoryAnalytics !== null)}${voice.evidenceNote}${voice.ownPastPriorityNote(!hasNoPastContext)}${recentConversationSection}${topicContinuitySection}${topicTimelineSection}${personViewSection}${personContextSection}${synthesisSection}${profileSection}${explicitSearchSection}${memoryAnalyticsSection}${memoriesSectionForPersona}${voice.noPastContextNote(hasNoPastContext)}${webSearchInstruction}${recordFormatResetInstruction}`;
 
   // thinkingBudget floorの判定：retrievedMemories.lengthのような取得件数ではなく、
   // 実際にsystemInstructionへ渡ったsection（`retrievedMemoriesSection` / `recentConversationSection` /
@@ -1220,6 +1236,15 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
             includedInSystemInstruction: memoryAnalyticsSection.length > 0 && systemInstruction.includes(memoryAnalyticsSection),
           },
         },
+        // P1-F（?debugLog=1のときだけ）：経路ごとに、実際にsystemInstructionへ使った値の由来。短い抜粋だけで、クライアントは保存せずタブのメモリにだけ置く
+        provenance: debugProvenance(() => buildContextProvenance({
+          retrievedMemories: memoriesForContext,
+          topicContinuity: topicContinuitySection ? (topicContext ?? []).filter((t) => t.memories.length > 0) : null,
+          topicTimeline: sanitizedTopicTimeline.map((timeline) => ({ topicId: timeline.topicId, events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic) })),
+          memoryTimeline: synthesisSection ? sanitizedMemoryTimeline : null,
+          personContext: personContextSection ? sanitizedPersonContext : null,
+          explicitSearch: explicitSearchSection ? sanitizedExplicitSearch : null,
+        })),
       }
     : null;
 

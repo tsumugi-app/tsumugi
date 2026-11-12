@@ -42,6 +42,23 @@ export const EVIDENCE_TOPIC_REFERENCE_NOTE = `
 export const ANALYST_MEMORY_USE_NOTE = `
 関連するMemoryがあるときは、今の発言の意味を理解するために使い、見解の根拠として必要なものを具体的に挙げてよい（件数は決めない。必要が無ければ挙げない）。`;
 
+/**
+ * P1-F: when the user asks about their own past (a reason, a thought, a wish, a change, a correction), the order in which the material given this turn is
+ * used. Only in a turn that carries something of the user's past (otherwise NO_PAST_CONTEXT_NOTE says there is nothing). Opinions stay allowed: the aim is
+ * never to mix the user's words with Tsumugi's reading, not to stop offering a view.
+ */
+export const OWN_PAST_PRIORITY_NOTE = `
+
+## 本人の過去の理由・考え・変化・訂正を聞かれたとき
+本人が自分の過去について、理由・考え・望み・考えの変化・訂正を尋ねているときは、渡された材料を次の順に使う。
+1. 本人が明示した発言（「本人の発言」「ユーザー発言の抜粋（逐語）」「ユーザー自身の発言そのもの」と示されたもの、今回と「直前の会話」の「ユーザー：」）
+2. 後から本人が説明した理由・訂正（「後から本人が説明した理由」「ユーザー自身の訂正」など）。以前の言葉と違うときは、どちらも時期とともに扱い、以前の言葉を消さない。
+3. AIの要約（記録の要約、経緯の要約、AIが書いた日記の振り返り）
+4. AIの仮説・解釈（「Tsumugiの仮説」「AIの要約の解釈」、記憶同士のつながり、「候補」とされたもの）
+- まず1と2で答える。1と2で答えられることを、3や4の言い換えで置き換えない。3と4は、1と2に無い部分を補うときだけ、AIの整理や見方だと分かる形で使い、本人が言ったことにしない。
+- 本人が「どう思う？」のように見方を求めているときは、1と2を踏まえて、自分の見解や仮説を具体的に述べてよい。そのときも、本人が言ったことと自分の見方を分けて伝える。一般論だけで返さない。
+- 1と2に当たる材料が渡されていないときは、見つかったように装わない。今見えている記録では本人がそう言った理由を確認できないと伝え、要約や仮説で答えるならそうだと分かるようにし、必要なら本人に尋ねる。`;
+
 /** a turn that carries nothing about the user's past (no Memories, no earlier conversations, no Profile / Person View / Timeline / search):
  * say so explicitly, because a model asked for a grounded view otherwise tends to invent "これまでのお話" */
 export const NO_PAST_CONTEXT_NOTE = `
@@ -79,6 +96,8 @@ export interface ConversationVoice {
   evidenceNote: string;
   analystMemoryNote: string;
   noPastContextNote(hasNoPastContext: boolean): string;
+  /** P1-F: the order of the material for questions about the user's own past ("" in a turn without any past context) */
+  ownPastPriorityNote(hasPastContext: boolean): string;
 }
 
 /** `mode`：リアルタイム日記の会話だけ（companionのとき）。それ以外の値・未指定は、これまでと同じ */
@@ -90,5 +109,6 @@ export function conversationVoice(mode?: unknown, persona?: string): Conversatio
     evidenceNote: EVIDENCE_TOPIC_REFERENCE_NOTE,
     analystMemoryNote: ANALYST_MEMORY_USE_NOTE,
     noPastContextNote: (hasNoPastContext) => (hasNoPastContext ? NO_PAST_CONTEXT_NOTE : ""),
+    ownPastPriorityNote: (hasPastContext) => (hasPastContext ? OWN_PAST_PRIORITY_NOTE : ""),
   };
 }
