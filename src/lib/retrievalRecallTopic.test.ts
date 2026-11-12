@@ -262,6 +262,7 @@ test("7 a recall question whose Memory search found nothing: the prompt says the
     const none = await systemFor(ask(Q_ABSTRACT, persona));
     assert.ok(none.includes(NOTE_HEAD), persona);
     assert.ok(none.includes("断定しない") && none.includes("今回参照できた記録では確認できなかった") && none.includes("謝罪"), persona);
+    assert.ok(none.includes("答えが今回の会話の中、「直前の会話」、またはほかの節にあれば、それを使って答える"), `${persona}: the conversation itself comes first`);
     pool = [...carA, ...seiri, ...unrelated];
     const retrieved = await r.retrieveRelevantMemoriesImpl(Q_ABSTRACT, { persona: persona as Persona, recallTopic: true, recentUserTurnsTexts: [Q_ABSTRACT] });
     assert.ok(retrieved.length > 0);
