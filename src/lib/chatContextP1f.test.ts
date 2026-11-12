@@ -139,8 +139,8 @@ test("4 the analyst path (person-aware selection) also puts reflections after th
 });
 
 test("5 a reflection is not brought back through a Connect link when the user's record of its conversation is there", async () => {
-  const link = { id: "L1", sourceId: "own-later-reason", targetId: "refl-same-day", axis: "person", reason: "同じ人物についての記録", contrast: "", strength: 0.9, createdBy: "ai-inference", createdAt: "2026-01-01T00:00:00.000Z" };
-  const withLink = POOL.map((m) => (m.id === "own-later-reason" ? ({ ...m, links: [link] } as MemoryObject) : m));
+  const link = { id: "L1", sourceId: "own-later-reason", targetId: "refl-same-day", axis: "person", reason: "同じ人物についての記録", contrast: false, strength: 0.9, createdBy: "ai-inference", createdAt: "2026-01-01T00:00:00.000Z" };
+  const withLink = POOL.map((m) => (m.id === "own-later-reason" ? ({ ...m, links: [link] } as unknown as MemoryObject) : m));
   pool = withLink;
   for (const q of ["転勤で未来がないと言ったのは、みおさんと距離を置くことにしたから？", QA, QB]) {
     for (const limit of [3, 6]) {
