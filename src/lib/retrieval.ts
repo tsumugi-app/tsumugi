@@ -989,7 +989,15 @@ function pickLinkedAdditions(
     }
   }
 
-  return [...bestByCandidateId.values()]
+  let pooled = [...bestByCandidateId.values()];
+  if (skip) {
+    // P1-F：Link経由の候補どうしでも、同じ会話の本人の記録が候補にあればReflectionは後に回す。
+    // 本人の記録が先に枠を取るので、そのReflectionが入る余地は無い（＝入れない）
+    const ownCandidateConversations = new Set(pooled.filter(({ memory }) => !isReflectionMemory(memory)).map(({ memory }) => memory.conversationId).filter(Boolean));
+    pooled = pooled.filter(({ memory }) => !(isReflectionMemory(memory) && Boolean(memory.conversationId) && ownCandidateConversations.has(memory.conversationId)));
+  }
+
+  return pooled
     .sort((a, b) => b.strength - a.strength)
     .slice(0, maxAdditions)
     .map(({ memory, reason }) => ({ memory, reason }));

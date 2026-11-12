@@ -160,6 +160,20 @@ test("5 a reflection is not brought back through a Connect link when the user's 
   if (old.includes("own-conclusion") && old.includes("refl-same-day")) assert.ok(!chat.includes("refl-same-day"), chat.join(","));
 });
 
+test("5b two Connect additions: the user's record and a reflection of the same conversation do not both come in", async () => {
+  // one direct match links to both the user's record and the reflection of another conversation (c-a)
+  const mk = (id: string, target: string, strength: number) => ({ id, sourceId: "own-later-reason", targetId: target, axis: "person", reason: "同じ人物についての記録", contrast: false, strength, createdBy: "ai-inference", createdAt: "2026-01-01T00:00:00.000Z" });
+  const source = { ...later, links: [mk("L1", "refl-same-day", 0.9), mk("L2", "own-conclusion", 0.8)] } as unknown as MemoryObject;
+  const unrelated = mem({ id: "x1", conv: "c-x1", day: 6, summary: "転勤の準備で荷物を片付けた", keywords: ["転勤"] });
+  pool = [source, own, reflection, unrelated];
+  const q = "転勤で住む場所が離れる";
+  const old = ids(await r.retrieveRelevantMemoriesImpl(q, { limit: 1, maxLinkedAdditions: 2 }));
+  assert.ok(old.includes("refl-same-day") && old.includes("own-conclusion"), `other callers keep both: ${old.join(",")}`);
+  const chat = ids(await r.retrieveRelevantMemoriesImpl(q, { limit: 1, maxLinkedAdditions: 2, deferReflections: true }));
+  assert.ok(chat.includes("own-conclusion"), chat.join(","));
+  assert.ok(!chat.includes("refl-same-day"), chat.join(","));
+});
+
 test("6 the debug trace does not change what retrieval returns", async () => {
   pool = POOL;
   for (const q of [QA, QB]) {
