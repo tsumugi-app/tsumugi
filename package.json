@@ -17,7 +17,7 @@
     "test:synthesis-s1": "tsc -p tsconfig.synthesis-s1.json && node --test .test-out/lib/synthesisS1.test.js",
     "test:memory-context": "tsc -p tsconfig.memory-context.json && node --test .test-out/lib/memoryContext.test.js",
     "test:person-sheet": "tsc -p tsconfig.person-sheet.json && node --test .test-out/lib/personSheet.test.js",
-    "test:person-context": "tsc -p tsconfig.person-context.json && node --test .test-out/lib/personContext.test.js .test-out/lib/personContextSelection.test.js .test-out/lib/personContextRelevance.test.js",
+    "test:person-context": "tsc -p tsconfig.person-context.json && node --test .test-out/lib/personContext.test.js .test-out/lib/personContextSelection.test.js .test-out/lib/personContextRelevance.test.js .test-out/lib/personContextConnect.test.js",
     "test:person-alias": "tsc -p tsconfig.person-alias.json && node --test .test-out/lib/personAlias.test.js",
     "test:memory-search": "tsc -p tsconfig.memory-search.json && node --test .test-out/lib/memorySearch.test.js",
     "test:capture": "tsc -p tsconfig.test.json && node --test .test-out/lib/capture.regression.test.js",

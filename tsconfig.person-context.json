@@ -15,6 +15,7 @@
     "src/lib/personContext.test.ts",
     "src/lib/personContextSelection.test.ts",
     "src/lib/personContextRelevance.test.ts",
+    "src/lib/personContextConnect.test.ts",
     "src/lib/personStance.ts",
     "src/lib/personContext.ts",
     "src/lib/personContextPrompt.ts",

@@ -475,6 +475,12 @@ export default function PersonSheetDiagnostics() {
               {chatTrace.candidates.map((x, i) => (
                 <div key={`c${i}`} className="text-xs">
                   {x.accepted ? "○" : "×"} <Id id={x.memoryId} /> {x.text}<span className="opacity-70">（根拠：{x.signals.join("・") || "なし"}。{x.why}）</span>
+                  {(x.links ?? []).map((l, j) => (
+                    <div key={`l${j}`} className="ml-4 opacity-80">
+                      Connect {l.used ? "使った" : "使わない"}：<Id id={l.fromId} /> → <Id id={l.toId} /> 軸：{l.axis} 強さ：{l.strength}（{l.why}）
+                      <div className="text-stone-600 dark:text-stone-300">AIが書いたつながりの理由（本人の発言ではなく、根拠には使わない）：{l.reason}</div>
+                    </div>
+                  ))}
                 </div>
               ))}
             </Section>
