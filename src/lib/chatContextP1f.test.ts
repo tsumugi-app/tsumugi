@@ -174,6 +174,20 @@ test("5b two Connect additions: the user's record and a reflection of the same c
   assert.ok(!chat.includes("refl-same-day"), chat.join(","));
 });
 
+test("5d a reflection picked directly is removed when a Connect link adds the user's record of its conversation", async () => {
+  const link = { id: "L9", sourceId: "refl-same-day", targetId: "own-conclusion", axis: "person", reason: "同じ人物についての記録", contrast: false, strength: 0.9, createdBy: "ai-inference", createdAt: "2026-01-01T00:00:00.000Z" };
+  const refl = { ...reflection, links: [link] } as unknown as MemoryObject;
+  pool = [refl, own];
+  const q = "自分が本当は何を望んでいるのか、その考え方が少しずつ変わってきた";
+  const old = ids(await r.retrieveRelevantMemoriesImpl(q, { limit: 1 }));
+  assert.deepEqual(old, ["refl-same-day", "own-conclusion"], "other callers keep both");
+  let trace: import("./chatContextProvenance").ReflectionTrace | null = null;
+  const chat = ids(await r.retrieveRelevantMemoriesImpl(q, { limit: 1, deferReflections: true, onReflectionTrace: (t) => { trace = t; } }));
+  assert.deepEqual(chat, ["own-conclusion"]);
+  const t = trace as unknown as import("./chatContextProvenance").ReflectionTrace;
+  assert.ok(t.dropped.some((d) => d.memoryId === "refl-same-day") && !t.deferred.includes("refl-same-day"));
+});
+
 test("5c a user's record that enters the window after a reflection is removed also removes the reflection of its conversation", () => {
   const ownA = mem({ id: "ownA", conv: "c-A", summary: "A", keywords: ["a"] });
   const reflB = mem({ id: "reflB", conv: "c-B", summary: "B", keywords: ["b"], reflection: true });

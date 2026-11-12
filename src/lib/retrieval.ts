@@ -1125,8 +1125,6 @@ export async function retrieveRelevantMemoriesImpl(
     .sort((a, b) => b.score - a.score);
   // P1-F：会話のRetrievalだけ、Reflectionを本人の記録の後に回す（未指定なら従来の順のまま）
   const deferred = deferReflections ? deferReflectionItems(ranked, (entry) => entry.memory, limit, (entry) => entry.score) : null;
-  if (deferred) report(deferred.trace);
-  else if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
   const scored = (deferred ? deferred.items : ranked).slice(0, limit);
 
   const directMatches = scored.map((entry) => entry.memory);
@@ -1150,7 +1148,19 @@ export async function retrieveRelevantMemoriesImpl(
     for (const addition of additions) {
       results.push(toRetrievedMemory(addition.memory, addition.reason, undefined, context));
     }
+    // P1-F：Link経由で本人の記録が入った会話の、直接一致のReflectionも外す（同じ会話をAIの文章で重ねて渡さない）
+    if (deferred) {
+      const linkedOwnConversations = new Set(additions.filter(({ memory }) => !isReflectionMemory(memory)).map(({ memory }) => memory.conversationId).filter(Boolean));
+      const removed = new Set(directMatches.filter((memory) => isReflectionMemory(memory) && Boolean(memory.conversationId) && linkedOwnConversations.has(memory.conversationId)).map((memory) => memory.id));
+      if (removed.size > 0) {
+        for (let i = results.length - 1; i >= 0; i -= 1) if (removed.has(results[i].id) && !results[i].linkReason) results.splice(i, 1);
+        deferred.trace.deferred = deferred.trace.deferred.filter((id) => !removed.has(id));
+        for (const id of removed) deferred.trace.dropped.push({ memoryId: id, why: "同じ会話の本人の記録がLink経由で選ばれている" });
+      }
+    }
   }
+  if (deferred) report(deferred.trace);
+  else if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
 
   const capped = results.slice(0, limit + maxLinkedAdditions);
   return withContext(options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped);
