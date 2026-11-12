@@ -109,7 +109,11 @@ test("2 a concrete reason question (B) gets the user's own conclusion and later 
   assert.ok(list.includes("own-conclusion") && list.includes("own-later-reason"), list.join(","));
   assert.ok(!list.includes("refl-same-day"));
   // the other day's reflection has no record of its own here, and a slot is left: it may come, but last
-  if (list.includes("refl-other-day")) assert.equal(list.indexOf("refl-other-day"), list.filter((id) => !id.startsWith("refl-")).length);
+  // after every record of the user whose keywords match (a record that only shares a few characters may come after it)
+  if (list.includes("refl-other-day")) {
+    const strong = list.filter((id) => !id.startsWith("refl-") && r.scoreMemory(POOL.find((m) => m.id === id)!, QB) >= r.KEYWORD_WEIGHT);
+    assert.ok(strong.every((id) => list.indexOf(id) < list.indexOf("refl-other-day")), list.join(","));
+  }
   // with three slots, the user's records fill them
   const three = ids(await r.retrieveRelevantMemoriesImpl(QB, { deferReflections: true }));
   assert.ok(three.every((id) => !id.startsWith("refl-")), three.join(","));
