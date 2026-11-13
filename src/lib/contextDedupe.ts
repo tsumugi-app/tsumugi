@@ -147,13 +147,14 @@ export function dedupeExactContext(input: {
       const why = timelineExtras(point);
       if (!same) why.push("話した日");
       if (why.length === 0 && left <= 1) why.push("テーマの経緯が空になる");
+      const reference = same ? `（上の人物「${same.where}」と同じ記録）` : "";
+      if (why.length === 0 && len(reference) >= len(point.summary)) why.push("要約が参照より短い（置き換えても減らない）");
       if (why.length > 0 || !same) {
         kept.push({ route: "Memory Timeline", memoryId: point.memoryId, theme: theme.theme, sameAs: "Memory Graph", why: why.join("・") });
         return point;
       }
       left -= 1;
       changed = true;
-      const reference = `（この記録の要約は、上の「話題の人物について」の「${same.where}」と同じ）`;
       referenced.add(`${theme.theme}\n${point.memoryId}`);
       removed.push({ route: "Memory Timeline", memoryId: point.memoryId, theme: theme.theme, keptIn: "Memory Graph", keptWhere: same.where, text: point.summary, chars: len(point.summary), reference, savedChars: len(point.summary) - len(reference) });
       return { ...point, summary: reference };

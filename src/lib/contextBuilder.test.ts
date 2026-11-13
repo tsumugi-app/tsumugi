@@ -462,7 +462,7 @@ test("13 the device log's three duplicates: the later copy leaves the real promp
   for (const kept of [S3, S4, REASON, "関係（記録を作ったAIの分類）：子", "### 長男", "### 次男", "## 複数の会話にわたる経緯", "## 関連する過去の記憶"]) assert.ok(onX.includes(kept), `ON keeps ${kept}`);
   // the time series stays: every point keeps its date and place; only the duplicated summary becomes a short reference
   const tl = onX.slice(onX.indexOf("## 複数の会話にわたる経緯"));
-  const at = ["2026-09-20に記録: （この記録の要約は、上の「話題の人物について」の「長男」と同じ）", "2026-10-04に記録: （この記録の要約は、上の「話題の人物について」の「長男」と同じ）", `2026-10-28に記録（最後に話した記録）: ${S3}`].map((x) => tl.indexOf(x));
+  const at = ["2026-09-20に記録: （上の人物「長男」と同じ記録）", "2026-10-04に記録: （上の人物「長男」と同じ記録）", `2026-10-28に記録（最後に話した記録）: ${S3}`].map((x) => tl.indexOf(x));
   assert.ok(at.every((i, k) => i >= 0 && (k === 0 || i > at[k - 1])), `the three points in order: ${at.join(",")}`);
   // turn 2: Memory Timeline → Retrieval (運動会)
   const [offY, onY] = await pair(chatBody(SCENE_Y), chatBody(SCENE_Y, { contextDedupe: true }));
@@ -527,6 +527,7 @@ test("14 kept when unsure or when the later copy says more: another text, anothe
   assert.deepEqual(plan(block(said("n1", "2026-10-01", T1, "user")), [point("n1", "2026-10-01", T1), other]).removed, []);
   assert.deepEqual(plan(block(said("n2", "2026-10-01", T1)), [point("n1", "2026-10-01", T1), other]).removed, [], "another Memory ID");
   assert.match(plan(block(said("n1", "2026-10-01", T1)), [point("n1", "2026-10-01", T1)]).kept[0].why, /空になる/);
+  assert.match(plan(block(said("n1", "2026-10-01", "長男が泳いだ")), [point("n1", "2026-10-01", "長男が泳いだ"), other]).kept[0].why, /参照より短い/, "a reference never makes the prompt longer");
 
   // Retrieval: anything the earlier copy does not carry keeps the record
   const tl = [point("r1", "2026-10-01", T1), other];
