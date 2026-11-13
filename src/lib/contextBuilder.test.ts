@@ -249,7 +249,7 @@ test("3 the AI's hypotheses are never the user's words, and they are not limited
   assert.ok(reason.decisions.some((d) => d.memoryIds.includes("k3") && d.decision === "採用"), "the later reason k3 is kept");
 });
 
-test("4 the same Memory ID with different information is kept apart; only an exact duplicate is removed", () => {
+test("4 the same Memory ID with different information is kept apart; a copy without an ID on the wire is not compared (uncertain: kept)", () => {
   const retrieved = [{ id: "k3", date: "2026-09-05T10:00:00.000Z", summary: POOL[10].summary, keywords: ["咲さん", "未来"], source: "ai-capture" as const, quote: "咲さんとの関係に未来がないと言ったのは、自分が既婚者だから。", persons: ["咲さん"] }];
   const topicContext = [{ topicId: "t-saki", memories: [{ date: "2026-09-05T10:00:00.000Z", summary: POOL[10].summary, keywords: ["咲さん", "未来"] }] }];
   const report = cb.buildContextBuilderReport({ question: "咲さんとの未来の話、前にどう言った？", turnCount: 1, retrievedMemories: retrieved as never, topicContext }, POOL);
@@ -257,9 +257,11 @@ test("4 the same Memory ID with different information is kept apart; only an exa
   assert.ok(k3.some((d) => d.route === "Retrieval" && d.kind === "本人の発言" && d.decision !== "除外"), "the user's words of the same Memory stay");
   assert.ok(k3.some((d) => d.route === "Topic Continuity" && d.decision !== "除外"), "the first copy of the summary stays");
   const dup = k3.find((d) => d.route === "Retrieval" && d.kind === "AIの要約");
-  assert.equal(dup?.decision, "除外", "the same summary of the same Memory a second time is the only exclusion");
+  // the Topic Continuity copy has no Memory ID on the wire (the device found it by its summary): the reduction does not rely on that guess
+  assert.notEqual(dup?.decision, "除外", "an uncertain duplicate is kept");
+  assert.deepEqual(report.dedupe.removed, []);
   assert.ok(report.sameMemory.some((s) => s.memoryId === "k3"));
-  assert.equal(report.exactDuplicates.length, 1);
+  assert.equal(report.exactDuplicates.length, 1, "the diagnosis still shows the same text twice");
   assert.deepEqual(report.lostMemoryIds, [], "the Memory itself is not lost");
 });
 
@@ -276,7 +278,7 @@ test("5 no reason in the candidates: the report says so and does not present a h
 test("6 everyday talk keeps a natural link to the past and pushes nothing out", async () => {
   const report = await reportFor(CASES[6]);
   assert.deepEqual(report.question.types, ["日常"]);
-  assert.equal(report.totals.excluded, report.exactDuplicates.length, "only exact duplicates are excluded");
+  assert.equal(report.totals.excluded, report.dedupe.removed.length, "only the exact duplicates the reduction takes out are excluded");
   const retrieval = report.decisions.filter((d) => d.route === "Retrieval");
   if (retrieval.length > 0) assert.ok(retrieval.some((d) => d.decision === "採用"), "the top record stays as a natural link");
 });
@@ -347,7 +349,7 @@ test("9 diagnostics on or off: the same request values, the same prompt, the sam
 
 test("10 Capture, Connect, the Vault and the saved Memories are untouched; no storage, no AI call, no network", () => {
   const src = (f: string) => fs.readFileSync(path.join(ROOT, "../src", f), "utf8");
-  for (const f of ["lib/contextBuilder.ts", "lib/contextBuilderStore.ts"]) {
+  for (const f of ["lib/contextBuilder.ts", "lib/contextBuilderStore.ts", "lib/contextDedupe.ts"]) {
     const s = src(f).split("\n").filter((l) => /^import /.test(l)).join("\n");
     assert.ok(!/\/db"|vault|Vault|\/ai\/|capture|connect"|storage|outbox/i.test(s), `${f} imports: ${s}`);
     const body = src(f).replace(/^\s*(?:\*|\/\/).*$/gm, "");
@@ -366,7 +368,7 @@ test("11 the report: what 保留 means, per-route counts and characters, and the
   assert.equal(report.routes.reduce((n, x) => n + x.virtual.chars, 0), report.totals.virtual.chars);
   assert.ok(report.decisions.every((d) => Array.from(d.text).length <= cb.CONTEXT_BUILDER_LIMITS.clipChars + 1), "only short clips are kept");
   const text = cb.formatContextBuilderReport(report);
-  for (const part of ["段階1・診断専用", "判定の意味", "■ 経路ごとの件数・文字数", "■ 本人の理由・訂正", "■ AIの仮説", "■ 人物", "■ 同じMemoryの別の情報", "■ 完全な重複", "■ 判定（プロンプトの順）"]) assert.ok(text.includes(part), part);
+  for (const part of ["段階1の判定は診断専用", "OFF：送る内容は従来どおり", "判定の意味", "■ 経路ごとの件数・文字数", "■ 本人の理由・訂正", "■ AIの仮説", "■ 人物", "■ 同じMemoryの別の情報", "■ 同じ本文の重複", "■ 重複の削減（段階2-A）", "■ 判定（プロンプトの順）"]) assert.ok(text.includes(part), part);
 });
 
 test("12 review: a pointer or a time word is not a topic; a statement (not a question) is everyday talk; a theme / a Graph name counts", async () => {
@@ -378,7 +380,7 @@ test("12 review: a pointer or a time word is not a topic; a statement (not a que
   for (const q of ["ドライブしたい", "昨日カフェに行った"]) {
     const report = cb.buildContextBuilderReport({ ...input, question: q }, POOL);
     assert.deepEqual(report.question.types, ["日常"], q);
-    assert.equal(report.totals.excluded, report.exactDuplicates.length, `${q}: everyday talk pushes nothing out`);
+    assert.equal(report.totals.excluded, report.dedupe.removed.length, `${q}: everyday talk pushes nothing out`);
   }
   // a Memory Timeline point chosen for its theme is about the theme even when its own words differ
   const theme = [{ theme: "引っ越し", state: { status: "不明" }, timeline: [{ memoryId: "mv1", statedAt: "2026-10-01T10:00:00.000Z", statedAtIsRecordDate: false, summary: "新居の契約を済ませた", retrospective: false, latestSaid: true, latestEvent: false, stateBasis: true }], items: [] }];
@@ -390,4 +392,204 @@ test("12 review: a pointer or a time word is not a topic; a statement (not a que
   const alias = cb.buildContextBuilderReport({ question: "さきちゃんとの将来について前にどう思っていた？", turnCount: 1, personContext: graph as never }, POOL);
   assert.ok(alias.question.persons.includes("さきちゃん"), alias.question.persons.join(","));
   assert.ok(alias.decisions.filter((d) => d.route === "Memory Graph").every((d) => d.decision !== "除外"), JSON.stringify(alias.decisions));
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// P1-H 段階2-A：完全な重複の削減（contextDedupe.ts、機能フラグ既定OFF）。架空のデータだけ
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+const dd = require(path.join(ROOT, "lib/contextDedupe.js")) as typeof import("./contextDedupe");
+const DELIM = (require(path.join(ROOT, "lib/generationDebugProtocol.js")) as typeof import("./generationDebugProtocol")).DEBUG_ENVELOPE_DELIMITER;
+const occurrences = (hay: string, needle: string) => (needle ? hay.split(needle).length - 1 : 0);
+/** two prompts built in the same minute (the prompt carries the current minute) */
+async function pair(a: Record<string, unknown>, b: Record<string, unknown>): Promise<[string, string]> {
+  for (let k = 0; k < 3; k++) {
+    const x = await prompt(a);
+    const y = await prompt(b);
+    if ((await prompt(a)) === x) return [x, y];
+  }
+  throw new Error("the minute kept rolling over");
+}
+async function envelope(body: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+  const res = await chatRoute.POST(new Request("http://x/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+  const text = await res.text();
+  const at = text.indexOf(DELIM);
+  return at < 0 ? null : (JSON.parse(text.slice(at + DELIM.length)) as Record<string, unknown>);
+}
+/** every piece of the diagnosis, found in the prompt in the same order */
+function walk(units: import("./contextBuilder").ContextUnit[], sys: string, label: string) {
+  let cursor = 0;
+  for (const u of units) {
+    const probe = u.route === "Memory Graph" && u.personLine ? u.text.split("：")[1].split("　")[0] : u.text;
+    const i = sys.indexOf(probe, cursor);
+    assert.ok(i >= 0, `${label}: ${u.index} ${u.route} ${u.part}「${probe}」 not found after ${cursor}`);
+    cursor = i;
+  }
+}
+const report = (lines: string[]) => {
+  for (const l of lines) console.log(`CI-REPORT ${l}`);
+  if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`);
+};
+
+// the three duplicates of the device log, in fictional words
+const S1 = "長男の運動会でリレーのアンカーを走った";
+const S2 = "長男と次男が公園で一緒に自転車の練習をした";
+const S3 = "長男が次男の宿題を見てあげた";
+const S4 = "長男の担任の先生と面談した";
+const REASON = "自分が厳しく育てられて苦しかったから";
+const point = (memoryId: string, day: string, summary: string, extra: Record<string, unknown> = {}) => ({ memoryId, statedAt: `${day}T10:00:00.000Z`, statedAtIsRecordDate: true, summary, retrospective: false, latestSaid: false, latestEvent: false, stateBasis: false, ...extra });
+const themeOf = (points: unknown[], theme = "長男") => [{ theme, state: { status: "不明" }, timeline: points, items: [] }];
+const said = (memoryId: string, day: string, text: string, kind = "summary") => ({ kind, text, day, memoryId });
+const retr = (id: string, day: string, summary: string, extra: Record<string, unknown> = {}) => ({ id, date: `${day}T10:00:00.000Z`, summary, keywords: ["長男"], source: "ai-capture", persons: ["長男"], ...extra });
+const GRAPH = [
+  { key: "長男", names: ["長男"], relation: { label: "子" }, conclusions: [{ statement: said("d5", "2026-09-01", "長男にはのびのび育ってほしい", "user"), role: "thought", reasons: [{ ...said("d6", "2026-10-10", REASON, "user"), when: "later" }], aiReadings: [] }], plans: [], events: [said("d1", "2026-09-20", S1), said("d2", "2026-10-04", S2)], candidates: [], memoryIds: [] },
+  { key: "次男", names: ["次男"], conclusions: [], plans: [], events: [said("d2", "2026-10-04", S2)], candidates: [], memoryIds: [] },
+];
+/** turn 1: the Memory Graph and the Memory Timeline carry the same summaries (運動会; 長男と次男) */
+const SCENE_X = { personContext: GRAPH, memoryTimeline: themeOf([point("d1", "2026-09-20", S1), point("d2", "2026-10-04", S2), point("d3", "2026-10-28", S3, { latestSaid: true })]), retrievedMemories: [retr("d4", "2026-10-30", S4)] };
+/** turn 2: the Memory Timeline and Retrieval carry the same summary (運動会) */
+const SCENE_Y = { memoryTimeline: themeOf([point("d1", "2026-09-20", S1), point("d3", "2026-10-28", S3, { latestSaid: true })]), retrievedMemories: [retr("d1", "2026-09-20", S1), retr("d4", "2026-10-30", S4)] };
+const Q = "長男のこと、どうだったっけ？";
+const chatBody = (scene: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ persona: "companion", turns: [{ role: "user", content: Q, timestamp: T }], ...scene, ...extra });
+
+test("13 the device log's three duplicates: the later copy leaves the real prompt with the flag ON; OFF is the prompt as before", async () => {
+  // turn 1: Memory Graph → Memory Timeline (運動会; 長男と次男)
+  const [offX, onX] = await pair(chatBody(SCENE_X), chatBody(SCENE_X, { contextDedupe: true }));
+  assert.equal(occurrences(offX, S1), 2, "OFF: 運動会 twice (Memory Graph and Memory Timeline), as before");
+  assert.equal(occurrences(onX, S1), 1, "ON: 運動会 once");
+  assert.equal(occurrences(offX, S2), 3, "OFF: 長男と次男 under both people and in the Memory Timeline");
+  assert.equal(occurrences(onX, S2), 2, "ON: kept under both people (two people are not merged), gone from the Memory Timeline");
+  for (const kept of [S3, S4, REASON, "関係（記録を作ったAIの分類）：子", "### 長男", "### 次男", "## 複数の会話にわたる経緯", "## 関連する過去の記憶"]) assert.ok(onX.includes(kept), `ON keeps ${kept}`);
+  // the time series stays: every point keeps its date and place; only the duplicated summary becomes a short reference
+  const tl = onX.slice(onX.indexOf("## 複数の会話にわたる経緯"));
+  const at = ["2026-09-20に記録: （上の人物「長男」と同じ記録）", "2026-10-04に記録: （上の人物「長男」と同じ記録）", `2026-10-28に記録（最後に話した記録）: ${S3}`].map((x) => tl.indexOf(x));
+  assert.ok(at.every((i, k) => i >= 0 && (k === 0 || i > at[k - 1])), `the three points in order: ${at.join(",")}`);
+  // turn 2: Memory Timeline → Retrieval (運動会)
+  const [offY, onY] = await pair(chatBody(SCENE_Y), chatBody(SCENE_Y, { contextDedupe: true }));
+  assert.equal(occurrences(offY, S1), 2);
+  assert.equal(occurrences(onY, S1), 1, "ON: the Retrieval copy leaves; the Memory Timeline copy (with its date in the time series) stays");
+  assert.ok(onY.indexOf(S1) < onY.indexOf("## 関連する過去の記憶") && onY.includes(S4), "the earlier copy stays; the other record of Retrieval stays");
+  // anything but true is OFF
+  const [offAgain, junk] = await pair(chatBody(SCENE_X), chatBody(SCENE_X, { contextDedupe: "1" }));
+  assert.equal(junk, offAgain, "a flag that is not true changes nothing");
+
+  // the server says what it actually took out (only with the debug id); OFF adds nothing to the debug envelope either
+  const envOn = await envelope(chatBody(SCENE_X, { contextDedupe: true, debugGenerationId: "g1" }));
+  const envOff = await envelope(chatBody(SCENE_X, { debugGenerationId: "g1" }));
+  const server = envOn?.contextDedupe as import("./contextDedupe").ServerDedupeReport;
+  assert.deepEqual(server.removed.map((x) => [x.route, x.memoryId, x.keptIn]), [["Memory Timeline", "d1", "Memory Graph"], ["Memory Timeline", "d2", "Memory Graph"]]);
+  assert.ok(server.sectionChars.after < server.sectionChars.before, JSON.stringify(server.sectionChars));
+  assert.ok(envOff && !("contextDedupe" in envOff), "OFF: the envelope is as before");
+  assert.ok(dd.formatServerDedupeReport(server).includes("外した2件"));
+  const envY = (await envelope(chatBody(SCENE_Y, { contextDedupe: true, debugGenerationId: "g2" })))?.contextDedupe as import("./contextDedupe").ServerDedupeReport;
+  assert.deepEqual(envY.removed.map((x) => [x.route, x.memoryId, x.keptIn]), [["Retrieval", "d1", "Memory Timeline"]]);
+
+  // the client's diagnosis shows the same pieces: OFF as 除外 (would leave), ON already gone from the current input
+  for (const [scene, sys, ids] of [[SCENE_X, onX, ["d1", "d2"]], [SCENE_Y, onY, ["d1"]]] as const) {
+    const base = { question: Q, turnCount: 1, ...(scene as Record<string, unknown>), persona: "companion" } as unknown as Input;
+    const off = cb.buildContextBuilderReport(base, POOL);
+    const on = cb.buildContextBuilderReport({ ...base, contextDedupe: true }, POOL);
+    assert.deepEqual(on.dedupe.removed, off.dedupe.removed);
+    assert.deepEqual(off.dedupe.removed.map((x) => x.memoryId), ids);
+    for (const id of ids) assert.ok(off.decisions.some((d) => d.memoryIds[0] === id && d.kind === "AIの要約" && d.decision === "除外" && d.why.startsWith("完全な重複")), `OFF shows ${id} as the duplicate that ON takes out`);
+    assert.equal(off.totals.current.chars - on.totals.current.chars, on.dedupe.removedChars, "the characters taken out");
+    assert.equal(off.explanations.current, on.explanations.current, "no reason / correction lost");
+    assert.deepEqual(off.persons.map((p) => [p.name, p.lineCurrent]), on.persons.map((p) => [p.name, p.lineCurrent]), "no person line lost");
+    walk(cb.collectContextUnits({ ...base, contextDedupe: true }, POOL).units, sys, "ON order");
+    assert.ok(cb.formatContextBuilderReport(on).includes("ON（下のものは実際に送っていない）"));
+  }
+  report([
+    "## 段階2-A：実機ログの3件（架空データ）",
+    "| 場面 | OFFのプロンプト | ONのプロンプト | 外したもの |",
+    "|---|---|---|---|",
+    `| 1ターン目（Memory Graph→Memory Timeline） | ${Array.from(offX).length}字 | ${Array.from(onX).length}字 | ${server.removed.map((x) => `${x.route} ${x.memoryId}「${x.text}」`).join("／")} |`,
+    `| 2ターン目（Memory Timeline→Retrieval） | ${Array.from(offY).length}字 | ${Array.from(onY).length}字 | ${envY.removed.map((x) => `${x.route} ${x.memoryId}「${x.text}」`).join("／")} |`,
+  ]);
+});
+
+test("14 kept when unsure or when the later copy says more: another text, another kind, another day, a time-series mark, the user's words, a person, analyst", () => {
+  const T1 = "長男が水泳の検定に合格して、家族みんなで喜んだ";
+  const other = point("x0", "2026-09-01", "長男と図書館に行った");
+  const plan = (graph: unknown[], timeline: unknown[], retrieved: unknown[] = [], persona = "companion") =>
+    dd.dedupeExactContext({ persona, personContext: graph as never, memoryTimeline: themeOf(timeline) as never, retrievedMemories: retrieved as never });
+  const block = (...events: unknown[]) => [{ key: "長男", names: ["長男"], conclusions: [], plans: [], events, candidates: [], memoryIds: [] }];
+  // the plain case is taken out
+  assert.equal(plan(block(said("n1", "2026-10-01", T1)), [point("n1", "2026-10-01", T1), other]).removed.length, 1);
+  // a time-series mark keeps the Memory Timeline point
+  for (const extra of [{ eventTime: "2026-09" }, { status: "保留" }, { retrospective: true }, { stateBasis: true }, { latestSaid: true }]) {
+    const r = plan(block(said("n1", "2026-10-01", T1)), [point("n1", "2026-10-01", T1, extra), other]);
+    assert.equal(r.removed.length, 0, JSON.stringify(extra));
+    assert.equal(r.kept.length, 1, JSON.stringify(extra));
+  }
+  // another day, another text, another kind (the user's words), the last point of a theme
+  assert.match(plan(block(said("n1", "2026-10-02", T1)), [point("n1", "2026-10-01", T1), other]).kept[0].why, /話した日/);
+  assert.deepEqual(plan(block(said("n1", "2026-10-01", `${T1}。`)), [point("n1", "2026-10-01", T1), other]).removed, []);
+  assert.deepEqual(plan(block(said("n1", "2026-10-01", T1, "user")), [point("n1", "2026-10-01", T1), other]).removed, []);
+  assert.deepEqual(plan(block(said("n2", "2026-10-01", T1)), [point("n1", "2026-10-01", T1), other]).removed, [], "another Memory ID");
+  assert.match(plan(block(said("n1", "2026-10-01", T1)), [point("n1", "2026-10-01", T1)]).kept[0].why, /空になる/);
+  assert.match(plan(block(said("n1", "2026-10-01", "長男が泳いだ")), [point("n1", "2026-10-01", "長男が泳いだ"), other]).kept[0].why, /参照より短い/, "a reference never makes the prompt longer");
+
+  // Retrieval: anything the earlier copy does not carry keeps the record
+  const tl = [point("r1", "2026-10-01", T1), other];
+  const second = retr("z9", "2026-10-30", S4);
+  assert.equal(plan([], tl, [retr("r1", "2026-10-01", T1), second]).removed.length, 1, "the plain case is taken out");
+  for (const extra of [{ keywords: ["長男", "成長"] }, { quote: "検定に受かったよ" }, { trait: "質問の記録" }, { linkReason: "水泳の話が続いている" }, { isOriginMemory: true }, { source: "user-authored" }, { persons: ["次男"] }, { eventTime: "2026-09-30" }, { date: "2026-10-03T10:00:00.000Z" }]) {
+    const r = plan([], tl, [retr("r1", "2026-10-01", T1, extra), second]);
+    assert.equal(r.removed.length, 0, JSON.stringify(extra));
+    assert.equal(r.kept.length, 1, JSON.stringify(extra));
+  }
+  assert.equal(plan([], tl, [retr("r1", "2026-10-01", T1, { source: "system-generated" }), second]).removed.length, 0, "a Reflection is another kind");
+  assert.match(plan([], tl, [retr("r1", "2026-10-01", T1), second], "analyst").kept[0].why, /分析モード/);
+  assert.match(plan([], tl, [retr("r1", "2026-10-01", T1)]).kept[0].why, /空になる/);
+  assert.match(plan([], tl, [retr("r1", "2026-10-01", T1), retr("rf", "2026-10-05", "日記の振り返り", { source: "system-generated" })]).kept[0].why, /空になる/, "a Reflection does not keep the section");
+  // the same record in two themes is two meanings; each theme is compared with the Memory Graph only, the Memory Graph keeps everything
+  const two = dd.dedupeExactContext({ personContext: block(said("n1", "2026-10-01", T1)) as never, memoryTimeline: [...themeOf([point("n1", "2026-10-01", T1), other]), ...themeOf([point("n1", "2026-10-01", T1), other], "水泳")] as never, retrievedMemories: [] });
+  assert.deepEqual(two.removed.map((x) => x.theme), ["長男", "水泳"]);
+  // the values passed in are never changed
+  const frozen = deepFreeze(structuredClone({ g: block(said("n1", "2026-10-01", T1)), t: themeOf([point("n1", "2026-10-01", T1), other]), r: [retr("r1", "2026-10-01", T1), second] }));
+  const before = JSON.stringify(frozen);
+  dd.dedupeExactContext({ personContext: frozen.g as never, memoryTimeline: frozen.t as never, retrievedMemories: frozen.r as never });
+  assert.equal(JSON.stringify(frozen), before);
+});
+
+test("15 the eight survey cases with the flag ON: the real prompt keeps every needed Memory, reason, person line and order (table: before → after)", async () => {
+  const rows = ["## 段階2-A：8ケースの変更前後（架空データ・実際のプロンプト）", "| 質問 | 入力の件数・文字数（OFF→ON） | プロンプト全体の文字数（OFF→ON） | 外したもの | 同じ本文だが残したもの |", "|---|---|---|---|---|"];
+  for (const c of CASES) {
+    const input = await bodyFor(c, { recentConversation: RECENT });
+    const offBody = fetchBody(input, false) as Record<string, unknown>;
+    const [offSys, onSys] = await pair(offBody, { ...offBody, contextDedupe: true });
+    const off = cb.buildContextBuilderReport({ ...input, persona: "companion" }, POOL);
+    const on = cb.buildContextBuilderReport({ ...input, persona: "companion", contextDedupe: true }, POOL);
+    assert.deepEqual(on.dedupe.removed, off.dedupe.removed, `${c.q}: the same pieces`);
+    if (off.dedupe.removed.length === 0) assert.equal(onSys, offSys, `${c.q}: nothing to take out, the same prompt`);
+    for (const x of off.dedupe.removed) {
+      const probe = x.text.replace(/…$/, "");
+      const times = off.dedupe.removed.filter((y) => y.text === x.text).length;
+      assert.equal(occurrences(onSys, probe), occurrences(offSys, probe) - times, `${c.q}: ${x.memoryId} once less`);
+      assert.ok(onSys.includes(probe), `${c.q}: ${x.memoryId} still in the prompt (the earlier copy)`);
+    }
+    const offIds = idsOf(off, "current");
+    const onIds = idsOf(on, "current");
+    for (const id of offIds) assert.ok(onIds.has(id), `${c.q}: ${id} is not lost`);
+    assert.equal(on.explanations.current, off.explanations.current, `${c.q}: no reason / correction lost`);
+    assert.deepEqual(on.persons.map((p) => [p.name, p.lineCurrent]), off.persons.map((p) => [p.name, p.lineCurrent]), `${c.q}: no person merged or lost`);
+    for (const d of on.decisions) if (d.kind === "本人の発言" || d.kind === "後からの本人の説明・訂正") assert.ok(!HYPOTHESES.some((h) => h.startsWith(d.text.replace(/…$/, ""))), `${c.q}: a hypothesis as the user's words`);
+    walk(cb.collectContextUnits({ ...input, persona: "companion", contextDedupe: true }, POOL).units, onSys, c.q);
+    rows.push(`| ${c.q} | ${off.totals.current.count}件・${off.totals.current.chars}字 → ${on.totals.current.count}件・${on.totals.current.chars}字 | ${Array.from(offSys).length} → ${Array.from(onSys).length} | ${off.dedupe.removed.map((x) => `${x.route} ${x.memoryId}（${x.keptIn}に残る）`).join("／") || "なし"} | ${off.dedupe.kept.map((x) => `${x.route} ${x.memoryId}：${x.why}`).join("／") || "なし"} |`);
+  }
+  report(rows);
+});
+
+test("16 the flag: default OFF, the request gains a field only when ON, the server decides with the same function, no extra AI call", async () => {
+  const screen = fs.readFileSync(path.join(ROOT, "../src/components/ChatScreen.tsx"), "utf8");
+  const fetchAt = screen.indexOf('const res = await fetch("/api/chat"');
+  const body = screen.slice(fetchAt, screen.indexOf("if (!res.ok || !res.body)", fetchAt));
+  assert.ok(body.includes("...(contextDedupeOn ? { contextDedupe: true } : {})"), "OFF adds nothing to the request");
+  const flag = fs.readFileSync(path.join(ROOT, "../src/lib/contextDedupeFlag.ts"), "utf8");
+  assert.ok(flag.includes('=== "1"') && flag.includes("return false;"), "on only with the stored 1; any error means OFF");
+  const route = fs.readFileSync(path.join(ROOT, "../src/app/api/chat/route.ts"), "utf8");
+  assert.ok(route.includes("contextDedupe === true ? dedupeExactContext("), "the server applies it only for true");
+  rec.calls = 0;
+  await prompt(chatBody(SCENE_X, { contextDedupe: true }));
+  assert.equal(rec.calls, 1, "one chat call, as before");
 });

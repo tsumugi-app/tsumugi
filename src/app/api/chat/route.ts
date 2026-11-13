@@ -16,6 +16,7 @@ import { sanitizeMemoryAnalyticsContext, type MemoryAnalyticsContext } from "@/l
 import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { buildContextProvenance } from "@/lib/chatContextProvenance";
+import { dedupeExactContext, serverDedupeReport } from "@/lib/contextDedupe";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -920,7 +921,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, personContext, debugGenerationId, conversationVoiceMode } = (await request.json()) as {
+  const { persona, turns, retrievedMemories, recentConversation, topicContext, profile, personView, topicTimeline, explicitSearch, memoryAnalytics, memoryTimeline, personContext, debugGenerationId, conversationVoiceMode, contextDedupe } = (await request.json()) as {
     /** リアルタイム日記の会話だけ"realtime-diary"（conversationVoice.ts）。返し方の指示だけを変える */
     conversationVoiceMode?: unknown;
     persona: Persona;
@@ -950,6 +951,8 @@ export async function POST(request: Request) {
      * 完全に同一（バイト単位で変化しない）。
      */
     debugGenerationId?: string;
+    /** P1-H 段階2-A（既定OFF、optional）。trueのときだけ、完全な重複（contextDedupe.ts）を外してプロンプトを組み立てる。無ければ従来とバイト単位で同じプロンプト。 */
+    contextDedupe?: unknown;
   };
 
   if (!turns || turns.length === 0) {
@@ -995,7 +998,13 @@ export async function POST(request: Request) {
         (memory) => memory.isOriginMemory === true || !isTimeDependentMemory(memory)
       ).map(withoutOutsideFactQuote);
 
-  const retrievedMemoriesSection = buildRetrievedMemoriesSection(memoriesForContext);
+  // P1-H 段階2-A：機能フラグがONのときだけ、Memory Graph・Memory Timeline・Retrievalの間の完全な重複を、後ろの節から外す（contextDedupe.ts）
+  const sanitizedMemoryTimeline = sanitizeSynthesisContext(memoryTimeline);
+  const sanitizedPersonContext = sanitizePersonContext(personContext);
+  const contextDedupeResult = contextDedupe === true ? dedupeExactContext({ persona, personContext: sanitizedPersonContext, memoryTimeline: sanitizedMemoryTimeline, retrievedMemories: memoriesForContext }) : null;
+  const promptMemories = contextDedupeResult ? contextDedupeResult.retrievedMemories : memoriesForContext;
+  const promptMemoryTimeline = contextDedupeResult ? contextDedupeResult.memoryTimeline : sanitizedMemoryTimeline;
+  const retrievedMemoriesSection = buildRetrievedMemoriesSection(promptMemories);
   // Conversation voice（意見・気づき・記憶の使い方の指示。conversationVoice.ts）。プロンプトのみで、取得・保存・AI呼び出し回数・thinking budgetは変えない。
   const voice = conversationVoice(conversationVoiceMode, persona);
   const memoriesSectionForPersona =
@@ -1074,9 +1083,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   const sanitizedPersonView = sanitizePersonViewContext(personView);
   const personViewSection = buildPersonViewSection(sanitizedPersonView);
   // Memory Timeline（試験接続）＋Memory Synthesis（実験）：複数の会話にまたがる経緯（コードが作る事実）と、あれば整理（仮説）。今回の話題に関係するものだけがクライアントから届く。
-  const sanitizedMemoryTimeline = sanitizeSynthesisContext(memoryTimeline);
-  const synthesisSection = buildSynthesisSection(sanitizedMemoryTimeline);
-  const sanitizedPersonContext = sanitizePersonContext(personContext);
+  const synthesisSection = buildSynthesisSection(promptMemoryTimeline);
   const personContextSection = buildPersonContextSection(sanitizedPersonContext);
 
   const sanitizedProfile = sanitizeProfileContext(profile);
@@ -1215,7 +1222,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
           topicContinuity: topicContext
             ? topicContext.filter((t) => t.memories.length > 0).map((t) => ({ topicId: t.topicId, memories: t.memories }))
             : null,
-          retrievedMemory: memoriesForContext,
+          retrievedMemory: promptMemories,
           // Explicit Memory Search P0.5（観測専用）：サーバーが実際に受け取った状態。件数とsectionの有無だけ。
           // `systemInstruction`は、下で`provider.generateStream`へ渡すのと同じ変数。
           explicitSearchServerAccepted: {
@@ -1238,13 +1245,15 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
         },
         // P1-F（?debugLog=1のときだけ）：経路ごとに、実際にsystemInstructionへ使った値の由来。短い抜粋だけで、クライアントは保存せずタブのメモリにだけ置く
         provenance: debugProvenance(() => buildContextProvenance({
-          retrievedMemories: memoriesForContext,
+          retrievedMemories: promptMemories,
           topicContinuity: topicContinuitySection ? (topicContext ?? []).filter((t) => t.memories.length > 0) : null,
           topicTimeline: sanitizedTopicTimeline.map((timeline) => ({ topicId: timeline.topicId, events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic) })),
-          memoryTimeline: synthesisSection ? sanitizedMemoryTimeline : null,
+          memoryTimeline: synthesisSection ? promptMemoryTimeline : null,
           personContext: personContextSection ? sanitizedPersonContext : null,
           explicitSearch: explicitSearchSection ? sanitizedExplicitSearch : null,
         })),
+        // P1-H 段階2-A（フラグONのときだけ）：実際にプロンプトから外した重複と、該当節の文字数（外す前 → 外した後）
+        ...(contextDedupeResult ? { contextDedupe: serverDedupeReport(contextDedupeResult, { before: buildRetrievedMemoriesSection(memoriesForContext).length + buildSynthesisSection(sanitizedMemoryTimeline).length, after: retrievedMemoriesSection.length + synthesisSection.length }, systemInstruction.length) } : {}),
       }
     : null;
 

@@ -16,11 +16,13 @@ import { formatContextProvenance } from "@/lib/chatContextProvenance";
 import { contextProvenanceFor } from "@/lib/contextProvenanceStore";
 import { formatContextBuilderReport } from "@/lib/contextBuilder";
 import { contextBuilderReportFor } from "@/lib/contextBuilderStore";
+import { formatServerDedupeReport } from "@/lib/contextDedupe";
 
 /** P1-H 段階1：診断の文の組み立てに失敗しても、このバッジのほかの表示は出す */
-function safeBuilderText(report: Parameters<typeof formatContextBuilderReport>[0]): string {
+function safeBuilderText(stored: NonNullable<ReturnType<typeof contextBuilderReportFor>>): string {
   try {
-    return formatContextBuilderReport(report);
+    // 段階2-A：サーバーが実際に外したもの（ON）を先に、続けて端末の判定
+    return `${formatServerDedupeReport(stored.server)}\n\n${formatContextBuilderReport(stored.report)}`;
   } catch {
     return "（Context Builderの診断を表示できなかった）";
   }
