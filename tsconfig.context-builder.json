@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/contextBuilder.test.ts",
+    "src/lib/contextBuilder.ts",
+    "src/lib/retrieval.ts",
+    "src/lib/personContext.ts",
+    "src/lib/person.ts",
+    "src/lib/memorySynthesis.ts",
+    "src/lib/topicContinuity.ts",
+    "src/lib/memorySearch.ts",
+    "src/lib/memoryAnalytics.ts",
+    "src/lib/profile.ts",
+    "src/lib/topicEvent.ts",
+    "src/app/api/chat/route.ts"
+  ]
+}

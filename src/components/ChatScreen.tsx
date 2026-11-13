@@ -21,6 +21,8 @@ import { appendGenerationDebugEntry, createGenerationId, debugLogEnabled as gene
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { buildContextProvenance, type ContextProvenance, type ReflectionTrace } from "@/lib/chatContextProvenance";
 import { rememberContextProvenance } from "@/lib/contextProvenanceStore";
+import { buildContextBuilderReport, type ContextBuilderReport } from "@/lib/contextBuilder";
+import { rememberContextBuilderReport } from "@/lib/contextBuilderStore";
 import { isVaultStartupInProgress } from "@/lib/vaultStartupState";
 import { useEffect, useRef, useState } from "react";
 import type { Conversation, ConversationTurn, MemoryObject, MemoryType, Persona } from "@/lib/types";
@@ -5226,6 +5228,18 @@ export default function ChatScreen() {
           console.warn("[GenerationDebug] context provenance skipped", error);
         }
       }
+      // P1-H 段階1：Context Builderの診断（?debugLog=1のときだけ。送る内容・順序・件数は変えない。保存しない。失敗しても送信は止めない）
+      let contextBuilderReport: ContextBuilderReport | null = null;
+      if (generationId) {
+        try {
+          contextBuilderReport = buildContextBuilderReport(
+            { question: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), turnCount: turnsForAi(retryTurns ?? updated.turns).length, retrievedMemories, recentConversation, topicContext, profile: profileContext, personView: personViewContext, topicTimeline: topicTimelineContext, explicitSearch: explicitSearchContext, memoryAnalytics: memoryAnalyticsContext, memoryTimeline: memoryTimelineContext, personContext: personGraphContext },
+            memoriesForProvenance
+          );
+        } catch (error) {
+          console.warn("[GenerationDebug] context builder skipped", error);
+        }
+      }
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -5372,6 +5386,8 @@ export default function ChatScreen() {
         });
         // P1-F：経路ごとの由来は、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
         if (sentProvenance) rememberContextProvenance(aiTurn.timestamp, { sent: sentProvenance, accepted: debugEnvelope.provenance ?? null, reflection: reflectionTrace });
+        // P1-H 段階1：Context Builderの診断も、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
+        if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport);
         // Explicit Memory Search P0.5：サーバーが受け取ったExplicit Searchの状態を、Conversation Debuggerの「全てコピー」
         // （conversationDebugLog）にも1行残す。観測専用（?debugLog=1のときだけ。promptにも検索にも影響しない）。
         const explicitSearchAccepted = debugEnvelope.serverAccepted.explicitSearchServerAccepted;

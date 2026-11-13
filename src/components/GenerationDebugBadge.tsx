@@ -14,6 +14,17 @@ import { useEffect, useState } from "react";
 import { debugLogEnabled, getGenerationDebugLog, type StoredGenerationDebugEntry } from "@/lib/generationDebugLog";
 import { formatContextProvenance } from "@/lib/chatContextProvenance";
 import { contextProvenanceFor } from "@/lib/contextProvenanceStore";
+import { formatContextBuilderReport } from "@/lib/contextBuilder";
+import { contextBuilderReportFor } from "@/lib/contextBuilderStore";
+
+/** P1-H 段階1：診断の文の組み立てに失敗しても、このバッジのほかの表示は出す */
+function safeBuilderText(report: Parameters<typeof formatContextBuilderReport>[0]): string {
+  try {
+    return formatContextBuilderReport(report);
+  } catch {
+    return "（Context Builderの診断を表示できなかった）";
+  }
+}
 
 export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp: string }) {
   const [enabled] = useState(() => debugLogEnabled());
@@ -36,6 +47,8 @@ export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp:
   if (!enabled || !entry) return null;
   // P1-F：経路ごとの由来（このタブのメモリにだけある。再読み込みの後は無い）
   const provenance = open ? contextProvenanceFor(turnTimestamp) : undefined;
+  // P1-H 段階1：Context Builderの診断（同じく、このタブのメモリにだけある）
+  const builderReport = open ? contextBuilderReportFor(turnTimestamp) : undefined;
 
   return (
     <div style={{ marginTop: 2 }}>
@@ -71,6 +84,7 @@ export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp:
             wordBreak: "break-all",
           }}
         >
+          {builderReport ? `${safeBuilderText(builderReport)}\n\n――― 以下、経路ごとの由来（P1-F） ―――\n` : ""}
           {provenance ? `${formatContextProvenance(provenance)}\n\n――― 以下、従来の記録 ―――\n` : open ? "（経路ごとの由来は、このタブで送ったターンだけ表示できる。再読み込みの後は無い）\n\n" : ""}
           {JSON.stringify(
             {
