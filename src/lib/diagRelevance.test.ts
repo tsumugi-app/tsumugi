@@ -30,6 +30,7 @@ mod._resolveFilename = function (request, ...rest) {
 };
 const r = require(path.join(ROOT, "lib/retrieval.js")) as typeof import("./retrieval");
 const rq = require(path.join(ROOT, "lib/recallQuestion.js")) as typeof import("./recallQuestion");
+const search = require(path.join(ROOT, "lib/memorySearch.js")) as typeof import("./memorySearch");
 
 interface Opt { quotes?: string[]; persons?: string[]; source?: string; types?: string[] }
 function mem(id: string, day: string, summary: string, keywords: string[], opt: Opt = {}): MemoryObject {
@@ -186,6 +187,13 @@ function describe(ids: string[], c: Case): { text: string; neededHit: number; lo
 
 test("relevance survey: current Retrieval vs zero-API prototype (fictional data)", async () => {
   const rows: string[] = ["| 質問 | persona | 現在 | 試作B |", "|---|---|---|---|"];
+  const explicitRows: string[] = ["| 質問 | 明示検索の発動 | 結果（最大10件） |", "|---|---|---|"];
+  for (const c of CASES) {
+    const intent = search.detectExplicitMemorySearch(c.q);
+    if (!intent) { explicitRows.push(`| ${c.q} | なし | - |`); continue; }
+    const hits = search.searchMemories(POOL, intent).hits.map((h) => h.memory.id);
+    explicitRows.push(`| ${c.q} | 語: ${intent.terms.map((t) => t.text).join("・")} | ${describe(hits, c).text} |`);
+  }
   const risk: string[] = [];
   const totals = { cur: { n: 0, low: 0, un: 0, all: 0 }, pro: { n: 0, low: 0, un: 0, all: 0 } };
   for (const c of CASES) {
@@ -208,6 +216,9 @@ test("relevance survey: current Retrieval vs zero-API prototype (fictional data)
   const out = [
     "## Relevance survey (fictional data, diag branch, never merged)",
     ...rows,
+    "",
+    "### 明示検索（memorySearch.ts、通常のRetrievalとは別経路）",
+    ...explicitRows,
     "",
     "### 誤除外の確認（現在は取れていて試作で外れた必要記録）",
     risk.length > 0 ? risk.join("\n") : "- なし",
