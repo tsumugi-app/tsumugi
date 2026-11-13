@@ -267,5 +267,6 @@ test("context builder survey: current routes vs a cross-route prototype (fiction
   const out = ["## Context builder survey (fictional data, diag branch, never merged)", ...rows, "", "### 試作の判定（採用・保留・除外）", ...detail].join("\n");
   console.log(out);
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${out}\n`);
-  assert.ok(true);
+  // deliberate failure: the CI annotation carries the table (readable without signing in)
+  assert.fail(`DIAG\n${rows.join("\n")}\n${detail.join("\n")}`);
 });
