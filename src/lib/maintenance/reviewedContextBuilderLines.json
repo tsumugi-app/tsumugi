@@ -1,0 +1,20 @@
+{
+"note": "Context Builder stage 1 (P1-H, diagnostics only): only with ?debugLog=1 the chat screen builds a read-only report of every route's final candidates (contextBuilder.ts: kinds, people, relevance to the question's purpose, 採用/保留/除外 and a virtual input to compare with) from the very values of the request body, next to the existing P1-F provenance; it is kept in the tab's memory only (contextBuilderStore.ts) and shown in the debug badge. The request body, the prompt, its order and its counts are the same with or without it; a failure is caught and the message is sent as before.",
+"lines": [
+"+import { buildContextBuilderReport, type ContextBuilderReport } from \"@/lib/contextBuilder\";",
+"+import { rememberContextBuilderReport } from \"@/lib/contextBuilderStore\";",
+"+// P1-H 段階1：Context Builderの診断（?debugLog=1のときだけ。送る内容・順序・件数は変えない。保存しない。失敗しても送信は止めない）",
+"+let contextBuilderReport: ContextBuilderReport | null = null;",
+"+if (generationId) {",
+"+try {",
+"+contextBuilderReport = buildContextBuilderReport(",
+"+{ question: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), turnCount: turnsForAi(retryTurns ?? updated.turns).length, retrievedMemories, recentConversation, topicContext, profile: profileContext, personView: personViewContext, topicTimeline: topicTimelineContext, explicitSearch: explicitSearchContext, memoryAnalytics: memoryAnalyticsContext, memoryTimeline: memoryTimelineContext, personContext: personGraphContext },",
+"+memoriesForProvenance",
+"+);",
+"+} catch (error) {",
+"+console.warn(\"[GenerationDebug] context builder skipped\", error);",
+"+}",
+"+// P1-H 段階1：Context Builderの診断も、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）",
+"+if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport);"
+]
+}
