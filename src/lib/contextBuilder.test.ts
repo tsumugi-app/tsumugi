@@ -460,6 +460,10 @@ test("13 the device log's three duplicates: the later copy leaves the real promp
   assert.equal(occurrences(offX, S2), 3, "OFF: 長男と次男 under both people and in the Memory Timeline");
   assert.equal(occurrences(onX, S2), 2, "ON: kept under both people (two people are not merged), gone from the Memory Timeline");
   for (const kept of [S3, S4, REASON, "関係（記録を作ったAIの分類）：子", "### 長男", "### 次男", "## 複数の会話にわたる経緯", "## 関連する過去の記憶"]) assert.ok(onX.includes(kept), `ON keeps ${kept}`);
+  // the time series stays: every point keeps its date and place; only the duplicated summary becomes a short reference
+  const tl = onX.slice(onX.indexOf("## 複数の会話にわたる経緯"));
+  const at = ["2026-09-20に記録: （この記録の要約は、上の「話題の人物について」の「長男」と同じ）", "2026-10-04に記録: （この記録の要約は、上の「話題の人物について」の「長男」と同じ）", `2026-10-28に記録（最後に話した記録）: ${S3}`].map((x) => tl.indexOf(x));
+  assert.ok(at.every((i, k) => i >= 0 && (k === 0 || i > at[k - 1])), `the three points in order: ${at.join(",")}`);
   // turn 2: Memory Timeline → Retrieval (運動会)
   const [offY, onY] = await pair(chatBody(SCENE_Y), chatBody(SCENE_Y, { contextDedupe: true }));
   assert.equal(occurrences(offY, S1), 2);
@@ -528,7 +532,7 @@ test("14 kept when unsure or when the later copy says more: another text, anothe
   const tl = [point("r1", "2026-10-01", T1), other];
   const second = retr("z9", "2026-10-30", S4);
   assert.equal(plan([], tl, [retr("r1", "2026-10-01", T1), second]).removed.length, 1, "the plain case is taken out");
-  for (const extra of [{ quote: "検定に受かったよ" }, { trait: "質問の記録" }, { linkReason: "水泳の話が続いている" }, { isOriginMemory: true }, { source: "user-authored" }, { persons: ["次男"] }, { eventTime: "2026-09-30" }, { date: "2026-10-03T10:00:00.000Z" }]) {
+  for (const extra of [{ keywords: ["長男", "成長"] }, { quote: "検定に受かったよ" }, { trait: "質問の記録" }, { linkReason: "水泳の話が続いている" }, { isOriginMemory: true }, { source: "user-authored" }, { persons: ["次男"] }, { eventTime: "2026-09-30" }, { date: "2026-10-03T10:00:00.000Z" }]) {
     const r = plan([], tl, [retr("r1", "2026-10-01", T1, extra), second]);
     assert.equal(r.removed.length, 0, JSON.stringify(extra));
     assert.equal(r.kept.length, 1, JSON.stringify(extra));
@@ -536,6 +540,7 @@ test("14 kept when unsure or when the later copy says more: another text, anothe
   assert.equal(plan([], tl, [retr("r1", "2026-10-01", T1, { source: "system-generated" }), second]).removed.length, 0, "a Reflection is another kind");
   assert.match(plan([], tl, [retr("r1", "2026-10-01", T1), second], "analyst").kept[0].why, /分析モード/);
   assert.match(plan([], tl, [retr("r1", "2026-10-01", T1)]).kept[0].why, /空になる/);
+  assert.match(plan([], tl, [retr("r1", "2026-10-01", T1), retr("rf", "2026-10-05", "日記の振り返り", { source: "system-generated" })]).kept[0].why, /空になる/, "a Reflection does not keep the section");
   // the same record in two themes is two meanings; each theme is compared with the Memory Graph only, the Memory Graph keeps everything
   const two = dd.dedupeExactContext({ personContext: block(said("n1", "2026-10-01", T1)) as never, memoryTimeline: [...themeOf([point("n1", "2026-10-01", T1), other]), ...themeOf([point("n1", "2026-10-01", T1), other], "水泳")] as never, retrievedMemories: [] });
   assert.deepEqual(two.removed.map((x) => x.theme), ["長男", "水泳"]);

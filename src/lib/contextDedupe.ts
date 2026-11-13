@@ -2,7 +2,8 @@
  * P1-H 段階2-A：完全な重複の削減（機能フラグ`?contextDedupe=1`、初期値OFF）。
  *
  * 同じ記録の同じAIの要約が、プロンプトの前の節（Memory Graph／Memory Timeline）と後ろの節（Memory Timeline／Retrieval）に
- * 二重に入るとき、後ろの方を外す。チャットのroute（サーバー）がプロンプトを組み立てる直前にこれを使い、端末のContext Builder診断も
+ * 二重に入るとき、後ろの方の本文を外す。Memory Timelineの経緯は時系列そのものなので、点（日付と並び）は残し、要約だけを
+ * 「同じ記録の要約は前の節にある」という短い参照に置き換える。Retrievalの記録は、その記録ごと外す。チャットのroute（サーバー）がプロンプトを組み立てる直前にこれを使い、端末のContext Builder診断も
  * 同じ関数で「どれが外れるか」を示す（判定は1か所だけ）。
  *
  * 外すのは、次をすべて満たすときだけ（どれか1つでも確かでなければ残す）：
@@ -23,8 +24,6 @@ import type { SynthesisThemeContext } from "./memorySynthesis";
 import type { PersonContext, PersonContextText } from "./personContextPrompt";
 import { jstDateOf } from "./dateModel";
 
-export type DedupeRoute = "Memory Graph" | "Memory Timeline" | "Retrieval";
-
 export interface DedupePiece {
   route: "Memory Timeline" | "Retrieval";
   memoryId: string;
@@ -37,6 +36,10 @@ export interface DedupePiece {
   /** the summary text (the same in both copies) */
   text: string;
   chars: number;
+  /** a Memory Timeline point keeps its date and place in the time series; its summary becomes this short reference */
+  reference?: string;
+  /** characters taken out of the prompt's text (the summary, less the reference that replaces it) */
+  savedChars: number;
 }
 
 export interface DedupeKeptPiece {
@@ -100,6 +103,10 @@ function retrievalExtras(m: RetrievedMemory, earlier: EarlierCopy): string[] {
   if (m.quote) why.push("本人の一文");
   if (m.linkReason) why.push("つながりの理由");
   if (m.trait) why.push("記録の性質");
+  const shown = `${m.summary ?? ""} ${earlier.where} ${earlier.persons.join(" ")}`;
+  const unshownKeywords = (m.keywords ?? []).filter((k) => typeof k === "string" && k.length > 0 && !shown.includes(k));
+  if (unshownKeywords.length > 0) why.push(`keywords（${unshownKeywords.join("・")}）`);
+  if (m.eventTime && m.eventTimePrecision && m.eventTimePrecision !== "day") why.push("出来事の時期の精度");
   const uncovered = (m.persons ?? []).filter((name) => !(m.summary ?? "").includes(name) && !earlier.persons.includes(name));
   if (uncovered.length > 0) why.push(`話題の人物（${uncovered.join("・")}）`);
   if (m.eventTime && m.eventTime !== earlier.eventTime) why.push("出来事の時期");
@@ -126,12 +133,15 @@ export function dedupeExactContext(input: {
   }
   const fromGraph = new Map(earlier);
 
-  // 2 the Memory Timeline: a point is compared with the Memory Graph only (the same record in another theme is another meaning)
+  // 2 the Memory Timeline: a point is compared with the Memory Graph only (the same record in another theme is another meaning).
+  //   The point stays where it is (its date and its place in the time series); only its summary becomes a short reference.
+  const referenced = new Set<string>();
   const memoryTimeline = input.memoryTimeline.map((theme) => {
     let left = theme.timeline.length;
-    const timeline = theme.timeline.filter((point) => {
+    let changed = false;
+    const timeline = theme.timeline.map((point) => {
       const copies = fromGraph.get(textKey(point.memoryId, point.summary));
-      if (!copies || copies.length === 0) return true;
+      if (!copies || copies.length === 0) return point;
       const day = typeof point.statedAt === "string" ? point.statedAt.slice(0, 10) : "";
       const same = copies.find((c) => c.day === day);
       const why = timelineExtras(point);
@@ -139,21 +149,25 @@ export function dedupeExactContext(input: {
       if (why.length === 0 && left <= 1) why.push("テーマの経緯が空になる");
       if (why.length > 0 || !same) {
         kept.push({ route: "Memory Timeline", memoryId: point.memoryId, theme: theme.theme, sameAs: "Memory Graph", why: why.join("・") });
-        return true;
+        return point;
       }
       left -= 1;
-      removed.push({ route: "Memory Timeline", memoryId: point.memoryId, theme: theme.theme, keptIn: "Memory Graph", keptWhere: same.where, text: point.summary, chars: len(point.summary) });
-      return false;
+      changed = true;
+      const reference = `（この記録の要約は、上の「話題の人物について」の「${same.where}」と同じ）`;
+      referenced.add(`${theme.theme}\n${point.memoryId}`);
+      removed.push({ route: "Memory Timeline", memoryId: point.memoryId, theme: theme.theme, keptIn: "Memory Graph", keptWhere: same.where, text: point.summary, chars: len(point.summary), reference, savedChars: len(point.summary) - len(reference) });
+      return { ...point, summary: reference };
     });
-    return timeline.length === theme.timeline.length ? theme : { ...theme, timeline };
+    return changed ? { ...theme, timeline } : theme;
   });
-  // what the prompt still carries of the Memory Timeline (a point taken out is not an earlier copy: its Memory Graph copy is)
+  // what the prompt still carries of the Memory Timeline in full (a referenced point is not an earlier copy: its Memory Graph copy is)
   for (const theme of memoryTimeline) {
-    for (const point of theme.timeline) remember(textKey(point.memoryId, point.summary), { route: "Memory Timeline", where: theme.theme, day: typeof point.statedAt === "string" ? point.statedAt.slice(0, 10) : null, persons: [], eventTime: point.eventTime });
+    for (const point of theme.timeline) if (!referenced.has(`${theme.theme}\n${point.memoryId}`)) remember(textKey(point.memoryId, point.summary), { route: "Memory Timeline", where: theme.theme, day: typeof point.statedAt === "string" ? point.statedAt.slice(0, 10) : null, persons: [], eventTime: point.eventTime });
   }
 
   // 3 Retrieval (the last section)
-  let left = input.retrievedMemories.length;
+  // a Reflection (the AI's own diary text) does not count as a record that keeps the section (it is another kind)
+  let left = input.retrievedMemories.filter((m) => m.source !== "system-generated").length;
   const retrievedMemories = input.retrievedMemories.filter((m) => {
     if (m.source === "system-generated") return true; // a Reflection is the AI's own text (another kind)
     const copies = earlier.get(textKey(m.id, m.summary));
@@ -168,7 +182,7 @@ export function dedupeExactContext(input: {
       return true;
     }
     left -= 1;
-    removed.push({ route: "Retrieval", memoryId: m.id, keptIn: clean.c.route, keptWhere: clean.c.where, text: m.summary, chars: len(m.summary) });
+    removed.push({ route: "Retrieval", memoryId: m.id, keptIn: clean.c.route, keptWhere: clean.c.where, text: m.summary, chars: len(m.summary), savedChars: len(m.summary) });
     return false;
   });
 
@@ -185,7 +199,7 @@ const uniqueJoin = (xs: string[]) => [...new Set(xs)].join("・");
 /** what the server reports (only with ?debugLog=1): the pieces it actually took out of the prompt, and the sections' length before and after */
 export interface ServerDedupeReport {
   enabled: true;
-  removed: { route: DedupePiece["route"]; memoryId: string; theme?: string; keptIn: DedupePiece["keptIn"]; keptWhere: string; text: string; chars: number }[];
+  removed: DedupePiece[];
   kept: DedupeKeptPiece[];
   /** the Memory Timeline section and the Retrieval section, in characters, without and with the reduction */
   sectionChars: { before: number; after: number };
@@ -209,7 +223,7 @@ export function serverDedupeReport(result: ContextDedupeResult, sectionChars: { 
 export function formatServerDedupeReport(r: ServerDedupeReport | null | undefined): string {
   if (!r) return "重複の削減（サーバー）：OFF（従来どおりの入力）";
   const lines = [`重複の削減（サーバー・実際に送った内容）：ON　外した${r.removed.length}件・該当節 ${r.sectionChars.before}字 → ${r.sectionChars.after}字（プロンプト全体 ${r.systemInstructionChars}字）`];
-  for (const x of r.removed) lines.push(`- ${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""}から ${x.memoryId} を外した（${x.keptIn}「${x.keptWhere}」に残る）：「${x.text}」`);
+  for (const x of r.removed) lines.push(`- ${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""}から ${x.memoryId} の${x.reference ? "要約を外し、日付と並びは参照で残した" : "記録を外した"}（${x.keptIn}「${x.keptWhere}」に残る・${x.savedChars}字減）：「${x.text}」`);
   for (const x of r.kept) lines.push(`- 同じ本文だが残した：${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""} ${x.memoryId}（${x.why}）`);
   return lines.join("\n");
 }

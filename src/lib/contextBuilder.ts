@@ -611,7 +611,7 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
       enabled: input.contextDedupe === true,
       removed: dedupe.removed.map((r) => ({ ...r, text: clip(r.text) })),
       kept: dedupe.kept,
-      removedChars: dedupe.removed.reduce((n, r) => n + r.chars, 0),
+      removedChars: dedupe.removed.reduce((n, r) => n + r.savedChars, 0),
     },
     explanations: {
       status: currentExplanations.length > 0 ? "候補にあり" : "候補に無し",
@@ -664,7 +664,7 @@ export function formatContextBuilderReport(r: ContextBuilderReport): string {
   for (const d of r.exactDuplicates) lines.push(`- ${d.memoryIds.join(",")} [${d.kind}]：${d.kept} と ${d.removed}`);
   lines.push("", `■ 重複の削減（段階2-A）：${r.dedupe.enabled ? "ON（下のものは実際に送っていない）" : "OFF（従来どおり送った。ONなら下のものを外す）"}`);
   if (r.dedupe.removed.length === 0) lines.push("- 外すもの：なし");
-  for (const x of r.dedupe.removed) lines.push(`- 外す：${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""} ${x.memoryId}・${x.chars}字（${x.keptIn}「${x.keptWhere}」に残る）「${x.text}」`);
+  for (const x of r.dedupe.removed) lines.push(`- 外す：${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""} ${x.memoryId}・${x.savedChars}字減${x.reference ? "（要約だけ。日付と並びは参照で残す）" : "（記録ごと）"}（${x.keptIn}「${x.keptWhere}」に残る）「${x.text}」`);
   for (const x of r.dedupe.kept) lines.push(`- 残す：${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""} ${x.memoryId}（${x.sameAs}と同じ本文だが、${x.why}）`);
   lines.push("", `■ 仮想の入力から消えるMemory：${r.lostMemoryIds.length === 0 ? "なし" : r.lostMemoryIds.join(", ")}`);
   lines.push("", "■ 判定（プロンプトの順）");
