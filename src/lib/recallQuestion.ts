@@ -52,10 +52,41 @@ const RECALL_VERB = /言っ|言わ|話し|話さ|話を|思っ|考え|書い|決
 /** a question (「かな」 only at the end: not 「かなり」) */
 const QUESTION = /[?？]|っけ|かな[?？。!！]?$|かしら|でしょうか|ですか/;
 
+/** the asker themself (「私は前に何て言った？」): the question is about the user even with another word marked as its subject */
+const FIRST_PERSON = /私|僕|俺|自分|わたし|ぼく|おれ|あたし/;
+/** 「昔の人」「過去の出来事」: the anchor describes the world's past, not the user's (「以前の会話」「過去の自分」 still point at the user) */
+const ATTRIBUTIVE_ANCHOR = /(?:過去|以前|昔|当時)の(?!私|僕|俺|自分|わたし|ぼく|おれ|会話|話|記録|日記|メモ)/g;
+/** a run that names a time, not an actor (「先週は」「去年は」「この間は」) */
+const TIME_RUN = /(?:週|月|年|日|朝|昼|夜|晩|頃|時|間|前|後|昔|去|今)$/;
+/** a quotation in front of the verb (「〜がいいって言った」「〜と思った」): the marked word is inside what was said, the speaker is left unsaid (the user) */
+const QUOTE = /って|と(?:言|話|思|考|書|決)/;
+/** only an interrogative is quoted (「何て言った」「どう思った」): the marked word is the one who said it */
+const INTERROGATIVE_QUOTE = /^(?:何|なに|なん|どう)(?:って|て|と)?/;
+
+/**
+ * The question names someone or something else as the one who said or did it (「ニュートンは何て言ったっけ？」「昔の人は何を食べてた？」):
+ * a word marked with は／が whose clause has no quotation of its own (or quotes only an interrogative), when nothing before it is the user's own words
+ * (「前に話した本はどうだったっけ？」 is about the user) and the asker does not name themself.
+ */
+function hasOtherActor(t: string): boolean {
+  if (FIRST_PERSON.test(t)) return false;
+  for (const m of t.matchAll(/([一-鿿々]+|[ァ-ヺー]{2,}|[A-Za-z]{2,})(は|が)/g)) {
+    const run = m[1];
+    if (QUESTION_FORM_TERMS.has(run) || TIME_RUN.test(run)) continue;
+    const start = m.index ?? 0;
+    if (RECALL_VERB.test(t.slice(0, start))) return false;
+    const rest = t.slice(start + m[0].length);
+    if (INTERROGATIVE_QUOTE.test(rest) || !QUOTE.test(rest)) return true;
+    return false;
+  }
+  return false;
+}
+
 export function isRecallQuestion(text: string): boolean {
   const t = (text ?? "").normalize("NFKC").trim();
   if (!t || !QUESTION.test(t) || !RECALL_VERB.test(t)) return false;
-  return RECALL_ANCHOR.test(t) || /たっけ/.test(t);
+  if (hasOtherActor(t)) return false;
+  return RECALL_ANCHOR.test(t.replace(ATTRIBUTIVE_ANCHOR, "　")) || /たっけ/.test(t);
 }
 
 export interface RecallTopic {

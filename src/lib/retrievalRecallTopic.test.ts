@@ -166,6 +166,20 @@ test("ordinary sentences are not recall questions; verb / adjective stems are no
   assert.equal(rq.isTopicKeyword("日本", noSake), true, "no record says 日本酒: the nearest keyword stands for it");
 });
 
+test("general-knowledge questions about someone else's past are not the user's own recall; the user's own words and the user as the asker still are", () => {
+  for (const text of ["昔の人は何を食べてた？", "ニュートンは何て言ったっけ？", "アインシュタインはどう考えてたっけ？", "孔子は何て言ってたっけ？", "昔の日本では何を食べてた？", "江戸時代の人は何を話してたっけ？"]) {
+    assert.equal(rq.isRecallQuestion(text), false, text);
+  }
+  // the asker's own past stays a recall question (also with a word marked by は／が inside what was said, or before it the user's own words)
+  for (const text of [Q_ABSTRACT, Q_NAME, Q_KIND, Q_AUTO, "前にアウトランダーが欲しいって言ったっけ？", "前に話した本はどうだったっけ？", "私は前にニュートンについて何て言ったっけ？", "先週は何て言ってたっけ？", "以前の会話で車の話をしたっけ？", "過去の自分は何て言ってた？"]) {
+    assert.equal(rq.isRecallQuestion(text), true, text);
+  }
+  const v = voice.conversationVoice(undefined, "companion");
+  assert.equal(v.recallNotFoundNote("ニュートンは何て言ったっけ？", true), "", "a knowledge question gets no record-lookup failure note");
+  assert.equal(v.recallNotFoundNote("昔の人は何を食べてた？", true), "");
+  assert.equal(rq.recallTopicOf("ニュートンは何て言ったっけ？"), null, "and no recall-topic Retrieval");
+});
+
 test("1 an abstract category (「車」「車種」「自動車」), the keyword 「車」 on 3 records: before analyst found nothing; after both find the car records first", async () => {
   pool = [...carA, ...seiri, ...unrelated];
   for (const q of [Q_ABSTRACT, Q_KIND, Q_AUTO]) {
@@ -267,7 +281,7 @@ test("7 a recall question whose Memory search found nothing: the prompt says the
     const retrieved = await r.retrieveRelevantMemoriesImpl(Q_ABSTRACT, { persona: persona as Persona, recallTopic: true, recentUserTurnsTexts: [Q_ABSTRACT] });
     assert.ok(retrieved.length > 0);
     assert.ok(!(await systemFor({ ...ask(Q_ABSTRACT, persona), retrievedMemories: retrieved })).includes(NOTE_HEAD), `${persona}: found`);
-    for (const text of ["今日はいい天気だった", "昔はピアノが好きだった", "名前は何がいいかな？"]) assert.ok(!(await systemFor(ask(text, persona))).includes(NOTE_HEAD), `${persona}: not a recall question: ${text}`);
+    for (const text of ["今日はいい天気だった", "昔はピアノが好きだった", "名前は何がいいかな？", "ニュートンは何て言ったっけ？", "昔の人は何を食べてた？"]) assert.ok(!(await systemFor(ask(text, persona))).includes(NOTE_HEAD), `${persona}: not a recall question: ${text}`);
   }
   const v = voice.conversationVoice(undefined, "analyst");
   assert.equal(v.recallNotFoundNote(Q_ABSTRACT, false), "", "an explicit search / analytics result or a found Memory: no note");
