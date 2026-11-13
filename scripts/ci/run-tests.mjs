@@ -35,6 +35,8 @@ for (const name of suites) {
   else if (c.cancelled !== 0) why = `cancelled=${c.cancelled}`;
   else if (c.pass + c.skipped + c.todo !== c.tests) why = "pass+skipped+todo != tests";
   rows.push({ name, ...c, ok: why === "" });
+  // a suite may print a short report for the log (lines starting with "CI-REPORT "; fictional test data only, never secrets)
+  for (const l of log.split("\n")) if (l.startsWith("CI-REPORT ")) console.log(l.slice(0, 2000));
   console.log(`RESULT ${name} exit=${r.status} tests=${c.tests ?? "?"} pass=${c.pass ?? "?"} fail=${c.fail ?? "?"} skipped=${c.skipped ?? "?"} cancelled=${c.cancelled ?? "?"} todo=${c.todo ?? "?"}${why ? ` FAIL(${why})` : ""}`);
   if (why) {
     failed++;

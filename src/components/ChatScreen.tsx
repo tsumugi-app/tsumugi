@@ -3,6 +3,7 @@
 import { memoryTimelineEnabled } from "@/lib/memoryTimelineFlag";
 import { memorySynthesisEnabled } from "@/lib/memorySynthesisFlag";
 import { memoryGraphEnabled } from "@/lib/memoryGraphFlag";
+import { contextDedupeEnabled } from "@/lib/contextDedupeFlag";
 import { loadConfirmedAliasLists } from "@/lib/personAliasDevice";
 import { selectPersonContextsForTurn, withoutCoveredPersonViews, type PersonContext } from "@/lib/personContext";
 import { recordSynthesisShown, runSynthesisAfterSession, synthesisContextForTurn } from "@/lib/synthesisChat";
@@ -5229,11 +5230,13 @@ export default function ChatScreen() {
         }
       }
       // P1-H 段階1：Context Builderの診断（?debugLog=1のときだけ。送る内容・順序・件数は変えない。保存しない。失敗しても送信は止めない）
+      // P1-H 段階2-A：完全な重複の削減（既定OFF）。ONのときだけリクエストに印を付け、サーバーがプロンプトから外す
+      const contextDedupeOn = contextDedupeEnabled();
       let contextBuilderReport: ContextBuilderReport | null = null;
       if (generationId) {
         try {
           contextBuilderReport = buildContextBuilderReport(
-            { question: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), turnCount: turnsForAi(retryTurns ?? updated.turns).length, retrievedMemories, recentConversation, topicContext, profile: profileContext, personView: personViewContext, topicTimeline: topicTimelineContext, explicitSearch: explicitSearchContext, memoryAnalytics: memoryAnalyticsContext, memoryTimeline: memoryTimelineContext, personContext: personGraphContext },
+            { question: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), turnCount: turnsForAi(retryTurns ?? updated.turns).length, retrievedMemories, recentConversation, topicContext, profile: profileContext, personView: personViewContext, topicTimeline: topicTimelineContext, explicitSearch: explicitSearchContext, memoryAnalytics: memoryAnalyticsContext, memoryTimeline: memoryTimelineContext, personContext: personGraphContext, persona: activePersona, contextDedupe: contextDedupeOn },
             memoriesForProvenance
           );
         } catch (error) {
@@ -5263,6 +5266,7 @@ export default function ChatScreen() {
           ...(memoryTimelineContext.length > 0 ? { memoryTimeline: memoryTimelineContext } : {}),
           ...(personGraphContext.length > 0 ? { personContext: personGraphContext } : {}),
           ...(generationId ? { debugGenerationId: generationId } : {}),
+          ...(contextDedupeOn ? { contextDedupe: true } : {}),
         }),
       });
 
@@ -5387,7 +5391,7 @@ export default function ChatScreen() {
         // P1-F：経路ごとの由来は、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
         if (sentProvenance) rememberContextProvenance(aiTurn.timestamp, { sent: sentProvenance, accepted: debugEnvelope.provenance ?? null, reflection: reflectionTrace });
         // P1-H 段階1：Context Builderの診断も、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
-        if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport);
+        if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport, debugEnvelope.contextDedupe ?? null);
         // Explicit Memory Search P0.5：サーバーが受け取ったExplicit Searchの状態を、Conversation Debuggerの「全てコピー」
         // （conversationDebugLog）にも1行残す。観測専用（?debugLog=1のときだけ。promptにも検索にも影響しない）。
         const explicitSearchAccepted = debugEnvelope.serverAccepted.explicitSearchServerAccepted;

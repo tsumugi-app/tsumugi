@@ -13,7 +13,7 @@
  * 判定の意味：
  * - 採用：仮想の入力に入れる。
  * - 保留：仮想の入力に「入れる」（渡さないのではない）。同じ節の採用より後ろに置き、段階2で減らす候補として示すだけ。
- * - 除外：仮想の入力に入れない。完全な重複（同じMemory ID・同じ種類・同じ本文）と、質問の話題・人物がはっきり読めるときの、
+ * - 除外：仮想の入力に入れない。完全な重複（同じMemory ID・同じ種類・同じ本文で、後ろの写しが別の情報を持たないもの。contextDedupe.tsと同じ判定）と、質問の話題・人物がはっきり読めるときの、
  *   話題にも人物にも一致しない補助の経路（Memory Graph・Memory Timeline・Topic Continuity）の項目だけ。
  *   本人の理由・訂正、人物の関係の行、直前の会話、Profile、Explicit Search、Memory Analyticsは除外しない。
  * - 質問の種類が読み切れないとき（指示語だけの続き・空の発言など）や、仮想の入力が本人の理由・訂正や人物の行を落とすときは、
@@ -40,6 +40,7 @@ import { stripLeadingTimeLabels } from "./timeLabel";
 import { purposeContextOf, type QuestionPurpose } from "./recordRelevance";
 import { questionTopicRuns } from "./recallQuestion";
 import { CORRECTION_FORM, REASON_FORM } from "./personStance";
+import { dedupeExactContext, type ContextDedupeResult, type DedupeKeptPiece, type DedupePiece } from "./contextDedupe";
 
 export type ContextRoute =
   | "Recent Conversation"
@@ -163,6 +164,11 @@ export interface ContextBuilderReport {
   sameMemory: { memoryId: string; pieces: { route: ContextRoute; kind: UnitKind; part: string }[] }[];
   /** exact duplicates (the same Memory ID, kind and text): the later copy is excluded */
   exactDuplicates: { memoryIds: string[]; kind: UnitKind; kept: ContextRoute; removed: ContextRoute }[];
+  /**
+   * 段階2-A：完全な重複の削減（contextDedupe.ts。サーバーがプロンプトを組み立てるときと同じ判定）。
+   * enabled（フラグON）のとき、現行の入力はすでに外した後の値で、removedは実際に外したもの。OFFのときは「ONなら外れるもの」。
+   */
+  dedupe: { enabled: boolean; removed: DedupePiece[]; kept: DedupeKeptPiece[]; removedChars: number };
   explanations: {
     /** 「候補にあり」 or 「候補に無し」 (never pretended) */
     status: "候補にあり" | "候補に無し";
@@ -206,6 +212,10 @@ export interface ContextBuilderInput {
   memoryAnalytics?: MemoryAnalyticsContext | null;
   memoryTimeline?: readonly SynthesisThemeContext[] | null;
   personContext?: readonly PersonContext[] | null;
+  /** the persona sent (the reduction keeps Retrieval as it is for analyst) */
+  persona?: string;
+  /** 段階2-A：the reduction flag the request carries (true: the server takes the exact duplicates out of the prompt) */
+  contextDedupe?: boolean;
 }
 
 /** the device's Memories (the same list the chat screen already read): ids for the routes without ids, people and keywords of a Memory */
@@ -240,7 +250,7 @@ const wire = <T,>(x: T): T => (x === undefined ? x : (JSON.parse(JSON.stringify(
 // 1 every route's final candidates, as the chat route writes them, in the prompt order
 // ---------------------------------------------------------------------------------------------------------------------------------
 
-export function collectContextUnits(input: ContextBuilderInput, memories: readonly ContextBuilderMemory[] = []): { units: ContextUnit[]; notes: string[] } {
+export function collectContextUnits(input: ContextBuilderInput, memories: readonly ContextBuilderMemory[] = []): { units: ContextUnit[]; notes: string[]; dedupe: ContextDedupeResult } {
   // what the server receives is the JSON of the request body: start from the same copy (and never touch the caller's values)
   const body = wire({
     retrievedMemories: input.retrievedMemories ?? [],
@@ -287,6 +297,12 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   const retrievedForContext = sanitizeMemoryContext(Array.isArray(body.retrievedMemories) ? (body.retrievedMemories as RetrievedMemory[]) : []).filter((m) => m.isOriginMemory === true || !explicitIds.has(m.id));
   const memoriesForContext = searchNeeded ? retrievedForContext : retrievedForContext.filter((m) => m.isOriginMemory === true || !isTimeDependentMemory(m)).map(withoutOutsideFactQuote);
   const sentRetrieved = Array.isArray(body.retrievedMemories) ? body.retrievedMemories.length : 0;
+  // 段階2-A：the route's reduction of exact duplicates (the same function); with the flag ON the current input is what remains after it
+  const graphContext = sanitizePersonContext(body.personContext);
+  const timelineContext = sanitizeSynthesisContext(body.memoryTimeline);
+  const dedupe = dedupeExactContext({ persona: input.persona, personContext: graphContext, memoryTimeline: timelineContext, retrievedMemories: memoriesForContext });
+  const promptMemories = input.contextDedupe === true ? dedupe.retrievedMemories : memoriesForContext;
+  const promptTimeline = input.contextDedupe === true ? dedupe.memoryTimeline : timelineContext;
   if (memoriesForContext.length < sentRetrieved) notes.push(`Retrievalで送った${sentRetrieved}件のうち${sentRetrieved - memoriesForContext.length}件は、routeの確認（Explicit Searchとの重複・時間で変わる事実）でプロンプトに入らないため、現行の入力から外した`);
 
   // 直前の会話
@@ -322,7 +338,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   }
 
   // Memory Graph（人物ごと：関係・考えと結論・後からの理由・AIの解釈・予定・出来事・候補。プロンプトと同じ順）
-  for (const p of sanitizePersonContext(body.personContext)) {
+  for (const p of graphContext) {
     const who = p.names.length > 0 ? p.names : [p.key];
     const graph = (u: Parameters<typeof add>[1]) => add("Memory Graph", { ...u, context: uniq([...who, p.key]) });
     const ownKind = (x: PersonContextText): UnitKind => (x.kind === "summary" ? "AIの要約" : "本人の発言");
@@ -341,7 +357,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   }
 
   // Memory Timeline ＋ Synthesis（テーマごと：経緯・本人の訂正・Tsumugiの整理。プロンプトと同じ順）
-  for (const t of sanitizeSynthesisContext(body.memoryTimeline)) {
+  for (const t of promptTimeline) {
     const context = [t.theme];
     for (const p of t.timeline) add("Memory Timeline", { part: `テーマ「${t.theme}」の経緯`, memoryIds: [p.memoryId], kind: "AIの要約", text: p.summary, context });
     for (const c of t.corrections ?? []) add("Memory Synthesis", { part: `テーマ「${t.theme}」への本人の${c.kind === "corrected" ? "訂正" : "否定"}`, memoryIds: [], kind: "後からの本人の説明・訂正", persons: [], text: c.userQuote, context });
@@ -368,7 +384,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   for (const row of analytics?.results ?? []) add("Memory Analytics", { part: "集計の行", memoryIds: [], kind: "集計・自動の目安", persons: [], text: `${row.rank}. ${row.keyword}` });
 
   // Retrieval（記録ごと：要約・記録の性質・本人の一文。その後にConnectのつながりの理由）
-  for (const m of memoriesForContext) {
+  for (const m of promptMemories) {
     const reflection = m.source === "system-generated";
     const route: ContextRoute = reflection ? "Reflection" : "Retrieval";
     const persons = m.persons && m.persons.length > 0 ? m.persons : personsOfIds([m.id]);
@@ -376,14 +392,14 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
     if (m.trait) add(route, { part: "記録の性質（自動の目安）", memoryIds: [m.id], kind: "集計・自動の目安", persons, text: m.trait });
     if (m.quote) add(route, { part: "本人の一文", memoryIds: [m.id], kind: "本人の発言", persons, text: m.quote });
   }
-  for (const m of memoriesForContext) {
+  for (const m of promptMemories) {
     if (!m.linkReason) continue;
     add(m.source === "system-generated" ? "Reflection" : "Retrieval", { part: "Connectのつながりの理由", memoryIds: [m.id], kind: "AIの仮説", persons: m.persons ?? personsOfIds([m.id]), text: m.linkReason });
   }
 
   units.sort((a, b) => a.section - b.section);
   units.forEach((u, i) => { u.index = i; });
-  return { units, notes };
+  return { units, notes, dedupe };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -431,7 +447,10 @@ export function readQuestion(question: string, earlierUserTurns: readonly string
 const PERSON_WIDE: QuestionType[] = ["理由", "望み", "変化", "考え"];
 
 export function buildContextBuilderReport(input: ContextBuilderInput, memories: readonly ContextBuilderMemory[] = []): ContextBuilderReport {
-  const { units, notes } = collectContextUnits(input, memories);
+  const { units, notes, dedupe } = collectContextUnits(input, memories);
+  // OFF: the units the reduction would take out (with the flag ON they are already gone from the units)
+  const dedupeHit = (u: ContextUnit): DedupePiece | undefined => input.contextDedupe === true ? undefined : dedupe.removed.find((r) =>
+    u.route === r.route && u.memoryIds.length === 1 && u.memoryIds[0] === r.memoryId && (r.route === "Retrieval" || (u.context[0] === r.theme && u.text === r.text)));
   const graphNames = uniq((input.personContext ?? []).flatMap((p) => [...(p.names ?? []), p.key]).filter((n): n is string => typeof n === "string"));
   const q = readQuestion(input.question ?? "", input.earlierUserTurns ?? [], memories, graphNames);
   const byId = new Map(memories.map((m) => [m.id, m]));
@@ -461,12 +480,12 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     if (u.memoryIds.length > 0) {
       const key = `${[...u.memoryIds].sort().join(",")}\n${u.kind}\n${squash(u.text)}`;
       const kept = seen.get(key);
-      if (kept) {
-        exactDuplicates.push({ memoryIds: u.memoryIds, kind: u.kind, kept, removed: u.route });
-        return { decision: "除外", why: `完全な重複（同じMemory・同じ種類・同じ本文が${kept}に既にある）` };
-      }
-      seen.set(key, u.route);
+      if (kept) exactDuplicates.push({ memoryIds: u.memoryIds, kind: u.kind, kept, removed: u.route });
+      else seen.set(key, u.route);
     }
+    // 段階2-A：外すのは、サーバーと同じ判定（contextDedupe.ts）で外れるものだけ。同じ本文でも別の情報を持つものは残す（dedupe.keptに理由）
+    const hit = dedupeHit(u);
+    if (hit) return { decision: "除外", why: `完全な重複（${hit.keptIn}「${hit.keptWhere}」に同じ要約がある。フラグONで実際に外す）` };
     if (q.fallback) return { decision: "採用", why: q.fallback };
     if (u.explanation) {
       return relation === "なし"
@@ -588,6 +607,12 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     },
     sameMemory,
     exactDuplicates,
+    dedupe: {
+      enabled: input.contextDedupe === true,
+      removed: dedupe.removed.map((r) => ({ ...r, text: clip(r.text) })),
+      kept: dedupe.kept,
+      removedChars: dedupe.removed.reduce((n, r) => n + r.chars, 0),
+    },
     explanations: {
       status: currentExplanations.length > 0 ? "候補にあり" : "候補に無し",
       // distinct reasons / corrections (an exact duplicate is one reason, not a lost one)
@@ -614,7 +639,7 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
 export function formatContextBuilderReport(r: ContextBuilderReport): string {
   const q = r.question;
   const lines: string[] = [
-    "Context Builder（段階1・診断専用。実際に送る内容・順序・件数は変えていない）",
+    `Context Builder（段階1の判定は診断専用。重複の削減（段階2-A）は${r.dedupe.enabled ? "ON：外した後の値を「現行」とする" : "OFF：送る内容は従来どおり"}）`,
     `質問の種類：${q.types.join("・")}　人物：${q.persons.join("・") || "なし"}${q.carriedPersons.length > 0 ? `（直前の発言から：${q.carriedPersons.join("・")}）` : ""}　話題の語：${q.terms.join("・") || "なし"}`,
     q.fallback ? `安全側：${q.fallback}` : q.judgeable ? "話題・人物を読み取れたので、関連性を判定した" : "話題・人物を読み取れないので、関連性では外していない",
     `判定の意味：採用＝仮想の入力に入れる／${r.holdMeaning}`,
@@ -634,9 +659,13 @@ export function formatContextBuilderReport(r: ContextBuilderReport): string {
   lines.push("", "■ 同じMemoryの別の情報（区別して残す）");
   if (r.sameMemory.length === 0) lines.push("- なし");
   for (const s of r.sameMemory) lines.push(`- ${s.memoryId}：${s.pieces.map((p) => `${p.route}/${p.kind}`).join("・")}`);
-  lines.push("", "■ 完全な重複（後ろの方を除外）");
+  lines.push("", "■ 同じ本文の重複（同じMemory・同じ種類・同じ本文）");
   if (r.exactDuplicates.length === 0) lines.push("- なし");
-  for (const d of r.exactDuplicates) lines.push(`- ${d.memoryIds.join(",")} [${d.kind}]：${d.kept}に残し、${d.removed}から除外`);
+  for (const d of r.exactDuplicates) lines.push(`- ${d.memoryIds.join(",")} [${d.kind}]：${d.kept} と ${d.removed}`);
+  lines.push("", `■ 重複の削減（段階2-A）：${r.dedupe.enabled ? "ON（下のものは実際に送っていない）" : "OFF（従来どおり送った。ONなら下のものを外す）"}`);
+  if (r.dedupe.removed.length === 0) lines.push("- 外すもの：なし");
+  for (const x of r.dedupe.removed) lines.push(`- 外す：${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""} ${x.memoryId}・${x.chars}字（${x.keptIn}「${x.keptWhere}」に残る）「${x.text}」`);
+  for (const x of r.dedupe.kept) lines.push(`- 残す：${x.route}${x.theme ? `（テーマ「${x.theme}」）` : ""} ${x.memoryId}（${x.sameAs}と同じ本文だが、${x.why}）`);
   lines.push("", `■ 仮想の入力から消えるMemory：${r.lostMemoryIds.length === 0 ? "なし" : r.lostMemoryIds.join(", ")}`);
   lines.push("", "■ 判定（プロンプトの順）");
   for (const d of r.decisions) lines.push(`- ${d.index + 1}. [${d.decision}] ${d.route}・${d.part} [${d.kind}] ${d.memoryIds.join(",") || "ID無し"}${d.persons.length > 0 ? `（${d.persons.join("・")}）` : ""} 関連:${d.relation}：${d.why}\n    「${d.text}」`);

@@ -17,6 +17,7 @@
  * Person View／Topic Timeline／Topic Continuity／Retrieved Memory／Recent
  * Conversation）の、既にクライアント⇄サーバー間で実際にやり取りされている値だけ。
  */
+import type { ServerDedupeReport } from "./contextDedupe";
 import type { ProfileContext } from "./profile";
 import type { PersonView } from "./person";
 import type { TopicTimeline } from "./topicEvent";
@@ -109,4 +110,6 @@ export interface GenerationDebugEnvelope {
    * （appendGenerationDebugEntryはserverAccepted・generationだけを保存する）。クライアントはタブのメモリにだけ置く。
    */
   provenance?: ContextProvenance;
+  /** P1-H 段階2-A：重複の削減がONのときだけ。サーバーが実際にプロンプトから外したもの（contextDedupe.ts）。localStorageへは保存しない */
+  contextDedupe?: ServerDedupeReport;
 }
