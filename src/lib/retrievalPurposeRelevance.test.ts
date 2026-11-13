@@ -218,7 +218,7 @@ test("2 order: the adjustment comes before the floor, the limit and the relative
   const withPurpose = r.selectConversationDirectMatches(all, q, [q], freq, r.REFLECTIVE_LIMIT, topic, ctx);
   // without: the question-only record is first and its score removes the answers by the relative filter
   assert.equal(without.kept[0]?.memory.id, "q1");
-  const q1 = withPurpose.kept.concat(withPurpose.droppedByRelativeStrength, withPurpose.droppedByFloor).find((e) => e.memory.id === "q1");
+  const q1 = r.scoreConversationCandidates(all, q, r.deriveConversationTopicAnchors([q], freq), freq, null, topic, ctx).find((e) => e.memory.id === "q1");
   assert.ok(q1 && q1.demoted && q1.conversationScore <= r.KEYWORD_WEIGHT, "pushed back to one keyword hit");
   assert.notEqual(withPurpose.kept[0]?.memory.id, "q1");
   assert.ok(withPurpose.kept.length > without.kept.length, "the relative filter now keeps the answers");
