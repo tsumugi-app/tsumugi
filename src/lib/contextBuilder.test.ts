@@ -508,7 +508,7 @@ test("13 the device log's three duplicates: the later copy leaves the real promp
 });
 
 test("14 kept when unsure or when the later copy says more: another text, another kind, another day, a time-series mark, the user's words, a person, analyst", () => {
-  const T1 = "長男が水泳の検定に合格した";
+  const T1 = "長男が水泳の検定に合格して、家族みんなで喜んだ";
   const other = point("x0", "2026-09-01", "長男と図書館に行った");
   const plan = (graph: unknown[], timeline: unknown[], retrieved: unknown[] = [], persona = "companion") =>
     dd.dedupeExactContext({ persona, personContext: graph as never, memoryTimeline: themeOf(timeline) as never, retrievedMemories: retrieved as never });
