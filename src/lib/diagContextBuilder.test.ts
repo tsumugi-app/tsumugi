@@ -174,7 +174,8 @@ function buildContext(q: string, units: Unit[]): Decision[] {
   const idea = /アイデア|企画|案/.test(q);
   const change = ctx.purpose === "change" || /変わ|変化/.test(q);
   const relation = persons.length > 0 && /どうなり|関係|気持ち|望|思って/.test(q);
-  const pastAsk = /前に|以前|過去|これまで|っけ|た[?？]$|た？$/.test(norm(q));
+  // a question about the past: a word pointing back, or a past form anywhere (「言った理由は？」)
+  const pastAsk = /前に|以前|過去|これまで|っけ|(?:言っ|話し|思っ|考え|作っ|決め)た|た[?？]$/.test(norm(q)) || reasonAsked;
   const unitText = (u: Unit) => norm(`${u.text} ${u.ids.map((id) => (byId.get(id)?.keywords ?? []).join(" ")).join(" ")}`);
   const direct = (u: Unit) => terms.some((t) => unitText(u).includes(t));
   const aboutPerson = (u: Unit) => persons.length > 0 && persons.some((p) => unitText(u).includes(p) || u.ids.some((id) => (byId.get(id)?.personMentions ?? []).some((m) => m.displayName.includes(p))));
@@ -196,7 +197,8 @@ function buildContext(q: string, units: Unit[]): Decision[] {
     if (u.kind === "背景") { out.push({ unit: u, verdict: p ? "採用" : "除外", why: p ? "誰の話かを示す人物の関係（1行）" : "今回の質問の人物ではない" }); continue; }
     // 3 everyday talk (no past asked, no topic of the records): at most one directly matching record, nothing else
     if (!pastAsk && !idea && persons.length === 0) {
-      if (d && casualKept < 1 && u.route === "Retrieval") { casualKept += 1; out.push({ unit: u, verdict: "採用", why: "日常会話：直接関係する記録を1件だけ" }); }
+      // the top record of Retrieval stays (a natural widening of the talk); the rest is held back, never pushed in
+      if (u.route === "Retrieval" && u.part === "summary" && casualKept < 1) { casualKept += 1; out.push({ unit: u, verdict: "採用", why: "日常会話：検索の最上位1件だけ（会話の広がり）" }); }
       else out.push({ unit: u, verdict: d ? "保留" : "除外", why: "日常会話：必要以上に押し込まない" });
       continue;
     }
