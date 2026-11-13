@@ -527,6 +527,11 @@ export interface RetrievedMemory {
    */
   persons?: string[];
   quote?: string;
+  /**
+   * 質問の目的に応じた関連性（recordRelevance.ts、会話の画面が`purposeRelevance`で求めたときだけ）。記録の言い回しから自動でつけた短い性質
+   * （「過去の記録を尋ねただけ」など）。本人が確かめた分類ではない。送信用の一時的な値（保存しない）。
+   */
+  trait?: string;
 }
 
 export const SCHEMA_VERSION = "0.1";

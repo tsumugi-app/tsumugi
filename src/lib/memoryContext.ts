@@ -13,6 +13,7 @@
  *    user's own view (a thought, a feeling, a judgment): the user's past view reaches the AI, as a view of the record's day.
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
+import { isAllowedTrait } from "./recordRelevance";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -100,6 +101,9 @@ export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[]):
     const out: RetrievedMemory = { ...memory };
     delete out.quote;
     delete out.persons;
+    delete out.trait;
+    // the trait of a record (recordRelevance.ts): only the fixed wording
+    if (isAllowedTrait(memory.trait)) out.trait = memory.trait;
     const quote = typeof memory.quote === "string" ? memory.quote.trim() : "";
     if (quote) out.quote = clip(quote, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
     const persons = Array.isArray(memory.persons)
@@ -153,8 +157,9 @@ export function withoutOutsideFactQuote<T extends Pick<RetrievedMemory, "quote">
 }
 
 /** the lines under a selected Memory in the prompt ("" when there is nothing to add) */
-export function memoryContextLines(memory: Pick<RetrievedMemory, "persons" | "quote">): string {
+export function memoryContextLines(memory: Pick<RetrievedMemory, "persons" | "quote" | "trait">): string {
   const lines: string[] = [];
+  if (memory.trait) lines.push(`  記録の性質（言い回しからの自動の目安。本人が確かめたものではない）：${memory.trait}`);
   if (memory.persons && memory.persons.length > 0) lines.push(`  話題の人物：${memory.persons.join("、")}`);
   if (memory.quote) lines.push(`  本人の発言（当時の逐語の抜粋）：「${memory.quote}」`);
   return lines.length > 0 ? `\n${lines.join("\n")}` : "";
