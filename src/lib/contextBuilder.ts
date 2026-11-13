@@ -103,6 +103,8 @@ export interface ContextUnit {
   personLine: boolean;
   /** a nameless record that may be about the person (not confirmed) */
   candidate: boolean;
+  /** what the route chose the piece for (the theme of a Memory Timeline / Synthesis, the person of a Memory Graph block): read with the text for relevance */
+  context: string[];
 }
 
 export type Decision = "採用" | "保留" | "除外";
@@ -256,7 +258,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   const personsOfIds = (ids: string[]) => uniq(ids.flatMap((id) => (byId.get(id)?.personMentions ?? []).map((p) => squash(p.displayName ?? "")).filter((n) => n.length > 0)));
   const notes: string[] = [];
   const units: ContextUnit[] = [];
-  const add = (route: ContextRoute, u: { part: string; memoryIds: string[]; kind: UnitKind; persons?: string[]; text: string; personLine?: boolean; candidate?: boolean }) => {
+  const add = (route: ContextRoute, u: { part: string; memoryIds: string[]; kind: UnitKind; persons?: string[]; text: string; personLine?: boolean; candidate?: boolean; context?: string[] }) => {
     const text = u.text ?? "";
     if (!squash(text)) return;
     const candidate = u.candidate === true;
@@ -273,6 +275,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
       explanation: u.kind === "後からの本人の説明・訂正" || (u.kind === "本人の発言" && !candidate && isExplanationForm(text)),
       personLine: u.personLine === true,
       candidate,
+      context: u.context ?? [],
     });
   };
 
@@ -321,26 +324,32 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   // Memory Graph（人物ごと：関係・考えと結論・後からの理由・AIの解釈・予定・出来事・候補。プロンプトと同じ順）
   for (const p of sanitizePersonContext(body.personContext)) {
     const who = p.names.length > 0 ? p.names : [p.key];
+    const graph = (u: Parameters<typeof add>[1]) => add("Memory Graph", { ...u, context: uniq([...who, p.key]) });
     const ownKind = (x: PersonContextText): UnitKind => (x.kind === "summary" ? "AIの要約" : "本人の発言");
-    if (p.relation) add("Memory Graph", { part: "人物と関係", memoryIds: p.relation.basis ? [p.relation.basis.memoryId] : [], kind: "人物の関係", persons: who, text: `${who.join("／")}：${p.relation.label}${p.relation.basis ? `　根拠 ${p.relation.basis.text}` : ""}`, personLine: true });
+    if (p.relation) graph({ part: "人物と関係", memoryIds: p.relation.basis ? [p.relation.basis.memoryId] : [], kind: "人物の関係", persons: who, text: `${who.join("／")}：${p.relation.label}${p.relation.basis ? `　根拠 ${p.relation.basis.text}` : ""}`, personLine: true });
     for (const c of p.conclusions) {
-      add("Memory Graph", { part: "過去の考え・結論", memoryIds: [c.statement.memoryId], kind: ownKind(c.statement), persons: who, text: c.statement.text, candidate: c.statement.kind === "candidate" });
-      for (const r of c.reasons) if (r.when === "later") add("Memory Graph", { part: "後から本人が説明した理由", memoryIds: [r.memoryId], kind: "後からの本人の説明・訂正", persons: who, text: r.text });
-      for (const a of c.aiReadings) add("Memory Graph", { part: "AIの要約の解釈", memoryIds: [a.memoryId], kind: "AIの仮説", persons: who, text: a.text });
+      graph({ part: "過去の考え・結論", memoryIds: [c.statement.memoryId], kind: ownKind(c.statement), persons: who, text: c.statement.text, candidate: c.statement.kind === "candidate" });
+      for (const r of c.reasons) if (r.when === "later") graph({ part: "後から本人が説明した理由", memoryIds: [r.memoryId], kind: "後からの本人の説明・訂正", persons: who, text: r.text });
+      for (const a of c.aiReadings) graph({ part: "AIの要約の解釈", memoryIds: [a.memoryId], kind: "AIの仮説", persons: who, text: a.text });
     }
     for (const plan of p.plans) {
-      add("Memory Graph", { part: "予定・希望", memoryIds: [plan.plan.memoryId], kind: ownKind(plan.plan), persons: who, text: plan.plan.text });
-      if (plan.outcome) add("Memory Graph", { part: "予定の結果の候補", memoryIds: [plan.outcome.memoryId], kind: ownKind(plan.outcome), persons: who, text: plan.outcome.text });
+      graph({ part: "予定・希望", memoryIds: [plan.plan.memoryId], kind: ownKind(plan.plan), persons: who, text: plan.plan.text });
+      if (plan.outcome) graph({ part: "予定の結果の候補", memoryIds: [plan.outcome.memoryId], kind: ownKind(plan.outcome), persons: who, text: plan.outcome.text });
     }
-    for (const e of p.events) add("Memory Graph", { part: "最近の出来事", memoryIds: [e.memoryId], kind: ownKind(e), persons: who, text: e.text });
-    for (const c of p.candidates) add("Memory Graph", { part: "名前の無い記録の候補", memoryIds: [c.memoryId], kind: "本人の発言", persons: who, text: c.text, candidate: true });
+    for (const e of p.events) graph({ part: "最近の出来事", memoryIds: [e.memoryId], kind: ownKind(e), persons: who, text: e.text });
+    for (const c of p.candidates) graph({ part: "名前の無い記録の候補", memoryIds: [c.memoryId], kind: "本人の発言", persons: who, text: c.text, candidate: true });
   }
 
   // Memory Timeline ＋ Synthesis（テーマごと：経緯・本人の訂正・Tsumugiの整理。プロンプトと同じ順）
   for (const t of sanitizeSynthesisContext(body.memoryTimeline)) {
-    for (const p of t.timeline) add("Memory Timeline", { part: `テーマ「${t.theme}」の経緯`, memoryIds: [p.memoryId], kind: "AIの要約", text: p.summary });
-    for (const c of t.corrections ?? []) add("Memory Synthesis", { part: `テーマ「${t.theme}」への本人の${c.kind === "corrected" ? "訂正" : "否定"}`, memoryIds: [], kind: "後からの本人の説明・訂正", persons: [], text: c.userQuote });
-    for (const i of t.items) add("Memory Synthesis", { part: `テーマ「${t.theme}」のTsumugiの整理`, memoryIds: i.evidenceIds, kind: i.support === "stated" ? "AIの要約" : "AIの仮説", text: i.statement });
+    const context = [t.theme];
+    for (const p of t.timeline) add("Memory Timeline", { part: `テーマ「${t.theme}」の経緯`, memoryIds: [p.memoryId], kind: "AIの要約", text: p.summary, context });
+    for (const c of t.corrections ?? []) add("Memory Synthesis", { part: `テーマ「${t.theme}」への本人の${c.kind === "corrected" ? "訂正" : "否定"}`, memoryIds: [], kind: "後からの本人の説明・訂正", persons: [], text: c.userQuote, context });
+    for (const i of t.items) {
+      // an item over records of several people names none of them (they are not merged into one); the theme still carries the topic
+      const evidencePersons = personsOfIds(i.evidenceIds);
+      add("Memory Synthesis", { part: `テーマ「${t.theme}」のTsumugiの整理`, memoryIds: i.evidenceIds, kind: i.support === "stated" ? "AIの要約" : "AIの仮説", persons: evidencePersons.length === 1 ? evidencePersons : [], text: i.statement, context });
+    }
   }
 
   // Profile（core → relevant）
@@ -349,7 +358,8 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
 
   // Explicit Search（要約・詳細・逐語）
   for (const r of explicit?.results ?? []) {
-    add("Explicit Search", { part: "検索結果の要約", memoryIds: [r.id], kind: "AIの要約", text: r.summary });
+    const reflection = byId.get(r.id)?.metadata?.source === "system-generated";
+    add("Explicit Search", { part: reflection ? "検索結果の日記の振り返り（AIの文章）" : "検索結果の要約", memoryIds: [r.id], kind: reflection ? "AIの仮説" : "AIの要約", text: r.summary });
     if (r.detail) add("Explicit Search", { part: "記録本文の抜粋", memoryIds: [r.id], kind: "AIの要約", text: r.detail });
     for (const q of r.evidenceQuotes) add("Explicit Search", { part: "本人の発言の抜粋", memoryIds: [r.id], kind: "本人の発言", text: q });
   }
@@ -381,28 +391,31 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 const REASON_ASK = /理由|なぜ|何故|どうして|なんで/;
-const PAST_ASK = /前に|以前|過去|これまで|今まで|昔|当時|っけ|(?:言っ|話し|思っ|考え|作っ|決め|し|行っ|買っ)た|ていた|てた|でいた/;
+const PAST_ASK = /前に|以前|過去|これまで|今まで|昔|当時|っけ|(?:言っ|話し|思っ|考え|作っ|決め|し|行っ|買っ)た(?!い|く|が)|ていた|てた(?!い)|でいた/;
+/** asked (not told): a statement about yesterday (「昨日カフェに行った」) is everyday talk, not a look back */
+const QUESTION_FORM = /[?？]|っけ|かな|かしら|ですか|ますか|でしょうか|(?:もの|こと|の)は$|教えて|知りたい/;
 const IDEA_ASK = /アイデア|企画|発想|案を/;
 /** a pointer to something the question does not name (「それ」「あの件」): what it points to cannot be read from the text alone */
 const DEMONSTRATIVE = /それ|あれ|その|あの|この件|さっき|例の/;
 /** words that are not a topic of their own (the question's form, time words) */
-const NOT_A_TOPIC = /^(?:話|理由|考え|考え方|関係|気持ち|企画|新|前|以前|過去|最近|今|昔|当時|何|こと|もの|自分|私|僕|俺|どう|なぜ)$/;
+const NOT_A_TOPIC = /^(?:話|理由|考え|考え方|関係|気持ち|企画|新|前|以前|過去|最近|今|昔|当時|何|こと|もの|自分|私|僕|俺|どう|なぜ|件|例|先日|先週|今週|来週|先月|今月|来月|去年|昨年|今年|来年|昨日|一昨日|今日|明日|週末|前回|毎日|毎週|朝|昼|夜|午前|午後)$/;
 const PURPOSE_TYPE: Record<QuestionPurpose, QuestionType> = { questions: "質問の記録", wish: "望み", change: "変化", view: "考え", personAction: "人物の行動" };
 const HONORIFIC = /(?:さん|くん|君|ちゃん|様|氏)$/;
 const bare = (name: string) => (HONORIFIC.test(name) && len(name.replace(HONORIFIC, "")) >= 2 ? name.replace(HONORIFIC, "") : name);
 
-export function readQuestion(question: string, earlierUserTurns: readonly string[], memories: readonly ContextBuilderMemory[]): QuestionReading {
+export function readQuestion(question: string, earlierUserTurns: readonly string[], memories: readonly ContextBuilderMemory[], graphNames: readonly string[] = []): QuestionReading {
   const t = squash(question);
   const pool = memories.map((m) => ({ summary: m.summary, keywords: m.keywords, evidenceQuotes: m.evidenceQuotes, personMentions: m.personMentions, metadata: m.metadata }));
   const ctx = purposeContextOf(t, pool);
   const carriedPersons = uniq(earlierUserTurns.slice(-2).flatMap((x) => purposeContextOf(squash(x), pool).namedPersons)).filter((n) => !ctx.namedPersons.includes(n));
-  const persons = ctx.namedPersons;
+  // the names the Memory Graph matched (confirmed aliases included) count as named too
+  const persons = uniq([...ctx.namedPersons, ...graphNames.filter((n) => len(n) >= 2 && (t.includes(n) || t.includes(bare(n))))]);
   const terms = questionTopicRuns(t).filter((run) => !NOT_A_TOPIC.test(run) && !persons.some((p) => run.includes(bare(p)) || bare(p).includes(run)));
   const types: QuestionType[] = [];
   if (REASON_ASK.test(t) && (PAST_ASK.test(t) || ctx.purpose !== null)) types.push("理由");
   if (ctx.purpose) types.push(PURPOSE_TYPE[ctx.purpose]);
   if (IDEA_ASK.test(t)) types.push("アイデア");
-  if (types.length === 0) types.push(PAST_ASK.test(t) || persons.length > 0 ? "振り返り" : "日常");
+  if (types.length === 0) types.push(PAST_ASK.test(t) && QUESTION_FORM.test(t) ? "振り返り" : "日常");
   const judgeable = persons.length > 0 || carriedPersons.length > 0 || terms.length > 0;
   let fallback: string | null = null;
   if (!t) fallback = "発言が空なので、現行の入力のまま";
@@ -419,13 +432,14 @@ const PERSON_WIDE: QuestionType[] = ["理由", "望み", "変化", "考え"];
 
 export function buildContextBuilderReport(input: ContextBuilderInput, memories: readonly ContextBuilderMemory[] = []): ContextBuilderReport {
   const { units, notes } = collectContextUnits(input, memories);
-  const q = readQuestion(input.question ?? "", input.earlierUserTurns ?? [], memories);
+  const graphNames = uniq((input.personContext ?? []).flatMap((p) => [...(p.names ?? []), p.key]).filter((n): n is string => typeof n === "string"));
+  const q = readQuestion(input.question ?? "", input.earlierUserTurns ?? [], memories, graphNames);
   const byId = new Map(memories.map((m) => [m.id, m]));
-  const everyday = q.types.length === 1 && q.types[0] === "日常" && q.persons.length === 0;
+  const everyday = q.types.length === 1 && q.types[0] === "日常";
   const personWide = q.types.some((x) => PERSON_WIDE.includes(x));
   const askedPersons = [...q.persons, ...q.carriedPersons];
 
-  const hay = (u: ContextUnit) => norm([u.text, ...u.persons, ...u.memoryIds.flatMap((id) => byId.get(id)?.keywords ?? [])].join(" "));
+  const hay = (u: ContextUnit) => norm([u.text, ...u.persons, ...u.context, ...u.memoryIds.flatMap((id) => byId.get(id)?.keywords ?? [])].join(" "));
   const relationOf = (u: ContextUnit): UnitRelation => {
     if (!q.judgeable) return "判定なし";
     const h = hay(u);
@@ -469,6 +483,7 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     if (u.route === "Memory Analytics") return { decision: "採用", why: "本人が求めた集計（扱いは変えない）" };
     if (everyday) {
       if ((u.route === "Retrieval" || u.route === "Reflection") && topRetrievalId && u.memoryIds.includes(topRetrievalId) && u.kind !== "AIの仮説") return { decision: "採用", why: "日常会話：過去との自然なつながり（検索の最上位の記録）" };
+      if (relation === "話題" || relation === "人物") return { decision: u.kind === "AIの仮説" ? "保留" : "採用", why: u.kind === "AIの仮説" ? "日常会話：AIの仮説は押し込まない（消さずに後ろへ）" : "日常会話：今の話題・人物につながる過去" };
       return { decision: "保留", why: "日常会話：必要以上に過去を押し込まない（消さずに後ろへ）" };
     }
     if (u.kind === "AIの仮説") {
@@ -575,8 +590,9 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     exactDuplicates,
     explanations: {
       status: currentExplanations.length > 0 ? "候補にあり" : "候補に無し",
-      current: currentExplanations.length,
-      virtual: virtualUnits.filter((u) => u.explanation).length,
+      // distinct reasons / corrections (an exact duplicate is one reason, not a lost one)
+      current: new Set(currentExplanations.map(explanationKey)).size,
+      virtual: virtualExplanationKeys.size,
       lost: currentExplanations.filter((u) => !virtualExplanationKeys.has(explanationKey(u))).map((u) => clip(u.text)),
     },
     hypotheses: {

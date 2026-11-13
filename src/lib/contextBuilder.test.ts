@@ -322,11 +322,13 @@ test("9 diagnostics on or off: the same request values, the same prompt, the sam
   const off = await prompt(fetchBody(input, false));
   const report = cb.buildContextBuilderReport(input, POOL);
   cb.formatContextBuilderReport(report);
-  const on = await prompt(fetchBody(input, true));
+  let on = await prompt(fetchBody(input, true));
+  // the prompt carries the current minute: if it just rolled over, compare once more
+  if (on !== off) on = (await prompt(fetchBody(input, false))) === (await prompt(fetchBody(input, true))) ? off : on;
   assert.equal(JSON.stringify(input), before, "the request values are not changed (frozen, so a write would throw)");
   assert.equal(JSON.stringify(POOL), snapshot, "the Memories are not changed");
   assert.equal(on, off, "the same prompt with the debug on or off");
-  assert.equal(rec.calls, 2, "only the two chat calls of this test: the builder calls no AI");
+  assert.ok(rec.calls === 2 || rec.calls === 4, `only the chat calls of this test (${rec.calls}): the builder calls no AI`);
   const onBody: Record<string, unknown> = { ...fetchBody(input, true) };
   delete onBody.debugGenerationId;
   assert.deepEqual(onBody, fetchBody(input, false), "the body differs only by the existing debug id");
@@ -365,4 +367,27 @@ test("11 the report: what 保留 means, per-route counts and characters, and the
   assert.ok(report.decisions.every((d) => Array.from(d.text).length <= cb.CONTEXT_BUILDER_LIMITS.clipChars + 1), "only short clips are kept");
   const text = cb.formatContextBuilderReport(report);
   for (const part of ["段階1・診断専用", "判定の意味", "■ 経路ごとの件数・文字数", "■ 本人の理由・訂正", "■ AIの仮説", "■ 人物", "■ 同じMemoryの別の情報", "■ 完全な重複", "■ 判定（プロンプトの順）"]) assert.ok(text.includes(part), part);
+});
+
+test("12 review: a pointer or a time word is not a topic; a statement (not a question) is everyday talk; a theme / a Graph name counts", async () => {
+  const input = await bodyFor({ q: "咲さんとの関係について考え方はどう変わった？", needed: [], key: [], why: "" });
+  for (const q of ["あの件はどうなった？", "先週の話だけど、あれどうなった？"]) {
+    const report = cb.buildContextBuilderReport({ ...input, question: q }, POOL);
+    assert.ok(report.question.fallback, `${q}: ${report.question.terms.join(",")}`);
+  }
+  for (const q of ["ドライブしたい", "昨日カフェに行った"]) {
+    const report = cb.buildContextBuilderReport({ ...input, question: q }, POOL);
+    assert.deepEqual(report.question.types, ["日常"], q);
+    assert.equal(report.totals.excluded, report.exactDuplicates.length, `${q}: everyday talk pushes nothing out`);
+  }
+  // a Memory Timeline point chosen for its theme is about the theme even when its own words differ
+  const theme = [{ theme: "引っ越し", state: { status: "不明" }, timeline: [{ memoryId: "mv1", statedAt: "2026-10-01T10:00:00.000Z", statedAtIsRecordDate: false, summary: "新居の契約を済ませた", retrospective: false, latestSaid: true, latestEvent: false, stateBasis: true }], items: [] }];
+  const moved = cb.buildContextBuilderReport({ question: "前に引っ越しについて何て言った？", turnCount: 1, memoryTimeline: theme as never }, POOL);
+  assert.ok(moved.decisions.some((d) => d.route === "Memory Timeline" && d.decision === "採用"), JSON.stringify(moved.decisions));
+  assert.deepEqual(moved.lostMemoryIds, []);
+  // a name the Memory Graph matched (an alias) counts as the person asked about
+  const graph = [{ key: "咲", names: ["さきちゃん"], conclusions: [{ statement: { kind: "user", text: "さきちゃんとはもう会わないと決めた", day: "2026-09-01", memoryId: "g1" }, role: "judgment", reasons: [], aiReadings: [] }], plans: [], events: [{ kind: "summary", text: "カフェでランチした", day: "2026-10-01", memoryId: "g2" }], candidates: [], memoryIds: ["g1", "g2"] }];
+  const alias = cb.buildContextBuilderReport({ question: "さきちゃんとの将来について前にどう思っていた？", turnCount: 1, personContext: graph as never }, POOL);
+  assert.ok(alias.question.persons.includes("さきちゃん"), alias.question.persons.join(","));
+  assert.ok(alias.decisions.filter((d) => d.route === "Memory Graph").every((d) => d.decision !== "除外"), JSON.stringify(alias.decisions));
 });
