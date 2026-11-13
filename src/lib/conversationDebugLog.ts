@@ -62,6 +62,7 @@ import {
 } from "./retrieval";
 import { needsWebSearch } from "./needsWebSearch";
 import { recallTopicOf, withPoolEvidence } from "./recallQuestion";
+import { purposeContextOf } from "./recordRelevance";
 import {
   getActiveVaultEpoch,
   getCommittedVaultEpoch,
@@ -393,11 +394,12 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
           .filter(Boolean);
 
         // 会話の画面と同じく、過去を尋ねる質問ならその話題を渡す（recallTopic）。件数も実際の選定と同じ（振り返りの質問は REFLECTIVE_LIMIT）
-        const selection = selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, isReflectiveQuery(trimmed) ? REFLECTIVE_LIMIT : DEFAULT_LIMIT, withPoolEvidence(recallTopicOf(trimmed), pool));
+        // 質問の目的に応じた関連性（purposeRelevance）も会話の画面と同じく渡す
+        const selection = selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, isReflectiveQuery(trimmed) ? REFLECTIVE_LIMIT : DEFAULT_LIMIT, withPoolEvidence(recallTopicOf(trimmed), pool), purposeContextOf(trimmed, pool));
 
         const fmt = (entry: ConversationCandidateScore) =>
           `id=${entry.memory.id} conversationScore=${entry.conversationScore.toFixed(2)} ` +
-          `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)} personBonus=+${entry.personBonus.toFixed(2)} recallBonus=+${entry.recallBonus.toFixed(2)}) ` +
+          `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)} personBonus=+${entry.personBonus.toFixed(2)} recallBonus=+${entry.recallBonus.toFixed(2)} purposeAdjust=${entry.purposeAdjust >= 0 ? "+" : ""}${entry.purposeAdjust.toFixed(2)}${entry.demoted ? " demoted" : ""}) ` +
           `summary="${entry.memory.summary}"`;
 
         conversationRetrievalLines = [

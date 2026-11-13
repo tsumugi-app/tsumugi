@@ -31,8 +31,8 @@ const isSingleKanji = (run: string) => Array.from(run).length === 1 && /[一-鿿
 const STEM_FOLLOWER = /^[ぁ-ゖ]/;
 const PARTICLE_FOLLOWER = /^(?:の|が|を|は|に|で|と|も|へ|や|か|っ)/;
 
-/** the question's own runs that can be its topic */
-function questionTopicRuns(text: string): string[] {
+/** the question's own runs that can be its topic (also used by recordRelevance.ts, for any question about the past) */
+export function questionTopicRuns(text: string): string[] {
   const t = text.normalize("NFKC");
   const out: string[] = [];
   for (const m of t.matchAll(RUNS)) {

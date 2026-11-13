@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/retrievalPurposeRelevance.test.ts",
+    "src/lib/recordRelevance.ts",
+    "src/lib/recallQuestion.ts",
+    "src/lib/retrieval.ts",
+    "src/lib/memorySynthesis.ts",
+    "src/lib/conversationVoice.ts",
+    "src/app/api/chat/route.ts"
+  ]
+}

@@ -31,6 +31,7 @@ import type { MemoryObject, Persona, RetrievedMemory } from "./types";
 import { limitMemoryQuotes, memoryContextOf } from "./memoryContext";
 import type { ReflectionTrace } from "./chatContextProvenance";
 import { isTopicKeyword, matchRecallTopic, recallTopicOf, withPoolEvidence, type RecallTopic } from "./recallQuestion";
+import { adjustForPurpose, purposeContextOf, recordTraitOf, type PurposeContext } from "./recordRelevance";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
 export const KEYWORD_WEIGHT = 3;
@@ -519,7 +520,11 @@ export interface ConversationCandidateScore {
   personBonus: number;
   /** 過去を尋ねる質問（recallTopic、会話の画面だけ）の話題に、キーワード一致では数えていない形で一致した分（「車」→「車種」「車選び」）。無ければ0。 */
   recallBonus: number;
-  /** queryScore - genericPenalty + anchorBonus + personBonus + recallBonus。実際の順位付け・floor判定に使う値。 */
+  /** 質問の目的に応じた加点・減点（purposeRelevance、会話の画面だけ。recordRelevance.ts）。無ければ0。 */
+  purposeAdjust: number;
+  /** 質問の目的で後ろに回した（尋ねただけの記録・他人の行動が中心の記録）。同点なら後に並べる。 */
+  demoted: boolean;
+  /** queryScore - genericPenalty + anchorBonus + personBonus + recallBonus + purposeAdjust。実際の順位付け・floor判定に使う値。 */
   conversationScore: number;
 }
 
@@ -534,7 +539,9 @@ export function scoreConversationCandidates(
   anchors: ConversationTopicAnchor[],
   keywordFrequency: Map<string, number>,
   personFocus: ConversationPersonFocus | null = null,
-  recall: RecallTopic | null = null
+  recall: RecallTopic | null = null,
+  /** 質問の目的（会話の画面だけ。未指定なら従来どおり） */
+  purpose: PurposeContext | null = null
 ): ConversationCandidateScore[] {
   return pool.map((memory) => {
     const queryScore = scoreMemory(memory, trimmed);
@@ -542,7 +549,11 @@ export function scoreConversationCandidates(
     const anchorBonus = conversationAnchorScore(memory, anchors);
     const personBonus = personCarryScore(memory, personFocus);
     const recallBonus = recallTopicBonus(memory, recall, trimmed);
-    return { memory, queryScore, genericPenalty, anchorBonus, personBonus, recallBonus, conversationScore: queryScore - genericPenalty + anchorBonus + personBonus + recallBonus };
+    const base = queryScore - genericPenalty + anchorBonus + personBonus + recallBonus;
+    // floor・件数・相対の強さの判定より前に、質問の目的で加点・減点する（話題に一致する記録だけ。recordRelevance.ts）
+    const adjusted = purpose ? adjustForPurpose(memory, base, purpose, trimmed, recall ? matchRecallTopic(memory, recall, trimmed).matched.length > 0 : false, KEYWORD_WEIGHT, CONVERSATION_MIN_SCORE) : null;
+    const conversationScore = adjusted ? adjusted.score : base;
+    return { memory, queryScore, genericPenalty, anchorBonus, personBonus, recallBonus, purposeAdjust: conversationScore - base, demoted: adjusted?.demoted ?? false, conversationScore };
   });
 }
 
@@ -583,18 +594,21 @@ export function selectConversationDirectMatches(
   keywordFrequency: Map<string, number>,
   limit: number,
   /** 過去を尋ねる質問の話題（会話の画面だけ。未指定なら従来どおり） */
-  recall: RecallTopic | null = null
+  recall: RecallTopic | null = null,
+  /** 質問の目的（会話の画面だけ。未指定なら従来どおり） */
+  purpose: PurposeContext | null = null
 ): ConversationDirectSelection {
   const anchors = deriveConversationTopicAnchors(recentUserTurnsTexts, keywordFrequency);
   const personFocus = deriveConversationPersonFocus(recentUserTurnsTexts, pool);
-  const allScored = scoreConversationCandidates(pool, trimmed, anchors, keywordFrequency, personFocus, recall);
+  const allScored = scoreConversationCandidates(pool, trimmed, anchors, keywordFrequency, personFocus, recall, purpose);
 
   const aboveFloor = allScored.filter((entry) => entry.conversationScore >= CONVERSATION_MIN_SCORE);
   const droppedByFloor = allScored
     .filter((entry) => entry.conversationScore > 0 && entry.conversationScore < CONVERSATION_MIN_SCORE)
     .sort((a, b) => b.conversationScore - a.conversationScore);
 
-  const sorted = [...aboveFloor].sort((a, b) => b.conversationScore - a.conversationScore).slice(0, limit);
+  // 同点なら、質問の目的で後ろに回した記録を後に（目的が無ければdemotedは常にfalse＝従来どおり）
+  const sorted = [...aboveFloor].sort((a, b) => b.conversationScore - a.conversationScore || Number(a.demoted) - Number(b.demoted)).slice(0, limit);
 
   const relativeInput = sorted.map((entry) => ({ memory: entry.memory, score: entry.conversationScore }));
   const keptIds = new Set(applyRelativeStrengthFilter(relativeInput).map((entry) => entry.memory.id));
@@ -717,11 +731,13 @@ export function selectConversationWithPersons(
   /** Memory Graph P1-B：本人が確定した同じ人物の名前の組（未指定・空なら従来どおり。名前の推測では束ねない） */
   aliases: string[][] = [],
   /** 過去を尋ねる質問の話題（会話の画面だけ。未指定なら従来どおり） */
-  recall: RecallTopic | null = null
+  recall: RecallTopic | null = null,
+  /** 質問の目的（会話の画面だけ。未指定なら従来どおり） */
+  purpose: PurposeContext | null = null
 ): PersonAwareSelection {
   // 人物の話でなければ、元の入力のままの従来の選定（「2人」の読み替えも人物の話のときだけ）
   const fallback = (): PersonAwareSelection => ({
-    memories: selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, limit, recall).kept.map((entry) => entry.memory),
+    memories: selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, limit, recall, purpose).kept.map((entry) => entry.memory),
     person: null,
     added: [],
     dropped: [],
@@ -759,7 +775,7 @@ export function selectConversationWithPersons(
   if (!person) return fallback();
   const targetKeys = groupKeys(person.key);
   const isAboutTarget = (memory: MemoryObject) => targetKeys.some((key) => isAboutPerson(memory, key));
-  const base = selectConversationDirectMatches(pool, latest, turns, keywordFrequency, limit, recall).kept.map((entry) => entry.memory);
+  const base = selectConversationDirectMatches(pool, latest, turns, keywordFrequency, limit, recall, purpose).kept.map((entry) => entry.memory);
   const aboutOther = (memory: MemoryObject) => keys.some((key) => !targetKeys.includes(key) && isAboutPerson(memory, key));
 
   const dropped: string[] = [];
@@ -859,6 +875,8 @@ async function retrieveCreativeMemories(
     personAliases?: string[][];
     /** 過去を尋ねる質問の話題（retrieveRelevantMemoriesImplが`recallTopic`のときだけ求める） */
     recall?: RecallTopic | null;
+    /** 質問の目的に応じた関連性（会話の画面だけ） */
+    purposeRelevance?: boolean;
   },
   context?: string[],
   /** P1-F：会話のRetrievalだけ。Reflectionを本人の記録の後に回し、その扱いを知らせる */
@@ -868,6 +886,7 @@ async function retrieveCreativeMemories(
   const all = await getAllMemoryObjects();
   const pool = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
   const keywordFrequency = computeKeywordFrequency(all);
+  const purpose = options.purposeRelevance === true ? purposeContextOf(trimmed, pool) : null;
 
   // 人物が話題のターンだけ、その人物の記録を整える（selectConversationWithPersons。人物が出てこないターンは従来の選定そのまま）
   const selected = selectConversationWithPersons(
@@ -878,7 +897,8 @@ async function retrieveCreativeMemories(
     directLimit,
     Date.now(),
     options.personAliases ?? [],
-    withPoolEvidence(options.recall ?? null, pool)
+    withPoolEvidence(options.recall ?? null, pool),
+    purpose
   ).memories;
   // P1-F：本人の記録で枠を埋め直すことはしない（analystの選定はそのまま）。同じ会話の本人の記録と重なるReflectionを外し、残りを後ろに回すだけ
   let directMatches = selected;
@@ -896,7 +916,7 @@ async function retrieveCreativeMemories(
   }
 
   return [
-    ...directMatches.map((memory) => toRetrievedMemory(memory, undefined, "direct", context)),
+    ...directMatches.map((memory) => withTrait(toRetrievedMemory(memory, undefined, "direct", context), memory, purpose)),
     ...divergentMatches.map((memory) => toRetrievedMemory(memory, undefined, "divergent", context)),
   ];
 }
@@ -958,6 +978,12 @@ export function deferReflectionItems<T>(items: T[], memoryOf: (item: T) => Memor
     else trace.dropped.push({ memoryId: memory.id, why: "本人の記録で枠が埋まった" });
   });
   return { items: kept, trace };
+}
+
+/** 質問の目的に応じた関連性（会話の画面だけ）：選ばれた記録の短い性質（recordRelevance.ts。目的が無ければ何も添えない） */
+function withTrait(retrieved: RetrievedMemory, memory: MemoryObject, purpose: PurposeContext | null): RetrievedMemory {
+  const trait = recordTraitOf(memory, purpose);
+  return trait ? { ...retrieved, trait } : retrieved;
 }
 
 /** `context`：会話のRetrievalが`includeContext`で求めたときだけ、今の発言（と直前の発言）。人物と本人の発言の一文を添える（memoryContext.ts） */
@@ -1117,6 +1143,11 @@ export interface RetrieveRelevantMemoriesOptions {
    * companionでも、話題に一致せず文字の偶然の重なりだけの弱い記録（analystの最低点未満）は外す。過去を尋ねる質問でなければ従来どおり。
    */
   recallTopic?: boolean;
+  /**
+   * 会話の画面だけ（Connect等は渡さない）。質問の目的（好み・意見／望み／変化／人物の行動／質問そのもの）に応じて、話題に一致する記録だけを並べ替え、
+   * 本人が過去を尋ねただけの記録は後ろに回す（recordRelevance.ts）。選んだ記録に短い性質（自動の目安）を添える。目的が分からない質問は従来の順位のまま。
+   */
+  purposeRelevance?: boolean;
   /** P1-F：診断（`?debugLog=1`）のときだけ会話画面が渡す。結果は変えず、Reflectionの扱いを知らせる */
   onReflectionTrace?: (trace: ReflectionTrace) => void;
 }
@@ -1175,24 +1206,27 @@ export async function retrieveRelevantMemoriesImpl(
 
   const searchable = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
   const topic = withPoolEvidence(recall, searchable);
+  const purpose = options.purposeRelevance === true ? purposeContextOf(trimmed, searchable) : null;
   const candidates = searchable
     .map((memory) => {
       const match = topic ? matchRecallTopic(memory, topic, trimmed) : null;
       const bonus = match ? (match.matched.length - match.coveredByKeyword.length) * KEYWORD_WEIGHT : 0;
-      return { memory, score: scoreMemory(memory, trimmed) + bonus, onTopic: (match?.matched.length ?? 0) > 0 };
+      // 件数・Reflectionの扱いより前に、質問の目的で加点・減点する（話題に一致する記録だけ。目的が無ければ尋ねただけの記録を後ろに回すだけ）
+      const adjusted = adjustForPurpose(memory, scoreMemory(memory, trimmed) + bonus, purpose, trimmed, (match?.matched.length ?? 0) > 0, KEYWORD_WEIGHT, CONVERSATION_MIN_SCORE);
+      return { memory, score: adjusted.score, onTopic: adjusted.onTopic, demoted: adjusted.demoted };
     })
     // スコア0（関連なし）は返さない。無理に件数を埋めない（MEMORY_ENGINE.md 7.4）。
     .filter((entry) => entry.score > 0);
-  // 過去を尋ねる質問（話題の語があるとき）：話題に一致せず、analystの最低点にも届かない弱い記録（文字の偶然の重なりだけ）は入れない（analystと同じ基準）
-  const ranked = (topic ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE) : candidates)
-    .map(({ memory, score }) => ({ memory, score }))
-    .sort((a, b) => b.score - a.score);
+  // 過去を尋ねる質問（話題の語があるとき）・目的が分かる過去の質問：話題に一致せず、analystの最低点にも届かない弱い記録（文字の偶然の重なりだけ）は入れない（analystと同じ基準）
+  const ranked = (topic || purpose?.purpose ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE) : candidates)
+    .sort((a, b) => b.score - a.score || Number(a.demoted) - Number(b.demoted))
+    .map(({ memory, score }) => ({ memory, score }));
   // P1-F：会話のRetrievalだけ、Reflectionを本人の記録の後に回す（未指定なら従来の順のまま）
   const deferred = deferReflections ? deferReflectionItems(ranked, (entry) => entry.memory, limit, (entry) => entry.score) : null;
   const scored = (deferred ? deferred.items : ranked).slice(0, limit);
 
   const directMatches = scored.map((entry) => entry.memory);
-  const results: RetrievedMemory[] = directMatches.map((memory) => toRetrievedMemory(memory, undefined, undefined, context));
+  const results: RetrievedMemory[] = directMatches.map((memory) => withTrait(toRetrievedMemory(memory, undefined, undefined, context), memory, purpose));
 
   // Link経由の追加は、直接一致がlimitを埋めているかどうかに関係なく常に探索する
   // （直接一致件数とは独立の別枠。直接一致のスコアリングやpickLinkedAdditions自体のロジックは変更しない）。

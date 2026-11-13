@@ -5050,6 +5050,8 @@ export default function ChatScreen() {
         deferReflections: true,
         // 過去を尋ねる質問では、話題の語（「車」など）を一般語として減点せず、「車種」「車選び」のような形の違いも話題として数える（会話の画面だけ）
         recallTopic: true,
+        // 質問の目的（好み・望み・変化・人物の行動・質問そのもの）に合う、話題に一致する記録を先に。過去を尋ねただけの記録は後ろに回す（会話の画面だけ）
+        purposeRelevance: true,
         ...(generationDebugLogEnabled() ? { onReflectionTrace: (trace: ReflectionTrace) => { reflectionTrace = trace; } } : {}),
       });
 

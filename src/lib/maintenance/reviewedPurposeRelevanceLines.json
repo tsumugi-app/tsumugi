@@ -1,0 +1,7 @@
+{
+"note": "Purpose relevance (chat Retrieval only): the chat screen asks the chat Retrieval to order on-topic records by the purpose of a question about the past and to push back records that only asked the Memory back (purposeRelevance; recordRelevance.ts). Connect and every other caller do not pass it.",
+"lines": [
+"+// 質問の目的（好み・望み・変化・人物の行動・質問そのもの）に合う、話題に一致する記録を先に。過去を尋ねただけの記録は後ろに回す（会話の画面だけ）",
+"+purposeRelevance: true,"
+]
+}
