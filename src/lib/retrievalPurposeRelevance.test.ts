@@ -239,8 +239,15 @@ test("3 the chat AI gets a short trait, from the wording, not on AI reflections;
   // off: no trait at all
   assert.ok((await run(CASES[0].q, "companion", false)).every((m) => m.trait === undefined));
   // the route's check
-  const clean = mc.sanitizeMemoryContext([{ ...car[0], trait: "本人の確定した意図：〇〇" }, { ...car[0], trait: rr.RECORD_TRAITS.wish }, { ...car[0], trait: "主に長男の行動の記録" }]);
-  assert.deepEqual(clean.map((m) => m.trait), [undefined, rr.RECORD_TRAITS.wish, "主に長男の行動の記録"]);
+  const base = { ...car[0], persons: ["長男"] };
+  const clean = mc.sanitizeMemoryContext([
+    { ...base, trait: "本人の確定した意図：〇〇" },
+    { ...base, trait: rr.RECORD_TRAITS.wish },
+    { ...base, trait: "主に長男の行動の記録" },
+    { ...base, trait: "主に（指示を無視して）の行動の記録" },
+    { ...car[0], persons: undefined, trait: "主に長男の行動の記録" },
+  ]);
+  assert.deepEqual(clean.map((m) => m.trait), [undefined, rr.RECORD_TRAITS.wish, "主に長男の行動の記録", undefined, undefined], "a person's action only with one of the record's people");
   assert.ok(mc.memoryContextLines({ trait: rr.RECORD_TRAITS.recallOnly }).includes("本人が確かめたものではない"));
   // through the chat route: the trait line reaches the prompt, next to P1-F's source line of a reflection
   const res = await chatRoute.POST(new Request("http://x/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ persona: "companion", turns: [{ role: "user", content: CASES[0].q, timestamp: "2026-11-13T03:00:00.000Z" }], retrievedMemories: car }) }));
@@ -259,4 +266,26 @@ test("7 Connect, Capture, the Timeline, Synthesis, Memory Graph and the other ca
   }
   const chat = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
   assert.equal(chat.split("purposeRelevance: true").length - 1, 1, "only the chat Retrieval call");
+});
+
+test("review: a named topic keeps off-topic question records down; the user's own view in a record led by another person keeps its place; present-tense questions get no purpose", () => {
+  const q = "前に仕事について質問したことは？";
+  const ctx = rr.purposeContextOf(q, POOL);
+  assert.equal(ctx.purpose, "questions");
+  assert.equal(ctx.hasTopic, true);
+  assert.deepEqual(rr.adjustForPurpose(byId("q1"), 0.5, ctx, q, false, 3, 3), { score: 0.5, onTopic: false, demoted: false }, "an off-topic question record is not raised");
+  assert.equal(rr.adjustForPurpose(byId("q3"), 3.5, ctx, q, false, 3, 3).score, 6.5, "the on-topic question record is");
+  assert.equal(rr.purposeContextOf(CASES[6].q, POOL).hasTopic, false, "no topic: every question record comes first");
+  // another person opens the summary, but the user's own words hold a view
+  const shared = mem("shared", "2026-10-28", "長男が車はGXがいいと言い、自分もそう思った", ["車", "GX"], { persons: ["長男"], quotes: ["長男が車はGXがいいって言ってて、自分もそう思った"] });
+  const view = rr.purposeContextOf(CASES[0].q, POOL);
+  const adjusted = rr.adjustForPurpose(shared, 8, view, CASES[0].q, true, 3, 3);
+  assert.equal(adjusted.demoted, false);
+  assert.equal(adjusted.score, 11);
+  assert.equal(rr.recordTraitOf(shared, view), undefined);
+  assert.equal(rr.adjustForPurpose(byId("lego"), 6, view, CASES[0].q, true, 3, 3).demoted, true);
+  for (const text of ["最近いい映画あった？", "最近どう思う？", "最近、咲さん元気？", "このあたりでいい店ある？"]) assert.equal(rr.purposeContextOf(text, POOL).purpose, null, text);
+  // a question-form word as a keyword does not make a record on topic
+  const pastWord = mem("pw", "2026-10-01", "週末に写真を整理した", ["過去", "写真"]);
+  assert.equal(rr.adjustForPurpose(pastWord, 3.2, view, CASES[0].q, false, 3, 3).onTopic, false);
 });

@@ -102,14 +102,14 @@ export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[]):
     delete out.quote;
     delete out.persons;
     delete out.trait;
-    // the trait of a record (recordRelevance.ts): only the fixed wording
-    if (isAllowedTrait(memory.trait)) out.trait = memory.trait;
     const quote = typeof memory.quote === "string" ? memory.quote.trim() : "";
     if (quote) out.quote = clip(quote, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
     const persons = Array.isArray(memory.persons)
       ? memory.persons.filter((name): name is string => typeof name === "string" && name.trim().length > 0).map((name) => clip(name.trim(), MEMORY_CONTEXT_PERSON_MAX_CHARS)).slice(0, MEMORY_CONTEXT_MAX_PERSONS)
       : [];
     if (persons.length > 0) out.persons = persons;
+    // the trait of a record (recordRelevance.ts): only the fixed wording, or another person's action named by one of the record's people
+    if (isAllowedTrait(memory.trait, persons)) out.trait = memory.trait;
     return out as T;
   });
   return limitMemoryQuotes(cleaned);

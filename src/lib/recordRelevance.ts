@@ -13,7 +13,7 @@
  *    an automatic hint, not the user's confirmed intent. AI-written reflections get none (P1-F already marks their source).
  * No topic, product or person name is written in this code.
  */
-import { isRecallQuestion } from "./recallQuestion";
+import { isQuestionFormTerm, isRecallQuestion, questionTopicRuns } from "./recallQuestion";
 
 export type QuestionPurpose = "questions" | "wish" | "change" | "view" | "personAction";
 
@@ -21,6 +21,8 @@ export interface PurposeContext {
   purpose: QuestionPurpose | null;
   /** person names of the pool (as the user called them) that the question names */
   namedPersons: string[];
+  /** the question names a topic besides asking about questions (「前に仕事について質問したことは？」): off-topic question records are not raised then */
+  hasTopic: boolean;
 }
 
 /** what the facets read: the user's own words (evidenceQuotes), the AI summary, the people, the source */
@@ -42,8 +44,10 @@ const personNames = (memory: RelevanceSource) =>
 
 /** a question (asked to the AI, not a statement) */
 const INTERROGATIVE = /[?？]$|っけ[?？。]?$|かな[?？。]?$|かしら[?？。]?$|ですか[?？。]?$|ますか[?？。]?$|でしょうか[?？。]?$/;
-/** a question about the past: a past form or a word pointing back */
-const ASKS_PAST = /た(?:の|ん|っけ|か|かな)?[?？]?$|ていた|でいた|てた|でた|たっけ|過去|以前|前に|昔|これまで|今まで|最近|当時/;
+/** a question about the past: a past form or a word pointing back (「最近」 alone is not: 「最近いい映画ある？」) */
+const ASKS_PAST = /た(?:の|ん|っけ|か|かな)?[?？]?$|ていた|でいた|てた|でた|たっけ|過去|以前|前に|昔|これまで|今まで|当時/;
+/** the user's own view asked back (「どう思っていた」「考えてた」); otherwise a view purpose needs a recall question (「どんな車がいいって言ったっけ？」), not 「最近いい映画あった？」 */
+const VIEW_ASKED_BACK = /(?:思|考|感じ)(?:って|て)(?:い)?た/;
 const ASKS_QUESTION_FORM = /[?？]|っけ|かな$|かしら|ですか|でしょうか|(?:もの|こと|の)は$/;
 
 const PURPOSE_ASK: { purpose: Exclude<QuestionPurpose, "personAction">; ask: RegExp }[] = [
@@ -64,10 +68,11 @@ export function purposeContextOf(text: string, pool: readonly RelevanceSource[])
   const t = norm(text).trim();
   const known = [...new Set(pool.flatMap(personNames))];
   const namedPersons = known.filter((name) => t.includes(name) || (HONORIFIC.test(name) && Array.from(name.replace(HONORIFIC, "")).length >= 2 && t.includes(name.replace(HONORIFIC, ""))));
-  if (!t || !ASKS_QUESTION_FORM.test(t) || !ASKS_PAST.test(t)) return { purpose: null, namedPersons };
-  const found = PURPOSE_ASK.find((p) => p.ask.test(t));
-  if (found) return { purpose: found.purpose, namedPersons };
-  return { purpose: namedPersons.length > 0 ? "personAction" : null, namedPersons };
+  const hasTopic = namedPersons.length > 0 || questionTopicRuns(t).some((run) => !/質問|尋ね/.test(run));
+  if (!t || !ASKS_QUESTION_FORM.test(t) || !ASKS_PAST.test(t)) return { purpose: null, namedPersons, hasTopic };
+  const found = PURPOSE_ASK.find((p) => p.ask.test(t) && (p.purpose !== "view" || isRecallQuestion(t) || VIEW_ASKED_BACK.test(t)));
+  if (found) return { purpose: found.purpose, namedPersons, hasTopic };
+  return { purpose: namedPersons.length > 0 ? "personAction" : null, namedPersons, hasTopic };
 }
 
 /** every sentence of the user's own words asks the Memory back (no answer of its own). No quotes (older records): false, never pushed back */
@@ -91,6 +96,18 @@ export function actionPersonOf(memory: RelevanceSource): string | null {
 }
 
 const isAboutNamed = (memory: RelevanceSource, ctx: PurposeContext) => personNames(memory).some((name) => ctx.namedPersons.includes(name));
+/** the user's own words (not the AI summary) say this kind of thing */
+const quotesSay = (memory: RelevanceSource, purpose: "wish" | "change" | "view") => RECORD_SAYS[purpose].test(quoteSentences(memory).join(" "));
+/**
+ * pushed back as another person's action: the user's own view / wish / change was asked, the summary opens with another person (not named in the question),
+ * and the user's own words do not say that kind of thing (「妻が車はGXがいいと言い、自分もそう思った」 keeps its place)
+ */
+function othersActionOnly(memory: RelevanceSource, ctx: PurposeContext): string | null {
+  if (ctx.purpose !== "wish" && ctx.purpose !== "change" && ctx.purpose !== "view") return null;
+  const actor = actionPersonOf(memory);
+  if (!actor || ctx.namedPersons.includes(actor) || quotesSay(memory, ctx.purpose)) return null;
+  return actor;
+}
 const saysPurpose = (memory: RelevanceSource, purpose: "wish" | "change" | "view") => RECORD_SAYS[purpose].test(norm(`${quoteSentences(memory).join(" ")} ${memory.summary ?? ""}`));
 
 export interface PurposeAdjustment {
@@ -108,22 +125,25 @@ export interface PurposeAdjustment {
  */
 export function adjustForPurpose(memory: RelevanceSource, score: number, ctx: PurposeContext | null, questionText: string, topicMatched: boolean, weight: number, floor: number): PurposeAdjustment {
   if (!ctx) return { score, onTopic: topicMatched, demoted: false };
-  const q = norm(questionText);
-  const keywordHit = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length > 0 && q.includes(k));
   const reflection = isReflectionSource(memory);
+  if (!reflection && ctx.purpose !== "questions" && isRecallOnlyRecord(memory)) return { score: Math.min(score, weight), onTopic: topicMatched, demoted: true };
+  // no purpose: nothing else changes (the on-topic test stays the recall-topic match, as before)
+  if (!ctx.purpose) return { score, onTopic: topicMatched, demoted: false };
+  // the same raw comparison as scoreMemory; a question-form word (過去・最近・自分…) as a keyword does not make a record on topic
+  const keywordHit = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length > 0 && !isQuestionFormTerm(k.trim()) && (questionText ?? "").includes(k));
   const onTopic = topicMatched || keywordHit || isAboutNamed(memory, ctx);
   if (ctx.purpose === "questions") {
-    if (!reflection && isQuestionRecord(memory)) return { score: Math.max(score, floor) + weight, onTopic: true, demoted: false };
+    // question records first; with a topic named (「前に仕事について質問したことは？」) only the on-topic ones
+    if (!reflection && isQuestionRecord(memory) && (onTopic || !ctx.hasTopic)) return { score: Math.max(score, floor) + weight, onTopic: true, demoted: false };
     return { score, onTopic, demoted: false };
   }
-  if (!reflection && isRecallOnlyRecord(memory)) return { score: Math.min(score, weight), onTopic, demoted: true };
-  if (!ctx.purpose || !onTopic || reflection || score <= 0) return { score, onTopic, demoted: false };
-  const actor = actionPersonOf(memory);
+  if (!onTopic || reflection || score <= 0) return { score, onTopic, demoted: false };
   if (ctx.purpose === "personAction") {
+    const actor = actionPersonOf(memory);
     return actor && ctx.namedPersons.includes(actor) ? { score: score + weight, onTopic, demoted: false } : { score, onTopic, demoted: false };
   }
-  // the user's own view / wish / change was asked: a record mainly about another person's action (not named in the question) goes back
-  if (actor && !ctx.namedPersons.includes(actor)) return { score: Math.min(score, weight), onTopic, demoted: true };
+  // the user's own view / wish / change was asked: a record mainly about another person's action goes back
+  if (othersActionOnly(memory, ctx)) return { score: Math.min(score, weight), onTopic, demoted: true };
   if (saysPurpose(memory, ctx.purpose)) return { score: score + weight, onTopic, demoted: false };
   return { score, onTopic, demoted: false };
 }
@@ -135,7 +155,7 @@ export const RECORD_TRAITS = {
   wish: "本人の希望の言い回しがある",
   change: "考えの変化の言い回しがある",
 } as const;
-const ACTION_TRAIT = /^主に.{1,20}の行動の記録$/;
+const ACTION_TRAIT = /^主に(.{1,20})の行動の記録$/;
 
 /** a trait of a selected record for this turn, or undefined (AI reflections: none; one trait at most) */
 export function recordTraitOf(memory: RelevanceSource, ctx: PurposeContext | null): string | undefined {
@@ -143,15 +163,18 @@ export function recordTraitOf(memory: RelevanceSource, ctx: PurposeContext | nul
   if (ctx.purpose === "questions") return isQuestionRecord(memory) ? RECORD_TRAITS.question : undefined;
   if (isRecallOnlyRecord(memory)) return RECORD_TRAITS.recallOnly;
   if (!ctx.purpose) return undefined;
-  const actor = actionPersonOf(memory);
-  // only where the record was pushed back for it (the user's own view / wish / change was asked)
-  if (actor && ctx.purpose !== "personAction" && !ctx.namedPersons.includes(actor)) return `主に${actor}の行動の記録`;
+  // only where the record was pushed back for it
+  const actor = othersActionOnly(memory, ctx);
+  if (actor) return `主に${actor}の行動の記録`;
   if (ctx.purpose === "wish" && saysPurpose(memory, "wish")) return RECORD_TRAITS.wish;
   if (ctx.purpose === "change" && saysPurpose(memory, "change")) return RECORD_TRAITS.change;
   return undefined;
 }
 
-/** the route's check of a trait a client sent: only the fixed traits, or 「主にXの行動の記録」 with a short name */
-export function isAllowedTrait(value: unknown): value is string {
-  return typeof value === "string" && ((Object.values(RECORD_TRAITS) as string[]).includes(value) || ACTION_TRAIT.test(value));
+/** the route's check of a trait a client sent: only the fixed traits, or 「主にXの行動の記録」 where X is one of the record's (already checked) people */
+export function isAllowedTrait(value: unknown, persons: readonly string[] = []): value is string {
+  if (typeof value !== "string") return false;
+  if ((Object.values(RECORD_TRAITS) as string[]).includes(value)) return true;
+  const name = ACTION_TRAIT.exec(value)?.[1];
+  return name !== undefined && persons.includes(name);
 }
