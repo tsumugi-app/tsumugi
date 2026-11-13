@@ -5048,6 +5048,8 @@ export default function ChatScreen() {
         personAliases,
         // P1-F：AIが書いた日記の振り返り（Reflection）は、本人の記録の後に回す（会話の画面だけ。Connect等は従来どおり）
         deferReflections: true,
+        // 過去を尋ねる質問では、話題の語（「車」など）を一般語として減点せず、「車種」「車選び」のような形の違いも話題として数える（会話の画面だけ）
+        recallTopic: true,
         ...(generationDebugLogEnabled() ? { onReflectionTrace: (trace: ReflectionTrace) => { reflectionTrace = trace; } } : {}),
       });
 

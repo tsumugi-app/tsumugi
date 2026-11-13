@@ -1,0 +1,7 @@
+{
+"note": "Recall topic (Retrieval precision for questions about the user's own past): the chat screen asks the chat Retrieval to treat the topic of a recall question as the topic (recallTopic; recallQuestion.ts). Connect and every other caller do not pass it and keep the old scoring.",
+"lines": [
+"+// 過去を尋ねる質問では、話題の語（「車」など）を一般語として減点せず、「車種」「車選び」のような形の違いも話題として数える（会話の画面だけ）",
+"+recallTopic: true,"
+]
+}

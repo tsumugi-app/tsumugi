@@ -23,6 +23,7 @@
  */
 import type { EventTimePrecision, MemoryObject } from "./types";
 import { normalizeAnalyticsKeyword } from "./memoryAnalytics";
+import { isQuestionFormTerm } from "./recallQuestion";
 
 export type SynthesisKind = "change" | "pattern" | "tension";
 export type SynthesisSupport = "stated" | "derived" | "hypothesis";
@@ -461,7 +462,8 @@ export function selectTimelineForTurn(
     const themeIds = memories.filter((m) => isSynthesisSource(m) && hasTheme(m, theme)).map((m) => m.id);
     const shared = themeIds.filter((id) => retrieved.has(id)).length;
     // related only through the user's own words: retrieval overlap alone is not enough (retrieval can return loosely matching Memories for an unrelated turn)
-    const termHit = themeTerms(theme, memories).some((t) => turn.userText.includes(t));
+    // 「過去」「以前」など、質問の形だけを表す語では関係があるとしない（「過去にどんな車…」で、「過去の写真を整理」のテーマを選ばない）。テーマの名前そのものは従来どおり
+    const termHit = themeTerms(theme, memories).some((t) => (t === theme.trim() || !isQuestionFormTerm(t)) && turn.userText.includes(t));
     if (!termHit) continue;
     const { state, points } = buildThemeTimeline(theme, memories);
     const covered = points.filter((p) => retrieved.has(p.memoryId)).length;
