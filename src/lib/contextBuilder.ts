@@ -626,7 +626,7 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     relevanceWhy: relevance[i].why,
   }));
   const classTally = (c: RelevanceClass) => tally(units.filter((_, i) => relevance[i].relevance === c));
-  const reasonUnits = units.map((u, i) => ({ u, c: relevance[i].relevance })).filter((x) => x.u.explanation || relevance[i].why.startsWith(DIRECT_REASON));
+  const reasonUnits = units.map((u, i) => ({ u, c: relevance[i].relevance, why: relevance[i].why })).filter((x) => x.u.explanation || x.why.startsWith(DIRECT_REASON));
 
   return {
     question,
