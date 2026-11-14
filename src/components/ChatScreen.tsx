@@ -5391,7 +5391,7 @@ export default function ChatScreen() {
         // P1-F：経路ごとの由来は、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
         if (sentProvenance) rememberContextProvenance(aiTurn.timestamp, { sent: sentProvenance, accepted: debugEnvelope.provenance ?? null, reflection: reflectionTrace });
         // P1-H 段階1：Context Builderの診断も、このタブのメモリにだけ置く（localStorage・IndexedDB・Vaultへは保存しない）
-        if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport, debugEnvelope.contextDedupe ?? null);
+        if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport, debugEnvelope.contextDedupe ?? null, debugEnvelope.explicitReason ?? null);
         // Explicit Memory Search P0.5：サーバーが受け取ったExplicit Searchの状態を、Conversation Debuggerの「全てコピー」
         // （conversationDebugLog）にも1行残す。観測専用（?debugLog=1のときだけ。promptにも検索にも影響しない）。
         const explicitSearchAccepted = debugEnvelope.serverAccepted.explicitSearchServerAccepted;

@@ -40,6 +40,7 @@ import { stripLeadingTimeLabels } from "./timeLabel";
 import { purposeContextOf, type QuestionPurpose } from "./recordRelevance";
 import { questionTopicRuns } from "./recallQuestion";
 import { CORRECTION_FORM, REASON_FORM } from "./personStance";
+import { reasonAnswerScore, reasonFocusOf, sentencesOf as reasonSentences } from "./explicitReason";
 import { dedupeExactContext, type ContextDedupeResult, type DedupeKeptPiece, type DedupePiece } from "./contextDedupe";
 
 export type ContextRoute =
@@ -169,6 +170,15 @@ export interface ContextBuilderReport {
    * enabled（フラグON）のとき、現行の入力はすでに外した後の値で、removedは実際に外したもの。OFFのときは「ONなら外れるもの」。
    */
   dedupe: { enabled: boolean; removed: DedupePiece[]; kept: DedupeKeptPiece[]; removedChars: number };
+  /**
+   * P1-H：理由を尋ねる質問のとき、質問に答える本人の理由・訂正（逐語）が、この端末の候補（今回選ばれた記録と経緯）にあるか、
+   * 実際にプロンプトに入るか、入らないならその理由。端末の判定（サーバーが受け取った値は別に表示する）。
+   */
+  explicitReason: {
+    asked: boolean;
+    terms: string[];
+    candidates: { memoryId?: string; route: "Retrieval" | "Topic Timeline"; text: string; sent: boolean; why: string; insteadOf: string[] }[];
+  };
   explanations: {
     /** 「候補にあり」 or 「候補に無し」 (never pretended) */
     status: "候補にあり" | "候補に無し";
@@ -325,7 +335,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
 
   // Topic Timeline（逐語。routeと同じ上限：最古1件＋直近）
   for (const timeline of sanitizeTopicTimelineContext(body.topicTimeline)) {
-    for (const e of selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic)) {
+    for (const e of selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, input.question ?? "")) {
       const id = memories.find((m) => (m.topicEvents ?? []).some((x) => x.quote === e.quote && x.statedAt === e.time && x.sourceConversationId === e.sourceConversationId))?.id;
       add("Topic Timeline", { part: "経緯の逐語", memoryIds: id ? [id] : [], kind: "本人の発言", text: e.quote });
     }
@@ -607,6 +617,7 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     },
     sameMemory,
     exactDuplicates,
+    explicitReason: explicitReasonOf(input, memories, units),
     dedupe: {
       enabled: input.contextDedupe === true,
       removed: dedupe.removed.map((r) => ({ ...r, text: clip(r.text) })),
@@ -632,6 +643,49 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
   };
 }
 
+/** P1-H: the user's reasons / corrections that answer the question, among this turn's records and Topic Timeline events; whether they are sent */
+function explicitReasonOf(input: ContextBuilderInput, memories: readonly ContextBuilderMemory[], units: ContextUnit[]): ContextBuilderReport["explicitReason"] {
+  const focus = reasonFocusOf(input.question ?? "");
+  if (!focus) return { asked: false, terms: [], candidates: [] };
+  const byId = new Map(memories.map((m) => [m.id, m]));
+  const flat = (t: string) => squash(t).replace(/…$/, "");
+  const sentTexts = units.filter((u) => u.kind === "本人の発言" || u.kind === "後からの本人の説明・訂正").map((u) => flat(u.text));
+  const isSent = (sentence: string) => sentTexts.some((t) => t.length > 0 && (t.includes(flat(sentence)) || flat(sentence).startsWith(t)));
+  const candidates: ContextBuilderReport["explicitReason"]["candidates"] = [];
+  const seen = new Set<string>();
+  // the records Retrieval chose: every sentence of the user's own words that answers the question
+  const retrieved = Array.isArray(input.retrievedMemories) ? input.retrievedMemories : [];
+  for (const r of retrieved) {
+    const m = byId.get(r.id);
+    if (!m) continue;
+    const sentences = [...(m.topicEvents ?? []).map((e) => e.quote), ...(m.evidenceQuotes ?? [])].filter((q): q is string => typeof q === "string").flatMap(reasonSentences);
+    for (const sentence of sentences) {
+      if (reasonAnswerScore(sentence, focus) === 0 || seen.has(flat(sentence))) continue;
+      seen.add(flat(sentence));
+      const sent = isSent(sentence);
+      const inPrompt = units.filter((u) => u.memoryIds.includes(r.id));
+      const quoteUnit = inPrompt.find((u) => (u.route === "Retrieval" || u.route === "Reflection") && u.part === "本人の一文");
+      const insteadOf = sent ? [] : inPrompt.map((u) => `${u.route}・${u.part}「${clip(u.text)}」`);
+      const why = sent ? "プロンプトに入る"
+        : inPrompt.length === 0 ? "この記録はプロンプトに入らない（routeの確認・時間で変わる事実の除外など）"
+        : quoteUnit ? "同じ記録の別の一文が「本人の一文」として選ばれた"
+        : "この記録の本人の一文が渡らない（1ターンの逐語の上限など）。要約など同じ記録の別の情報だけが入る";
+      candidates.push({ memoryId: r.id, route: "Retrieval", text: clip(sentence), sent, why, insteadOf });
+    }
+  }
+  // the Topic Timeline events the client sent (before the route's budget)
+  for (const timeline of sanitizeTopicTimelineContext(wire(input.topicTimeline ?? null))) {
+    for (const e of timeline.events) {
+      if (!reasonSentences(e.quote).some((sentence) => reasonAnswerScore(sentence, focus) > 0) || seen.has(flat(e.quote))) continue;
+      seen.add(flat(e.quote));
+      const sent = units.some((u) => u.route === "Topic Timeline" && flat(u.text) === flat(e.quote)) || isSent(e.quote);
+      const id = memories.find((m) => (m.topicEvents ?? []).some((x) => x.quote === e.quote && x.statedAt === e.time))?.id;
+      candidates.push({ ...(id ? { memoryId: id } : {}), route: "Topic Timeline", text: clip(e.quote), sent, why: sent ? "プロンプトに入る" : "経緯の件数の上限で外れた", insteadOf: [] });
+    }
+  }
+  return { asked: true, terms: focus.terms, candidates };
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // 4 the debug badge's text
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -651,6 +705,10 @@ export function formatContextBuilderReport(r: ContextBuilderReport): string {
   lines.push("", "■ 本人の理由・訂正");
   if (r.explanations.status === "候補に無し") lines.push("- 候補に無し（AIの仮説を本人の理由として扱わない）");
   else lines.push(`- 現行${r.explanations.current}件 → 仮想${r.explanations.virtual}件${r.explanations.lost.length > 0 ? `（失ったもの：${r.explanations.lost.join("／")}）` : "（すべて残る）"}`);
+  lines.push("", "■ 質問に答える本人の理由・訂正（端末の判定）");
+  if (!r.explicitReason.asked) lines.push("- 理由を尋ねる質問ではない（従来どおり）");
+  else if (r.explicitReason.candidates.length === 0) lines.push(`- 候補に無し（話題の語：${r.explicitReason.terms.join("・")}。今回の記録・経緯に、本人が理由・訂正を述べた一文が無い。理由は作らない）`);
+  for (const c of r.explicitReason.candidates) lines.push(`- ${c.sent ? "渡る" : "渡らない"}：${c.route}${c.memoryId ? ` ${c.memoryId}` : ""}「${c.text}」（${c.why}）${c.insteadOf.length > 0 ? `\n    代わりに入る同じ記録の情報：${c.insteadOf.join("／")}` : ""}`);
   lines.push("", "■ AIの仮説");
   lines.push(`- 現行${r.hypotheses.current}件 → 仮想${r.hypotheses.virtual}件。本人の理由・訂正より前にあるか：現行 ${r.hypotheses.beforeExplanationCurrent ? "はい" : "いいえ"} → 仮想 ${r.hypotheses.beforeExplanationVirtual ? "はい" : "いいえ"}`);
   lines.push("", "■ 人物（現行 → 仮想の項目数・人物の行）");

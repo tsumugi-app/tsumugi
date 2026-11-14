@@ -5,17 +5,18 @@
  */
 import type { ContextBuilderReport } from "./contextBuilder";
 import type { ServerDedupeReport } from "./contextDedupe";
+import type { ServerReasonReport } from "./explicitReason";
 
 const MAX_TURNS = 20;
 /** server: 段階2-A, what the server actually took out of the prompt (null when the reduction was OFF) */
-const reports = new Map<string, { report: ContextBuilderReport; server: ServerDedupeReport | null }>();
+const reports = new Map<string, { report: ContextBuilderReport; server: ServerDedupeReport | null; serverReason?: ServerReasonReport | null }>();
 
-export function rememberContextBuilderReport(turnTimestamp: string, report: ContextBuilderReport, server: ServerDedupeReport | null = null): void {
+export function rememberContextBuilderReport(turnTimestamp: string, report: ContextBuilderReport, server: ServerDedupeReport | null = null, serverReason: ServerReasonReport | null = null): void {
   reports.delete(turnTimestamp);
-  reports.set(turnTimestamp, { report, server });
+  reports.set(turnTimestamp, { report, server, serverReason });
   while (reports.size > MAX_TURNS) reports.delete(reports.keys().next().value as string);
 }
 
-export function contextBuilderReportFor(turnTimestamp: string): { report: ContextBuilderReport; server: ServerDedupeReport | null } | undefined {
+export function contextBuilderReportFor(turnTimestamp: string): { report: ContextBuilderReport; server: ServerDedupeReport | null; serverReason?: ServerReasonReport | null } | undefined {
   return reports.get(turnTimestamp);
 }

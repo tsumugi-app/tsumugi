@@ -14,6 +14,7 @@
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
 import { isAllowedTrait } from "./recordRelevance";
+import { reasonFocusOf, reasonSentenceOf } from "./explicitReason";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -55,8 +56,15 @@ export function memoryPersons(memory: Pick<MemoryObject, "personMentions">): str
   return names;
 }
 
-/** one sentence of the user's own words that the summary does not already carry, closest to the current turn; undefined if none */
-export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes">, conversationTexts: string[]): string | undefined {
+/**
+ * one sentence of the user's own words that the summary does not already carry, closest to the current turn; undefined if none.
+ * P1-H: when the current turn (conversationTexts[0]) asks for the reason of something said before, the user's sentence that states that reason or
+ * corrects it comes first (explicitReason.ts), even when the AI summary covers it (the summary is not the user's words). None: as before.
+ */
+export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes"> & Partial<Pick<MemoryObject, "topicEvents">>, conversationTexts: string[]): string | undefined {
+  const focus = reasonFocusOf(conversationTexts[0] ?? "");
+  const reason = focus ? reasonSentenceOf(memory, focus) : undefined;
+  if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
   const summary = bigrams(memory.summary ?? "");
   const turn = bigrams(conversationTexts.join(" "));
   let best: { text: string; relevance: number; novelty: number } | undefined;

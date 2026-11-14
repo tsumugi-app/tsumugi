@@ -17,6 +17,7 @@ import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIME
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
 import { buildContextProvenance } from "@/lib/chatContextProvenance";
 import { dedupeExactContext, serverDedupeReport } from "@/lib/contextDedupe";
+import { serverReasonReport } from "@/lib/explicitReason";
 import { AIProviderError } from "@/lib/ai/errors";
 import {
   getProvider,
@@ -875,11 +876,11 @@ function formatTimelineTimeLabel(time: string): string {
  * 既存の「継続中かもしれない話題の候補」（Topic Continuity Context）とは別の情報源
  * （こちらは人物軸で関連付けたtopicIdのUser逐語履歴）であり、内容が重複するとは限らない。
  */
-function buildTopicTimelineSection(timelines: TopicTimeline[]): string {
+function buildTopicTimelineSection(timelines: TopicTimeline[], question: string): string {
   if (timelines.length === 0) return "";
   const blocks = timelines
     .map((timeline, index) => {
-      const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic)
+      const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, question)
         .map((event) => `  - ${formatTimelineTimeLabel(event.time)}：「${event.quote}」`)
         .join("\n");
       return `経緯${index + 1}：\n${eventLines}`;
@@ -1078,7 +1079,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
   // Conversation Debugger v1：sanitize後の値を変数として持ち、[Server Accepted]の
   // 元データとしてそのまま再利用する（Debuggerのためだけの再計算はしない）。
   const sanitizedTopicTimeline = sanitizeTopicTimelineContext(topicTimeline);
-  const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline);
+  const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline, latestUserMessage);
   // Person Memory v1をここで初めてChat Contextへ接続する（今までは保存されるだけだった）。
   const sanitizedPersonView = sanitizePersonViewContext(personView);
   const personViewSection = buildPersonViewSection(sanitizedPersonView);
@@ -1215,7 +1216,7 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
           // ここでも同じ選択を適用する（sanitize結果そのままではない）。
           topicTimeline: sanitizedTopicTimeline.map((timeline) => ({
             topicId: timeline.topicId,
-            events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic),
+            events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, latestUserMessage),
           })),
           // buildTopicContinuitySection()はmemories.length>0のtopicだけを使う。
           // 同じ絞り込みをここでも適用する。
@@ -1247,11 +1248,13 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
         provenance: debugProvenance(() => buildContextProvenance({
           retrievedMemories: promptMemories,
           topicContinuity: topicContinuitySection ? (topicContext ?? []).filter((t) => t.memories.length > 0) : null,
-          topicTimeline: sanitizedTopicTimeline.map((timeline) => ({ topicId: timeline.topicId, events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic) })),
+          topicTimeline: sanitizedTopicTimeline.map((timeline) => ({ topicId: timeline.topicId, events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, latestUserMessage) })),
           memoryTimeline: synthesisSection ? promptMemoryTimeline : null,
           personContext: personContextSection ? sanitizedPersonContext : null,
           explicitSearch: explicitSearchSection ? sanitizedExplicitSearch : null,
         })),
+        // P1-H：理由を尋ねる質問のとき、実際のプロンプトに入った本人の理由・訂正（Retrievalの一文・経緯の逐語）
+        explicitReason: serverReasonReport(latestUserMessage, promptMemories, topicTimelineSection ? sanitizedTopicTimeline.flatMap((timeline) => selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, latestUserMessage)) : []),
         // P1-H 段階2-A（フラグONのときだけ）：実際にプロンプトから外した重複と、該当節の文字数（外す前 → 外した後）
         ...(contextDedupeResult ? { contextDedupe: serverDedupeReport(contextDedupeResult, { before: buildRetrievedMemoriesSection(memoriesForContext).length + buildSynthesisSection(sanitizedMemoryTimeline).length, after: retrievedMemoriesSection.length + synthesisSection.length }, systemInstruction.length) } : {}),
       }

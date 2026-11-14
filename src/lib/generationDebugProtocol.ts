@@ -18,6 +18,7 @@
  * Conversation）の、既にクライアント⇄サーバー間で実際にやり取りされている値だけ。
  */
 import type { ServerDedupeReport } from "./contextDedupe";
+import type { ServerReasonReport } from "./explicitReason";
 import type { ProfileContext } from "./profile";
 import type { PersonView } from "./person";
 import type { TopicTimeline } from "./topicEvent";
@@ -112,4 +113,6 @@ export interface GenerationDebugEnvelope {
   provenance?: ContextProvenance;
   /** P1-H 段階2-A：重複の削減がONのときだけ。サーバーが実際にプロンプトから外したもの（contextDedupe.ts）。localStorageへは保存しない */
   contextDedupe?: ServerDedupeReport;
+  /** P1-H：理由を尋ねる質問で、実際のプロンプトに入った本人の理由・訂正（explicitReason.ts）。?debugLog=1のときだけ。localStorageへは保存しない */
+  explicitReason?: ServerReasonReport;
 }
