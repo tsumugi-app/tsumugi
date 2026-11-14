@@ -28,6 +28,7 @@
  * このモジュールはサーバー（/api/capture, /api/chat）とクライアントの両方から使う
  * 純粋関数だけを持つ。
  */
+import { REASON_TIMELINE_SLOTS, reasonAnswerScore, reasonFocusOf, sentencesOf } from "./explicitReason";
 import { normalizeText } from "./profile";
 import type { ConversationTurn, ID, MemoryObject, TopicEvent } from "./types";
 
@@ -267,15 +268,42 @@ export function computeTopicTimelines(memories: MemoryObject[], topicIds: string
  */
 export function selectTimelineEventsForBudget(
   events: TopicTimelineEntry[],
-  maxEvents: number = TOPIC_TIMELINE_BUDGET.maxEventsPerTopic
+  maxEvents: number = TOPIC_TIMELINE_BUDGET.maxEventsPerTopic,
+  /** P1-H：今回のユーザー発言。理由を尋ねる質問なら、その理由・訂正を述べた本人の発言を先に残す（それ以外は従来どおり） */
+  question?: string
 ): TopicTimelineEntry[] {
   if (maxEvents <= 0) return [];
   if (events.length <= maxEvents) return events;
+  const focused = question ? selectWithReasonFocus(events, maxEvents, question) : null;
+  if (focused) return focused;
   if (maxEvents === 1) return [events[events.length - 1]];
   const oldest = events[0];
   const recent = events.slice(events.length - (maxEvents - 1));
   if (recent[0] === oldest) return recent;
   return [oldest, ...recent];
+}
+
+/**
+ * P1-H：理由を尋ねる質問のとき、上限（最古1件＋直近）から外れる本人の理由・訂正の発言を、最大REASON_TIMELINE_SLOTS件まで先に残す
+ * （新しいものから。後の訂正が前の発言より先）。残りは従来どおり最古1件＋直近で埋め、時系列順に返す。該当が無い・すでに残る場合はnull（従来の選択）。
+ */
+function selectWithReasonFocus(events: TopicTimelineEntry[], maxEvents: number, question: string): TopicTimelineEntry[] | null {
+  if (maxEvents < 3) return null;
+  const focus = reasonFocusOf(question);
+  if (!focus) return null;
+  const plain = selectTimelineEventsForBudget(events, maxEvents);
+  const answers = events
+    .map((event, index) => ({ event, index }))
+    .filter((x) => sentencesOf(x.event.quote).some((sentence) => reasonAnswerScore(sentence, focus) > 0))
+    .sort((a, b) => Date.parse(b.event.time) - Date.parse(a.event.time) || b.index - a.index)
+    .slice(0, REASON_TIMELINE_SLOTS);
+  if (answers.length === 0 || answers.every((x) => plain.includes(x.event))) return null;
+  const chosen = new Set<number>(answers.map((x) => x.index));
+  const rest = events.map((_, index) => index).filter((index) => !chosen.has(index));
+  // the oldest of the rest, then the latest of the rest, until the budget is full
+  if (rest.length > 0) chosen.add(rest[0]);
+  for (let k = rest.length - 1; k > 0 && chosen.size < maxEvents; k--) chosen.add(rest[k]);
+  return events.filter((_, index) => chosen.has(index));
 }
 
 // ---------------------------------------------------------------------------

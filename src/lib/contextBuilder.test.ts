@@ -55,6 +55,7 @@ type SynthesisItem = import("./memorySynthesis").SynthesisItem;
 type PersonMention = import("./types").PersonMention;
 type Report = import("./contextBuilder").ContextBuilderReport;
 type Input = import("./contextBuilder").ContextBuilderInput;
+type RetrievedMemory = import("./types").RetrievedMemory;
 
 function mention(name: string, quote: string, at: string, relation?: PersonMention["relation"]): PersonMention {
   return { id: `pm-${name}-${at}`, groupingKey: name, displayName: name, ...(relation ? { relation } : {}), assertion: "mention", stated: "explicit", quote, statedAt: at, sourceConversationId: "c", recordedAt: at, origin: "ai-extracted", schemaVersion: 1 };
@@ -604,4 +605,141 @@ test("17 the flag OFF (no field, false, or anything but true) builds exactly the
     const env = await envelope(chatBody(scene, { debugGenerationId: "g-off" }));
     assert.ok(env && !("contextDedupe" in env), "OFF: the server reports no reduction");
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// P1-H：本人の明示的な理由・訂正（explicitReason.ts）。架空のデータだけ（みおさん・転勤・年齢は作りもの）
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+const er = require(path.join(ROOT, "lib/explicitReason.js")) as typeof import("./explicitReason");
+const mc = require(path.join(ROOT, "lib/memoryContext.js")) as typeof import("./memoryContext");
+const RQ = "以前、未来がないと言ったのは、どういう理由だったっけ？";
+const REASON_SAID = "未来がないって言ったのは、自分が来年から海外に転勤するから、一緒にいられる時間が無いって意味だよ。";
+const OLD_REASON = "未来がないのは、年齢が離れているからだと思う。";
+const withEvents = (m: MemoryObject, events: [string, string][]): MemoryObject => ({ ...m, topicId: "t-mio", topicEvents: events.map(([day, quote], k) => ({ id: `te-${m.id}-${k}`, topicId: "t-mio", quote, statedAt: `${day}T10:00:00.000Z`, sourceConversationId: `c-${m.id}`, recordedAt: `${day}T10:00:00.000Z`, origin: "ai-extracted", schemaVersion: 1 })) } as unknown as MemoryObject);
+const MIO_REASON = withEvents(mem("mio-r", "2026-11-09", "未来がないって言ったのは、来年から海外に転勤するから、一緒にいられる時間が無いという意味だと話した", ["みおさん", "未来", "関係"], { quotes: ["わかんない。", REASON_SAID], who: ["みおさん", "friend"] }), [["2026-11-09", "わかんない。"], ["2026-11-09", REASON_SAID]]);
+const MIO_POOL: MemoryObject[] = [
+  withEvents(mem("mio-0", "2026-09-01", "みおさんと初めて会った", ["みおさん"], { who: ["みおさん", "friend"] }), [["2026-09-01", "みおさんと初めて会った"]]),
+  withEvents(mem("mio-1", "2026-09-20", "みおさんとの未来について年齢差を気にしていた", ["みおさん", "未来"], { quotes: [OLD_REASON], who: ["みおさん", "friend"] }), [["2026-09-20", OLD_REASON]]),
+  withEvents(mem("mio-2", "2026-10-01", "みおさんと映画を見た", ["みおさん", "映画"], { who: ["みおさん", "friend"] }), [["2026-10-01", "みおさんと映画を見た"]]),
+  withEvents(mem("mio-3", "2026-10-20", "みおさんとの関係には未来がないと話した", ["みおさん", "未来"], { quotes: ["正直、みおさんとの関係に未来はない"], who: ["みおさん", "friend"] }), [["2026-10-20", "正直、みおさんとの関係に未来はない"]]),
+  MIO_REASON,
+  ...["ランチに行った", "誕生日プレゼントを選んだ", "駅まで一緒に歩いた", "カフェで話した"].map((what, k) => withEvents(mem(`mio-${5 + k}`, `2026-11-${10 + k}`, `みおさんと${what}`, ["みおさん"], { who: ["みおさん", "friend"] }), [[`2026-11-${10 + k}`, `みおさんと${what}`]])),
+];
+async function reasonBody(q: string, extra: Record<string, unknown> = {}) {
+  pool = MIO_POOL;
+  const retrievedMemories = await r.retrieveRelevantMemoriesImpl(q, { excludeConversationId: "now", persona: "companion", recentUserTurnsTexts: [q], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true });
+  const topicIds = [...new Set(MIO_POOL.filter((m) => retrievedMemories.some((x) => x.id === m.id)).map((m) => m.topicId).filter((id): id is string => Boolean(id)))];
+  const topicTimeline = topicIds.length > 0 ? te.computeTopicTimelines(MIO_POOL, topicIds) : [];
+  return { persona: "companion", turns: [{ role: "user", content: q, timestamp: T }], retrievedMemories, ...(topicTimeline.length > 0 ? { topicTimeline } : {}), ...extra };
+}
+
+test("18 the question's reason: the user's own sentence wins over a short unrelated one of the same record; the newest correction first; nothing made up", () => {
+  const focus = er.reasonFocusOf(RQ);
+  assert.ok(focus && focus.terms.includes("未来"), JSON.stringify(focus));
+  // before: the share-of-words rule and the summary filter picked the short sentence; after: the stated reason
+  const before = mc.memoryQuote(MIO_REASON, ["", RQ]);
+  const after = mc.memoryQuote(MIO_REASON, [RQ]);
+  assert.equal(before, "わかんない。", `before (reproduces the bug: the AI summary covers the reason, so the user's sentence was skipped): ${before}`);
+  assert.equal(after, REASON_SAID, `after: ${after}`);
+  // a later correction of the same record comes before an earlier statement
+  const both = withEvents(mem("mio-x", "2026-11-09", "みおさんとの未来の話", ["未来"], { quotes: [OLD_REASON, REASON_SAID] }), [["2026-09-20", OLD_REASON], ["2026-11-09", REASON_SAID]]);
+  assert.equal(mc.memoryQuote(both, [RQ]), REASON_SAID);
+  // no stated reason: nothing is made up (the old choice stays)
+  const none = mem("mio-n", "2026-11-01", "旅行には行かないと話した", ["旅行"], { quotes: ["旅行は行かない。", "わかんない。"] });
+  const q2 = "以前、旅行に行かないと言ったのは、どういう理由だったっけ？";
+  assert.equal(mc.memoryQuote(none, [q2]), mc.memoryQuote(none, ["", q2]), "no reason: as before");
+  assert.equal(er.reasonSentenceOf(none, er.reasonFocusOf(q2)!), undefined);
+  // not a reason question / no topic word: as before
+  for (const q of ["みおさんと最近どう？", "なんでだっけ？", "なんで疲れるんだろう"]) assert.equal(er.reasonFocusOf(q), null, q);
+  assert.equal(mc.memoryQuote(MIO_REASON, ["みおさんと最近どう？"]), mc.memoryQuote(MIO_REASON, ["", "みおさんと最近どう？"]));
+  report(["## 本人の理由：Retrievalの本人の一文（架空データ）", "| | 本人の一文 |", "|---|---|", `| 修正前の選び方 | ${before ?? "なし"} |`, `| 修正後 | ${after} |`]);
+});
+
+test("19 the Topic Timeline budget: the newest event that answers the question is kept (an older statement before a correction is not brought back), the oldest and the latest stay; other questions as before", () => {
+  const events = te.computeTopicTimelines(MIO_POOL, ["t-mio"])[0].events;
+  assert.ok(events.length > te.TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, `${events.length} events`);
+  const plain = te.selectTimelineEventsForBudget(events, te.TOPIC_TIMELINE_BUDGET.maxEventsPerTopic);
+  const focused = te.selectTimelineEventsForBudget(events, te.TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, RQ);
+  assert.ok(!plain.some((e) => e.quote === REASON_SAID), "before: the reason is outside the oldest + latest");
+  assert.ok(focused.some((e) => e.quote === REASON_SAID), "after: the reason is kept");
+  assert.equal(focused.length, te.TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, "the same budget");
+  assert.equal(focused[0], events[0], "the oldest stays");
+  assert.equal(focused[focused.length - 1], events[events.length - 1], "the latest stays");
+  assert.ok(focused.every((e, k) => k === 0 || Date.parse(e.time) >= Date.parse(focused[k - 1].time)), "in time order");
+  // the newer correction is taken before the older statement when the slots are short
+  assert.ok(!focused.some((e) => e.quote === OLD_REASON), "the older reason the user later corrected is not brought back into the budget");
+  for (const q of ["みおさんと最近どう？", "前にどんな車が欲しいと言った？", "長男がレゴで何を作った？", "なんだか最近疲れる"]) assert.deepEqual(te.selectTimelineEventsForBudget(events, 5, q), plain, q);
+  report(["## 本人の理由：Topic Timelineの選び方（架空データ・上限5件）", "| | 選ばれた発言 |", "|---|---|", `| 修正前（最古1件＋直近4件） | ${plain.map((e) => e.quote).join("／")} |`, `| 修正後 | ${focused.map((e) => e.quote).join("／")} |`]);
+});
+
+test("20 end to end: the stated reason reaches the final prompt, with contextDedupe OFF and ON; the client and the server report it", async () => {
+  for (const flag of [{}, { contextDedupe: true }]) {
+    const body = await reasonBody(RQ, flag);
+    const sys = await prompt(body);
+    assert.ok(sys.includes(REASON_SAID), `${JSON.stringify(flag)}: the stated reason is in the prompt`);
+    const env = await envelope({ ...body, debugGenerationId: "g-r" });
+    const server = env?.explicitReason as import("./explicitReason").ServerReasonReport;
+    assert.ok(server.asked && server.sent.some((s) => REASON_SAID.startsWith(s.text.replace(/…$/, ""))), JSON.stringify(server));
+    const rep = cb.buildContextBuilderReport({ question: RQ, turnCount: 1, retrievedMemories: body.retrievedMemories, topicTimeline: (body as { topicTimeline?: unknown }).topicTimeline, persona: "companion", ...(flag as object) }, MIO_POOL);
+    assert.ok(rep.explicitReason.asked);
+    assert.ok(rep.explicitReason.candidates.some((c) => c.sent && REASON_SAID.startsWith(c.text.replace(/…$/, ""))), JSON.stringify(rep.explicitReason));
+    assert.equal(rep.explanations.status, "候補にあり", "the stated reason is a reason / correction of the user");
+    assert.ok(cb.formatContextBuilderReport(rep).includes("■ 質問に答える本人の理由・訂正（端末の判定）"));
+    assert.ok(er.formatServerReasonReport(server).includes("サーバーが受け取った値"));
+    // the AI's summary of the same record does not stand in for the user's words: both are there, apart
+    const r0 = (body.retrievedMemories as RetrievedMemory[]).find((m) => m.id === "mio-r");
+    assert.ok(r0, "the record with the stated reason is retrieved");
+    assert.equal(r0?.quote, REASON_SAID, "Retrieval carries the stated reason as the user's sentence");
+  }
+  // no stated reason anywhere: the report says so (no reason is made up)
+  const q2 = "以前、映画を見たと言ったのは、どういう理由だったっけ？";
+  const body2 = await reasonBody(q2);
+  const rep2 = cb.buildContextBuilderReport({ question: q2, turnCount: 1, retrievedMemories: body2.retrievedMemories, topicTimeline: (body2 as { topicTimeline?: unknown }).topicTimeline, persona: "companion" }, MIO_POOL);
+  assert.equal(rep2.explicitReason.candidates.length, 0, JSON.stringify(rep2.explicitReason));
+  assert.ok(cb.formatContextBuilderReport(rep2).includes("候補に無し（話題の語"));
+});
+
+test("21 the eight survey cases keep their evidence (no reason question but one: the same Topic Timeline choice as before)", async () => {
+  for (const c of CASES) {
+    const input = await bodyFor(c);
+    for (const t of (input.topicTimeline as { events: import("./topicEvent").TopicTimelineEntry[] }[] | null) ?? []) {
+      const plain = te.selectTimelineEventsForBudget(t.events, 5);
+      const now = te.selectTimelineEventsForBudget(t.events, 5, c.q);
+      if (!er.reasonFocusOf(c.q)) assert.deepEqual(now, plain, `${c.q}: as before`);
+      else assert.equal(now.length, plain.length, `${c.q}: the same budget`);
+    }
+  }
+});
+
+test("22 review fixes: the user's repeated question is not a reason; a later correction wins over an older statement with more topic words; everyday past-tense talk is not a reason question; the reason quote takes the per-turn quote slots first", () => {
+  const focus = er.reasonFocusOf(RQ)!;
+  // the same question asked again in an earlier conversation (「〜って言ったのは」 is also a correction form): never the user's reason
+  const REPEAT = "前に未来がないって言ったのは、なんでだっけ？";
+  assert.equal(er.reasonAnswerScore(REPEAT, focus), 0, "a question is not a reason");
+  const repeatOnly = withEvents(mem("rep-1", "2026-11-12", "未来がない理由をもう一度聞いた", ["未来"], { quotes: [REPEAT] }), [["2026-11-12", REPEAT]]);
+  assert.equal(er.reasonSentenceOf(repeatOnly, focus), undefined, "only the repeated question: no reason");
+  const repeatAfter = withEvents(mem("rep-2", "2026-11-12", "未来の話", ["未来"], { quotes: [REASON_SAID, REPEAT] }), [["2026-11-09", REASON_SAID], ["2026-11-12", REPEAT]]);
+  assert.equal(er.reasonSentenceOf(repeatAfter, focus), REASON_SAID, "the stated reason, not the later question");
+  // a tentative reason of the user's own stays a reason
+  assert.ok(er.reasonAnswerScore("未来がないのは、年齢が離れているからかな", focus) > 0);
+  assert.ok(er.reasonAnswerScore("なぜなら、未来がないと思ったのは転勤するからだ。", focus) > 0);
+  // two topic words: an older statement naming both does not beat a newer correction naming one
+  const q2 = "以前、仕事の未来がないと言ったのは、どういう理由だったっけ？";
+  const f2 = er.reasonFocusOf(q2)!;
+  assert.deepEqual([...f2.terms].sort(), ["仕事", "未来"].sort(), JSON.stringify(f2));
+  const OLD2 = "仕事に未来がないのは、給料が低いからだ。";
+  const NEW2 = "本当は、未来がないと言ったのは、部署がなくなるからだった。";
+  const job = withEvents(mem("job-1", "2026-11-01", "仕事の未来の話", ["仕事", "未来"], { quotes: [OLD2, NEW2] }), [["2026-09-01", OLD2], ["2026-11-01", NEW2]]);
+  assert.equal(er.reasonSentenceOf(job, f2), NEW2, "the later correction wins");
+  // everyday talk in the past tense, なんでも / なぜか: not a reason question (as before)
+  for (const q of ["なんで今日こんなに緊張したんだろう", "なんでイライラしたんだろう", "前に話した旅行の件、なんでもいいから教えて", "なぜか前に行ったカフェを思い出した"]) assert.equal(er.reasonFocusOf(q), null, q);
+  assert.ok(er.reasonFocusOf("前に転職したいと言ったのはなぜ？"), "a reason question about something said before");
+  // the per-turn quote limit: the quote stating the reason takes a slot first; other questions as before
+  const four = [{ id: "a", quote: "車が欲しい。" }, { id: "b", quote: "レゴを作った。" }, { id: "c", quote: "映画を見た。" }, { id: "d", quote: REASON_SAID }];
+  const limited = mc.limitMemoryQuotes(four, RQ);
+  assert.equal(limited.find((m) => m.id === "d")?.quote, REASON_SAID, "the reason quote is kept");
+  assert.equal(limited.filter((m) => m.quote).length, 3, "the same limit");
+  assert.equal(limited.find((m) => m.id === "c")?.quote, undefined, "the last ordinary quote gives its slot");
+  assert.deepEqual(mc.limitMemoryQuotes(four, "前にどんな車が欲しいと言った？"), mc.limitMemoryQuotes(four), "other questions: as before");
 });

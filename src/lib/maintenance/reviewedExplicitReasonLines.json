@@ -1,0 +1,22 @@
+{
+"note": "Reviewed (P1-H explicit reasons): for a question asking the reason of something said before, the chat route passes the user's message to the Topic Timeline budget (explicitReason.ts keeps the event that states the reason, the oldest and the latest stay) and, only with the debug id, reports which of the user's reasons / corrections the prompt carries; the chat screen keeps that report in the tab's memory. Exact added / removed lines of ChatScreen.tsx and the chat route only (never a pattern).",
+"lines": [
+"+import { serverReasonReport } from \"@/lib/explicitReason\";",
+"-function buildTopicTimelineSection(timelines: TopicTimeline[]): string {",
+"+function buildTopicTimelineSection(timelines: TopicTimeline[], question: string): string {",
+"-const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic)",
+"+const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, question)",
+"-const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : []).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));",
+"+const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : [], latestUserMessage).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));",
+"-const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline);",
+"+const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline, latestUserMessage);",
+"-events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic),",
+"+events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, latestUserMessage),",
+"-topicTimeline: sanitizedTopicTimeline.map((timeline) => ({ topicId: timeline.topicId, events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic) })),",
+"+topicTimeline: sanitizedTopicTimeline.map((timeline) => ({ topicId: timeline.topicId, events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, latestUserMessage) })),",
+"+// P1-H：理由を尋ねる質問のとき、実際のプロンプトに入った本人の理由・訂正（Retrievalの一文・経緯の逐語）",
+"+explicitReason: serverReasonReport(latestUserMessage, promptMemories, topicTimelineSection ? sanitizedTopicTimeline.flatMap((timeline) => selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, latestUserMessage)) : []),",
+"-if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport, debugEnvelope.contextDedupe ?? null);",
+"+if (contextBuilderReport) rememberContextBuilderReport(aiTurn.timestamp, contextBuilderReport, debugEnvelope.contextDedupe ?? null, debugEnvelope.explicitReason ?? null);"
+]
+}
