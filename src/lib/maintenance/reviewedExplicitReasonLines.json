@@ -6,6 +6,8 @@
 "+function buildTopicTimelineSection(timelines: TopicTimeline[], question: string): string {",
 "-const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic)",
 "+const eventLines = selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic, question)",
+"-const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : []).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));",
+"+const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : [], latestUserMessage).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));",
 "-const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline);",
 "+const topicTimelineSection = buildTopicTimelineSection(sanitizedTopicTimeline, latestUserMessage);",
 "-events: selectTimelineEventsForBudget(timeline.events, TOPIC_TIMELINE_BUDGET.maxEventsPerTopic),",

@@ -1172,7 +1172,7 @@ export async function retrieveRelevantMemoriesImpl(
   const trimmed = queryText.trim();
   if (!trimmed) return [];
   const context = options.includeContext ? [trimmed, ...(options.recentUserTurnsTexts ?? []).slice(-3)] : undefined;
-  const withContext = (memories: RetrievedMemory[]) => (context ? limitMemoryQuotes(memories) : memories);
+  const withContext = (memories: RetrievedMemory[]) => (context ? limitMemoryQuotes(memories, trimmed) : memories);
 
   // クリエイト（analyst）だけ別ロジックへ委譲する。companion/coachはこの下の
   // 既存ロジックをそのまま通る（挙動は一切変えていない）。

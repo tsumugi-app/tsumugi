@@ -992,7 +992,7 @@ export async function POST(request: Request) {
   // Explicit Memory Searchの結果にあるMemoryは、通常のRetrieved Memoriesから外す（同じMemoryを要約だけで二重に渡さない）。
   const sanitizedExplicitSearch = sanitizeExplicitSearchContext(explicitSearch);
   const explicitSearchIds = new Set((sanitizedExplicitSearch?.results ?? []).map((memory) => memory.id));
-  const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : []).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));
+  const retrievedForContext = sanitizeMemoryContext(Array.isArray(retrievedMemories) ? retrievedMemories : [], latestUserMessage).filter((memory) => memory.isOriginMemory === true || !explicitSearchIds.has(memory.id));
   const memoriesForContext = searchNeeded
     ? retrievedForContext
     : retrievedForContext.filter(

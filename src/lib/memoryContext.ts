@@ -14,7 +14,7 @@
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
 import { isAllowedTrait } from "./recordRelevance";
-import { reasonFocusOf, reasonSentenceOf } from "./explicitReason";
+import { reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -88,11 +88,17 @@ export function memoryContextOf(memory: MemoryObject, conversationTexts: string[
   return { ...(persons.length > 0 ? { persons } : {}), ...(quote ? { quote } : {}) };
 }
 
-/** the per-turn quote limit, in the order of the selection (earlier selections first) */
-export function limitMemoryQuotes<T extends Pick<RetrievedMemory, "quote">>(memories: T[]): T[] {
-  let used = 0;
+/**
+ * the per-turn quote limit, in the order of the selection (earlier selections first). P1-H: when the question asks the reason of something
+ * said before, the quotes that state that reason (or correct it) take the slots first; the limit itself is the same. Other questions: as before.
+ */
+export function limitMemoryQuotes<T extends Pick<RetrievedMemory, "quote">>(memories: T[], question = ""): T[] {
+  const focus = reasonFocusOf(question);
+  const answers = focus ? memories.filter((m) => m.quote && reasonAnswerScore(m.quote, focus) > 0).slice(0, MEMORY_CONTEXT_MAX_QUOTES) : [];
+  let used = answers.length;
   return memories.map((memory) => {
     if (!memory.quote) return memory;
+    if (answers.includes(memory)) return memory;
     if (used < MEMORY_CONTEXT_MAX_QUOTES) {
       used += 1;
       return memory;
@@ -104,7 +110,7 @@ export function limitMemoryQuotes<T extends Pick<RetrievedMemory, "quote">>(memo
 }
 
 /** the chat route's check of what a client sent (the request body is not trusted): strings only, the same limits as above */
-export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[]): T[] {
+export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[], question = ""): T[] {
   const cleaned = memories.map((memory) => {
     const out: RetrievedMemory = { ...memory };
     delete out.quote;
@@ -120,7 +126,7 @@ export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[]):
     if (isAllowedTrait(memory.trait, persons)) out.trait = memory.trait;
     return out as T;
   });
-  return limitMemoryQuotes(cleaned);
+  return limitMemoryQuotes(cleaned, question);
 }
 
 /** an outside fact that changes over time (always kept out of a turn without web search, as before) */

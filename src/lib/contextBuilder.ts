@@ -304,7 +304,7 @@ export function collectContextUnits(input: ContextBuilderInput, memories: readon
   const searchNeeded = needsWebSearch(input.question ?? "", input.turnCount > 1) && analytics === null;
   const explicit = sanitizeExplicitSearchContext(body.explicitSearch);
   const explicitIds = new Set((explicit?.results ?? []).map((m) => m.id));
-  const retrievedForContext = sanitizeMemoryContext(Array.isArray(body.retrievedMemories) ? (body.retrievedMemories as RetrievedMemory[]) : []).filter((m) => m.isOriginMemory === true || !explicitIds.has(m.id));
+  const retrievedForContext = sanitizeMemoryContext(Array.isArray(body.retrievedMemories) ? (body.retrievedMemories as RetrievedMemory[]) : [], input.question ?? "").filter((m) => m.isOriginMemory === true || !explicitIds.has(m.id));
   const memoriesForContext = searchNeeded ? retrievedForContext : retrievedForContext.filter((m) => m.isOriginMemory === true || !isTimeDependentMemory(m)).map(withoutOutsideFactQuote);
   const sentRetrieved = Array.isArray(body.retrievedMemories) ? body.retrievedMemories.length : 0;
   // 段階2-A：the route's reduction of exact duplicates (the same function); with the flag ON the current input is what remains after it

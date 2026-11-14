@@ -16,9 +16,12 @@ const norm = (t: string) => (t ?? "").normalize("NFKC");
 const len = (t: string) => Array.from(t ?? "").length;
 
 /** asking why (理由・なぜ・どうして・なんで) */
-export const REASON_ASK = /理由|なぜ|何故|どうして|なんで|わけは|訳は/;
-/** looking back at what the user said / thought / did (not a question about now) */
-const PAST_ASK = /前に|以前|過去|これまで|今まで|昔|当時|っけ|(?:言っ|話し|思っ|考え|作っ|決め|し|行っ|買っ|やめ|辞め)た(?!い|く|が)|ていた|てた(?!い)|でいた/;
+export const REASON_ASK = /理由|なぜ(?!か)|何故(?!か)|どうして|なんで(?!も)|わけは|訳は/;
+/**
+ * looking back at what the user said / thought / decided (the anchors and verbs of recallQuestion.ts): not a bare past tense
+ * (「なんで緊張したんだろう」「なんでイライラしたんだろう」 are everyday talk, not a question about the user's earlier words)
+ */
+const PAST_ASK = /前に|以前|過去|これまで|今まで|昔|当時|っけ|(?:言っ|話し|思っ|考え|書い|決め|選ん)(?:た(?!い|く|が)|てた(?!い)|ていた)/;
 /** words that are not a topic of their own (the question's form, time words, reason words) */
 const NOT_A_TOPIC = /^(?:話|理由|考え|考え方|関係|気持ち|前|以前|過去|最近|今|昔|当時|何|こと|もの|自分|私|僕|俺|どう|なぜ|何故|件|例|先日|先週|今週|来週|先月|今月|来月|去年|昨年|今年|来年|昨日|一昨日|今日|明日|週末|前回|毎日|毎週|朝|昼|夜|午前|午後|言|意味|訳)$/;
 
@@ -35,13 +38,21 @@ export function reasonFocusOf(question: string): ReasonFocus | null {
   return terms.length > 0 ? { terms: [...new Set(terms)] } : null;
 }
 
+/**
+ * a question, not a statement: it ends with ？／っけ／かしら, or its last clause is an unanswered 「なんで〜」 (「なんでだったか」).
+ * A tentative reason of the user's own (「年齢が離れているからかな」「〜だからだろう」) is a statement, not a question.
+ */
+const QUESTION_END = /(?:[?？]|っけ|かしら)[。！!…\s]*$|(?:なぜ|何故|どうして|なんで)(?!か|も|なら)[^、,。]*$/;
+export const isQuestionText = (text: string) => QUESTION_END.test(norm(text).trim());
+
 /** the user's words in the form of a reason or a correction */
 export const isExplanationText = (text: string) => REASON_FORM.test(norm(text)) || CORRECTION_FORM.test(norm(text));
 
 /** how well one of the user's sentences answers the question: 0 = it does not (no reason / correction form, or none of the topic words) */
 export function reasonAnswerScore(sentence: string, focus: ReasonFocus): number {
   const s = norm(sentence);
-  if (!isExplanationText(s)) return 0;
+  // the user's own question (「前に未来がないって言ったのは、なんでだっけ？」 asked again) is not a reason, even in the form 「〜って言ったのは」
+  if (isQuestionText(s) || !isExplanationText(s)) return 0;
   const named = focus.terms.filter((term) => s.includes(term)).length;
   return named > 0 ? named : 0;
 }
@@ -58,8 +69,9 @@ export interface ReasonSource {
 }
 
 /**
- * the user's sentence of one record that answers the question best: the most topic words, then the newest (a later correction wins over an
- * earlier statement), then the first written. Only the user's own words (evidenceQuotes, topicEvents); undefined when none answers.
+ * the user's sentence of one record that answers the question: the newest (a later correction wins over an earlier statement, even one that
+ * names more of the topic words), then the most topic words, then the first written. Only the user's own words (evidenceQuotes, topicEvents;
+ * evidenceQuotes carry no time and come after dated events); undefined when none answers.
  */
 export function reasonSentenceOf(memory: ReasonSource, focus: ReasonFocus): string | undefined {
   let best: { text: string; score: number; time: number; order: number } | undefined;
@@ -70,7 +82,7 @@ export function reasonSentenceOf(memory: ReasonSource, focus: ReasonFocus): stri
       const score = reasonAnswerScore(sentence, focus);
       order += 1;
       if (score === 0) continue;
-      if (!best || score > best.score || (score === best.score && time > best.time)) best = { text: sentence, score, time, order };
+      if (!best || time > best.time || (time === best.time && score > best.score)) best = { text: sentence, score, time, order };
     }
   };
   for (const e of memory.topicEvents ?? []) consider(e?.quote, Number.isFinite(Date.parse(e?.statedAt ?? "")) ? Date.parse(e.statedAt) : 0);
@@ -78,8 +90,11 @@ export function reasonSentenceOf(memory: ReasonSource, focus: ReasonFocus): stri
   return best?.text;
 }
 
-/** how many Topic Timeline slots may go to events that answer the question (the oldest and the latest keep the rest) */
-export const REASON_TIMELINE_SLOTS = 2;
+/**
+ * how many Topic Timeline slots may go to events that answer the question (the oldest and the latest keep the rest): only the newest, so an
+ * earlier reason the user later corrected is not brought back into the budget (it stays only where the plain oldest + latest choice has it)
+ */
+export const REASON_TIMELINE_SLOTS = 1;
 
 /** the user's verbatim lines the prompt carries that answer the question (the server's report, only with ?debugLog=1) */
 export interface ServerReasonReport {
