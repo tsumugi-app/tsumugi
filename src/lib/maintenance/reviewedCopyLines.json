@@ -1,0 +1,15 @@
+{
+"note": "Reviewed (copy for device checks): the chat screen passes the question and the answer of an AI turn to its [D] badge (for the short diagnostic copy, ?debugLog=1 only) and shows a 「会話をコピー」 button that copies the current chat's turns as text. Display and copy only: no prompt, Memory, storage or AI change. Exact added / removed lines of ChatScreen.tsx only (never a pattern).",
+"lines": [
+"+import CopyButton from \"./CopyButton\";",
+"+import { formatConversationForCopy } from \"@/lib/conversationCopy\";",
+"-{turn.role === \"ai\" && <GenerationDebugBadge turnTimestamp={turn.timestamp} />}",
+"+{turn.role === \"ai\" && <GenerationDebugBadge turnTimestamp={turn.timestamp} question={conversation.turns.slice(0, index).reverse().find((t) => t.role === \"user\")?.content ?? \"\"} answer={turn.content} />}",
+"+",
+"+{conversation.turns.length > 0 && !busy && (",
+"+<div className=\"flex justify-end\">",
+"+<CopyButton label=\"会話をコピー\" testId=\"conversation-copy\" build={() => formatConversationForCopy(conversation.turns, { diaryDate: conversation.realtimeDiary?.date })} className=\"rounded-full border border-stone-300/70 px-4 py-2 text-xs text-stone-500 transition hover:border-stone-500 hover:text-stone-700 dark:border-stone-700/70 dark:text-stone-400 dark:hover:border-stone-400 dark:hover:text-stone-200\" />",
+"+</div>",
+"+)}"
+]
+}
