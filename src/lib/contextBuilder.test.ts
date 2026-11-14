@@ -743,3 +743,126 @@ test("22 review fixes: the user's repeated question is not a reason; a later cor
   assert.equal(limited.find((m) => m.id === "c")?.quote, undefined, "the last ordinary quote gives its slot");
   assert.deepEqual(mc.limitMemoryQuotes(four, "前にどんな車が欲しいと言った？"), mc.limitMemoryQuotes(four), "other questions: as before");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// 段階2-B：関連性の分類（診断専用）。A 直接根拠／B 関連する文脈／C 関連性の低い補助情報。実際の入力は変えない
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+const CASES_2B: Case[] = [
+  { q: "未来がないと言った理由は？", needed: ["k3"], key: ["k3"], why: "本人の理由", earlier: ["咲さんのことを少し話したい"] },
+  { q: "以前、長男がレゴで何を作っていたっけ？", needed: ["s1"], key: [], why: "人物の行動" },
+  { q: "以前どんな車がいいと言っていた？", needed: ["c1", "c2", "c3"], key: [], why: "本人の希望" },
+  { q: "咲さんとの関係について考え方はどう変わった？", needed: ["k1", "k2", "k5"], key: ["k3", "k5"], why: "考え方の変化" },
+  { q: "最近、自分はどんなことに悩んでいる？", needed: [], key: [], why: "漠然とした振り返り" },
+  { q: "以前話したことと今の考えは違う？", needed: [], key: [], why: "変化（話題なし）" },
+  { q: "それって、なんでだったっけ？", needed: [], key: [], why: "人物・話題を省いた継続", earlier: ["咲さんとの関係に未来がないと言ったことを話したい"] },
+  { q: "以前、カフェに行ったのはなぜだっけ？", needed: [], key: [], why: "理由が存在しない" },
+];
+const isAi = (kind: string) => kind === "AIの要約" || kind === "AIの仮説";
+const COURSE_ROUTES_T = ["Topic Timeline", "Memory Timeline", "Memory Synthesis", "Topic Continuity"];
+
+test("23 stage 2-B: the eight cases are classified A / B / C; reasons are never C; no AI text is direct evidence; the course of things is never low; nothing is made up (table)", async () => {
+  const rows = ["| 質問 | 種類 | 現行 | A 直接根拠 | B 関連する文脈 | C 関連性の低い補助情報 | 仮にCを省いた場合 | 保護された根拠 | 省略候補 |", "|---|---|---|---|---|---|---|---|---|"];
+  for (const c of CASES_2B) {
+    const input = await bodyFor(c);
+    const rep = cb.buildContextBuilderReport(input, POOL);
+    const rel = rep.relevance;
+    const cls = (name: string) => rel.classes.find((x) => x.relevance === name)!;
+    // the classes cover the current input exactly; C assumed away is the rest
+    assert.equal(rel.classes.reduce((n, x) => n + x.count, 0), rep.totals.current.count, c.q);
+    assert.equal(rel.withoutLow.chars + rel.omitCandidates.reduce((n, o) => n + o.chars, 0), rep.totals.current.chars, c.q);
+    // the user's reasons / corrections are never low; an AI summary / hypothesis is never direct evidence
+    assert.equal(rel.reasons.low, 0, `${c.q}: a reason / correction is protected`);
+    for (const d of rep.decisions) {
+      if (d.explanation) assert.notEqual(d.relevance, "関連性の低い補助情報", `${c.q}: ${d.text}`);
+      if (isAi(d.kind)) assert.notEqual(d.relevance, "直接根拠", `${c.q}: AI text is not direct evidence: ${d.text}`);
+      if (d.personLine) assert.notEqual(d.relevance, "関連性の低い補助情報", `${c.q}: a person line is kept`);
+      if (d.route === "Recent Conversation") assert.notEqual(d.relevance, "関連性の低い補助情報");
+      if (rep.question.types.some((t) => t === "変化" || t === "振り返り") && COURSE_ROUTES_T.includes(d.route)) assert.notEqual(d.relevance, "関連性の低い補助情報", `${c.q}: the course of things is context: ${d.text}`);
+      if (rep.question.types.length === 1 && rep.question.types[0] === "日常" && (d.route === "Retrieval" || d.route === "Topic Timeline")) assert.notEqual(d.relevance, "関連性の低い補助情報", `${c.q}: a natural link to the past`);
+    }
+    // a question that cannot be read: nothing is low (the safe side)
+    if (rep.question.fallback || !rep.question.judgeable) assert.equal(cls("関連性の低い補助情報").count, 0, `${c.q}: unreadable → no C`);
+    // the needed records stay outside C (their user's words at least)
+    for (const id of c.needed) {
+      const pieces = rep.decisions.filter((d) => d.memoryIds.includes(id));
+      if (pieces.length > 0) assert.ok(pieces.some((d) => d.relevance !== "関連性の低い補助情報"), `${c.q}: ${id} is not all low`);
+    }
+    // the classification changes nothing of stage 1 (the decisions and the virtual input are as they were)
+    assert.ok(rep.decisions.every((d) => (d.decision === "除外") === (d.virtualIndex === null)));
+    const reasons = rep.decisions.filter((d) => d.relevanceWhy.startsWith("本人の明示的な理由・訂正"));
+    rows.push(`| ${c.q}（${c.why}） | ${rep.question.types.join("・")} | ${rep.totals.current.count}件・${rep.totals.current.chars}字 | ${cls("直接根拠").count}件・${cls("直接根拠").chars}字 | ${cls("関連する文脈").count}件・${cls("関連する文脈").chars}字 | ${cls("関連性の低い補助情報").count}件・${cls("関連性の低い補助情報").chars}字 | ${rel.withoutLow.count}件・${rel.withoutLow.chars}字 | ${reasons.length > 0 ? reasons.map((d) => `${d.route} ${d.memoryIds.join(",")}「${d.text}」`).join("／") : "なし"} | ${rel.omitCandidates.length > 0 ? rel.omitCandidates.map((o) => `${o.route}「${o.text}」（${o.why}）`).join("／") : "なし"} |`);
+  }
+  // 1: the stated reason is direct evidence
+  const r1 = cb.buildContextBuilderReport(await bodyFor(CASES_2B[0]), POOL);
+  assert.ok(r1.decisions.some((d) => d.memoryIds.includes("k3") && !isAi(d.kind) && d.relevance === "直接根拠"), "k3's own words are direct evidence");
+  // 2 / 3: the user's words about the topic are direct evidence
+  const r2 = cb.buildContextBuilderReport(await bodyFor(CASES_2B[1]), POOL);
+  assert.ok(r2.decisions.some((d) => d.memoryIds.includes("s1") && d.relevance === "直接根拠"), "s1 (the Lego) is direct evidence");
+  // 8: no reason exists: no reason is presented, nothing made up
+  const r8 = cb.buildContextBuilderReport(await bodyFor(CASES_2B[7]), POOL);
+  assert.equal(r8.decisions.filter((d) => d.relevanceWhy.startsWith("本人の明示的な理由・訂正（質問の話題の語")).length, 0);
+  assert.equal(r8.explicitReason.candidates.length, 0);
+  assert.ok(cb.formatContextBuilderReport(r8).includes("■ 関連性の分類（段階2-B・端末の仮想判定。実際の入力は変えていない"));
+  report(["## 段階2-B：8ケースの分類（架空データ・端末の仮想判定。実際の入力は変えていない）", ...rows]);
+});
+
+test("24 stage 2-B on the device's shape: the stated reason is direct, a later unrelated Topic Timeline line is a low candidate, a line that refers back is context; OFF and ON the same; the prompt is unchanged", async () => {
+  const noise = (id: string, day: string, quote: string, keywords: string[]) => withEvents(mem(id, day, quote, keywords), [[day, quote]]);
+  const LIKE = "彼女のことが好きで、それに未来がないことが苦しい";
+  const STORY = "物語を考えてみようと思う";
+  const SINCE = "2023年の9月からだよ";
+  const REPEAT = "前に未来がないって言ったのは、なんでだっけ？";
+  const NOISE_POOL = [...MIO_POOL, noise("mio-q", "2026-11-12", REPEAT, ["未来"]), noise("mio-l", "2026-11-16", LIKE, ["好き"]), noise("mio-s", "2026-11-17", STORY, ["物語"]), noise("mio-t", "2026-11-18", SINCE, ["時期"])];
+  for (const flag of [{}, { contextDedupe: true }]) {
+    pool = NOISE_POOL;
+    const retrievedMemories = await r.retrieveRelevantMemoriesImpl(RQ, { excludeConversationId: "now", persona: "companion", recentUserTurnsTexts: [RQ], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true });
+    const topicIds = [...new Set(NOISE_POOL.filter((m) => retrievedMemories.some((x) => x.id === m.id)).map((m) => m.topicId).filter((id): id is string => Boolean(id)))];
+    const topicTimeline = te.computeTopicTimelines(NOISE_POOL, topicIds);
+    const body = { persona: "companion", turns: [{ role: "user", content: RQ, timestamp: T }], retrievedMemories, topicTimeline, ...flag };
+    const before = await prompt(body);
+    const rep = cb.buildContextBuilderReport({ question: RQ, turnCount: 1, retrievedMemories, topicTimeline, persona: "companion", ...(flag as object) }, NOISE_POOL);
+    const unit = (text: string, route = "Topic Timeline") => rep.decisions.find((d) => d.route === route && text.startsWith(d.text.replace(/…$/, "")));
+    assert.ok(before.includes(REASON_SAID), "PR #45: the stated reason is in the prompt");
+    assert.equal(unit(REASON_SAID)?.relevance, "直接根拠", JSON.stringify(unit(REASON_SAID)));
+    assert.equal(unit(STORY)?.relevance, "関連性の低い補助情報", JSON.stringify(unit(STORY)));
+    assert.equal(unit(SINCE)?.relevance, "関連性の低い補助情報", JSON.stringify(unit(SINCE)));
+    assert.equal(unit(LIKE)?.relevance, "関連する文脈", JSON.stringify(unit(LIKE)));
+    for (const d of rep.decisions) if (d.text.startsWith(REPEAT.slice(0, 10))) assert.notEqual(d.relevance, "直接根拠", "the repeated question is not evidence");
+    assert.equal(rep.relevance.reasons.status, "保護されている");
+    assert.equal(rep.relevance.reasons.low, 0);
+    assert.ok(rep.relevance.withoutLow.chars < rep.totals.current.chars);
+    // diagnostics only: the prompt with the debug id is the same prompt (nothing removed for real)
+    assert.equal(await prompt({ ...body, debugGenerationId: "g-2b" }), before, "the classification removes nothing from the real prompt");
+    const text = cb.formatContextBuilderReport(rep);
+    assert.ok(text.includes("仮にCを省いた場合") && text.includes("省略候補も実際には送っている"));
+    if (Object.keys(flag).length === 0) report(["## 段階2-B：実機と同じ形（架空データ）", "| 項目 | 分類 | 理由 |", "|---|---|---|", ...[REASON_SAID, LIKE, STORY, SINCE].map((t) => `| ${t} | ${unit(t)?.relevance ?? "（入っていない）"} | ${unit(t)?.relevanceWhy ?? ""} |`), `| 合計 | ${rep.totals.current.count}件・${rep.totals.current.chars}字 → 仮にCを省いた場合 ${rep.relevance.withoutLow.count}件・${rep.relevance.withoutLow.chars}字 | |`]);
+  }
+});
+
+test("25 stage 2-B protections: the repeated question, a pronoun, the course of things, Profile and everyday talk are never low by a word mismatch alone", () => {
+  const unitOf = (text: string, route: import("./contextBuilder").ContextRoute, kind: import("./contextBuilder").UnitKind, explanation = false): import("./contextBuilder").ContextUnit =>
+    ({ index: 0, section: 0, route, part: "p", memoryIds: ["x"], kind, persons: [], text, chars: text.length, explanation, personLine: false, candidate: false, context: [] });
+  const read = (q: string) => cb.readQuestion(q, [], POOL);
+  const held = { decision: "保留" as const, why: "検索で選ばれたが、質問の話題にも人物にも一致しない（会話の広がりとして残す）" };
+  const kept = { decision: "採用" as const, why: "質問の話題に一致" };
+  const qR = read(RQ);
+  const base = { q: qR, everyday: false, personWide: true, focus: er.reasonFocusOf(RQ) };
+  // the repeated question (also a correction form) is not direct evidence
+  assert.notEqual(cb.relevanceOf(unitOf("前に未来がないって言ったのは、なんでだっけ？", "Retrieval", "本人の発言", true), { ...base, relation: "話題", decision: kept }).relevance, "直接根拠");
+  // the stated reason is direct evidence
+  assert.equal(cb.relevanceOf(unitOf(REASON_SAID, "Topic Timeline", "本人の発言", true), { ...base, relation: "話題", decision: kept }).relevance, "直接根拠");
+  // a pronoun: the line may continue what was said before
+  assert.equal(cb.relevanceOf(unitOf("それがずっと引っかかっている", "Topic Timeline", "本人の発言"), { ...base, relation: "なし", decision: held }).relevance, "関連する文脈");
+  // Profile: a reason question keeps the user's situation as background; a plain question may not
+  assert.equal(cb.relevanceOf(unitOf("既婚", "Profile", "プロフィール"), { ...base, relation: "なし", decision: kept }).relevance, "関連する文脈");
+  assert.equal(cb.relevanceOf(unitOf("既婚", "Profile", "プロフィール"), { ...base, relation: "人物", decision: kept }).relevance, "直接根拠");
+  // the course of things: a question about a change keeps the time series
+  const qC = read("咲さんとの関係について考え方はどう変わった？");
+  assert.equal(cb.relevanceOf(unitOf("咲さんとカフェでランチした", "Topic Timeline", "本人の発言"), { q: qC, everyday: false, personWide: true, focus: null, relation: "なし", decision: held }).relevance, "関連する文脈");
+  // everyday talk: a natural link to the past stays
+  const qE = read("なんだか最近疲れる");
+  assert.equal(cb.relevanceOf(unitOf("週末に過去の写真を整理した", "Retrieval", "AIの要約"), { q: qE, everyday: true, personWide: false, focus: null, relation: "なし", decision: { decision: "保留", why: "日常会話：必要以上に過去を押し込まない（消さずに後ろへ）" } }).relevance, "関連する文脈");
+  // an AI hypothesis is never direct evidence, even on the topic
+  assert.notEqual(cb.relevanceOf(unitOf("未来がないのは冷たくされたからかもしれない", "Memory Synthesis", "AIの仮説"), { ...base, relation: "話題", decision: kept }).relevance, "直接根拠");
+});
