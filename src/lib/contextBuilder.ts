@@ -37,7 +37,7 @@ import { sanitizeTopicTimelineContext, selectTimelineEventsForBudget, TOPIC_TIME
 import { isTimeDependentMemory, sanitizeMemoryContext, withoutOutsideFactQuote } from "./memoryContext";
 import { needsWebSearch } from "./needsWebSearch";
 import { stripLeadingTimeLabels } from "./timeLabel";
-import { purposeContextOf, type QuestionPurpose } from "./recordRelevance";
+import { purposeContextOf, textSaysPurpose, type QuestionPurpose } from "./recordRelevance";
 import { questionTopicRuns } from "./recallQuestion";
 import { CORRECTION_FORM, REASON_FORM } from "./personStance";
 import { isQuestionText, reasonAnswerScore, reasonFocusOf, sentencesOf as reasonSentences } from "./explicitReason";
@@ -197,7 +197,7 @@ export interface ContextBuilderReport {
     /** C: what would be left out, and why */
     omitCandidates: { index: number; route: ContextRoute; part: string; kind: UnitKind; memoryIds: string[]; text: string; chars: number; why: string }[];
     /** the user's reasons / corrections of the current input: none is C (protected) */
-    reasons: { status: "保護されている" | "本人の理由・訂正は候補に無し"; direct: number; context: number; low: number; texts: string[] };
+    reasons: { status: "保護されている" | "保護されていない" | "本人の理由・訂正は候補に無し"; direct: number; context: number; low: number; texts: string[] };
   };
   explanations: {
     /** 「候補にあり」 or 「候補に無し」 (never pretended) */
@@ -626,7 +626,7 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     relevanceWhy: relevance[i].why,
   }));
   const classTally = (c: RelevanceClass) => tally(units.filter((_, i) => relevance[i].relevance === c));
-  const reasonUnits = units.map((u, i) => ({ u, c: relevance[i].relevance, why: relevance[i].why })).filter((x) => x.u.explanation || x.why.startsWith(DIRECT_REASON));
+  const reasonUnits = units.map((u, i) => ({ u, c: relevance[i].relevance, why: relevance[i].why })).filter((x) => (x.u.explanation && !isQuestionText(x.u.text)) || x.why.startsWith(DIRECT_REASON));
 
   return {
     question,
@@ -646,9 +646,9 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
     relevance: {
       classes: RELEVANCE_CLASSES.map((c) => ({ relevance: c, ...classTally(c) })),
       withoutLow: tally(units.filter((_, i) => relevance[i].relevance !== "関連性の低い補助情報")),
-      omitCandidates: units.flatMap((u, i) => relevance[i].relevance === "関連性の低い補助情報" ? [{ index: u.index, route: u.route, part: u.part, kind: u.kind, memoryIds: u.memoryIds, text: clip(u.text), chars: u.chars, why: relevance[i].why }] : []),
+      omitCandidates: units.slice(0, CONTEXT_BUILDER_LIMITS.maxDecisions).flatMap((u, i) => relevance[i].relevance === "関連性の低い補助情報" ? [{ index: u.index, route: u.route, part: u.part, kind: u.kind, memoryIds: u.memoryIds, text: clip(u.text), chars: u.chars, why: relevance[i].why }] : []),
       reasons: {
-        status: reasonUnits.length > 0 ? "保護されている" : "本人の理由・訂正は候補に無し",
+        status: reasonUnits.length === 0 ? "本人の理由・訂正は候補に無し" : reasonUnits.some((x) => x.c === "関連性の低い補助情報") ? "保護されていない" : "保護されている",
         direct: reasonUnits.filter((x) => x.c === "直接根拠").length,
         context: reasonUnits.filter((x) => x.c === "関連する文脈").length,
         low: reasonUnits.filter((x) => x.c === "関連性の低い補助情報").length,
@@ -686,12 +686,17 @@ export function buildContextBuilderReport(input: ContextBuilderInput, memories: 
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 const DIRECT_REASON = "本人の明示的な理由・訂正";
-/** a pointer or a pronoun: the piece may continue what was said before even without the question's words (「それが苦しい」「彼女は」) */
-const REFERS_BACK = /それ|あれ|その|あの|この|そう(?:い|だ|な|思)|彼女|彼(?!岸)|あの人|あいつ|向こう/;
+/**
+ * a pointer or a pronoun: the piece may continue what was said before even without the question's words (「それが苦しい」「これがつらい」「彼女は」).
+ * The pointers of DEMONSTRATIVE (stage 1) and the same kind, without the set phrases that point at nothing (それぞれ・それから・あれば・そのまま・このあいだ・この前・あの頃)
+ * and without そう (hearsay / appearance: 楽しそうな).
+ */
+const REFERS_BACK = /それ(?!ぞれ|から|まで)|あれ(?!ば)|その(?!まま|ため|うち|後)|あの(?!頃)|この(?!あいだ|間|前|頃|まま|辺)|これ(?!から|まで)|ここ(?!ろ)|そこ|あそこ|例の|さっき|彼女|彼(?!岸|方|ら)|あの人|あいつ|向こう/;
 /** questions whose answer is the course of things: the time series is context, never low */
 const COURSE: QuestionType[] = ["変化", "振り返り"];
 const COURSE_ROUTES: ContextRoute[] = ["Topic Timeline", "Memory Timeline", "Memory Synthesis", "Topic Continuity"];
 const USERS_OWN: UnitKind[] = ["本人の発言", "後からの本人の説明・訂正"];
+const TYPE_PURPOSE: Partial<Record<QuestionType, "wish" | "change" | "view">> = { 望み: "wish", 変化: "change", 考え: "view" };
 
 interface RelevanceInput {
   relation: UnitRelation;
@@ -706,40 +711,51 @@ export function relevanceOf(u: ContextUnit, x: RelevanceInput): { relevance: Rel
   const A = (why: string) => ({ relevance: "直接根拠" as const, why });
   const B = (why: string) => ({ relevance: "関連する文脈" as const, why });
   const C = (why: string) => ({ relevance: "関連性の低い補助情報" as const, why });
-  const own = USERS_OWN.includes(u.kind) && !u.candidate;
+  // the user's own words (a user's turn of the recent conversation too)
+  const own = (USERS_OWN.includes(u.kind) && !u.candidate) || (u.route === "Recent Conversation" && u.part === "ユーザーの発言");
   // the user's question asked again is not evidence (unless the user asks what they asked)
   const asksAgain = own && isQuestionText(u.text) && !x.q.types.includes("質問の記録");
   const focus = x.focus;
+  const reasonAsked = focus !== null && x.q.types.includes("理由");
   const answersReason = own && focus !== null && reasonSentences(u.text).some((sentence) => reasonAnswerScore(sentence, focus) > 0);
+  const onPoint = x.relation === "話題" || x.relation === "人物";
+  const course = COURSE.some((t) => x.q.types.includes(t)) && COURSE_ROUTES.includes(u.route);
+  const unread = x.q.fallback !== null || x.relation === "判定なし";
 
-  if (x.decision.why.startsWith("完全な重複")) return C("完全な重複（同じ情報が別の節に残る）");
   // A：本人の明示的な理由・訂正は最優先（質問に答えるもの）
   if (answersReason) return A(`${DIRECT_REASON}（質問の話題の語を含む）`);
-  if (u.explanation && !asksAgain && x.relation !== "なし" && (x.focus === null || !x.q.types.includes("理由"))) return A(`${DIRECT_REASON}（質問の話題・人物について）`);
-  if (u.explanation) return B("本人の理由・訂正（この質問に直接は答えないが、消さない）");
-  if (x.q.fallback || x.relation === "判定なし") return B(`質問の話題・人物を読み取れないため、分類しない（${x.q.fallback ?? "現行どおり"}）`);
+  if (u.explanation && !asksAgain) {
+    if (onPoint && !reasonAsked) return A(`${DIRECT_REASON}（質問の${x.relation}について）`);
+    return B(unread ? "本人の理由・訂正（質問の話題・人物を読み取れないため分類しない。消さない）" : "本人の理由・訂正（この質問に直接は答えないが、消さない）");
+  }
+  if (x.decision.why.startsWith("完全な重複")) {
+    if (unread || course) return B(`完全な重複だが、${unread ? "質問の話題・人物を読み取れない" : "経緯・変化を尋ねる質問"}ため分類しない（同じ情報は別の節にもある）`);
+    return C("完全な重複（同じ情報が別の節に残る。段階2-AのONで外すもの）");
+  }
+  if (unread) return B(`質問の話題・人物を読み取れないため、分類しない（${x.q.fallback ?? "現行どおり"}）`);
   if (u.personLine) return B("誰の話かを示す人物の行");
   if (u.route === "Recent Conversation") return B("直前の会話の流れ");
   if (u.route === "Memory Analytics") return A("本人が求めた集計");
-  if (u.route === "Explicit Search") return own ? A("本人が明示的に探した記録の本人の言葉") : B("本人が明示的に探した記録（AIの要約）");
-  if (u.route === "Profile") {
-    if (x.relation === "話題" || x.relation === "人物") return A("質問の話題・人物に関わる本人の前提（属性・状況）");
-    if (x.personWide) return B("理由・望み・変化・考えを尋ねる質問：本人の属性・状況は背景になりうる");
-    if (x.everyday) return B("日常会話：本人の前提");
-    return C("質問の話題・人物に関わらない前提");
+  // 段階1が採用しているもの（Profile・Explicit Searchは常に採用）はCにしない
+  if (u.route === "Profile") return onPoint ? A("質問の話題・人物に関わる本人の前提（属性・状況）") : B("本人の前提（質問によっては背景になる。消さない）");
+  if (u.route === "Explicit Search") {
+    if (own && !asksAgain && !reasonAsked) return A("本人が明示的に探した記録の本人の言葉");
+    return B(asksAgain ? "本人の質問の繰り返し（根拠ではない）" : own ? "本人が探した記録の本人の言葉（理由そのものではない）" : "本人が明示的に探した記録（AIの要約）");
   }
-  // A：質問に答える本人の具体的な発言（AIの要約・仮説は本人の発言より強い根拠にしない）
+  // A：質問に答える本人の具体的な発言（AIの要約・仮説は本人の発言より強い根拠にしない。人物の一致だけでは直接根拠にしない）
   if (own && !asksAgain && x.decision.decision === "採用" && !x.everyday) {
-    if (x.q.types.includes("理由") && x.focus !== null) return B("質問の話題の本人の発言（理由そのものではない）");
+    if (reasonAsked) return B("質問の話題の本人の発言（理由そのものではない）");
     if (x.relation === "話題") return A("質問の話題についての本人の発言");
-    if (x.relation === "人物" && x.personWide) return A("質問の人物について、目的（理由・望み・変化・考え）に関わる本人の発言");
+    const purposes = x.q.types.map((t) => TYPE_PURPOSE[t]).filter((p): p is "wish" | "change" | "view" => p !== undefined);
+    if (x.relation === "人物" && purposes.some((p) => textSaysPurpose(u.text, p))) return A(`質問の人物について、目的（${x.q.types.join("・")}）を述べた本人の発言`);
+    if (x.relation === "人物") return B("質問の人物の本人の発言（人物の一致だけでは直接根拠にしない）");
   }
-  if (asksAgain) return x.decision.decision === "採用" ? B("本人の質問の繰り返し（根拠ではない）") : C("本人の質問の繰り返しで、質問の話題・人物にも一致しない");
-  if (x.decision.decision === "採用") return B(u.kind === "AIの仮説" ? "AIの仮説（本人の言葉ではない。根拠にしない）" : u.kind === "AIの要約" ? "質問に関わるAIの要約（本人の発言より弱い根拠）" : "質問に関わる記録");
-  // 以下は段階1が「保留」「除外」としたもの：保護に当たらなければC
-  if (COURSE.some((t) => x.q.types.includes(t)) && COURSE_ROUTES.includes(u.route)) return B("経緯・変化を尋ねる質問：時系列として残す");
+  if (x.decision.decision === "採用") return B(asksAgain ? "本人の質問の繰り返し（根拠ではない）" : u.kind === "AIの仮説" ? "AIの仮説（本人の言葉ではない。根拠にしない）" : u.kind === "AIの要約" ? "質問に関わるAIの要約（本人の発言より弱い根拠）" : "質問に関わる記録");
+  // 以下は段階1が「保留」としたもの：保護に当たらなければC
+  if (course) return B("経緯・変化を尋ねる質問：時系列として残す");
   if (REFERS_BACK.test(norm(u.text))) return B("指示語・代名詞で前の話を受けている可能性（語が一致しなくても消さない）");
-  if (x.everyday && (u.route === "Retrieval" || u.route === "Topic Timeline")) return B("日常会話：過去との自然なつながり");
+  if (x.everyday && (u.route === "Retrieval" || u.route === "Reflection" || u.route === "Topic Timeline")) return B("日常会話：過去との自然なつながり");
+  if (asksAgain) return C("本人の質問の繰り返しで、今回の質問への貢献が小さい");
   return C(x.decision.why);
 }
 
@@ -813,7 +829,7 @@ export function formatContextBuilderReport(r: ContextBuilderReport): string {
   lines.push("", "■ 関連性の分類（段階2-B・端末の仮想判定。実際の入力は変えていない。省略候補も実際には送っている）");
   for (const c of rel.classes) lines.push(`- ${c.relevance}：${c.count}件・${c.chars}字`);
   lines.push(`- 現行の入力 ${r.totals.current.count}件・${r.totals.current.chars}字 → 仮にCを省いた場合 ${rel.withoutLow.count}件・${rel.withoutLow.chars}字`);
-  lines.push(`- 本人の理由・訂正：${rel.reasons.status === "保護されている" ? `保護されている（直接根拠${rel.reasons.direct}・関連する文脈${rel.reasons.context}・関連性の低い補助情報${rel.reasons.low}）` : "候補に無し（理由は作らない）"}`);
+  lines.push(`- 本人の理由・訂正：${rel.reasons.status === "本人の理由・訂正は候補に無し" ? "候補に無し（理由は作らない）" : `${rel.reasons.status}（直接根拠${rel.reasons.direct}・関連する文脈${rel.reasons.context}・関連性の低い補助情報${rel.reasons.low}）`}`);
   if (rel.omitCandidates.length === 0) lines.push("- 省略候補：なし");
   for (const o of rel.omitCandidates) lines.push(`- 省略候補：${o.route}・${o.part} [${o.kind}] ${o.memoryIds.join(",") || "ID無し"}・${o.chars}字（${o.why}）「${o.text}」`);
   lines.push("", "■ AIの仮説");

@@ -97,6 +97,8 @@ export function actionPersonOf(memory: RelevanceSource): string | null {
 
 const isAboutNamed = (memory: RelevanceSource, ctx: PurposeContext) => personNames(memory).some((name) => ctx.namedPersons.includes(name));
 /** the user's own words (not the AI summary) say this kind of thing */
+/** one text says a wish / a change / a view (the same wording the ranking reads; used by the Context Builder's diagnostics) */
+export const textSaysPurpose = (text: string, purpose: "wish" | "change" | "view") => RECORD_SAYS[purpose].test(norm(text));
 const quotesSay = (memory: RelevanceSource, purpose: "wish" | "change" | "view") => RECORD_SAYS[purpose].test(quoteSentences(memory).join(" "));
 /**
  * pushed back as another person's action: the user's own view / wish / change was asked, the summary opens with another person (not named in the question),

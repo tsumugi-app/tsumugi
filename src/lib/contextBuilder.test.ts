@@ -863,6 +863,19 @@ test("25 stage 2-B protections: the repeated question, a pronoun, the course of 
   // everyday talk: a natural link to the past stays
   const qE = read("なんだか最近疲れる");
   assert.equal(cb.relevanceOf(unitOf("週末に過去の写真を整理した", "Retrieval", "AIの要約"), { q: qE, everyday: true, personWide: false, focus: null, relation: "なし", decision: { decision: "保留", why: "日常会話：必要以上に過去を押し込まない（消さずに後ろへ）" } }).relevance, "関連する文脈");
+  // review fixes: a held repeated question in a change question keeps the course; a reason / correction when the question cannot be read is context;
+  // a repeated question found by an explicit search is not evidence; a person-only match is not direct evidence; set phrases are not pointers
+  assert.equal(cb.relevanceOf(unitOf("咲さんのこと、どう思えばいいんだろう？", "Topic Timeline", "本人の発言"), { q: qC, everyday: false, personWide: true, focus: null, relation: "人物", decision: held }).relevance, "関連する文脈");
+  const qU = read("うん");
+  assert.equal(cb.relevanceOf(unitOf("未来がないのは、自分が既婚者だから。", "Retrieval", "本人の発言", true), { q: qU, everyday: true, personWide: false, focus: null, relation: "判定なし", decision: kept }).relevance, "関連する文脈");
+  assert.notEqual(cb.relevanceOf(unitOf("前に未来がないって言ったのは、なんでだっけ？", "Explicit Search", "本人の発言", true), { ...base, relation: "話題", decision: kept }).relevance, "直接根拠");
+  assert.equal(cb.relevanceOf(unitOf("咲さんとカフェでランチした", "Retrieval", "本人の発言"), { q: qC, everyday: false, personWide: true, focus: null, relation: "人物", decision: kept }).relevance, "関連する文脈", "a person-only match");
+  assert.equal(cb.relevanceOf(unitOf("今は咲さんを友人として大切にしたいと思うようになった", "Retrieval", "本人の発言"), { q: qC, everyday: false, personWide: true, focus: null, relation: "人物", decision: kept }).relevance, "直接根拠", "the person, saying the change asked");
+  const qL = read("以前どんな車がいいと言っていた？");
+  const lowOf = (t: string) => cb.relevanceOf(unitOf(t, "Retrieval", "本人の発言"), { q: qL, everyday: false, personWide: false, focus: null, relation: "なし", decision: held }).relevance;
+  assert.equal(lowOf("時間があれば行きたい"), "関連性の低い補助情報", "あれば is not a pointer");
+  assert.equal(lowOf("それぞれ違う色にした"), "関連性の低い補助情報", "それぞれ is not a pointer");
+  assert.equal(lowOf("これがつらい"), "関連する文脈", "これ points back");
   // an AI hypothesis is never direct evidence, even on the topic
   assert.notEqual(cb.relevanceOf(unitOf("未来がないのは冷たくされたからかもしれない", "Memory Synthesis", "AIの仮説"), { ...base, relation: "話題", decision: kept }).relevance, "直接根拠");
 });
