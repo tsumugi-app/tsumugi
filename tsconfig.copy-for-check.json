@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/copyForCheck.test.ts",
+    "src/lib/debugCopy.ts",
+    "src/lib/conversationCopy.ts",
+    "src/lib/copyText.ts",
+    "src/lib/contextBuilder.ts"
+  ]
+}

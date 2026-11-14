@@ -201,6 +201,8 @@ import ConversationDebugPanel from "./ConversationDebugPanel";
 // 役割はConversationDebugPanel（画面固定の一覧）とは別（AI返答1件ごとの生成contextを
 // そのメッセージの近くで確認する）——削除・統合しない。
 import GenerationDebugBadge from "./GenerationDebugBadge";
+import CopyButton from "./CopyButton";
+import { formatConversationForCopy } from "@/lib/conversationCopy";
 import HistoryPanel from "./HistoryPanel";
 import {
   computeLeafColorProgress,
@@ -6152,7 +6154,7 @@ export default function ChatScreen() {
                   return label && <p data-testid="diary-time" className="pb-2 text-center text-xs text-stone-400 dark:text-stone-500">{label}</p>;
                 })()}
                 <TurnBubble turn={turn} superseded={isSupersededTurn(conversation.turns, index)} />
-                {turn.role === "ai" && <GenerationDebugBadge turnTimestamp={turn.timestamp} />}
+                {turn.role === "ai" && <GenerationDebugBadge turnTimestamp={turn.timestamp} question={conversation.turns.slice(0, index).reverse().find((t) => t.role === "user")?.content ?? ""} answer={turn.content} />}
               </div>
             ))}
 
@@ -6162,6 +6164,12 @@ export default function ChatScreen() {
 
             {busy && !streamingText && waitingMessage && (
               <p className="text-sm text-stone-400 dark:text-stone-500">{waitingMessage}</p>
+            )}
+
+            {conversation.turns.length > 0 && !busy && (
+              <div className="flex justify-end">
+                <CopyButton label="会話をコピー" testId="conversation-copy" build={() => formatConversationForCopy(conversation.turns, { diaryDate: conversation.realtimeDiary?.date })} className="rounded-full border border-stone-300/70 px-4 py-2 text-xs text-stone-500 transition hover:border-stone-500 hover:text-stone-700 dark:border-stone-700/70 dark:text-stone-400 dark:hover:border-stone-400 dark:hover:text-stone-200" />
+              </div>
             )}
           </>
         )}
