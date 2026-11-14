@@ -62,7 +62,7 @@ test("4 from an ON URL to an OFF URL, nothing carries over", () => {
   assert.equal(contextDedupeEnabled(), false);
 });
 
-test("storage unavailable: the URL still decides, and nothing throws; no window (server render): OFF", () => {
+test("5 storage unavailable: the URL still decides, and nothing throws; no window (server render): OFF", () => {
   fakeWindow("?contextDedupe=1", new Map(), true);
   assert.equal(contextDedupeEnabled(), true);
   fakeWindow("", new Map(), true);
