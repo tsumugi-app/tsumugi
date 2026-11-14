@@ -28,7 +28,7 @@ export function formatConversationForCopy(
   opts: { diaryDate?: string; stamp?: (iso: string | undefined) => LocalStamp | null } = {},
 ): string {
   const stamp = opts.stamp ?? localStamp;
-  const lines: string[] = ["【会話ログ】", "（日時は発言した日時。話の中の出来事の日時ではない）"];
+  const lines: string[] = ["【会話ログ】", "（日時は発言した日時で、この端末の現地時刻。話の中の出来事の日時ではない）"];
   if (opts.diaryDate) lines.push(`リアルタイム日記の日付：${opts.diaryDate}`);
   let day = "";
   const list = [...turns];
@@ -36,11 +36,11 @@ export function formatConversationForCopy(
     const s = stamp(turn.timestamp);
     if (s && s.date !== day) {
       day = s.date;
-      lines.push("", s.date);
+      lines.push("", `■ ${s.date}`);
     }
     const who = turn.role === "user" ? "ユーザー" : "Tsumugi";
     const marks = [s ? s.time : "", isSupersededTurn(list, index) ? "途中で止まり、再生成された返答" : turn.interrupted ? "途中で止まった返答" : ""].filter(Boolean);
-    lines.push(`${who}${marks.length > 0 ? `（${marks.join("・")}）` : ""}：`, turn.content);
+    lines.push("", `${who}${marks.length > 0 ? `（${marks.join("・")}）` : ""}：`, turn.content);
   });
   return lines.join("\n");
 }

@@ -58,9 +58,9 @@ const len = (t: string) => Array.from(t).length;
 
 test("1 the short diagnostic copy carries what a check needs, apart: the question and the answer in full, the model, the counts, A / B / C, the reasons, C with its reasons, dedupe, the server's real input and the client's virtual judgement", () => {
   const text = dc.formatDebugCopy({ question: Q, answer: ANSWER, generationId: "gen-1", generation, serverAccepted: server, builder: builder() });
-  for (const s of [Q, ANSWER, "Generation ID：gen-1", "gemini / gemini-test", "maxOutputTokens：2048", "Retrieval 2件", "Topic Timeline（経緯の発言）4件",
+  for (const s of [Q, ANSWER, "Generation ID：gen-1", "gemini / gemini-test", "maxOutputTokens：2048", "Retrieval 2件", "Topic Timeline（経緯の発言） 4件",
     "■ サーバーが受け取った値（実際の入力）", "■ 端末の仮想判定（Context Builder。実際の入力は変えていない）", "直接根拠", "関連する文脈", "関連性の低い補助情報",
-    "仮にCを省いた場合", "本人の理由・訂正（実際のプロンプト）：話題の語 未来　入った1件", "重複の削減：OFF", "■ Cに分類された項目", "■ 警告・取りこぼし"]) assert.ok(text.includes(s), `missing: ${s}\n${text}`);
+    "仮にCを省いた場合", "本人の理由・訂正（実際のプロンプト）：話題の語 未来　入った1件", "重複の削減：OFF", "■ Cに分類された項目", "■ 警告・取りこぼし・注記"]) assert.ok(text.includes(s), `missing: ${s}\n${text}`);
   // C with its reason (the unrelated Topic Timeline line of the device's shape)
   assert.ok(/■ Cに分類された項目[\s\S]*物語を考えてみようと思う/.test(text), text);
   // the stated reason, as the user said it, with whether it is sent
@@ -84,12 +84,28 @@ test("2 over the target: the lists get shorter, and what was left out is said (c
   const long = "とても長い返答。".repeat(1500);
   const t2 = dc.formatDebugCopy({ question: Q, answer: long, generationId: "gen-3", generation, serverAccepted: server, builder: b });
   assert.ok(t2.includes(long), "the whole answer");
-  assert.match(t2, /目標の8000字を超えた。質問・返答は全文のまま/);
+  assert.match(t2, /目標の8000字を超えた。質問・返答・警告は全文のまま/);
+});
+
+test("2b the server's real input comes before the client's virtual judgement; reasons are shortened only after the C items; the provenance counts name Memory Graph", () => {
+  const b = builder();
+  b.report.relevance.omitCandidates = Array.from({ length: 300 }, (_, k) => ({ index: k, route: "Retrieval" as const, part: "要約", kind: "AIの要約" as const, memoryIds: [`m${k}`], text: `関係の薄い記録その${k}の長めの説明文。`.repeat(3), chars: 60, why: "質問の話題にも人物にも一致しない" }));
+  const text = dc.formatDebugCopy({ question: Q, answer: ANSWER, generationId: "gen-5", generation, serverAccepted: server, serverRouteCounts: { "Memory Graph": 4, "Memory Timeline": 2 }, builder: b });
+  const at = (s: string) => text.indexOf(s);
+  assert.ok(at("■ サーバーが受け取った値") < at("■ 実際のプロンプトに入った本人の理由・訂正（サーバー）"));
+  assert.ok(at("■ 実際のプロンプトに入った本人の理由・訂正（サーバー）") < at("■ 端末の仮想判定"), "server lists stay under the server heading");
+  assert.ok(text.includes("Memory Graph（由来の項目） 4件") && text.includes("Memory Timeline（由来の項目） 2件"));
+  assert.ok(text.includes(`「${REASON}」`), "the user's reason in full, though the C list was cut");
+  assert.match(text, /省略：Cの項目 \d+件/);
+  assert.ok(!/省略：[^）]*理由・訂正の候補/.test(text), "the reasons are not cut while the C items can be");
+  assert.ok(len(text) <= dc.DEBUG_COPY_TARGET_CHARS);
 });
 
 test("3 no Context Builder record (after a reload): said so, the rest is still there", () => {
   const text = dc.formatDebugCopy({ question: Q, answer: ANSWER, generationId: "gen-4", generation, serverAccepted: server, builder: null });
   assert.ok(text.includes("記録なし（このタブで送ったターンだけ。再読み込みの後は無い）"));
+  assert.ok(text.includes("重複の削減：不明（このタブの記録なし）") && text.includes("本人の理由・訂正（実際のプロンプト）：不明"), "said unknown, not omitted");
+  assert.ok(text.includes("Memory Graph・Memory Timeline・Synthesis・Reflection の件数：このタブの記録なし"));
   assert.ok(text.includes(ANSWER) && text.includes("Retrieval 2件"));
 });
 
@@ -103,13 +119,13 @@ test("4 the conversation copy: the current chat's turns in order, word for word,
   ];
   const text = cc.formatConversationForCopy(turns, { stamp });
   assert.equal(text, [
-    "【会話ログ】", "（日時は発言した日時。話の中の出来事の日時ではない）",
-    "", "2026-11-15",
-    "ユーザー（09:00）：", Q,
-    "Tsumugi（09:00・途中で止まり、再生成された返答）：", "途中まで",
-    "Tsumugi（09:00）：", ANSWER,
-    "", "2026-11-16",
-    "ユーザー（08:00）：", "ありがとう。\n2行目もそのまま。",
+    "【会話ログ】", "（日時は発言した日時で、この端末の現地時刻。話の中の出来事の日時ではない）",
+    "", "■ 2026-11-15",
+    "", "ユーザー（09:00）：", Q,
+    "", "Tsumugi（09:00・途中で止まり、再生成された返答）：", "途中まで",
+    "", "Tsumugi（09:00）：", ANSWER,
+    "", "■ 2026-11-16",
+    "", "ユーザー（08:00）：", "ありがとう。\n2行目もそのまま。",
   ].join("\n"));
   assert.ok(!text.includes("Generation") && !text.includes("{"), "no diagnostics, no JSON");
   // a realtime diary: its date is apart from the times said
@@ -117,12 +133,8 @@ test("4 the conversation copy: the current chat's turns in order, word for word,
   // a long conversation: every turn, in order
   const longTurns: ConversationTurn[] = Array.from({ length: 600 }, (_, k) => ({ role: k % 2 === 0 ? "user" : "ai", content: `発言${k}`, timestamp: new Date(Date.UTC(2026, 10, 15, 0, 0, k)).toISOString() }));
   const longText = cc.formatConversationForCopy(longTurns, { stamp });
-  let at = -1;
-  for (let k = 0; k < 600; k++) {
-    const next = longText.indexOf(`\n発言${k}\n`, at + 1) >= 0 ? longText.indexOf(`\n発言${k}\n`, at + 1) : longText.indexOf(`\n発言${k}`, at + 1);
-    assert.ok(next > at, `turn ${k} in order`);
-    at = next;
-  }
+  const said = longText.split("\n").filter((l) => /^発言\d+$/.test(l));
+  assert.deepEqual(said, longTurns.map((t) => t.content), "every turn, once, in order");
   // a turn without a valid time: no made-up date
   assert.ok(cc.formatConversationForCopy([{ role: "user", content: "こんにちは", timestamp: "" }]).endsWith("ユーザー：\nこんにちは"));
 });
