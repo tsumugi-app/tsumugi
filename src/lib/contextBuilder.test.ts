@@ -586,10 +586,22 @@ test("16 the flag: default OFF, the request gains a field only when ON, the serv
   const body = screen.slice(fetchAt, screen.indexOf("if (!res.ok || !res.body)", fetchAt));
   assert.ok(body.includes("...(contextDedupeOn ? { contextDedupe: true } : {})"), "OFF adds nothing to the request");
   const flag = fs.readFileSync(path.join(ROOT, "../src/lib/contextDedupeFlag.ts"), "utf8");
-  assert.ok(flag.includes('=== "1"') && flag.includes("return false;"), "on only with the stored 1; any error means OFF");
+  assert.ok(flag.includes('.get("contextDedupe") === "1"') && !/getItem|setItem/.test(flag.replace(/^\s*(?:\*|\/\/|\/\*\*).*$/gm, "")), "on only with ?contextDedupe=1 in the URL; nothing read from storage (contextDedupeFlag.test.ts)");
   const route = fs.readFileSync(path.join(ROOT, "../src/app/api/chat/route.ts"), "utf8");
   assert.ok(route.includes("contextDedupe === true ? dedupeExactContext("), "the server applies it only for true");
   rec.calls = 0;
   await prompt(chatBody(SCENE_X, { contextDedupe: true }));
   assert.equal(rec.calls, 1, "one chat call, as before");
+});
+
+test("17 the flag OFF (no field, false, or anything but true) builds exactly the prompt of the reduction-free route: the duplicates stay as before", async () => {
+  for (const scene of [SCENE_X, SCENE_Y] as Record<string, unknown>[]) {
+    const [none, falseFlag] = await pair(chatBody(scene), chatBody(scene, { contextDedupe: false }));
+    assert.equal(falseFlag, none, "contextDedupe:false is OFF");
+    const [none2, stringFlag] = await pair(chatBody(scene), chatBody(scene, { contextDedupe: "1" }));
+    assert.equal(stringFlag, none2, "a string is OFF");
+    assert.equal(occurrences(none, S1), 2, "OFF keeps both copies, as before the reduction existed");
+    const env = await envelope(chatBody(scene, { debugGenerationId: "g-off" }));
+    assert.ok(env && !("contextDedupe" in env), "OFF: the server reports no reduction");
+  }
 });
