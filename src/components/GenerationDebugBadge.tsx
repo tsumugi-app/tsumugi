@@ -18,6 +18,8 @@ import { formatContextBuilderReport } from "@/lib/contextBuilder";
 import { contextBuilderReportFor } from "@/lib/contextBuilderStore";
 import { formatServerDedupeReport } from "@/lib/contextDedupe";
 import { formatServerReasonReport } from "@/lib/explicitReason";
+import { formatDebugCopy } from "@/lib/debugCopy";
+import CopyButton from "./CopyButton";
 
 /** P1-H 段階1：診断の文の組み立てに失敗しても、このバッジのほかの表示は出す */
 function safeBuilderText(stored: NonNullable<ReturnType<typeof contextBuilderReportFor>>): string {
@@ -30,7 +32,16 @@ function safeBuilderText(stored: NonNullable<ReturnType<typeof contextBuilderRep
   }
 }
 
-export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp: string }) {
+/** the short copy for pasting into another AI (the detailed view below stays as it is) */
+function safeCopyText(entry: StoredGenerationDebugEntry, question: string, answer: string, turnTimestamp: string): string {
+  try {
+    return formatDebugCopy({ question, answer, generationId: entry.generationId, generation: entry.generation, serverAccepted: entry.serverAccepted, serverRouteCounts: contextProvenanceFor(turnTimestamp)?.accepted?.counts ?? null, builder: contextBuilderReportFor(turnTimestamp) ?? null });
+  } catch {
+    return `【Tsumugi 診断ログ（短縮版）】\nGeneration ID：${entry.generationId}\n（短縮版を作れなかった。[D]の詳細表示を参照）\n\n■ 質問（全文）\n${question}\n\n■ AIの返答（全文）\n${answer}`;
+  }
+}
+
+export default function GenerationDebugBadge({ turnTimestamp, question = "", answer = "" }: { turnTimestamp: string; question?: string; answer?: string }) {
   const [enabled] = useState(() => debugLogEnabled());
   const [entry, setEntry] = useState<StoredGenerationDebugEntry | null>(null);
   const [open, setOpen] = useState(false);
@@ -71,6 +82,12 @@ export default function GenerationDebugBadge({ turnTimestamp }: { turnTimestamp:
       >
         [D]
       </button>
+      <CopyButton
+        label="診断ログをコピー"
+        testId="debug-copy"
+        build={() => safeCopyText(entry, question, answer, turnTimestamp)}
+        style={{ marginLeft: 6, minHeight: 32, fontSize: 11, padding: "4px 10px", borderRadius: 4, border: "1px solid #7dd3fc", color: "#0284c7", background: "transparent" }}
+      />
       {open && (
         <pre
           style={{
