@@ -60,11 +60,11 @@ type EvalConfig = import("./contextEval").EvalConfig;
 type RunResult = import("./contextEval").RunResult;
 type GenerationDebugEnvelope = import("./generationDebugProtocol").GenerationDebugEnvelope;
 
-async function post(body: Record<string, unknown>): Promise<{ systemInstruction: string; envelope: GenerationDebugEnvelope | null }> {
+async function post(body: Record<string, unknown>): Promise<{ systemInstruction: string; envelope: GenerationDebugEnvelope | null; webSearch: boolean }> {
   const res = await chatRoute.POST(new Request("http://x/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   const text = await res.text();
   const i = text.indexOf(DEBUG_ENVELOPE_DELIMITER);
-  return { systemInstruction: rec.systemInstruction, envelope: i === -1 ? null : (JSON.parse(text.slice(i + DEBUG_ENVELOPE_DELIMITER.length)) as GenerationDebugEnvelope) };
+  return { systemInstruction: rec.systemInstruction, envelope: i === -1 ? null : (JSON.parse(text.slice(i + DEBUG_ENVELOPE_DELIMITER.length)) as GenerationDebugEnvelope), webSearch: res.headers.get("X-Tsumugi-Web-Search-Requested") === "true" };
 }
 
 interface Run { result: RunResult; prompt: string; aiCalls: number; debugSamePrompt: boolean; clientSent: Record<string, unknown> }
@@ -122,6 +122,8 @@ async function runOne(c: EvalCase, config: EvalConfig): Promise<Run> {
     serverDuplicates: env?.provenance?.duplicates.length ?? 0,
     dedupeRemoved: env?.contextDedupe?.removed.length ?? 0,
     reasonsSent: env?.explicitReason?.sent.length ?? 0,
+    serverDroppedRetrieval: ctx.retrievedMemories.map((m) => m.id).filter((id) => !(env?.provenance?.entries ?? []).some((e) => e.memoryIds.includes(id))),
+    webSearch: debug.webSearch,
     abc: { A: A.count, B: B.count, C: C.count, Achars: A.chars, Bchars: B.chars, Cchars: C.chars },
     reasonStatus: report.relevance.reasons.status,
     aiTexts: { reflection: world.AI_TEXTS.reflection, hypotheses: [world.AI_TEXTS.hypothesisJob, world.AI_TEXTS.hypothesisYuki] },

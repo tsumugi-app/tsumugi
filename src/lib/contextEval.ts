@@ -43,6 +43,10 @@ export interface RunInput {
   dedupeRemoved: number;
   /** server: the user's reasons / corrections it put into the prompt (reason questions only) */
   reasonsSent: number;
+  /** Retrieval records the client sent that the server did not put into the prompt (its filters; a record moved to the Explicit Search is not counted) */
+  serverDroppedRetrieval: string[];
+  /** the server turned web search on for this turn (its Memory filter differs then) */
+  webSearch: boolean;
   /** client (virtual): A/B/C of the Context Builder */
   abc: { A: number; B: number; C: number; Achars: number; Bchars: number; Cchars: number };
   reasonStatus: string;
@@ -62,6 +66,10 @@ export interface RunResult {
   optionalFound: number;
   optionalTotal: number;
   forbiddenHits: string[];
+  /** where each forbidden word was found: 「語（節の見出し）」 */
+  forbiddenWhere: string[];
+  serverDroppedRetrieval: string[];
+  webSearch: boolean;
   /** AI texts in the prompt without their label (as if they were the user's words) */
   aiUnlabelled: string[];
   /** AI texts in the prompt with their label */
@@ -84,6 +92,14 @@ function occurrences(text: string, needle: string): number[] {
   if (!needle) return out;
   for (let i = text.indexOf(needle); i !== -1; i = text.indexOf(needle, i + 1)) out.push(i);
   return out;
+}
+
+/** the heading of the prompt section that holds this position ("（見出しの前）" before the first one) */
+export function sectionAt(prompt: string, index: number): string {
+  const h = prompt.lastIndexOf("\n## ", index);
+  if (h === -1) return "（見出しの前）";
+  const end = prompt.indexOf("\n", h + 1);
+  return prompt.slice(h + 4, end === -1 ? undefined : end).trim().slice(0, 40);
 }
 
 /** the synthesis section: [start, end) */
@@ -130,6 +146,9 @@ export function evaluateRun(x: RunInput): RunResult {
     optionalFound: (x.caseDef.optional ?? []).filter(has).length,
     optionalTotal: (x.caseDef.optional ?? []).length,
     forbiddenHits: x.caseDef.forbidden.filter(has),
+    forbiddenWhere: x.caseDef.forbidden.filter(has).map((f) => `${f}（${[...new Set(occurrences(p, f).map((i) => sectionAt(p, i)))].join("／")}）`),
+    serverDroppedRetrieval: x.serverDroppedRetrieval,
+    webSearch: x.webSearch,
     aiUnlabelled,
     aiLabelled,
     notFoundNote: has(NOT_FOUND_HEADING),
@@ -276,8 +295,9 @@ export function formatShortfalls(runs: RunResult[], retrieved: { caseId: string;
   const add = (key: string, config: string) => groups.set(key, [...(groups.get(key) ?? []), config]);
   for (const r of runs) {
     for (const q of r.required.filter((x) => !x.found)) add(`${r.caseId}：必須の根拠「${q.text}」がプロンプトに無い${r.protectedOk === false ? "（本人の理由・訂正）" : ""}`, r.config);
-    for (const f of r.forbiddenHits) add(`${r.caseId}：混入してはいけない「${f}」がプロンプトにある`, r.config);
-    if (r.expectNotFound && !r.notFoundNote) add(`${r.caseId}：記憶が無い質問だが「見つからなかった」の注記が無い`, r.config);
+    for (const f of r.forbiddenWhere) add(`${r.caseId}：混入してはいけない「${f}」がプロンプトにある`, r.config);
+    if (r.expectNotFound && !r.notFoundNote) add(`${r.caseId}：記憶が無い質問だが「見つからなかった」の注記が無い${r.webSearch ? "（このターンはWeb検索がON）" : ""}`, r.config);
+    if (r.serverDroppedRetrieval.length > 0) add(`${r.caseId}：端末の記憶の検索が選んだが、サーバーがプロンプトに入れなかった記録 ${r.serverDroppedRetrieval.join(", ")}`, r.config);
   }
   const all = EVAL_CONFIGS.length;
   for (const [what, configs] of groups) lines.push(`- ${what}：${configs.length === all ? "全12構成" : configs.join(", ")}`);

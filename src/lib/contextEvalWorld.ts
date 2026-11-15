@@ -5,6 +5,7 @@
  * - 本人の発言・理由・訂正（逐語）・人物・話題の経緯・プロフィール・直前の会話・AIの文章（日記の振り返り・Tsumugiの仮説）を含む。
  * - 時刻は EVAL_NOW に固定する（テストは Date を固定して使う）。
  * - 各ケースに、期待する根拠（本人の言葉の一部）と、混入してはいけない情報を書く。判定はプロンプトの文字列で行う（AIの返答は見ない）。
+ *   根拠の目印は、その記録の要約と本人の発言（逐語）の両方に含まれる部分にする（どちらの形でプロンプトに入っても見つかるように）。
  */
 import type { MemoryObject, Conversation, ConversationTurn, Persona } from "./types";
 import type { StoredHypothesis } from "./synthesisModel";
@@ -136,14 +137,14 @@ export interface EvalCase {
 export const EVAL_CASES: EvalCase[] = [
   { id: "fact-bike-price", kind: "具体的な事実", persona: "analyst", turns: ["前に買ったロードバイクって、いくらだったっけ？"], required: ["12万円"], direct: ["12万円"], optional: ["50km"], forbidden: ["はるとさん", "カレー"] },
   { id: "reason-job", kind: "理由・訂正", persona: "analyst", turns: ["転職をやめたのって、なんでだったっけ？"], required: ["チームを離れたくなかった"], protectedReasons: ["チームを離れたくなかった"], direct: ["チームを離れたくなかった"], optional: ["給料が下がるから"], forbidden: ["はるとさん", "ロードバイク"] },
-  { id: "person-omitted", kind: "人物名を省いた継続", persona: "analyst", turns: ["ゆうきさんのこと、覚えてる？", "あの後、仲直りできたんだっけ？"], required: ["謝った"], direct: ["謝った"], optional: ["喧嘩しちゃった"], forbidden: ["はるとさん"] },
-  { id: "change-yuki", kind: "時系列の変化", persona: "analyst", turns: ["ゆうきさんへの気持ちって、どう変わってきたと思う？"], required: ["喧嘩しちゃった", "また普通に話せる"], direct: ["また普通に話せる"], optional: ["まだ気まずい", "楽しかった"], forbidden: ["はるとさん"] },
+  { id: "person-omitted", kind: "人物名を省いた継続", persona: "analyst", turns: ["ゆうきさんのこと、覚えてる？", "あの後、仲直りできたんだっけ？"], required: ["ゆうきさんに謝"], direct: ["ゆうきさんに謝"], optional: ["約束のことで喧嘩"], forbidden: ["はるとさん"] },
+  { id: "change-yuki", kind: "時系列の変化", persona: "analyst", turns: ["ゆうきさんへの気持ちって、どう変わってきたと思う？"], required: ["約束のことで喧嘩", "話せるようになった"], direct: ["話せるようになった"], optional: ["まだ気まずい", "楽しかった"], forbidden: ["はるとさん"] },
   { id: "chat-weather", kind: "雑談", persona: "companion", turns: ["今日は天気がいいし、どこか出かけたいな"], required: [], direct: [], optional: ["自転車", "ロードバイク"], forbidden: ["はるとさん", "転職"] },
   { id: "none-mars", kind: "記憶がない質問", persona: "analyst", turns: ["前に話した火星旅行の計画、どうなってたっけ？"], required: [], direct: [], forbidden: ["ロードバイク", "転職", "ゆうきさん", "はるとさん"], expectNotFound: true },
   { id: "contradict-job", kind: "AIの仮説との矛盾", persona: "analyst", turns: ["転職をやめたのは、結局お金の不安が一番だったのかな？"], required: ["チームを離れたくなかった"], protectedReasons: ["チームを離れたくなかった"], direct: ["チームを離れたくなかった"], optional: ["給料が下がるから"], forbidden: ["はるとさん"] },
-  { id: "dup-yuki", kind: "複数経路での重複", persona: "analyst", turns: ["ゆうきさんと最近どうしてる？"], required: ["自転車で出かけた"], direct: ["自転車で出かけた"], optional: ["謝った"], forbidden: ["はるとさん"] },
+  { id: "dup-yuki", kind: "複数経路での重複", persona: "analyst", turns: ["ゆうきさんと最近どうしてる？"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["はるとさん"] },
   { id: "search-bike", kind: "明示的な検索", persona: "analyst", turns: ["自転車について何話した？"], required: ["12万円", "50km"], direct: ["12万円", "50km"], optional: ["高いんだよね"], forbidden: ["はるとさん", "転職"] },
-  { id: "recent-continue", kind: "直前の会話の続き", persona: "companion", turns: ["さっきの話の続きなんだけど、ゆうきさんとまた出かけたいな"], required: ["さっきまでゆうきさんと自転車の話"], direct: ["さっきまでゆうきさんと自転車の話"], optional: ["自転車で出かけた"], forbidden: ["はるとさん", "転職"] },
+  { id: "recent-continue", kind: "直前の会話の続き", persona: "companion", turns: ["さっきの話の続きなんだけど、ゆうきさんとまた出かけたいな"], required: ["さっきまでゆうきさんと自転車の話"], direct: ["さっきまでゆうきさんと自転車の話"], optional: ["自転車で出かけ"], forbidden: ["はるとさん", "転職"] },
 ];
 
 /** the conversation's turns: one minute apart, ending a minute before EVAL_NOW */
