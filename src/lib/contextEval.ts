@@ -268,3 +268,25 @@ export function formatSummaryMarkdown(summaries: ConfigSummary[], effects: FlagE
   }
   return lines.join("\n");
 }
+
+/** what the current app does not reach, listed as it is (no pass / fail here): per case, the configurations and what was missing or mixed in */
+export function formatShortfalls(runs: RunResult[], retrieved: { caseId: string; config: string; retrievedIds: string[] }[]): string {
+  const lines: string[] = ["#### 現状の取りこぼし・混入（そのまま記録。E2では合否にしない）", ""];
+  const groups = new Map<string, string[]>();
+  const add = (key: string, config: string) => groups.set(key, [...(groups.get(key) ?? []), config]);
+  for (const r of runs) {
+    for (const q of r.required.filter((x) => !x.found)) add(`${r.caseId}：必須の根拠「${q.text}」がプロンプトに無い${r.protectedOk === false ? "（本人の理由・訂正）" : ""}`, r.config);
+    for (const f of r.forbiddenHits) add(`${r.caseId}：混入してはいけない「${f}」がプロンプトにある`, r.config);
+    if (r.expectNotFound && !r.notFoundNote) add(`${r.caseId}：記憶が無い質問だが「見つからなかった」の注記が無い`, r.config);
+  }
+  const all = EVAL_CONFIGS.length;
+  for (const [what, configs] of groups) lines.push(`- ${what}：${configs.length === all ? "全12構成" : configs.join(", ")}`);
+  if (groups.size === 0) lines.push("- なし");
+  lines.push("", "#### 記憶の検索（Retrieval）が選んだ記録（G0-OFF-D0 と G1-Synthesis-D1）", "");
+  lines.push("| ケース | G0-OFF-D0 | G1-Synthesis-D1 |", "|---|---|---|");
+  for (const id of [...new Set(retrieved.map((x) => x.caseId))]) {
+    const of = (c: string) => retrieved.find((x) => x.caseId === id && x.config === c)?.retrievedIds.join(", ") || "（なし）";
+    lines.push(`| ${id} | ${of(BASELINE_CONFIG_ID)} | ${of("G1-Synthesis-D1")} |`);
+  }
+  return lines.join("\n");
+}
