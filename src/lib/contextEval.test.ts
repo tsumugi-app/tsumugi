@@ -50,6 +50,7 @@ const asm = require(path.join(ROOT, "lib/chatContextAssembly.js")) as typeof imp
 const r = require(path.join(ROOT, "lib/retrieval.js")) as typeof import("./retrieval");
 const { turnsForAi } = require(path.join(ROOT, "lib/aiReplyOutcome.js")) as typeof import("./aiReplyOutcome");
 const { buildContextBuilderReport } = require(path.join(ROOT, "lib/contextBuilder.js")) as typeof import("./contextBuilder");
+const prov = require(path.join(ROOT, "lib/chatContextProvenance.js")) as typeof import("./chatContextProvenance");
 const { DEBUG_ENVELOPE_DELIMITER } = require(path.join(ROOT, "lib/generationDebugProtocol.js")) as typeof import("./generationDebugProtocol");
 const { selectSynthesisForTurn } = require(path.join(ROOT, "lib/memorySynthesis.js")) as typeof import("./memorySynthesis");
 const sm = require(path.join(ROOT, "lib/synthesisModel.js")) as typeof import("./synthesisModel");
@@ -125,7 +126,14 @@ async function runOne(c: EvalCase, config: EvalConfig): Promise<Run> {
     systemInstruction: debug.systemInstruction,
     baselineChars: empty.systemInstruction.length,
     serverRouteCounts: counts,
-    serverDuplicates: env?.provenance?.duplicates.length ?? 0,
+    // the server leaves ids empty for routes without them (Topic Continuity / Topic Timeline): fill them from what the client sent, as the [D] view does
+    serverDuplicates: env?.provenance ? prov.withSentIds(env.provenance, prov.buildContextProvenance(
+      { retrievedMemories: ctx.retrievedMemories, topicContinuity: ctx.topicContext, topicTimeline: ctx.topicTimelineContext, memoryTimeline: ctx.memoryTimelineContext, personContext: ctx.personGraphContext, explicitSearch: ctx.explicitSearchContext },
+      {
+        topicContinuityId: (ref) => ctx.memoriesForProvenance.find((m) => m.summary === ref.summary && m.date === ref.date)?.id,
+        topicTimelineId: (event) => ctx.memoriesForProvenance.find((m) => (m.topicEvents ?? []).some((e) => e.quote === event.quote && e.statedAt === event.time && e.sourceConversationId === event.sourceConversationId))?.id,
+      }
+    )).duplicates.length : 0,
     dedupeRemoved: env?.contextDedupe?.removed.length ?? 0,
     reasonsSent: env?.explicitReason?.sent.length ?? 0,
     // Retrieval records the server did not put into its Retrieval section: not moved to the Explicit Search, not removed as an exact duplicate
