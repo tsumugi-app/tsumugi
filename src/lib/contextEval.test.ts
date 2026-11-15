@@ -205,6 +205,21 @@ test("E2: the 12 configurations, the same fictional data, questions and fixed ti
   }
   // Context Dedupe acts only on Memory Graph / Memory Timeline vs Retrieval: without them it changes nothing
   for (const c of world.EVAL_CASES) assert.equal(prompts.get(`${c.id}|G0-OFF-D1`), prompts.get(`${c.id}|G0-OFF-D0`), `dedupe alone has no effect: ${c.id}`);
+  // the user's correction with 今の (job-3) is a wish of that time, not today's state: the server's time filter keeps it in Retrieval in all 12
+  // configurations, with Memory Timeline / Synthesis OFF too, and the user's words reach the prompt in the Retrieval section
+  const CORRECTION = "チームを離れたくなかった";
+  for (const x of runs.filter((r) => r.result.caseId === "reason-job")) {
+    const where = `reason-job / ${x.result.config}`;
+    assert.ok(!x.result.serverDroppedRetrieval.includes("job-3"), `the time filter keeps the correction: ${where}`);
+    assert.equal(x.result.protectedOk, true, `the correction reaches the prompt: ${where}`);
+    const at: string[] = [];
+    for (let i = x.prompt.indexOf(CORRECTION); i !== -1; i = x.prompt.indexOf(CORRECTION, i + 1)) at.push(ev.sectionAt(x.prompt, i));
+    assert.ok(at.some((h) => h.startsWith("関連する過去の記憶")), `in the Retrieval section: ${where} (${at.join(" / ")})`);
+  }
+  // the AI's hypothesis never reaches a turn without the user's correction it contradicts
+  for (const x of runs.filter((r) => r.prompt.includes(world.AI_TEXTS.hypothesisJob))) assert.ok(x.prompt.includes(CORRECTION), `hypothesis with the correction: ${x.result.caseId} / ${x.result.config}`);
+  // the correction does not reach questions about something else (chat-weather: web search is ON there, so the time filter never applied; see the shortfalls)
+  for (const x of runs.filter((r) => !["reason-job", "contradict-job", "chat-weather"].includes(r.result.caseId))) assert.ok(!x.prompt.includes(CORRECTION), `no correction in an unrelated question: ${x.result.caseId} / ${x.result.config}`);
   // the comparison exercised every route (a route that never appears would compare nothing)
   const seen = new Set(results.flatMap((x) => Object.keys(x.routes)));
   for (const route of ["Retrieval", "Recent Conversation", "Topic Timeline", "Memory Graph", "Memory Timeline", "Memory Synthesis", "Explicit Search"]) assert.ok(seen.has(route), `route ${route} appeared (${[...seen].join(", ")})`);
