@@ -350,6 +350,7 @@ test("14 the client keeps the provenance in the tab's memory only, and the chat 
   assert.equal(screen.match(/deferReflections: true/g)?.length, 1);
   assert.ok(/flags\.diagnostics\(\) \? \{ onReflectionTrace/.test(screen), "the trace only with the debug");
   assert.ok(fs.readFileSync(path.join(ROOT, "../src/lib/chatContextSources.ts"), "utf8").includes("diagnostics: () => debugLogEnabled()"), "the debug is ?debugLog=1");
+  assert.ok(!fs.readFileSync(path.join(ROOT, "../src/components/ChatScreen.tsx"), "utf8").includes("deferReflections"), "the chat screen passes it through the assembly only");
 });
 
 test("15 the debug view: a Retrieval item moved to the Explicit Search is not shown as lost; the client's ids are shown for routes without ids", async () => {

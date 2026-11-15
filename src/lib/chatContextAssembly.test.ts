@@ -149,12 +149,16 @@ function device(flags: Flags, log: string[]) {
     memoryTimelineEnabled: () => { log.push("flag:timeline"); return flags.memoryTimeline; },
     memorySynthesisEnabled: () => { log.push("flag:synthesis"); return flags.memorySynthesis; },
     generationDebugLogEnabled: () => { log.push("flag:debug"); return flags.diagnostics; },
+    /** the clock (fixed by the mocked Date); logged, so the moment it is read is compared too */
+    now: () => { log.push("now"); return Date.now(); },
   };
 }
 
 // ---- BEFORE: the code of ChatScreen.tsx at main f55e738, lines 5027–5179 (copied as is; only the indentation is shorter)
 async function legacyAssemble(env: { text: string; baseConversation: { id: string; promptedMemoryId?: string }; updated: { turns: ConversationTurn[] }; activePersona: Persona } & ReturnType<typeof device>) {
   const { text, baseConversation, updated, activePersona, retrieveRelevantMemories, loadConfirmedAliasLists, getAllConversations, getAllMemoryObjects, withVaultWorldRead, synthesisContextForTurn, recordSynthesisShown, memoryGraphEnabled, memoryTimelineEnabled, memorySynthesisEnabled, generationDebugLogEnabled } = env;
+  // the copied code reads the clock as Date.now(): the same logged clock as the after path
+  const Date = { now: env.now };
   // Retrieval Engine（ローカルのみ・AIを呼ばない）。毎ターン実行し、
   // 使うかどうかの判断は/api/chat側のAIに委ねる（0件ならそのまま0件で渡す）。
   // 明示的Reflection（ROADMAP.md Phase 2）：ローカル判定のみでlimitとLink経由上限を広げる。
@@ -355,7 +359,7 @@ test("before / after: the same state, time and flags give the same context, requ
         const afterLog: string[] = [];
         const d = device(flags, afterLog);
         const after = await asm.assembleChatContext(
-          { text, turns, conversationId: "conv-now", promptedMemoryId: c.promptedMemoryId, persona: c.persona, now: () => Date.now() },
+          { text, turns, conversationId: "conv-now", promptedMemoryId: c.promptedMemoryId, persona: c.persona, now: d.now },
           {
             retrieve: d.retrieveRelevantMemories,
             loadConfirmedAliasLists: d.loadConfirmedAliasLists,
@@ -366,8 +370,10 @@ test("before / after: the same state, time and flags give the same context, requ
           },
           { memoryGraph: d.memoryGraphEnabled, memoryTimeline: d.memoryTimelineEnabled, memorySynthesis: d.memorySynthesisEnabled, diagnostics: d.generationDebugLogEnabled }
         );
-        // the same reads and flag checks, in the same order and number (the device's lists are read under the lock, as before)
+        // the same reads, flag checks and clock read, in the same order and number (the device's lists are read under the lock, as before)
         assert.deepEqual(afterLog, beforeLog, `reads and flag checks: ${where}`);
+        assert.equal(afterLog.filter((l) => l === "now").length, 1, "the clock is read once, after the conversation list");
+        assert.equal(afterLog[afterLog.indexOf("now") - 1], "conversations");
         assert.deepEqual(after, before, `assembled values: ${where}`);
         const beforeBody = bodyOf(c.persona, turns, legacyFields(before, generationId, flags.contextDedupe));
         const afterBody = bodyOf(c.persona, turns, asm.chatContextRequestFields(after, { generationId, contextDedupe: flags.contextDedupe }));
@@ -391,7 +397,7 @@ test("before / after: the same state, time and flags give the same context, requ
   console.log(`CI-REPORT chat-context-assembly: ${runs} runs identical before/after; routes present (runs): ${[...covered].map(([k, n]) => `${k}=${n}`).join(", ")}`);
   assert.equal(runs, CASES.length * FLAG_SETS.length);
   // the comparison exercised the routes (a route that never appears would compare nothing)
-  for (const k of ["retrievedMemories", "recentConversation", "memoryAnalytics", "explicitSearch"] as const) assert.ok((covered.get(k) ?? 0) > 0, `route ${k} appeared`);
+  for (const k of ROUTES) assert.ok((covered.get(k) ?? 0) > 0, `route ${k} appeared`);
 });
 
 test("the flags keep their dependencies: Synthesis ON reads no Timeline flag; Graph OFF reads no aliases and sends no person context; OFF sends no new field", async () => {
