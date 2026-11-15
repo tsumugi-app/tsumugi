@@ -139,17 +139,25 @@ export const OWN_VIEW = /思う|思っ|思い|感じ|気持ち|気がする|考�
 /**
  * the user's own wish of that time, in the past tense (「本当は今のチームを離れたくなかった」「今の仕事を続けたかった」): a feeling of then, not a state
  * that changes with the day. Only for the time filter below (OWN_VIEW stays as it is for the other readers). Past forms only: a present wish
- * (「今は辞めたい」) is filtered as before. 冷たかった / 重たかった / 平たかった (adjectives) and まったくない are not wishes.
+ * (「今は辞めたい」) is filtered as before. 冷たかった / 重たかった / 平たかった / 煙たかった / おもたかった / ひらたかった / かたかった (adjectives) and
+ * まったくなかった are not wishes; つめたかった in kana is not told apart from やめたかった (a known gap).
  */
-const PAST_OWN_WISH = /(?<![冷重平っ])た(?:かった|くなかった)|(?:ほし|欲し)かった/;
+const PAST_OWN_WISH = /(?<![冷重平煙もらかっ])た(?:かった|くなかった)|(?:ほし|欲し)かった/;
+/** a wish exempts only its own clause: a present fact joined to it with 、 / けど / ながら (「今の会社に勤めながら、本当は転職したかった」) stays out (review on this PR) */
+const CLAUSE_BREAK = /[、，,]|けれど|けど|ながら/;
+
+function presentOnlyAsPastWish(sentence: string): boolean {
+  const clauses = sentence.split(CLAUSE_BREAK).filter((clause) => PRESENT_MARKERS.some((marker) => clause.includes(marker)));
+  return clauses.length > 0 && clauses.every((clause) => PAST_OWN_WISH.test(clause));
+}
 
 /**
  * a text says "now" only as the user's own view: every sentence with 現在 / 今の / 今は / 次は / 次回 also holds a thought, feeling or judgment word,
- * or the user's past wish (an opinion in another sentence, or in the quote, does not exempt a present-tense fact: Codex on PR #31)
+ * or the user's past wish in the same clause (an opinion in another sentence, or in the quote, does not exempt a present-tense fact: Codex on PR #31)
  */
 export function presentOnlyAsOwnView(text: string): boolean {
   const sentences = sentencesOf(text).filter((sentence) => PRESENT_MARKERS.some((marker) => sentence.includes(marker)));
-  return sentences.length > 0 && sentences.every((sentence) => OWN_VIEW.test(sentence) || PAST_OWN_WISH.test(sentence));
+  return sentences.length > 0 && sentences.every((sentence) => OWN_VIEW.test(sentence) || presentOnlyAsPastWish(sentence));
 }
 
 /** kept out of a turn without web search: an outside, changing fact (a present-tense summary sentence that is not the user's own view counts as one) */
