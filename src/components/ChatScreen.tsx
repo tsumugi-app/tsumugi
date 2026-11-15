@@ -1,26 +1,17 @@
 "use client";
 
-import { memoryTimelineEnabled } from "@/lib/memoryTimelineFlag";
-import { memorySynthesisEnabled } from "@/lib/memorySynthesisFlag";
-import { memoryGraphEnabled } from "@/lib/memoryGraphFlag";
 import { contextDedupeEnabled } from "@/lib/contextDedupeFlag";
-import { loadConfirmedAliasLists } from "@/lib/personAliasDevice";
-import { selectPersonContextsForTurn, withoutCoveredPersonViews, type PersonContext } from "@/lib/personContext";
-import { recordSynthesisShown, runSynthesisAfterSession, synthesisContextForTurn } from "@/lib/synthesisChat";
-import { safeSelectTimelineForTurn, type SynthesisThemeContext } from "@/lib/memorySynthesis";
+import { assembleChatContext, chatContextRequestFields } from "@/lib/chatContextAssembly";
+import { deviceChatContextFlags, deviceChatContextSources } from "@/lib/chatContextSources";
+import { runSynthesisAfterSession } from "@/lib/synthesisChat";
 import { waitUntilIdle } from "@/lib/waitUntilIdle";
 import { logRecoveryArchiveDiagnostic } from "@/lib/vaultRecoveryArchiveDebug";
 import { requestFullWipe } from "@/lib/dataWipe";
 import { getJstTodayDateString } from "@/lib/jstDate";
 import { normalizeAiResponseText, stripLeadingTimeLabelsForDisplay } from "@/lib/timeLabel";
-import { computeProfileFacts, selectProfileContext, type ProfileContext } from "@/lib/profile";
-import { computePersonViews, PERSON_VIEW_CONTEXT_LIMIT, type PersonView } from "@/lib/person";
-import { buildExplicitSearchContext, type ExplicitSearchContext } from "@/lib/memorySearch";
-import { buildMemoryAnalyticsContext, type MemoryAnalyticsContext } from "@/lib/memoryAnalytics";
-import { computeTopicTimelines, TOPIC_TIMELINE_BUDGET, type TopicTimeline } from "@/lib/topicEvent";
 import { appendGenerationDebugEntry, createGenerationId, debugLogEnabled as generationDebugLogEnabled } from "@/lib/generationDebugLog";
 import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugContext, type GenerationDebugEnvelope } from "@/lib/generationDebugProtocol";
-import { buildContextProvenance, type ContextProvenance, type ReflectionTrace } from "@/lib/chatContextProvenance";
+import { buildContextProvenance, type ContextProvenance } from "@/lib/chatContextProvenance";
 import { rememberContextProvenance } from "@/lib/contextProvenanceStore";
 import { buildContextBuilderReport, type ContextBuilderReport } from "@/lib/contextBuilder";
 import { rememberContextBuilderReport } from "@/lib/contextBuilderStore";
@@ -95,15 +86,7 @@ import {
 } from "@/lib/db";
 import { createZipBlob } from "@/lib/zip";
 import { getGreeting } from "@/lib/greeting";
-import {
-  isReflectiveQuery,
-  REFLECTIVE_LIMIT,
-  REFLECTIVE_MAX_LINKED_ADDITIONS,
-  retrieveRelevantMemories,
-} from "@/lib/retrieval";
 import { createInsightMemoryObject, generateSessionReflection } from "@/lib/reflection";
-import { buildRecentConversationPayload, type RecentConversationPayload } from "@/lib/recentConversation";
-import { buildTopicContinuityPayload, type TopicContinuityCandidate } from "@/lib/topicContinuity";
 import { connectMemory } from "@/lib/connect";
 import { filterUnconnected } from "@/lib/connectState";
 import {
@@ -5024,159 +5007,27 @@ export default function ChatScreen() {
       // （Phase 3-3のProjection Engine移行まで、outboxはまだ誰にも消費されない）。
       await putConversationWithOutbox(updated);
 
-      // Retrieval Engine（ローカルのみ・AIを呼ばない）。毎ターン実行し、
-      // 使うかどうかの判断は/api/chat側のAIに委ねる（0件ならそのまま0件で渡す）。
-      // 明示的Reflection（ROADMAP.md Phase 2）：ローカル判定のみでlimitとLink経由上限を広げる。
-      // 判定がfalseの場合は既定のまま、Phase 1からの挙動を完全に維持する。
-      const reflective = isReflectiveQuery(text);
-      // Conversation Retrieval（analyst専用、Conversation品質改善 第2修正）が使う、
-      // 直近の同一Conversation内user turns本文。turns全文を検索クエリへ連結するのではなく、
-      // retrieval.ts側でkeyword単位の存在判定だけに使う（deriveConversationTopicAnchors参照）。
-      // companion/coachはこのフィールドを読まないため、常に渡しても挙動に影響しない。
-      const recentUserTurnsTexts = updated.turns
-        .filter((turn) => turn.role === "user")
-        .map((turn) => turn.content.trim())
-        .filter(Boolean);
-      // Memory Graph P1-B（試験フラグONのときだけ）：本人が確定した同じ人物の名前の組（端末内。読めなければ空＝従来どおり）
-      const personAliases = memoryGraphEnabled() ? await loadConfirmedAliasLists() : [];
-      // P1-F：診断（?debugLog=1）のときだけ、RetrievalがReflectionをどう扱ったかを受け取る（結果は変わらない）
-      let reflectionTrace: ReflectionTrace | null = null;
-      const retrievedMemories = await retrieveRelevantMemories(text, {
-        excludeConversationId: baseConversation.id,
-        limit: reflective ? REFLECTIVE_LIMIT : undefined,
-        maxLinkedAdditions: reflective ? REFLECTIVE_MAX_LINKED_ADDITIONS : undefined,
-        persona: activePersona,
-        promptedMemoryId: baseConversation.promptedMemoryId,
+      // 過去の文脈（記憶の検索・直前の会話・話題・人物・経緯など）の組み立て。自動評価基盤 E1 で chatContextAssembly.ts へ切り出した（処理は同じ）
+      const assembled = await assembleChatContext(
+        { text, turns: updated.turns, conversationId: baseConversation.id, promptedMemoryId: baseConversation.promptedMemoryId, persona: activePersona, now: Date.now },
+        deviceChatContextSources,
+        deviceChatContextFlags
+      );
+      const {
         recentUserTurnsTexts,
-        // 会話品質改善 第1段階：選ばれたMemoryに、話題の人物と、要約に無い本人の発言の一文を添える（memoryContext.ts）
-        includeContext: true,
-        personAliases,
-        // P1-F：AIが書いた日記の振り返り（Reflection）は、本人の記録の後に回す（会話の画面だけ。Connect等は従来どおり）
-        deferReflections: true,
-        // 過去を尋ねる質問では、話題の語（「車」など）を一般語として減点せず、「車種」「車選び」のような形の違いも話題として数える（会話の画面だけ）
-        recallTopic: true,
-        // 質問の目的（好み・望み・変化・人物の行動・質問そのもの）に合う、話題に一致する記録を先に。過去を尋ねただけの記録は後ろに回す（会話の画面だけ）
-        purposeRelevance: true,
-        ...(generationDebugLogEnabled() ? { onReflectionTrace: (trace: ReflectionTrace) => { reflectionTrace = trace; } } : {}),
-      });
-
-      // Recent Conversation Context（Current Conversation → Recent Conversation → Memory Retrieval
-      // の中間層。Recent Conversation Continuity v1）。数時間以内に終了した直前Conversationの
-      // 末尾6 turnだけを、現在turnsとは別枠として/api/chatへ渡す（recentConversation.ts参照）。
-      // Vault境界の安全性（H4対応）：getAllConversations()はロックを取らないprimitiveのため、
-      // withVaultWorldReadで包む（retrieveRelevantMemories()の内部ロックとは別個の順次取得で
-      // あり、同一ロックのネストにはならない。vaultWorldLock.ts参照）。取得失敗は
-      // StaleVaultTabErrorのみ上位へ再送出し、それ以外は会話送信をブロックせずnullで続行する。
-      let recentConversation: RecentConversationPayload | null = null;
-      try {
-        const allConversations = await withVaultWorldRead(() => getAllConversations());
-        recentConversation = buildRecentConversationPayload(allConversations, baseConversation.id, Date.now());
-      } catch (recentError) {
-        if (recentError instanceof StaleVaultTabError) throw recentError;
-        console.error("Failed to load recent conversation context", recentError);
-      }
-
-      // Topic Continuity Context v1（Recent ConversationとMemory Retrievalの間の層。
-      // topicContinuity.ts参照）。「昨日の話なんだけど」のようなcontinuity signalが
-      // 現在発言にある場合のみ、MemoryObject.topicId（Capture時に判定・付与済み、
-      // Topic Continuity Phase 1）でグルーピングした話題候補（最大3件、各最大3 Memory、
-      // summary/date/keywordsのみ）を/api/chatへ別枠で渡す。どのtopicの続きか・
-      // どれも使うべきでないかの最終判断はローカルでは行わず、/api/chatの既存LLM呼び出しへ
-      // 委ねる（新しいAPI/LLM callは追加しない）。取得失敗は既存recentConversationと同じ
-      // 方針：StaleVaultTabErrorのみ上位へ再送出、それ以外は会話送信をブロックせずnullで続行。
-      let topicContext: TopicContinuityCandidate[] | null = null;
-      // Personal Profile v1：同じMemory一覧から、派生ビュー（ProfileFact）を計算し、今回の話題に関連する少量だけを選ぶ
-      // （追加のAPI呼び出し・保存は無い。失敗しても会話送信をブロックしない）。
-      let profileContext: ProfileContext | null = null;
-      // Topic / Current State v1 + Person View Context Assembly：Person Memoryは今まで
-      // 保存されるだけでChat Contextへ一切接続されていなかった。ここで初めて接続する。
-      // どちらも追加のAPI呼び出し・保存は無い（computePersonViews()/computeTopicTimelines()は
-      // ローカルの純粋関数。失敗しても会話送信をブロックしない）。
-      let personViewContext: PersonView[] | null = null;
-      let topicTimelineContext: TopicTimeline[] | null = null;
-      // Explicit Memory Search Phase 1：ユーザーが保存済みの過去を明示的に探す発言のときだけ、保存済みMemory全体を検索する
-      // （通常のAssociative Recall＝上のretrievedMemoriesは変更しない。追加のIDB読み込み・API呼び出しは無い）。
-      let explicitSearchContext: ExplicitSearchContext | null = null;
-      // Memory Analytics Phase 1：保存済みMemory全体の集計（キーワードランキング）を求める発言のときだけ、code側で集計する。
-      // 優先順位は Memory Analytics → Explicit Search → 通常Retrieval。Analyticsが成立した発言は、Explicit Searchとして処理しない。
-      let memoryAnalyticsContext: MemoryAnalyticsContext | null = null;
-      // Memory Timeline（試験接続・既定OFF）：関連があり、通常のRetrievalに不足する経緯だけ。同じMemory一覧を再利用（追加のIDB読み込み・API呼び出し・保存は無い）。
-      let memoryTimelineContext: SynthesisThemeContext[] = [];
-      // Memory Graph P1-A（試験・既定OFF）：話題の人物の背景（結論・理由・後からの説明・予定と結果）。同じMemory一覧から端末内で組み立てる（AI呼び出し・保存は無い）
-      let personGraphContext: PersonContext[] = [];
-      // P1-F：診断のときだけ、ID を持たない経路（話題の候補・経緯）の記録を探すために使う（同じ一覧。追加の読み込みは無い）
-      let memoriesForProvenance: MemoryObject[] = [];
-      try {
-        const allMemoriesForTopicContinuity = await withVaultWorldRead(() => getAllMemoryObjects());
-        if (generationDebugLogEnabled()) memoriesForProvenance = allMemoriesForTopicContinuity;
-        try {
-          memoryAnalyticsContext = buildMemoryAnalyticsContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
-        } catch (analyticsError) {
-          console.error("Failed to run memory analytics", analyticsError);
-        }
-        try {
-          if (memoryAnalyticsContext === null) {
-            explicitSearchContext = buildExplicitSearchContext(allMemoriesForTopicContinuity, text, { excludeConversationId: baseConversation.id });
-          }
-        } catch (searchError) {
-          console.error("Failed to run explicit memory search", searchError);
-        }
-        topicContext = buildTopicContinuityPayload(allMemoriesForTopicContinuity, text);
-        try {
-          const recentUserTexts = updated.turns.filter((turn) => turn.role === "user").slice(-3).map((turn) => turn.content).reverse();
-          const selected = selectProfileContext(computeProfileFacts(allMemoriesForTopicContinuity), { userTexts: recentUserTexts.length > 0 ? recentUserTexts : [text] });
-          if (selected.core.length + selected.relevant.length > 0) profileContext = selected;
-        } catch (profileError) {
-          console.error("Failed to build profile context", profileError);
-        }
-        try {
-          // 「今回の会話に関係する人物・topicIdだけ」を、既存Retrievalが選んだMemory
-          // （retrievedMemories）を起点に特定する（新しいセマンティック検索は作らない。
-          // 既にIDBから読み込み済みのallMemoriesForTopicContinuityを再利用するだけで、
-          // 追加のIDB読み込みは発生させない）。
-          const retrievedIds = new Set(retrievedMemories.map((memory) => memory.id));
-          const relevantMemories = allMemoriesForTopicContinuity.filter((memory) => retrievedIds.has(memory.id));
-          const relevantGroupingKeys = new Set(
-            relevantMemories.flatMap((memory) => (memory.personMentions ?? []).map((mention) => mention.groupingKey))
-          );
-          if (relevantGroupingKeys.size > 0) {
-            const views = computePersonViews(allMemoriesForTopicContinuity).filter((view) => relevantGroupingKeys.has(view.groupingKey));
-            if (views.length > 0) personViewContext = views.slice(0, PERSON_VIEW_CONTEXT_LIMIT);
-          }
-          const relevantTopicIds = [
-            ...new Set(relevantMemories.map((memory) => memory.topicId).filter((id): id is string => Boolean(id))),
-          ].slice(0, TOPIC_TIMELINE_BUDGET.maxTopics);
-          if (relevantTopicIds.length > 0) {
-            const timelines = computeTopicTimelines(allMemoriesForTopicContinuity, relevantTopicIds);
-            if (timelines.length > 0) topicTimelineContext = timelines;
-          }
-        } catch (personTopicError) {
-          console.error("Failed to build person view / topic timeline context", personTopicError);
-        }
-        if (memoryGraphEnabled()) {
-          // 失敗しても空配列（personContext.ts）。この人物のPersonViewは背景に含まれるので二重に送らない
-          personGraphContext = selectPersonContextsForTurn(allMemoriesForTopicContinuity, { userText: text, earlierUserTurns: recentUserTurnsTexts.slice(0, -1), excludeConversationId: baseConversation.id, alreadyGivenIds: retrievedMemories.map((memory) => memory.id), aliases: personAliases });
-          personViewContext = withoutCoveredPersonViews(personViewContext, personGraphContext);
-        }
-        if (memorySynthesisEnabled()) {
-          // Memory Synthesis S1（試験・既定OFF）：経緯に、そのテーマのTsumugiの仮説（端末内キャッシュ）を添える。AI呼び出しは無い。失敗時は経緯だけ（synthesisChat.ts）。
-          const synthesisTurn = await synthesisContextForTurn(
-            allMemoriesForTopicContinuity.filter((memory) => memory.conversationId !== baseConversation.id),
-            { userText: text, retrievedMemoryIds: retrievedMemories.map((memory) => memory.id) }
-          );
-          memoryTimelineContext = synthesisTurn.contexts;
-          recordSynthesisShown(synthesisTurn.shownIds, baseConversation.id);
-        } else if (memoryTimelineEnabled()) {
-          // 失敗しても空配列（会話は通常のRetrievalだけで続く）。今の会話自身のMemoryは、Retrievalと同じく使わない。
-          memoryTimelineContext = safeSelectTimelineForTurn(
-            allMemoriesForTopicContinuity.filter((memory) => memory.conversationId !== baseConversation.id),
-            { userText: text, retrievedMemoryIds: retrievedMemories.map((memory) => memory.id) }
-          );
-        }
-      } catch (topicError) {
-        if (topicError instanceof StaleVaultTabError) throw topicError;
-        console.error("Failed to load topic continuity context", topicError);
-      }
+        retrievedMemories,
+        recentConversation,
+        topicContext,
+        profileContext,
+        personViewContext,
+        topicTimelineContext,
+        explicitSearchContext,
+        memoryAnalyticsContext,
+        memoryTimelineContext,
+        personGraphContext,
+        reflectionTrace,
+        memoriesForProvenance,
+      } = assembled;
 
       // TEMP-TEST：PC/スマホ間で応答傾向が異なって見える件の原因切り分け用。`?debugLog=1`が
       // 無い場合は即returnするため（conversationDebugLog.ts参照）、通常のユーザーには
@@ -5257,18 +5108,8 @@ export default function ChatScreen() {
           // リアルタイム日記の会話だけ、専用の返し方（conversationVoice.ts）。通常の日記・会話は送らない（これまでと同じ指示）
           ...(updated.realtimeDiary ? { conversationVoiceMode: "realtime-diary" } : {}),
           turns: turnsForAi(retryTurns ?? updated.turns),
-          retrievedMemories,
-          ...(recentConversation ? { recentConversation } : {}),
-          ...(topicContext ? { topicContext } : {}),
-          ...(profileContext ? { profile: profileContext } : {}),
-          ...(personViewContext ? { personView: personViewContext } : {}),
-          ...(topicTimelineContext ? { topicTimeline: topicTimelineContext } : {}),
-          ...(explicitSearchContext ? { explicitSearch: explicitSearchContext } : {}),
-          ...(memoryAnalyticsContext ? { memoryAnalytics: memoryAnalyticsContext } : {}),
-          ...(memoryTimelineContext.length > 0 ? { memoryTimeline: memoryTimelineContext } : {}),
-          ...(personGraphContext.length > 0 ? { personContext: personGraphContext } : {}),
-          ...(generationId ? { debugGenerationId: generationId } : {}),
-          ...(contextDedupeOn ? { contextDedupe: true } : {}),
+          // 過去の文脈の部分（キーの順序・空のときに送らない規則は切り出す前と同じ。chatContextAssembly.ts）
+          ...chatContextRequestFields(assembled, { generationId, contextDedupe: contextDedupeOn }),
         }),
       });
 
