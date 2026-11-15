@@ -4,7 +4,8 @@
  * - 会話の画面と同じ assembleChatContext（E1）で過去の文脈を組み立て、実際の /api/chat の処理でプロンプトを組み立てる。AI は偽物（呼び出しを数えるだけ）。
  * - 読み込み先は架空のデータ（contextEvalWorld.ts）。Memory Synthesis の仮説は、synthesisChat.ts の synthesisContextForTurn と同じ処理を、
  *   端末のキャッシュの代わりに架空の仮説で行う（生成はしない）。
- * - 結果：CI の概要に一覧表（contextEval.ts の formatSummaryMarkdown）。詳細は .eval-out/context-eval.json（CI は成果物として保存する）。
+ * - 結果：CI の概要に一覧表（contextEval.ts の formatSummaryMarkdown）。詳細は .eval-out/context-eval.json に書く
+ *   （CI の成果物として残すには ci.yml に upload-artifact の手順が要る。この PR の時点では無い：ワークフローの変更は別途）。
  * - 合否にするのは、壊れてはいけない条件だけ（再現性・AI呼び出し1回・診断の有無で同じプロンプト・AIの文章の区別・
  *   Context Builder が本人の理由・訂正を C にしないこと・どの経路も比較の中に出ること）。
  *   必須の根拠・本人の理由と訂正がプロンプトに届いたか・混入・文字数などは、現状を数値と一覧で記録する（現状の取りこぼしもそのまま示す。
@@ -60,11 +61,14 @@ type EvalConfig = import("./contextEval").EvalConfig;
 type RunResult = import("./contextEval").RunResult;
 type GenerationDebugEnvelope = import("./generationDebugProtocol").GenerationDebugEnvelope;
 
-async function post(body: Record<string, unknown>): Promise<{ systemInstruction: string; envelope: GenerationDebugEnvelope | null; webSearch: boolean }> {
+async function post(body: Record<string, unknown>): Promise<{ systemInstruction: string; envelope: GenerationDebugEnvelope | null; webSearch: boolean; calls: number }> {
+  rec.systemInstruction = "";
+  const before = rec.calls;
   const res = await chatRoute.POST(new Request("http://x/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+  assert.equal(res.status, 200, "the chat route answered");
   const text = await res.text();
   const i = text.indexOf(DEBUG_ENVELOPE_DELIMITER);
-  return { systemInstruction: rec.systemInstruction, envelope: i === -1 ? null : (JSON.parse(text.slice(i + DEBUG_ENVELOPE_DELIMITER.length)) as GenerationDebugEnvelope), webSearch: res.headers.get("X-Tsumugi-Web-Search-Requested") === "true" };
+  return { systemInstruction: rec.systemInstruction, envelope: i === -1 ? null : (JSON.parse(text.slice(i + DEBUG_ENVELOPE_DELIMITER.length)) as GenerationDebugEnvelope), webSearch: res.headers.get("X-Tsumugi-Web-Search-Requested") === "true", calls: rec.calls - before };
 }
 
 interface Run { result: RunResult; prompt: string; aiCalls: number; debugSamePrompt: boolean; clientSent: Record<string, unknown> }
@@ -98,18 +102,20 @@ async function runOne(c: EvalCase, config: EvalConfig): Promise<Run> {
   );
   const base = { persona: c.persona, turns: turnsForAi(turns) };
   const fields = asm.chatContextRequestFields(ctx, { generationId: "gen-eval", contextDedupe: config.contextDedupe });
-  rec.calls = 0;
   const debug = await post({ ...base, ...fields });
   const plain = await post({ ...base, ...asm.chatContextRequestFields(ctx, { contextDedupe: config.contextDedupe }) });
-  const aiCalls = rec.calls / 2;
   const empty = await post({ ...base, retrievedMemories: [] });
+  const aiCalls = Math.max(debug.calls, plain.calls);
+  assert.ok(debug.calls === 1 && plain.calls === 1 && empty.calls === 1 && empty.systemInstruction.length > 0, "one AI call per request, each with a prompt");
   const env = debug.envelope;
+  // entries per route, all from what the server accepted: the provenance entries (one Memory may give several: a summary, the user's words, a reason line),
+  // and, for the routes the provenance does not list, the accepted values (turns, facts, people, results)
   const counts = { ...(env?.provenance?.counts ?? {}) } as Record<string, number>;
-  // routes the provenance does not list: counted from the values sent (the server builds a section for each non-empty one)
-  if (ctx.recentConversation) counts["Recent Conversation"] = ctx.recentConversation.turns.length;
-  if (ctx.profileContext) counts.Profile = ctx.profileContext.core.length + ctx.profileContext.relevant.length;
-  if (ctx.personViewContext) counts["Person View"] = ctx.personViewContext.length;
-  if (ctx.memoryAnalyticsContext) counts["Memory Analytics"] = ctx.memoryAnalyticsContext.results.length;
+  const acc = env?.serverAccepted;
+  if (acc?.recentConversation) counts["Recent Conversation"] = acc.recentConversation.turns.length;
+  if (acc?.profile) counts.Profile = acc.profile.core.length + acc.profile.relevant.length;
+  if (acc?.personView) counts["Person View"] = acc.personView.length;
+  if (acc?.memoryAnalyticsServerAccepted) counts["Memory Analytics"] = acc.memoryAnalyticsServerAccepted.resultCount;
   for (const k of Object.keys(counts)) if (!counts[k]) delete counts[k];
   const cls = (name: string) => report.relevance.classes.find((x) => x.relevance === name) ?? { count: 0, chars: 0 };
   const A = cls("直接根拠"), B = cls("関連する文脈"), C = cls("関連性の低い補助情報");
@@ -122,7 +128,9 @@ async function runOne(c: EvalCase, config: EvalConfig): Promise<Run> {
     serverDuplicates: env?.provenance?.duplicates.length ?? 0,
     dedupeRemoved: env?.contextDedupe?.removed.length ?? 0,
     reasonsSent: env?.explicitReason?.sent.length ?? 0,
-    serverDroppedRetrieval: ctx.retrievedMemories.map((m) => m.id).filter((id) => !(env?.provenance?.entries ?? []).some((e) => e.memoryIds.includes(id))),
+    // Retrieval records the server did not put into its Retrieval section: not moved to the Explicit Search, not removed as an exact duplicate
+    // (those are listed apart), i.e. left out by its filters. Another route may still carry the same Memory.
+    serverDroppedRetrieval: ctx.retrievedMemories.map((m) => m.id).filter((id) => !(acc?.retrievedMemory ?? []).some((m) => m.id === id) && !(ctx.explicitSearchContext?.results ?? []).some((m) => m.id === id) && !(env?.contextDedupe?.removed ?? []).some((p) => p.route === "Retrieval" && p.memoryId === id)),
     webSearch: debug.webSearch,
     abc: { A: A.count, B: B.count, C: C.count, Achars: A.chars, Bchars: B.chars, Cchars: C.chars },
     reasonStatus: report.relevance.reasons.status,

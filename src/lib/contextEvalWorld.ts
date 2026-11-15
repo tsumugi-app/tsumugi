@@ -141,6 +141,8 @@ export const EVAL_CASES: EvalCase[] = [
   { id: "change-yuki", kind: "時系列の変化", persona: "analyst", turns: ["ゆうきさんへの気持ちって、どう変わってきたと思う？"], required: ["約束のことで喧嘩", "話せるようになった"], direct: ["話せるようになった"], optional: ["まだ気まずい", "楽しかった"], forbidden: ["はるとさん"] },
   { id: "chat-weather", kind: "雑談", persona: "companion", turns: ["今日は天気がいいし、どこか出かけたいな"], required: [], direct: [], optional: ["自転車", "ロードバイク"], forbidden: ["はるとさん", "転職"] },
   { id: "none-mars", kind: "記憶がない質問", persona: "analyst", turns: ["前に話した火星旅行の計画、どうなってたっけ？"], required: [], direct: [], forbidden: ["ロードバイク", "転職", "ゆうきさん", "はるとさん"], expectNotFound: true },
+  // the same kind without words that turn web search on (the Mars question does: the server then keeps its Memory filter off and adds no not-found note)
+  { id: "none-pottery", kind: "記憶がない質問", persona: "analyst", turns: ["前に話した陶芸教室のこと、どうなってたっけ？"], required: [], direct: [], forbidden: ["ロードバイク", "転職", "ゆうきさん", "はるとさん"], expectNotFound: true },
   { id: "contradict-job", kind: "AIの仮説との矛盾", persona: "analyst", turns: ["転職をやめたのは、結局お金の不安が一番だったのかな？"], required: ["チームを離れたくなかった"], protectedReasons: ["チームを離れたくなかった"], direct: ["チームを離れたくなかった"], optional: ["給料が下がるから"], forbidden: ["はるとさん"] },
   { id: "dup-yuki", kind: "複数経路での重複", persona: "analyst", turns: ["ゆうきさんと最近どうしてる？"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["はるとさん"] },
   { id: "search-bike", kind: "明示的な検索", persona: "analyst", turns: ["自転車について何話した？"], required: ["12万円", "50km"], direct: ["12万円", "50km"], optional: ["高いんだよね"], forbidden: ["はるとさん", "転職"] },

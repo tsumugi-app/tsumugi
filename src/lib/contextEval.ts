@@ -27,6 +27,7 @@ export const estimateTokens = (chars: number) => chars;
 
 export const SYNTHESIS_HEADING = "## 複数の会話にわたる経緯";
 export const REFLECTION_LABEL = "Tsumugiが書いた日記の振り返り";
+export const RECENT_HEADING = "直前の会話";
 export const NOT_FOUND_HEADING = "このターンの記憶の検索で一致する記録が見つからなかったとき";
 
 export interface RunInput {
@@ -68,6 +69,8 @@ export interface RunResult {
   forbiddenHits: string[];
   /** where each forbidden word was found: 「語（節の見出し）」 */
   forbiddenWhere: string[];
+  /** forbidden words found only in the recent conversation (the app always passes the conversation that ended within 6 hours, verbatim): not counted as mixed in */
+  forbiddenInRecentOnly: string[];
   serverDroppedRetrieval: string[];
   webSearch: boolean;
   /** AI texts in the prompt without their label (as if they were the user's words) */
@@ -145,8 +148,9 @@ export function evaluateRun(x: RunInput): RunResult {
     directFound: x.caseDef.direct.length > 0 ? x.caseDef.direct.some(has) : null,
     optionalFound: (x.caseDef.optional ?? []).filter(has).length,
     optionalTotal: (x.caseDef.optional ?? []).length,
-    forbiddenHits: x.caseDef.forbidden.filter(has),
-    forbiddenWhere: x.caseDef.forbidden.filter(has).map((f) => `${f}（${[...new Set(occurrences(p, f).map((i) => sectionAt(p, i)))].join("／")}）`),
+    forbiddenHits: x.caseDef.forbidden.filter((f) => occurrences(p, f).some((i) => !sectionAt(p, i).startsWith(RECENT_HEADING))),
+    forbiddenWhere: x.caseDef.forbidden.filter((f) => occurrences(p, f).some((i) => !sectionAt(p, i).startsWith(RECENT_HEADING))).map((f) => `${f}（${[...new Set(occurrences(p, f).map((i) => sectionAt(p, i)))].join("／")}）`),
+    forbiddenInRecentOnly: x.caseDef.forbidden.filter((f) => occurrences(p, f).length > 0 && occurrences(p, f).every((i) => sectionAt(p, i).startsWith(RECENT_HEADING))),
     serverDroppedRetrieval: x.serverDroppedRetrieval,
     webSearch: x.webSearch,
     aiUnlabelled,
@@ -175,6 +179,7 @@ export interface ConfigSummary {
   protectedTotal: number;
   forbiddenHits: number;
   aiUnlabelled: number;
+  aiLabelled: number;
   notFoundOk: number;
   notFoundTotal: number;
   duplicates: number;
@@ -200,6 +205,7 @@ export function summarizeConfig(config: string, runs: RunResult[]): ConfigSummar
     protectedTotal: rs.filter((r) => r.protectedOk !== null).length,
     forbiddenHits: sum((r) => r.forbiddenHits.length),
     aiUnlabelled: sum((r) => r.aiUnlabelled.length),
+    aiLabelled: sum((r) => r.aiLabelled.length),
     notFoundOk: rs.filter((r) => r.expectNotFound && r.notFoundNote).length,
     notFoundTotal: rs.filter((r) => r.expectNotFound).length,
     duplicates: sum((r) => r.duplicates),
@@ -258,18 +264,20 @@ export function formatSummaryMarkdown(summaries: ConfigSummary[], effects: FlagE
   const sign = (n: number) => (n > 0 ? `+${n}` : `${n}`);
   const lines: string[] = [];
   lines.push("### 自動評価 E2：12構成の比較（架空データ・固定時刻・AIは呼ばない）", "");
-  lines.push("判定はサーバーが組み立てた最終プロンプトの文字列で行う。返答の自然さ・正確なAPIトークン数は測っていない（推定トークン＝文字数。粗い目安）。A/B/C は端末の仮想判定（Context Builder）。", "");
-  lines.push("| 構成 | 必須の根拠 | 直接の根拠 | 理由・訂正の保護 | 混入 | AI文の区別違反 | 記憶なしの注記 | 重複Memory | 重複の削減 | 過去の文脈（字） | 推定トークン | A/B/C（件） |");
-  lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|");
+  lines.push("判定はサーバーが組み立てた最終プロンプトの文字列で行う。返答の自然さ・正確なAPIトークン数は測っていない（推定トークン＝文字数。粗い目安）。A/B/C は端末の仮想判定（Context Builder）。",
+    "過去の文脈（字）＝プロンプト全体から、過去の文脈が無いときのプロンプトを引いた目安（固定の注記の差を含む。全ケースの合計）。混入には、直前の会話（6時間以内に終わった会話。アプリは毎回そのまま渡す）だけにある語は数えない。",
+    "重複Memory＝2つ以上の経路が渡した Memory の数（Tsumugiの仮説の根拠に挙がった Memory も含む）。AI文＝日記の振り返りとTsumugiの仮説（区別違反＝ラベルなしで出た回数／ラベルつき＝ラベルつきで出た回数）。", "");
+  lines.push("| 構成 | 必須の根拠 | 直接の根拠 | 理由・訂正の保護 | 混入 | AI文の区別違反 | AI文（ラベルつき） | 記憶なしの注記 | 重複Memory | 重複の削減 | 過去の文脈（字） | 推定トークン | A/B/C（件） |");
+  lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const s of summaries) {
-    lines.push(`| ${s.config} | ${s.requiredFound}/${s.requiredTotal} | ${s.directCases}/${s.directTotal} | ${s.protectedOk}/${s.protectedTotal} | ${s.forbiddenHits} | ${s.aiUnlabelled} | ${s.notFoundOk}/${s.notFoundTotal} | ${s.duplicates} | ${s.dedupeRemoved} | ${s.pastContextChars} | ${s.estimatedTokens} | ${s.abc.A}/${s.abc.B}/${s.abc.C} |`);
+    lines.push(`| ${s.config} | ${s.requiredFound}/${s.requiredTotal} | ${s.directCases}/${s.directTotal} | ${s.protectedOk}/${s.protectedTotal} | ${s.forbiddenHits} | ${s.aiUnlabelled} | ${s.aiLabelled} | ${s.notFoundOk}/${s.notFoundTotal} | ${s.duplicates} | ${s.dedupeRemoved} | ${s.pastContextChars} | ${s.estimatedTokens} | ${s.abc.A}/${s.abc.B}/${s.abc.C} |`);
   }
-  lines.push("", "#### 経路ごとの採用件数（サーバーが受け取った値・全ケースの合計）", "");
+  lines.push("", "#### 経路ごとの採用件数（サーバーが受け取った値の項目数・全ケースの合計。1つの Memory から要約・本人の発言・理由の行など複数の項目になることがある）", "");
   const routes = [...new Set([...ROUTE_ORDER, ...summaries.flatMap((s) => Object.keys(s.routes))])].filter((r) => summaries.some((s) => (s.routes[r] ?? 0) > 0));
   lines.push(`| 構成 | ${routes.join(" | ")} |`, `|---|${routes.map(() => "---").join("|")}|`);
   for (const s of summaries) lines.push(`| ${s.config} | ${routes.map((r) => s.routes[r] ?? 0).join(" | ")} |`);
-  lines.push("", "#### 1つの設定だけを変えたときの差（同じケース・ほかの設定は同じ）", "");
-  lines.push("| 設定 | 変更 | 比べた組 | 効果なし（プロンプト同一） | 必須の根拠 | 混入 | AI文の区別違反 | 重複Memory | 過去の文脈（字） | 変わったケース |");
+  lines.push("", "#### 1つの設定だけを変えたときの差（同じケース・ほかの設定は同じ。差は比べた組すべての合計）", "");
+  lines.push("| 設定 | 変更 | 比べた組 | 効果なし（プロンプト同一） | 必須の根拠（合計） | 混入（合計） | AI文の区別違反（合計） | 重複Memory（合計） | 過去の文脈（字・合計） | 変わったケース |");
   lines.push("|---|---|---|---|---|---|---|---|---|---|");
   for (const e of effects) {
     lines.push(`| ${e.setting} | ${e.from}→${e.to} | ${e.pairs} | ${e.identical} | ${sign(e.requiredDelta)} | ${sign(e.forbiddenDelta)} | ${sign(e.aiUnlabelledDelta)} | ${sign(e.duplicatesDelta)} | ${sign(e.charsDelta)} | ${e.changedCases.length > 0 ? e.changedCases.join(", ") : "なし（効果なし）"} |`);
@@ -297,7 +305,8 @@ export function formatShortfalls(runs: RunResult[], retrieved: { caseId: string;
     for (const q of r.required.filter((x) => !x.found)) add(`${r.caseId}：必須の根拠「${q.text}」がプロンプトに無い${r.protectedOk === false ? "（本人の理由・訂正）" : ""}`, r.config);
     for (const f of r.forbiddenWhere) add(`${r.caseId}：混入してはいけない「${f}」がプロンプトにある`, r.config);
     if (r.expectNotFound && !r.notFoundNote) add(`${r.caseId}：記憶が無い質問だが「見つからなかった」の注記が無い${r.webSearch ? "（このターンはWeb検索がON）" : ""}`, r.config);
-    if (r.serverDroppedRetrieval.length > 0) add(`${r.caseId}：端末の記憶の検索が選んだが、サーバーがプロンプトに入れなかった記録 ${r.serverDroppedRetrieval.join(", ")}`, r.config);
+    if (r.serverDroppedRetrieval.length > 0) add(`${r.caseId}：端末の記憶の検索が選んだが、サーバーの絞り込みで「関連する過去の記憶」に入らなかった記録 ${r.serverDroppedRetrieval.join(", ")}（ほかの経路が同じ記録を渡すことはある）`, r.config);
+    for (const f of r.forbiddenInRecentOnly) add(`${r.caseId}：「${f}」は直前の会話にだけある（混入には数えない）`, r.config);
   }
   const all = EVAL_CONFIGS.length;
   for (const [what, configs] of groups) lines.push(`- ${what}：${configs.length === all ? "全12構成" : configs.join(", ")}`);
