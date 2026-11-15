@@ -374,8 +374,12 @@ test("wiring: the alias code never writes a Memory or calls an AI; the chat read
     const code = strip(fs.readFileSync(path.join(src, f), "utf8"));
     assert.doesNotMatch(code, /fetch\(|\/api\/|memoryObjects|putMemoryObject|Outbox|registry|removeEntry|localStorage/i, f);
   }
-  const chat = fs.readFileSync(path.join(src, "components", "ChatScreen.tsx"), "utf8");
-  assert.match(chat, /const personAliases = memoryGraphEnabled\(\) \? await loadConfirmedAliasLists\(\) : \[\];/);
+  // the chat screen's context assembly (E1: lib/chatContextAssembly.ts with the device sources of lib/chatContextSources.ts)
+  const chat = fs.readFileSync(path.join(src, "lib", "chatContextAssembly.ts"), "utf8");
+  assert.match(chat, /const personAliases = flags\.memoryGraph\(\) \? await sources\.loadConfirmedAliasLists\(\) : \[\];/);
+  const device = fs.readFileSync(path.join(src, "lib", "chatContextSources.ts"), "utf8");
+  assert.match(device, /loadConfirmedAliasLists: \(\) => loadConfirmedAliasLists\(\),/);
+  assert.match(device, /memoryGraph: \(\) => memoryGraphEnabled\(\),/);
   const boot = strip(fs.readFileSync(path.join(src, "lib", "productionBootstrap.ts"), "utf8"));
   assert.match(boot, /await runSaveFoundationBootstrap\([\s\S]*?\);\s*await syncPeopleOnStartup\(root\);/);
 });

@@ -585,7 +585,8 @@ test("16 the flag: default OFF, the request gains a field only when ON, the serv
   const screen = fs.readFileSync(path.join(ROOT, "../src/components/ChatScreen.tsx"), "utf8");
   const fetchAt = screen.indexOf('const res = await fetch("/api/chat"');
   const body = screen.slice(fetchAt, screen.indexOf("if (!res.ok || !res.body)", fetchAt));
-  assert.ok(body.includes("...(contextDedupeOn ? { contextDedupe: true } : {})"), "OFF adds nothing to the request");
+  assert.ok(body.includes("...chatContextRequestFields(assembled, { generationId, contextDedupe: contextDedupeOn }),"), "the request's context fields (E1: lib/chatContextAssembly.ts)");
+  assert.ok(fs.readFileSync(path.join(ROOT, "../src/lib/chatContextAssembly.ts"), "utf8").includes("...(opts.contextDedupe ? { contextDedupe: true } : {}),"), "OFF adds nothing to the request");
   const flag = fs.readFileSync(path.join(ROOT, "../src/lib/contextDedupeFlag.ts"), "utf8");
   assert.ok(flag.includes('.get("contextDedupe") === "1"') && !/getItem|setItem/.test(flag.replace(/^\s*(?:\*|\/\/|\/\*\*).*$/gm, "")), "on only with ?contextDedupe=1 in the URL; nothing read from storage (contextDedupeFlag.test.ts)");
   const route = fs.readFileSync(path.join(ROOT, "../src/app/api/chat/route.ts"), "utf8");

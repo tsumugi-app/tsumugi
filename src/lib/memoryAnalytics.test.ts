@@ -138,11 +138,13 @@ test("11 Explicit Search non-regression: Analytics never claims an Explicit Sear
   }
   for (const q of POSITIVE) assert.equal(ms.detectExplicitMemorySearch(q), null, `Analytics phrasing is not an explicit search: ${q}`);
   // ChatScreen wiring: Analytics is evaluated first and Explicit Search is skipped when Analytics matched
-  const src = require("node:fs").readFileSync(path.join(ROOT, "..", "src/components/ChatScreen.tsx"), "utf8") as string;
+  // the chat screen's context assembly (E1: lib/chatContextAssembly.ts)
+  const src = require("node:fs").readFileSync(path.join(ROOT, "..", "src/lib/chatContextAssembly.ts"), "utf8") as string;
+  const screen = require("node:fs").readFileSync(path.join(ROOT, "..", "src/components/ChatScreen.tsx"), "utf8") as string;
   const a = src.indexOf("buildMemoryAnalyticsContext(allMemoriesForTopicContinuity"); const e = src.indexOf("buildExplicitSearchContext(allMemoriesForTopicContinuity");
   assert.ok(a > 0 && e > a, "analytics first"); assert.ok(src.slice(a, e).includes("if (memoryAnalyticsContext === null)"), "explicit only when analytics did not match");
-  assert.ok(src.includes("...(memoryAnalyticsContext ? { memoryAnalytics: memoryAnalyticsContext } : {})"));
-  assert.equal(src.split("appendMemoryAnalyticsAcceptanceNote(generationId").length - 1, 1);
+  assert.ok(src.includes("...(ctx.memoryAnalyticsContext ? { memoryAnalytics: ctx.memoryAnalyticsContext } : {})"));
+  assert.equal(screen.split("appendMemoryAnalyticsAcceptanceNote(generationId").length - 1, 1);
 });
 test("12 ordinary conversation: no Analytics context", () => {
   assert.equal(ma.buildMemoryAnalyticsContext([mem({ keywords: ["黄金湯"] })], "黄金湯に行きたい"), null);

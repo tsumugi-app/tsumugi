@@ -293,8 +293,10 @@ test("8 Connect, Capture and the other callers do not pass the option; without i
     const p = path.join(ROOT, "..", "src", "lib", file);
     if (fs.existsSync(p)) assert.ok(!fs.readFileSync(p, "utf8").includes("recallTopic"), file);
   }
-  const chat = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
+  // the chat screen's context assembly (E1: lib/chatContextAssembly.ts)
+  const chat = fs.readFileSync(path.join(ROOT, "..", "src", "lib", "chatContextAssembly.ts"), "utf8");
   assert.equal(chat.split("recallTopic: true").length - 1, 1, "only the chat screen's chat Retrieval passes it");
+  assert.ok(!fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8").includes("recallTopic"), "the chat screen passes it through the assembly only");
   pool = [...carA, ...seiri, ...unrelated];
   // without the option: the companion order is exactly scoreMemory's (as Connect calls it)
   for (const q of [Q_ABSTRACT, Q_NAME, "車を洗った"]) {

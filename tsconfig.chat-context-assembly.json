@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "outDir": ".test-out",
+    "rootDir": "src",
+    "plugins": []
+  },
+  "include": [],
+  "files": [
+    "src/lib/chatContextAssembly.test.ts",
+    "src/lib/chatContextAssembly.ts",
+    "src/lib/retrieval.ts",
+    "src/lib/synthesisFictionalData.ts",
+    "src/app/api/chat/route.ts"
+  ]
+}

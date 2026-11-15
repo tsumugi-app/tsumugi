@@ -264,8 +264,10 @@ test("7 Connect, Capture, the Timeline, Synthesis, Memory Graph and the other ca
       assert.ok(!text.includes("purposeRelevance") && !text.includes("recordRelevance"), file);
     }
   }
-  const chat = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
+  // the chat screen's context assembly (E1: lib/chatContextAssembly.ts)
+  const chat = fs.readFileSync(path.join(ROOT, "..", "src", "lib", "chatContextAssembly.ts"), "utf8");
   assert.equal(chat.split("purposeRelevance: true").length - 1, 1, "only the chat Retrieval call");
+  assert.ok(!fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8").includes("purposeRelevance"), "the chat screen passes it through the assembly only");
 });
 
 test("review: a named topic keeps off-topic question records down; the user's own view in a record led by another person keeps its place; present-tense questions get no purpose", () => {
