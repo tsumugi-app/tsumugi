@@ -236,3 +236,29 @@ test("E2: the app is untouched — the evaluation files are read by tests only, 
   }
 });
 
+
+// DIAG ONLY (diag/correction-retrieval, never merge): the analyst Retrieval scores of the job records per question
+test("DIAG correction retrieval scores", () => {
+  const rq = require(path.join(ROOT, "lib/recallQuestion.js")) as typeof import("./recallQuestion");
+  const rr = require(path.join(ROOT, "lib/recordRelevance.js")) as typeof import("./recordRelevance");
+  const er = require(path.join(ROOT, "lib/explicitReason.js")) as typeof import("./explicitReason");
+  mock.timers.enable({ apis: ["Date"], now: world.EVAL_NOW });
+  try {
+    const all = world.evalMemories();
+    const freq = r.computeKeywordFrequency(all);
+    for (const c of world.EVAL_CASES) {
+      const q = c.turns[c.turns.length - 1];
+      const recall = rq.withPoolEvidence(rq.recallTopicOf(q), all);
+      const purpose = rr.purposeContextOf(q, all);
+      const sel = r.selectConversationDirectMatches(all, q, c.turns, freq, 3, recall, purpose);
+      const fmt = (e: { memory: { id: string }; queryScore: number; genericPenalty: number; anchorBonus: number; personBonus: number; recallBonus: number; purposeAdjust: number; conversationScore: number }) =>
+        `${e.memory.id}=${e.conversationScore.toFixed(2)}(q${e.queryScore.toFixed(2)} g-${e.genericPenalty.toFixed(2)} a${e.anchorBonus.toFixed(2)} p${e.personBonus.toFixed(2)} r${e.recallBonus.toFixed(2)} u${e.purposeAdjust.toFixed(2)})`;
+      const scored = r.scoreConversationCandidates(all, q, r.deriveConversationTopicAnchors(c.turns, freq), freq, r.deriveConversationPersonFocus(c.turns, all), recall, purpose).filter((e) => e.memory.id.startsWith("job")).sort((a, b) => b.conversationScore - a.conversationScore);
+      console.log(`CI-REPORT diag ${c.id} recall=${recall ? JSON.stringify(recall).slice(0, 80) : "null"} purpose=${purpose.purpose} reasonFocus=${JSON.stringify(er.reasonFocusOf(q))}`);
+      console.log(`CI-REPORT diag ${c.id} kept=${sel.kept.map(fmt).join(" ")} | floor=${sel.droppedByFloor.slice(0, 4).map(fmt).join(" ")} | rel=${sel.droppedByRelativeStrength.map(fmt).join(" ")}`);
+      console.log(`CI-REPORT diag ${c.id} job=${scored.map(fmt).join(" ")}`);
+    }
+  } finally {
+    mock.timers.reset();
+  }
+});
