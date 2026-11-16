@@ -356,6 +356,9 @@ test("4 what counts: a reason question (asked or put forward), the user's own wo
   assert.equal(rr.reasonSubjectOf(CONTRADICT), "転職をやめたの", "the subject is the act, not the reason put forward");
   // the quote of a reason question: a correction first, then the sentence closest to the turn; not the first reason-form sentence
   assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職", "チーム"], evidenceQuotes: ["今日は雨だったので在宅にした。", "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
+  // an earlier reason and its later correction in one record (Capture appends): the correction, even without a correction word the later one
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["給料が下がるからなんだ", "本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "本当は今のチームを離れたくなかったからなんだ");
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["給料が下がるからなんだ", "チームを離れたくなかったからなんだ"] }, [CONTRADICT]), "チームを離れたくなかったからなんだ");
   const ctx = rr.purposeContextOf(CONTRADICT, JOB);
   const byJob = (id: string) => JOB.find((m) => m.id === id)!;
   assert.deepEqual(rr.adjustForPurpose(byJob("j3"), 2, ctx, CONTRADICT, false, 3, 3), { score: 6, onTopic: true, demoted: false, reasonAnswer: true });

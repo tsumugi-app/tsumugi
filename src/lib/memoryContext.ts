@@ -69,20 +69,24 @@ export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuot
   if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
   // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (a keyword named in the subject of
   // the question): the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat
-  // the topic word. A correction first, then the sentence closest to the turn
+  // the topic word. A correction first, then the newest (dated events, then the later quotes: Capture appends new evidence after the old), as
+  // reasonSentenceOf does: an earlier reason the user corrected never wins over the correction (Codex on this PR)
   const subject = reasonSubjectOf(latest);
   if (subject !== null && onReasonSubject(memory, subject)) {
-    const turnGrams = bigrams(latest);
-    let pick: { text: string; correction: boolean; relevance: number } | undefined;
-    for (const quote of memory.evidenceQuotes ?? []) {
-      if (typeof quote !== "string") continue;
+    let pick: { text: string; correction: boolean; time: number; order: number } | undefined;
+    let order = 0;
+    const consider = (quote: unknown, time: number) => {
+      if (typeof quote !== "string") return;
       for (const sentence of sentencesOf(quote)) {
+        order += 1;
         if (isQuestionText(sentence) || !isExplanationText(sentence)) continue;
         const correction = CORRECTION_FORM.test(sentence.normalize("NFKC"));
-        const relevance = coverage(bigrams(sentence), turnGrams);
-        if (!pick || (correction && !pick.correction) || (correction === pick.correction && relevance > pick.relevance)) pick = { text: sentence, correction, relevance };
+        const better = !pick || (correction !== pick.correction ? correction : time !== pick.time ? time > pick.time : order > pick.order);
+        if (better) pick = { text: sentence, correction, time, order };
       }
-    }
+    };
+    for (const e of memory.topicEvents ?? []) consider(e?.quote, Number.isFinite(Date.parse(e?.statedAt ?? "")) ? Date.parse(e.statedAt) : 0);
+    for (const q of memory.evidenceQuotes ?? []) consider(q, 0);
     if (pick) return clip(pick.text, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
   }
   const summary = bigrams(memory.summary ?? "");
