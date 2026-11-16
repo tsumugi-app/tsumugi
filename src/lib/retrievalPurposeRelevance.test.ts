@@ -491,3 +491,19 @@ test("5 report: the companion selection and the text scores of the cases outside
   for (const l of rows.slice(2)) console.log(`CI-REPORT weak-overlap ${l}`);
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${out}\n`);
 });
+
+test("5 reason-word filtering preserves interpreter / translation topics after an acknowledgment", async () => {
+  for (const topic of ["通訳", "翻訳"]) {
+    const records = [
+      mem("language", "2026-09-01", `${topic}をやめて別の道へ進むことにした。`, ["キャリア", "語学"]),
+      mem("unrelated-reason", "2026-09-02", "転職をやめた理由を家族に説明した。", ["転職", "家族"]),
+    ];
+    for (const persona of ["companion", "coach"] as Persona[]) {
+      for (const q of [`そっか、なんで${topic}をやめたんだったっけ？`, `そっか、${topic}をやめた理由って何だったっけ？`]) {
+        const got = await ids(q, persona, true, records);
+        assert.ok(got.includes("language"), `${persona} ${q}: topic preserved (${got.join(", ")})`);
+        assert.ok(!got.includes("unrelated-reason"), `${persona} ${q}: reason alone is not a topic`);
+      }
+    }
+  }
+});

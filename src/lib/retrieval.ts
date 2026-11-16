@@ -122,7 +122,7 @@ const HIRAGANA = /^[\u3041-\u309f]$/;
 /** a character that carries content on its own (kanji, katakana, letters, digits): not hiragana, not punctuation */
 const isContentChar = (c: string | undefined) => c !== undefined && !HIRAGANA.test(c) && !WEAK_RUN_BREAK.test(c);
 /** a reason word, never the topic of a reason question */
-const REASON_WORD = /理由|なぜ|何故|どうして|なんで|わけ|訳/;
+const REASON_WORD = /^(?:理由|なぜ|何故|どうして|なんで|わけ|訳)$/;
 /**
  * the recall topic terms inside the subject of a reason question. When none is inside it (the subject is only an opener: 「そっか、なんで転職を…」),
  * the terms without the reason words (independent review on this PR). null when nothing is left
