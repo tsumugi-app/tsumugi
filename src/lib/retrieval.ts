@@ -120,6 +120,11 @@ const WEAK_RUN_EDGE_PARTICLE = /^[をがはのにでともへ]$/;
 const HIRAGANA = /^[\u3041-\u309f]$/;
 /** a character that carries content on its own (kanji, katakana, letters, digits): not hiragana, not punctuation */
 const isContentChar = (c: string | undefined) => c !== undefined && !HIRAGANA.test(c) && !WEAK_RUN_BREAK.test(c);
+/** the recall topic terms inside the subject of a reason question (null when none is left) */
+const subjectTermsOf = (topic: RecallTopic | null, subject: string): RecallTopic | null => {
+  const terms = topic?.terms.filter((term) => subject.includes(term)) ?? [];
+  return terms.length > 0 ? { terms } : null;
+};
 export const WEAK_RUN_MIN_CHARS = 3;
 const WEAK_RUN_COMMON_RECORDS = 5;
 const WEAK_RUN_COMMON_SHARE = 0.2;
@@ -1270,8 +1275,10 @@ export async function retrieveRelevantMemoriesImpl(
   const all = await getAllMemoryObjects();
 
   const searchable = all.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
-  const topic = withPoolEvidence(recall, searchable);
   const purpose = options.purposeRelevance === true ? purposeContextOf(trimmed, searchable) : null;
+  // 会話の画面で過去の行動の理由を尋ねるとき：話題は尋ねた行動（主題）の語だけ。「理由」などの理由の語は話題の根拠にしない
+  // （「旅行をやめた理由って何だったっけ？」の「理由」で「転職をやめた理由を…」を話題に一致させない）
+  const topic = withPoolEvidence(purpose?.reasonAsked && purpose.reasonSubject ? subjectTermsOf(recall, purpose.reasonSubject) : recall, searchable);
   // 会話の画面（purposeRelevanceを渡す）だけ、弱い文字の重なりの根拠を確かめる。Connect等は従来どおり
   const weakGate = options.purposeRelevance === true;
   const poolTexts = weakGate ? searchable.map((memory) => `${memory.summary} ${memory.content}`.replace(/\s+/g, "")) : [];

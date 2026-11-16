@@ -321,13 +321,14 @@ test("4 a reason question: the user's own on-topic correction is selected before
 
 test("4 the correction stays out of unrelated questions, and a reason question about another topic does not raise it", async () => {
   for (const persona of ["analyst", "companion"] as Persona[]) {
-    // not a reason question: the change never acts, so the correction is where it was without the purpose relevance (companion's chat
-    // 「今日は天気が…」 already picks it by a weak overlap: an older issue, reported, not changed here)
+    // not a reason question: the purpose change never acts, so the correction is where it was without the purpose relevance; except companion's
+    // chat 「今日は天気が…」, where the weak overlap 「し、」 no longer picks it (the companion weak-overlap fix, section 5)
     for (const q of ["今日は天気がいいし、どこか出かけたいな", "前に買ったロードバイクって、いくらだったっけ？"]) {
       assert.equal(rr.asksReasonOfPast(q), false, q);
       const got = await ids(q, persona, true, JOB);
       const without = await ids(q, persona, false, JOB);
-      assert.equal(got.includes("j3"), without.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
+      if (persona === "companion" && q.startsWith("今日は")) assert.ok(without.includes("j3") && !got.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
+      else assert.equal(got.includes("j3"), without.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
     }
     // a reason question about another topic: the correction is not raised into it (companion may still pick it by a weak overlap of 「やめた」, as before)
     for (const q of ["旅行をやめたのは、雨のせいだったのかな？", "旅行をやめたのって、なんでだったっけ？"]) {
@@ -418,6 +419,7 @@ const WEAK_CASES: { q: string; pool: "JOB" | "HIRA" | "OUTINGS"; keep: string[];
   ...TRAVEL.map((q) => ({ q, pool: "JOB" as const, keep: ["trip"], drop: ["j3", "jrefl"], what: "別の行動の理由の質問" })),
   { q: CONTRADICT, pool: "JOB", keep: ["j3"], drop: [], what: "PR #51：本人の訂正" },
   { q: "転職をやめたのって、なんでだったっけ？", pool: "JOB", keep: ["j3"], drop: [], what: "PR #51：本人の訂正" },
+  { q: "転職をやめた理由って何だったっけ？", pool: "JOB", keep: ["j3"], drop: ["trip"], what: "PR #51：本人の訂正（「理由」を含む想起の質問）" },
   { q: "最近なんだかさみしいな", pool: "HIRA", keep: ["sad"], drop: [], what: "ひらがなの感情" },
   { q: "なんだかかなしい気分", pool: "HIRA", keep: ["kanashi"], drop: [], what: "ひらがなの感情" },
   { q: "今日はうれしいことがあった", pool: "HIRA", keep: ["ureshi"], drop: [], what: "ひらがなの感情" },
