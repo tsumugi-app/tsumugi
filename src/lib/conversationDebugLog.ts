@@ -398,7 +398,7 @@ export async function logConversationDebug(params: ConversationDebugParams): Pro
         const selection = selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, isReflectiveQuery(trimmed) ? REFLECTIVE_LIMIT : DEFAULT_LIMIT, withPoolEvidence(recallTopicOf(trimmed), pool), purposeContextOf(trimmed, pool));
 
         const fmt = (entry: ConversationCandidateScore) =>
-          `id=${entry.memory.id} conversationScore=${entry.conversationScore.toFixed(2)} ` +
+          `id=${entry.memory.id} conversationScore=${entry.conversationScore.toFixed(2)}${entry.reasonAnswer ? " reasonAnswer(本人の理由・訂正。相対の強さでは外さない)" : ""} ` +
           `(queryScore=${entry.queryScore.toFixed(2)} genericPenalty=-${entry.genericPenalty.toFixed(2)} anchorBonus=+${entry.anchorBonus.toFixed(2)} personBonus=+${entry.personBonus.toFixed(2)} recallBonus=+${entry.recallBonus.toFixed(2)} purposeAdjust=${entry.purposeAdjust >= 0 ? "+" : ""}${entry.purposeAdjust.toFixed(2)}${entry.demoted ? " demoted" : ""}) ` +
           `summary="${entry.memory.summary}"`;
 

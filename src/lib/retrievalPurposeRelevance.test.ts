@@ -329,11 +329,22 @@ test("4 the correction stays out of unrelated questions, and a reason question a
       const without = await ids(q, persona, false, JOB);
       assert.equal(got.includes("j3"), without.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
     }
-    // a reason question about another topic: the correction is not raised into it
+    // a reason question about another topic: the correction is not raised into it (companion may still pick it by a weak overlap of 「やめた」, as before)
     for (const q of ["旅行をやめたのは、雨のせいだったのかな？", "旅行をやめたのって、なんでだったっけ？"]) {
       const got = await ids(q, persona, true, JOB);
-      assert.ok(!got.includes("j3"), `${persona} ${q}: ${got.join(", ")}`);
+      const without = await ids(q, persona, false, JOB);
+      assert.ok(!got.includes("j3") || without.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
+      const ctx = rr.purposeContextOf(q, JOB);
+      assert.equal(rr.adjustForPurpose(JOB.find((m) => m.id === "j3")!, 1, ctx, q, false, 3, 3).reasonAnswer, undefined, q);
     }
+    // the reason put forward does not make a record on topic: a money record with a reason form is not raised for the 転職 question (review on this PR)
+    const money = mem("money", "2026-10-01", "今月は出費が多かったので節約しようと思うと話した。", ["お金", "家計"], { quotes: ["今月は出費が多かったので、少し節約しようと思う。"] });
+    const anxious = mem("anx", "2026-10-02", "不安で眠れなかったと話した。", ["不安", "睡眠"], { quotes: ["不安だったから、眠れなかった。"] });
+    const withNoise = [...JOB, money, anxious];
+    const got = await ids(CONTRADICT, persona, true, withNoise);
+    assert.ok(got.includes("j3"), `${persona}: ${got.join(", ")}`);
+    const ctx = rr.purposeContextOf(CONTRADICT, withNoise);
+    for (const m of [money, anxious]) assert.equal(rr.adjustForPurpose(m, 2, ctx, CONTRADICT, false, 3, 3).reasonAnswer, undefined, m.id);
     // the travel reason question gets the travel reason
     assert.ok((await ids("旅行をやめたのは、雨のせいだったのかな？", persona, true, JOB)).includes("trip"), persona);
   }
@@ -341,7 +352,10 @@ test("4 the correction stays out of unrelated questions, and a reason question a
 
 test("4 what counts: a reason question (asked or put forward), the user's own words in a reason / correction form, on topic; never an AI reflection", () => {
   for (const q of [CONTRADICT, "転職をやめたのって、なんでだったっけ？", "旅行をやめたのは、雨のせいだったのかな？", "引っ越したのは、仕事のためだったっけ？"]) assert.equal(rr.asksReasonOfPast(q), true, q);
-  for (const q of ["昨日食べたのは、カレーだったっけ？", "今日は天気がいいし、どこか出かけたいな", "なんで疲れるんだろう", "転職しようかな", "前に買ったロードバイクって、いくらだったっけ？"]) assert.equal(rr.asksReasonOfPast(q), false, q);
+  for (const q of ["昨日食べたのは、カレーだったっけ？", "今日は天気がいいし、どこか出かけたいな", "なんで疲れるんだろう", "転職しようかな", "前に買ったロードバイクって、いくらだったっけ？", "先週会ったのは、大学からの友達だったっけ？", "行ったのは、駅から近いカフェだったかな？"]) assert.equal(rr.asksReasonOfPast(q), false, q);
+  assert.equal(rr.reasonSubjectOf(CONTRADICT), "転職をやめたの", "the subject is the act, not the reason put forward");
+  // the quote of a reason question: a correction first, then the sentence closest to the turn; not the first reason-form sentence
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職", "チーム"], evidenceQuotes: ["今日は雨だったので在宅にした。", "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
   const ctx = rr.purposeContextOf(CONTRADICT, JOB);
   const byJob = (id: string) => JOB.find((m) => m.id === id)!;
   assert.deepEqual(rr.adjustForPurpose(byJob("j3"), 2, ctx, CONTRADICT, false, 3, 3), { score: 6, onTopic: true, demoted: false, reasonAnswer: true });

@@ -13,8 +13,9 @@
  *    user's own view (a thought, a feeling, a judgment): the user's past view reaches the AI, as a view of the record's day.
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
-import { asksReasonOfPast, isAllowedTrait } from "./recordRelevance";
+import { isAllowedTrait, onReasonSubject, reasonSubjectOf } from "./recordRelevance";
 import { isExplanationText, isQuestionText, reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
+import { CORRECTION_FORM } from "./personStance";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -66,15 +67,23 @@ export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuot
   const focus = reasonFocusOf(latest);
   const reason = focus ? reasonSentenceOf(memory, focus) : undefined;
   if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
-  // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (one of its keywords is in the turn):
-  // the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat the topic word
-  const onTopic = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length >= 2 && latest.includes(k.trim()));
-  if (onTopic && asksReasonOfPast(latest)) {
+  // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (a keyword named in the subject of
+  // the question): the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat
+  // the topic word. A correction first, then the sentence closest to the turn
+  const subject = reasonSubjectOf(latest);
+  if (subject !== null && onReasonSubject(memory, subject)) {
+    const turnGrams = bigrams(latest);
+    let pick: { text: string; correction: boolean; relevance: number } | undefined;
     for (const quote of memory.evidenceQuotes ?? []) {
       if (typeof quote !== "string") continue;
-      const own = sentencesOf(quote).find((sentence) => !isQuestionText(sentence) && isExplanationText(sentence));
-      if (own) return clip(own, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
+      for (const sentence of sentencesOf(quote)) {
+        if (isQuestionText(sentence) || !isExplanationText(sentence)) continue;
+        const correction = CORRECTION_FORM.test(sentence.normalize("NFKC"));
+        const relevance = coverage(bigrams(sentence), turnGrams);
+        if (!pick || (correction && !pick.correction) || (correction === pick.correction && relevance > pick.relevance)) pick = { text: sentence, correction, relevance };
+      }
     }
+    if (pick) return clip(pick.text, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
   }
   const summary = bigrams(memory.summary ?? "");
   const turn = bigrams(conversationTexts.join(" "));
