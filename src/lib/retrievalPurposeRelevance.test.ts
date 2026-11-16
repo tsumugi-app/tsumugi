@@ -403,9 +403,17 @@ const HIRA: MemoryObject[] = [
   mem("bike2", "2026-09-08", "ロードバイクを買ったと話した。", ["自転車", "ロードバイク"]),
   mem("yuki", "2026-09-09", "ゆうきさんと約束のことで喧嘩したと話した。", ["ゆうきさん", "友人"], { persons: ["ゆうきさん"] }),
   mem("curry", "2026-09-10", "スパイスからカレーを作ったと話した。", ["料理", "カレー"]),
+  mem("mirai", "2026-09-11", "咲さんとの関係には未来がないと話した。", ["咲さん", "関係"], { persons: ["咲さん"] }),
+];
+// a user who often goes out: three records share 「出かけ」 (none has it as a keyword); a common run needs 5 records, so they stay (review on this PR)
+const OUTINGS: MemoryObject[] = [
+  ...HIRA,
+  mem("out1", "2026-10-01", "友達と海に出かけたと話した。", ["海", "友達"]),
+  mem("out2", "2026-10-08", "一人で美術館に出かけたと話した。", ["美術館"]),
+  mem("out3", "2026-10-15", "雨の日に近所の本屋へ出かけたと話した。", ["本屋", "雨"]),
 ];
 const TRAVEL = ["旅行をやめたのは、雨のせいだったのかな？", "旅行をやめたのって、なんでだったっけ？", "旅行をやめた理由って何だったっけ？"];
-const WEAK_CASES: { q: string; pool: "JOB" | "HIRA"; keep: string[]; drop: string[]; what: string }[] = [
+const WEAK_CASES: { q: string; pool: "JOB" | "HIRA" | "OUTINGS"; keep: string[]; drop: string[]; what: string }[] = [
   { q: "今日は天気がいいし、どこか出かけたいな", pool: "JOB", keep: [], drop: ["j3", "jrefl"], what: "雑談（句読点・ひらがな2文字だけの一致）" },
   ...TRAVEL.map((q) => ({ q, pool: "JOB" as const, keep: ["trip"], drop: ["j3", "jrefl"], what: "別の行動の理由の質問" })),
   { q: CONTRADICT, pool: "JOB", keep: ["j3"], drop: [], what: "PR #51：本人の訂正" },
@@ -421,11 +429,16 @@ const WEAK_CASES: { q: string; pool: "JOB" | "HIRA"; keep: string[]; drop: strin
   { q: "スパイスを買いに行きたい", pool: "HIRA", keep: ["curry"], drop: [], what: "キーワード外の具体的な語" },
   { q: "ロードバイクで遠くまで行きたい", pool: "HIRA", keep: ["bike2"], drop: [], what: "具体的な話題（キーワード）" },
   { q: "ゆうきさんに会いたいな", pool: "HIRA", keep: ["yuki"], drop: [], what: "人物" },
+  { q: "週末どこかにでかけたいな", pool: "HIRA", keep: ["odekake"], drop: [], what: "ひらがなの行動（助詞と同じ文字で始まる語）" },
+  { q: "ゆうきと喧嘩したのは、約束を守らなかったせいかな？", pool: "HIRA", keep: ["yuki"], drop: [], what: "理由の質問：さん無しで呼んだ人物" },
+  { q: "未来がないと言った理由は？", pool: "HIRA", keep: ["mirai"], drop: [], what: "理由の質問：主題の言い回しが一致する元の発言" },
+  { q: "どこか出かけたいな", pool: "OUTINGS", keep: ["out1", "out2", "out3"], drop: [], what: "よく話す話題（3件の記録）" },
+  { q: "落ち込んだのは、さみしいからかな", pool: "HIRA", keep: [], drop: [], what: "理由の形の独り言（課題：sadは外れる）" },
 ];
 
 test("5 companion chat: weak overlaps of punctuation, endings or common phrasing pick nothing; hiragana feelings / acts, keywords, topics and people stay", async () => {
   for (const c of WEAK_CASES) {
-    const got = await ids(c.q, "companion", true, c.pool === "JOB" ? JOB : HIRA);
+    const got = await ids(c.q, "companion", true, c.pool === "JOB" ? JOB : c.pool === "OUTINGS" ? OUTINGS : HIRA);
     for (const id of c.keep) assert.ok(got.includes(id), `${c.what} ${c.q}: ${id} kept (${got.join(", ")})`);
     for (const id of c.drop) assert.ok(!got.includes(id), `${c.what} ${c.q}: ${id} not picked (${got.join(", ")})`);
   }
@@ -436,6 +449,15 @@ test("5 companion chat: weak overlaps of punctuation, endings or common phrasing
   assert.deepEqual(r.sharedTextRuns("今日は天気がいいし、どこか出かけたいな", text(byJob("jrefl"))), [], "「たい」 alone is too short");
   assert.deepEqual(r.sharedTextRuns("理由はよくわからないけど、疲れた", text(HIRA.find((m) => m.id === "move")!)), [], "「理由」 alone is too short");
   assert.deepEqual(r.sharedTextRuns("最近なんだかさみしいな", text(HIRA[0])), ["さみし"]);
+  // a piece the record contains as it is, not a chain of bigrams found in different places (review on this PR)
+  assert.deepEqual(r.sharedTextRuns("もうやめたい", "仕事をやめた。旅に出たいと話した。"), ["やめた"]);
+  // an edge particle goes only next to a kanji / katakana / letter: 「にでかけ」 keeps 「でかけ」, 「旅行をやめた」 drops 「を」, 「理由を」 drops 「を」
+  assert.deepEqual(r.sharedTextRuns("週末どこかにでかけたいな", text(HIRA.find((m) => m.id === "odekake")!)), ["でかけ"]);
+  assert.deepEqual(r.sharedTextRuns("旅行をやめたのって、なんでだったっけ？", text(byJob("j3"))), ["やめた"]);
+  // a reason question about another act: 「やめた」 is in the subject but has no kanji / katakana, so 「転職をやめた」 is not tied to 「旅行をやめた」
+  const jobTexts = JOB.map((m) => text(m).replace(/\s+/g, ""));
+  assert.equal(r.hasSubjectRun("旅行をやめたのって、なんでだったっけ？", byJob("j3"), jobTexts, "旅行をやめた"), false);
+  assert.equal(r.hasSubjectRun("旅行をやめた理由って何だったっけ？", byJob("j3"), jobTexts, "旅行をやめた"), false, "「やめた理由」 is not inside the subject");
   // a run of the turn that most records share is not a reason to pick one (「と話した」 is in every summary)
   const poolTexts = HIRA.map((m) => text(m).replace(/\s+/g, ""));
   assert.equal(r.hasDistinctSharedRun("昨日、上司と話した", HIRA[0], poolTexts), false);
@@ -454,7 +476,7 @@ test("5 companion chat: weak overlaps of punctuation, endings or common phrasing
 test("5 report: the companion selection and the text scores of the cases outside the 12 configurations", async () => {
   const rows: string[] = ["| ケース | 発言 | 採用（順） | scoreMemory>0 の記録 |", "|---|---|---|---|"];
   for (const c of WEAK_CASES) {
-    const p = c.pool === "JOB" ? JOB : HIRA;
+    const p = c.pool === "JOB" ? JOB : c.pool === "OUTINGS" ? OUTINGS : HIRA;
     const got = await ids(c.q, "companion", true, p);
     const scores = p.map((m) => [m.id, r.scoreMemory(m, c.q)] as const).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]).map(([id, s]) => `${id} ${s.toFixed(2)}`);
     rows.push(`| ${c.what} | ${c.q} | ${got.join(", ") || "（なし）"} | ${scores.join(", ") || "（なし）"} |`);

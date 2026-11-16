@@ -108,46 +108,62 @@ function bigramOverlap(a: string, b: string): number {
  * 会話の画面のcompanion/coachだけ（`purposeRelevance`を渡す呼び出し）。キーワード・話題・人物のどれにも一致せず、最低点にも届かない弱い記録を、
  * 文字の重なりだけで選んでよいか。scoreMemoryのスコア自体は変えず、選ぶかどうかの根拠だけを確かめる。
  *
- * 根拠になるのは、発言と記録の要約が共有する「続いた文字列」（発言の中で隣り合う2文字が、どれも記録の2文字にも含まれる、最長のつながり）だけ:
+ * 根拠になるのは、発言の中の、記録の要約に「そのまま含まれる」続いた文字列（sharedTextRuns）だけ:
  * - 句読点・記号・空白をまたがない（「言い直し、」と「いいし、」の「し、」は根拠にしない）
- * - 端の助詞（を・が・は・の・に・で・と・も・へ）を除いて3文字以上（「たい」「理由」「理由を」の一致だけでは選ばない。「さみし」「出かけ」「やめた」は残る）
- * - 記録の集合の中で珍しい（その文字列を含む記録が3件未満、かつ全体の2割未満）。「と話した」「やめた」のように多くの記録にある言い回しは根拠にしない
- * 文字の種類（漢字・ひらがな）では決めない（ひらがなの感情・行動の言葉も同じ扱い）。語や話題の名前は書かない。
+ * - 端の助詞は、漢字・カタカナ・英数字と接しているときだけ1文字除く（「旅行をやめた」の「を」、「理由を」の「を」。「にでかけ」の「で」は語の一部として残す）
+ * - 3文字以上（「たい」「理由」だけの一致では選ばない。「さみし」「でかけ」「やめた」は残る）
+ * - 記録の集合の中で珍しい：その文字列を含む記録が5件未満、かつ全体の2割未満（「と話した」のような多くの記録にある言い回しは根拠にしない）
+ * 文字の種類（漢字・ひらがな）だけでは決めない。語や話題の名前は書かない。
  */
 const WEAK_RUN_BREAK = /[\s、。，．,.・！？!?「」『』（）()［］\[\]【】〈〉《》〔〕｛｝{}"'“”‘’…‥〜～:：;；\/／\\＼|｜\-－―＋+＝=＊*＆&＃#＠@％%＄$￥¥^＾_＿<>＜＞★☆○●◎◇◆□■△▲▽▼♪※→←↑↓]/;
-const WEAK_RUN_EDGE_PARTICLES = /^[をがはのにでともへ]+|[をがはのにでともへ]+$/g;
+const WEAK_RUN_EDGE_PARTICLE = /^[をがはのにでともへ]$/;
+const HIRAGANA = /^[\u3041-\u309f]$/;
+/** a character that carries content on its own (kanji, katakana, letters, digits): not hiragana, not punctuation */
+const isContentChar = (c: string | undefined) => c !== undefined && !HIRAGANA.test(c) && !WEAK_RUN_BREAK.test(c);
 export const WEAK_RUN_MIN_CHARS = 3;
-const WEAK_RUN_COMMON_RECORDS = 3;
+const WEAK_RUN_COMMON_RECORDS = 5;
 const WEAK_RUN_COMMON_SHARE = 0.2;
 export function sharedTextRuns(query: string, memoryText: string): string[] {
-  const grams = toBigrams(memoryText);
+  const text = memoryText.replace(/\s+/g, "");
   const chars = Array.from(query.replace(/\s+/g, ""));
   const runs: string[] = [];
-  let run: string[] = [];
-  const close = () => {
-    if (run.length >= 2) runs.push(run.join(""));
-    run = [];
-  };
-  for (let i = 0; i < chars.length - 1; i++) {
-    const a = chars[i];
-    const b = chars[i + 1];
-    if (!WEAK_RUN_BREAK.test(a) && !WEAK_RUN_BREAK.test(b) && grams.has(a + b)) {
-      if (run.length === 0) run.push(a);
-      run.push(b);
-    } else {
-      close();
-    }
+  let p = 0;
+  while (p < chars.length - 1) {
+    if (WEAK_RUN_BREAK.test(chars[p])) { p += 1; continue; }
+    // the longest piece from p that the record contains as it is (not a chain of bigrams found in different places)
+    let len = 1;
+    while (p + len < chars.length && !WEAK_RUN_BREAK.test(chars[p + len]) && text.includes(chars.slice(p, p + len + 1).join(""))) len += 1;
+    if (len < 2) { p += 1; continue; }
+    let piece = chars.slice(p, p + len);
+    if (WEAK_RUN_EDGE_PARTICLE.test(piece[0]) && isContentChar(chars[p - 1])) piece = piece.slice(1);
+    if (piece.length >= 2 && WEAK_RUN_EDGE_PARTICLE.test(piece[piece.length - 1]) && isContentChar(piece[piece.length - 2])) piece = piece.slice(0, -1);
+    if (piece.length >= WEAK_RUN_MIN_CHARS) runs.push(piece.join(""));
+    p += len - 1;
   }
-  close();
-  return runs.map((text) => text.replace(WEAK_RUN_EDGE_PARTICLES, "")).filter((text) => Array.from(text).length >= WEAK_RUN_MIN_CHARS);
+  return runs;
 }
-/** a weak record (no keyword, topic or person) may be picked by its text only through a shared run that is not common in the pool */
-export function hasDistinctSharedRun(query: string, memory: MemoryObject, poolTexts: readonly string[]): boolean {
-  const runs = sharedTextRuns(query, `${memory.summary} ${memory.content}`);
-  if (runs.length === 0) return false;
+const runCounts = new WeakMap<readonly string[], Map<string, number>>();
+/** how many records of the pool contain the run (cached per pool for the turn) */
+function poolCount(run: string, poolTexts: readonly string[]): number {
+  let counts = runCounts.get(poolTexts);
+  if (!counts) { counts = new Map(); runCounts.set(poolTexts, counts); }
+  let n = counts.get(run);
+  if (n === undefined) { n = poolTexts.filter((t) => t.includes(run)).length; counts.set(run, n); }
+  return n;
+}
+/** the shared runs of a weak record that are not common in the pool */
+export function distinctSharedRuns(query: string, memory: MemoryObject, poolTexts: readonly string[]): string[] {
   const common = Math.max(WEAK_RUN_COMMON_RECORDS, Math.ceil(poolTexts.length * WEAK_RUN_COMMON_SHARE));
-  return runs.some((text) => poolTexts.filter((t) => t.includes(text)).length < common);
+  return sharedTextRuns(query, `${memory.summary} ${memory.content}`).filter((run) => poolCount(run, poolTexts) < common);
 }
+export const hasDistinctSharedRun = (query: string, memory: MemoryObject, poolTexts: readonly string[]) => distinctSharedRuns(query, memory, poolTexts).length > 0;
+/**
+ * a reason question about a past act (「旅行をやめたのは、雨のせいだったのかな？」): a weak record counts only through a distinct run inside the act asked
+ * about (the subject) that has a kanji / katakana / letter / digit (「未来がないと言った理由は？」 keeps 「…未来がないと話した」; 「やめた」 alone does not
+ * tie 「転職をやめた」 to 「旅行をやめた」; the reason put forward, 「雨のせい」「さみしい」, never counts)
+ */
+export const hasSubjectRun = (query: string, memory: MemoryObject, poolTexts: readonly string[], subject: string) =>
+  distinctSharedRuns(query, memory, poolTexts).some((run) => subject.includes(run.normalize("NFKC")) && Array.from(run).some((c) => isContentChar(c)));
 
 /**
  * Entity（person/theme/emotion）軸のスコアラー。
@@ -1259,25 +1275,29 @@ export async function retrieveRelevantMemoriesImpl(
   // 会話の画面（purposeRelevanceを渡す）だけ、弱い文字の重なりの根拠を確かめる。Connect等は従来どおり
   const weakGate = options.purposeRelevance === true;
   const poolTexts = weakGate ? searchable.map((memory) => `${memory.summary} ${memory.content}`.replace(/\s+/g, "")) : [];
-  // a keyword or a person of the record is named in the turn (the same raw comparison as scoreMemory)
-  const hasWeakBasis = (memory: MemoryObject) =>
-    memory.keywords.some((keyword) => keyword && trimmed.includes(keyword)) ||
-    (memory.personMentions ?? []).some((p) => typeof p?.displayName === "string" && Array.from(p.displayName.trim()).length >= 2 && trimmed.includes(p.displayName.trim()));
+  // a person of the record is named in the turn (as purposeContextOf reads it: 「ゆうき」 names 「ゆうきさん」). A keyword hit already passes the floor
+  const namesPerson = (memory: MemoryObject) =>
+    (purpose?.namedPersons.length ?? 0) > 0 &&
+    (memory.personMentions ?? []).some((p) => typeof p?.displayName === "string" && purpose!.namedPersons.includes(p.displayName.normalize("NFKC").trim()));
   const candidates = searchable
     .map((memory) => {
       const match = topic ? matchRecallTopic(memory, topic, trimmed) : null;
       const bonus = match ? (match.matched.length - match.coveredByKeyword.length) * KEYWORD_WEIGHT : 0;
       // 件数・Reflectionの扱いより前に、質問の目的で加点・減点する（話題に一致する記録だけ。目的が無ければ尋ねただけの記録を後ろに回すだけ）
       const adjusted = adjustForPurpose(memory, scoreMemory(memory, trimmed) + bonus, purpose, trimmed, (match?.matched.length ?? 0) > 0, KEYWORD_WEIGHT, CONVERSATION_MIN_SCORE);
-      return { memory, score: adjusted.score, onTopic: adjusted.onTopic, demoted: adjusted.demoted, reasonAnswer: adjusted.reasonAnswer === true, topicMatched: (match?.matched.length ?? 0) > 0 };
+      return { memory, score: adjusted.score, onTopic: adjusted.onTopic, demoted: adjusted.demoted, reasonAnswer: adjusted.reasonAnswer === true };
     })
     // スコア0（関連なし）は返さない。無理に件数を埋めない（MEMORY_ENGINE.md 7.4）。
     .filter((entry) => entry.score > 0)
     // 会話の画面だけ：キーワード・話題・人物のどれにも一致しない最低点未満の弱い記録は、珍しい続いた文字列を共有するときだけ（hasDistinctSharedRun）
-    .filter((entry) => !weakGate || entry.score >= CONVERSATION_MIN_SCORE || entry.onTopic || entry.reasonAnswer || entry.topicMatched || hasWeakBasis(entry.memory) || hasDistinctSharedRun(trimmed, entry.memory, poolTexts));
-  // 過去を尋ねる質問（話題の語があるとき）・目的が分かる過去の質問・過去の行動の理由を尋ねる質問：話題に一致せず、analystの最低点にも届かない弱い記録
-  // （文字の偶然の重なりだけ）は入れない（analystと同じ基準）。本人の理由・訂正（reasonAnswer）は最低点＋1キーワード分あるので残る
-  const ranked = (topic || purpose?.purpose || purpose?.reasonAsked ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE) : candidates)
+    .filter((entry) => !weakGate || entry.score >= CONVERSATION_MIN_SCORE || entry.onTopic || entry.reasonAnswer || namesPerson(entry.memory) || hasDistinctSharedRun(trimmed, entry.memory, poolTexts));
+  // 過去を尋ねる質問（話題の語があるとき）・目的が分かる過去の質問：話題に一致せず、analystの最低点にも届かない弱い記録（文字の偶然の重なりだけ）は入れない（analystと同じ基準）
+  // 過去の行動の理由を尋ねる質問（それだけのとき）も同じ。ただし、名前を挙げた人物の記録と、尋ねた行動（主題）の中の珍しい文字列を共有する記録は残す
+  // （hasSubjectRun。「旅行をやめた」に「転職をやめた」は入れない）。本人の理由・訂正（reasonAnswer）は最低点＋1キーワード分あるので残る
+  const reasonOnly = !topic && !purpose?.purpose && purpose?.reasonAsked === true && Boolean(purpose.reasonSubject);
+  const ranked = (topic || purpose?.purpose || reasonOnly
+    ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE || (reasonOnly && (namesPerson(entry.memory) || hasSubjectRun(trimmed, entry.memory, poolTexts, purpose!.reasonSubject!))))
+    : candidates)
     .sort((a, b) => b.score - a.score || Number(a.demoted) - Number(b.demoted))
     .map(({ memory, score }) => ({ memory, score }));
   // P1-F：会話のRetrievalだけ、Reflectionを本人の記録の後に回す（未指定なら従来の順のまま）
