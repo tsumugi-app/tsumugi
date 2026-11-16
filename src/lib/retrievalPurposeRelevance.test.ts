@@ -437,7 +437,7 @@ const WEAK_CASES: { q: string; pool: "JOB" | "HIRA" | "OUTINGS"; keep: string[];
   { q: "ゆうきと喧嘩したのは、約束を守らなかったせいかな？", pool: "HIRA", keep: ["yuki"], drop: [], what: "理由の質問：さん無しで呼んだ人物" },
   { q: "未来がないと言った理由は？", pool: "HIRA", keep: ["mirai"], drop: [], what: "理由の質問：主題の言い回しが一致する元の発言" },
   { q: "どこか出かけたいな", pool: "OUTINGS", keep: ["out1", "out2", "out3"], drop: [], what: "よく話す話題（3件の記録）" },
-  { q: "スパイスを買ったのは、カレーを作りたかったからかな？", pool: "OUTINGS", keep: ["spice"], drop: [], what: "理由の質問：主題より長く一致する元の発言" },
+  { q: "スパイスを買ったのは、カレーを作りたかったからかな？", pool: "OUTINGS", keep: ["spice"], drop: ["bike2"], what: "理由の質問：主題より長く一致する元の発言（「買った」だけの記録は外す）" },
   { q: "落ち込んだのは、さみしいからかな", pool: "HIRA", keep: [], drop: [], what: "理由の形の独り言（課題：sadは外れる）" },
 ];
 

@@ -177,7 +177,8 @@ export const hasDistinctSharedRun = (query: string, memory: MemoryObject, poolTe
  */
 export const hasSubjectRun = (memory: MemoryObject, poolTexts: readonly string[], subject: string) =>
   // the runs are taken from the subject itself: a longer run of the whole question (「スパイスを買ったのは」) still ties the act (Codex on this PR)
-  distinctSharedRuns(subject, memory, poolTexts).some((run) => Array.from(run).some((c) => isContentChar(c)));
+  // two or more kanji / katakana / letters / digits: one kanji with its ending (「買った」) is not a tie (single characters never count)
+  distinctSharedRuns(subject, memory, poolTexts).some((run) => Array.from(run).filter((c) => isContentChar(c)).length >= 2);
 
 /**
  * Entity（person/theme/emotion）軸のスコアラー。
