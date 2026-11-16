@@ -420,6 +420,7 @@ const WEAK_CASES: { q: string; pool: "JOB" | "HIRA" | "OUTINGS"; keep: string[];
   { q: CONTRADICT, pool: "JOB", keep: ["j3"], drop: [], what: "PR #51：本人の訂正" },
   { q: "転職をやめたのって、なんでだったっけ？", pool: "JOB", keep: ["j3"], drop: [], what: "PR #51：本人の訂正" },
   { q: "転職をやめた理由って何だったっけ？", pool: "JOB", keep: ["j3"], drop: ["trip"], what: "PR #51：本人の訂正（「理由」を含む想起の質問）" },
+  { q: "そっか、なんで転職をやめたんだったっけ？", pool: "JOB", keep: ["j3"], drop: ["trip"], what: "PR #51：本人の訂正（理由の語の前に相づち）" },
   { q: "最近なんだかさみしいな", pool: "HIRA", keep: ["sad"], drop: [], what: "ひらがなの感情" },
   { q: "なんだかかなしい気分", pool: "HIRA", keep: ["kanashi"], drop: [], what: "ひらがなの感情" },
   { q: "今日はうれしいことがあった", pool: "HIRA", keep: ["ureshi"], drop: [], what: "ひらがなの感情" },

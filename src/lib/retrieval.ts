@@ -112,7 +112,8 @@ function bigramOverlap(a: string, b: string): number {
  * - 句読点・記号・空白をまたがない（「言い直し、」と「いいし、」の「し、」は根拠にしない）
  * - 端の助詞は、漢字・カタカナ・英数字と接しているときだけ1文字除く（「旅行をやめた」の「を」、「理由を」の「を」。「にでかけ」の「で」は語の一部として残す）
  * - 3文字以上（「たい」「理由」だけの一致では選ばない。「さみし」「でかけ」「やめた」は残る）
- * - 記録の集合の中で珍しい：その文字列を含む記録が5件未満、かつ全体の2割未満（「と話した」のような多くの記録にある言い回しは根拠にしない）
+ * - 記録の集合の中で珍しい：その文字列を含む記録が max(5件, 全体の2割) 未満（「と話した」のような多くの記録にある言い回しは根拠にしない）。
+ *   小さい集合でも、よく話す話題（3〜4件の記録）は根拠に残す。大きい集合では2割未満の言い回しも珍しい扱いになる（今後の関連度の課題）
  * 文字の種類（漢字・ひらがな）だけでは決めない。語や話題の名前は書かない。
  */
 const WEAK_RUN_BREAK = /[\s、。，．,.・！？!?「」『』（）()［］\[\]【】〈〉《》〔〕｛｝{}"'“”‘’…‥〜～:：;；\/／\\＼|｜\-－―＋+＝=＊*＆&＃#＠@％%＄$￥¥^＾_＿<>＜＞★☆○●◎◇◆□■△▲▽▼♪※→←↑↓]/;
@@ -120,9 +121,16 @@ const WEAK_RUN_EDGE_PARTICLE = /^[をがはのにでともへ]$/;
 const HIRAGANA = /^[\u3041-\u309f]$/;
 /** a character that carries content on its own (kanji, katakana, letters, digits): not hiragana, not punctuation */
 const isContentChar = (c: string | undefined) => c !== undefined && !HIRAGANA.test(c) && !WEAK_RUN_BREAK.test(c);
-/** the recall topic terms inside the subject of a reason question (null when none is left) */
+/** a reason word, never the topic of a reason question */
+const REASON_WORD = /理由|なぜ|何故|どうして|なんで|わけ|訳/;
+/**
+ * the recall topic terms inside the subject of a reason question. When none is inside it (the subject is only an opener: 「そっか、なんで転職を…」),
+ * the terms without the reason words (independent review on this PR). null when nothing is left
+ */
 const subjectTermsOf = (topic: RecallTopic | null, subject: string): RecallTopic | null => {
-  const terms = topic?.terms.filter((term) => subject.includes(term)) ?? [];
+  if (!topic) return null;
+  const inSubject = topic.terms.filter((term) => subject.includes(term));
+  const terms = inSubject.length > 0 ? inSubject : topic.terms.filter((term) => !REASON_WORD.test(term));
   return terms.length > 0 ? { terms } : null;
 };
 export const WEAK_RUN_MIN_CHARS = 3;
