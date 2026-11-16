@@ -175,8 +175,9 @@ export const hasDistinctSharedRun = (query: string, memory: MemoryObject, poolTe
  * about (the subject) that has a kanji / katakana / letter / digit (「未来がないと言った理由は？」 keeps 「…未来がないと話した」; 「やめた」 alone does not
  * tie 「転職をやめた」 to 「旅行をやめた」; the reason put forward, 「雨のせい」「さみしい」, never counts)
  */
-export const hasSubjectRun = (query: string, memory: MemoryObject, poolTexts: readonly string[], subject: string) =>
-  distinctSharedRuns(query, memory, poolTexts).some((run) => subject.includes(run.normalize("NFKC")) && Array.from(run).some((c) => isContentChar(c)));
+export const hasSubjectRun = (memory: MemoryObject, poolTexts: readonly string[], subject: string) =>
+  // the runs are taken from the subject itself: a longer run of the whole question (「スパイスを買ったのは」) still ties the act (Codex on this PR)
+  distinctSharedRuns(subject, memory, poolTexts).some((run) => Array.from(run).some((c) => isContentChar(c)));
 
 /**
  * Entity（person/theme/emotion）軸のスコアラー。
@@ -1311,7 +1312,7 @@ export async function retrieveRelevantMemoriesImpl(
   // （hasSubjectRun。「旅行をやめた」に「転職をやめた」は入れない）。本人の理由・訂正（reasonAnswer）は最低点＋1キーワード分あるので残る
   const reasonOnly = !topic && !purpose?.purpose && purpose?.reasonAsked === true && Boolean(purpose.reasonSubject);
   const ranked = (topic || purpose?.purpose || reasonOnly
-    ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE || (reasonOnly && (namesPerson(entry.memory) || hasSubjectRun(trimmed, entry.memory, poolTexts, purpose!.reasonSubject!))))
+    ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE || (reasonOnly && (namesPerson(entry.memory) || hasSubjectRun(entry.memory, poolTexts, purpose!.reasonSubject!))))
     : candidates)
     .sort((a, b) => b.score - a.score || Number(a.demoted) - Number(b.demoted))
     .map(({ memory, score }) => ({ memory, score }));

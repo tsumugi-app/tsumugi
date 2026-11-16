@@ -412,6 +412,7 @@ const OUTINGS: MemoryObject[] = [
   mem("out1", "2026-10-01", "友達と海に出かけたと話した。", ["海", "友達"]),
   mem("out2", "2026-10-08", "一人で美術館に出かけたと話した。", ["美術館"]),
   mem("out3", "2026-10-15", "雨の日に近所の本屋へ出かけたと話した。", ["本屋", "雨"]),
+  mem("spice", "2026-10-20", "スパイスを買ったのは、友達に本格的なインド料理を教わって試したくなったからだと話した。", ["料理", "買い物"]),
 ];
 const TRAVEL = ["旅行をやめたのは、雨のせいだったのかな？", "旅行をやめたのって、なんでだったっけ？", "旅行をやめた理由って何だったっけ？"];
 const WEAK_CASES: { q: string; pool: "JOB" | "HIRA" | "OUTINGS"; keep: string[]; drop: string[]; what: string }[] = [
@@ -436,6 +437,7 @@ const WEAK_CASES: { q: string; pool: "JOB" | "HIRA" | "OUTINGS"; keep: string[];
   { q: "ゆうきと喧嘩したのは、約束を守らなかったせいかな？", pool: "HIRA", keep: ["yuki"], drop: [], what: "理由の質問：さん無しで呼んだ人物" },
   { q: "未来がないと言った理由は？", pool: "HIRA", keep: ["mirai"], drop: [], what: "理由の質問：主題の言い回しが一致する元の発言" },
   { q: "どこか出かけたいな", pool: "OUTINGS", keep: ["out1", "out2", "out3"], drop: [], what: "よく話す話題（3件の記録）" },
+  { q: "スパイスを買ったのは、カレーを作りたかったからかな？", pool: "OUTINGS", keep: ["spice"], drop: [], what: "理由の質問：主題より長く一致する元の発言" },
   { q: "落ち込んだのは、さみしいからかな", pool: "HIRA", keep: [], drop: [], what: "理由の形の独り言（課題：sadは外れる）" },
 ];
 
@@ -459,8 +461,9 @@ test("5 companion chat: weak overlaps of punctuation, endings or common phrasing
   assert.deepEqual(r.sharedTextRuns("旅行をやめたのって、なんでだったっけ？", text(byJob("j3"))), ["やめた"]);
   // a reason question about another act: 「やめた」 is in the subject but has no kanji / katakana, so 「転職をやめた」 is not tied to 「旅行をやめた」
   const jobTexts = JOB.map((m) => text(m).replace(/\s+/g, ""));
-  assert.equal(r.hasSubjectRun("旅行をやめたのって、なんでだったっけ？", byJob("j3"), jobTexts, "旅行をやめた"), false);
-  assert.equal(r.hasSubjectRun("旅行をやめた理由って何だったっけ？", byJob("j3"), jobTexts, "旅行をやめた"), false, "「やめた理由」 is not inside the subject");
+  assert.equal(r.hasSubjectRun(byJob("j3"), jobTexts, "旅行をやめた"), false, "only 「やめた」 of the subject is shared");
+  const outTexts = OUTINGS.map((m) => text(m).replace(/\s+/g, ""));
+  assert.equal(r.hasSubjectRun(OUTINGS.find((m) => m.id === "spice")!, outTexts, "スパイスを買ったの"), true, "a run longer than the subject in the question still ties the act (Codex)");
   // a run of the turn that most records share is not a reason to pick one (「と話した」 is in every summary)
   const poolTexts = HIRA.map((m) => text(m).replace(/\s+/g, ""));
   assert.equal(r.hasDistinctSharedRun("昨日、上司と話した", HIRA[0], poolTexts), false);
