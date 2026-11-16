@@ -13,8 +13,8 @@
  *    user's own view (a thought, a feeling, a judgment): the user's past view reaches the AI, as a view of the record's day.
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
-import { isAllowedTrait } from "./recordRelevance";
-import { reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
+import { asksReasonOfPast, isAllowedTrait } from "./recordRelevance";
+import { isExplanationText, isQuestionText, reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -61,10 +61,21 @@ export function memoryPersons(memory: Pick<MemoryObject, "personMentions">): str
  * P1-H: when the current turn (conversationTexts[0]) asks for the reason of something said before, the user's sentence that states that reason or
  * corrects it comes first (explicitReason.ts), even when the AI summary covers it (the summary is not the user's words). None: as before.
  */
-export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes"> & Partial<Pick<MemoryObject, "topicEvents">>, conversationTexts: string[]): string | undefined {
-  const focus = reasonFocusOf(conversationTexts[0] ?? "");
+export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes"> & Partial<Pick<MemoryObject, "topicEvents" | "keywords">>, conversationTexts: string[]): string | undefined {
+  const turn = conversationTexts[0] ?? "";
+  const focus = reasonFocusOf(turn);
   const reason = focus ? reasonSentenceOf(memory, focus) : undefined;
   if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
+  // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (one of its keywords is in the turn):
+  // the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat the topic word
+  const onTopic = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length >= 2 && turn.includes(k.trim()));
+  if (onTopic && asksReasonOfPast(turn)) {
+    for (const quote of memory.evidenceQuotes ?? []) {
+      if (typeof quote !== "string") continue;
+      const own = sentencesOf(quote).find((sentence) => !isQuestionText(sentence) && isExplanationText(sentence));
+      if (own) return clip(own, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
+    }
+  }
   const summary = bigrams(memory.summary ?? "");
   const turn = bigrams(conversationTexts.join(" "));
   let best: { text: string; relevance: number; novelty: number } | undefined;

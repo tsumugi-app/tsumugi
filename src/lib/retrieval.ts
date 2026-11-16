@@ -522,6 +522,8 @@ export interface ConversationCandidateScore {
   recallBonus: number;
   /** 質問の目的に応じた加点・減点（purposeRelevance、会話の画面だけ。recordRelevance.ts）。無ければ0。 */
   purposeAdjust: number;
+  /** 理由を尋ねる質問への、話題に一致する本人の理由・訂正（recordRelevance.ts 4.）。相対の強さでは外さない（floor・件数は従来どおり）。 */
+  reasonAnswer?: boolean;
   /** 質問の目的で後ろに回した（尋ねただけの記録・他人の行動が中心の記録）。同点なら後に並べる。 */
   demoted: boolean;
   /** queryScore - genericPenalty + anchorBonus + personBonus + recallBonus + purposeAdjust。実際の順位付け・floor判定に使う値。 */
@@ -553,7 +555,7 @@ export function scoreConversationCandidates(
     // floor・件数・相対の強さの判定より前に、質問の目的で加点・減点する（話題に一致する記録だけ。recordRelevance.ts）
     const adjusted = purpose ? adjustForPurpose(memory, base, purpose, trimmed, recall ? matchRecallTopic(memory, recall, trimmed).matched.length > 0 : false, KEYWORD_WEIGHT, CONVERSATION_MIN_SCORE) : null;
     const conversationScore = adjusted ? adjusted.score : base;
-    return { memory, queryScore, genericPenalty, anchorBonus, personBonus, recallBonus, purposeAdjust: conversationScore - base, demoted: adjusted?.demoted ?? false, conversationScore };
+    return { memory, queryScore, genericPenalty, anchorBonus, personBonus, recallBonus, purposeAdjust: conversationScore - base, demoted: adjusted?.demoted ?? false, ...(adjusted?.reasonAnswer ? { reasonAnswer: true } : {}), conversationScore };
   });
 }
 
@@ -612,6 +614,8 @@ export function selectConversationDirectMatches(
 
   const relativeInput = sorted.map((entry) => ({ memory: entry.memory, score: entry.conversationScore }));
   const keptIds = new Set(applyRelativeStrengthFilter(relativeInput).map((entry) => entry.memory.id));
+  // 理由を尋ねる質問：話題に一致する本人の理由・訂正は、1位（質問の言い回しをなぞったAIの振り返りのこともある）より弱いだけでは外さない
+  for (const entry of sorted) if (entry.reasonAnswer) keptIds.add(entry.memory.id);
   const kept = sorted.filter((entry) => keptIds.has(entry.memory.id));
   const droppedByRelativeStrength = sorted.filter((entry) => !keptIds.has(entry.memory.id));
 

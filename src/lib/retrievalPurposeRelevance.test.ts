@@ -291,3 +291,57 @@ test("review: a named topic keeps off-topic question records down; the user's ow
   const pastWord = mem("pw", "2026-10-01", "週末に写真を整理した", ["過去", "写真"]);
   assert.equal(rr.adjustForPurpose(pastWord, 3.2, view, CASES[0].q, false, 3, 3).onTopic, false);
 });
+
+// 4. a reason question: the user's own reason / correction comes before the AI reflection that echoes the question (fictional records)
+const JOB: MemoryObject[] = [
+  mem("j1", "2026-05-24", "今の会社からの転職を考え始めたと話した。", ["転職", "仕事"], { quotes: ["今の会社、そろそろ転職しようかな"] }),
+  mem("j2", "2026-06-21", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], { quotes: ["転職はやめた。給料が下がるから"] }),
+  mem("jrefl", "2026-06-22", "転職をやめたのは、お金への不安が強かったからだろう。収入を守りたい気持ちが見えた一日だった。", ["転職", "お金"], { source: "system-generated", quotes: [] }),
+  mem("j3", "2026-09-13", "転職をやめた理由を言い直し、本当は今のチームを離れたくなかったからだと話した。", ["転職", "チーム"], { quotes: ["給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"] }),
+  mem("trip", "2026-08-02", "雨が降っていたので旅行をやめたと話した。", ["旅行", "雨"], { quotes: ["雨が降ってたから、旅行はやめたんだ"] }),
+  mem("bike", "2026-08-10", "ロードバイクを買ったと話した。", ["自転車", "ロードバイク"], { quotes: ["ロードバイク買った。12万円だった"] }),
+];
+const CONTRADICT = "転職をやめたのは、結局お金の不安が一番だったのかな？";
+
+test("4 a reason question: the user's own on-topic correction is selected before the AI reflection (both personas), the reflection is not the user's words", async () => {
+  for (const persona of ["analyst", "companion"] as Persona[]) {
+    for (const q of [CONTRADICT, "転職をやめたのって、なんでだったっけ？"]) {
+      const got = await run(q, persona, true, JOB);
+      const order = got.map((m) => m.id);
+      assert.ok(order.includes("j3"), `${persona} ${q}: the correction is selected (${order.join(", ")})`);
+      if (order.includes("jrefl")) assert.ok(order.indexOf("j3") < order.indexOf("jrefl"), `${persona} ${q}: the user's words come before the reflection (${order.join(", ")})`);
+      const refl = got.find((m) => m.id === "jrefl");
+      assert.equal(refl?.quote, undefined, "an AI reflection never carries 本人の発言");
+      assert.equal(got.find((m) => m.id === "j3")?.quote, "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
+    }
+  }
+  // before the change (no purpose relevance) the analyst Retrieval chose the reflection only
+  assert.deepEqual(await ids(CONTRADICT, "analyst", false, JOB), ["jrefl"]);
+});
+
+test("4 the correction stays out of unrelated questions, and a reason question about another topic does not raise it", async () => {
+  for (const persona of ["analyst", "companion"] as Persona[]) {
+    for (const q of ["今日は天気がいいし、どこか出かけたいな", "前に買ったロードバイクって、いくらだったっけ？", "旅行をやめたのは、雨のせいだったのかな？", "旅行をやめたのって、なんでだったっけ？"]) {
+      const got = await ids(q, persona, true, JOB);
+      assert.ok(!got.includes("j3"), `${persona} ${q}: ${got.join(", ")}`);
+    }
+    // the travel reason question gets the travel reason
+    assert.ok((await ids("旅行をやめたのは、雨のせいだったのかな？", persona, true, JOB)).includes("trip"), persona);
+  }
+});
+
+test("4 what counts: a reason question (asked or put forward), the user's own words in a reason / correction form, on topic; never an AI reflection", () => {
+  for (const q of [CONTRADICT, "転職をやめたのって、なんでだったっけ？", "旅行をやめたのは、雨のせいだったのかな？", "引っ越したのは、仕事のためだったっけ？"]) assert.equal(rr.asksReasonOfPast(q), true, q);
+  for (const q of ["昨日食べたのは、カレーだったっけ？", "今日は天気がいいし、どこか出かけたいな", "なんで疲れるんだろう", "転職しようかな", "前に買ったロードバイクって、いくらだったっけ？"]) assert.equal(rr.asksReasonOfPast(q), false, q);
+  const ctx = rr.purposeContextOf(CONTRADICT, JOB);
+  const byJob = (id: string) => JOB.find((m) => m.id === id)!;
+  assert.deepEqual(rr.adjustForPurpose(byJob("j3"), 2, ctx, CONTRADICT, false, 3, 3), { score: 6, onTopic: true, demoted: false, reasonAnswer: true });
+  assert.deepEqual(rr.adjustForPurpose(byJob("jrefl"), 10, ctx, CONTRADICT, false, 3, 3), { score: 10, onTopic: false, demoted: false }, "an AI reflection is not raised");
+  assert.deepEqual(rr.adjustForPurpose(byJob("trip"), 1, ctx, CONTRADICT, false, 3, 3), { score: 1, onTopic: false, demoted: false }, "an off-topic reason is not raised");
+  assert.deepEqual(rr.adjustForPurpose(byJob("j1"), 1.5, ctx, CONTRADICT, false, 3, 3), { score: 1.5, onTopic: false, demoted: false }, "an on-topic record without a reason is not raised");
+  // the analyst selection keeps the correction although it is weaker than half of the top (the reflection that echoes the question)
+  const freq = r.computeKeywordFrequency(JOB);
+  const sel = r.selectConversationDirectMatches(JOB, CONTRADICT, [CONTRADICT], freq, 3, null, ctx);
+  assert.ok(sel.kept.some((e) => e.memory.id === "j3" && e.reasonAnswer === true), sel.kept.map((e) => e.memory.id).join(", "));
+  assert.equal(sel.droppedByRelativeStrength.some((e) => e.memory.id === "j3"), false);
+});
