@@ -11,8 +11,14 @@
  *    but the record is mainly another person's action. A record that is not on topic is never raised. No purpose: the order is unchanged.
  * 3. A short trait for the chat AI (「過去の記録を尋ねただけ」「主に長男の行動」「本人の希望の言い回しがある」), from the wording only:
  *    an automatic hint, not the user's confirmed intent. AI-written reflections get none (P1-F already marks their source).
+ * 4. A question about the reason of something the user did before (「なんでだったっけ？」, or a reason put forward to confirm: 「〜をやめたのは、結局お金の
+ *    不安が一番だったのかな？」): an on-topic record whose own words give a reason or correct an earlier one (「本当は〜からなんだ」) is raised to at
+ *    least the floor plus one keyword hit, and is not dropped only for being weaker than the top record (the top may be an AI reflection that
+ *    echoes the question's wording). AI reflections and the AI summary never count as the user's reason. Off-topic records are never raised.
  * No topic, product or person name is written in this code.
  */
+import { isQuestionText, reasonFocusOf } from "./explicitReason";
+import { REASON_FORM } from "./personStance";
 import { isQuestionFormTerm, isRecallQuestion, questionTopicRuns } from "./recallQuestion";
 
 export type QuestionPurpose = "questions" | "wish" | "change" | "view" | "personAction";
@@ -23,6 +29,10 @@ export interface PurposeContext {
   namedPersons: string[];
   /** the question names a topic besides asking about questions (「前に仕事について質問したことは？」): off-topic question records are not raised then */
   hasTopic: boolean;
+  /** the question asks the reason of something the user did before (4. above); absent / false: nothing changes */
+  reasonAsked?: boolean;
+  /** the part of the question that names what the reason is about (reasonSubjectOf) */
+  reasonSubject?: string;
 }
 
 /** what the facets read: the user's own words (evidenceQuotes), the AI summary, the people, the source */
@@ -63,17 +73,56 @@ const RECORD_SAYS: Record<"wish" | "change" | "view", RegExp> = {
   view: /好き|嫌い|いい|良い|欲し|気にな|かな|迷|検討|重視|したい|ほしい|驚|思|感じ|考え/,
 };
 
+/**
+ * a reason put forward about something the user did before, to confirm it: 「〜たのは、…から／ため／せい／が一番／が原因／がきっかけ…かな？」.
+ * A plain fact asked back (「昨日食べたのは、カレーだったっけ？」) has no reason word and is not one. 理由・なぜ・なんで… go through reasonFocusOf.
+ */
+const PROPOSED_REASON = /^(.+?た(?:の|ん))(?:は|って)[^。？?！!]*(?:(?:[いたるだ]|ない)から|ため|せい|が一番|が原因|がきっかけ)[^。？?！!]*(?:かな|かしら|っけ|のか|ですか|でしょうか)[?？。]*$/;
+/**
+ * the part of a reason question that names what the reason is about: the act before 「〜たのは」 / 「理由」 / 「なんで」… (the reason words after it,
+ * 「お金の不安」, do not make a record on topic, also in 「転職をやめた理由は、お金の不安だったっけ？」: Codex on this PR); when the question opens with
+ * the reason word (「なんで転職をやめたんだっけ？」), the rest of it. null: not a reason question.
+ * から as "from" (「大学からの友達だったっけ？」) is not a reason: only a predicate form before it counts (as REASON_FORM).
+ */
+const REASON_SPLIT = /理由|(?<=た)(?:の|ん)(?:は|って)|なぜ|何故|どうして|なんで|わけは|訳は/;
+const LEADING_TIME = /^(?:(?:前に|以前|前は|昔|この前|こないだ|当時|過去に|これまで|今まで|最近|あの(?:時|とき)|その(?:時|とき)|結局|そういえば|ところで|ねえ|ねぇ)[、,\s]*)+/;
+export function reasonSubjectOf(text: string): string | null {
+  const t = norm(text).trim();
+  if (!t) return null;
+  if (reasonFocusOf(t) !== null) {
+    const cut = REASON_SPLIT.exec(t);
+    if (!cut) return t;
+    // a time word before it (「前になんで〜」「以前、なんで〜」) is not the act: the rest is (Codex on this PR)
+    const before = t.slice(0, cut.index).replace(LEADING_TIME, "").trim();
+    return Array.from(before).length >= 2 ? t.slice(0, cut.index).trim() : t.slice(cut.index + cut[0].length).trim() || t;
+  }
+  const m = PROPOSED_REASON.exec(t);
+  return m ? m[1] : null;
+}
+export const asksReasonOfPast = (text: string) => reasonSubjectOf(text) !== null;
+/** a keyword of the record named in the subject of the reason question (a question-form word such as 過去・最近 does not count) */
+export const onReasonSubject = (memory: Pick<RelevanceSource, "keywords">, subject: string) =>
+  (memory.keywords ?? []).some((k) => typeof k === "string" && Array.from(k.trim()).length >= 2 && !isQuestionFormTerm(k.trim()) && subject.includes(norm(k.trim())));
+
 /** the purpose of the turn's question; null when it is not a question about the past or no purpose is clear (then nothing changes) */
 export function purposeContextOf(text: string, pool: readonly RelevanceSource[]): PurposeContext {
   const t = norm(text).trim();
   const known = [...new Set(pool.flatMap(personNames))];
   const namedPersons = known.filter((name) => t.includes(name) || (HONORIFIC.test(name) && Array.from(name.replace(HONORIFIC, "")).length >= 2 && t.includes(name.replace(HONORIFIC, ""))));
   const hasTopic = namedPersons.length > 0 || questionTopicRuns(t).some((run) => !/質問|尋ね/.test(run));
-  if (!t || !ASKS_QUESTION_FORM.test(t) || !ASKS_PAST.test(t)) return { purpose: null, namedPersons, hasTopic };
+  const subject = reasonSubjectOf(t);
+  const reason = subject !== null ? { reasonAsked: true, reasonSubject: subject } : {};
+  if (!t || !ASKS_QUESTION_FORM.test(t) || !ASKS_PAST.test(t)) return { purpose: null, namedPersons, hasTopic, ...reason };
   const found = PURPOSE_ASK.find((p) => p.ask.test(t) && (p.purpose !== "view" || isRecallQuestion(t) || VIEW_ASKED_BACK.test(t)));
-  if (found) return { purpose: found.purpose, namedPersons, hasTopic };
-  return { purpose: namedPersons.length > 0 ? "personAction" : null, namedPersons, hasTopic };
+  if (found) return { purpose: found.purpose, namedPersons, hasTopic, ...reason };
+  return { purpose: namedPersons.length > 0 ? "personAction" : null, namedPersons, hasTopic, ...reason };
 }
+
+/**
+ * the user's own words (evidenceQuotes, not the AI summary) give a reason (a corrected one included: 「本当は〜からなんだ」), in a sentence that is not a
+ * question. A correction of another fact (「本当は9月じゃなくて10月に始めた」) is not a reason (Codex on this PR)
+ */
+export const statesOwnReason = (memory: RelevanceSource) => quoteSentences(memory).some((sentence) => !isQuestionText(sentence) && REASON_FORM.test(sentence));
 
 /** every sentence of the user's own words asks the Memory back (no answer of its own). No quotes (older records): false, never pushed back */
 export function isRecallOnlyRecord(memory: RelevanceSource): boolean {
@@ -119,6 +168,8 @@ export interface PurposeAdjustment {
   onTopic: boolean;
   /** pushed back (ranked after equal scores) */
   demoted: boolean;
+  /** 4. above: the user's own reason / correction for a reason question (the analyst selection keeps it even when weaker than the top record). Absent otherwise */
+  reasonAnswer?: true;
 }
 
 /**
@@ -129,11 +180,17 @@ export function adjustForPurpose(memory: RelevanceSource, score: number, ctx: Pu
   if (!ctx) return { score, onTopic: topicMatched, demoted: false };
   const reflection = isReflectionSource(memory);
   if (!reflection && ctx.purpose !== "questions" && isRecallOnlyRecord(memory)) return { score: Math.min(score, weight), onTopic: topicMatched, demoted: true };
-  // no purpose: nothing else changes (the on-topic test stays the recall-topic match, as before)
-  if (!ctx.purpose) return { score, onTopic: topicMatched, demoted: false };
   // the same raw comparison as scoreMemory; a question-form word (過去・最近・自分…) as a keyword does not make a record on topic
   const keywordHit = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length > 0 && !isQuestionFormTerm(k.trim()) && (questionText ?? "").includes(k));
   const onTopic = topicMatched || keywordHit || isAboutNamed(memory, ctx);
+  // 4. a reason question: the user's own on-topic reason / correction comes up (never an AI reflection, never an off-topic record)
+  //    on topic = a keyword named in the subject of the question (not in the reason put forward); a record mainly about another person's action
+  //    when the user's own view / wish / change is asked keeps its pushed-back place
+  if (ctx.reasonAsked && ctx.reasonSubject && ctx.purpose !== "questions" && !reflection && score > 0 && onReasonSubject(memory, ctx.reasonSubject) && !othersActionOnly(memory, ctx) && statesOwnReason(memory)) {
+    return { score: Math.max(score, floor) + weight, onTopic, demoted: false, reasonAnswer: true };
+  }
+  // no purpose: nothing else changes (the on-topic test stays the recall-topic match, as before)
+  if (!ctx.purpose) return { score, onTopic: topicMatched, demoted: false };
   if (ctx.purpose === "questions") {
     // question records first; with a topic named (「前に仕事について質問したことは？」) only the on-topic ones
     if (!reflection && isQuestionRecord(memory) && (onTopic || !ctx.hasTopic)) return { score: Math.max(score, floor) + weight, onTopic: true, demoted: false };

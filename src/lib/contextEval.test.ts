@@ -208,13 +208,21 @@ test("E2: the 12 configurations, the same fictional data, questions and fixed ti
   // the user's correction with 今の (job-3) is a wish of that time, not today's state: the server's time filter keeps it in Retrieval in all 12
   // configurations, with Memory Timeline / Synthesis OFF too, and the user's words reach the prompt in the Retrieval section
   const CORRECTION = "チームを離れたくなかった";
-  for (const x of runs.filter((r) => r.result.caseId === "reason-job")) {
-    const where = `reason-job / ${x.result.config}`;
+  // a reason question, asked (reason-job) or put forward against the AI's reading (contradict-job): the device Retrieval selects the correction
+  // before the AI reflection, and the user's own sentence (not only the AI summary) reaches the Retrieval section, in all 12 configurations
+  const OWN_WORDS = "本人の発言（当時の逐語の抜粋）：「給料って言ったけど、本当は今のチームを離れたくなかったからなんだ」";
+  for (const x of runs.filter((r) => r.result.caseId === "reason-job" || r.result.caseId === "contradict-job")) {
+    const where = `${x.result.caseId} / ${x.result.config}`;
+    const sent = ((x.clientSent.retrievedMemories ?? []) as { id: string }[]).map((m) => m.id);
+    assert.ok(sent.includes("job-3"), `the device Retrieval selects the correction: ${where} (${sent.join(", ")})`);
+    if (sent.includes("job-refl")) assert.ok(sent.indexOf("job-3") < sent.indexOf("job-refl"), `the user's words before the AI reflection: ${where} (${sent.join(", ")})`);
     assert.ok(!x.result.serverDroppedRetrieval.includes("job-3"), `the time filter keeps the correction: ${where}`);
     assert.equal(x.result.protectedOk, true, `the correction reaches the prompt: ${where}`);
     const at: string[] = [];
     for (let i = x.prompt.indexOf(CORRECTION); i !== -1; i = x.prompt.indexOf(CORRECTION, i + 1)) at.push(ev.sectionAt(x.prompt, i));
     assert.ok(at.some((h) => h.startsWith("関連する過去の記憶")), `in the Retrieval section: ${where} (${at.join(" / ")})`);
+    const own = x.prompt.indexOf(OWN_WORDS);
+    assert.ok(own !== -1 && ev.sectionAt(x.prompt, own).startsWith("関連する過去の記憶"), `the user's own sentence in the Retrieval section: ${where}`);
   }
   // the AI's hypothesis never reaches a turn without the user's correction it contradicts
   for (const x of runs.filter((r) => r.prompt.includes(world.AI_TEXTS.hypothesisJob))) assert.ok(x.prompt.includes(CORRECTION), `hypothesis with the correction: ${x.result.caseId} / ${x.result.config}`);

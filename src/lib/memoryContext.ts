@@ -13,8 +13,9 @@
  *    user's own view (a thought, a feeling, a judgment): the user's past view reaches the AI, as a view of the record's day.
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
-import { isAllowedTrait } from "./recordRelevance";
-import { reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
+import { isAllowedTrait, onReasonSubject, reasonSubjectOf } from "./recordRelevance";
+import { isQuestionText, reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
+import { CORRECTION_FORM, REASON_FORM } from "./personStance";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -61,10 +62,38 @@ export function memoryPersons(memory: Pick<MemoryObject, "personMentions">): str
  * P1-H: when the current turn (conversationTexts[0]) asks for the reason of something said before, the user's sentence that states that reason or
  * corrects it comes first (explicitReason.ts), even when the AI summary covers it (the summary is not the user's words). None: as before.
  */
-export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes"> & Partial<Pick<MemoryObject, "topicEvents">>, conversationTexts: string[]): string | undefined {
-  const focus = reasonFocusOf(conversationTexts[0] ?? "");
+export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes"> & Partial<Pick<MemoryObject, "topicEvents" | "keywords">>, conversationTexts: string[]): string | undefined {
+  const latest = conversationTexts[0] ?? "";
+  const focus = reasonFocusOf(latest);
   const reason = focus ? reasonSentenceOf(memory, focus) : undefined;
   if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
+  // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (a keyword named in the subject of
+  // the question): the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat
+  // the topic word. Only a sentence in a reason form (a correction of another fact, 「本当は9月じゃなくて10月に始めた」, is not a reason: Codex on
+  // this PR). A corrected reason first, then the sentence that shares most of the act asked about (the subject, 「転職をやめたの」: a reason of
+  // another act on the same topic does not win by recency, Codex on this PR), then the newest (dated events, then the later quotes: Capture appends new evidence after the old), as
+  // reasonSentenceOf does: an earlier reason the user corrected never wins over the correction (Codex on this PR)
+  const subject = reasonSubjectOf(latest);
+  if (subject !== null && onReasonSubject(memory, subject)) {
+    const subjectGrams = bigrams(subject);
+    let pick: { text: string; correction: boolean; relevance: number; time: number; order: number } | undefined;
+    let order = 0;
+    const consider = (quote: unknown, time: number) => {
+      if (typeof quote !== "string") return;
+      for (const sentence of sentencesOf(quote)) {
+        order += 1;
+        const n = sentence.normalize("NFKC");
+        if (isQuestionText(sentence) || !REASON_FORM.test(n)) continue;
+        const correction = CORRECTION_FORM.test(n);
+        const relevance = coverage(subjectGrams, bigrams(sentence));
+        const better = !pick || (correction !== pick.correction ? correction : relevance !== pick.relevance ? relevance > pick.relevance : time !== pick.time ? time > pick.time : order > pick.order);
+        if (better) pick = { text: sentence, correction, relevance, time, order };
+      }
+    };
+    for (const e of memory.topicEvents ?? []) consider(e?.quote, Number.isFinite(Date.parse(e?.statedAt ?? "")) ? Date.parse(e.statedAt) : 0);
+    for (const q of memory.evidenceQuotes ?? []) consider(q, 0);
+    if (pick) return clip(pick.text, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
+  }
   const summary = bigrams(memory.summary ?? "");
   const turn = bigrams(conversationTexts.join(" "));
   let best: { text: string; relevance: number; novelty: number } | undefined;

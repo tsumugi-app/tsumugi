@@ -291,3 +291,101 @@ test("review: a named topic keeps off-topic question records down; the user's ow
   const pastWord = mem("pw", "2026-10-01", "週末に写真を整理した", ["過去", "写真"]);
   assert.equal(rr.adjustForPurpose(pastWord, 3.2, view, CASES[0].q, false, 3, 3).onTopic, false);
 });
+
+// 4. a reason question: the user's own reason / correction comes before the AI reflection that echoes the question (fictional records)
+const JOB: MemoryObject[] = [
+  mem("j1", "2026-05-24", "今の会社からの転職を考え始めたと話した。", ["転職", "仕事"], { quotes: ["今の会社、そろそろ転職しようかな"] }),
+  mem("j2", "2026-06-21", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], { quotes: ["転職はやめた。給料が下がるから"] }),
+  mem("jrefl", "2026-06-22", "転職をやめたのは、お金への不安が強かったからだろう。収入を守りたい気持ちが見えた一日だった。", ["転職", "お金"], { source: "system-generated", quotes: [] }),
+  mem("j3", "2026-09-13", "転職をやめた理由を言い直し、本当は今のチームを離れたくなかったからだと話した。", ["転職", "チーム"], { quotes: ["給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"] }),
+  mem("trip", "2026-08-02", "雨が降っていたので旅行をやめたと話した。", ["旅行", "雨"], { quotes: ["雨が降ってたから、旅行はやめたんだ"] }),
+  mem("bike", "2026-08-10", "ロードバイクを買ったと話した。", ["自転車", "ロードバイク"], { quotes: ["ロードバイク買った。12万円だった"] }),
+];
+const CONTRADICT = "転職をやめたのは、結局お金の不安が一番だったのかな？";
+
+test("4 a reason question: the user's own on-topic correction is selected before the AI reflection (both personas), the reflection is not the user's words", async () => {
+  for (const persona of ["analyst", "companion"] as Persona[]) {
+    for (const q of [CONTRADICT, "転職をやめたのって、なんでだったっけ？"]) {
+      const got = await run(q, persona, true, JOB);
+      const order = got.map((m) => m.id);
+      assert.ok(order.includes("j3"), `${persona} ${q}: the correction is selected (${order.join(", ")})`);
+      if (order.includes("jrefl")) assert.ok(order.indexOf("j3") < order.indexOf("jrefl"), `${persona} ${q}: the user's words come before the reflection (${order.join(", ")})`);
+      const refl = got.find((m) => m.id === "jrefl");
+      assert.equal(refl?.quote, undefined, "an AI reflection never carries 本人の発言");
+      assert.equal(got.find((m) => m.id === "j3")?.quote, "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
+    }
+  }
+  // before the change (no purpose relevance) the analyst Retrieval chose the reflection only
+  assert.deepEqual(await ids(CONTRADICT, "analyst", false, JOB), ["jrefl"]);
+});
+
+test("4 the correction stays out of unrelated questions, and a reason question about another topic does not raise it", async () => {
+  for (const persona of ["analyst", "companion"] as Persona[]) {
+    // not a reason question: the change never acts, so the correction is where it was without the purpose relevance (companion's chat
+    // 「今日は天気が…」 already picks it by a weak overlap: an older issue, reported, not changed here)
+    for (const q of ["今日は天気がいいし、どこか出かけたいな", "前に買ったロードバイクって、いくらだったっけ？"]) {
+      assert.equal(rr.asksReasonOfPast(q), false, q);
+      const got = await ids(q, persona, true, JOB);
+      const without = await ids(q, persona, false, JOB);
+      assert.equal(got.includes("j3"), without.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
+    }
+    // a reason question about another topic: the correction is not raised into it (companion may still pick it by a weak overlap of 「やめた」, as before)
+    for (const q of ["旅行をやめたのは、雨のせいだったのかな？", "旅行をやめたのって、なんでだったっけ？"]) {
+      const got = await ids(q, persona, true, JOB);
+      const without = await ids(q, persona, false, JOB);
+      assert.ok(!got.includes("j3") || without.includes("j3"), `${persona} ${q}: ${got.join(", ")} / without ${without.join(", ")}`);
+      const ctx = rr.purposeContextOf(q, JOB);
+      assert.equal(rr.adjustForPurpose(JOB.find((m) => m.id === "j3")!, 1, ctx, q, false, 3, 3).reasonAnswer, undefined, q);
+    }
+    // the reason put forward does not make a record on topic: a money record with a reason form is not raised for the 転職 question (review on this PR)
+    const money = mem("money", "2026-10-01", "今月は出費が多かったので節約しようと思うと話した。", ["お金", "家計"], { quotes: ["今月は出費が多かったので、少し節約しようと思う。"] });
+    const anxious = mem("anx", "2026-10-02", "不安で眠れなかったと話した。", ["不安", "睡眠"], { quotes: ["不安だったから、眠れなかった。"] });
+    const withNoise = [...JOB, money, anxious];
+    const got = await ids(CONTRADICT, persona, true, withNoise);
+    assert.ok(got.includes("j3"), `${persona}: ${got.join(", ")}`);
+    const ctx = rr.purposeContextOf(CONTRADICT, withNoise);
+    for (const m of [money, anxious]) assert.equal(rr.adjustForPurpose(m, 2, ctx, CONTRADICT, false, 3, 3).reasonAnswer, undefined, m.id);
+    // the travel reason question gets the travel reason
+    assert.ok((await ids("旅行をやめたのは、雨のせいだったのかな？", persona, true, JOB)).includes("trip"), persona);
+  }
+});
+
+test("4 what counts: a reason question (asked or put forward), the user's own words in a reason / correction form, on topic; never an AI reflection", () => {
+  for (const q of [CONTRADICT, "転職をやめたのって、なんでだったっけ？", "旅行をやめたのは、雨のせいだったのかな？", "引っ越したのは、仕事のためだったっけ？"]) assert.equal(rr.asksReasonOfPast(q), true, q);
+  for (const q of ["昨日食べたのは、カレーだったっけ？", "今日は天気がいいし、どこか出かけたいな", "なんで疲れるんだろう", "転職しようかな", "前に買ったロードバイクって、いくらだったっけ？", "先週会ったのは、大学からの友達だったっけ？", "行ったのは、駅から近いカフェだったかな？"]) assert.equal(rr.asksReasonOfPast(q), false, q);
+  assert.equal(rr.reasonSubjectOf(CONTRADICT), "転職をやめたの", "the subject is the act, not the reason put forward");
+  // explicit reason questions too: the act before 理由 / のって / なんで, or after a leading なんで (Codex on this PR)
+  assert.equal(rr.reasonSubjectOf("転職をやめた理由は、お金の不安だったっけ？"), "転職をやめた");
+  assert.equal(rr.reasonSubjectOf("転職をやめたのって、なんでだったっけ？"), "転職をやめた");
+  assert.equal(rr.reasonSubjectOf("なんで転職をやめたんだっけ？"), "転職をやめたんだっけ?", "NFKC");
+  for (const q of ["前になんで転職をやめたんだっけ？", "以前、なんで転職をやめたんだっけ？"]) assert.equal(rr.reasonSubjectOf(q), "転職をやめたんだっけ?", q);
+  assert.equal(rr.reasonSubjectOf("以前、転職をやめた理由は何だっけ？"), "以前、転職をやめた");
+  const budget = mem("budget", "2026-10-01", "今月は出費が多かったので節約すると話した。", ["お金", "家計"], { quotes: ["今月は出費が多かったので、少し節約しようと思う。"] });
+  const sleep = mem("sleep", "2026-10-02", "不安で眠れなかったと話した。", ["不安", "睡眠"], { quotes: ["不安だったから、眠れなかった。"] });
+  const askedReason = "転職をやめた理由は、お金の不安だったっけ？";
+  const askedCtx = rr.purposeContextOf(askedReason, [...JOB, budget, sleep]);
+  for (const m of [budget, sleep]) assert.equal(rr.adjustForPurpose(m, 2, askedCtx, askedReason, false, 3, 3).reasonAnswer, undefined, m.id);
+  assert.equal(rr.adjustForPurpose(JOB.find((m) => m.id === "j3")!, 2, askedCtx, askedReason, false, 3, 3).reasonAnswer, true);
+  // the quote of a reason question: a correction first, then the sentence closest to the turn; not the first reason-form sentence
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職", "チーム"], evidenceQuotes: ["今日は雨だったので在宅にした。", "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
+  // an earlier reason and its later correction in one record (Capture appends): the correction, even without a correction word the later one
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["給料が下がるからなんだ", "本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "本当は今のチームを離れたくなかったからなんだ");
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["給料が下がるからなんだ", "チームを離れたくなかったからなんだ"] }, [CONTRADICT]), "チームを離れたくなかったからなんだ");
+  // a correction of another fact is not a reason: the stated reason stays the quote, and such a record alone is not raised (Codex on this PR)
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["転職をやめたのは給料が下がるからなんだ", "本当は9月じゃなくて10月に始めたんだ"] }, [CONTRADICT]), "転職をやめたのは給料が下がるからなんだ");
+  // a reason of another act on the same topic does not replace the reason of the act asked about (Codex on this PR)
+  assert.equal(mc.memoryQuote({ summary: "転職を断念し、面接方法も変更したと話した。", keywords: ["転職"], evidenceQuotes: ["転職をやめたのは給料が下がるからなんだ", "転職の面接は遠いのでオンラインにしたんだ"] }, [CONTRADICT]), "転職をやめたのは給料が下がるからなんだ");
+  const dateOnly = mem("date", "2026-10-10", "転職活動を始めた月を言い直した。", ["転職"], { quotes: ["本当は9月じゃなくて10月に始めたんだ"] });
+  assert.equal(rr.adjustForPurpose(dateOnly, 2, rr.purposeContextOf(CONTRADICT, JOB), CONTRADICT, false, 3, 3).reasonAnswer, undefined);
+  const ctx = rr.purposeContextOf(CONTRADICT, JOB);
+  const byJob = (id: string) => JOB.find((m) => m.id === id)!;
+  assert.deepEqual(rr.adjustForPurpose(byJob("j3"), 2, ctx, CONTRADICT, false, 3, 3), { score: 6, onTopic: true, demoted: false, reasonAnswer: true });
+  assert.deepEqual(rr.adjustForPurpose(byJob("jrefl"), 10, ctx, CONTRADICT, false, 3, 3), { score: 10, onTopic: false, demoted: false }, "an AI reflection is not raised");
+  assert.deepEqual(rr.adjustForPurpose(byJob("trip"), 1, ctx, CONTRADICT, false, 3, 3), { score: 1, onTopic: false, demoted: false }, "an off-topic reason is not raised");
+  assert.deepEqual(rr.adjustForPurpose(byJob("j1"), 1.5, ctx, CONTRADICT, false, 3, 3), { score: 1.5, onTopic: false, demoted: false }, "an on-topic record without a reason is not raised");
+  // the analyst selection keeps the correction although it is weaker than half of the top (the reflection that echoes the question)
+  const freq = r.computeKeywordFrequency(JOB);
+  const sel = r.selectConversationDirectMatches(JOB, CONTRADICT, [CONTRADICT], freq, 3, null, ctx);
+  assert.ok(sel.kept.some((e) => e.memory.id === "j3" && e.reasonAnswer === true), sel.kept.map((e) => e.memory.id).join(", "));
+  assert.equal(sel.droppedByRelativeStrength.some((e) => e.memory.id === "j3"), false);
+});
