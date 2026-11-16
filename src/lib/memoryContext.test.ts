@@ -163,3 +163,52 @@ test("time filter without web search: outside, changing facts stay out; the user
   assert.ok(!unrelated.includes("ランチが千円") && !unrelated.includes("雰囲気が好き"), unrelated);
   assert.equal(mc.withoutOutsideFactQuote({ quote: "雰囲気が好き。今はランチが千円。" }).quote, undefined);
 });
+
+test("time filter: the user's own past wish or correction with 今の stays in (summary and quote); a present state, a present wish and a fact that goes stale with the day stay out", async () => {
+  const kept = (summary: string) => assert.equal(mc.isTimeDependentMemory({ summary, keywords: [] }), false, summary);
+  const out = (summary: string) => assert.equal(mc.isTimeDependentMemory({ summary, keywords: [] }), true, summary);
+  // 1. the user's correction of a past reason: a wish of that time, not today's state
+  kept("本当は今のチームを離れたくなかった");
+  kept("転職をやめた理由を言い直し、本当は今のチームを離れたくなかったからだと話した。");
+  assert.equal(mc.withoutOutsideFactQuote({ quote: "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ" }).quote, "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
+  kept("本当は今の仕事を続けたかったと話した。");
+  kept("今の部署に残ってほしかったと話した。");
+  // 2. a present state that can go stale: still out
+  out("今の会社に勤めている");
+  out("今の会社に勤めていた");
+  out("今の会社に3年前に入ったと話した。");
+  assert.equal(mc.withoutOutsideFactQuote({ quote: "今の会社に勤めてる" }).quote, undefined);
+  // 3. a past wish told with a thought word (as before)
+  kept("以前は今の仕事を辞めたいと思っていた");
+  // 4. a changed view (as before: a thought word)
+  kept("あのときはそう思ったけれど、今は違う");
+  // a present wish is today's view of a state: out, as before (only past forms are exempt)
+  out("今は会社を辞めたい");
+  // adjectives / まったく are not wishes
+  out("今の部屋は冷たかった");
+  out("今の鞄は重たかった");
+  out("今のチームには不満がまったくなかった");
+  out("今の部屋は煙たかった");
+  out("今の靴はかたかった");
+  // a wish exempts only its own clause: a present fact joined to it with 、 / けど / ながら stays out (summary and quote)
+  out("今の会社に勤めながら、本当は転職したかったと話した。");
+  out("次回の検診は12月3日で、本当は休みたかった。");
+  assert.equal(mc.withoutOutsideFactQuote({ quote: "今は大阪に住んでて、ほんとは東京に住みたかったんだけど" }).quote, undefined);
+  kept("給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
+  kept("本当は今のチームにいたかった");
+  // 8. a fact that goes stale when the day changes: out, a wish in another sentence does not exempt it (the exemption is per sentence)
+  out("次回の検診は12月3日。");
+  out("現在は大阪に住んでいる。");
+  out("前は東京に住みたかった。現在は大阪に住んでいる。");
+  // a present-tense keyword and an outside fact stay out whatever the summary says
+  assert.equal(mc.isTimeDependentMemory({ summary: "本当は今のチームを離れたくなかった", keywords: ["今の会社"] }), true);
+  assert.equal(mc.isTimeDependentMemory({ summary: "今の価格で買いたかった", keywords: [] }), true);
+  // the prompt: the correction (summary and the user's words) reaches a turn without web search; the present state does not
+  const toRet = (id: string, summary: string, quote?: string): RetrievedMemory => ({ id, date: "2026-09-13", summary, keywords: ["転職"], source: "ai-capture", ...(quote ? { quote } : {}) });
+  const si = await prompt(chatBody("転職をやめた理由って何だったっけ", [
+    toRet("m-correct", "転職をやめた理由を言い直し、本当は今のチームを離れたくなかったからだと話した。", "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"),
+    toRet("m-state", "今の会社に勤めていると話した。"),
+  ]));
+  assert.ok(si.includes("本当は今のチームを離れたくなかったからだと話した。") && si.includes("「給料って言ったけど、本当は今のチームを離れたくなかったからなんだ」"), si);
+  assert.ok(!si.includes("今の会社に勤めていると話した。"), "a present state stays out");
+});
