@@ -358,6 +358,8 @@ test("4 what counts: a reason question (asked or put forward), the user's own wo
   assert.equal(rr.reasonSubjectOf("転職をやめた理由は、お金の不安だったっけ？"), "転職をやめた");
   assert.equal(rr.reasonSubjectOf("転職をやめたのって、なんでだったっけ？"), "転職をやめた");
   assert.equal(rr.reasonSubjectOf("なんで転職をやめたんだっけ？"), "転職をやめたんだっけ?", "NFKC");
+  for (const q of ["前になんで転職をやめたんだっけ？", "以前、なんで転職をやめたんだっけ？"]) assert.equal(rr.reasonSubjectOf(q), "転職をやめたんだっけ?", q);
+  assert.equal(rr.reasonSubjectOf("以前、転職をやめた理由は何だっけ？"), "以前、転職をやめた");
   const budget = mem("budget", "2026-10-01", "今月は出費が多かったので節約すると話した。", ["お金", "家計"], { quotes: ["今月は出費が多かったので、少し節約しようと思う。"] });
   const sleep = mem("sleep", "2026-10-02", "不安で眠れなかったと話した。", ["不安", "睡眠"], { quotes: ["不安だったから、眠れなかった。"] });
   const askedReason = "転職をやめた理由は、お金の不安だったっけ？";

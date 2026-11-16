@@ -85,14 +85,16 @@ const PROPOSED_REASON = /^(.+?た(?:の|ん))(?:は|って)[^。？?！!]*(?:(?:
  * から as "from" (「大学からの友達だったっけ？」) is not a reason: only a predicate form before it counts (as REASON_FORM).
  */
 const REASON_SPLIT = /理由|(?<=た)(?:の|ん)(?:は|って)|なぜ|何故|どうして|なんで|わけは|訳は/;
+const LEADING_TIME = /^(?:(?:前に|以前|前は|昔|この前|こないだ|当時|過去に|これまで|今まで|最近|あの(?:時|とき)|その(?:時|とき)|結局|そういえば|ところで|ねえ|ねぇ)[、,\s]*)+/;
 export function reasonSubjectOf(text: string): string | null {
   const t = norm(text).trim();
   if (!t) return null;
   if (reasonFocusOf(t) !== null) {
     const cut = REASON_SPLIT.exec(t);
     if (!cut) return t;
-    const before = t.slice(0, cut.index).trim();
-    return Array.from(before).length >= 2 ? before : t.slice(cut.index + cut[0].length).trim() || t;
+    // a time word before it (「前になんで〜」「以前、なんで〜」) is not the act: the rest is (Codex on this PR)
+    const before = t.slice(0, cut.index).replace(LEADING_TIME, "").trim();
+    return Array.from(before).length >= 2 ? t.slice(0, cut.index).trim() : t.slice(cut.index + cut[0].length).trim() || t;
   }
   const m = PROPOSED_REASON.exec(t);
   return m ? m[1] : null;
