@@ -62,14 +62,14 @@ export function memoryPersons(memory: Pick<MemoryObject, "personMentions">): str
  * corrects it comes first (explicitReason.ts), even when the AI summary covers it (the summary is not the user's words). None: as before.
  */
 export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuotes"> & Partial<Pick<MemoryObject, "topicEvents" | "keywords">>, conversationTexts: string[]): string | undefined {
-  const turn = conversationTexts[0] ?? "";
-  const focus = reasonFocusOf(turn);
+  const latest = conversationTexts[0] ?? "";
+  const focus = reasonFocusOf(latest);
   const reason = focus ? reasonSentenceOf(memory, focus) : undefined;
   if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
   // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (one of its keywords is in the turn):
   // the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat the topic word
-  const onTopic = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length >= 2 && turn.includes(k.trim()));
-  if (onTopic && asksReasonOfPast(turn)) {
+  const onTopic = (memory.keywords ?? []).some((k) => typeof k === "string" && k.trim().length >= 2 && latest.includes(k.trim()));
+  if (onTopic && asksReasonOfPast(latest)) {
     for (const quote of memory.evidenceQuotes ?? []) {
       if (typeof quote !== "string") continue;
       const own = sentencesOf(quote).find((sentence) => !isQuestionText(sentence) && isExplanationText(sentence));
