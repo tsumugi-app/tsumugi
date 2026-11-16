@@ -70,11 +70,13 @@ export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuot
   // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (a keyword named in the subject of
   // the question): the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat
   // the topic word. Only a sentence in a reason form (a correction of another fact, 「本当は9月じゃなくて10月に始めた」, is not a reason: Codex on
-  // this PR). A corrected reason first, then the newest (dated events, then the later quotes: Capture appends new evidence after the old), as
+  // this PR). A corrected reason first, then the sentence that shares most of the act asked about (the subject, 「転職をやめたの」: a reason of
+  // another act on the same topic does not win by recency, Codex on this PR), then the newest (dated events, then the later quotes: Capture appends new evidence after the old), as
   // reasonSentenceOf does: an earlier reason the user corrected never wins over the correction (Codex on this PR)
   const subject = reasonSubjectOf(latest);
   if (subject !== null && onReasonSubject(memory, subject)) {
-    let pick: { text: string; correction: boolean; time: number; order: number } | undefined;
+    const subjectGrams = bigrams(subject);
+    let pick: { text: string; correction: boolean; relevance: number; time: number; order: number } | undefined;
     let order = 0;
     const consider = (quote: unknown, time: number) => {
       if (typeof quote !== "string") return;
@@ -83,8 +85,9 @@ export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuot
         const n = sentence.normalize("NFKC");
         if (isQuestionText(sentence) || !REASON_FORM.test(n)) continue;
         const correction = CORRECTION_FORM.test(n);
-        const better = !pick || (correction !== pick.correction ? correction : time !== pick.time ? time > pick.time : order > pick.order);
-        if (better) pick = { text: sentence, correction, time, order };
+        const relevance = coverage(subjectGrams, bigrams(sentence));
+        const better = !pick || (correction !== pick.correction ? correction : relevance !== pick.relevance ? relevance > pick.relevance : time !== pick.time ? time > pick.time : order > pick.order);
+        if (better) pick = { text: sentence, correction, relevance, time, order };
       }
     };
     for (const e of memory.topicEvents ?? []) consider(e?.quote, Number.isFinite(Date.parse(e?.statedAt ?? "")) ? Date.parse(e.statedAt) : 0);
