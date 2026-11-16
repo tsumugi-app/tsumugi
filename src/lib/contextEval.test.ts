@@ -226,8 +226,14 @@ test("E2: the 12 configurations, the same fictional data, questions and fixed ti
   }
   // the AI's hypothesis never reaches a turn without the user's correction it contradicts
   for (const x of runs.filter((r) => r.prompt.includes(world.AI_TEXTS.hypothesisJob))) assert.ok(x.prompt.includes(CORRECTION), `hypothesis with the correction: ${x.result.caseId} / ${x.result.config}`);
-  // the correction does not reach questions about something else (chat-weather: web search is ON there, so the time filter never applied; see the shortfalls)
-  for (const x of runs.filter((r) => !["reason-job", "contradict-job", "chat-weather"].includes(r.result.caseId))) assert.ok(!x.prompt.includes(CORRECTION), `no correction in an unrelated question: ${x.result.caseId} / ${x.result.config}`);
+  // the correction does not reach questions about something else, chat-weather included (its weak overlaps 「し、」「たい」 no longer pick job-3 / job-refl
+  // in companion; the outing record yuki-4 stays)
+  for (const x of runs.filter((r) => !["reason-job", "contradict-job"].includes(r.result.caseId))) assert.ok(!x.prompt.includes(CORRECTION), `no correction in an unrelated question: ${x.result.caseId} / ${x.result.config}`);
+  for (const x of runs.filter((r) => r.result.caseId === "chat-weather")) {
+    const sent = ((x.clientSent.retrievedMemories ?? []) as { id: string }[]).map((m) => m.id);
+    assert.deepEqual(sent, ["yuki-4"], `chat-weather: ${x.result.config} (${sent.join(", ")})`);
+    assert.deepEqual(x.result.forbiddenHits, [], `chat-weather mixes nothing in: ${x.result.config}`);
+  }
   // the comparison exercised every route (a route that never appears would compare nothing)
   const seen = new Set(results.flatMap((x) => Object.keys(x.routes)));
   for (const route of ["Retrieval", "Recent Conversation", "Topic Timeline", "Memory Graph", "Memory Timeline", "Memory Synthesis", "Explicit Search"]) assert.ok(seen.has(route), `route ${route} appeared (${[...seen].join(", ")})`);
