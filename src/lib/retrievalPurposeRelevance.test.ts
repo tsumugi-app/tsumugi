@@ -359,6 +359,10 @@ test("4 what counts: a reason question (asked or put forward), the user's own wo
   // an earlier reason and its later correction in one record (Capture appends): the correction, even without a correction word the later one
   assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["給料が下がるからなんだ", "本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "本当は今のチームを離れたくなかったからなんだ");
   assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["給料が下がるからなんだ", "チームを離れたくなかったからなんだ"] }, [CONTRADICT]), "チームを離れたくなかったからなんだ");
+  // a correction of another fact is not a reason: the stated reason stays the quote, and such a record alone is not raised (Codex on this PR)
+  assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職"], evidenceQuotes: ["転職をやめたのは給料が下がるからなんだ", "本当は9月じゃなくて10月に始めたんだ"] }, [CONTRADICT]), "転職をやめたのは給料が下がるからなんだ");
+  const dateOnly = mem("date", "2026-10-10", "転職活動を始めた月を言い直した。", ["転職"], { quotes: ["本当は9月じゃなくて10月に始めたんだ"] });
+  assert.equal(rr.adjustForPurpose(dateOnly, 2, rr.purposeContextOf(CONTRADICT, JOB), CONTRADICT, false, 3, 3).reasonAnswer, undefined);
   const ctx = rr.purposeContextOf(CONTRADICT, JOB);
   const byJob = (id: string) => JOB.find((m) => m.id === id)!;
   assert.deepEqual(rr.adjustForPurpose(byJob("j3"), 2, ctx, CONTRADICT, false, 3, 3), { score: 6, onTopic: true, demoted: false, reasonAnswer: true });

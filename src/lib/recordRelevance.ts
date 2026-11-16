@@ -17,7 +17,8 @@
  *    echoes the question's wording). AI reflections and the AI summary never count as the user's reason. Off-topic records are never raised.
  * No topic, product or person name is written in this code.
  */
-import { isExplanationText, isQuestionText, reasonFocusOf } from "./explicitReason";
+import { isQuestionText, reasonFocusOf } from "./explicitReason";
+import { REASON_FORM } from "./personStance";
 import { isQuestionFormTerm, isRecallQuestion, questionTopicRuns } from "./recallQuestion";
 
 export type QuestionPurpose = "questions" | "wish" | "change" | "view" | "personAction";
@@ -108,8 +109,11 @@ export function purposeContextOf(text: string, pool: readonly RelevanceSource[])
   return { purpose: namedPersons.length > 0 ? "personAction" : null, namedPersons, hasTopic, ...reason };
 }
 
-/** the user's own words (evidenceQuotes, not the AI summary) give a reason or correct an earlier statement, in a sentence that is not a question */
-export const statesOwnReason = (memory: RelevanceSource) => quoteSentences(memory).some((sentence) => !isQuestionText(sentence) && isExplanationText(sentence));
+/**
+ * the user's own words (evidenceQuotes, not the AI summary) give a reason (a corrected one included: 「本当は〜からなんだ」), in a sentence that is not a
+ * question. A correction of another fact (「本当は9月じゃなくて10月に始めた」) is not a reason (Codex on this PR)
+ */
+export const statesOwnReason = (memory: RelevanceSource) => quoteSentences(memory).some((sentence) => !isQuestionText(sentence) && REASON_FORM.test(sentence));
 
 /** every sentence of the user's own words asks the Memory back (no answer of its own). No quotes (older records): false, never pushed back */
 export function isRecallOnlyRecord(memory: RelevanceSource): boolean {

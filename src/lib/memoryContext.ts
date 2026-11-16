@@ -14,8 +14,8 @@
  */
 import type { MemoryObject, RetrievedMemory } from "./types";
 import { isAllowedTrait, onReasonSubject, reasonSubjectOf } from "./recordRelevance";
-import { isExplanationText, isQuestionText, reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
-import { CORRECTION_FORM } from "./personStance";
+import { isQuestionText, reasonAnswerScore, reasonFocusOf, reasonSentenceOf } from "./explicitReason";
+import { CORRECTION_FORM, REASON_FORM } from "./personStance";
 
 export const MEMORY_CONTEXT_MAX_QUOTES = 3;
 export const MEMORY_CONTEXT_QUOTE_MAX_CHARS = 80;
@@ -69,7 +69,8 @@ export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuot
   if (reason) return clip(reason, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
   // a reason question (asked, or a reason put forward: 「〜たのは、…が一番だったのかな？」) about this record's topic (a keyword named in the subject of
   // the question): the user's own sentence that gives a reason or corrects one, even when the AI summary covers it and the sentence does not repeat
-  // the topic word. A correction first, then the newest (dated events, then the later quotes: Capture appends new evidence after the old), as
+  // the topic word. Only a sentence in a reason form (a correction of another fact, 「本当は9月じゃなくて10月に始めた」, is not a reason: Codex on
+  // this PR). A corrected reason first, then the newest (dated events, then the later quotes: Capture appends new evidence after the old), as
   // reasonSentenceOf does: an earlier reason the user corrected never wins over the correction (Codex on this PR)
   const subject = reasonSubjectOf(latest);
   if (subject !== null && onReasonSubject(memory, subject)) {
@@ -79,8 +80,9 @@ export function memoryQuote(memory: Pick<MemoryObject, "summary" | "evidenceQuot
       if (typeof quote !== "string") return;
       for (const sentence of sentencesOf(quote)) {
         order += 1;
-        if (isQuestionText(sentence) || !isExplanationText(sentence)) continue;
-        const correction = CORRECTION_FORM.test(sentence.normalize("NFKC"));
+        const n = sentence.normalize("NFKC");
+        if (isQuestionText(sentence) || !REASON_FORM.test(n)) continue;
+        const correction = CORRECTION_FORM.test(n);
         const better = !pick || (correction !== pick.correction ? correction : time !== pick.time ? time > pick.time : order > pick.order);
         if (better) pick = { text: sentence, correction, time, order };
       }
