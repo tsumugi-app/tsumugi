@@ -79,14 +79,21 @@ const RECORD_SAYS: Record<"wish" | "change" | "view", RegExp> = {
  */
 const PROPOSED_REASON = /^(.+?た(?:の|ん))(?:は|って)[^。？?！!]*(?:(?:[いたるだ]|ない)から|ため|せい|が一番|が原因|がきっかけ)[^。？?！!]*(?:かな|かしら|っけ|のか|ですか|でしょうか)[?？。]*$/;
 /**
- * the part of a reason question that names what the reason is about: for a reason put forward, the act before 「〜たのは」 (the reason words
- * after it, 「お金の不安」, do not make a record on topic); for 「なんで／理由」 questions, the whole question. null: not a reason question.
+ * the part of a reason question that names what the reason is about: the act before 「〜たのは」 / 「理由」 / 「なんで」… (the reason words after it,
+ * 「お金の不安」, do not make a record on topic, also in 「転職をやめた理由は、お金の不安だったっけ？」: Codex on this PR); when the question opens with
+ * the reason word (「なんで転職をやめたんだっけ？」), the rest of it. null: not a reason question.
  * から as "from" (「大学からの友達だったっけ？」) is not a reason: only a predicate form before it counts (as REASON_FORM).
  */
+const REASON_SPLIT = /理由|(?<=た)(?:の|ん)(?:は|って)|なぜ|何故|どうして|なんで|わけは|訳は/;
 export function reasonSubjectOf(text: string): string | null {
   const t = norm(text).trim();
   if (!t) return null;
-  if (reasonFocusOf(t) !== null) return t;
+  if (reasonFocusOf(t) !== null) {
+    const cut = REASON_SPLIT.exec(t);
+    if (!cut) return t;
+    const before = t.slice(0, cut.index).trim();
+    return Array.from(before).length >= 2 ? before : t.slice(cut.index + cut[0].length).trim() || t;
+  }
   const m = PROPOSED_REASON.exec(t);
   return m ? m[1] : null;
 }

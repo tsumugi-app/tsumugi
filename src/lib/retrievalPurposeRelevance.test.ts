@@ -354,6 +354,16 @@ test("4 what counts: a reason question (asked or put forward), the user's own wo
   for (const q of [CONTRADICT, "転職をやめたのって、なんでだったっけ？", "旅行をやめたのは、雨のせいだったのかな？", "引っ越したのは、仕事のためだったっけ？"]) assert.equal(rr.asksReasonOfPast(q), true, q);
   for (const q of ["昨日食べたのは、カレーだったっけ？", "今日は天気がいいし、どこか出かけたいな", "なんで疲れるんだろう", "転職しようかな", "前に買ったロードバイクって、いくらだったっけ？", "先週会ったのは、大学からの友達だったっけ？", "行ったのは、駅から近いカフェだったかな？"]) assert.equal(rr.asksReasonOfPast(q), false, q);
   assert.equal(rr.reasonSubjectOf(CONTRADICT), "転職をやめたの", "the subject is the act, not the reason put forward");
+  // explicit reason questions too: the act before 理由 / のって / なんで, or after a leading なんで (Codex on this PR)
+  assert.equal(rr.reasonSubjectOf("転職をやめた理由は、お金の不安だったっけ？"), "転職をやめた");
+  assert.equal(rr.reasonSubjectOf("転職をやめたのって、なんでだったっけ？"), "転職をやめた");
+  assert.equal(rr.reasonSubjectOf("なんで転職をやめたんだっけ？"), "転職をやめたんだっけ？");
+  const budget = mem("budget", "2026-10-01", "今月は出費が多かったので節約すると話した。", ["お金", "家計"], { quotes: ["今月は出費が多かったので、少し節約しようと思う。"] });
+  const sleep = mem("sleep", "2026-10-02", "不安で眠れなかったと話した。", ["不安", "睡眠"], { quotes: ["不安だったから、眠れなかった。"] });
+  const askedReason = "転職をやめた理由は、お金の不安だったっけ？";
+  const askedCtx = rr.purposeContextOf(askedReason, [...JOB, budget, sleep]);
+  for (const m of [budget, sleep]) assert.equal(rr.adjustForPurpose(m, 2, askedCtx, askedReason, false, 3, 3).reasonAnswer, undefined, m.id);
+  assert.equal(rr.adjustForPurpose(JOB.find((m) => m.id === "j3")!, 2, askedCtx, askedReason, false, 3, 3).reasonAnswer, true);
   // the quote of a reason question: a correction first, then the sentence closest to the turn; not the first reason-form sentence
   assert.equal(mc.memoryQuote({ summary: "s", keywords: ["転職", "チーム"], evidenceQuotes: ["今日は雨だったので在宅にした。", "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"] }, [CONTRADICT]), "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ");
   // an earlier reason and its later correction in one record (Capture appends): the correction, even without a correction word the later one
