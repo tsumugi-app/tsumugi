@@ -11,6 +11,8 @@ import {
   isAboutPerson,
   isRelationshipTalk,
   normalizeTwoPeople,
+  PERSON_ARC_LIMIT,
+  PERSON_ARC_SCAN_LIMIT,
   PERSON_EXTRA_LIMIT,
   personKeysInText,
   selectConversationDirectMatches,
@@ -206,4 +208,59 @@ test("P1-B: an earlier turn with two confirmed names of one person still carries
   assert.equal(r.person?.how, "carried");
   assert.ok(ids(r).includes("r2"));
   assert.ok(!ids(r).includes("mr"));
+});
+
+// the change of a relationship: the records that explain it (fictional person あおいさん, NOW = 2026-11-01)
+const reflection = (m: MemoryObject) => ({ ...m, metadata: { ...(m.metadata as object), source: "system-generated" }, evidenceQuotes: [] }) as unknown as MemoryObject;
+const AOI = [
+  mem("a0", "2025-09-01", ["あおいさん"], "あおいさんと初めて会って、緊張したと話した。", "あおいさん"),
+  mem("a1", "2026-01-10", ["あおいさん", "旅行"], "あおいさんと旅行の計画を立てたと話した。", "あおいさん"),
+  mem("a2", "2026-03-05", ["あおいさん"], "あおいさんに冷たくされた気がして寂しいと話した。", "あおいさん", true),
+  mem("a3", "2026-05-20", ["あおいさん", "ランチ"], "あおいさんとランチに行ったと話した。", "あおいさん"),
+  mem("a4", "2026-07-15", ["あおいさん"], "あおいさんと本音で話して、また頼れるようになったと話した。", "あおいさん"),
+  mem("a5", "2026-08-01", ["あおいさん", "髪型"], "あおいさんが髪型を変えて、イメージが変わったと話した。", "あおいさん"),
+  mem("a6", "2026-09-10", ["あおいさん", "カレー"], "あおいさんとの夕食はカレーにしたと話した。", "あおいさん"),
+  reflection(mem("a7", "2026-09-20", ["あおいさん"], "あおいさんとの関係は、以前より安心できるものに変わったのだろう。", "あおいさん")),
+  mem("ab", "2026-06-01", ["あおいさん", "はるきさん"], "あおいさんとはるきさんの関係が変わったと話した。", "あおいさん"),
+  mem("h1", "2026-06-10", ["はるきさん"], "はるきさんと前より話せるようになったと話した。", "はるきさん"),
+  mem("a9", "2026-10-25", ["あおいさん", "映画"], "あおいさんと映画を観たと話した。", "あおいさん"),
+];
+AOI.find((m) => m.id === "ab")!.personMentions!.push({ ...AOI.find((m) => m.id === "h1")!.personMentions![0] });
+
+test("person arc: a question about how the relationship changed gets the change and the feeling before it, not the oldest, a looks change, a decision, a reflection or another person", () => {
+  const r = select(AOI, "あおいさんとの関係って、どう変わってきたと思う？");
+  assert.equal(r.person?.key, "あおい");
+  assert.deepEqual(r.arc, ["a2", "a4"], `the feeling before the change, then the change (${r.arc.join(", ")})`);
+  for (const id of ["a0", "a5", "a6", "a7", "ab", "h1"]) assert.ok(!ids(r).includes(id) || id === "a9", `${id} is not taken (${ids(r).join(", ")})`);
+  assert.ok(ids(r).includes("a9"), "the newest record stays");
+  assert.ok(r.arc.length <= PERSON_ARC_LIMIT);
+  // the change without a relationship word: 「頼れるようになった」 still comes before the newer looks change 「イメージが変わった」 and the decision 「カレーにした」
+  const plain = AOI.map((m) => (m.id === "a4" ? mem("a4", "2026-07-15", ["あおいさん"], "あおいさんと話して、また頼れるようになったと話した。", "あおいさん") : m));
+  assert.deepEqual(select(plain, "あおいさんとの関係って、どう変わってきたと思う？").arc, ["a2", "a4"]);
+});
+
+test("person arc: the name left out (carried person) works the same; no relationship word, no change word, or another person: nothing added", () => {
+  const carried = select(AOI, "最近、気持ちがどう変わってきたのか気になる", ["あおいさんのこと話したい", "最近、気持ちがどう変わってきたのか気になる"]);
+  assert.equal(carried.person?.how, "carried");
+  assert.deepEqual(carried.arc, ["a2", "a4"]);
+  assert.deepEqual(select(AOI, "あおいさん、髪型変えたんだって").arc, [], "a looks change is not a relationship change");
+  assert.deepEqual(select(AOI, "あおいさんとの関係ってどう？").arc, [], "no change asked");
+  assert.deepEqual(select(AOI, "仕事の進め方が変わった").arc, [], "no person");
+  const h = select(AOI, "はるきさんとの関係って、どう変わった？");
+  assert.ok(!h.arc.some((id) => id.startsWith("a")), "only はるきさん's own records");
+});
+
+test("person arc: the original change-yuki shape (no feeling word in the records) gets the start and the change; many records stay bounded", () => {
+  const Y = [
+    mem("y1", "2026-06-07", ["ゆうきさん", "友人"], "友人のゆうきさんと約束のことで喧嘩したと話した。", "ゆうきさん"),
+    mem("y2", "2026-07-19", ["ゆうきさん"], "ゆうきさんとまだ気まずいと話した。", "ゆうきさん"),
+    mem("y3", "2026-09-06", ["ゆうきさん", "仲直り"], "ゆうきさんに謝って、また話せるようになったと話した。", "ゆうきさん"),
+    mem("y4", "2026-10-25", ["ゆうきさん", "自転車"], "ゆうきさんと一緒に自転車で出かけて楽しかったと話した。", "ゆうきさん"),
+  ];
+  assert.deepEqual(select(Y, "ゆうきさんへの気持ちって、どう変わってきたと思う？").arc, ["y1", "y3"]);
+  // 90 records of one person: only the newest PERSON_ARC_SCAN_LIMIT are looked at, at most PERSON_ARC_LIMIT added
+  const many = Array.from({ length: 90 }, (_, i) => mem(`m${i}`, new Date(Date.parse("2026-10-30T12:00:00.000Z") - i * 86_400_000).toISOString().slice(0, 10), ["ゆうきさん"], i === 70 ? "ゆうきさんと話せるようになったと話した。" : `ゆうきさんと${i}回目の話をしたと話した。`, "ゆうきさん"));
+  const r = select(many, "ゆうきさんとの関係って、どう変わってきた？");
+  assert.ok(r.arc.length <= PERSON_ARC_LIMIT);
+  assert.ok(!r.arc.includes("m70"), `beyond the newest ${PERSON_ARC_SCAN_LIMIT} records (${r.arc.join(", ")})`);
 });

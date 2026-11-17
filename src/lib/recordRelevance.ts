@@ -60,10 +60,13 @@ const ASKS_PAST = /た(?:の|ん|っけ|か|かな)?[?？]?$|ていた|でいた
 const VIEW_ASKED_BACK = /(?:思|考|感じ)(?:って|て)(?:い)?た/;
 const ASKS_QUESTION_FORM = /[?？]|っけ|かな$|かしら|ですか|でしょうか|(?:もの|こと|の)は$/;
 
+/** a change asked about or told (「どう変わってきた」「変化」「話せるようになった」): the change purpose, also the person arc of retrieval.ts */
+const CHANGE_ASK = /変わ|変化|ようになっ|変え/;
+export const asksChange = (text: string) => CHANGE_ASK.test(norm(text));
 const PURPOSE_ASK: { purpose: Exclude<QuestionPurpose, "personAction">; ask: RegExp }[] = [
   { purpose: "questions", ask: /質問|尋ね/ },
   { purpose: "wish", ask: /望|願|ほしかっ|欲しかっ|してほし|たかった/ },
-  { purpose: "change", ask: /変わ|変化|ようになっ|変え/ },
+  { purpose: "change", ask: CHANGE_ASK },
   { purpose: "view", ask: /どう思|思って|考えて|好き|嫌い|いい|良い|欲し|気に|選|どっち|どちら|評価|印象|感じ/ },
 ];
 /** what the user's words or the summary say, per purpose */
