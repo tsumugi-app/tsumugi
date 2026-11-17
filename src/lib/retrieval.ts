@@ -719,11 +719,11 @@ export const PERSON_ARC_LIMIT = 2;
 export const PERSON_ARC_MAX_AGE_DAYS = 365;
 export const PERSON_ARC_SCAN_LIMIT = 60;
 /**
- * 関係の変化を説明する記録の言い回し（質問の目的「変化」の判定 RECORD_SAYS.change と同じ語。「前は」は「この前は」「名前は」「午前は」の一部を除く）。
+ * 関係の変化を説明する記録の言い回し（質問の目的「変化」の判定 RECORD_SAYS.change と同じ語。「前は」は文や句の始まりのときだけ。「この前は」「名前は」「午前は」は除く）。
  * STATE_CHANGEは、関係の言葉が無くても変化の記録にしてよい、できること・状態の変化（「話せるようになった」「以前は」）だけ
  */
-const ARC_CHANGE = /ようになっ|変わ|以前は|(?<![こ名午駅目手])前は|ことにし|にした|やめ|始め/;
-const STATE_CHANGE = /ようになっ|以前は|(?<![こ名午駅目手])前は/;
+const ARC_CHANGE = /ようになっ|変わ|以前は|(?<![一-鿿々ぁ-んァ-ヶー])前は|ことにし|にした|やめ|始め/;
+const STATE_CHANGE = /ようになっ|以前は|(?<![一-鿿々ぁ-んァ-ヶー])前は/;
 const DAY_MS_RETRIEVAL = 86_400_000;
 
 export const normalizeTwoPeople = (text: string) => text.replace(/2人|２人/g, "二人");
@@ -910,7 +910,7 @@ export function selectConversationWithPersons(
   const arc: MemoryObject[] = [];
   if (isRelationshipTalk(trimmed) && asksChange(latest)) {
     const hasOwnWords = (memory: MemoryObject) => (memory.evidenceQuotes ?? []).some((quote) => typeof quote === "string" && quote.trim().length > 0);
-    const ownText = (memory: MemoryObject) => nfkcCompact(`${(memory.evidenceQuotes ?? []).filter((quote) => typeof quote === "string").join(" ")} ${memory.summary ?? ""}`);
+    const ownText = (memory: MemoryObject) => nfkcCompact([...(memory.evidenceQuotes ?? []).filter((quote) => typeof quote === "string"), memory.summary ?? ""].join("。"));
     const own = pool
       .filter((memory) => isAboutTarget(memory) && !aboutOther(memory) && !isReflectionMemory(memory) && !isRecallOnlyRecord(memory) && hasOwnWords(memory))
       .filter((memory) => now - memoryTime(memory) <= PERSON_ARC_MAX_AGE_DAYS * DAY_MS_RETRIEVAL)
