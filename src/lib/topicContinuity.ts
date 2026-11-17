@@ -36,7 +36,7 @@
 
 import type { EventTimePrecision, MemoryObject } from "./types";
 import { scoreMemory } from "./retrieval";
-import { matchRecallTopic, questionTopicRuns, withPoolEvidence } from "./recallQuestion";
+import { matchRecallTopic, questionTopicRuns } from "./recallQuestion";
 
 /** topic候補として提示する最大topic数（v1）。 */
 export const MAX_TOPIC_CANDIDATES = 3;
@@ -73,16 +73,43 @@ const TOPIC_CONTINUITY_SIGNAL_WORDS = [
  * 「前に」「昨日」「さっき」「やっぱり」は時や気持ちを言うだけなので、ここには入れない。
  */
 const POINTING_SIGNAL_WORDS = ["あの件", "あの話", "例の", "続き", "その後"];
-/** 時を言う語（「先週」「去年」「今朝」）。話題の語として数えない */
-const TIME_TERM = /(?:週|月|年|日|朝|昼|夜|晩|頃|時|間|前|後|昔|去|今)$/;
+/** 時を言う短い語（「先週」「去年」「今朝」「明日」）。話題の語として数えない（「誕生日」「記念日」のような3文字以上の語は数える） */
+const SHORT_TIME_TERM = /^.?(?:週|月|年|日|朝|昼|夜|晩|頃|時|間|前|後|昔|去|今)$/;
+/**
+ * 話題の名前として置かれた語：直後が「の・って・は・が・も・と・について」か句読点・疑問符。「説明して」「確認して」「不安になって」
+ * 「会社を辞める」「LINEした」のように、頼みごと・様子・動作の語として使った語は、話題の名前に数えない（Codex / 独立レビュー on this PR）
+ */
+const TOPIC_POSITION = /^(?:の|って|は|が|も|と|について|[、,。.？?！!])/;
+/** よくある語：その語に一致する記録が max(5件, 全体の2割) 以上（「仕事」「予定」など）。話題を見分ける根拠にしない */
+const COMMON_RECORDS = 5;
+const COMMON_SHARE = 0.2;
+
+const inTopicPosition = (text: string, term: string) => {
+  for (let at = text.indexOf(term); at !== -1; at = text.indexOf(term, at + 1)) if (TOPIC_POSITION.test(text.slice(at + term.length))) return true;
+  return false;
+};
 
 /**
- * 発言が名前で挙げた話題の語（recallQuestion.questionTopicRuns：漢字・カタカナ・英数字の語から、質問の形の語・1文字の語幹を除いたもの）。
- * きっかけの言い回しの一部（「あの件」の「件」、「例の」の「例」）と時を言う語は除く。話題の語が無い発言（「昨日の話なんだけど、やっぱり
- * あれでいこうかな」）は空。
+ * 発言が名前で挙げた話題の語（recallQuestion.questionTopicRuns：漢字・カタカナ・英数字の語から、質問の形の語・1文字の語幹を除いたもの）のうち、
+ * 話題の名前として置かれたもの。きっかけの言い回しの一部（「あの件」の「件」）・時を言う短い語・数字だけの語は除く。
+ * 話題の語が無い発言（「昨日の話なんだけど、やっぱりあれでいこうかな」「昨日の話、もう少し詳しく説明して」）は空。
  */
 export function namedTopicTerms(text: string): string[] {
-  return questionTopicRuns(text.trim()).filter((term) => !TOPIC_CONTINUITY_SIGNAL_WORDS.some((word) => word.includes(term)) && !TIME_TERM.test(term));
+  const t = text.trim().normalize("NFKC");
+  return questionTopicRuns(t).filter(
+    (term) => !TOPIC_CONTINUITY_SIGNAL_WORDS.some((word) => word.includes(term)) && !SHORT_TIME_TERM.test(term) && !/^[0-9]+$/.test(term) && inTopicPosition(t, term)
+  );
+}
+
+const keywordsOf = (memory: MemoryObject) => (memory.keywords ?? []).filter((k): k is string => typeof k === "string").map((k) => k.normalize("NFKC").trim());
+/**
+ * 記録がその語に一致するか：Retrievalの想起の質問と同じ一致（キーワード、または要約・本文の語。matchRecallTopic）。どの記録にもそのままの
+ * 一致が無い語だけ、その語の中にある2文字以上のキーワード（「火星旅行」の「旅行」）でも一致とする（1文字のキーワード「車」で「自転車通勤」には一致させない）
+ */
+function recordsMatching(memories: readonly MemoryObject[], term: string, text: string): Set<MemoryObject> {
+  const direct = new Set(memories.filter((memory) => matchRecallTopic(memory, { terms: [term] }, text).matched.length > 0));
+  if (direct.size > 0) return direct;
+  return new Set(memories.filter((memory) => keywordsOf(memory).some((k) => Array.from(k).length >= 2 && term.includes(k))));
 }
 
 export function hasTopicContinuitySignal(text: string): boolean {
@@ -176,15 +203,19 @@ export function selectTopicContinuityCandidates(
   const allGroups = groupByTopicId(allMemories);
   if (allGroups.length === 0) return [];
 
-  // 関連の確認：発言が話題の語を名前で挙げたとき（「前に話した火星旅行の計画」）は、その語に一致する記録（キーワード、または要約・本文の語。
-  // Retrievalの想起の質問と同じ一致）を含む話題だけを候補にする。一致する話題が無ければ候補を渡さない（無関係な直近の話題を渡さない）。
-  // ただし指し示すだけの言い回し（「あの件」「続き」）があるときは、一致が無ければ従来どおり（言い換え「会社を辞める」→「転職」を失わない）。
+  // 関連の確認：発言が話題の名前を挙げたとき（「前に話した火星旅行の計画、」）は、その語に一致する記録を含む話題だけを候補にする。
+  // - 見分ける根拠にするのは、よくある語でない語だけ（よくある語・話題の名前でない語しか無ければ従来どおり）
+  // - 一致する話題が無く、どの記録にも無い名前なら候補を渡さない（無関係な直近の話題を渡さない）
+  // - 指し示すだけの言い回し（「あの件」「続き」）があるときは、一致が無ければ従来どおり（言い換え「会社を辞める」→「転職」を失わない）
   // 話題の語が無い発言は従来どおり（キーワードが弱ければ直近の複数の候補をそのまま渡し、判断はAIに委ねる）
-  const terms = trimmed ? namedTopicTerms(trimmed) : [];
-  const topic = terms.length > 0 ? withPoolEvidence({ terms }, allMemories) : null;
-  const related = topic ? allGroups.filter((group) => group.memories.some((memory) => matchRecallTopic(memory, topic, trimmed).matched.length > 0)) : allGroups;
-  const pointing = POINTING_SIGNAL_WORDS.some((word) => trimmed.includes(word));
-  const groups = related.length > 0 || !pointing ? related : allGroups;
+  const common = Math.max(COMMON_RECORDS, Math.ceil(allMemories.length * COMMON_SHARE));
+  const matches = (trimmed ? namedTopicTerms(trimmed) : []).map((term) => recordsMatching(allMemories, term, trimmed.normalize("NFKC"))).filter((records) => records.size < common);
+  let groups = allGroups;
+  if (matches.length > 0) {
+    const related = allGroups.filter((group) => group.memories.some((memory) => matches.some((records) => records.has(memory))));
+    const pointing = POINTING_SIGNAL_WORDS.some((word) => trimmed.includes(word));
+    groups = related.length > 0 || !pointing ? related : allGroups;
+  }
   if (groups.length === 0) return [];
 
   const scored = groups.map((group) => ({

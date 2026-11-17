@@ -26,6 +26,12 @@ const POOL: MemoryObject[] = [
 const POOL_KAISHA: MemoryObject[] = [...POOL, mem("job-3", "2026-10-01", "今の会社に残ると話した。", ["転職", "会社"], "topic-job")];
 // a topic that names a person in katakana
 const POOL_PERSON: MemoryObject[] = [...POOL, mem("kenta-1", "2026-10-05", "ケンタと山に登る約束をしたと話した。", ["登山", "ケンタ"], "topic-hike")];
+// 仕事 is in many records (five of them without a topic): a common word, not a reason to tell topics apart
+const POOL_COMMON: MemoryObject[] = [...POOL, ...[1, 2, 3, 4, 5].map((i) => mem(`work-${i}`, `2026-06-0${i}`, `仕事で${i}件目の資料を作ったと話した。`, ["仕事"], ""))];
+// another topic that has 旅行 and 計画 (the co-words of 「火星旅行の計画」)
+const POOL_PLAN: MemoryObject[] = [...POOL, mem("trip-1", "2026-10-10", "京都への旅行の計画を立てたと話した。", ["旅行", "計画"], "topic-trip")];
+// a topic whose only keyword is the single kanji 車 (inside 自転車通勤 too)
+const POOL_CAR: MemoryObject[] = [...POOL, mem("car-1", "2026-10-12", "車を買い替えたいと話した。", ["車"], "topic-car")];
 
 /** the selection before this change: score, then recency, top 3, with no check against the turn's topic words */
 function before(pool: MemoryObject[], text: string): string[] | null {
@@ -50,8 +56,15 @@ const CASES: { what: string; q: string; pool: MemoryObject[]; want: string[] | n
   { what: "時を言う語だけ", q: "先週の話の続きなんだけど", pool: POOL, want: ["topic-job", "topic-bike"] },
   { what: "人物（ひらがな）だけ", q: "前に話したゆうきさんのこと、覚えてる？", pool: POOL, want: ["topic-job", "topic-bike"] },
   { what: "言い換え＋指し示す言い回し", q: "あの件、やっぱり会社を辞めることにした", pool: POOL, want: ["topic-job", "topic-bike"] },
-  { what: "言い換え（記録に「会社」がある）", q: "前に話したけど、やっぱり会社を辞めることにした", pool: POOL_KAISHA, want: ["topic-job"] },
-  { what: "言い換えだけ（記録に「会社」が無い）", q: "前に話したけど、やっぱり会社を辞めることにした", pool: POOL, want: null, known: "指し示す言い回しが無い言い換えは、話題の候補が渡らない（今後の課題）" },
+  { what: "言い換え（「会社を」は話題の名前に数えない）", q: "前に話したけど、やっぱり会社を辞めることにした", pool: POOL, want: ["topic-job", "topic-bike"] },
+  { what: "言い換え（記録に「会社」がある）", q: "前に話した会社のこと、やっぱり辞めることにした", pool: POOL_KAISHA, want: ["topic-job"] },
+  { what: "言い換え（記録に「会社」が無い）", q: "前に話した会社のこと、やっぱり辞めることにした", pool: POOL, want: null, known: "話題の名前を記録に無い言葉で言い換え、指し示す言い回しも無いと、話題の候補が渡らない（今後の課題）" },
+  { what: "頼みごとの語（説明して）", q: "昨日の話、もう少し詳しく説明して", pool: POOL, want: ["topic-job", "topic-bike"] },
+  { what: "様子の語（不安になって）", q: "さっきの話、やっぱり不安になってきた", pool: POOL, want: ["topic-job", "topic-bike"] },
+  { what: "動作の語・数字（LINEした・10時）", q: "昨日10時にLINEした件だけど", pool: POOL, want: ["topic-job", "topic-bike"] },
+  { what: "よくある語（仕事）", q: "前に話した仕事のこと、どうなった？", pool: POOL_COMMON, want: ["topic-job", "topic-bike"] },
+  { what: "記録に無い話題の、よくある組み合わせの語（旅行・計画）", q: "前に話した火星旅行の計画、どうなってたっけ？", pool: POOL_PLAN, want: ["topic-trip"], known: "「旅行」「計画」の記録がある話題は候補に残る（話題は近い。判断はAI）" },
+  { what: "1文字のキーワード（車）は長い語の代わりにしない", q: "前に話した自転車通勤の件、どうなった？", pool: POOL_CAR, want: ["topic-bike"] },
   { what: "人物（カタカナ）が記録にある", q: "前に話したケンタとの約束、どうなったっけ？", pool: POOL_PERSON, want: ["topic-hike"] },
   { what: "きっかけの語が無い", q: "ロードバイクに乗りたい", pool: POOL, want: null },
 ];
@@ -63,6 +76,8 @@ test("topic continuity: a turn that names a topic gets only the topics whose rec
   assert.deepEqual(namedTopicTerms("あの件、どうなったっけ？"), [], "「件」 of 「あの件」 is not a topic word");
   assert.deepEqual(namedTopicTerms("先週の話の続きなんだけど"), [], "a time word is not a topic word");
   assert.deepEqual(namedTopicTerms("前に話した火星旅行の計画、どうなってたっけ？"), ["火星旅行", "計画"]);
+  assert.deepEqual(namedTopicTerms("昨日の話、もう少し詳しく説明して"), [], "a request word is not a topic name (Codex)");
+  assert.deepEqual(namedTopicTerms("前に話した誕生日の計画、どうする？"), ["誕生日", "計画"], "a longer word that ends with 日 is a topic");
 });
 
 test("topic continuity: unchanged where the turn names no topic word (the same candidates as before)", () => {
