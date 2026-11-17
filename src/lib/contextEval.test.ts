@@ -244,6 +244,14 @@ test("E2: the 12 configurations, the same fictional data, questions and fixed ti
   for (const x of runs.filter((r) => r.result.caseId === "fact-bike-price" || r.result.caseId === "recent-continue")) {
     assert.deepEqual(topicIds(x), ["topic-bike"], `the topic candidate stays: ${x.result.caseId} / ${x.result.config}`);
   }
+  // change-yuki: the Retrieval itself carries the change of the relationship (the start and the change), so the routes that are off by default
+  // (Timeline / Memory Graph) are not needed for it; nothing about another person comes in
+  for (const x of runs.filter((r) => r.result.caseId === "change-yuki")) {
+    const sent = ((x.clientSent.retrievedMemories ?? []) as { id: string }[]).map((m) => m.id);
+    for (const id of ["yuki-1", "yuki-3", "yuki-4"]) assert.ok(sent.includes(id), `change-yuki ${x.result.config}: ${id} (${sent.join(", ")})`);
+    assert.ok(sent.every((id) => id.startsWith("yuki-")), `change-yuki ${x.result.config}: only ゆうきさん (${sent.join(", ")})`);
+    assert.deepEqual(x.result.forbiddenHits, [], `change-yuki mixes nothing in: ${x.result.config}`);
+  }
   // the comparison exercised every route (a route that never appears would compare nothing)
   const seen = new Set(results.flatMap((x) => Object.keys(x.routes)));
   for (const route of ["Retrieval", "Recent Conversation", "Topic Timeline", "Memory Graph", "Memory Timeline", "Memory Synthesis", "Explicit Search"]) assert.ok(seen.has(route), `route ${route} appeared (${[...seen].join(", ")})`);
