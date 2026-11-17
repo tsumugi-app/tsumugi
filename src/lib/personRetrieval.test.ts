@@ -264,3 +264,38 @@ test("person arc: the original change-yuki shape (no feeling word in the records
   assert.ok(r.arc.length <= PERSON_ARC_LIMIT);
   assert.ok(!r.arc.includes("m70"), `beyond the newest ${PERSON_ARC_SCAN_LIMIT} records (${r.arc.join(", ")})`);
 });
+
+test("person arc (review on this PR): the change already selected is the anchor; 「この前は」 / a decision without a relationship word is not a change; the relationship word must be in the latest turn; the nearest feeling before the change", () => {
+  const ASK = "ゆうきさんへの気持ちって、どう変わってきたと思う？";
+  // the newest record is the change itself (already selected): the record before it is the argument, not an older trivial 「にした」
+  const newestIsChange = [
+    mem("c1", "2026-01-15", ["ゆうきさん"], "ゆうきさんと初めて会ったと話した。", "ゆうきさん"),
+    mem("c2", "2026-02-10", ["ゆうきさん", "髪型"], "ゆうきさんが髪型を変えたと話した。", "ゆうきさん"),
+    mem("c3", "2026-03-20", ["ゆうきさん", "喧嘩"], "ゆうきさんと約束のことで喧嘩したと話した。", "ゆうきさん"),
+    mem("c4", "2026-06-01", ["ゆうきさん", "夕食"], "ゆうきさんとの夕食はカレーにしたと話した。", "ゆうきさん"),
+    mem("c5", "2026-10-20", ["ゆうきさん"], "ゆうきさんとまた話せるようになったと話した。", "ゆうきさん"),
+  ];
+  const a = select(newestIsChange, ASK);
+  assert.ok(ids(a).includes("c5"));
+  assert.ok(!a.arc.includes("c4") && !a.arc.includes("c2"), `no trivial change (${a.arc.join(", ")})`);
+  // known limit: 「喧嘩」 is not a feeling / relationship word of the existing lists, so with none in the records the start is the oldest (c1), not the argument (c3)
+  assert.deepEqual(a.arc, ["c1"], "before the change: the oldest when no record has a feeling / relationship word");
+  // 「この前は」 is not a change phrase
+  const konomae = [
+    mem("k1", "2026-05-01", ["ゆうきさん"], "ゆうきさんと気まずくなったと話した。", "ゆうきさん"),
+    mem("k2", "2026-07-01", ["ゆうきさん"], "ゆうきさんとまた話せるようになったと話した。", "ゆうきさん"),
+    mem("k3", "2026-09-01", ["ゆうきさん", "飲み会"], "この前はゆうきさんと飲みに行ったと話した。", "ゆうきさん"),
+    mem("k4", "2026-10-20", ["ゆうきさん", "映画"], "ゆうきさんと映画を観たと話した。", "ゆうきさん"),
+  ];
+  assert.deepEqual(select(konomae, ASK).arc, ["k1", "k2"]);
+  // a relationship word only in the previous turn does not make a looks change a relationship change
+  assert.deepEqual(select(konomae, "ゆうきさん、髪型変えたんだって", ["ゆうきさんと距離ができて寂しい", "ゆうきさん、髪型変えたんだって"]).arc, []);
+  // the feeling nearest before the change, not the oldest feeling
+  const nearest = [
+    mem("n1", "2026-01-10", ["ゆうきさん"], "ゆうきさんと初めて会えて嬉しかったと話した。", "ゆうきさん", true),
+    mem("n2", "2026-06-10", ["ゆうきさん"], "ゆうきさんと距離ができて寂しいと話した。", "ゆうきさん", true),
+    mem("n3", "2026-08-10", ["ゆうきさん"], "ゆうきさんとまた話せるようになったと話した。", "ゆうきさん"),
+    mem("n4", "2026-10-20", ["ゆうきさん", "映画"], "ゆうきさんと映画を観たと話した。", "ゆうきさん"),
+  ];
+  assert.deepEqual(select(nearest, ASK).arc, ["n2", "n3"]);
+});
