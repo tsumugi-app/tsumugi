@@ -928,7 +928,8 @@ export function selectConversationWithPersons(
   let feeling: MemoryObject | undefined;
   if (relationshipTalk) {
     const eligible = pool
-      .filter((memory) => isAboutTarget(memory) && isFeelingRecord(memory) && !aboutOther(memory))
+      // AIの振り返りは本人の気持ちの記録の代わりにしない（本人の言葉より先に立てない）
+      .filter((memory) => isAboutTarget(memory) && isFeelingRecord(memory) && !aboutOther(memory) && !isReflectionMemory(memory))
       .filter((memory) => now - memoryTime(memory) <= FEELING_MAX_AGE_DAYS * DAY_MS_RETRIEVAL);
     const matched = eligible
       .filter((memory) => !included.has(memory.id))

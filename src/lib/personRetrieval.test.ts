@@ -240,7 +240,7 @@ test("person arc: a question about how the relationship changed gets the change 
 });
 
 test("person arc: the name left out (carried person) works the same; no relationship word, no change word, or another person: nothing added", () => {
-  const carried = select(AOI, "最近、気持ちがどう変わってきたのか気になる", ["あおいさんのこと話したい", "最近、気持ちがどう変わってきたのか気になる"]);
+  const carried = select(AOI, "あの人への気持ちって、どう変わってきたんだろう", ["あおいさんのこと話したい", "あの人への気持ちって、どう変わってきたんだろう"]);
   assert.equal(carried.person?.how, "carried");
   assert.deepEqual(carried.arc, ["a2", "a4"]);
   assert.deepEqual(select(AOI, "あおいさん、髪型変えたんだって").arc, [], "a looks change is not a relationship change");
