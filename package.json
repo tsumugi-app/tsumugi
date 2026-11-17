@@ -16,6 +16,7 @@
     "test:retrieval-recall-topic": "tsc -p tsconfig.retrieval-recall-topic.json && node --test .test-out/lib/retrievalRecallTopic.test.js",
     "test:retrieval-purpose-relevance": "tsc -p tsconfig.retrieval-purpose-relevance.json && node --test .test-out/lib/retrievalPurposeRelevance.test.js",
     "test:copy-for-check": "tsc -p tsconfig.copy-for-check.json && node --test .test-out/lib/copyForCheck.test.js",
+    "test:topic-continuity": "tsc -p tsconfig.topic-continuity.json && node --test .test-out/lib/topicContinuity.test.js",
     "test:chat-context-assembly": "tsc -p tsconfig.chat-context-assembly.json && node --test .test-out/lib/chatContextAssembly.test.js",
     "test:context-eval": "tsc -p tsconfig.context-eval.json && node --test .test-out/lib/contextEval.test.js",
     "test:context-builder": "tsc -p tsconfig.context-builder.json && node --test .test-out/lib/contextBuilder.test.js .test-out/lib/contextDedupeFlag.test.js",

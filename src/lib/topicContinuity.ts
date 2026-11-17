@@ -36,6 +36,7 @@
 
 import type { EventTimePrecision, MemoryObject } from "./types";
 import { scoreMemory } from "./retrieval";
+import { matchRecallTopic, questionTopicRuns, withPoolEvidence } from "./recallQuestion";
 
 /** topic候補として提示する最大topic数（v1）。 */
 export const MAX_TOPIC_CANDIDATES = 3;
@@ -65,6 +66,24 @@ const TOPIC_CONTINUITY_SIGNAL_WORDS = [
   "やっぱり",
   "前回",
 ];
+
+/**
+ * 指し示すだけの言い回し（「あの件」「例の」「続き」「その後」「あの話」）。何の話かを言わずに過去の話題を指すので、発言の他の語が記録と
+ * 一致しなくても（「あの件、やっぱり会社を辞めることにした」の「会社」が記録では「転職」）、従来どおり直近の候補を渡す。
+ * 「前に」「昨日」「さっき」「やっぱり」は時や気持ちを言うだけなので、ここには入れない。
+ */
+const POINTING_SIGNAL_WORDS = ["あの件", "あの話", "例の", "続き", "その後"];
+/** 時を言う語（「先週」「去年」「今朝」）。話題の語として数えない */
+const TIME_TERM = /(?:週|月|年|日|朝|昼|夜|晩|頃|時|間|前|後|昔|去|今)$/;
+
+/**
+ * 発言が名前で挙げた話題の語（recallQuestion.questionTopicRuns：漢字・カタカナ・英数字の語から、質問の形の語・1文字の語幹を除いたもの）。
+ * きっかけの言い回しの一部（「あの件」の「件」、「例の」の「例」）と時を言う語は除く。話題の語が無い発言（「昨日の話なんだけど、やっぱり
+ * あれでいこうかな」）は空。
+ */
+export function namedTopicTerms(text: string): string[] {
+  return questionTopicRuns(text.trim()).filter((term) => !TOPIC_CONTINUITY_SIGNAL_WORDS.some((word) => word.includes(term)) && !TIME_TERM.test(term));
+}
 
 export function hasTopicContinuitySignal(text: string): boolean {
   const trimmed = text.trim();
@@ -154,7 +173,18 @@ export function selectTopicContinuityCandidates(
   currentUserMessage: string
 ): TopicContinuityCandidate[] {
   const trimmed = currentUserMessage.trim();
-  const groups = groupByTopicId(allMemories);
+  const allGroups = groupByTopicId(allMemories);
+  if (allGroups.length === 0) return [];
+
+  // 関連の確認：発言が話題の語を名前で挙げたとき（「前に話した火星旅行の計画」）は、その語に一致する記録（キーワード、または要約・本文の語。
+  // Retrievalの想起の質問と同じ一致）を含む話題だけを候補にする。一致する話題が無ければ候補を渡さない（無関係な直近の話題を渡さない）。
+  // ただし指し示すだけの言い回し（「あの件」「続き」）があるときは、一致が無ければ従来どおり（言い換え「会社を辞める」→「転職」を失わない）。
+  // 話題の語が無い発言は従来どおり（キーワードが弱ければ直近の複数の候補をそのまま渡し、判断はAIに委ねる）
+  const terms = trimmed ? namedTopicTerms(trimmed) : [];
+  const topic = terms.length > 0 ? withPoolEvidence({ terms }, allMemories) : null;
+  const related = topic ? allGroups.filter((group) => group.memories.some((memory) => matchRecallTopic(memory, topic, trimmed).matched.length > 0)) : allGroups;
+  const pointing = POINTING_SIGNAL_WORDS.some((word) => trimmed.includes(word));
+  const groups = related.length > 0 || !pointing ? related : allGroups;
   if (groups.length === 0) return [];
 
   const scored = groups.map((group) => ({

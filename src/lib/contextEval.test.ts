@@ -234,6 +234,16 @@ test("E2: the 12 configurations, the same fictional data, questions and fixed ti
     assert.deepEqual(sent, ["yuki-4"], `chat-weather: ${x.result.config} (${sent.join(", ")})`);
     assert.deepEqual(x.result.forbiddenHits, [], `chat-weather mixes nothing in: ${x.result.config}`);
   }
+  // Topic Continuity: a turn that names a topic no record has (火星旅行・陶芸教室) gets no topic candidate; a turn whose topic a record has
+  // (ロードバイク) and a turn with no topic word (「さっきの話の続き…」) keep the topic-bike candidate, in every configuration
+  const topicIds = (x: Run) => ((x.clientSent.topicContext ?? []) as { topicId: string }[]).map((t) => t.topicId);
+  for (const x of runs.filter((r) => r.result.caseId === "none-mars" || r.result.caseId === "none-pottery")) {
+    assert.deepEqual(topicIds(x), [], `no topic candidate: ${x.result.caseId} / ${x.result.config}`);
+    assert.deepEqual(x.result.forbiddenHits, [], `nothing mixed in: ${x.result.caseId} / ${x.result.config}`);
+  }
+  for (const x of runs.filter((r) => r.result.caseId === "fact-bike-price" || r.result.caseId === "recent-continue")) {
+    assert.deepEqual(topicIds(x), ["topic-bike"], `the topic candidate stays: ${x.result.caseId} / ${x.result.config}`);
+  }
   // the comparison exercised every route (a route that never appears would compare nothing)
   const seen = new Set(results.flatMap((x) => Object.keys(x.routes)));
   for (const route of ["Retrieval", "Recent Conversation", "Topic Timeline", "Memory Graph", "Memory Timeline", "Memory Synthesis", "Explicit Search"]) assert.ok(seen.has(route), `route ${route} appeared (${[...seen].join(", ")})`);
