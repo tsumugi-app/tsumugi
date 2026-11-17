@@ -36,7 +36,7 @@
 
 import type { EventTimePrecision, MemoryObject } from "./types";
 import { scoreMemory } from "./retrieval";
-import { matchRecallTopic, questionTopicRuns } from "./recallQuestion";
+import { questionTopicRuns } from "./recallQuestion";
 
 /** topic候補として提示する最大topic数（v1）。 */
 export const MAX_TOPIC_CANDIDATES = 3;
@@ -101,15 +101,39 @@ export function namedTopicTerms(text: string): string[] {
   );
 }
 
-const keywordsOf = (memory: MemoryObject) => (memory.keywords ?? []).filter((k): k is string => typeof k === "string").map((k) => k.normalize("NFKC").trim());
+const RUNS = /[一-鿿々]+|[ァ-ヺー]{2,}|[A-Za-z0-9]{2,}/g;
+const runsOf = (text: string): string[] => text.normalize("NFKC").match(RUNS) ?? [];
+const keywordsOf = (memory: MemoryObject) => (memory.keywords ?? []).filter((k): k is string => typeof k === "string").map((k) => k.normalize("NFKC").trim()).filter(Boolean);
+
 /**
- * 記録がその語に一致するか：Retrievalの想起の質問と同じ一致（キーワード、または要約・本文の語。matchRecallTopic）。どの記録にもそのままの
- * 一致が無い語だけ、その語の中にある2文字以上のキーワード（「火星旅行」の「旅行」）でも一致とする（1文字のキーワード「車」で「自転車通勤」には一致させない）
+ * 記録がその語に一致するか（1ターンに1回、記録ごとの語を作って使い回す）:
+ * - キーワード、またはキーワード・要約・本文の語が、その語で始まる（Retrievalの想起の質問と同じ。「車」には「車選び」）か、2文字以上の語なら
+ *   その語で終わる（「旅行」には「京都旅行」、「会議」には「定例会議」。独立レビュー on this PR）。1文字の語は要約・本文の語と同じときだけ
+ * - そのままの一致がどの記録にも無い語だけ、その語の中にある2文字以上のキーワード（「火星旅行」の「旅行」）でも一致とする
+ *   （1文字のキーワード「車」で「自転車通勤」には一致させない）
  */
-function recordsMatching(memories: readonly MemoryObject[], term: string, text: string): Set<MemoryObject> {
-  const direct = new Set(memories.filter((memory) => matchRecallTopic(memory, { terms: [term] }, text).matched.length > 0));
-  if (direct.size > 0) return direct;
-  return new Set(memories.filter((memory) => keywordsOf(memory).some((k) => Array.from(k).length >= 2 && term.includes(k))));
+function recordMatcher(memories: readonly MemoryObject[]) {
+  const cache = new Map<MemoryObject, { keywords: string[]; runs: string[] }>();
+  const wordsOf = (memory: MemoryObject) => {
+    let words = cache.get(memory);
+    if (!words) {
+      const keywords = keywordsOf(memory);
+      words = { keywords, runs: [...keywords, ...keywords.flatMap(runsOf), ...runsOf(`${memory.summary ?? ""} ${memory.content ?? ""}`)] };
+      cache.set(memory, words);
+    }
+    return words;
+  };
+  return (term: string): Set<MemoryObject> => {
+    const single = Array.from(term).length === 1;
+    const direct = new Set(
+      memories.filter((memory) => {
+        const { keywords, runs } = wordsOf(memory);
+        return keywords.some((k) => k.startsWith(term)) || runs.some((run) => (single ? run === term : run.startsWith(term) || run.endsWith(term)));
+      })
+    );
+    if (direct.size > 0) return direct;
+    return new Set(memories.filter((memory) => wordsOf(memory).keywords.some((k) => Array.from(k).length >= 2 && term.includes(k))));
+  };
 }
 
 export function hasTopicContinuitySignal(text: string): boolean {
@@ -208,11 +232,14 @@ export function selectTopicContinuityCandidates(
   // - 一致する話題が無く、どの記録にも無い名前なら候補を渡さない（無関係な直近の話題を渡さない）
   // - 指し示すだけの言い回し（「あの件」「続き」）があるときは、一致が無ければ従来どおり（言い換え「会社を辞める」→「転職」を失わない）
   // 話題の語が無い発言は従来どおり（キーワードが弱ければ直近の複数の候補をそのまま渡し、判断はAIに委ねる）
+  // 見分ける根拠は、発言が最初に挙げた話題の名前（よくある語を除く）だけ。「火星旅行の計画」の「計画」のような後の語では話題を選ばない
+  // （別の話題の「…計画を立てた」を候補に戻さない。独立レビュー on this PR）
   const common = Math.max(COMMON_RECORDS, Math.ceil(allMemories.length * COMMON_SHARE));
-  const matches = (trimmed ? namedTopicTerms(trimmed) : []).map((term) => recordsMatching(allMemories, term, trimmed.normalize("NFKC"))).filter((records) => records.size < common);
+  const matching = recordMatcher(allMemories);
+  const named = (trimmed ? namedTopicTerms(trimmed) : []).map(matching).find((records) => records.size < common);
   let groups = allGroups;
-  if (matches.length > 0) {
-    const related = allGroups.filter((group) => group.memories.some((memory) => matches.some((records) => records.has(memory))));
+  if (named) {
+    const related = allGroups.filter((group) => group.memories.some((memory) => named.has(memory)));
     const pointing = POINTING_SIGNAL_WORDS.some((word) => trimmed.includes(word));
     groups = related.length > 0 || !pointing ? related : allGroups;
   }

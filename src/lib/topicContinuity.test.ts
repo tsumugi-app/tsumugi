@@ -30,6 +30,12 @@ const POOL_PERSON: MemoryObject[] = [...POOL, mem("kenta-1", "2026-10-05", "ケ�
 const POOL_COMMON: MemoryObject[] = [...POOL, ...[1, 2, 3, 4, 5].map((i) => mem(`work-${i}`, `2026-06-0${i}`, `仕事で${i}件目の資料を作ったと話した。`, ["仕事"], ""))];
 // another topic that has 旅行 and 計画 (the co-words of 「火星旅行の計画」)
 const POOL_PLAN: MemoryObject[] = [...POOL, mem("trip-1", "2026-10-10", "京都への旅行の計画を立てたと話した。", ["旅行", "計画"], "topic-trip")];
+// an unrelated topic that has only the co-word 計画 of 「火星旅行の計画」 (independent review on this PR)
+const POOL_COWORD: MemoryObject[] = [...POOL, mem("bike-3", "2026-10-11", "週末ロードバイクで走る計画を立てたと話した。", ["ロードバイク"], "topic-bike")];
+// a record word that ends with the named word (京都旅行 for 旅行)
+const POOL_TAIL: MemoryObject[] = [...POOL, mem("kyoto-1", "2026-10-15", "京都旅行に行ったと話した。", ["京都旅行"], "topic-kyoto")];
+// the named topic is only in a record without a topic
+const POOL_UNTAGGED: MemoryObject[] = [...POOL, mem("pot-1", "2026-10-16", "陶芸教室に通い始めたと話した。", ["陶芸"], "")];
 // a topic whose only keyword is the single kanji 車 (inside 自転車通勤 too)
 const POOL_CAR: MemoryObject[] = [...POOL, mem("car-1", "2026-10-12", "車を買い替えたいと話した。", ["車"], "topic-car")];
 
@@ -64,6 +70,9 @@ const CASES: { what: string; q: string; pool: MemoryObject[]; want: string[] | n
   { what: "動作の語・数字（LINEした・10時）", q: "昨日10時にLINEした件だけど", pool: POOL, want: ["topic-job", "topic-bike"] },
   { what: "よくある語（仕事）", q: "前に話した仕事のこと、どうなった？", pool: POOL_COMMON, want: ["topic-job", "topic-bike"] },
   { what: "記録に無い話題の、よくある組み合わせの語（旅行・計画）", q: "前に話した火星旅行の計画、どうなってたっけ？", pool: POOL_PLAN, want: ["topic-trip"], known: "「旅行」「計画」の記録がある話題は候補に残る（話題は近い。判断はAI）" },
+  { what: "後の語（計画）だけが別の話題にある", q: "前に話した火星旅行の計画、どうなってたっけ？", pool: POOL_COWORD, want: null },
+  { what: "記録の語が名前で終わる（京都旅行）", q: "前に話した旅行のこと、どうなった？", pool: POOL_TAIL, want: ["topic-kyoto"] },
+  { what: "話題の名前が話題の無い記録にだけある", q: "前に話した陶芸教室のこと、どうなってたっけ？", pool: POOL_UNTAGGED, want: null, known: "その記録はRetrievalが扱う（話題の候補にはできない）" },
   { what: "1文字のキーワード（車）は長い語の代わりにしない", q: "前に話した自転車通勤の件、どうなった？", pool: POOL_CAR, want: ["topic-bike"] },
   { what: "人物（カタカナ）が記録にある", q: "前に話したケンタとの約束、どうなったっけ？", pool: POOL_PERSON, want: ["topic-hike"] },
   { what: "きっかけの語が無い", q: "ロードバイクに乗りたい", pool: POOL, want: null },
