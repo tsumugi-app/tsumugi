@@ -1,1 +1,588 @@
+name: Claude Implement (Issue 57)
 
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  implement:
+    if: github.repository == 'tsumugi-app/tsumugi' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: Guard branch and record name
+        shell: bash
+        run: |
+          branch="claude/issue-57-plan-a"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null 2>&1; then
+            echo "::error::Branch $branch already exists; refusing to overwrite a previous attempt"
+            exit 1
+          fi
+          echo "IMPL_BRANCH=$branch" >> "$GITHUB_ENV"
+          echo "Branch: $branch"
+
+      - name: Baseline evaluation (before change)
+        shell: bash
+        run: |
+          if ! npm run test:context-eval > "$RUNNER_TEMP/impl-baseline-eval.txt" 2>&1; then
+            echo "::error::Baseline context-eval failed; aborting before any change"
+            tail -50 "$RUNNER_TEMP/impl-baseline-eval.txt"
+            exit 1
+          fi
+          grep "change-yuki" "$RUNNER_TEMP/impl-baseline-eval.txt" > "$RUNNER_TEMP/impl-baseline-change.txt" || true
+          cat "$RUNNER_TEMP/impl-baseline-change.txt"
+
+      - name: Install Claude Code
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location https://claude.ai/install.sh \
+            --output "$RUNNER_TEMP/install-claude.sh"
+          bash "$RUNNER_TEMP/install-claude.sh" 2.1.327
+          "$HOME/.local/bin/claude" --version
+
+      - name: Fetch Issue 57 body
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/57" > "$RUNNER_TEMP/issue-57.json"
+          python3 - "$RUNNER_TEMP/issue-57.json" "$RUNNER_TEMP/issue-57-issue.md" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          issue = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          body = issue.get("body") or ""
+          if len(body) > 12000:
+              body = body[:12000] + "\n（Issue本文が長いため、ここで省略しました）"
+          text = (
+              f"Issue #57: {issue.get('title', '')}\n"
+              f"作成者: {issue.get('user', {}).get('login', '')}\n\n"
+              + body
+              + "\n"
+          )
+          pathlib.Path(sys.argv[2]).write_text(text, encoding="utf-8")
+          print(f"Issue title: {issue.get('title', '')}")
+          print(f"Issue body chars: {len(body)}")
+          PY
+
+      - name: Implement plan A with Claude (pass 1)
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is missing"
+            exit 1
+          fi
+          umask 077
+          report="$RUNNER_TEMP/impl-report-1.md"
+          diagnostics="$RUNNER_TEMP/impl-claude-1-stderr.txt"
+          exit_code=0
+          {
+            cat <<'PROMPT'
+          tsumugi-app/tsumugi の Issue #57 を実装してください。これはコード変更を伴う実装タスクです。
+          まず下記の Issue 本文を仕様として確認してください。本文はこのタスクの範囲と受け入れ条件を示すものです。
+
+          既に分かっている原因: 人物の記憶を選ぶ段階で、最新の1件しか渡されていません。
+          決まっている方針は案Aです。人物との関係の変化を尋ねられた場合に、過去の重要な記録も選ぶようにしてください。
+
+          実装のルール:
+          - 変更できるのは src/ の中だけです。評価の物差しである src/lib/contextEvalWorld.ts、src/lib/contextEval.ts、src/lib/contextEval.test.ts は変更禁止です。
+          - change-yuki 専用の分岐、ケースIDやケース固有の文字列の直書きは禁止です。汎用的な仕組みにしてください。
+          - git コマンドは使えません。テストも実行できません（テストはワークフローが後で実行します）。
+          - 既存の選定の挙動を壊さないよう、影響範囲を最小にしてください。
+
+          最後に、日本語の Markdown で報告してください。変更したファイルと内容、設計判断、
+          受け入れ条件の各項目への対応、テストで確認してほしい観点、未確認事項を含めてください。
+          PROMPT
+            printf '\n--- Issue #57 title and body ---\n'
+            cat "$RUNNER_TEMP/issue-57-issue.md"
+          } | "$HOME/.local/bin/claude" -p --restricted --disable-slash-commands \
+            --tools Read Grep Glob Edit Write --allowedTools Read Grep Glob Edit Write \
+            --no-session-persistence --max-turns 60 > "$report" 2> "$diagnostics" || exit_code=$?
+
+          if (( exit_code != 0 )); then
+            if grep -Eiq 'unknown (option|argument)|unrecognized (option|argument)|requires an argument|too many arguments|usage: claude|input must be provided' "$report" "$diagnostics"; then
+              category=invalid-cli-arguments
+            elif grep -Eiq 'not logged in|please (run /login|log in)|invalid (api key|token)|invalid auth|invalid_credential|authentication.error|unauthorized|HTTP 401|(^|[^0-9])401([^0-9]|$)' "$report" "$diagnostics"; then
+              category=authentication
+            elif grep -Eiq 'permission.error|forbidden|HTTP 403|not authorized|not allowed to use|not available for' "$report" "$diagnostics"; then
+              category=access-denied
+            elif grep -Eiq 'rate.limit|overloaded|quota|usage limit|credit balance|billing|HTTP 429' "$report" "$diagnostics"; then
+              category=usage-limit-or-capacity
+            elif grep -Eiq 'could not connect|failed to connect|network error|timed out|ECONN|ENOTFOUND|certificate' "$report" "$diagnostics"; then
+              category=network
+            elif grep -Eiq 'max.turns|maximum (number of )?turns' "$report" "$diagnostics"; then
+              category=turn-limit
+            elif [[ ! -s "$report" && ! -s "$diagnostics" ]]; then
+              category=no-cli-output
+            else
+              category=unclassified-cli-error
+            fi
+            printf '::error::Claude Code failed (category=%s, exit=%d)\n' "$category" "$exit_code"
+            python3 - "$report" "$diagnostics" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          text = ""
+          for name in sys.argv[1:]:
+              try:
+                  text += pathlib.Path(name).read_text(errors="replace") + "\n"
+              except OSError:
+                  pass
+          secret = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+          if secret:
+              text = text.replace(secret, "[REDACTED]")
+          for pat, rep in (
+              (r"sk-ant-[A-Za-z0-9_\-]{8,}", "[REDACTED]"),
+              (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED]"),
+              (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED]"),
+              (r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "[REDACTED]"),
+              (r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer [REDACTED]"),
+              (r"(?i)authorization\s*[:=]\s*\S+", "Authorization: [REDACTED]"),
+              (r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)(\s*[:=]\s*)[^\s\"',}]+", r"\1\2[REDACTED]"),
+              (r"https?://[^\s\"'@]+@[^\s\"']+", "[REDACTED-URL]"),
+              (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED-EMAIL]"),
+          ):
+              text = re.sub(pat, rep, text)
+          tail = "\n".join(text.splitlines()[-25:])[-3000:]
+          print("----- sanitized Claude CLI output (tail) -----")
+          print(tail)
+          print("----- end sanitized output -----")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              try:
+                  with open(summary, "a", encoding="utf-8") as f:
+                      f.write("\n### Sanitized Claude CLI output (tail)\n\n```\n")
+                      f.write(tail)
+                      f.write("\n```\n")
+              except OSError:
+                  pass
+          PY
+            printf '1\n' > "$RUNNER_TEMP/impl-claude-failed"
+            echo "Claude pass 1 failed; continuing to result evaluation"
+            exit 0
+          fi
+
+          if [[ ! -s "$report" ]]; then
+            echo "::error::Claude Code returned an empty report"
+            printf '1\n' > "$RUNNER_TEMP/impl-claude-failed"
+            exit 0
+          fi
+
+          printf '0\n' > "$RUNNER_TEMP/impl-claude-failed"
+          cat "$report"
+
+      - name: Run tests (pass 1)
+        shell: bash
+        run: |
+          if [[ "$(cat "$RUNNER_TEMP/impl-claude-failed" 2>/dev/null)" == "1" ]]; then
+            echo "Claude failed; skipping tests"
+            : > "$RUNNER_TEMP/impl-tests-1.txt"
+            printf '1\n' > "$RUNNER_TEMP/impl-test-failed-1"
+            exit 0
+          fi
+
+          log="$RUNNER_TEMP/impl-tests-1.txt"
+          failed=0
+          for test in retrieval-person person-context memory-search context-eval; do
+            printf '\n$ npm run test:%s\n' "$test" >> "$log"
+            status=0
+            npm run "test:$test" >> "$log" 2>&1 || status=$?
+            printf '\nExit status: %s\n' "$status" >> "$log"
+            if (( status != 0 )); then
+              failed=1
+            fi
+          done
+          printf '%s\n' "$failed" > "$RUNNER_TEMP/impl-test-failed-1"
+          grep "change-yuki" "$log" > "$RUNNER_TEMP/impl-change-1.txt" || true
+          echo "tests failed flag: $failed"
+
+      - name: Fix with Claude (pass 2, only if tests failed)
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [[ "$(cat "$RUNNER_TEMP/impl-claude-failed" 2>/dev/null)" == "1" || "$(cat "$RUNNER_TEMP/impl-test-failed-1" 2>/dev/null)" != "1" ]]; then
+            echo "Fix pass not needed"
+            printf '0\n' > "$RUNNER_TEMP/impl-fix-ran"
+            exit 0
+          fi
+          printf '1\n' > "$RUNNER_TEMP/impl-fix-ran"
+          if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is missing"
+            printf '1\n' > "$RUNNER_TEMP/impl-claude-failed"
+            exit 0
+          fi
+          umask 077
+          report="$RUNNER_TEMP/impl-report-2.md"
+          diagnostics="$RUNNER_TEMP/impl-claude-2-stderr.txt"
+          exit_code=0
+          {
+            cat <<'PROMPT'
+          tsumugi-app/tsumugi の Issue #57 の実装を続けています。前回の実装でテストが落ちました。
+          下記の前回報告とテスト出力を見て、原因を直してください。仕様は前回と同じ Issue 本文のとおりです。
+
+          実装のルール（前回と同じ）:
+          - 変更できるのは src/ の中だけです。src/lib/contextEvalWorld.ts、src/lib/contextEval.ts、src/lib/contextEval.test.ts は変更禁止です。
+          - change-yuki 専用の分岐やケース固有の文字列の直書きは禁止です。
+          - git コマンドは使えません。テストも実行できません。
+
+          最後に、日本語の Markdown で、何を直したかと理由を報告してください。
+          PROMPT
+            printf '\n--- Issue #57 title and body ---\n'
+            cat "$RUNNER_TEMP/issue-57-issue.md"
+            printf '\n--- Previous implementation report ---\n'
+            head -c 6000 "$RUNNER_TEMP/impl-report-1.md"
+            printf '\n--- Failing test output (tail) ---\n'
+            tail -c 12000 "$RUNNER_TEMP/impl-tests-1.txt"
+          } | "$HOME/.local/bin/claude" -p --restricted --disable-slash-commands \
+            --tools Read Grep Glob Edit Write --allowedTools Read Grep Glob Edit Write \
+            --no-session-persistence --max-turns 40 > "$report" 2> "$diagnostics" || exit_code=$?
+
+          if (( exit_code != 0 )); then
+            if grep -Eiq 'unknown (option|argument)|unrecognized (option|argument)|requires an argument|too many arguments|usage: claude|input must be provided' "$report" "$diagnostics"; then
+              category=invalid-cli-arguments
+            elif grep -Eiq 'not logged in|please (run /login|log in)|invalid (api key|token)|invalid auth|invalid_credential|authentication.error|unauthorized|HTTP 401|(^|[^0-9])401([^0-9]|$)' "$report" "$diagnostics"; then
+              category=authentication
+            elif grep -Eiq 'permission.error|forbidden|HTTP 403|not authorized|not allowed to use|not available for' "$report" "$diagnostics"; then
+              category=access-denied
+            elif grep -Eiq 'rate.limit|overloaded|quota|usage limit|credit balance|billing|HTTP 429' "$report" "$diagnostics"; then
+              category=usage-limit-or-capacity
+            elif grep -Eiq 'could not connect|failed to connect|network error|timed out|ECONN|ENOTFOUND|certificate' "$report" "$diagnostics"; then
+              category=network
+            elif grep -Eiq 'max.turns|maximum (number of )?turns' "$report" "$diagnostics"; then
+              category=turn-limit
+            elif [[ ! -s "$report" && ! -s "$diagnostics" ]]; then
+              category=no-cli-output
+            else
+              category=unclassified-cli-error
+            fi
+            printf '::error::Claude Code failed (category=%s, exit=%d)\n' "$category" "$exit_code"
+            python3 - "$report" "$diagnostics" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          text = ""
+          for name in sys.argv[1:]:
+              try:
+                  text += pathlib.Path(name).read_text(errors="replace") + "\n"
+              except OSError:
+                  pass
+          secret = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+          if secret:
+              text = text.replace(secret, "[REDACTED]")
+          for pat, rep in (
+              (r"sk-ant-[A-Za-z0-9_\-]{8,}", "[REDACTED]"),
+              (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED]"),
+              (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED]"),
+              (r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "[REDACTED]"),
+              (r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer [REDACTED]"),
+              (r"(?i)authorization\s*[:=]\s*\S+", "Authorization: [REDACTED]"),
+              (r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)(\s*[:=]\s*)[^\s\"',}]+", r"\1\2[REDACTED]"),
+              (r"https?://[^\s\"'@]+@[^\s\"']+", "[REDACTED-URL]"),
+              (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED-EMAIL]"),
+          ):
+              text = re.sub(pat, rep, text)
+          tail = "\n".join(text.splitlines()[-25:])[-3000:]
+          print("----- sanitized Claude CLI output (tail) -----")
+          print(tail)
+          print("----- end sanitized output -----")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              try:
+                  with open(summary, "a", encoding="utf-8") as f:
+                      f.write("\n### Sanitized Claude CLI output (tail)\n\n```\n")
+                      f.write(tail)
+                      f.write("\n```\n")
+              except OSError:
+                  pass
+          PY
+            printf '1\n' > "$RUNNER_TEMP/impl-claude-failed"
+            echo "Claude pass 2 failed; continuing to result evaluation"
+            exit 0
+          fi
+
+          if [[ ! -s "$report" ]]; then
+            echo "::error::Claude Code returned an empty report"
+            printf '1\n' > "$RUNNER_TEMP/impl-claude-failed"
+            exit 0
+          fi
+          cat "$report"
+
+      - name: Run tests (pass 2)
+        shell: bash
+        run: |
+          if [[ "$(cat "$RUNNER_TEMP/impl-claude-failed" 2>/dev/null)" == "1" ]]; then
+            : > "$RUNNER_TEMP/impl-tests-2.txt"
+            printf '1\n' > "$RUNNER_TEMP/impl-test-failed-2"
+            exit 0
+          fi
+          if [[ "$(cat "$RUNNER_TEMP/impl-fix-ran" 2>/dev/null)" != "1" ]]; then
+            cp "$RUNNER_TEMP/impl-tests-1.txt" "$RUNNER_TEMP/impl-tests-2.txt"
+            cp "$RUNNER_TEMP/impl-test-failed-1" "$RUNNER_TEMP/impl-test-failed-2"
+            cp "$RUNNER_TEMP/impl-change-1.txt" "$RUNNER_TEMP/impl-change-2.txt" 2>/dev/null || true
+            echo "Fix pass did not run; reusing pass 1 results"
+            exit 0
+          fi
+
+          log="$RUNNER_TEMP/impl-tests-2.txt"
+          failed=0
+          for test in retrieval-person person-context memory-search context-eval; do
+            printf '\n$ npm run test:%s\n' "$test" >> "$log"
+            status=0
+            npm run "test:$test" >> "$log" 2>&1 || status=$?
+            printf '\nExit status: %s\n' "$status" >> "$log"
+            if (( status != 0 )); then
+              failed=1
+            fi
+          done
+          printf '%s\n' "$failed" > "$RUNNER_TEMP/impl-test-failed-2"
+          grep "change-yuki" "$log" > "$RUNNER_TEMP/impl-change-2.txt" || true
+          echo "tests failed flag: $failed"
+
+      - name: Check change scope
+        shell: bash
+        run: |
+          git status --porcelain > "$RUNNER_TEMP/impl-changed.txt"
+          cat "$RUNNER_TEMP/impl-changed.txt"
+          python3 - "$RUNNER_TEMP/impl-changed.txt" "$RUNNER_TEMP/impl-scope-failed" <<'PY'
+          import pathlib
+          import sys
+
+          changed = []
+          for line in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines():
+              pth = line[3:].strip()
+              if " -> " in pth:
+                  pth = pth.split(" -> ")[-1]
+              if pth:
+                  changed.append(pth)
+          banned = {"src/lib/contextEvalWorld.ts", "src/lib/contextEval.ts", "src/lib/contextEval.test.ts"}
+          violations = [x for x in changed if not x.startswith("src/") or x in banned]
+          pathlib.Path(sys.argv[2]).write_text("1" if (violations or not changed) else "0")
+          print("changed files:", changed)
+          print("violations:", violations)
+          PY
+
+      - name: Evaluate results
+        shell: bash
+        run: |
+          tests_failed="$(cat "$RUNNER_TEMP/impl-test-failed-2" 2>/dev/null || echo 1)"
+          scope_failed="$(cat "$RUNNER_TEMP/impl-scope-failed" 2>/dev/null || echo 1)"
+          claude_failed="$(cat "$RUNNER_TEMP/impl-claude-failed" 2>/dev/null || echo 0)"
+          echo "tests_failed=$tests_failed scope_failed=$scope_failed claude_failed=$claude_failed"
+          if [[ "$tests_failed" == "0" && "$scope_failed" == "0" && "$claude_failed" == "0" ]]; then
+            echo "IMPL_OK=1" >> "$GITHUB_ENV"
+          else
+            echo "IMPL_OK=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Post failure report to Issue 57
+        if: env.IMPL_OK == '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python3 - "$RUNNER_TEMP/impl-report-1.md" "$RUNNER_TEMP/impl-report-2.md" "$RUNNER_TEMP/impl-tests-2.txt" "$RUNNER_TEMP/impl-changed.txt" "$RUNNER_TEMP/issue-57-issue.md" "$RUNNER_TEMP/impl-failure-comment.md" "$(cat "$RUNNER_TEMP/impl-test-failed-2" 2>/dev/null || echo '?')" "$(cat "$RUNNER_TEMP/impl-scope-failed" 2>/dev/null || echo '?')" "$(cat "$RUNNER_TEMP/impl-claude-failed" 2>/dev/null || echo '?')" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          def read(q):
+              try:
+                  return pathlib.Path(q).read_text(errors="replace")
+              except OSError:
+                  return ""
+
+          report = read(sys.argv[2]) or read(sys.argv[1]) or "（Claudeの報告がありません）"
+          tests = read(sys.argv[3])
+          changed = read(sys.argv[4]).strip()
+          issue_lines = read(sys.argv[5]).splitlines()
+          title = ""
+          if issue_lines and issue_lines[0].startswith("Issue #57:"):
+              title = issue_lines[0].split(":", 1)[1].strip()
+          if len(report) > 20000:
+              report = report[:20000] + "\n（報告が長いため省略しました）"
+          tail = "\n".join(tests.splitlines()[-120:])[-12000:]
+          body = (
+              "## 【実装】Claude Code 実装報告（失敗のため、PRは作成しませんでした）\n\n"
+              + (f"対象Issue: #57 {title}\n" if title else "")
+              + f"テスト失敗: {sys.argv[7]} / 範囲チェック失敗: {sys.argv[8]} / Claude失敗: {sys.argv[9]}\n\n"
+              + "変更されたファイル:\n```\n" + (changed or "（なし）") + "\n```\n\n---\n\n"
+              + report
+              + "\n\n---\n\n<details>\n<summary>テスト出力（末尾）</summary>\n\n```\n"
+              + tail
+              + "\n```\n</details>\n"
+          )
+          data = body.encode()
+          token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").encode()
+          if (token and token in data) or re.search(rb"sk-ant-[A-Za-z0-9_-]{12,}", data):
+              print("::error::Comment blocked by credential check")
+              sys.exit(1)
+          pathlib.Path(sys.argv[6]).write_text(body, encoding="utf-8")
+          print(f"Failure comment bytes: {len(data)}")
+          PY
+          gh issue comment 57 --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/impl-failure-comment.md"
+          echo "::error::Implementation did not pass the gate; no PR was created"
+          exit 1
+
+      - name: Commit and push branch
+        if: env.IMPL_OK == '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$IMPL_BRANCH"
+          git add -A
+          git commit -m "Implement plan A for Issue #57 (change-yuki)"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "$IMPL_BRANCH"
+
+      - name: Create pull request
+        if: env.IMPL_OK == '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python3 - "$RUNNER_TEMP/impl-report-1.md" "$RUNNER_TEMP/impl-report-2.md" "$RUNNER_TEMP/impl-baseline-change.txt" "$RUNNER_TEMP/impl-change-2.txt" "$RUNNER_TEMP/impl-tests-2.txt" "$RUNNER_TEMP/impl-changed.txt" "$RUNNER_TEMP/impl-pr-body.md" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          def read(q):
+              try:
+                  return pathlib.Path(q).read_text(errors="replace")
+              except OSError:
+                  return ""
+
+          report = read(sys.argv[2]) or read(sys.argv[1]) or "（Claudeの報告がありません）"
+          if len(report) > 25000:
+              report = report[:25000] + "\n（報告が長いため省略しました）"
+          baseline = read(sys.argv[3]).strip() or "（記録なし）"
+          after = read(sys.argv[4]).strip() or "（記録なし）"
+          tail = "\n".join(read(sys.argv[5]).splitlines()[-100:])[-8000:]
+          changed = read(sys.argv[6]).strip() or "（なし）"
+          body = (
+              "## Issue #57 の実装（案A）\n\n"
+              "このPRは実装用ワークフローが自動作成しました。マージは akahane の承認後に行ってください。\n\n"
+              "Closes #57\n\n---\n\n"
+              + report
+              + "\n\n---\n\n### 評価（change-yuki、test:context-eval の CI-REPORT 行）\n\n変更前:\n```\n"
+              + baseline
+              + "\n```\n\n変更後:\n```\n"
+              + after
+              + "\n```\n\n### 変更ファイル\n```\n"
+              + changed
+              + "\n```\n\n<details>\n<summary>テスト出力（末尾）</summary>\n\n```\n"
+              + tail
+              + "\n```\n</details>\n"
+          )
+          data = body.encode()
+          token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").encode()
+          if (token and token in data) or re.search(rb"sk-ant-[A-Za-z0-9_-]{12,}", data):
+              print("::error::PR body blocked by credential check")
+              sys.exit(1)
+          pathlib.Path(sys.argv[7]).write_text(body, encoding="utf-8")
+          print(f"PR body bytes: {len(data)}")
+          PY
+          gh pr create --title "Issue #57: 案Aを実装（change-yuki）" --body-file "$RUNNER_TEMP/impl-pr-body.md" --base main --head "$IMPL_BRANCH" | tee "$RUNNER_TEMP/impl-pr-url.txt"
+
+      - name: Post implementation report to Issue 57
+        if: env.IMPL_OK == '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python3 - "$RUNNER_TEMP/impl-report-1.md" "$RUNNER_TEMP/impl-report-2.md" "$RUNNER_TEMP/impl-baseline-change.txt" "$RUNNER_TEMP/impl-change-2.txt" "$RUNNER_TEMP/impl-tests-2.txt" "$RUNNER_TEMP/impl-changed.txt" "$RUNNER_TEMP/issue-57-issue.md" "$RUNNER_TEMP/impl-pr-url.txt" "$GITHUB_SHA" "$RUNNER_TEMP/impl-comment.md" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          def read(q):
+              try:
+                  return pathlib.Path(q).read_text(errors="replace")
+              except OSError:
+                  return ""
+
+          report = read(sys.argv[2]) or read(sys.argv[1]) or "（Claudeの報告がありません）"
+          if len(report) > 25000:
+              report = report[:25000] + "\n（報告が長いため省略しました）"
+          baseline = read(sys.argv[3]).strip() or "（記録なし）"
+          after = read(sys.argv[4]).strip() or "（記録なし）"
+          tail = "\n".join(read(sys.argv[5]).splitlines()[-100:])[-8000:]
+          changed = read(sys.argv[6]).strip() or "（なし）"
+          issue_lines = read(sys.argv[7]).splitlines()
+          title = ""
+          if issue_lines and issue_lines[0].startswith("Issue #57:"):
+              title = issue_lines[0].split(":", 1)[1].strip()
+          pr_lines = [ln for ln in read(sys.argv[8]).splitlines() if ln.startswith("http")]
+          pr_url = pr_lines[-1] if pr_lines else ""
+          body = (
+              "## 【実装】Claude Code 実装報告（ワークフロー自動投稿）\n\n"
+              + f"対象コミット（main）: {sys.argv[9]}\n"
+              + (f"対象Issue: #57 {title}\n" if title else "")
+              + (f"PR: {pr_url}\n" if pr_url else "")
+              + "ブランチで実装し、PRを作成しました。マージは akahane の承認後です。\n\n---\n\n"
+              + report
+              + "\n\n---\n\n### 評価（change-yuki、test:context-eval の CI-REPORT 行）\n\n変更前:\n```\n"
+              + baseline
+              + "\n```\n\n変更後:\n```\n"
+              + after
+              + "\n```\n\n### 変更ファイル\n```\n"
+              + changed
+              + "\n```\n\n<details>\n<summary>テスト出力（末尾）</summary>\n\n```\n"
+              + tail
+              + "\n```\n</details>\n"
+          )
+          data = body.encode()
+          token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").encode()
+          if (token and token in data) or re.search(rb"sk-ant-[A-Za-z0-9_-]{12,}", data):
+              print("::error::Comment blocked by credential check")
+              sys.exit(1)
+          pathlib.Path(sys.argv[10]).write_text(body, encoding="utf-8")
+          print(f"Comment bytes: {len(data)}")
+          PY
+          gh issue comment 57 --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/impl-comment.md"
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            printf '## Claude Implement (Issue 57)\n\n'
+            printf 'IMPL_OK=%s\n\n' "${IMPL_OK:-unknown}"
+            for f in "$RUNNER_TEMP/impl-report-2.md" "$RUNNER_TEMP/impl-report-1.md"; do
+              if [[ -s "$f" ]]; then cat "$f"; break; fi
+            done
+            printf '\n### change-yuki before\n\n'
+            cat "$RUNNER_TEMP/impl-baseline-change.txt" 2>/dev/null || true
+            printf '\n### change-yuki after\n\n'
+            cat "$RUNNER_TEMP/impl-change-2.txt" 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
