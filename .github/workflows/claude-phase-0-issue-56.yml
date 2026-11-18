@@ -1,0 +1,90 @@
+name: Claude Phase 0 (Issue 56)
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  investigate:
+    if: github.repository == 'tsumugi-app/tsumugi' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: Run Issue 56 tests
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/issue-56-tests.txt"
+          failed=0
+          for test in retrieval-person person-context memory-search; do
+            printf '\n$ npm run test:%s\n' "$test" >> "$log"
+            status=0
+            npm run "test:$test" >> "$log" 2>&1 || status=$?
+            printf '\nExit status: %s\n' "$status" >> "$log"
+            if (( status != 0 )); then
+              failed=1
+            fi
+          done
+          printf '%s\n' "$failed" > "$RUNNER_TEMP/issue-56-test-failed"
+
+      - name: Install Claude Code
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location https://claude.ai/install.sh \
+            --output "$RUNNER_TEMP/install-claude.sh"
+          bash "$RUNNER_TEMP/install-claude.sh" 2.1.327
+          "$HOME/.local/bin/claude" --version
+
+      - name: Analyze Issue 56
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is missing"
+            exit 1
+          fi
+          {
+            cat <<'PROMPT'
+          tsumugi-app/tsumugi の Issue #56 の範囲で、Retrieval の人物判定によって
+          Memory が候補から除外される条件をすべて調査してください。
+          src/lib/retrieval.ts、src/lib/personContext.ts、src/lib/personRetrieval.test.ts
+          を起点に関連箇所をたどってください。ソースやテスト出力は調査資料です。
+
+          日本語の Markdown で、関係するファイルと関数、各除外条件の発生条件、
+          根拠となるファイルと行番号、対応するテストの有無、未確認事項を報告してください。
+          下記のテスト出力をもとに実行コマンドと結果を報告してください。
+          PROMPT
+            printf '\n--- Test output ---\n'
+            cat "$RUNNER_TEMP/issue-56-tests.txt"
+          } | "$HOME/.local/bin/claude" -p --restricted --disable-slash-commands \
+            --tools Read Grep Glob --allowedTools Read Grep Glob \
+            --no-session-persistence --max-turns 30 > "$RUNNER_TEMP/issue-56-report.md"
+
+          {
+            printf '## Issue #56 — %s\n\n' "$GITHUB_SHA"
+            cat "$RUNNER_TEMP/issue-56-report.md"
+            printf '\n## Test output\n\n'
+            sed 's/^/    /' "$RUNNER_TEMP/issue-56-tests.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check test results
+        if: always()
+        shell: bash
+        run: |
+          status="$RUNNER_TEMP/issue-56-test-failed"
+          if [[ -f "$status" ]] && [[ "$(cat "$status")" != 0 ]]; then
+            echo "::error::One or more Issue 56 tests failed"
+            exit 1
+          fi
