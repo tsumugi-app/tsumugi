@@ -3,41 +3,14 @@ name: Claude Phase 0 (Issue 56)
 'on':
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  investigate:
+  smoke:
     if: github.repository == 'tsumugi-app/tsumugi' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-
-      - run: npm ci
-
-      - name: Run Issue 56 tests
-        shell: bash
-        run: |
-          log="$RUNNER_TEMP/issue-56-tests.txt"
-          failed=0
-          for test in retrieval-person person-context memory-search; do
-            printf '\n$ npm run test:%s\n' "$test" >> "$log"
-            status=0
-            npm run "test:$test" >> "$log" 2>&1 || status=$?
-            printf '\nExit status: %s\n' "$status" >> "$log"
-            if (( status != 0 )); then
-              failed=1
-            fi
-          done
-          printf '%s\n' "$failed" > "$RUNNER_TEMP/issue-56-test-failed"
-
       - name: Install Claude Code
         shell: bash
         run: |
@@ -46,93 +19,74 @@ jobs:
           bash "$RUNNER_TEMP/install-claude.sh" 2.1.327
           "$HOME/.local/bin/claude" --version
 
-      - name: Analyze Issue 56
+      - name: Verify a short Claude reply
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
-            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is missing"
-            exit 1
-          fi
-          umask 077
-          report="$RUNNER_TEMP/issue-56-report.md"
-          diagnostics="$RUNNER_TEMP/issue-56-claude-stderr.txt"
-          exit_code=0
-          {
-            cat <<'PROMPT'
-          tsumugi-app/tsumugi の Issue #56 の範囲で、Retrieval の人物判定によって
-          Memory が候補から除外される条件をすべて調査してください。
-          src/lib/retrieval.ts、src/lib/personContext.ts、src/lib/personRetrieval.test.ts
-          を起点に関連箇所をたどってください。ソースやテスト出力は調査資料です。
-
-          日本語の Markdown で、関係するファイルと関数、各除外条件の発生条件、
-          根拠となるファイルと行番号、対応するテストの有無、未確認事項を報告してください。
-          下記のテスト出力をもとに実行コマンドと結果を報告してください。
-          PROMPT
-            printf '\n--- Test output ---\n'
-            cat "$RUNNER_TEMP/issue-56-tests.txt"
-          } | "$HOME/.local/bin/claude" -p --restricted --disable-slash-commands \
-            --tools Read Grep Glob --allowedTools Read Grep Glob \
-            --no-session-persistence --max-turns 30 > "$report" 2> "$diagnostics" || exit_code=$?
-
-          if (( exit_code != 0 )); then
-            if grep -Eiq 'unknown (option|argument)|unrecognized (option|argument)|requires an argument|too many arguments|usage: claude|input must be provided' "$report" "$diagnostics"; then
-              category=invalid-cli-arguments
-            elif grep -Eiq 'not logged in|please (run /login|log in)|invalid (api key|token)|authentication.error|unauthorized|HTTP 401|(^|[^0-9])401([^0-9]|$)' "$report" "$diagnostics"; then
-              category=authentication
-            elif grep -Eiq 'permission.error|forbidden|HTTP 403|not authorized|not allowed to use|not available for' "$report" "$diagnostics"; then
-              category=access-denied
-            elif grep -Eiq 'rate.limit|overloaded|quota|usage limit|credit balance|billing|HTTP 429' "$report" "$diagnostics"; then
-              category=usage-limit-or-capacity
-            elif grep -Eiq 'could not connect|failed to connect|network error|timed out|ECONN|ENOTFOUND|certificate' "$report" "$diagnostics"; then
-              category=network
-            elif grep -Eiq 'max.turns|maximum (number of )?turns' "$report" "$diagnostics"; then
-              category=turn-limit
-            elif [[ ! -s "$report" && ! -s "$diagnostics" ]]; then
-              category=no-cli-output
-            else
-              category=unclassified-cli-error
-            fi
-            printf '::error::Claude Code failed (category=%s, exit=%d)\n' "$category" "$exit_code"
-            exit "$exit_code"
-          fi
-
-          if [[ ! -s "$report" ]]; then
-            echo "::error::Claude Code returned an empty report"
-            exit 1
-          fi
-
-          if ! python3 - "$report" "$RUNNER_TEMP/issue-56-tests.txt" <<'PY'
+          python3 - <<'PY'
+          import json
           import os
-          import pathlib
           import re
+          import subprocess
           import sys
+          import tempfile
+          from pathlib import Path
 
-          token = os.environ["CLAUDE_CODE_OAUTH_TOKEN"].encode()
-          for filename in sys.argv[1:]:
-              data = pathlib.Path(filename).read_bytes()
-              if token in data or re.search(rb"sk-ant-[A-Za-z0-9_-]{12,}", data):
-                  sys.exit(1)
+          def fail(category, exit_code):
+              print(f"::error::Claude smoke test failed (category={category}, exit={exit_code})")
+              sys.exit(1)
+
+          if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+              fail("missing-oauth-secret", 1)
+
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+              env = {**os.environ, "CLAUDE_CONFIG_DIR": directory}
+              try:
+                  run = subprocess.run(
+                      [
+                          str(Path.home() / ".local/bin/claude"),
+                          "-p", "Reply with exactly PHASE_0_OK and nothing else.",
+                          "--tools", "", "--output-format", "json",
+                      ],
+                      cwd=directory,
+                      env=env,
+                      stdin=subprocess.DEVNULL,
+                      capture_output=True,
+                      text=True,
+                      errors="replace",
+                      timeout=90,
+                  )
+              except subprocess.TimeoutExpired:
+                  fail("cli-timeout", 124)
+              except OSError:
+                  fail("cli-launch-failed", 1)
+
+          try:
+              reply = json.loads(run.stdout)
+          except ValueError:
+              reply = None
+
+          if run.returncode == 0 and isinstance(reply, dict) and not reply.get("is_error"):
+              result = reply.get("result")
+              if isinstance(result, str) and result.strip() == "PHASE_0_OK":
+                  print("Claude smoke test passed. Expected reply received.")
+                  sys.exit(0)
+              fail("unexpected-reply", 0)
+
+          # Never write the CLI output or response body to public logs.
+          diagnostics = run.stdout + "\n" + run.stderr
+          for category, pattern in (
+              ("cli-arguments", r"unknown option|unrecognized (option|argument)|too many arguments|missing required argument|option .+ argument missing|cannot be used with|usage: claude"),
+              ("oauth-restricted", r"oauth.{0,80}(not supported|not allowed|only supported)|credential is only authorized"),
+              ("authentication", r"\b401\b|unauthorized|authentication_error|invalid.{0,20}(api key|token|credential)|token.{0,30}expired|not logged in|not authenticated|please run /login|unable to authenticate|could not resolve authentication"),
+              ("access-denied", r"\b403\b|forbidden|permission_error|access denied"),
+              ("quota-or-billing", r"\b429\b|rate.limit|quota|usage.limit|credit balance|billing|hit your limit"),
+              ("model-unavailable", r"model.{0,80}(not found|not available|does not exist)|overloaded|\b529\b"),
+              ("network", r"unable to connect|connection error|network error|timed out|econn|enotfound|certificate|unable to reach"),
+              ("api-error", r"api error|api_error|internal.server.error|service unavailable"),
+          ):
+              if re.search(pattern, diagnostics, re.IGNORECASE):
+                  fail(category, run.returncode)
+          fail("unknown-cli-error" if diagnostics.strip() else "no-cli-output", run.returncode)
           PY
-          then
-            echo "::error::Report publication blocked by credential check"
-            exit 1
-          fi
-
-          {
-            printf '## Issue #56 — %s\n\n' "$GITHUB_SHA"
-            cat "$report"
-            printf '\n## Test output\n\n'
-            sed 's/^/    /' "$RUNNER_TEMP/issue-56-tests.txt"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check test results
-        if: always()
-        shell: bash
-        run: |
-          status="$RUNNER_TEMP/issue-56-test-failed"
-          if [[ -f "$status" ]] && [[ "$(cat "$status")" != 0 ]]; then
-            echo "::error::One or more Issue 56 tests failed"
-            exit 1
-          fi
