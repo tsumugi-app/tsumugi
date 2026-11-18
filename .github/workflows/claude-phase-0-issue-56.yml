@@ -35,6 +35,13 @@ jobs:
 
           def fail(category, exit_code):
               print(f"::error::Claude smoke test failed (category={category}, exit={exit_code})")
+              _summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if _summary:
+                  try:
+                      with open(_summary, "a", encoding="utf-8") as _f:
+                          _f.write(f"\nClaude smoke test failed: category={category}, exit={exit_code}\n")
+                  except OSError:
+                      pass
               sys.exit(1)
 
           if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
@@ -74,8 +81,41 @@ jobs:
                   sys.exit(0)
               fail("unexpected-reply", 0)
 
-          # Never write the CLI output or response body to public logs.
+          # Diagnostic output (approved by the owner on 2026-11-18):
+          # print only a sanitized tail of the CLI output. The exact OAuth
+          # token value, common token formats, authorization values,
+          # credential-bearing URLs and email addresses are removed first,
+          # and the output is limited to the last 25 lines / 3000 characters.
           diagnostics = run.stdout + "\n" + run.stderr
+          _diag = diagnostics
+          _secret = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+          if _secret:
+              _diag = _diag.replace(_secret, "[REDACTED]")
+          for _pat, _rep in (
+              (r"sk-ant-[A-Za-z0-9_\-]{8,}", "[REDACTED]"),
+              (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED]"),
+              (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED]"),
+              (r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "[REDACTED]"),
+              (r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer [REDACTED]"),
+              (r"(?i)authorization\s*[:=]\s*\S+", "Authorization: [REDACTED]"),
+              (r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)(\s*[:=]\s*)[^\s\"',}]+", r"\1\2[REDACTED]"),
+              (r"https?://[^\s\"'@]+@[^\s\"']+", "[REDACTED-URL]"),
+              (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[REDACTED-EMAIL]"),
+          ):
+              _diag = re.sub(_pat, _rep, _diag)
+          _sanitized = "\n".join(_diag.splitlines()[-25:])[-3000:]
+          print("----- sanitized Claude CLI output (tail) -----")
+          print(_sanitized)
+          print("----- end sanitized output -----")
+          _summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if _summary:
+              try:
+                  with open(_summary, "a", encoding="utf-8") as _f:
+                      _f.write("\n### Sanitized Claude CLI output (tail)\n\n```\n")
+                      _f.write(_sanitized)
+                      _f.write("\n```\n")
+              except OSError:
+                  pass
           for category, pattern in (
               ("cli-arguments", r"unknown option|unrecognized (option|argument)|too many arguments|missing required argument|option .+ argument missing|cannot be used with|usage: claude"),
               ("oauth-restricted", r"oauth.{0,80}(not supported|not allowed|only supported)|credential is only authorized"),
