@@ -31,7 +31,7 @@ import type { MemoryObject, Persona, RetrievedMemory } from "./types";
 import { limitMemoryQuotes, memoryContextOf } from "./memoryContext";
 import type { ReflectionTrace } from "./chatContextProvenance";
 import { isTopicKeyword, matchRecallTopic, recallTopicOf, withPoolEvidence, type RecallTopic } from "./recallQuestion";
-import { adjustForPurpose, purposeContextOf, recordTraitOf, type PurposeContext } from "./recordRelevance";
+import { adjustForPurpose, asksChange, isRecallOnlyRecord, purposeContextOf, recordTraitOf, type PurposeContext } from "./recordRelevance";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
 export const KEYWORD_WEIGHT = 3;
@@ -713,6 +713,17 @@ export function selectConversationDirectMatches(
 // ---------------------------------------------------------------------------
 export const PERSON_EXTRA_LIMIT = 2;
 export const FEELING_MAX_AGE_DAYS = 180;
+/** 人物との関係の変化を尋ねるターンに足す、変化を説明する記録の上限（変化の前の記録・変化の記録） */
+export const PERSON_ARC_LIMIT = 2;
+/** その記録を探す範囲：この日数以内の、その人物の新しい記録から最大PERSON_ARC_SCAN_LIMIT件 */
+export const PERSON_ARC_MAX_AGE_DAYS = 365;
+export const PERSON_ARC_SCAN_LIMIT = 60;
+/**
+ * 関係の変化を説明する記録の言い回し（質問の目的「変化」の判定 RECORD_SAYS.change と同じ語。「前は」は文や句の始まりのときだけ。「この前は」「名前は」「午前は」は除く）。
+ * STATE_CHANGEは、関係の言葉が無くても変化の記録にしてよい、できること・状態の変化（「話せるようになった」「以前は」）だけ
+ */
+const ARC_CHANGE = /ようになっ|変わ|以前は|(?<![一-鿿々ぁ-んァ-ヶー])前は|ことにし|にした|やめ|始め/;
+const STATE_CHANGE = /ようになっ|以前は|(?<![一-鿿々ぁ-んァ-ヶー])前は/;
 const DAY_MS_RETRIEVAL = 86_400_000;
 
 export const normalizeTwoPeople = (text: string) => text.replace(/2人|２人/g, "二人");
@@ -797,6 +808,8 @@ export interface PersonAwareSelection {
   /** このターンの人物（無ければnull＝従来の選定そのまま） */
   person: { key: string; how: "named" | "carried" } | null;
   added: string[];
+  /** 関係の変化を尋ねるターンに足した、変化を説明する記録（変化の前・変化。古い順） */
+  arc: string[];
   dropped: string[];
   feeling: string | null;
 }
@@ -820,6 +833,7 @@ export function selectConversationWithPersons(
     memories: selectConversationDirectMatches(pool, trimmed, recentUserTurnsTexts, keywordFrequency, limit, recall, purpose).kept.map((entry) => entry.memory),
     person: null,
     added: [],
+    arc: [],
     dropped: [],
     feeling: null,
   });
@@ -885,10 +899,38 @@ export function selectConversationWithPersons(
   const extra = added.slice(0, PERSON_EXTRA_LIMIT);
   for (const memory of extra) included.add(memory.id);
 
+  const relationshipTalk = isRelationshipTalk(trimmed, turns.length >= 2 ? turns[turns.length - 2] : undefined);
+  // 人物との関係・気持ちの変化を尋ねる（語る）ターンだけ（「ゆうきさんへの気持ちって、どう変わってきた？」。関係の言葉は今の発言に要る：
+  // 「髪型を変えた」のような関係の言葉が無い変化、前の発言の関係の言葉だけでは足さない）：最新の記録だけでは変化が分からないので、
+  // その変化を説明する本人の記録を最大PERSON_ARC_LIMIT件足す。
+  //   - 変化の記録：関係・気持ちの言葉と変化の言い回しがある記録 → できること・状態の変化（「話せるようになった」「以前は」）の記録。それぞれ新しい順。
+  //     既に選ばれている記録でもよい（そのときは足さずに、変化の時点として使う）。「夕食はカレーにした」のような関係の言葉が無い決めごとは使わない
+  //   - 変化の前の記録：それより前の、本人の言葉がある記録。気持ち・関係の言葉がある中で変化にいちばん近いもの、無ければ最も古いもの
+  // AIの振り返り・尋ねただけの記録・別の人物も関わる記録は使わない。範囲はPERSON_ARC_MAX_AGE_DAYS以内の新しい順PERSON_ARC_SCAN_LIMIT件
+  const arc: MemoryObject[] = [];
+  if (isRelationshipTalk(trimmed) && asksChange(latest)) {
+    const hasOwnWords = (memory: MemoryObject) => (memory.evidenceQuotes ?? []).some((quote) => typeof quote === "string" && quote.trim().length > 0);
+    const ownText = (memory: MemoryObject) => nfkcCompact([...(memory.evidenceQuotes ?? []).filter((quote) => typeof quote === "string"), memory.summary ?? ""].join("。"));
+    const own = pool
+      .filter((memory) => isAboutTarget(memory) && !aboutOther(memory) && !isReflectionMemory(memory) && !isRecallOnlyRecord(memory) && hasOwnWords(memory))
+      .filter((memory) => now - memoryTime(memory) <= PERSON_ARC_MAX_AGE_DAYS * DAY_MS_RETRIEVAL)
+      .sort((a, b) => memoryTime(b) - memoryTime(a))
+      .slice(0, PERSON_ARC_SCAN_LIMIT);
+    const cue = (memory: MemoryObject) => isFeelingRecord(memory) || relationCueIn(ownText(memory));
+    const change = own.find((memory) => ARC_CHANGE.test(ownText(memory)) && relationCueIn(ownText(memory))) ?? own.find((memory) => STATE_CHANGE.test(ownText(memory)));
+    const changeAt = change ? memoryTime(change) : Math.min(...own.filter((memory) => included.has(memory.id)).map(memoryTime), Infinity);
+    const before = own.filter((memory) => memory !== change && !included.has(memory.id) && memoryTime(memory) < changeAt);
+    const start = before.find(cue) ?? before[before.length - 1];
+    for (const memory of [start, change]) if (memory && !included.has(memory.id) && arc.length < PERSON_ARC_LIMIT) arc.push(memory);
+    arc.sort((a, b) => memoryTime(a) - memoryTime(b));
+    for (const memory of arc) included.add(memory.id);
+  }
+
   let feeling: MemoryObject | undefined;
-  if (isRelationshipTalk(trimmed, turns.length >= 2 ? turns[turns.length - 2] : undefined)) {
+  if (relationshipTalk) {
     const eligible = pool
-      .filter((memory) => isAboutTarget(memory) && isFeelingRecord(memory) && !aboutOther(memory))
+      // AIの振り返りは本人の気持ちの記録の代わりにしない（本人の言葉より先に立てない）
+      .filter((memory) => isAboutTarget(memory) && isFeelingRecord(memory) && !aboutOther(memory) && !isReflectionMemory(memory))
       .filter((memory) => now - memoryTime(memory) <= FEELING_MAX_AGE_DAYS * DAY_MS_RETRIEVAL);
     const matched = eligible
       .filter((memory) => !included.has(memory.id))
@@ -916,9 +958,10 @@ export function selectConversationWithPersons(
   }
 
   return {
-    memories: [...kept, ...extra, ...(feeling ? [feeling] : [])],
+    memories: [...kept, ...extra, ...arc, ...(feeling ? [feeling] : [])],
     person,
     added: extra.map((memory) => memory.id),
+    arc: arc.map((memory) => memory.id),
     dropped,
     feeling: feeling?.id ?? null,
   };
