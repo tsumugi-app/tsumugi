@@ -55,6 +55,10 @@ jobs:
             echo "::error::CLAUDE_CODE_OAUTH_TOKEN is missing"
             exit 1
           fi
+          umask 077
+          report="$RUNNER_TEMP/issue-56-report.md"
+          diagnostics="$RUNNER_TEMP/issue-56-claude-stderr.txt"
+          exit_code=0
           {
             cat <<'PROMPT'
           tsumugi-app/tsumugi の Issue #56 の範囲で、Retrieval の人物判定によって
@@ -70,11 +74,55 @@ jobs:
             cat "$RUNNER_TEMP/issue-56-tests.txt"
           } | "$HOME/.local/bin/claude" -p --restricted --disable-slash-commands \
             --tools Read Grep Glob --allowedTools Read Grep Glob \
-            --no-session-persistence --max-turns 30 > "$RUNNER_TEMP/issue-56-report.md"
+            --no-session-persistence --max-turns 30 > "$report" 2> "$diagnostics" || exit_code=$?
+
+          if (( exit_code != 0 )); then
+            if grep -Eiq 'unknown (option|argument)|unrecognized (option|argument)|requires an argument|too many arguments|usage: claude|input must be provided' "$report" "$diagnostics"; then
+              category=invalid-cli-arguments
+            elif grep -Eiq 'not logged in|please (run /login|log in)|invalid (api key|token)|authentication.error|unauthorized|HTTP 401|(^|[^0-9])401([^0-9]|$)' "$report" "$diagnostics"; then
+              category=authentication
+            elif grep -Eiq 'permission.error|forbidden|HTTP 403|not authorized|not allowed to use|not available for' "$report" "$diagnostics"; then
+              category=access-denied
+            elif grep -Eiq 'rate.limit|overloaded|quota|usage limit|credit balance|billing|HTTP 429' "$report" "$diagnostics"; then
+              category=usage-limit-or-capacity
+            elif grep -Eiq 'could not connect|failed to connect|network error|timed out|ECONN|ENOTFOUND|certificate' "$report" "$diagnostics"; then
+              category=network
+            elif grep -Eiq 'max.turns|maximum (number of )?turns' "$report" "$diagnostics"; then
+              category=turn-limit
+            elif [[ ! -s "$report" && ! -s "$diagnostics" ]]; then
+              category=no-cli-output
+            else
+              category=unclassified-cli-error
+            fi
+            printf '::error::Claude Code failed (category=%s, exit=%d)\n' "$category" "$exit_code"
+            exit "$exit_code"
+          fi
+
+          if [[ ! -s "$report" ]]; then
+            echo "::error::Claude Code returned an empty report"
+            exit 1
+          fi
+
+          if ! python3 - "$report" "$RUNNER_TEMP/issue-56-tests.txt" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          token = os.environ["CLAUDE_CODE_OAUTH_TOKEN"].encode()
+          for filename in sys.argv[1:]:
+              data = pathlib.Path(filename).read_bytes()
+              if token in data or re.search(rb"sk-ant-[A-Za-z0-9_-]{12,}", data):
+                  sys.exit(1)
+          PY
+          then
+            echo "::error::Report publication blocked by credential check"
+            exit 1
+          fi
 
           {
             printf '## Issue #56 — %s\n\n' "$GITHUB_SHA"
-            cat "$RUNNER_TEMP/issue-56-report.md"
+            cat "$report"
             printf '\n## Test output\n\n'
             sed 's/^/    /' "$RUNNER_TEMP/issue-56-tests.txt"
           } >> "$GITHUB_STEP_SUMMARY"
