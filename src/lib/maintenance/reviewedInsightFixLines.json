@@ -1,0 +1,6 @@
+{
+"note": "Reviewed (insight fix, owner approval 2026-11-20): the chat route record-mode block gains exactly one bullet. When the user asks for organisation AND a view of the stage/change, the request is treated as record + conversation: the view is returned inside the conversation, framed as a hypothesis, and the recorded content itself stays free of views/speculation. Wording verified unchanged from the 198-call 3-arm comparison (insight axis: scenario s3 +3.0, fatal errors 0, record-control violations 0, no OFF impact). Exact added line of the chat route only (never a pattern).",
+"lines": [
+"+- 整理とあわせて「どういう段階に来ているんだろう」「どう変わってきたと思う」など、段階や変化についての見方も求めている場合は、記録と会話の両方を求めているものとして扱う。この場合は記録本文だけを唯一の出力とせず、会話の中で経緯に触れ、見方を仮説として分かる形で返す（記録として残す内容そのものには、見解や推測を混ぜない）。"
+]
+}

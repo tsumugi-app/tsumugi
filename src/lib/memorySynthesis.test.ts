@@ -203,3 +203,11 @@ test("chat section: empty without themes; state, latest statement and history ar
   const forged = sanitizeSynthesisContext([{ theme: "車", state: { status: "実施済み" }, timeline: [{ memoryId: "m", statedAt: "2026-09-19", summary: "部品待ち", stateBasis: false }], items: [] }]);
   assert.equal(forged[0].state.status, "不明", "a state is accepted only with the timeline point it comes from");
 });
+
+test("chat section usage notes: the last prohibition is followed by the insight-fix bullet (a short view of the stage/change may be added, framed as a hypothesis; verified wording)", () => {
+  const move = selectTimelineForTurn(userC, { userText: "引っ越してから通勤が楽", retrievedMemoryIds: [] });
+  const section = buildSynthesisSection(sanitizeSynthesisContext(JSON.parse(JSON.stringify(move))));
+  const prohibition = "- 記録に無い動機・目的・心理を付け足さない。性格や心理のラベル（「〜な人」「〜を求めている」「心を守る」等）を付けない。";
+  const insightFix = "- 経緯を並べるだけで終えず、今の発言と関係する範囲で、段階や変化についての見方を短く添えてよい。見方は仮説として分かる形で述べ、事実として断定しない。";
+  assert.ok(section.includes(prohibition + "\n" + insightFix), section);
+});
