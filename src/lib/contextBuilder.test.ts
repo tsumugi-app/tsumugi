@@ -396,7 +396,7 @@ test("12 review: a pointer or a time word is not a topic; a statement (not a que
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// P1-H 段階2-A：完全な重複の削減（contextDedupe.ts、機能フラグ既定OFF）。架空のデータだけ
+// P1-H 段階2-A：完全な重複の削減（contextDedupe.ts、正式採用・既定ON。`?contextDedupe=0` で一時的にOFF）。架空のデータだけ
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 const dd = require(path.join(ROOT, "lib/contextDedupe.js")) as typeof import("./contextDedupe");
@@ -581,14 +581,14 @@ test("15 the eight survey cases with the flag ON: the real prompt keeps every ne
   report(rows);
 });
 
-test("16 the flag: default OFF, the request gains a field only when ON, the server decides with the same function, no extra AI call", async () => {
+test("16 the flag: default ON (adopted), the request gains a field unless ?contextDedupe=0, the server decides with the same function, no extra AI call", async () => {
   const screen = fs.readFileSync(path.join(ROOT, "../src/components/ChatScreen.tsx"), "utf8");
   const fetchAt = screen.indexOf('const res = await fetch("/api/chat"');
   const body = screen.slice(fetchAt, screen.indexOf("if (!res.ok || !res.body)", fetchAt));
   assert.ok(body.includes("...chatContextRequestFields(assembled, { generationId, contextDedupe: contextDedupeOn }),"), "the request's context fields (E1: lib/chatContextAssembly.ts)");
   assert.ok(fs.readFileSync(path.join(ROOT, "../src/lib/chatContextAssembly.ts"), "utf8").includes("...(opts.contextDedupe ? { contextDedupe: true } : {}),"), "OFF adds nothing to the request");
   const flag = fs.readFileSync(path.join(ROOT, "../src/lib/contextDedupeFlag.ts"), "utf8");
-  assert.ok(flag.includes('.get("contextDedupe") === "1"') && !/getItem|setItem/.test(flag.replace(/^\s*(?:\*|\/\/|\/\*\*).*$/gm, "")), "on only with ?contextDedupe=1 in the URL; nothing read from storage (contextDedupeFlag.test.ts)");
+  assert.ok(flag.includes('.get("contextDedupe") !== "0"') && !/getItem|setItem/.test(flag.replace(/^\s*(?:\*|\/\/|\/\*\*).*$/gm, "")), "off only with ?contextDedupe=0 in the URL; nothing read from storage (contextDedupeFlag.test.ts)");
   const route = fs.readFileSync(path.join(ROOT, "../src/app/api/chat/route.ts"), "utf8");
   assert.ok(route.includes("contextDedupe === true ? dedupeExactContext("), "the server applies it only for true");
   rec.calls = 0;
