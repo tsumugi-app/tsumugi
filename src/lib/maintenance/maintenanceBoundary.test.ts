@@ -150,10 +150,13 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (auto-evaluation E1): the past-context assembly moved as is to lib/chatContextAssembly.ts (same reads, flags, values, body and prompt; chatContextAssembly.test.ts). Exact added / removed lines of ChatScreen.tsx only (never a pattern)
   const contextAssemblyLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedContextAssemblyLines.json"), "utf8")).lines);
   const contextAssembly = (l: string) => contextAssemblyLines.has(l[0] + l.slice(1).trim());
+  // Reviewed (insight fix, owner approval 2026-11-20): the record-mode block gains exactly one bullet — a request that asks for organisation and a view of the stage/change is record + conversation, and the view is returned as a hypothesis inside the conversation. Exact added line only (never a pattern)
+  const insightFixLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedInsightFixLines.json"), "utf8")).lines);
+  const insightFix = (l: string) => insightFixLines.has(l[0] + l.slice(1).trim());
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (conversation voice): prompt text lives in lib/conversationVoice.ts; the route only resolves it, appends it, and may raise the thinking floor
   const conversationVoiceLine = /conversationVoice|voice\.|Conversation voice|^-\$\{sanitizedExplicitSearch && sanitizedMemoryAnalytics \?/;
-  for (const l of chatRouteDiff) assert.ok(aiSelection(l) || memoryContext(l) || memoryGraph(l) || contextDiagnostics(l) || contextDedupe(l) || explicitReason(l) || /synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
+  for (const l of chatRouteDiff) assert.ok(aiSelection(l) || memoryContext(l) || memoryGraph(l) || contextDiagnostics(l) || contextDedupe(l) || explicitReason(l) || insightFix(l) || /synthesis|Synthesis|memoryTimeline|Memory Timeline|^-\s+const \{ persona, turns, |^-\s+const systemInstruction = `/.test(l) || conversationVoiceLine.test(l), "unexpected chat route change: " + l);
   // Capture: the only allowed change is the reviewed own-conversation filter (capture-isolation); anything else is a boundary violation
   const captureDiff = git("diff", "-U0", ...range, "--", "src/lib/capture.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (startup Memory creation): the Capture result is saved in one transaction and the AI call runs outside the Vault world lock; ChatScreen runs it and marks the open conversation. Exact lines only (never a pattern)

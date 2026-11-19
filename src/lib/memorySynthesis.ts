@@ -625,7 +625,8 @@ ${blocks}
 - 「Tsumugiの仮説」「複数の発言を並べると見えること」は事実として断定しない。確かめるように触れる。
 - 「揺れ」は矛盾の指摘ではない。状況が違えば望みが違うのは自然なこととして扱う。
 - 話した日付は出来事の日付ではない。
-- 記録に無い動機・目的・心理を付け足さない。性格や心理のラベル（「〜な人」「〜を求めている」「心を守る」等）を付けない。${contexts.some((c) => (c.corrections ?? []).length > 0) ? CORRECTION_USAGE : ""}`;
+- 記録に無い動機・目的・心理を付け足さない。性格や心理のラベル（「〜な人」「〜を求めている」「心を守る」等）を付けない。
+- 経緯を並べるだけで終えず、今の発言と関係する範囲で、段階や変化についての見方を短く添えてよい。見方は仮説として分かる形で述べ、事実として断定しない。${contexts.some((c) => (c.corrections ?? []).length > 0) ? CORRECTION_USAGE : ""}`;
 }
 
 /** added only when a theme carries a correction (otherwise the section is exactly what it was before) */
