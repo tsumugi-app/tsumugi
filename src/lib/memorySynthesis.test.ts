@@ -30,6 +30,8 @@ test("clusters: only themes the user came back to in 3+ conversations over 2+ we
 test("status words: literal, not negated, not someone else's thing", () => {
   assert.equal(statusOf("異動の話はいったん保留になったが、勉強は続けたいと話した。"), "保留");
   assert.equal(statusOf("台風で家族の沖縄旅行が中止になったと話した。"), "中止");
+  assert.equal(statusOf("管理職試験は見送ることにした。来年受け直すつもりだと話した。"), "保留", "見送り is a postponement, not a cancellation");
+  assert.equal(statusOf("今年の昇格試験は見送ったと話した。"), "保留");
   assert.equal(statusOf("10kmの大会に申し込んだと話した。"), "予定");
   assert.equal(statusOf("車の修理が終わって戻ってきたと話した。"), "実施済み");
   assert.equal(statusOf("職場に近い部屋への引っ越しを考え始めたと話した。"), "検討中");

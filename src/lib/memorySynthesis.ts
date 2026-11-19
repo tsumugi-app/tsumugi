@@ -319,8 +319,10 @@ export function dropItemsWithMissingEvidence(items: SynthesisItem[], existingMem
 }
 
 const STATUS_RULES: [TimelineStatus, RegExp][] = [
-  ["中止", /中止|キャンセル|取りやめ|やめにした|見送/],
-  ["保留", /保留|延期|行き直す|先送り/],
+  ["中止", /中止|キャンセル|取りやめ|やめにした/],
+  // 見送り is "not this time" — a postponement that keeps the thing itself (like 先送り), not a cancellation.
+  // It was grouped under 中止 until the 2026-11 Timeline adoption; see docs/memory-timeline.md, open issue 1.
+  ["保留", /保留|延期|行き直す|先送り|見送/],
   ["実施済み", /完走|完了|終わった|終わり|戻ってきた|届いた|になった|契約した|出した|行ってきた|受けた|再開した/],
   ["予定", /予約|申し込|予定|ことにした|つもり|行きたい|受けたい/],
   ["検討中", /考えている|考え始め|迷って|検討|悩んで/],
