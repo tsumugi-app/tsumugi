@@ -32,6 +32,7 @@ import { limitMemoryQuotes, memoryContextOf } from "./memoryContext";
 import type { ReflectionTrace } from "./chatContextProvenance";
 import { isTopicKeyword, matchRecallTopic, recallTopicOf, withPoolEvidence, type RecallTopic } from "./recallQuestion";
 import { adjustForPurpose, asksPersonChange, isRecallOnlyRecord, purposeContextOf, recordTraitOf, sentences, type PurposeContext } from "./recordRelevance";
+import { correctionIndexOf, correctionThemeInText, isRecordRequestTurn, shareThemeKeyword } from "./correction";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
 export const KEYWORD_WEIGHT = 3;
@@ -1620,6 +1621,96 @@ export async function retrieveRelevantMemoriesImpl(
   }
   if (weakGate) reportPerson(personTrace);
 
+  // N6 訂正優先（案B 消費側＋案C 記録経路）: 会話の画面だけ（weakGate。人物機構と同じ境界）。
+  // 訂正情報が無い（古い Vault で索引が空）ときは、記録経路のフォールバック以外は何も変わらない。
+  // - 打ち消された Reflection は、訂正と対でなければ渡さない（対にできなければ外す）。
+  // - 打ち消された本人の記録は残すが、訂正の逐語つきの注記（correctionNote）を付ける。
+  // - 記録・整理のリクエストでは、その話題の訂正記録を、話題の語が今の発言になくても必ず入れる。
+  // - 記録経路のフォールバック: 訂正情報が無い Reflection は、同じ話題の本人の記録が一緒に
+  //   選ばれていなければ記録の材料にしない（古い AI の解釈が本人の確定した理由として記録されるのを防ぐ）。
+  const correctionNotes = new Map<string, { quote: string }>();
+  if (weakGate) {
+    const correctionIndex = correctionIndexOf(searchable);
+    const recordRequest = isRecordRequestTurn(trimmed);
+    if (correctionIndex.size > 0 || recordRequest) {
+      const byId = new Map(searchable.map((memory) => [memory.id, memory] as const));
+      const rankedScore = new Map(ranked.map((entry) => [entry.memory.id, entry.score] as const));
+      const correctingIds = new Set([...correctionIndex.values()].map((link) => link.correcting.id));
+      const appendedCorrections: MemoryObject[] = [];
+      const removedReflections: { memoryId: string; why: string }[] = [];
+      /** 人物補完（tryComplete）と同じ作法: 枠内の入れ替えだけ。理由の記録（reasonAnswer）と訂正記録は追い出さない */
+      const addByEviction = (memory: MemoryObject): boolean => {
+        if (scored.some((entry) => entry.memory.id === memory.id)) return true;
+        const victim = scored
+          .filter((entry) => !entry.reasonAnswer && !correctingIds.has(entry.memory.id) && !appendedCorrections.some((m) => m.id === entry.memory.id))
+          .sort((a, b) => a.score - b.score || memoryTime(a.memory) - memoryTime(b.memory))[0];
+        if (!victim) return false;
+        scored = scored.filter((entry) => entry.memory.id !== victim.memory.id);
+        scored = [...scored, { memory, score: rankedScore.get(memory.id) ?? 0, reasonAnswer: false }];
+        appendedCorrections.push(memory);
+        return true;
+      };
+      // 記録経路の保証: 会話のどこかで話題が出ている訂正は、今の発言に話題の語が無くても入れる（新しいものから最大2件）
+      if (recordRequest && correctionIndex.size > 0) {
+        const conversationText = [trimmed, ...(options.recentUserTurnsTexts ?? [])].join(" ");
+        const targetsByCorrecting = new Map<string, MemoryObject[]>();
+        for (const [targetId, link] of correctionIndex) {
+          const target = byId.get(targetId);
+          if (!target) continue;
+          const list = targetsByCorrecting.get(link.correcting.id) ?? [];
+          list.push(target);
+          targetsByCorrecting.set(link.correcting.id, list);
+        }
+        const themeCorrecting = [...targetsByCorrecting.entries()]
+          .map(([id, targets]) => ({ memory: byId.get(id)!, targets }))
+          .filter(({ memory, targets }) => memory && correctionThemeInText(memory, targets, conversationText))
+          .sort((a, b) => memoryTime(b.memory) - memoryTime(a.memory))
+          .slice(0, 2);
+        for (const { memory } of themeCorrecting) addByEviction(memory);
+      }
+      // ペアリング: 選定済みの打ち消された記録について、訂正が一緒に届く状態にする
+      for (const entry of [...scored]) {
+        const link = correctionIndex.get(entry.memory.id);
+        if (!link) continue;
+        if (scored.some((e) => e.memory.id === link.correcting.id)) {
+          correctionNotes.set(entry.memory.id, { quote: link.correction.quote });
+        } else if (isReflectionMemory(entry.memory)) {
+          if (addByEviction(link.correcting)) {
+            correctionNotes.set(entry.memory.id, { quote: link.correction.quote });
+          } else {
+            scored = scored.filter((e) => e.memory.id !== entry.memory.id);
+            removedReflections.push({ memoryId: entry.memory.id, why: "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）" });
+          }
+        } else {
+          // 本人の記録自体は事実として残す。注記が訂正の逐語を含むので、古い理由が単独で「今の理由」にはならない
+          correctionNotes.set(entry.memory.id, { quote: link.correction.quote });
+        }
+      }
+      // 記録経路のフォールバック（訂正情報が無い Reflection の制限）
+      if (recordRequest) {
+        const beforeFallback = scored;
+        scored = beforeFallback.filter((entry) => {
+          if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) return true;
+          return beforeFallback.some((other) => other.memory.id !== entry.memory.id && !isReflectionMemory(other.memory) && shareThemeKeyword(other.memory, entry.memory));
+        });
+        for (const entry of beforeFallback) {
+          if (isReflectionMemory(entry.memory) && !correctionIndex.has(entry.memory.id) && !scored.some((e) => e.memory.id === entry.memory.id)) {
+            removedReflections.push({ memoryId: entry.memory.id, why: "記録経路: 同じ話題の本人の記録が無く、訂正情報も無いReflectionは材料にしない" });
+          }
+        }
+      }
+      if (appendedCorrections.length > 0) {
+        const tail = scored.filter((entry) => appendedCorrections.some((m) => m.id === entry.memory.id)).sort((a, b) => memoryTime(a.memory) - memoryTime(b.memory));
+        scored = [...scored.filter((entry) => !appendedCorrections.some((m) => m.id === entry.memory.id)), ...tail];
+      }
+      if (deferred && removedReflections.length > 0) {
+        const removedIds = new Set(removedReflections.map((d) => d.memoryId));
+        deferred.trace.deferred = deferred.trace.deferred.filter((id) => !removedIds.has(id));
+        deferred.trace.dropped.push(...removedReflections);
+      }
+    }
+  }
+
   const directMatches = scored.map((entry) => entry.memory);
   const results: RetrievedMemory[] = directMatches.map((memory) => withTrait(toRetrievedMemory(memory, undefined, undefined, context), memory, purpose));
 
@@ -1665,11 +1756,14 @@ export async function retrieveRelevantMemoriesImpl(
   }
   const capped = results.slice(0, limit + maxLinkedAdditions);
   const withOrigin = options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped;
+  // N6 訂正優先: 打ち消された記録には訂正注記を付けて返す（注記が無ければ従来どおり）
+  const attachCorrectionNotes = (items: RetrievedMemory[]): RetrievedMemory[] =>
+    correctionNotes.size === 0 ? items : items.map((item) => { const note = correctionNotes.get(item.id); return note ? { ...item, correctionNote: note } : item; });
   if (deferred) {
     const final = await dropReflectionsCoveredByOwnRecords(withOrigin, deferred.trace);
     report(deferred.trace);
-    return withContext(final);
+    return withContext(attachCorrectionNotes(final));
   }
   if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
-  return withContext(withOrigin);
+  return withContext(attachCorrectionNotes(withOrigin));
 }
