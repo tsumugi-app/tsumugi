@@ -223,14 +223,21 @@ export function buildSynthesisClusters(memories: MemoryObject[], options: { maxC
     const correctingIds = new Set([...correctionIndex.values()].map((link) => link.correcting.id));
     for (const candidate of candidates) {
       const ids = new Set(candidate.evidence.map((e) => e.id));
-      const conversations = new Set(candidate.evidence.map((e) => e.conversationId));
       for (const e of [...candidate.evidence]) {
         const link = correctionIndex.get(e.id);
-        if (!link || ids.has(link.correcting.id) || conversations.has(link.correcting.conversationId as string)) continue;
+        if (!link || ids.has(link.correcting.id)) continue;
         if (!isSynthesisSource(link.correcting)) continue;
-        candidate.evidence.push(toEvidence(link.correcting));
+        // 訂正した会話が別の記録で代表されているときは、その代表を訂正した記録に置き換える（会話の代表は
+        // 保ったまま、根拠は本人の言い直しになる。代表が訂正対象・訂正記録そのもののときは置き換えずに追加する。
+        // Codex レビュー on PR #63）
+        const repIdx = candidate.evidence.findIndex((x) => x.conversationId === (link.correcting.conversationId as string) && !correctionIndex.has(x.id) && !correctingIds.has(x.id));
+        if (repIdx >= 0) {
+          ids.delete(candidate.evidence[repIdx].id);
+          candidate.evidence[repIdx] = toEvidence(link.correcting);
+        } else {
+          candidate.evidence.push(toEvidence(link.correcting));
+        }
         ids.add(link.correcting.id);
-        conversations.add(link.correcting.conversationId as string);
       }
       candidate.evidence.sort((a, b) => Date.parse(a.statedAt) - Date.parse(b.statedAt));
       // 上限を超えた分は、訂正ペア（対象・訂正のどちらでもない記録）から落とす

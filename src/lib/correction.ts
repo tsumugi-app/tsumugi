@@ -59,6 +59,13 @@ function isChangeMarked(sentence: string): boolean {
   return false;
 }
 
+/**
+ * 訂正専用の目印（CORRECTION_FORM から「というのも」を除いたもの）。「というのも」は理由の
+ * 説明の言い方で、同じ理由を繰り返しただけでも当たってしまう（Codex レビュー on PR #63）。
+ * 理由の配送では目印として有用でも、「打ち消し」の根拠にはならないため、ここでは使わない。
+ */
+const CORRECTION_SPECIFIC = /本当は|ほんとうは|というより|っていうより|じゃなくて|ではなくて|ではなく[、,]|(?:と|って)言ったのは|言い直す|訂正|間違いで/;
+
 /** 本人の逐語の中で、訂正と断定できる文（疑問文・変化・追加を除く）。無ければ空配列 */
 function correctionSentencesOf(memory: Pick<MemoryObject, "evidenceQuotes">): string[] {
   const out: string[] = [];
@@ -67,6 +74,7 @@ function correctionSentencesOf(memory: Pick<MemoryObject, "evidenceQuotes">): st
     for (const sentence of sentences(quote)) {
       if (isQuestionText(sentence)) continue;
       if (!CORRECTION_FORM.test(sentence)) continue;
+      if (!CORRECTION_SPECIFIC.test(sentence)) continue;
       if (isChangeMarked(sentence)) continue;
       if (ADDITION_FORM.test(sentence)) continue;
       out.push(sentence);

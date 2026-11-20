@@ -116,6 +116,22 @@ test("打ち消された本人の記録が届くときは、訂正注記が必�
   assert.ok(mc.memoryContextLines(noted).includes("訂正あり"), "プロンプトにも訂正の行が出る");
 });
 
+test("Link経由で入った打ち消されたReflectionにも、ペアリングの不変条件が効く（Codex on PR #63）", async () => {
+  const linked = correctedEvalWorld().map((m) =>
+    m.id === "bike-1"
+      ? { ...m, links: [{ id: "link-bike-refl", sourceId: "bike-1", targetId: "job-refl", axis: "theme" as const, reason: "同じ時期の話題", contrast: false, strength: 0.9, createdBy: "auto-linked" as const, createdAt: "2026-10-05T03:00:00.000Z" }] }
+      : m
+  );
+  const res = await run(N6_TURN, [N6_EARLIER], linked);
+  const ids = res.map((m) => m.id);
+  assert.ok(ids.includes("job-3"), `訂正記録 job-3 が届く (got: ${ids.join(",")})`);
+  const refl = res.find((m) => m.id === "job-refl");
+  if (refl) {
+    assert.ok(refl.correctionNote, "Link経由の job-refl にも訂正注記が付く");
+    assert.ok(ids.includes("job-3"), "訂正と対になっている");
+  }
+});
+
 test("無関係な話題では訂正注記は付かない（漏れない）", async () => {
   const res = await run("ロードバイクっていくらだったっけ？", [], correctedEvalWorld());
   assert.ok(res.some((m) => m.id === "bike-2"), "自転車の記録は届く");
@@ -165,6 +181,21 @@ test("Synthesis: クラスタ根拠は打ち消された記録だけで組み立
   const ids = job.evidence.map((e) => e.id);
   assert.ok(ids.includes("sj-2"), "打ち消された記録も根拠に残る（事実として）");
   assert.ok(ids.includes("sj-3"), `訂正記録 sj-3 が必ず対になる (got: ${ids.join(",")})`);
+});
+
+test("Synthesis: 訂正した会話が別の記録で代表されていても、訂正記録が根拠に入る（Codex on PR #63）", () => {
+  const sj0 = mem("sj-0", "2026-05-01", "c-s0", "転職を考え始めたと話した。", ["転職"], { quote: "転職しようかな" });
+  const sj4 = mem("sj-4", "2026-05-20", "c-s4", "転職の面接を受けたと話した。", ["転職", "面接"], { quote: "面接を受けた" });
+  const sj2 = mem("sj-2", "2026-06-01", "c-s2", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], { quote: "転職はやめた。理由は給料が下がるからだ" });
+  const sj3 = mem("sj-3", "2026-07-01", "c-s3", "転職をやめた理由を言い直した。", ["チーム"], { quote: CORRECTION_QUOTE, corrections: corrTo("sj-2", "2026-07-01", "c-s3") });
+  // 訂正と同じ会話の、より新しい話題記録がクラスタの代表になるケース
+  const sj5 = mem("sj-5", "2026-07-05", "c-s3", "転職活動を振り返った。", ["転職"], { quote: "振り返った" });
+  const clusters = ms.buildSynthesisClusters([sj0, sj4, sj2, sj3, sj5]);
+  const job = clusters.find((c) => c.theme === "転職");
+  assert.ok(job, "転職クラスタができる");
+  const ids = job.evidence.map((e) => e.id);
+  assert.ok(ids.includes("sj-2"), "打ち消された記録が根拠に残る");
+  assert.ok(ids.includes("sj-3"), `代表の置き換えで訂正記録 sj-3 が入る (got: ${ids.join(",")})`);
 });
 
 test("Vault往復: corrections は Markdown に保存され、読み戻しても失われない", () => {

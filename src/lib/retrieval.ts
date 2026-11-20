@@ -1755,7 +1755,40 @@ export async function retrieveRelevantMemoriesImpl(
     }
   }
   const capped = results.slice(0, limit + maxLinkedAdditions);
-  const withOrigin = options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped;
+  let withOrigin = options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped;
+  // N6 訂正優先（最終強制）: Link経由・起点Memoryで入った打ち消された記録にも、選定へのペアリングと
+  // 同じ不変条件を適用する（打ち消された Reflection を単独で渡さない。Codex レビュー on PR #63）。
+  // 会話の画面だけ（weakGate）。訂正が一緒でない Reflection は、訂正を末尾に足して対にする。
+  if (weakGate) {
+    const finalIndex = correctionIndexOf(all);
+    if (finalIndex.size > 0) {
+      const allByIdFinal = new Map(all.map((memory) => [memory.id, memory] as const));
+      const present = new Set(withOrigin.map((item) => item.id));
+      const kept: RetrievedMemory[] = [];
+      const extra: RetrievedMemory[] = [];
+      for (const item of withOrigin) {
+        const link = finalIndex.get(item.id);
+        const target = link ? allByIdFinal.get(item.id) : undefined;
+        if (!link || !target) { kept.push(item); continue; }
+        if (present.has(link.correcting.id)) { correctionNotes.set(item.id, { quote: link.correction.quote }); kept.push(item); continue; }
+        if (isReflectionMemory(target)) {
+          const correcting = allByIdFinal.get(link.correcting.id);
+          if (!correcting) {
+            if (deferred) deferred.trace.dropped.push({ memoryId: item.id, why: "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）" });
+            continue;
+          }
+          correctionNotes.set(item.id, { quote: link.correction.quote });
+          kept.push(item);
+          extra.push(toRetrievedMemory(correcting, undefined, undefined, context));
+          present.add(correcting.id);
+          continue;
+        }
+        correctionNotes.set(item.id, { quote: link.correction.quote });
+        kept.push(item);
+      }
+      withOrigin = [...kept, ...extra];
+    }
+  }
   // N6 訂正優先: 打ち消された記録には訂正注記を付けて返す（注記が無ければ従来どおり）
   const attachCorrectionNotes = (items: RetrievedMemory[]): RetrievedMemory[] =>
     correctionNotes.size === 0 ? items : items.map((item) => { const note = correctionNotes.get(item.id); return note ? { ...item, correctionNote: note } : item; });
