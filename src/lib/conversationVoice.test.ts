@@ -63,7 +63,7 @@ test("the voice section defers to record mode, and keeps the evidence rules (fac
   assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("記録モードには適用しない"));
   assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("ユーザーが話していない出来事や心理を事実として述べない"));
   assert.ok(!/一つだけ|1つだけ/.test(voice.CONVERSATION_VOICE_SECTION + voice.ANALYST_MEMORY_USE_NOTE), "no fixed number of Memories");
-  assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("毎回分析や仮説を出さなくてよい"));
+  assert.ok(voice.CONVERSATION_VOICE_SECTION.includes("毎回分析や仮説を出す必要はない"));
 });
 
 test("the thinking budget is not changed by the voice", async () => {
