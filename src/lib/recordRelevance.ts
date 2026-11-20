@@ -46,7 +46,8 @@ export interface RelevanceSource {
 }
 
 const norm = (text: string) => (text ?? "").normalize("NFKC");
-const sentences = (text: string) => (norm(text).match(/[^。！？!?\n]+[。！？!?]*/g) ?? []).map((s) => s.trim()).filter((s) => s.length > 0);
+/** 文の分割（NFKC＋句読点）。retrieval.ts の変化ゲートも同じ流儀で文を見る */
+export const sentences = (text: string) => (norm(text).match(/[^。！？!?\n]+[。！？!?]*/g) ?? []).map((s) => s.trim()).filter((s) => s.length > 0);
 const quoteSentences = (memory: RelevanceSource) => (memory.evidenceQuotes ?? []).filter((q): q is string => typeof q === "string").flatMap(sentences);
 const HONORIFIC = /(?:さん|くん|君|ちゃん|様|氏)$/;
 const personNames = (memory: RelevanceSource) =>
@@ -63,6 +64,15 @@ const ASKS_QUESTION_FORM = /[?？]|っけ|かな$|かしら|ですか|でしょ�
 /** a change asked about or told (「どう変わってきた」「変化」「話せるようになった」): the change purpose, also the person arc of retrieval.ts */
 const CHANGE_ASK = /変わ|変化|ようになっ|変え/;
 export const asksChange = (text: string) => CHANGE_ASK.test(norm(text));
+/**
+ * 人物との関係の変化を尋ねる・語るときの、自然な変化の言い回しまで広げた語彙（retrieval.ts の人物の弧と、
+ * companion/coach の変化／振り返りゲートが共有する）。語幹で登録して活用を吸収する：
+ * 減っ（考える時間が減った）・増え・前ほど（過去との対比そのもの）・落ち着い・なくなっ（〜しなくなった）・
+ * 薄れ・なってき（どうなってきてる）。大丈夫・戻っ・慣れは入れない（状態の宣言・物理的な帰還・仕事への慣れと区別できないため）。
+ * 目的判定（PURPOSE_ASK の "change"）は広げない：あちらは「過去を尋ねる質問の目的」で、意味が違う。
+ */
+const PERSON_CHANGE_ASK = new RegExp(`${CHANGE_ASK.source}|減っ|増え|前ほど|落ち着い|なくなっ|薄れ|なってき`);
+export const asksPersonChange = (text: string) => PERSON_CHANGE_ASK.test(norm(text));
 const PURPOSE_ASK: { purpose: Exclude<QuestionPurpose, "personAction">; ask: RegExp }[] = [
   { purpose: "questions", ask: /質問|尋ね/ },
   { purpose: "wish", ask: /望|願|ほしかっ|欲しかっ|してほし|たかった/ },

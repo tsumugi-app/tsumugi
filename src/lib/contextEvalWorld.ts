@@ -51,8 +51,8 @@ const ROWS: Row[] = [
   { id: "movie", day: "2026-09-27", conv: "c-movie", summary: "古い映画を観て面白かったと話した。", quote: "昔の映画、意外と面白かった", keywords: ["映画"] },
 ];
 
-export function evalMemories(): MemoryObject[] {
-  return ROWS.map((r) => {
+function rowToMemory(r: Row): MemoryObject {
+  {
     const t = at(r.day);
     const m: Record<string, unknown> = {
       id: r.id, date: t, statedAt: t, types: r.reflection ? ["insight"] : ["conversation"], conversationId: r.conv,
@@ -74,7 +74,29 @@ export function evalMemories(): MemoryObject[] {
       m.profileClaims = [{ id: `pc-${r.id}`, category: r.profile.category, slot: r.profile.slot, value: r.profile.value, statement: r.profile.statement, tense: "current", change: "none", stated: "explicit", quote: r.quote, statedAt: t, sourceConversationId: r.conv, recordedAt: t, origin: "ai-extracted", schemaVersion: 1 }];
     }
     return m as unknown as MemoryObject;
-  });
+  }
+}
+
+export function evalMemories(): MemoryObject[] {
+  return ROWS.map(rowToMemory);
+}
+
+/**
+ * 佐藤さんの独立した記録セット（N1〜N4 用）。共有の評価世界（ROWS）に足すと既存ケースの選択が変わりうるため分ける。
+ * 佐藤さん（同僚）：登山の約束（2026-04-12、217日前）→ 喧嘩（2026-05-17、182日前）→ まだ気まずい（2026-07-04、134日前）
+ * → ランチした（2026-10-30、16日前）→ 海外赴任の話（2026-11-12、3日前）。ほかに人物のいない旅行の記録。
+ */
+const SATO_ROWS: Row[] = [
+  { id: "sato-1", day: "2026-04-12", conv: "c-sato-1", summary: "佐藤さんと秋に登山に行く約束をしたと話した。", quote: "佐藤さんと秋に登山に行く約束をした", keywords: ["佐藤さん", "登山", "約束"], person: { name: "佐藤さん", relation: "coworker" } },
+  { id: "sato-2", day: "2026-05-17", conv: "c-sato-2", summary: "佐藤さんと仕事の進め方で喧嘩したと話した。", quote: "佐藤さんと仕事の進め方で喧嘩しちゃった", keywords: ["佐藤さん", "仕事"], person: { name: "佐藤さん" } },
+  { id: "sato-3", day: "2026-07-04", conv: "c-sato-3", summary: "佐藤さんとまだ気まずいと話した。", quote: "佐藤さんとはまだ気まずい", keywords: ["佐藤さん"], person: { name: "佐藤さん" } },
+  { id: "sato-4", day: "2026-10-30", conv: "c-sato-4", summary: "佐藤さんと駅前の店でランチをしたと話した。", quote: "佐藤さんと駅前の店でランチした", keywords: ["佐藤さん", "ランチ"], person: { name: "佐藤さん" } },
+  { id: "sato-5", day: "2026-11-12", conv: "c-sato-5", summary: "佐藤さんが来月から海外赴任になると聞いたと話した。", quote: "佐藤さん、来月から海外赴任になるんだって", keywords: ["佐藤さん", "海外赴任"], person: { name: "佐藤さん" } },
+  { id: "trip-1", day: "2026-08-15", conv: "c-trip-1", summary: "夏休みの行き先を決めたと話した。", quote: "夏休みの行き先を決めた", keywords: ["旅行", "行き先"] },
+];
+
+export function evalSatoMemories(): MemoryObject[] {
+  return SATO_ROWS.map(rowToMemory);
 }
 
 /** a conversation that ended an hour before EVAL_NOW (the recent conversation), and an old one */
@@ -112,12 +134,14 @@ export function evalHypotheses(fingerprint: (themeLabel: string) => string, them
   ];
 }
 
-export type EvalCaseKind = "具体的な事実" | "理由・訂正" | "人物名を省いた継続" | "時系列の変化" | "雑談" | "記憶がない質問" | "AIの仮説との矛盾" | "複数経路での重複" | "明示的な検索" | "直前の会話の続き";
+export type EvalCaseKind = "具体的な事実" | "理由・訂正" | "人物名を省いた継続" | "時系列の変化" | "雑談" | "記憶がない質問" | "AIの仮説との矛盾" | "複数経路での重複" | "明示的な検索" | "直前の会話の続き" | "人物名を明示した振り返り" | "名前を省略した呟き" | "気持ちの変化の呟き" | "近況報告" | "曖昧な呟き" | "複数人物の会話" | "人物の切り替わり" | "話題の切り替わり";
 
 export interface EvalCase {
   id: string;
   kind: EvalCaseKind;
   persona: Persona;
+  /** 使う記録セット（未指定は共有の評価世界。"sato" は佐藤さんの独立セット：既存ケースの選択を変えないため分けてある） */
+  world?: "sato";
   /** the user's turns of this conversation (the last one is the question) */
   turns: string[];
   /** the user's own words that the prompt must carry (a part of the verbatim quote) */
@@ -147,6 +171,34 @@ export const EVAL_CASES: EvalCase[] = [
   { id: "dup-yuki", kind: "複数経路での重複", persona: "analyst", turns: ["ゆうきさんと最近どうしてる？"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["はるとさん"] },
   { id: "search-bike", kind: "明示的な検索", persona: "analyst", turns: ["自転車について何話した？"], required: ["12万円", "50km"], direct: ["12万円", "50km"], optional: ["高いんだよね"], forbidden: ["はるとさん", "転職"] },
   { id: "recent-continue", kind: "直前の会話の続き", persona: "companion", turns: ["さっきの話の続きなんだけど、ゆうきさんとまた出かけたいな"], required: ["さっきまでゆうきさんと自転車の話"], direct: ["さっきまでゆうきさんと自転車の話"], optional: ["自転車で出かけ"], forbidden: ["はるとさん", "転職"] },
+  // companion の人物ケース（本命ペルソナの Memory 選択を測る。上の人物ケース person-omitted / change-yuki は analyst のみだった）。
+  // 1件ずつ analyst の対照ケース（-analyst）も置き、同じ入力で人物を扱う経路が何を届けるかを比べる。
+  // 気持ちの変化の呟きは、弧の発火条件の語（変わ・変化・ようになっ・変え）を避けた自然な言い方にしてある。
+  { id: "person-named-reflect", kind: "人物名を明示した振り返り", persona: "companion", turns: ["ゆうきさんとの関係、最近どうなってきてるんだろう"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝", "まだ気まずい"], forbidden: ["はるとさん"] },
+  { id: "person-named-reflect-analyst", kind: "人物名を明示した振り返り", persona: "analyst", turns: ["ゆうきさんとの関係、最近どうなってきてるんだろう"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝", "まだ気まずい"], forbidden: ["はるとさん"] },
+  { id: "person-carried-murmur", kind: "名前を省略した呟き", persona: "companion", turns: ["ゆうきさんのことなんだけど", "あの人とは、もう大丈夫な気がする"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["はるとさん"] },
+  { id: "person-carried-murmur-analyst", kind: "名前を省略した呟き", persona: "analyst", turns: ["ゆうきさんのことなんだけど", "あの人とは、もう大丈夫な気がする"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["はるとさん"] },
+  // 以前と現在のペア：必須の根拠2件＝以前の強い気持ち（まだ気まずい）と最近の記録（自転車で出かけ）。両方そろって初めてペア成立
+  { id: "person-feeling-change", kind: "気持ちの変化の呟き", persona: "companion", turns: ["ゆうきさんのこと、前ほどモヤモヤしなくなった気がする"], required: ["まだ気まずい", "自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["話せるようになった"], forbidden: ["はるとさん"] },
+  { id: "person-feeling-change-analyst", kind: "気持ちの変化の呟き", persona: "analyst", turns: ["ゆうきさんのこと、前ほどモヤモヤしなくなった気がする"], required: ["まだ気まずい", "自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["話せるようになった"], forbidden: ["はるとさん"] },
+  // 近況報告：過去の根拠は必須ではない。このケースの forbidden は「他人の混入」ではなく「単なる近況報告で持ち出すべきでない深い過去（喧嘩・気まずい時期）」の目印
+  { id: "person-status-update", kind: "近況報告", persona: "companion", turns: ["ゆうきさんと明日ランチに行くことになったよ"], required: [], direct: [], optional: ["自転車で出かけ"], forbidden: ["約束のことで喧嘩", "まだ気まずい"] },
+  // 曖昧な呟き：2人とも候補になりうるが特定はできない。成功＝どちらの人物の記録も「特定したもの」として選ばれないこと（必須なし・全人物の目印が混入扱い）
+  { id: "person-ambiguous-murmur", kind: "曖昧な呟き", persona: "companion", turns: ["ゆうきさんとはるとさん、最近どっちも会えてないな", "あの人、元気にしてるかな"], required: [], direct: [], forbidden: ["約束のことで喧嘩", "まだ気まずい", "自転車で出かけ", "話せるようになった", "ランチ行った", "異動になった"] },
+  { id: "person-multi-focus", kind: "複数人物の会話", persona: "companion", turns: ["ゆうきさんとはるとさんの近況なんだけど", "ゆうきさんのほうは、最近どうしてるんだっけ？"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["ランチ行った", "異動になった"] },
+  { id: "person-multi-focus-analyst", kind: "複数人物の会話", persona: "analyst", turns: ["ゆうきさんとはるとさんの近況なんだけど", "ゆうきさんのほうは、最近どうしてるんだっけ？"], required: ["自転車で出かけ"], direct: ["自転車で出かけ"], optional: ["ゆうきさんに謝"], forbidden: ["ランチ行った", "異動になった"] },
+  { id: "person-switch-focus", kind: "人物の切り替わり", persona: "companion", turns: ["ゆうきさんのこと、最近どうしてるんだっけ？", "ところで、はるとさんは元気にしてるかな"], required: ["異動になった"], direct: ["異動になった"], optional: ["ランチ行った"], forbidden: ["約束のことで喧嘩", "まだ気まずい", "自転車で出かけ", "話せるようになった"] },
+  { id: "person-switch-focus-analyst", kind: "人物の切り替わり", persona: "analyst", turns: ["ゆうきさんのこと、最近どうしてるんだっけ？", "ところで、はるとさんは元気にしてるかな"], required: ["異動になった"], direct: ["異動になった"], optional: ["ランチ行った"], forbidden: ["約束のことで喧嘩", "まだ気まずい", "自転車で出かけ", "話せるようになった"] },
+  // 佐藤さんケース（N1〜N4、独立セット）。companion の人物機構のうち、ケース1〜7では測れない形を固定する。
+  // N1：近況報告（ケース4の佐藤さん版）。無関係な深い過去（喧嘩・気まずい時期）が選ばれないこと
+  { id: "person-sato-status", kind: "近況報告", persona: "companion", world: "sato", turns: ["明日、佐藤さんとランチする"], required: [], direct: [], optional: ["ランチした"], forbidden: ["喧嘩", "まだ気まずい"] },
+  // N2：久しぶり＋緊張は「気まずい時期」へのつながりに見えるが、設計の受け皿（最新の記録／名前以外のキーワード／話題・理由／
+  // 名前を伏せた文字列の共有）のどれにも機械的には当たらない。届くかどうかは実測して報告する（optional に置き、合否にはしない）
+  { id: "person-sato-nervous", kind: "近況報告", persona: "companion", world: "sato", turns: ["明日、久しぶりに佐藤さんとランチする。ちょっと緊張する"], required: [], direct: [], optional: ["まだ気まずい", "ランチした"], forbidden: ["喧嘩"] },
+  // N3：半年以上前の記録でも、話題のつながり（登山・約束のキーワード）が明確なら届くこと（P4 の受け皿）
+  { id: "person-sato-old-promise", kind: "具体的な事実", persona: "companion", world: "sato", turns: ["佐藤さんとの約束、秋に登山に行くって話、どうなったっけ？"], required: ["登山に行く約束"], direct: ["登山に行く約束"], optional: [], forbidden: ["喧嘩", "まだ気まずい"] },
+  // N4：人物の話から話題が切り替わった後は、その人物の最近の記録でも新しさ・人物一致だけで選ばれないこと
+  { id: "person-sato-switch", kind: "話題の切り替わり", persona: "companion", world: "sato", turns: ["佐藤さんのことなんだけど", "ところで、来週の旅行の行き先、決めたっけ？"], required: ["行き先を決めた"], direct: ["行き先を決めた"], optional: [], forbidden: ["海外赴任", "喧嘩", "まだ気まずい", "ランチした"] },
 ];
 
 /** the conversation's turns: one minute apart, ending a minute before EVAL_NOW */

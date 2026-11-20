@@ -31,7 +31,7 @@ import type { MemoryObject, Persona, RetrievedMemory } from "./types";
 import { limitMemoryQuotes, memoryContextOf } from "./memoryContext";
 import type { ReflectionTrace } from "./chatContextProvenance";
 import { isTopicKeyword, matchRecallTopic, recallTopicOf, withPoolEvidence, type RecallTopic } from "./recallQuestion";
-import { adjustForPurpose, asksChange, isRecallOnlyRecord, purposeContextOf, recordTraitOf, type PurposeContext } from "./recordRelevance";
+import { adjustForPurpose, asksPersonChange, isRecallOnlyRecord, purposeContextOf, recordTraitOf, sentences, type PurposeContext } from "./recordRelevance";
 
 /** capture.ts側の候補スコア閾値の根拠としても参照する（1キーワード一致分の重み）。 */
 export const KEYWORD_WEIGHT = 3;
@@ -814,6 +814,135 @@ export interface PersonAwareSelection {
   feeling: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// 人物の特定・変化のゲート・弧の選定（analyst と companion/coach で共有する部品）。
+// 人物の特定と「深掘りするか」の判断は分ける：特定しただけでは記録は1件も足さない。
+// 深掘り（時系列の補完）は、変化／振り返りのゲートが開いたときだけ行う。
+// ---------------------------------------------------------------------------
+
+export interface TurnPersonResolution {
+  /** 特定した人物のキー（名前が出た形のキー。確定した組があるときはその組のキー） */
+  key: string;
+  /** その人物の名前の組（確定した同じ人物の名前。組が無ければ [key]） */
+  targetKeys: string[];
+  how: "named" | "carried";
+  /** 既知の人物キーすべて（確定した組の名前を含む）。他の人物の判定・名前を伏せた照合に使う */
+  keys: string[];
+}
+
+/**
+ * 段階1：このターンが一人の人物の話かを求める。名前が明示されていれば（別名の組は1人と数える）その人物、
+ * 無ければ従来の人物継続（deriveConversationPersonFocus）を、キーワードが名前と一致する記録もその人物の記録として
+ * 扱った写しの上で使う。曖昧・複数・続柄のみ・話題転換のときは null（呼び出し元は従来の選定そのままになる）。
+ */
+export function resolveTurnPerson(
+  pool: MemoryObject[],
+  trimmed: string,
+  recentUserTurnsTexts: string[],
+  /** Memory Graph P1-B：本人が確定した同じ人物の名前の組（未指定・空なら従来どおり） */
+  aliases: string[][] = []
+): TurnPersonResolution | null {
+  const turns = recentUserTurnsTexts.map(normalizeTwoPeople);
+  const known = knownPersonKeys(pool);
+  if (known.length === 0) return null;
+  // 確定した名前の組：既知の名前を1つでも含む組だけ。組の名前はどれも既知の人物の名前として扱い、同じ組の名前は1人と数える
+  const groupOf = new Map<string, string[]>();
+  for (const list of aliases) {
+    const group = [...new Set(list.map(personNameKey).filter((key) => Array.from(key).length >= 2 && !GENERIC_PERSON_WORDS.includes(key)))];
+    if (group.length < 2 || !group.some((key) => known.includes(key)) || group.some((key) => groupOf.has(key))) continue;
+    for (const key of group) groupOf.set(key, group);
+  }
+  const keys = [...new Set([...known, ...groupOf.keys()])];
+  const groupKeys = (key: string) => groupOf.get(key) ?? [key];
+
+  const named = [...new Map(personKeysInText(trimmed, keys).map((key) => [groupKeys(key)[0], key])).values()];
+  if (named.length === 1) {
+    return { key: named[0], targetKeys: groupKeys(named[0]), how: "named", keys };
+  }
+  if (named.length === 0) {
+    // 従来の人物継続を、キーワードが名前と一致する記録（と、確定した同じ人物の別の名前の記録）もその人物の記録として扱った写しの上で使う
+    // 確定した名前の組は、組の最初の名前1つとして読む（発言の別名を置き換え、組のどの名前の記録もその名前の記録として扱う）。組が無ければ従来どおり
+    const canonical = (key: string) => groupKeys(key)[0];
+    const linked = pool.map((memory) => {
+      const extra = keys.filter((key) => canonical(key) === key && !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && groupKeys(key).some((k) => (k === key ? (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key) : isAboutPerson(memory, k))));
+      return extra.length === 0 ? memory : ({ ...memory, personMentions: [...(memory.personMentions ?? []), ...extra.map((key) => ({ displayName: key, groupingKey: key }))] } as unknown as MemoryObject);
+    });
+    const focus = deriveConversationPersonFocus(groupOf.size === 0 ? turns : turns.map((text) => withCanonicalNames(text, keys, canonical)), linked);
+    if (focus) {
+      const key = personNameKey(focus.displayName);
+      return { key, targetKeys: groupKeys(key), how: "carried", keys };
+    }
+  }
+  return null;
+}
+
+/** 会話の本文から人物名を除いた照合用の文字列（名前だけで「重なる」としないため。敬称も除く） */
+function personMaskedQuery(turns: string[], latest: string, keys: string[]): string {
+  return keys.reduce((text, key) => text.split(key).join(" "), nfkcCompact((turns.length > 0 ? turns : [latest]).join(" ")).replace(/(さん|ちゃん|くん|君|様|氏)/g, " "));
+}
+
+/** 名前以外のキーワードが、名前を除いた会話に出てくる数 */
+export function ownKeywordHitsOf(memory: MemoryObject, query: string, keys: string[]): number {
+  return (memory.keywords ?? []).filter((keyword) => !keys.includes(personNameKey(keyword)) && query.includes(nfkcCompact(keyword))).length;
+}
+
+export interface PersonArcSelection {
+  /** 変化の記録（既に選ばれている記録のこともある。そのときは変化の時点の基準として使う） */
+  change: MemoryObject | null;
+  /** 変化の前の記録（未選定のものだけ） */
+  before: MemoryObject | null;
+  changeAt: number;
+}
+
+/**
+ * 段階4の材料：関係の変化を説明する記録の選定（analyst の弧と同じ規則のまま切り出したもの）。
+ * 候補は、対象人物だけの記録（別の人物も関わる記録は使わない）・本人の言葉があるもの・AIの振り返りでないもの・
+ * 尋ねただけの記録でないもの、PERSON_ARC_MAX_AGE_DAYS以内の新しい順に最大PERSON_ARC_SCAN_LIMIT件。
+ *   - 変化の記録：本人の言葉＋要約に、関係の言葉と変化の言い回しがあるもの → 無ければ、できること・状態の変化のもの。それぞれ新しい順
+ *   - 変化の前の記録：変化の時点より前で未選定のものから、気持ち・関係の言葉がある中で変化に一番近いもの。無ければ一番古いもの
+ */
+export function pickPersonArc(
+  pool: MemoryObject[],
+  opts: { keys: string[]; targetKeys: string[]; includedIds: ReadonlySet<string>; now: number }
+): PersonArcSelection {
+  const { keys, targetKeys, includedIds, now } = opts;
+  const isAboutTarget = (memory: MemoryObject) => targetKeys.some((key) => isAboutPerson(memory, key));
+  const aboutOther = (memory: MemoryObject) => keys.some((key) => !targetKeys.includes(key) && isAboutPerson(memory, key));
+  const hasOwnWords = (memory: MemoryObject) => (memory.evidenceQuotes ?? []).some((quote) => typeof quote === "string" && quote.trim().length > 0);
+  const ownText = (memory: MemoryObject) => nfkcCompact([...(memory.evidenceQuotes ?? []).filter((quote) => typeof quote === "string"), memory.summary ?? ""].join("。"));
+  const own = pool
+    .filter((memory) => isAboutTarget(memory) && !aboutOther(memory) && !isReflectionMemory(memory) && !isRecallOnlyRecord(memory) && hasOwnWords(memory))
+    .filter((memory) => now - memoryTime(memory) <= PERSON_ARC_MAX_AGE_DAYS * DAY_MS_RETRIEVAL)
+    .sort((a, b) => memoryTime(b) - memoryTime(a))
+    .slice(0, PERSON_ARC_SCAN_LIMIT);
+  const cue = (memory: MemoryObject) => isFeelingRecord(memory) || relationCueIn(ownText(memory));
+  const change = own.find((memory) => ARC_CHANGE.test(ownText(memory)) && relationCueIn(ownText(memory))) ?? own.find((memory) => STATE_CHANGE.test(ownText(memory))) ?? null;
+  const changeAt = change ? memoryTime(change) : Math.min(...own.filter((memory) => includedIds.has(memory.id)).map(memoryTime), Infinity);
+  const beforeList = own.filter((memory) => memory !== change && !includedIds.has(memory.id) && memoryTime(memory) < changeAt);
+  const before = beforeList.find(cue) ?? beforeList[beforeList.length - 1] ?? null;
+  return { change, before, changeAt };
+}
+
+/**
+ * 段階3：変化／振り返りのゲート。開くのは、人物が1人特定できていて、最新発言に変化の言い回し（asksPersonChange）があり、
+ * その変化がその人物についてのものである傍証が取れるときだけ：
+ *   (a) 発言全体が関係・気持ちの話（isRelationshipTalk）、または
+ *   (b) 変化の語がある同じ文に、その人物への言及（名前・人を指す言い方）がある、または
+ *   (c) 変化の語がある文に気持ちの言葉がある。
+ * 人物と無関係な変化（別の文の「体重が減った」など）では開かない。判定は最新発言だけ（直前の発言は見ない）。
+ */
+export function personChangeGate(latest: string, person: { targetKeys: string[] }): boolean {
+  if (!asksPersonChange(latest)) return false;
+  if (isRelationshipTalk(latest)) return true;
+  for (const sentence of sentences(latest)) {
+    if (!asksPersonChange(sentence)) continue;
+    if (personKeysInText(sentence, person.targetKeys).length > 0) return true;
+    if (PERSON_REFERENCE_CUES.some((cue) => sentence.includes(cue))) return true;
+    if (FEELING_WORDS.test(sentence)) return true;
+  }
+  return false;
+}
+
 export function selectConversationWithPersons(
   pool: MemoryObject[],
   trimmed: string,
@@ -839,35 +968,12 @@ export function selectConversationWithPersons(
   });
   const latest = normalizeTwoPeople(trimmed);
   const turns = recentUserTurnsTexts.map(normalizeTwoPeople);
-  const known = knownPersonKeys(pool);
-  if (known.length === 0) return fallback();
-  // 確定した名前の組：既知の名前を1つでも含む組だけ。組の名前はどれも既知の人物の名前として扱い、同じ組の名前は1人と数える
-  const groupOf = new Map<string, string[]>();
-  for (const list of aliases) {
-    const group = [...new Set(list.map(personNameKey).filter((key) => Array.from(key).length >= 2 && !GENERIC_PERSON_WORDS.includes(key)))];
-    if (group.length < 2 || !group.some((key) => known.includes(key)) || group.some((key) => groupOf.has(key))) continue;
-    for (const key of group) groupOf.set(key, group);
-  }
-  const keys = [...new Set([...known, ...groupOf.keys()])];
-  const groupKeys = (key: string) => groupOf.get(key) ?? [key];
-
-  const named = [...new Map(personKeysInText(trimmed, keys).map((key) => [groupKeys(key)[0], key])).values()];
-  let person: PersonAwareSelection["person"] = null;
-  if (named.length === 1) {
-    person = { key: named[0], how: "named" };
-  } else if (named.length === 0) {
-    // 従来の人物継続を、キーワードが名前と一致する記録（と、確定した同じ人物の別の名前の記録）もその人物の記録として扱った写しの上で使う
-    // 確定した名前の組は、組の最初の名前1つとして読む（発言の別名を置き換え、組のどの名前の記録もその名前の記録として扱う）。組が無ければ従来どおり
-    const canonical = (key: string) => groupKeys(key)[0];
-    const linked = pool.map((memory) => {
-      const extra = keys.filter((key) => canonical(key) === key && !(memory.personMentions ?? []).some((mention) => personNameKey(mention.displayName ?? "") === key) && groupKeys(key).some((k) => (k === key ? (memory.keywords ?? []).some((keyword) => personNameKey(keyword) === key) : isAboutPerson(memory, k))));
-      return extra.length === 0 ? memory : ({ ...memory, personMentions: [...(memory.personMentions ?? []), ...extra.map((key) => ({ displayName: key, groupingKey: key }))] } as unknown as MemoryObject);
-    });
-    const focus = deriveConversationPersonFocus(groupOf.size === 0 ? turns : turns.map((text) => withCanonicalNames(text, keys, canonical)), linked);
-    if (focus) person = { key: personNameKey(focus.displayName), how: "carried" };
-  }
-  if (!person) return fallback();
-  const targetKeys = groupKeys(person.key);
+  // 人物の特定は共有部品（resolveTurnPerson）。特定できなければ従来の選定そのまま
+  const resolution = resolveTurnPerson(pool, trimmed, recentUserTurnsTexts, aliases);
+  if (!resolution) return fallback();
+  const person: PersonAwareSelection["person"] = { key: resolution.key, how: resolution.how };
+  const keys = resolution.keys;
+  const targetKeys = resolution.targetKeys;
   const isAboutTarget = (memory: MemoryObject) => targetKeys.some((key) => isAboutPerson(memory, key));
   const base = selectConversationDirectMatches(pool, latest, turns, keywordFrequency, limit, recall, purpose).kept.map((entry) => entry.memory);
   const aboutOther = (memory: MemoryObject) => keys.some((key) => !targetKeys.includes(key) && isAboutPerson(memory, key));
@@ -882,8 +988,8 @@ export function selectConversationWithPersons(
   });
 
   // 名前を除いた会話（名前だけで「重なる」としないため）
-  const query = keys.reduce((text, key) => text.split(key).join(" "), nfkcCompact((turns.length > 0 ? turns : [latest]).join(" ")).replace(/(さん|ちゃん|くん|君|様|氏)/g, " "));
-  const ownKeywordHits = (memory: MemoryObject) => (memory.keywords ?? []).filter((keyword) => !keys.includes(personNameKey(keyword)) && query.includes(nfkcCompact(keyword))).length;
+  const query = personMaskedQuery(turns, latest, keys);
+  const ownKeywordHits = (memory: MemoryObject) => ownKeywordHitsOf(memory, query, keys);
 
   const included = new Set(kept.map((memory) => memory.id));
   const candidates = pool.filter((memory) => isAboutTarget(memory) && !aboutOther(memory) && !included.has(memory.id));
@@ -908,20 +1014,11 @@ export function selectConversationWithPersons(
   //   - 変化の前の記録：それより前の、本人の言葉がある記録。気持ち・関係の言葉がある中で変化にいちばん近いもの、無ければ最も古いもの
   // AIの振り返り・尋ねただけの記録・別の人物も関わる記録は使わない。範囲はPERSON_ARC_MAX_AGE_DAYS以内の新しい順PERSON_ARC_SCAN_LIMIT件
   const arc: MemoryObject[] = [];
-  if (isRelationshipTalk(trimmed) && asksChange(latest)) {
-    const hasOwnWords = (memory: MemoryObject) => (memory.evidenceQuotes ?? []).some((quote) => typeof quote === "string" && quote.trim().length > 0);
-    const ownText = (memory: MemoryObject) => nfkcCompact([...(memory.evidenceQuotes ?? []).filter((quote) => typeof quote === "string"), memory.summary ?? ""].join("。"));
-    const own = pool
-      .filter((memory) => isAboutTarget(memory) && !aboutOther(memory) && !isReflectionMemory(memory) && !isRecallOnlyRecord(memory) && hasOwnWords(memory))
-      .filter((memory) => now - memoryTime(memory) <= PERSON_ARC_MAX_AGE_DAYS * DAY_MS_RETRIEVAL)
-      .sort((a, b) => memoryTime(b) - memoryTime(a))
-      .slice(0, PERSON_ARC_SCAN_LIMIT);
-    const cue = (memory: MemoryObject) => isFeelingRecord(memory) || relationCueIn(ownText(memory));
-    const change = own.find((memory) => ARC_CHANGE.test(ownText(memory)) && relationCueIn(ownText(memory))) ?? own.find((memory) => STATE_CHANGE.test(ownText(memory)));
-    const changeAt = change ? memoryTime(change) : Math.min(...own.filter((memory) => included.has(memory.id)).map(memoryTime), Infinity);
-    const before = own.filter((memory) => memory !== change && !included.has(memory.id) && memoryTime(memory) < changeAt);
-    const start = before.find(cue) ?? before[before.length - 1];
-    for (const memory of [start, change]) if (memory && !included.has(memory.id) && arc.length < PERSON_ARC_LIMIT) arc.push(memory);
+  // 変化の言い回しは companion/coach のゲートと共有する拡張語彙（asksPersonChange）。analyst は元々 isRelationshipTalk を
+  // 必須にし、人物も特定済みの文脈でのみ弧が動くため、差分は語彙の拡張だけ（D1）
+  if (isRelationshipTalk(trimmed) && asksPersonChange(latest)) {
+    const { change, before } = pickPersonArc(pool, { keys, targetKeys, includedIds: included, now });
+    for (const memory of [before, change]) if (memory && !included.has(memory.id) && arc.length < PERSON_ARC_LIMIT) arc.push(memory);
     arc.sort((a, b) => memoryTime(a) - memoryTime(b));
     for (const memory of arc) included.add(memory.id);
   }
@@ -1273,6 +1370,34 @@ export interface RetrieveRelevantMemoriesOptions {
   purposeRelevance?: boolean;
   /** P1-F：診断（`?debugLog=1`）のときだけ会話画面が渡す。結果は変えず、Reflectionの扱いを知らせる */
   onReflectionTrace?: (trace: ReflectionTrace) => void;
+  /**
+   * 評価用（会話画面は渡さない）：companion/coach の人物機構で「深い過去」とみなす境界（日数）を差し替える。
+   * 未指定は COMPANION_DEEP_PAST_DAYS。境界は暫定値であり、恒久的な製品ルールではない（評価で比較して決める）。
+   */
+  deepPastDays?: number;
+  /** 診断・評価用：人物機構の判定（特定した人物・ゲート・深い過去の除外・補完の入れ替え）を知らせる。結果は変えない */
+  onPersonTrace?: (trace: PersonRetrievalTrace) => void;
+}
+
+/**
+ * 「深い過去」の境界（日数。暫定）。ゲートが閉じているとき、対象人物の記録がこれより古く、人物以外のつながりが
+ * 無ければ候補から外す。評価フィクスチャでは「気まずい」記録（119日）が深く、「謝った」記録（70日）が深くない
+ * 境界にあり、90 はその中間。既存の暫定値と同じく、実データで調整する前提で1か所に置く。
+ */
+export const COMPANION_DEEP_PAST_DAYS = 90;
+
+/** companion/coach の人物機構の診断（評価・`?debugLog=1` 相当の用途だけ。選定そのものは変えない） */
+export interface PersonRetrievalTrace {
+  /** 段階1で特定した人物（特定できなければ null＝従来の選定そのまま） */
+  person: { key: string; how: "named" | "carried" } | null;
+  /** 段階3の変化／振り返りゲートが開いたか */
+  gateOpen: boolean;
+  /** P4：深い過去で、人物以外のつながりが無く候補から外した記録 */
+  excludedDeepPast: string[];
+  /** 段階4の補完で枠から出した記録（何の枠を空けたか） */
+  evictions: { memoryId: string; why: string; forId: string }[];
+  /** 段階4の補完で入れた記録と、その役割 */
+  completed: { memoryId: string; role: "newest" | "before" | "change" }[];
 }
 
 /**
@@ -1308,6 +1433,13 @@ export async function retrieveRelevantMemoriesImpl(
       // 診断の失敗で会話を止めない
     }
   };
+  const reportPerson = (trace: PersonRetrievalTrace) => {
+    try {
+      options.onPersonTrace?.(trace);
+    } catch {
+      // 診断の失敗で会話を止めない
+    }
+  };
 
   if (options.persona === "analyst") {
     if (options.deferReflections && !deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
@@ -1339,18 +1471,81 @@ export async function retrieveRelevantMemoriesImpl(
   const namesPerson = (memory: MemoryObject) =>
     (purpose?.namedPersons.length ?? 0) > 0 &&
     (memory.personMentions ?? []).some((p) => typeof p?.displayName === "string" && purpose!.namedPersons.includes(p.displayName.normalize("NFKC").trim()));
+
+  // companion/coach の人物機構（段階1〜4＋P4）。会話の画面（purposeRelevance）だけ有効で、Connect・Capture の候補探しは
+  // 従来どおり。人物が特定できなければ、このターンは従来の選定と1件も変わらない。人物の特定と深掘りは分ける：
+  // 特定だけでは記録は足さず、加点・他人のみの記録の除外・深い過去の除外（ゲートが閉じているとき）だけが効き、
+  // 時系列の補完は補完パス（上限切りの後）で、ゲートが開いたときだけ以前の端・変化の記録まで広げる。
+  const deepPastDays = options.deepPastDays ?? COMPANION_DEEP_PAST_DAYS;
+  const personRes = weakGate ? resolveTurnPerson(searchable, trimmed, options.recentUserTurnsTexts ?? [], options.personAliases ?? []) : null;
+  const personGateOpen = personRes ? personChangeGate(trimmed, personRes) : false;
+  const personTrace: PersonRetrievalTrace = {
+    person: personRes ? { key: personRes.key, how: personRes.how } : null,
+    gateOpen: personGateOpen,
+    excludedDeepPast: [],
+    evictions: [],
+    completed: [],
+  };
+  const isAboutTarget = (memory: MemoryObject) => personRes !== null && personRes.targetKeys.some((key) => isAboutPerson(memory, key));
+  const aboutOther = (memory: MemoryObject) => personRes !== null && personRes.keys.some((key) => !personRes.targetKeys.includes(key) && isAboutPerson(memory, key));
+  /** 別の人物だけの記録（対象人物と別の人物の両方に関わる記録は残す。analyst と同じ規則） */
+  const otherOnly = (memory: MemoryObject) => aboutOther(memory) && !isAboutTarget(memory);
+  const personNow = Date.now();
+  /** 対象人物の現在の端：Reflection を除いた最新の記録（現在の状態は本人の記録で表す） */
+  const newestTarget = personRes
+    ? (searchable.filter((memory) => isAboutTarget(memory) && !isReflectionMemory(memory)).sort((a, b) => memoryTime(b) - memoryTime(a))[0] ?? null)
+    : null;
+  // 名前を除いた会話（P4 の「人物以外のつながり」の判定用。analyst の ownKeywordHits と同じ作り）
+  const personQuery = personRes ? personMaskedQuery((options.recentUserTurnsTexts ?? []).map(normalizeTwoPeople), normalizeTwoPeople(trimmed), personRes.keys) : "";
+  const maskNames = (text: string) => {
+    if (!personRes) return text;
+    let masked = text ?? "";
+    for (const key of [...personRes.keys].sort((a, b) => Array.from(b).length - Array.from(a).length)) masked = masked.split(key).join("■");
+    return masked.replace(/(さん|ちゃん|くん|君|様|氏)/g, "■");
+  };
+  const maskedPoolTexts = personRes && !personGateOpen ? searchable.map((memory) => `${maskNames(memory.summary)} ${maskNames(memory.content)}`) : [];
+  /** 話題の語が人物名そのものか（P4 の受け皿では、人物名による話題の一致は「人物以外のつながり」に数えない） */
+  const isPersonNameTerm = (term: string) => (personRes?.keys ?? []).some((key) => key === term || key.includes(term) || term.includes(key));
+  /** P4 の受け皿：人物以外のつながりがあるか（最新の記録／名前以外のキーワードの一致／話題の一致・理由の記録／名前を伏せた文字列の共有） */
+  const hasNonPersonTie = (entry: { memory: MemoryObject; topicMatched: boolean; reasonAnswer: boolean }): boolean => {
+    if (!personRes) return true;
+    const memory = entry.memory;
+    if (newestTarget && memory.id === newestTarget.id) return true;
+    if (ownKeywordHitsOf(memory, personQuery, personRes.keys) >= 1) return true;
+    if (entry.topicMatched || entry.reasonAnswer) return true;
+    const maskedMemory = { ...memory, summary: maskNames(memory.summary), content: maskNames(memory.content) } as MemoryObject;
+    return hasDistinctSharedRun(maskNames(trimmed), maskedMemory, maskedPoolTexts);
+  };
+  /** P4：ゲートが閉じているとき、深い過去の対象人物の記録で、人物以外のつながりが無いものを候補から外す（ゲートが開けば全面的に緩む） */
+  const deepPastExcluded = (entry: { memory: MemoryObject; topicMatched: boolean; reasonAnswer: boolean }): boolean =>
+    personRes !== null && !personGateOpen && isAboutTarget(entry.memory) && personNow - memoryTime(entry.memory) > deepPastDays * DAY_MS_RETRIEVAL && !hasNonPersonTie(entry);
+
   const candidates = searchable
     .map((memory) => {
       const match = topic ? matchRecallTopic(memory, topic, trimmed) : null;
       const bonus = match ? (match.matched.length - match.coveredByKeyword.length) * KEYWORD_WEIGHT : 0;
+      // 段階2の加点：対象人物の記録に PERSON_CARRY_WEIGHT（adjustForPurpose の前。analyst の引き継ぎ加点と同じ位置・同じ値）
+      const personBonus = personRes && isAboutTarget(memory) ? PERSON_CARRY_WEIGHT : 0;
       // 件数・Reflectionの扱いより前に、質問の目的で加点・減点する（話題に一致する記録だけ。目的が無ければ尋ねただけの記録を後ろに回すだけ）
-      const adjusted = adjustForPurpose(memory, scoreMemory(memory, trimmed) + bonus, purpose, trimmed, (match?.matched.length ?? 0) > 0, KEYWORD_WEIGHT, CONVERSATION_MIN_SCORE);
-      return { memory, score: adjusted.score, onTopic: adjusted.onTopic, demoted: adjusted.demoted, reasonAnswer: adjusted.reasonAnswer === true };
+      const adjusted = adjustForPurpose(memory, scoreMemory(memory, trimmed) + bonus + personBonus, purpose, trimmed, (match?.matched.length ?? 0) > 0, KEYWORD_WEIGHT, CONVERSATION_MIN_SCORE);
+      // P4 の受け皿用の話題一致：人物名そのものの語による一致は除く（名前で一致しただけでは、深い過去のつながりにしない）
+      const topicMatched = match ? match.matched.some((term) => !isPersonNameTerm(term)) : false;
+      return { memory, score: adjusted.score, onTopic: adjusted.onTopic, demoted: adjusted.demoted, reasonAnswer: adjusted.reasonAnswer === true, topicMatched };
     })
     // スコア0（関連なし）は返さない。無理に件数を埋めない（MEMORY_ENGINE.md 7.4）。
     .filter((entry) => entry.score > 0)
     // 会話の画面だけ：キーワード・話題・人物のどれにも一致しない最低点未満の弱い記録は、珍しい続いた文字列を共有するときだけ（hasDistinctSharedRun）
-    .filter((entry) => !weakGate || entry.score >= CONVERSATION_MIN_SCORE || entry.onTopic || entry.reasonAnswer || namesPerson(entry.memory) || hasDistinctSharedRun(trimmed, entry.memory, poolTexts));
+    .filter((entry) => !weakGate || entry.score >= CONVERSATION_MIN_SCORE || entry.onTopic || entry.reasonAnswer || namesPerson(entry.memory) || hasDistinctSharedRun(trimmed, entry.memory, poolTexts))
+    // 段階2：別の人物だけの記録は候補に入れない（人物が特定できたときだけ）
+    .filter((entry) => !personRes || !otherOnly(entry.memory))
+    // P4：深い過去の除外（ゲートが閉じているときだけ。除外した記録は診断に残す）
+    .filter((entry) => {
+      if (!deepPastExcluded(entry)) return true;
+      personTrace.excludedDeepPast.push(entry.memory.id);
+      return false;
+    });
+  /** 補完パスの下限判定用：候補として成立していた記録（スコア計算・足切り・人物の除外を通過したもの） */
+  const candidateIds = new Set(candidates.map((entry) => entry.memory.id));
   // 過去を尋ねる質問（話題の語があるとき）・目的が分かる過去の質問：話題に一致せず、analystの最低点にも届かない弱い記録（文字の偶然の重なりだけ）は入れない（analystと同じ基準）
   // 過去の行動の理由を尋ねる質問（それだけのとき）も同じ。ただし、名前を挙げた人物の記録と、尋ねた行動（主題）の中の珍しい文字列を共有する記録は残す
   // （hasSubjectRun。「旅行をやめた」に「転職をやめた」は入れない）。本人の理由・訂正（reasonAnswer）は最低点＋1キーワード分あるので残る
@@ -1359,10 +1554,67 @@ export async function retrieveRelevantMemoriesImpl(
     ? candidates.filter((entry) => entry.onTopic || entry.score >= CONVERSATION_MIN_SCORE || (reasonOnly && (namesPerson(entry.memory) || hasSubjectRun(entry.memory, poolTexts, purpose!.reasonSubject!))))
     : candidates)
     .sort((a, b) => b.score - a.score || Number(a.demoted) - Number(b.demoted))
-    .map(({ memory, score }) => ({ memory, score }));
+    .map(({ memory, score, reasonAnswer }) => ({ memory, score, reasonAnswer }));
   // P1-F：会話のRetrievalだけ、Reflectionを本人の記録の後に回す（未指定なら従来の順のまま）
   const deferred = deferReflections ? deferReflectionItems(ranked, (entry) => entry.memory, limit, (entry) => entry.score) : null;
-  const scored = (deferred ? deferred.items : ranked).slice(0, limit);
+  let scored = (deferred ? deferred.items : ranked).slice(0, limit);
+
+  // 段階2の保証＋段階4の補完（枠内の入れ替えだけ。追加枠は作らない）。Reflection の後ろ倒しの後に置く
+  // （後ろ倒しで落ちた記録を補完が拾い直さないため）。人物が特定できなければ何もしない。
+  // 処理は優先順に1件ずつ：現在の端 →（ゲートが開いているとき）以前の端 → 変化の記録。
+  // 弧の選定は、現在の端の入れ替えが終わった後の選定に対して行う（入れ替えで外れた記録が「以前の端」になりうるため）。
+  if (personRes) {
+    const droppedByDefer = new Set((deferred?.trace.dropped ?? []).map((d) => d.memoryId));
+    const scoreOf = new Map(ranked.map((entry) => [entry.memory.id, entry.score] as const));
+    /** 弧の候補条件（対象人物だけ・本人の言葉・Reflection でない・尋ねただけではない・365日以内）。最新保証の下限の片方 */
+    const arcEligible = (memory: MemoryObject) =>
+      isAboutTarget(memory) && !aboutOther(memory) && !isReflectionMemory(memory) && !isRecallOnlyRecord(memory) &&
+      (memory.evidenceQuotes ?? []).some((quote) => typeof quote === "string" && quote.trim().length > 0) &&
+      personNow - memoryTime(memory) <= PERSON_ARC_MAX_AGE_DAYS * DAY_MS_RETRIEVAL;
+    const appended = new Set<string>();
+    /** 追い出しから保護する記録：既に満たされた必要な記録と、変化の時点の基準になった変化の記録 */
+    const protectedIds = new Set<string>();
+    const tryComplete = (memory: MemoryObject, role: "newest" | "before" | "change") => {
+      if (scored.some((entry) => entry.memory.id === memory.id) || appended.has(memory.id)) {
+        protectedIds.add(memory.id);
+        return;
+      }
+      const evictable = scored.filter((entry) => !protectedIds.has(entry.memory.id) && !appended.has(entry.memory.id) && !entry.reasonAnswer);
+      // 第1順位：対象人物に関わらない記録（スコアの低いものから）。第2順位：対象人物の記録のうち必要な記録でないもの（低いものから、同点なら古いものから）
+      const victim =
+        evictable.filter((entry) => !isAboutTarget(entry.memory)).sort((a, b) => a.score - b.score)[0] ??
+        evictable.filter((entry) => isAboutTarget(entry.memory)).sort((a, b) => a.score - b.score || memoryTime(a.memory) - memoryTime(b.memory))[0];
+      if (!victim) return; // 追い出せる記録が無ければ、その必要な記録は諦める（ペアは不完全のまま）
+      scored = scored.filter((entry) => entry.memory.id !== victim.memory.id);
+      scored = [...scored, { memory, score: scoreOf.get(memory.id) ?? 0, reasonAnswer: false }];
+      appended.add(memory.id);
+      protectedIds.add(memory.id);
+      personTrace.evictions.push({
+        memoryId: victim.memory.id,
+        why: isAboutTarget(victim.memory) ? "補完のため除外：対象人物の記録だが、現在の端・以前の端・変化の記録ではない" : "補完のため除外：対象人物の記録ではない",
+        forId: memory.id,
+      });
+      personTrace.completed.push({ memoryId: memory.id, role });
+    };
+    // 現在の端（ゲートの開閉によらず）。下限：候補として成立していた、または弧の候補条件を満たす記録だけを保証する
+    if (newestTarget && !droppedByDefer.has(newestTarget.id) && (candidateIds.has(newestTarget.id) || arcEligible(newestTarget))) {
+      tryComplete(newestTarget, "newest");
+    }
+    if (personGateOpen) {
+      const includedIds = new Set(scored.map((entry) => entry.memory.id));
+      const arc = pickPersonArc(searchable, { keys: personRes.keys, targetKeys: personRes.targetKeys, includedIds, now: personNow });
+      // 変化の記録が既に選定内にあるときは「時点の基準」として満たされたものとし、追い出しから保護する
+      if (arc.change && includedIds.has(arc.change.id)) protectedIds.add(arc.change.id);
+      if (arc.before && !droppedByDefer.has(arc.before.id)) tryComplete(arc.before, "before");
+      if (arc.change && !includedIds.has(arc.change.id) && !droppedByDefer.has(arc.change.id)) tryComplete(arc.change, "change");
+    }
+    if (appended.size > 0) {
+      // 補完した記録は直接一致の末尾に古い順で置く（analyst が弧を古い順に渡す流儀に合わせ、時系列として読めるように）
+      const tail = scored.filter((entry) => appended.has(entry.memory.id)).sort((a, b) => memoryTime(a.memory) - memoryTime(b.memory));
+      scored = [...scored.filter((entry) => !appended.has(entry.memory.id)), ...tail];
+    }
+  }
+  if (weakGate) reportPerson(personTrace);
 
   const directMatches = scored.map((entry) => entry.memory);
   const results: RetrievedMemory[] = directMatches.map((memory) => withTrait(toRetrievedMemory(memory, undefined, undefined, context), memory, purpose));
@@ -1373,6 +1625,17 @@ export async function retrieveRelevantMemoriesImpl(
     const allById = new Map(all.map((memory) => [memory.id, memory]));
     const excludeIds = new Set(directMatches.map((memory) => memory.id));
     const ownConversations = new Set(directMatches.filter((memory) => !isReflectionMemory(memory)).map((memory) => memory.conversationId).filter(Boolean));
+    // §6.4：人物が特定できたときは、Link経由でも別の人物だけの記録と、つながりの無い深い過去の記録を入れない
+    // （直接一致で塞いだ問題が +1 件の裏口から戻らないように。候補として残った記録は、その記録自身のつながり判定を使う）
+    const candidateById = new Map(candidates.map((entry) => [entry.memory.id, entry] as const));
+    const personSkip = personRes
+      ? (candidate: MemoryObject) =>
+          otherOnly(candidate) ||
+          deepPastExcluded(candidateById.get(candidate.id) ?? { memory: candidate, topicMatched: topic ? matchRecallTopic(candidate, topic, trimmed).matched.some((term) => !isPersonNameTerm(term)) : false, reasonAnswer: false })
+      : null;
+    const reflectionSkip = deferReflections
+      ? (candidate: MemoryObject) => isReflectionMemory(candidate) && ((Boolean(candidate.conversationId) && ownConversations.has(candidate.conversationId)) || (deferred?.trace.dropped.some((d) => d.memoryId === candidate.id) ?? false))
+      : null;
     const additions = pickLinkedAdditions(
       directMatches,
       allById,
@@ -1380,7 +1643,7 @@ export async function retrieveRelevantMemoriesImpl(
       maxLinkedAdditions,
       options.excludeConversationId,
       // Link経由でも、同じ会話の本人の記録がある・枠から外したReflectionは入れない（診断の表示と食い違わないように）
-      deferReflections ? (candidate) => isReflectionMemory(candidate) && ((Boolean(candidate.conversationId) && ownConversations.has(candidate.conversationId)) || (deferred?.trace.dropped.some((d) => d.memoryId === candidate.id) ?? false)) : undefined
+      reflectionSkip || personSkip ? (candidate) => (reflectionSkip?.(candidate) ?? false) || (personSkip?.(candidate) ?? false) : undefined
     );
     for (const addition of additions) {
       results.push(toRetrievedMemory(addition.memory, addition.reason, undefined, context));
