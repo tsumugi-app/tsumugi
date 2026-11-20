@@ -14,10 +14,14 @@ import {
   PERSON_ARC_LIMIT,
   PERSON_ARC_SCAN_LIMIT,
   PERSON_EXTRA_LIMIT,
+  personChangeGate,
   personKeysInText,
+  pickPersonArc,
+  resolveTurnPerson,
   selectConversationDirectMatches,
   selectConversationWithPersons,
 } from "./retrieval";
+import { asksPersonChange } from "./recordRelevance";
 import type { MemoryObject } from "./types";
 
 const at = (d: string) => `${d}T12:00:00.000Z`;
@@ -298,4 +302,99 @@ test("person arc (review on this PR): the change already selected is the anchor;
     mem("n4", "2026-10-20", ["ゆうきさん", "映画"], "ゆうきさんと映画を観たと話した。", "ゆうきさん"),
   ];
   assert.deepEqual(select(nearest, ASK).arc, ["n2", "n3"]);
+});
+
+test("resolveTurnPerson (shared stage 1): named, carried, and null when ambiguous or switched", () => {
+  const named = resolveTurnPerson(POOL, "さきさんと最近どうしてる？", ["さきさんと最近どうしてる？"]);
+  assert.equal(named?.key, "さき");
+  assert.equal(named?.how, "named");
+  assert.deepEqual(named?.targetKeys, ["さき"]);
+  // two names in the latest turn: no resolution (the caller keeps the previous selection)
+  assert.equal(resolveTurnPerson(POOL, "さきさんと渡邊さんのこと", ["さきさんと渡邊さんのこと"]), null);
+  // carried: the name was in an earlier turn and the latest turn refers to the same person
+  const carried = resolveTurnPerson(POOL, "あの人とは、もう大丈夫な気がする", ["さきさんのことなんだけど", "あの人とは、もう大丈夫な気がする"]);
+  assert.equal(carried?.key, "さき");
+  assert.equal(carried?.how, "carried");
+  // a topic switch in the latest turn breaks the carry
+  assert.equal(resolveTurnPerson(POOL, "ところで、来週の旅行の行き先は？", ["さきさんのことなんだけど", "ところで、来週の旅行の行き先は？"]), null);
+  // no person anywhere: null
+  assert.equal(resolveTurnPerson(POOL, "今日は雨で洗濯物が乾かない", ["今日は雨で洗濯物が乾かない"]), null);
+});
+
+test("personChangeGate (shared stage 3): opens only for a change about the resolved person", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // (a) relationship talk in the utterance itself
+  assert.equal(personChangeGate("ゆうきさんのこと、前ほどモヤモヤしなくなった気がする", yuki), true);
+  assert.equal(personChangeGate("ゆうきさんとの関係、最近どうなってきてるんだろう", yuki), true);
+  // (b) a person reference in the same sentence as the change word (carried person, no name)
+  assert.equal(personChangeGate("あの人のことを考える時間が減った", yuki), true);
+  // a change in a different sentence, about something else: closed (the person's past is not dug up for a weight change)
+  assert.equal(personChangeGate("ゆうきさんと明日ランチ。そういえば体重が減った", yuki), false);
+  assert.equal(personChangeGate("体重が減った", yuki), false);
+  // no change wording: closed, however relational the talk is
+  assert.equal(personChangeGate("ゆうきさんと明日ランチに行くことになったよ", yuki), false);
+  // 大丈夫 is a state, not a change wording (not in the lexicon)
+  assert.equal(personChangeGate("あの人とは、もう大丈夫な気がする", yuki), false);
+});
+
+test("personChangeGate: a topic-switch opener (「話は変わるけど」) is not a change of the person (Codex [P2] on PR #61)", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // the 変わ of the topic-switch idiom is about the topic, not the person: the shared detection does not see a change,
+  // so the gate stays closed and the deep-past exclusion keeps working for a plain lunch update
+  for (const opener of ["話は変わるけど", "話変わるけど", "話は変わって", "話が変わるけど", "話は変わりますが"]) {
+    const text = `${opener}、ゆうきさんと明日ランチに行くよ`;
+    assert.equal(asksPersonChange(text), false, opener);
+    assert.equal(personChangeGate(text, yuki), false, opener);
+  }
+  // only the idiom is removed: a real change wording later in the same turn still opens the gate
+  assert.equal(personChangeGate("話は変わるけど、ゆうきさんとの関係は前より落ち着いた気がする", yuki), true);
+  // 話 itself is not excluded: a change in the way of talking with the person is a change of the person
+  assert.equal(asksPersonChange("ゆうきさんとの話し方が変わった"), true);
+  assert.equal(personChangeGate("ゆうきさんとの話し方が変わった", yuki), true);
+});
+
+test("personChangeGate: relationship evidence counts only in the sentence containing the change (Codex [P2] re-review on PR #61)", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // a relationship cue in ANOTHER sentence does not make an unrelated change a change of the person:
+  // the weight change is not about ゆうき, so the gate stays closed and the deep-past exclusion keeps working
+  assert.equal(personChangeGate("ゆうきさんに会いたい。最近、体重が減ったよ", yuki), false);
+  // control: no change wording anywhere — closed either way
+  assert.equal(personChangeGate("ゆうきさんに会いたい。最近、体重を測ったよ", yuki), false);
+  // the relationship cue and the change in the SAME sentence: still opens
+  assert.equal(personChangeGate("ゆうきさんに会いたいし、最近は前より話せるようになった気がする", yuki), true);
+  // (a) relationship talk inside the change's own sentence opens it too, even with no name / person cue / feeling word
+  assert.equal(personChangeGate("最近は関係が良くなってきた気がする", yuki), true);
+  // a change about the person in a later sentence still opens when its own sentence carries the evidence
+  assert.equal(personChangeGate("今日はいい天気だね。ゆうきさんのこと、前ほどモヤモヤしなくなった気がする", yuki), true);
+});
+
+test("personChangeGate: numeric two-people forms are normalized like person resolution (Codex [P2] re-review on PR #61)", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // 二人 / 2人 / ２人 are the same reference: the gate receives the same normalized text resolveTurnPerson works on,
+  // so the carried person's change opens identically in all three spellings
+  for (const form of ["二人", "2人", "２人"]) {
+    assert.equal(personChangeGate(`最近は${form}で話せるようになった`, yuki), true, form);
+  }
+  // normalization changes nothing else: no change wording stays closed in every spelling
+  for (const form of ["二人", "2人", "２人"]) {
+    assert.equal(personChangeGate(`明日は${form}でランチに行くよ`, yuki), false, form);
+  }
+});
+
+test("pickPersonArc (shared stage 4 picker): the same picks the analyst arc makes", () => {
+  const pool = [
+    mem("y1", "2026-06-07", ["ゆうきさん", "友人"], "ゆうきさんと約束のことで喧嘩したと話した。", "ゆうきさん"),
+    mem("y2", "2026-07-19", ["ゆうきさん"], "ゆうきさんとまだ気まずいと話した。", "ゆうきさん"),
+    mem("y3", "2026-09-06", ["ゆうきさん", "仲直り"], "ゆうきさんに謝って、また話せるようになったと話した。", "ゆうきさん"),
+    mem("y4", "2026-10-25", ["ゆうきさん", "自転車"], "ゆうきさんと一緒に自転車で出かけて楽しかったと話した。", "ゆうきさん"),
+  ];
+  const keys = ["ゆうき", "はると"];
+  // y3 (話せるようになった) is already selected: it is the change anchor; the before is the oldest record before it
+  const arc = pickPersonArc(pool, { keys, targetKeys: ["ゆうき"], includedIds: new Set(["y3", "y4"]), now: NOW });
+  assert.equal(arc.change?.id, "y3");
+  assert.equal(arc.before?.id, "y1");
+  // with y2 not selected and nothing else included, the before is still y1 here (気まずい is in no feeling list), as in the analyst arc
+  const arc2 = pickPersonArc(pool, { keys, targetKeys: ["ゆうき"], includedIds: new Set(["y4"]), now: NOW });
+  assert.equal(arc2.change?.id, "y3");
+  assert.equal(arc2.before?.id, "y1");
 });

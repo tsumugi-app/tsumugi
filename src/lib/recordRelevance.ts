@@ -46,7 +46,8 @@ export interface RelevanceSource {
 }
 
 const norm = (text: string) => (text ?? "").normalize("NFKC");
-const sentences = (text: string) => (norm(text).match(/[^。！？!?\n]+[。！？!?]*/g) ?? []).map((s) => s.trim()).filter((s) => s.length > 0);
+/** 文の分割（NFKC＋句読点）。retrieval.ts の変化ゲートも同じ流儀で文を見る */
+export const sentences = (text: string) => (norm(text).match(/[^。！？!?\n]+[。！？!?]*/g) ?? []).map((s) => s.trim()).filter((s) => s.length > 0);
 const quoteSentences = (memory: RelevanceSource) => (memory.evidenceQuotes ?? []).filter((q): q is string => typeof q === "string").flatMap(sentences);
 const HONORIFIC = /(?:さん|くん|君|ちゃん|様|氏)$/;
 const personNames = (memory: RelevanceSource) =>
@@ -63,6 +64,23 @@ const ASKS_QUESTION_FORM = /[?？]|っけ|かな$|かしら|ですか|でしょ�
 /** a change asked about or told (「どう変わってきた」「変化」「話せるようになった」): the change purpose, also the person arc of retrieval.ts */
 const CHANGE_ASK = /変わ|変化|ようになっ|変え/;
 export const asksChange = (text: string) => CHANGE_ASK.test(norm(text));
+/**
+ * 人物との関係の変化を尋ねる・語るときの、自然な変化の言い回しまで広げた語彙（retrieval.ts の人物の弧と、
+ * companion/coach の変化／振り返りゲートが共有する）。語幹で登録して活用を吸収する：
+ * 減っ（考える時間が減った）・増え・前ほど（過去との対比そのもの）・落ち着い・なくなっ（〜しなくなった）・
+ * 薄れ・なってき（どうなってきてる）。大丈夫・戻っ・慣れは入れない（状態の宣言・物理的な帰還・仕事への慣れと区別できないため）。
+ * 目的判定（PURPOSE_ASK の "change"）は広げない：あちらは「過去を尋ねる質問の目的」で、意味が違う。
+ */
+const PERSON_CHANGE_ASK = new RegExp(`${CHANGE_ASK.source}|減っ|増え|前ほど|落ち着い|なくなっ|薄れ|なってき`);
+/**
+ * 話題転換の言い回し（「話は変わるけど」「話変わるけど」「話は変わって」「話が変わる」など）は、人物の変化ではない：
+ * 変わるのは話題であって、その人物との関係ではない。検出の前に取り除く。共有する検出（asksPersonChange）で落とすので、
+ * companion/coach の変化ゲートと analyst の弧の発火条件の両方に効く（どちらの文脈でも、この言い回しは人物の変化を表さない）。
+ * 取り除くのは「話（題）」の直後に助詞「は／が」を介するか直に「変わ」が続く形だけ：「ゆうきさんとの話し方が変わった」のような、
+ * 話そのものの変化は落とさない。言い回しの後ろに本物の変化の言い回しが続けば、それは残る（「話は変わるけど、関係は落ち着いた」）。
+ */
+const TOPIC_SWITCH_PHRASE = /話題?(?:は|が)?変わ(?:る|ります|って)/g;
+export const asksPersonChange = (text: string) => PERSON_CHANGE_ASK.test(norm(text).replace(TOPIC_SWITCH_PHRASE, ""));
 const PURPOSE_ASK: { purpose: Exclude<QuestionPurpose, "personAction">; ask: RegExp }[] = [
   { purpose: "questions", ask: /質問|尋ね/ },
   { purpose: "wish", ask: /望|願|ほしかっ|欲しかっ|してほし|たかった/ },

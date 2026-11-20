@@ -314,7 +314,10 @@ test("8 the diagnostic order is the prompt order (every piece found in the real 
     assert.ok(i >= 0, `${u.index} ${u.route} ${u.part}「${probe}」 not found after ${cursor}`);
     cursor = i;
   }
-  for (const route of ["Recent Conversation", "Memory Graph", "Memory Synthesis", "Retrieval"] as const) assert.ok(units.some((u) => u.route === route), route);
+  // Memory Synthesis はこのケースでは出ない：companion の人物 Retrieval が咲さんの経緯（変化と理由）を
+  // 取得側で揃えるようになり、経緯の節は「取得が経緯を見せていないときだけ」という従来の条件で発火しない
+  // （設計 §9.2 の相互作用。必要な根拠 k1・k2・k5 がプロンプトに届くことはテスト15・21が担保する）
+  for (const route of ["Recent Conversation", "Memory Graph", "Retrieval"] as const) assert.ok(units.some((u) => u.route === route), route);
 });
 
 test("9 diagnostics on or off: the same request values, the same prompt, the same number of AI calls", async () => {
