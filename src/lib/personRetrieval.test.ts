@@ -21,6 +21,7 @@ import {
   selectConversationDirectMatches,
   selectConversationWithPersons,
 } from "./retrieval";
+import { asksPersonChange } from "./recordRelevance";
 import type { MemoryObject } from "./types";
 
 const at = (d: string) => `${d}T12:00:00.000Z`;
@@ -334,6 +335,22 @@ test("personChangeGate (shared stage 3): opens only for a change about the resol
   assert.equal(personChangeGate("ゆうきさんと明日ランチに行くことになったよ", yuki), false);
   // 大丈夫 is a state, not a change wording (not in the lexicon)
   assert.equal(personChangeGate("あの人とは、もう大丈夫な気がする", yuki), false);
+});
+
+test("personChangeGate: a topic-switch opener (「話は変わるけど」) is not a change of the person (Codex [P2] on PR #61)", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // the 変わ of the topic-switch idiom is about the topic, not the person: the shared detection does not see a change,
+  // so the gate stays closed and the deep-past exclusion keeps working for a plain lunch update
+  for (const opener of ["話は変わるけど", "話変わるけど", "話は変わって", "話が変わるけど", "話は変わりますが"]) {
+    const text = `${opener}、ゆうきさんと明日ランチに行くよ`;
+    assert.equal(asksPersonChange(text), false, opener);
+    assert.equal(personChangeGate(text, yuki), false, opener);
+  }
+  // only the idiom is removed: a real change wording later in the same turn still opens the gate
+  assert.equal(personChangeGate("話は変わるけど、ゆうきさんとの関係は前より落ち着いた気がする", yuki), true);
+  // 話 itself is not excluded: a change in the way of talking with the person is a change of the person
+  assert.equal(asksPersonChange("ゆうきさんとの話し方が変わった"), true);
+  assert.equal(personChangeGate("ゆうきさんとの話し方が変わった", yuki), true);
 });
 
 test("pickPersonArc (shared stage 4 picker): the same picks the analyst arc makes", () => {

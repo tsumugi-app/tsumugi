@@ -72,7 +72,15 @@ export const asksChange = (text: string) => CHANGE_ASK.test(norm(text));
  * 目的判定（PURPOSE_ASK の "change"）は広げない：あちらは「過去を尋ねる質問の目的」で、意味が違う。
  */
 const PERSON_CHANGE_ASK = new RegExp(`${CHANGE_ASK.source}|減っ|増え|前ほど|落ち着い|なくなっ|薄れ|なってき`);
-export const asksPersonChange = (text: string) => PERSON_CHANGE_ASK.test(norm(text));
+/**
+ * 話題転換の言い回し（「話は変わるけど」「話変わるけど」「話は変わって」「話が変わる」など）は、人物の変化ではない：
+ * 変わるのは話題であって、その人物との関係ではない。検出の前に取り除く。共有する検出（asksPersonChange）で落とすので、
+ * companion/coach の変化ゲートと analyst の弧の発火条件の両方に効く（どちらの文脈でも、この言い回しは人物の変化を表さない）。
+ * 取り除くのは「話（題）」の直後に助詞「は／が」を介するか直に「変わ」が続く形だけ：「ゆうきさんとの話し方が変わった」のような、
+ * 話そのものの変化は落とさない。言い回しの後ろに本物の変化の言い回しが続けば、それは残る（「話は変わるけど、関係は落ち着いた」）。
+ */
+const TOPIC_SWITCH_PHRASE = /話題?(?:は|が)?変わ(?:る|ります|って)/g;
+export const asksPersonChange = (text: string) => PERSON_CHANGE_ASK.test(norm(text).replace(TOPIC_SWITCH_PHRASE, ""));
 const PURPOSE_ASK: { purpose: Exclude<QuestionPurpose, "personAction">; ask: RegExp }[] = [
   { purpose: "questions", ask: /質問|尋ね/ },
   { purpose: "wish", ask: /望|願|ほしかっ|欲しかっ|してほし|たかった/ },

@@ -355,6 +355,30 @@ test("E2: coach inherits the same person machinery as companion (D6: the shared 
   }
 });
 
+test("E2: a topic-switch opener does not open the change gate (Codex [P2] on PR #61: the old awkwardness record stays out)", async () => {
+  mock.timers.enable({ apis: ["Date"], now: world.EVAL_NOW });
+  try {
+    pool = world.evalMemories();
+    // the same lunch update, with and without the topic-switch opener: both keep the gate closed, so the deep-past
+    // fight / awkwardness records stay excluded instead of resurfacing through the opened gate (compare person-status-update)
+    for (const text of ["ゆうきさんと明日ランチに行くよ", "話は変わるけど、ゆうきさんと明日ランチに行くよ"]) {
+      let trace: import("./retrieval").PersonRetrievalTrace | null = null;
+      const results = await r.retrieveRelevantMemoriesImpl(text, {
+        excludeConversationId: "c-now", persona: "companion", recentUserTurnsTexts: [text], includeContext: true,
+        personAliases: [], deferReflections: true, recallTopic: true, purposeRelevance: true,
+        onPersonTrace: (t) => { trace = t; },
+      });
+      const captured = trace as import("./retrieval").PersonRetrievalTrace | null;
+      const ids = results.map((m) => m.id);
+      assert.equal(captured?.gateOpen, false, `the gate stays closed: ${text} (${ids.join(", ")})`);
+      assert.ok(!ids.includes("yuki-1") && !ids.includes("yuki-2"), `the deep past stays out: ${text} (${ids.join(", ")})`);
+      assert.ok(captured?.excludedDeepPast.includes("yuki-2"), `yuki-2 is excluded as deep past: ${text} (${(captured?.excludedDeepPast ?? []).join(", ")})`);
+    }
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test("E2: the app is untouched — the evaluation files are read by tests only, and call no AI", () => {
   const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
   const src = path.join(ROOT, "../src");
