@@ -925,17 +925,21 @@ export function pickPersonArc(
 
 /**
  * 段階3：変化／振り返りのゲート。開くのは、人物が1人特定できていて、最新発言に変化の言い回し（asksPersonChange）があり、
- * その変化がその人物についてのものである傍証が取れるときだけ：
- *   (a) 発言全体が関係・気持ちの話（isRelationshipTalk）、または
+ * その変化がその人物についてのものである傍証が取れるときだけ。傍証は「変化の語がある文」の中でだけ数える：
+ *   (a) 変化の語がある文そのものが関係・気持ちの話（isRelationshipTalk）、または
  *   (b) 変化の語がある同じ文に、その人物への言及（名前・人を指す言い方）がある、または
  *   (c) 変化の語がある文に気持ちの言葉がある。
- * 人物と無関係な変化（別の文の「体重が減った」など）では開かない。判定は最新発言だけ（直前の発言は見ない）。
+ * 別の文にある関係の合図では開かない（「ゆうきさんに会いたい。最近、体重が減ったよ」の「会いたい」は、
+ * 体重の変化をゆうきさんの変化にしない）。人物と無関係な変化では開かない、は文単位の原則（Codex 再レビュー [P2]）。
+ * 判定は最新発言だけ（直前の発言は見ない）。判定の前に normalizeTwoPeople を通して人物の特定と同じ土俵にし、
+ * 「二人」「2人」「２人」を同じ言及として扱う（Codex 再レビュー [P2]）。
  */
 export function personChangeGate(latest: string, person: { targetKeys: string[] }): boolean {
-  if (!asksPersonChange(latest)) return false;
-  if (isRelationshipTalk(latest)) return true;
-  for (const sentence of sentences(latest)) {
+  const text = normalizeTwoPeople(latest);
+  if (!asksPersonChange(text)) return false;
+  for (const sentence of sentences(text)) {
     if (!asksPersonChange(sentence)) continue;
+    if (isRelationshipTalk(sentence)) return true;
     if (personKeysInText(sentence, person.targetKeys).length > 0) return true;
     if (PERSON_REFERENCE_CUES.some((cue) => sentence.includes(cue))) return true;
     if (FEELING_WORDS.test(sentence)) return true;

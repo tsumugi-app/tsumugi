@@ -353,6 +353,34 @@ test("personChangeGate: a topic-switch opener (「話は変わるけど」) is n
   assert.equal(personChangeGate("ゆうきさんとの話し方が変わった", yuki), true);
 });
 
+test("personChangeGate: relationship evidence counts only in the sentence containing the change (Codex [P2] re-review on PR #61)", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // a relationship cue in ANOTHER sentence does not make an unrelated change a change of the person:
+  // the weight change is not about ゆうき, so the gate stays closed and the deep-past exclusion keeps working
+  assert.equal(personChangeGate("ゆうきさんに会いたい。最近、体重が減ったよ", yuki), false);
+  // control: no change wording anywhere — closed either way
+  assert.equal(personChangeGate("ゆうきさんに会いたい。最近、体重を測ったよ", yuki), false);
+  // the relationship cue and the change in the SAME sentence: still opens
+  assert.equal(personChangeGate("ゆうきさんに会いたいし、最近は前より話せるようになった気がする", yuki), true);
+  // (a) relationship talk inside the change's own sentence opens it too, even with no name / person cue / feeling word
+  assert.equal(personChangeGate("最近は関係が良くなってきた気がする", yuki), true);
+  // a change about the person in a later sentence still opens when its own sentence carries the evidence
+  assert.equal(personChangeGate("今日はいい天気だね。ゆうきさんのこと、前ほどモヤモヤしなくなった気がする", yuki), true);
+});
+
+test("personChangeGate: numeric two-people forms are normalized like person resolution (Codex [P2] re-review on PR #61)", () => {
+  const yuki = { targetKeys: ["ゆうき"] };
+  // 二人 / 2人 / ２人 are the same reference: the gate receives the same normalized text resolveTurnPerson works on,
+  // so the carried person's change opens identically in all three spellings
+  for (const form of ["二人", "2人", "２人"]) {
+    assert.equal(personChangeGate(`最近は${form}で話せるようになった`, yuki), true, form);
+  }
+  // normalization changes nothing else: no change wording stays closed in every spelling
+  for (const form of ["二人", "2人", "２人"]) {
+    assert.equal(personChangeGate(`明日は${form}でランチに行くよ`, yuki), false, form);
+  }
+});
+
 test("pickPersonArc (shared stage 4 picker): the same picks the analyst arc makes", () => {
   const pool = [
     mem("y1", "2026-06-07", ["ゆうきさん", "友人"], "ゆうきさんと約束のことで喧嘩したと話した。", "ゆうきさん"),

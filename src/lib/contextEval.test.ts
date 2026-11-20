@@ -379,6 +379,60 @@ test("E2: a topic-switch opener does not open the change gate (Codex [P2] on PR 
   }
 });
 
+test("E2: a relationship cue in another sentence does not open the change gate (Codex [P2] re-review on PR #61: the old fight record stays out)", async () => {
+  mock.timers.enable({ apis: ["Date"], now: world.EVAL_NOW });
+  try {
+    pool = world.evalMemories();
+    // 「会いたい」 in the first sentence is relationship talk, but the change in the second sentence is about weight,
+    // not about ゆうき: the gate must judge the evidence in the sentence containing the change, so it stays closed
+    // and the old fight record (yuki-1) stays excluded as deep past instead of resurfacing through the opened gate
+    for (const text of ["ゆうきさんに会いたい。最近、体重が減ったよ", "ゆうきさんに会いたい。最近、体重を測ったよ"]) {
+      let trace: import("./retrieval").PersonRetrievalTrace | null = null;
+      const results = await r.retrieveRelevantMemoriesImpl(text, {
+        excludeConversationId: "c-now", persona: "companion", recentUserTurnsTexts: [text], includeContext: true,
+        personAliases: [], deferReflections: true, recallTopic: true, purposeRelevance: true,
+        onPersonTrace: (t) => { trace = t; },
+      });
+      const captured = trace as import("./retrieval").PersonRetrievalTrace | null;
+      const ids = results.map((m) => m.id);
+      assert.equal(captured?.gateOpen, false, `the gate stays closed: ${text} (${ids.join(", ")})`);
+      assert.ok(!ids.includes("yuki-1"), `the old fight record stays out: ${text} (${ids.join(", ")})`);
+      if (text.includes("減った")) assert.ok(captured?.excludedDeepPast.includes("yuki-1"), `yuki-1 is excluded as deep past: ${text} (${(captured?.excludedDeepPast ?? []).join(", ")})`);
+    }
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("E2: numeric two-people forms open the gate identically in a carried conversation (Codex [P2] re-review on PR #61)", async () => {
+  mock.timers.enable({ apis: ["Date"], now: world.EVAL_NOW });
+  try {
+    pool = world.evalMemories();
+    // the person is carried from the previous turn; the change is told with 二人 / 2人 / ２人. Person resolution
+    // normalizes the numeric forms, so the gate must see the same text: all three spellings open the gate and
+    // complete the before/after pair (yuki-2 arrives) with identical selections
+    const selections: string[][] = [];
+    for (const form of ["二人", "2人", "２人"]) {
+      const latest = `最近は${form}で話せるようになった`;
+      let trace: import("./retrieval").PersonRetrievalTrace | null = null;
+      const results = await r.retrieveRelevantMemoriesImpl(latest, {
+        excludeConversationId: "c-now", persona: "companion", recentUserTurnsTexts: ["ゆうきさんのことなんだけど", latest], includeContext: true,
+        personAliases: [], deferReflections: true, recallTopic: true, purposeRelevance: true,
+        onPersonTrace: (t) => { trace = t; },
+      });
+      const captured = trace as import("./retrieval").PersonRetrievalTrace | null;
+      const ids = results.map((m) => m.id);
+      assert.equal(captured?.gateOpen, true, `the gate opens: ${form} (${ids.join(", ")})`);
+      assert.ok(ids.includes("yuki-2"), `the pair completes (yuki-2 arrives): ${form} (${ids.join(", ")})`);
+      selections.push(ids);
+    }
+    assert.deepEqual(selections[1], selections[0], "2人 selects exactly what 二人 selects");
+    assert.deepEqual(selections[2], selections[0], "２人 selects exactly what 二人 selects");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test("E2: the app is untouched — the evaluation files are read by tests only, and call no AI", () => {
   const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
   const src = path.join(ROOT, "../src");
