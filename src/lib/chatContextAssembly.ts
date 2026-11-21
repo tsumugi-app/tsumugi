@@ -19,6 +19,7 @@ import { buildExplicitSearchContext, type ExplicitSearchContext } from "./memory
 import { buildMemoryAnalyticsContext, type MemoryAnalyticsContext } from "./memoryAnalytics";
 import { safeSelectTimelineForTurn, type SynthesisThemeContext } from "./memorySynthesis";
 import { selectPersonContextsForTurn, withoutCoveredPersonViews, type PersonContext } from "./personContext";
+import { shapeDelivery } from "./deliveryShaping";
 import { StaleVaultTabError } from "./vaultWorldLock";
 import type { ReflectionTrace } from "./chatContextProvenance";
 import type { Conversation, ConversationTurn, MemoryObject, Persona, RetrievedMemory } from "./types";
@@ -59,6 +60,8 @@ export interface ChatContextInput {
   conversationId: string;
   promptedMemoryId?: string;
   persona: Persona;
+  /** リアルタイム日記の会話か（日記モードは配送の整形の対象外。未指定なら通常の会話として扱う） */
+  realtimeDiary?: boolean;
   /** 現在時刻（ミリ秒）を返す。直前の会話の判定に使う（切り出す前と同じく、会話の一覧を読み終えた時点で1回だけ呼ぶ）。会話の画面は Date.now */
   now: () => number;
 }
@@ -231,6 +234,28 @@ export async function assembleChatContext(input: ChatContextInput, sources: Chat
         allMemoriesForTopicContinuity.filter((memory) => memory.conversationId !== input.conversationId),
         { userText: text, retrievedMemoryIds: retrievedMemories.map((memory) => memory.id) }
       );
+    }
+    try {
+      // 配送の整形（deliveryShaping.ts）：経緯2チャネルの届ける量だけを、最後段のこの1か所で絞る。
+      // 拒否が1つでもあれば従来どおり全量（組み立てた値はバイト同一）。失敗しても整形なしで続行する。
+      const shaped = shapeDelivery({
+        text,
+        persona: input.persona,
+        realtimeDiary: input.realtimeDiary === true,
+        recentUserTurns: recentUserTurnsTexts,
+        pool: allMemoriesForTopicContinuity,
+        personAliases,
+        topicTimelineContext: topicTimelineContext ?? [],
+        memoryTimelineContext,
+        explicitSearchPresent: explicitSearchContext !== null,
+        memoryAnalyticsPresent: memoryAnalyticsContext !== null,
+      });
+      if (shaped.profile !== null) {
+        if (topicTimelineContext !== null) topicTimelineContext = [...shaped.topicTimelineContext];
+        memoryTimelineContext = [...shaped.memoryTimelineContext];
+      }
+    } catch (shapingError) {
+      console.error("Failed to shape delivered timelines", shapingError);
     }
   } catch (topicError) {
     if (topicError instanceof StaleVaultTabError) throw topicError;

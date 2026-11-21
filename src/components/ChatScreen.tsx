@@ -5009,7 +5009,7 @@ export default function ChatScreen() {
 
       // 過去の文脈（記憶の検索・直前の会話・話題・人物・経緯など）の組み立て。自動評価基盤 E1 で chatContextAssembly.ts へ切り出した（処理は同じ）
       const assembled = await assembleChatContext(
-        { text, turns: updated.turns, conversationId: baseConversation.id, promptedMemoryId: baseConversation.promptedMemoryId, persona: activePersona, now: Date.now },
+        { text, turns: updated.turns, conversationId: baseConversation.id, promptedMemoryId: baseConversation.promptedMemoryId, persona: activePersona, realtimeDiary: isOpenRealtimeDiary(baseConversation), now: Date.now },
         deviceChatContextSources,
         deviceChatContextFlags
       );

@@ -61,6 +61,12 @@ const ASKS_PAST = /た(?:の|ん|っけ|か|かな)?[?？]?$|ていた|でいた
 const VIEW_ASKED_BACK = /(?:思|考|感じ)(?:って|て)(?:い)?た/;
 const ASKS_QUESTION_FORM = /[?？]|っけ|かな$|かしら|ですか|でしょうか|(?:もの|こと|の)は$/;
 
+/** 質問の形をしていて、かつ過去を指す形をしている（「車のこと、どう考えてた？」など）。配送の整形の拒否7'が使う：過去を尋ねる質問には経緯が要るので整形しない。新しい語彙は足さず、このモジュールの既存の2つの正規表現の積だけを見る */
+export const asksPastQuestion = (text: string) => {
+  const normalized = norm(text).trim();
+  return ASKS_QUESTION_FORM.test(normalized) && ASKS_PAST.test(normalized);
+};
+
 /** a change asked about or told (「どう変わってきた」「変化」「話せるようになった」): the change purpose, also the person arc of retrieval.ts */
 const CHANGE_ASK = /変わ|変化|ようになっ|変え/;
 export const asksChange = (text: string) => CHANGE_ASK.test(norm(text));
