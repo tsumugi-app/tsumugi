@@ -1361,6 +1361,13 @@ export interface CorrectionFinalizationOptions {
  * 場合はアクセスを維持し、打ち消されていれば注記と訂正記録の対で「AI の文章である」ことと
  * 訂正を一緒に届ける（出典の区別は chat route が source から必ず表示する）。
  *
+ * 連鎖の扱い（Codex 再レビュー on PR #63）: 対として足した訂正記録も、元の結果と同じ
+ * 判定に通す。足した記録自体が打ち消されていれば、その注記・対も最終結果に含める
+ * （打ち消された理由が、裏付けとして無資格のまま残らないように）。判定は記録 id ごとに
+ * 1回だけ行うため、連鎖の長さに依らず進み、循環リンクでも同じ記録を二度判定せず必ず
+ * 止まる。欠損リンク（対象・訂正記録がプールに無い）は、視界にある範囲の注記・対で
+ * 安全に劣化する（壊れない・不正な配送をしない）。
+ *
  * 対象外（従来の位置に残す）: 検出（correction.ts）、記録経路の保証配送と薄さ対策の補完
  * （枠の入れ替えを伴う挿入）、Timeline / Synthesis の消費。
  */
@@ -1376,34 +1383,51 @@ export function finalizeCorrectionInvariants(
   const notes = new Map<string, { quote: string }>();
   const kept: RetrievedMemory[] = [];
   const extra: RetrievedMemory[] = [];
-  // (a) ペアリングと (b) 注記
-  for (const item of results) {
+  // (a) ペアリングと (b) 注記。対として足した訂正記録もキューに入れ、元の結果と同じ判定を
+  // 通す（訂正の連鎖: 足した記録自身の打ち消しも、注記・対として最終結果に含める）。
+  // 判定は記録 id ごとに1回だけ（processed）: 連鎖の長さに依らず進み、循環リンクでも
+  // 同じ記録を二度判定しないため必ず止まる。重複して届いた記録は最初の判定に従い、
+  // 対の追加は present で一意に保つ（同じ訂正記録を二重に足さない）。
+  const processed = new Set<string>();
+  const removedIds = new Set<string>();
+  const queue: { item: RetrievedMemory; appended: boolean }[] = results.map((item) => ({ item, appended: false }));
+  for (let head = 0; head < queue.length; head += 1) {
+    const { item, appended } = queue[head];
+    if (processed.has(item.id)) {
+      // 重複コピーは最初の判定に従う（追加分は判定時に振り分け済みなので、ここでは何もしない）
+      if (!appended && !removedIds.has(item.id)) kept.push(item);
+      continue;
+    }
+    processed.add(item.id);
+    const sink = appended ? extra : kept;
     const link = index.get(item.id);
     if (!link) {
-      kept.push(item);
+      sink.push(item);
       continue;
     }
     notes.set(item.id, { quote: link.correction.quote });
     if (present.has(link.correcting.id)) {
-      kept.push(item);
+      sink.push(item);
       continue;
     }
     const target = byId.get(item.id);
     const reflection = target ? isReflectionMemory(target) : item.source === "system-generated";
     if (!reflection) {
       // 本人の記録自体は事実として残す。注記が付くので、古い理由が単独で「今の理由」にはならない
-      kept.push(item);
+      sink.push(item);
       continue;
     }
     const correcting = byId.get(link.correcting.id);
     if (!correcting && !item.isOriginMemory) {
+      removedIds.add(item.id);
+      present.delete(item.id);
       options.onRemoved?.(item.id, "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）");
       continue;
     }
-    kept.push(item);
+    sink.push(item);
     if (correcting) {
-      extra.push(toRetrievedMemory(correcting, undefined, undefined, options.context));
       present.add(correcting.id);
+      queue.push({ item: toRetrievedMemory(correcting, undefined, undefined, options.context), appended: true });
     }
   }
   let finalized = [...kept, ...extra];
@@ -1421,6 +1445,22 @@ export function finalizeCorrectionInvariants(
       });
       if (!backed) options.onRemoved?.(item.id, "記録経路: 同じ話題の本人の記録が無く、訂正情報も無いReflectionは材料にしない");
       return backed;
+    });
+  }
+  // 欠損リンクへの最終防御: 対の訂正記録が最終結果に残らなかった打ち消された Reflection は、
+  // 注記が付いていても単独では渡さない。索引とプールが食い違う場合（訂正記録がプールに
+  // 無い等）でも、不変条件は最終結果に対して守る。通常の検出では訂正記録は本人の記録で
+  // 常にプールに在るため、ここには到達しない。
+  {
+    const surviving = new Set(finalized.map((item) => item.id));
+    finalized = finalized.filter((item) => {
+      const link = index.get(item.id);
+      if (!link || item.isOriginMemory || surviving.has(link.correcting.id)) return true;
+      const target = byId.get(item.id);
+      const reflection = target ? isReflectionMemory(target) : item.source === "system-generated";
+      if (!reflection) return true;
+      options.onRemoved?.(item.id, "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）");
+      return false;
     });
   }
   if (notes.size === 0) return finalized;

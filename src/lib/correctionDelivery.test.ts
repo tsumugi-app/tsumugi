@@ -325,6 +325,142 @@ test("最終確定 analyst: 記録リクエストでは、訂正情報の無い�
   assert.ok(!ids.includes("r-1"), `裏付けの無い r-1 は analyst の記録経路でも外れる (got: ${ids.join(",")})`);
 });
 
+// ---- 訂正の連鎖（Codex 再レビュー on PR #63: 最終確定で追加された訂正記録にも不変条件を適用する） ----
+const CHAIN_B_QUOTE = "給料って言ったけど、本当は今のチームを離れたくなかったからなんだ";
+const CHAIN_C_QUOTE = "チームって言ったけど、本当は家族との時間を優先したかったからなんだ";
+const corrQ = (targetMemoryId: string, day: string, conv: string, quote: string) => [
+  { id: `corr-${targetMemoryId}-${day}`, targetMemoryId, quote, statedAt: `${day}T03:00:00.000Z`, sourceConversationId: conv, recordedAt: `${day}T03:00:00.000Z`, schemaVersion: 1 as const },
+];
+/** Reflection A を本人の記録 B が訂正し、B を本人の記録 C がさらに訂正する世界（Codex の最小再現と同じ形） */
+const chainWorld = (): MemoryObject[] => [
+  mem("chain-a", "2026-06-05", "c-chain-a", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" }),
+  mem("chain-b", "2026-07-01", "c-chain-b", "転職をやめた理由を言い直した。", ["転職", "チーム"], { quote: CHAIN_B_QUOTE, corrections: corrQ("chain-a", "2026-07-01", "c-chain-b", CHAIN_B_QUOTE) }),
+  mem("chain-c", "2026-08-01", "c-chain-c", "転職をやめた理由をさらに言い直した。", ["転職", "家族"], { quote: CHAIN_C_QUOTE, corrections: corrQ("chain-b", "2026-08-01", "c-chain-c", CHAIN_C_QUOTE) }),
+];
+const rmOf = (m: MemoryObject): RetrievedMemory =>
+  ({ id: m.id, date: m.date, summary: m.summary, keywords: m.keywords }) as unknown as RetrievedMemory;
+
+test("最終確定 連鎖: 起点に呼び出したReflectionの訂正記録（B）自体が訂正（C）されている場合、Bにも注記が付く（Codex 再レビュー）", async () => {
+  pool = chainWorld();
+  const res = await r.retrieveRelevantMemoriesImpl("今日は天気がいいね", {
+    excludeConversationId: "now", persona: "companion", promptedMemoryId: "chain-a",
+    recentUserTurnsTexts: [], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true,
+  });
+  const ids = res.map((m) => m.id);
+  const a = res.find((m) => m.id === "chain-a");
+  assert.ok(a, "起点の chain-a は外されない");
+  assert.ok(a!.correctionNote && a!.correctionNote.quote.includes("チーム"), "chain-a には B の訂正注記が付く");
+  const b = res.find((m) => m.id === "chain-b");
+  assert.ok(b, `訂正記録 chain-b が対として届く (got: ${ids.join(",")})`);
+  assert.ok(b!.correctionNote, "最終確定で追加された chain-b にも訂正注記が付く（打ち消された理由が無資格で残らない）");
+  assert.ok(b!.correctionNote!.quote.includes("家族"), "chain-b の注記は C の訂正の逐語を含む");
+});
+
+test("最終確定 連鎖: analyst でも、追加された訂正記録に注記が付く（Codex 再レビュー）", async () => {
+  pool = chainWorld();
+  const res = await r.retrieveRelevantMemoriesImpl("今日は天気がいいね", {
+    excludeConversationId: "now", persona: "analyst", promptedMemoryId: "chain-a",
+    recentUserTurnsTexts: [], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true,
+  });
+  const ids = res.map((m) => m.id);
+  const a = res.find((m) => m.id === "chain-a");
+  assert.ok(a, `analyst でも起点の chain-a は外されない (got: ${ids.join(",")})`);
+  const b = res.find((m) => m.id === "chain-b");
+  assert.ok(b, `analyst でも訂正記録 chain-b が対として届く (got: ${ids.join(",")})`);
+  assert.ok(b!.correctionNote && b!.correctionNote.quote.includes("家族"), "analyst でも chain-b に C の訂正注記が付く");
+});
+
+test("最終確定 連鎖（直接）: 長い連鎖でも、最終結果に残る打ち消された記録は全て注記を持つ", () => {
+  const q = (n: string) => `訂正${n}の逐語、本当は理由${n}なんだ`;
+  const r0 = mem("lc-0", "2026-05-05", "c-lc0", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const u1 = mem("lc-1", "2026-06-01", "c-lc1", "転職をやめた理由を言い直した。", ["転職"], { quote: q("1"), corrections: corrQ("lc-0", "2026-06-01", "c-lc1", q("1")) });
+  const u2 = mem("lc-2", "2026-07-01", "c-lc2", "転職をやめた理由を言い直した。", ["転職"], { quote: q("2"), corrections: corrQ("lc-1", "2026-07-01", "c-lc2", q("2")) });
+  const u3 = mem("lc-3", "2026-08-01", "c-lc3", "転職をやめた理由を言い直した。", ["転職"], { quote: q("3"), corrections: corrQ("lc-2", "2026-08-01", "c-lc3", q("3")) });
+  const u4 = mem("lc-4", "2026-09-01", "c-lc4", "転職をやめた理由を言い直した。", ["転職"], { quote: q("4"), corrections: corrQ("lc-3", "2026-09-01", "c-lc4", q("4")) });
+  const out = r.finalizeCorrectionInvariants([rmOf(r0)], [r0, u1, u2, u3, u4], { recordRequest: false });
+  const ids = out.map((m) => m.id);
+  // 本人の記録の訂正は注記（逐語）で表す既存の規則どおり、対として届くのは直接の訂正 lc-1 まで。
+  // その lc-1 自身の打ち消しは、lc-2 の逐語の注記で表される
+  assert.deepEqual(ids, ["lc-0", "lc-1"], `連鎖の届く範囲 (got: ${ids.join(",")})`);
+  assert.equal(out.find((m) => m.id === "lc-0")!.correctionNote!.quote, q("1"), "lc-0 の注記は直接の訂正（lc-1）の逐語");
+  assert.equal(out.find((m) => m.id === "lc-1")!.correctionNote!.quote, q("2"), "追加された lc-1 の注記は、その訂正（lc-2）の逐語");
+});
+
+test("最終確定 連鎖（直接）: 連鎖の途中にReflectionがあっても、対の追加と注記が最後まで通る", () => {
+  const r0 = mem("mc-0", "2026-05-05", "c-mc0", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const r1 = mem("mc-1", "2026-06-05", "c-mc1", "転職を見送ったのは、チームの人間関係が理由だろう。", ["転職", "チーム"], { source: "system-generated", corrections: corrQ("mc-0", "2026-06-05", "c-mc1", "お金じゃなくて、本当はチームの人間関係なんだ") });
+  const u2 = mem("mc-2", "2026-07-01", "c-mc2", "転職をやめた理由を言い直した。", ["転職", "家族"], { quote: "本当は家族との時間を優先したかったからだ", corrections: corrQ("mc-1", "2026-07-01", "c-mc2", "チームじゃなくて、本当は家族との時間を優先したかったからだ") });
+  const out = r.finalizeCorrectionInvariants([rmOf(r0)], [r0, r1, u2], { recordRequest: false });
+  const ids = out.map((m) => m.id);
+  assert.deepEqual(ids, ["mc-0", "mc-1", "mc-2"], `Reflection の対、その対の対まで届く (got: ${ids.join(",")})`);
+  assert.ok(out.find((m) => m.id === "mc-0")!.correctionNote, "mc-0 に注記が付く");
+  assert.ok(out.find((m) => m.id === "mc-1")!.correctionNote, "追加された Reflection mc-1 にも注記が付く");
+  assert.equal(out.find((m) => m.id === "mc-2")!.correctionNote, undefined, "打ち消されていない訂正記録には注記は付かない");
+});
+
+test("最終確定 循環（直接）: 本人の記録同士の循環でも最終確定は止まり、注記が付く", () => {
+  const x = mem("cy-x", "2026-06-01", "c-cyx", "転職をやめた理由を述べた記録X。", ["転職"], { quote: "Xの逐語", corrections: corrQ("cy-y", "2026-06-01", "c-cyx", "Xの逐語") });
+  const y = mem("cy-y", "2026-07-01", "c-cyy", "転職をやめた理由を述べた記録Y。", ["転職"], { quote: "Yの逐語", corrections: corrQ("cy-x", "2026-07-01", "c-cyy", "Yの逐語") });
+  const out = r.finalizeCorrectionInvariants([rmOf(x)], [x, y], { recordRequest: false });
+  assert.deepEqual(out.map((m) => m.id), ["cy-x"], "本人の記録は事実として残る（対の追加はしない既存の規則）");
+  assert.equal(out[0].correctionNote!.quote, "Yの逐語", "循環でも直接の訂正の注記が付く");
+});
+
+test("最終確定 循環（直接）: Reflection同士の循環でも対と注記が付き、止まる", () => {
+  const p = mem("cy-p", "2026-06-05", "c-cyp", "転職を見送った理由についてのAIの解釈P。", ["転職"], { source: "system-generated", corrections: corrQ("cy-q", "2026-06-05", "c-cyp", "Pの逐語") });
+  const qq = mem("cy-q", "2026-07-05", "c-cyq", "転職を見送った理由についてのAIの解釈Q。", ["転職"], { source: "system-generated", corrections: corrQ("cy-p", "2026-07-05", "c-cyq", "Qの逐語") });
+  const out = r.finalizeCorrectionInvariants([rmOf(p)], [p, qq], { recordRequest: false });
+  assert.deepEqual(out.map((m) => m.id), ["cy-p", "cy-q"], "互いが対になり、無限に追加されない");
+  assert.ok(out.every((m) => m.correctionNote), "両方に注記が付く");
+});
+
+test("最終確定 欠損（直接）: 対象の無い訂正リンクは無視され、通常の記録はそのまま届く", () => {
+  const d = mem("ml-d", "2026-06-01", "c-mld", "何かを言い直した記録。", ["転職"], { quote: "言い直した", corrections: corrQ("ghost", "2026-06-01", "c-mld", "言い直した") });
+  const o = mem("ml-o", "2026-06-02", "c-mlo", "普通の記録。", ["旅行"], { quote: "旅行した" });
+  const out = r.finalizeCorrectionInvariants([rmOf(d), rmOf(o)], [d, o], { recordRequest: false });
+  assert.deepEqual(out.map((m) => m.id), ["ml-d", "ml-o"], "壊れたリンクがあっても結果は変わらない");
+  assert.ok(out.every((m) => !m.correctionNote), "実在しない対象へのリンクでは注記は付かない");
+});
+
+test("最終確定 欠損（直接）: 連鎖の先の訂正がプールに無い場合、視界にある範囲の注記で安全に劣化する", () => {
+  const worldPool = chainWorld().filter((m) => m.id !== "chain-c");
+  const a = worldPool.find((m) => m.id === "chain-a")!;
+  const out = r.finalizeCorrectionInvariants([rmOf(a)], worldPool, { recordRequest: false });
+  const ids = out.map((m) => m.id);
+  assert.deepEqual(ids, ["chain-a", "chain-b"], `対は届く (got: ${ids.join(",")})`);
+  assert.ok(out.find((m) => m.id === "chain-a")!.correctionNote, "chain-a には注記が付く");
+  assert.equal(out.find((m) => m.id === "chain-b")!.correctionNote, undefined, "プールに無い訂正は注記にできない（視界の範囲で劣化し、壊れない）");
+});
+
+test("最終確定 重複（直接）: 同じ訂正記録が2件の対象の対でも、追加は1回だけ", () => {
+  const a1 = mem("dp-1", "2026-06-05", "c-dp1", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const a2 = mem("dp-2", "2026-06-06", "c-dp2", "転職を見送ったのは、通勤が遠いからだろう。", ["転職", "通勤"], { source: "system-generated" });
+  const b = mem("dp-b", "2026-07-01", "c-dpb", "転職をやめた理由を言い直した。", ["転職", "チーム"], { quote: CHAIN_B_QUOTE, corrections: [...corrQ("dp-1", "2026-07-01", "c-dpb", CHAIN_B_QUOTE), ...corrQ("dp-2", "2026-07-01", "c-dpb", CHAIN_B_QUOTE)] });
+  const out = r.finalizeCorrectionInvariants([rmOf(a1), rmOf(a2)], [a1, a2, b], { recordRequest: false });
+  assert.equal(out.filter((m) => m.id === "dp-b").length, 1, "訂正記録は1回だけ追加される");
+  assert.ok(out.find((m) => m.id === "dp-1")!.correctionNote && out.find((m) => m.id === "dp-2")!.correctionNote, "両方の対象に注記が付く");
+});
+
+test("最終確定 重複（直接）: 同じ記録が二重に届いても、判定は一度だけ・対も一回だけ", () => {
+  const worldPool = chainWorld();
+  const a = worldPool.find((m) => m.id === "chain-a")!;
+  const out = r.finalizeCorrectionInvariants([rmOf(a), rmOf(a)], worldPool, { recordRequest: false });
+  assert.equal(out.filter((m) => m.id === "chain-a").length, 2, "入力の重複コピーは両方残る（従来どおり）");
+  assert.equal(out.filter((m) => m.id === "chain-b").length, 1, "対の追加は1回だけ");
+  assert.ok(out.filter((m) => m.id === "chain-a").every((m) => m.correctionNote), "両コピーに注記が付く");
+  assert.ok(out.find((m) => m.id === "chain-b")!.correctionNote, "追加された訂正記録にも注記が付く");
+});
+
+test("最終確定 通常（直接）: 訂正されていない記録には何もしない", () => {
+  const o1 = mem("od-1", "2026-05-01", "c-od1", "普通の記録1。", ["旅行"], { quote: "旅行した" });
+  const o2 = mem("od-2", "2026-05-02", "c-od2", "普通の記録2。", ["仕事"], { quote: "仕事した" });
+  const input = [rmOf(o1), rmOf(o2)];
+  const out = r.finalizeCorrectionInvariants(input, [...chainWorld(), o1, o2], { recordRequest: false });
+  assert.deepEqual(out.map((m) => m.id), ["od-1", "od-2"], "順序も件数も変わらない");
+  assert.ok(out.every((m) => !m.correctionNote), "注記は付かない");
+  assert.equal(out[0], input[0], "記録オブジェクト自体は書き換えない");
+});
+
 test("route検証: correctionNote は形と長さだけ検証され、壊れた値は落とされる", () => {
   const base = { id: "x", date: "2026-07-01T03:00:00.000Z", summary: "要約", keywords: ["転職"] } as unknown as RetrievedMemory;
   const ok = mc.sanitizeMemoryContext([{ ...base, correctionNote: { quote: "あ".repeat(120) } }], "");
