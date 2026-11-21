@@ -149,6 +149,23 @@ test("記録経路の薄さ対策: Reflectionが外れる話題では、本人�
   assert.ok(ids.includes("job-2"), `本人の記録 job-2 も補完で届く (got: ${ids.join(",")})`);
 });
 
+test("記録経路の補完は、別の話題のReflectionの裏付け（本人の記録）を追い出さない（Codex 再レビュー）", async () => {
+  // 枠が満杯（上限3）で、話題AのReflectionには本人の記録の裏付けがあり、話題BのReflectionには裏付けが無い場面。
+  // Bの補完の入れ替えでAの裏付け（最もスコアの低い a-1）を追い出すと、AのReflectionが
+  // 「裏付けあり」の判定のまま単独で残ってしまう（修正前は実際に [a-2, b-3] になった）。
+  const a1 = mem("a-1", "2026-03-01", "c-a1", "温泉旅行へ行った。宿の食事も美味しく、露天風呂にもゆっくり入った。地元の蕎麦屋にも寄って、家族への土産も買った。", ["旅行", "温泉"], { quote: "春に温泉旅行へ行った" });
+  const a2 = mem("a-2", "2026-03-02", "c-a2", "温泉とお金の話が心に残ったようだ。", ["旅行", "温泉"], { source: "system-generated" });
+  const b2 = mem("b-2", "2026-04-02", "c-b2", "お金の話、記録に残る不安が強かったようだ。", ["転職", "お金"], { source: "system-generated" });
+  const b3 = mem("b-3", "2026-05-01", "c-b3", "今はチームの雰囲気が良く、転職は考えていないと述べた。", ["転職", "チーム"], { quote: "最近はチームの雰囲気が良くて、転職は考えていない" });
+  pool = [a1, a2, b2, b3];
+  const res = await r.retrieveRelevantMemoriesImpl("温泉とお金の話、記録しておいて", {
+    excludeConversationId: "now", limit: 3, persona: "companion", recentUserTurnsTexts: [], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true,
+  });
+  const ids = res.map((m) => m.id);
+  assert.ok(ids.includes("b-3"), `話題Bの本人の記録 b-3 が補完で届く (got: ${ids.join(",")})`);
+  assert.ok(!(ids.includes("a-2") && !ids.includes("a-1")), `話題AのReflectionが裏付けなしで単独に残らない (got: ${ids.join(",")})`);
+});
+
 test("analyst P2-3: analyst経路でも、打ち消された記録には訂正注記が付く（選定は変えない）", async () => {
   const q = "転職をやめたのって、なんでだったっけ？";
   const res = await run(q, [], correctedEvalWorld(), "analyst");

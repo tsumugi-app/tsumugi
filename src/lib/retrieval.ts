@@ -1646,6 +1646,8 @@ export async function retrieveRelevantMemoriesImpl(
       const rankedScore = new Map(ranked.map((entry) => [entry.memory.id, entry.score] as const));
       const correctingIds = new Set([...correctionIndex.values()].map((link) => link.correcting.id));
       const appendedCorrections: MemoryObject[] = [];
+      /** 記録経路フォールバックの「裏付け」になっている本人の記録（補完の入れ替えで追い出さない。フォールバックの直前にだけ埋める） */
+      const fallbackProtectedIds = new Set<string>();
       const removedReflections: { memoryId: string; why: string }[] = [];
       /** 人物補完（tryComplete）と同じ作法: 原則は枠内の入れ替えだけ。理由の記録（reasonAnswer）と訂正記録は追い出さない */
       const addByEviction = (memory: MemoryObject): boolean => {
@@ -1658,7 +1660,7 @@ export async function retrieveRelevantMemoriesImpl(
           return true;
         }
         const victim = scored
-          .filter((entry) => !entry.reasonAnswer && !correctingIds.has(entry.memory.id) && !appendedCorrections.some((m) => m.id === entry.memory.id))
+          .filter((entry) => !entry.reasonAnswer && !correctingIds.has(entry.memory.id) && !fallbackProtectedIds.has(entry.memory.id) && !appendedCorrections.some((m) => m.id === entry.memory.id))
           .sort((a, b) => a.score - b.score || memoryTime(a.memory) - memoryTime(b.memory))[0];
         if (!victim) return false;
         scored = scored.filter((entry) => entry.memory.id !== victim.memory.id);
@@ -1705,6 +1707,17 @@ export async function retrieveRelevantMemoriesImpl(
       // 記録経路のフォールバック（訂正情報が無い Reflection の制限）
       if (recordRequest) {
         const beforeFallback = scored;
+        // 補完の入れ替えで、別の Reflection の「裏付け」になっている本人の記録を追い出さない
+        // （裏付けの判定は beforeFallback に対して行うため、追い出すと判定と実態が食い違い、
+        // 裏付けありとされた Reflection が単独で残ってしまう。Codex 再レビュー on PR #63）
+        for (const entry of beforeFallback) {
+          if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) continue;
+          for (const other of beforeFallback) {
+            if (other.memory.id !== entry.memory.id && !isReflectionMemory(other.memory) && shareThemeKeyword(other.memory, entry.memory)) {
+              fallbackProtectedIds.add(other.memory.id);
+            }
+          }
+        }
         // 薄さ対策（第2ラウンド）: Reflection だけがその話題の材料になっている場合、外す前に、
         // その話題の本人の記録（本人の逐語を持つもの、新しいものから最大2件）を補完する。
         // 本人の後の発言が基礎の検索で選ばれていない場面でも、記録が本人の言葉で厚みを保てる。
