@@ -132,6 +132,38 @@ test("Link経由で入った打ち消されたReflectionにも、ペアリング
   }
 });
 
+test("記録経路の保証 P2-2: 基礎の選定が空でも、その話題の訂正記録が必ず届く", async () => {
+  const p1 = mem("p-1", "2026-06-01", "c-p1", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], { quote: "転職はやめた。理由は給料が下がるからだ" });
+  const p2 = mem("p-2", "2026-07-01", "c-p2", "転職をやめた理由を言い直した。", ["転職", "チーム"], { quote: CORRECTION_QUOTE, corrections: corrTo("p-1", "2026-07-01", "c-p2") });
+  // 今の発言は記録リクエストのみ（話題の語なし）。基礎の選定は空になる組み立て
+  const res = await run("今日の分、記録しておいて", [N6_EARLIER], [p1, p2]);
+  const ids = res.map((m) => m.id);
+  assert.deepEqual(ids, ["p-2"], `選定が空でも訂正記録 p-2 だけが保証で届く (got: ${ids.join(",")})`);
+});
+
+test("記録経路の薄さ対策: Reflectionが外れる話題では、本人の後の発言が補完されて届く", async () => {
+  const res = await run(N6_TURN, [N6_EARLIER], world.evalMemories());
+  const ids = res.map((m) => m.id);
+  assert.ok(!ids.includes("job-refl"), "job-refl は従来どおり渡らない（安全条件は弱めない）");
+  assert.ok(ids.includes("job-3"), `本人の後の発言 job-3 が補完で届く (got: ${ids.join(",")})`);
+  assert.ok(ids.includes("job-2"), `本人の記録 job-2 も補完で届く (got: ${ids.join(",")})`);
+});
+
+test("analyst P2-3: analyst経路でも、打ち消された記録には訂正注記が付く（選定は変えない）", async () => {
+  const q = "転職をやめたのって、なんでだったっけ？";
+  const res = await run(q, [], correctedEvalWorld(), "analyst");
+  const ids = res.map((m) => m.id);
+  const refl = res.find((m) => m.id === "job-refl");
+  assert.ok(refl, `analyst でも job-refl が選ばれる (got: ${ids.join(",")})`);
+  assert.ok(refl!.correctionNote, "job-refl に訂正注記が付く");
+  assert.ok(refl!.correctionNote!.quote.includes("本当は"), "注記に本人の訂正の逐語が入る");
+  assert.ok(mc.memoryContextLines(refl!).includes("訂正あり"), "プロンプトの行にも訂正が出る");
+  const plain = res.find((m) => m.id === "job-1");
+  assert.ok(plain && !plain.correctionNote, "打ち消されていない記録には注記は付かない");
+  const bare = await run(q, [], world.evalMemories(), "analyst");
+  assert.ok(bare.every((m) => !m.correctionNote), "訂正情報の無い世界では analyst でも注記は付かない");
+});
+
 test("無関係な話題では訂正注記は付かない（漏れない）", async () => {
   const res = await run("ロードバイクっていくらだったっけ？", [], correctedEvalWorld());
   assert.ok(res.some((m) => m.id === "bike-2"), "自転車の記録は届く");

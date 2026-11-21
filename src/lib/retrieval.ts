@@ -1453,11 +1453,20 @@ export async function retrieveRelevantMemoriesImpl(
     const withOrigin = options.promptedMemoryId
       ? await ensureOriginMemoryIncluded(creativeResults, options.promptedMemoryId, context)
       : creativeResults;
-    if (!analystTrace) return withContext(withOrigin);
-    const trace: ReflectionTrace = analystTrace;
-    const final = await dropReflectionsCoveredByOwnRecords(withOrigin, trace);
-    report(trace);
-    return withContext(final);
+    const final = analystTrace ? await dropReflectionsCoveredByOwnRecords(withOrigin, analystTrace) : withOrigin;
+    if (analystTrace) report(analystTrace);
+    // N6 訂正優先（analyst、第2ラウンド P2-3）: 選定・ペアリング・除外は会話経路のまま変えず、
+    // 打ち消された記録に訂正注記（訂正の逐語）だけを付ける。保存された訂正が、persona を
+    // 切り替えても証拠から消えないようにするための最小対応（注記の描画は memoryContext が共通）。
+    const analystAll = await getAllMemoryObjects();
+    const analystIndex = correctionIndexOf(analystAll.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId)));
+    const annotated = analystIndex.size === 0
+      ? final
+      : final.map((item) => {
+          const link = analystIndex.get(item.id);
+          return link ? { ...item, correctionNote: { quote: link.correction.quote } } : item;
+        });
+    return withContext(annotated);
   }
 
   const limit = options.limit ?? DEFAULT_LIMIT;
@@ -1638,9 +1647,16 @@ export async function retrieveRelevantMemoriesImpl(
       const correctingIds = new Set([...correctionIndex.values()].map((link) => link.correcting.id));
       const appendedCorrections: MemoryObject[] = [];
       const removedReflections: { memoryId: string; why: string }[] = [];
-      /** 人物補完（tryComplete）と同じ作法: 枠内の入れ替えだけ。理由の記録（reasonAnswer）と訂正記録は追い出さない */
+      /** 人物補完（tryComplete）と同じ作法: 原則は枠内の入れ替えだけ。理由の記録（reasonAnswer）と訂正記録は追い出さない */
       const addByEviction = (memory: MemoryObject): boolean => {
         if (scored.some((entry) => entry.memory.id === memory.id)) return true;
+        // 枠に空きがある（上限未満）のに追い出せる記録が無い場合（選定が空・全て保護対象）は、
+        // 入れ替えではなく直接追加で保証を果たす（上限は超えない。第2ラウンド P2-2）
+        if (scored.length < limit) {
+          scored = [...scored, { memory, score: rankedScore.get(memory.id) ?? 0, reasonAnswer: false }];
+          appendedCorrections.push(memory);
+          return true;
+        }
         const victim = scored
           .filter((entry) => !entry.reasonAnswer && !correctingIds.has(entry.memory.id) && !appendedCorrections.some((m) => m.id === entry.memory.id))
           .sort((a, b) => a.score - b.score || memoryTime(a.memory) - memoryTime(b.memory))[0];
@@ -1689,7 +1705,22 @@ export async function retrieveRelevantMemoriesImpl(
       // 記録経路のフォールバック（訂正情報が無い Reflection の制限）
       if (recordRequest) {
         const beforeFallback = scored;
-        scored = beforeFallback.filter((entry) => {
+        // 薄さ対策（第2ラウンド）: Reflection だけがその話題の材料になっている場合、外す前に、
+        // その話題の本人の記録（本人の逐語を持つもの、新しいものから最大2件）を補完する。
+        // 本人の後の発言が基礎の検索で選ばれていない場面でも、記録が本人の言葉で厚みを保てる。
+        // Reflection 自体は従来どおり外す（補完した記録は下の「裏付け」判定に数えない）ため、
+        // 安全条件（古い AI の解釈を本人の確定した理由として単独で記録しない）は弱まらない。
+        for (const entry of beforeFallback) {
+          if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) continue;
+          const hasOwnCompany = beforeFallback.some((other) => other.memory.id !== entry.memory.id && !isReflectionMemory(other.memory) && shareThemeKeyword(other.memory, entry.memory));
+          if (hasOwnCompany) continue;
+          const ownCandidates = searchable
+            .filter((m) => !isReflectionMemory(m) && !scored.some((e) => e.memory.id === m.id) && shareThemeKeyword(m, entry.memory) && (m.evidenceQuotes ?? []).some((q) => typeof q === "string" && q.trim().length > 0))
+            .sort((a, b) => memoryTime(b) - memoryTime(a))
+            .slice(0, 2);
+          for (const candidate of ownCandidates) addByEviction(candidate);
+        }
+        scored = scored.filter((entry) => {
           if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) return true;
           return beforeFallback.some((other) => other.memory.id !== entry.memory.id && !isReflectionMemory(other.memory) && shareThemeKeyword(other.memory, entry.memory));
         });

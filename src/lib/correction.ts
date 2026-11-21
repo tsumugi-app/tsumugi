@@ -13,6 +13,8 @@
  * 2. 対象は (a) AI の解釈（Reflection、`system-generated`）か、(b) 理由を述べた本人の記録
  *    （既存の statesOwnReason の定義どおり）だけ。理由の追加（〜だけじゃなくて〜も／あと、等）は
  *    訂正ではない。迷ったらリンクを作らない（従来の挙動のままになる）。
+ *    さらに精度条件として、訂正文が対象の理由・解釈に実際に触れていること（engagesReason）を
+ *    要求する。同じ話題の別の事実（日付等）の訂正は、理由の記録を打ち消さない。
  * 3. 対象の本文は一切書き換えない。リンクは訂正した側の Memory の `corrections`（追加のみの
  *    optional フィールド）にだけ付く。古い Vault（フィールド無し）は従来どおり。
  *
@@ -21,7 +23,7 @@
  * Timeline の根拠の除外は memorySynthesis.ts が、それぞれ最小の範囲で行う。
  */
 import type { MemoryCorrection, MemoryObject } from "./types";
-import { CORRECTION_FORM } from "./personStance";
+import { CORRECTION_FORM, REASON_FORM } from "./personStance";
 import { isReflectionSource, sentences, statesOwnReason } from "./recordRelevance";
 import { isQuestionText } from "./explicitReason";
 import { isQuestionFormTerm } from "./recallQuestion";
@@ -100,6 +102,22 @@ function sharesTheme(correcting: MemoryObject, target: MemoryObject, sentence: s
 }
 
 /**
+ * 訂正文が、対象の「理由・解釈」に実際に触れているか（精度条件。第2ラウンドで追加）。
+ * 話題の共有だけでは足りない: 同じ話題の別の事実（日付・金額など）の訂正が、無関係な
+ * 理由記録を打ち消してしまう誤検出を防ぐ（Codex 再レビュー on PR #63）。
+ * 次のどちらかが必要:
+ * - 訂正文自体が理由を述べ直している（REASON_FORM: 〜からだ／理由は〜 等）。
+ * - 訂正文が、対象固有のキーワード（訂正側と共有しない語＝古い理由の内容語）を名指ししている
+ *   （例:「お金の不安じゃなくて、…」は対象の「お金」を含む）。
+ * どちらも無ければ、その訂正は別の事実に向けられたものとみなし、リンクしない（安全側）。
+ */
+function engagesReason(sentence: string, correcting: MemoryObject, target: MemoryObject): boolean {
+  if (REASON_FORM.test(sentence)) return true;
+  const ownKeys = new Set(themeKeywords(correcting));
+  return themeKeywords(target).some((k) => !ownKeys.has(k) && sentence.includes(k));
+}
+
+/**
  * 新しく保存される Memory が、過去のどの記録を訂正しているか（コードのみ・決定的）。
  * 対象の条件を全て満たすものだけ: 別の会話の記録／訂正より前に述べられた記録／AI の解釈か
  * 理由を述べた本人の記録／訂正と話題を共有。1件の訂正文が複数の対象に当たることはある
@@ -123,7 +141,7 @@ export function detectMemoryCorrections(memory: MemoryObject, pool: readonly Mem
     .sort((a, b) => timeOf(b) - timeOf(a));
   const out: MemoryCorrection[] = [];
   for (const target of targets) {
-    const sentence = correctionSentences.find((s) => sharesTheme(memory, target, s));
+    const sentence = correctionSentences.find((s) => sharesTheme(memory, target, s) && engagesReason(s, memory, target));
     if (!sentence) continue;
     out.push({
       id: opts.newId(),

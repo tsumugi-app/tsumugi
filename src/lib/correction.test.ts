@@ -89,6 +89,32 @@ test("検出(vi): 別の話題の訂正は混ざらない", () => {
   assert.deepEqual(detect(bikeCorrection, [bikeTarget]), [], "理由も解釈でもない記録は、同じ話題でも対象にならない");
 });
 
+test("検出 P2-1: 同じ話題の別の事実（日付）の訂正は、無関係な理由記録を打ち消さない", () => {
+  const target = mem("t-date-t", "2026-06-01", "c-a", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], "転職はやめた。理由は給料が下がるからだ");
+  const dateCorrection = mem("t-date", "2026-07-01", "c-b", "転職活動を始めた時期を言い直した。", ["転職", "時期"], "転職活動を始めたのは9月じゃなくて10月だった");
+  assert.deepEqual(detect(dateCorrection, [target]), [], "日付の訂正は理由の記録にリンクしない");
+});
+
+test("検出 P2-1: 日付の訂正は、同じ話題の Reflection（AIの解釈）も打ち消さない", () => {
+  const reflection = mem("t-date-r", "2026-06-22", "c-diary", "転職をやめたのは、お金への不安が強かったからだろう。", ["転職", "お金"], undefined, "system-generated");
+  const dateCorrection = mem("t-date2", "2026-07-01", "c-b", "転職活動を始めた時期を言い直した。", ["転職", "時期"], "転職活動を始めたのは9月じゃなくて10月だった");
+  assert.deepEqual(detect(dateCorrection, [reflection]), [], "理由に触れていない訂正は Reflection にもリンクしない");
+});
+
+test("検出 P2-1: 古い理由の内容を名指しで否定する訂正は、理由形が無くてもリンクする", () => {
+  const reflection = mem("t-neg-r", "2026-06-22", "c-diary", "転職をやめたのは、お金への不安が強かったからだろう。", ["転職", "お金"], undefined, "system-generated");
+  const negation = mem("t-neg", "2026-07-01", "c-b", "転職をやめた理由を言い直した。", ["転職", "チーム"], "お金の不安じゃなくて、今のチームを離れたくなかったんだ");
+  const found = detect(negation, [reflection]);
+  assert.deepEqual(found.map((x) => x.targetMemoryId), ["t-neg-r"], "対象固有の語（お金）への否定は理由への訂正とみなす");
+});
+
+test("検出 P2-1: 理由を述べ直す訂正は、古い理由の語を含まなくてもリンクする", () => {
+  const target = mem("t-re-t", "2026-06-01", "c-a", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], "転職はやめた。理由は給料が下がるからだ");
+  const restate = mem("t-re", "2026-07-01", "c-b", "転職をやめた理由を言い直した。", ["転職", "チーム"], "言い直すけど、理由は今のチームを離れたくなかったからだ");
+  const found = detect(restate, [target]);
+  assert.deepEqual(found.map((x) => x.targetMemoryId), ["t-re-t"], "理由の述べ直し（理由は〜からだ）は理由への訂正とみなす");
+});
+
 test("検出の安全側: 同じ理由を「というのも」で繰り返しただけでは訂正にしない（Codex on PR #63）", () => {
   const target = mem("t-echo", "2026-06-01", "c-a", "転職はやめることにした。理由は給料が下がるからだと話した。", ["転職", "給料"], "転職はやめた。理由は給料が下がるからだ");
   const echo = mem("t-echo2", "2026-07-01", "c-b", "理由を繰り返した。", ["転職", "給料"], "転職はやめた。というのも、給料が下がるからだ");
