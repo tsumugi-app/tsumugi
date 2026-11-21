@@ -261,6 +261,70 @@ test("Vault往復: corrections は Markdown に保存され、読み戻しても
   assert.equal(plainBack!.corrections, undefined, "古い形式のまま読める（後方互換）");
 });
 
+test("最終確定 R4-a: 訂正リンクの無いVaultで、Link経由で入った裏付けの無いReflectionが記録経路に残らない（監査の最小再現）", async () => {
+  // 監査（tsumugi-n6-design-audit.md §3）の世界: 訂正リンクは一切無い。
+  // 選定段階では job-refl は scored に無く、フォールバックの検査後に Link で入るのが欠陥だった。
+  const t1 = mem("t-1", "2026-03-01", "c-t1", "温泉旅行へ行った。露天風呂にもゆっくり入った。", ["旅行", "温泉"], { quote: "春に温泉旅行へ行った" });
+  const refl = mem("job-refl", "2026-06-05", "c-refl", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const linked = {
+    ...t1,
+    links: [{ id: "link-t1-refl", sourceId: "t-1", targetId: "job-refl", axis: "theme" as const, reason: "同じ時期の話題", contrast: false, strength: 0.9, createdBy: "auto-linked" as const, createdAt: "2026-10-05T03:00:00.000Z" }],
+  };
+  const res = await run("温泉旅行の話、記録しておいて", [], [linked, refl]);
+  const ids = res.map((m) => m.id);
+  assert.ok(ids.includes("t-1"), `本人の記録 t-1 は届く (got: ${ids.join(",")})`);
+  assert.ok(!ids.includes("job-refl"), `Link経由の job-refl は最終確定で外れる (got: ${ids.join(",")})`);
+});
+
+test("最終確定 起点Memory: 明示的に呼び出したReflectionは、記録経路でも外さない（出典の区別は保つ）", async () => {
+  const t1 = mem("t-1", "2026-03-01", "c-t1", "温泉旅行へ行った。露天風呂にもゆっくり入った。", ["旅行", "温泉"], { quote: "春に温泉旅行へ行った" });
+  const refl = mem("job-refl", "2026-06-05", "c-refl", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const linked = {
+    ...t1,
+    links: [{ id: "link-t1-refl", sourceId: "t-1", targetId: "job-refl", axis: "theme" as const, reason: "同じ時期の話題", contrast: false, strength: 0.9, createdBy: "auto-linked" as const, createdAt: "2026-10-05T03:00:00.000Z" }],
+  };
+  pool = [linked, refl];
+  const res = await r.retrieveRelevantMemoriesImpl("温泉旅行の話、記録しておいて", {
+    excludeConversationId: "now", persona: "companion", promptedMemoryId: "job-refl",
+    recentUserTurnsTexts: [], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true,
+  });
+  const origin = res.find((m) => m.id === "job-refl");
+  assert.ok(origin, "起点として呼び出した job-refl は残る");
+  assert.equal(origin!.isOriginMemory, true, "起点 Memory として届く");
+  assert.equal(origin!.source, "system-generated", "出典は AI の文章のまま（route が『本人の発言ではない』と表示する根拠）");
+});
+
+test("最終確定 起点Memory: 打ち消されたReflectionを呼び出した場合は、注記と訂正記録が対で届く", async () => {
+  pool = correctedEvalWorld();
+  const res = await r.retrieveRelevantMemoriesImpl("今日は天気がいいね", {
+    excludeConversationId: "now", persona: "companion", promptedMemoryId: "job-refl",
+    recentUserTurnsTexts: [], includeContext: true, deferReflections: true, recallTopic: true, purposeRelevance: true,
+  });
+  const ids = res.map((m) => m.id);
+  const origin = res.find((m) => m.id === "job-refl");
+  assert.ok(origin, "起点の job-refl は外されない");
+  assert.ok(origin!.correctionNote, "打ち消された記録として注記が付く");
+  assert.ok(ids.includes("job-3"), `訂正記録 job-3 が対として届く (got: ${ids.join(",")})`);
+});
+
+test("最終確定 analyst: 訂正記録が選定に無くても、打ち消されたReflectionは訂正と対＋注記で届く", async () => {
+  const r1 = mem("r-1", "2026-06-05", "c-r1", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const u2 = mem("u-2", "2026-07-01", "c-u2", "言い直した。", ["チーム"], { quote: CORRECTION_QUOTE, corrections: corrTo("r-1", "2026-07-01", "c-u2") });
+  const res = await run("転職をやめたのって、なんでだったっけ？", [], [r1, u2], "analyst");
+  const ids = res.map((m) => m.id);
+  const refl = res.find((m) => m.id === "r-1");
+  assert.ok(refl, `analyst でも r-1 が選ばれる (got: ${ids.join(",")})`);
+  assert.ok(refl!.correctionNote, "r-1 に訂正注記が付く");
+  assert.ok(ids.includes("u-2"), `訂正記録 u-2 が最終確定で対として届く (got: ${ids.join(",")})`);
+});
+
+test("最終確定 analyst: 記録リクエストでは、訂正情報の無い裏付けの無いReflectionを analyst でも渡さない", async () => {
+  const r1 = mem("r-1", "2026-06-05", "c-r1", "転職を見送ったのは、お金への不安が強かったからだろう。", ["転職", "お金"], { source: "system-generated" });
+  const res = await run("転職の話、記録しておいて", [], [r1], "analyst");
+  const ids = res.map((m) => m.id);
+  assert.ok(!ids.includes("r-1"), `裏付けの無い r-1 は analyst の記録経路でも外れる (got: ${ids.join(",")})`);
+});
+
 test("route検証: correctionNote は形と長さだけ検証され、壊れた値は落とされる", () => {
   const base = { id: "x", date: "2026-07-01T03:00:00.000Z", summary: "要約", keywords: ["転職"] } as unknown as RetrievedMemory;
   const ok = mc.sanitizeMemoryContext([{ ...base, correctionNote: { quote: "あ".repeat(120) } }], "");

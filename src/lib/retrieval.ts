@@ -1328,6 +1328,108 @@ async function dropReflectionsCoveredByOwnRecords(results: RetrievedMemory[], tr
   return results.filter((r) => !removed.has(r.id));
 }
 
+export interface CorrectionFinalizationOptions {
+  /** 記録・整理リクエストのターンか（記録経路フォールバックの適用条件） */
+  recordRequest: boolean;
+  /**
+   * フォールバックの「裏付け」に数えない記録の id（記録経路の薄さ対策で補完された本人の記録）。
+   * 補完は「Reflection を外した後の記録に本人の言葉を残す」ための挿入であり、Reflection を
+   * 残す根拠にはしない（従来の beforeFallback 基準の判定と最終結果の判定を一致させるため）。
+   */
+  nonBackingIds?: ReadonlySet<string>;
+  /** 会話の画面の文脈（添付する訂正記録にも本人の発言・人物を添えるため。toRetrievedMemory の context と同じ） */
+  context?: string[];
+  /** 外した Reflection の通知（診断トレース用。結果そのものは変えない） */
+  onRemoved?: (memoryId: string, why: string) => void;
+}
+
+/**
+ * N6 訂正優先（案B・最終確定、オーナー承認 2026-11-21）: 訂正に関する不変条件を、経路ごとに
+ * 途中段階のスナップショットへ書くのではなく、完成した結果リストに対して一箇所で言明する。
+ * companion / coach / analyst が共有し、各経路の「全ての追加・選定が終わった後」の最後の
+ * 段としてだけ呼ぶ（この関数の後に結果リストを変更する処理は置かない）。
+ *
+ * 検証する不変条件:
+ * (a) ペアリング: 打ち消された Reflection は、訂正記録と対でなければ渡さない（対にできない
+ *     場合は外す）。打ち消された本人の記録は残す（事実として）。
+ * (b) 注記: 打ち消された記録が結果に残る場合は、必ず訂正注記（本人の訂正の逐語）を付ける。
+ * (c) 記録経路フォールバック: 記録・整理リクエストでは、訂正情報の無い Reflection は、
+ *     最終結果の中に同じ話題の本人の記録が一緒に無ければ材料にしない（入口が直接スコア・
+ *     Link 追加・起点 Memory のどれでも同じ判定。索引が空の Vault でも働く）。
+ *
+ * 明示的な記録参照（起点 Memory、isOriginMemory）は外さない: 本人が特定の記録を呼び出した
+ * 場合はアクセスを維持し、打ち消されていれば注記と訂正記録の対で「AI の文章である」ことと
+ * 訂正を一緒に届ける（出典の区別は chat route が source から必ず表示する）。
+ *
+ * 対象外（従来の位置に残す）: 検出（correction.ts）、記録経路の保証配送と薄さ対策の補完
+ * （枠の入れ替えを伴う挿入）、Timeline / Synthesis の消費。
+ */
+export function finalizeCorrectionInvariants(
+  results: RetrievedMemory[],
+  pool: readonly MemoryObject[],
+  options: CorrectionFinalizationOptions
+): RetrievedMemory[] {
+  const index = correctionIndexOf(pool);
+  if (index.size === 0 && !options.recordRequest) return results;
+  const byId = new Map(pool.map((memory) => [memory.id, memory] as const));
+  const present = new Set(results.map((item) => item.id));
+  const notes = new Map<string, { quote: string }>();
+  const kept: RetrievedMemory[] = [];
+  const extra: RetrievedMemory[] = [];
+  // (a) ペアリングと (b) 注記
+  for (const item of results) {
+    const link = index.get(item.id);
+    if (!link) {
+      kept.push(item);
+      continue;
+    }
+    notes.set(item.id, { quote: link.correction.quote });
+    if (present.has(link.correcting.id)) {
+      kept.push(item);
+      continue;
+    }
+    const target = byId.get(item.id);
+    const reflection = target ? isReflectionMemory(target) : item.source === "system-generated";
+    if (!reflection) {
+      // 本人の記録自体は事実として残す。注記が付くので、古い理由が単独で「今の理由」にはならない
+      kept.push(item);
+      continue;
+    }
+    const correcting = byId.get(link.correcting.id);
+    if (!correcting && !item.isOriginMemory) {
+      options.onRemoved?.(item.id, "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）");
+      continue;
+    }
+    kept.push(item);
+    if (correcting) {
+      extra.push(toRetrievedMemory(correcting, undefined, undefined, options.context));
+      present.add(correcting.id);
+    }
+  }
+  let finalized = [...kept, ...extra];
+  // (c) 記録経路フォールバック（最終結果に対して判定する）
+  if (options.recordRequest) {
+    const nonBacking = options.nonBackingIds;
+    finalized = finalized.filter((item) => {
+      if (item.isOriginMemory || index.has(item.id)) return true;
+      const memory = byId.get(item.id);
+      if (!memory || !isReflectionMemory(memory)) return true;
+      const backed = finalized.some((other) => {
+        if (other.id === item.id || nonBacking?.has(other.id)) return false;
+        const otherMemory = byId.get(other.id);
+        return Boolean(otherMemory) && !isReflectionMemory(otherMemory as MemoryObject) && shareThemeKeyword(otherMemory as MemoryObject, memory);
+      });
+      if (!backed) options.onRemoved?.(item.id, "記録経路: 同じ話題の本人の記録が無く、訂正情報も無いReflectionは材料にしない");
+      return backed;
+    });
+  }
+  if (notes.size === 0) return finalized;
+  return finalized.map((item) => {
+    const note = notes.get(item.id);
+    return note ? { ...item, correctionNote: note } : item;
+  });
+}
+
 export interface RetrieveRelevantMemoriesOptions {
   excludeConversationId?: string;
   limit?: number;
@@ -1453,20 +1555,29 @@ export async function retrieveRelevantMemoriesImpl(
     const withOrigin = options.promptedMemoryId
       ? await ensureOriginMemoryIncluded(creativeResults, options.promptedMemoryId, context)
       : creativeResults;
-    const final = analystTrace ? await dropReflectionsCoveredByOwnRecords(withOrigin, analystTrace) : withOrigin;
-    if (analystTrace) report(analystTrace);
-    // N6 訂正優先（analyst、第2ラウンド P2-3）: 選定・ペアリング・除外は会話経路のまま変えず、
-    // 打ち消された記録に訂正注記（訂正の逐語）だけを付ける。保存された訂正が、persona を
-    // 切り替えても証拠から消えないようにするための最小対応（注記の描画は memoryContext が共通）。
+    const covered = analystTrace ? await dropReflectionsCoveredByOwnRecords(withOrigin, analystTrace) : withOrigin;
+    // N6 訂正優先（案B・最終確定）: analyst も会話経路と同じ最終確定関数を通す（ペアリング・
+    // 注記・記録経路フォールバックを最終結果に対して一括で適用。選定そのものは変えない）。
+    // 索引の土台は従来の注記パスと同じ（今の会話を除いたプール）。
     const analystAll = await getAllMemoryObjects();
-    const analystIndex = correctionIndexOf(analystAll.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId)));
-    const annotated = analystIndex.size === 0
-      ? final
-      : final.map((item) => {
-          const link = analystIndex.get(item.id);
-          return link ? { ...item, correctionNote: { quote: link.correction.quote } } : item;
-        });
-    return withContext(annotated);
+    const analystPool = analystAll.filter((memory) => !isSameConversation(memory.conversationId, options.excludeConversationId));
+    // analystTrace はコールバックで代入されるため、型検査のフロー解析では null に狭まって見える。実型で読み直す
+    const traceSnapshot = analystTrace as ReflectionTrace | null;
+    let analystOnRemoved: ((memoryId: string, why: string) => void) | undefined;
+    if (traceSnapshot) {
+      const trace = traceSnapshot;
+      analystOnRemoved = (memoryId, why) => {
+        trace.deferred = trace.deferred.filter((id) => id !== memoryId);
+        trace.dropped.push({ memoryId, why });
+      };
+    }
+    const finalized = finalizeCorrectionInvariants(covered, analystPool, {
+      recordRequest: isRecordRequestTurn(trimmed),
+      context,
+      onRemoved: analystOnRemoved,
+    });
+    if (analystTrace) report(analystTrace);
+    return withContext(finalized);
   }
 
   const limit = options.limit ?? DEFAULT_LIMIT;
@@ -1631,13 +1742,13 @@ export async function retrieveRelevantMemoriesImpl(
   if (weakGate) reportPerson(personTrace);
 
   // N6 訂正優先（案B 消費側＋案C 記録経路）: 会話の画面だけ（weakGate。人物機構と同じ境界）。
-  // 訂正情報が無い（古い Vault で索引が空）ときは、記録経路のフォールバック以外は何も変わらない。
-  // - 打ち消された Reflection は、訂正と対でなければ渡さない（対にできなければ外す）。
-  // - 打ち消された本人の記録は残すが、訂正の逐語つきの注記（correctionNote）を付ける。
-  // - 記録・整理のリクエストでは、その話題の訂正記録を、話題の語が今の発言になくても必ず入れる。
-  // - 記録経路のフォールバック: 訂正情報が無い Reflection は、同じ話題の本人の記録が一緒に
-  //   選ばれていなければ記録の材料にしない（古い AI の解釈が本人の確定した理由として記録されるのを防ぐ）。
-  const correctionNotes = new Map<string, { quote: string }>();
+  // ここで行うのは「選定への挿入」だけ（枠の入れ替えを伴うため、最終確定には含めない）:
+  // - 記録・整理のリクエストでは、その話題の訂正記録を、話題の語が今の発言になくても必ず入れる（保証配送）。
+  // - 記録経路の薄さ対策: 裏付けの無い Reflection だけが話題の材料になっている場合、その話題の
+  //   本人の記録を補完する（補完した記録は、最終確定のフォールバック判定では裏付けに数えない）。
+  // ペアリング・注記・フォールバックの不変条件そのものは途中段階では検査せず、結果が完成した後に
+  // finalizeCorrectionInvariants が最終結果に対して一括で適用する。
+  const fallbackCompletionIds = new Set<string>();
   if (weakGate) {
     const correctionIndex = correctionIndexOf(searchable);
     const recordRequest = isRecordRequestTurn(trimmed);
@@ -1646,9 +1757,8 @@ export async function retrieveRelevantMemoriesImpl(
       const rankedScore = new Map(ranked.map((entry) => [entry.memory.id, entry.score] as const));
       const correctingIds = new Set([...correctionIndex.values()].map((link) => link.correcting.id));
       const appendedCorrections: MemoryObject[] = [];
-      /** 記録経路フォールバックの「裏付け」になっている本人の記録（補完の入れ替えで追い出さない。フォールバックの直前にだけ埋める） */
+      /** 最終確定のフォールバック判定で「裏付け」になる本人の記録（補完の入れ替えで追い出さない） */
       const fallbackProtectedIds = new Set<string>();
-      const removedReflections: { memoryId: string; why: string }[] = [];
       /** 人物補完（tryComplete）と同じ作法: 原則は枠内の入れ替えだけ。理由の記録（reasonAnswer）と訂正記録は追い出さない */
       const addByEviction = (memory: MemoryObject): boolean => {
         if (scored.some((entry) => entry.memory.id === memory.id)) return true;
@@ -1686,30 +1796,13 @@ export async function retrieveRelevantMemoriesImpl(
           .slice(0, 2);
         for (const { memory } of themeCorrecting) addByEviction(memory);
       }
-      // ペアリング: 選定済みの打ち消された記録について、訂正が一緒に届く状態にする
-      for (const entry of [...scored]) {
-        const link = correctionIndex.get(entry.memory.id);
-        if (!link) continue;
-        if (scored.some((e) => e.memory.id === link.correcting.id)) {
-          correctionNotes.set(entry.memory.id, { quote: link.correction.quote });
-        } else if (isReflectionMemory(entry.memory)) {
-          if (addByEviction(link.correcting)) {
-            correctionNotes.set(entry.memory.id, { quote: link.correction.quote });
-          } else {
-            scored = scored.filter((e) => e.memory.id !== entry.memory.id);
-            removedReflections.push({ memoryId: entry.memory.id, why: "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）" });
-          }
-        } else {
-          // 本人の記録自体は事実として残す。注記が訂正の逐語を含むので、古い理由が単独で「今の理由」にはならない
-          correctionNotes.set(entry.memory.id, { quote: link.correction.quote });
-        }
-      }
-      // 記録経路のフォールバック（訂正情報が無い Reflection の制限）
+      // 記録経路のフォールバックに向けた挿入（裏付けの保護と薄さ対策の補完）。
+      // Reflection を外すかどうか自体は最終確定（finalizeCorrectionInvariants）が最終結果で判定する。
       if (recordRequest) {
         const beforeFallback = scored;
         // 補完の入れ替えで、別の Reflection の「裏付け」になっている本人の記録を追い出さない
-        // （裏付けの判定は beforeFallback に対して行うため、追い出すと判定と実態が食い違い、
-        // 裏付けありとされた Reflection が単独で残ってしまう。Codex 再レビュー on PR #63）
+        // （裏付けの判定は最終確定が最終結果に対して行うため、追い出すと最終結果で裏付けが
+        // 消え、裏付けありとされた Reflection が単独で残ってしまう。Codex 再レビュー on PR #63）
         for (const entry of beforeFallback) {
           if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) continue;
           for (const other of beforeFallback) {
@@ -1718,11 +1811,12 @@ export async function retrieveRelevantMemoriesImpl(
             }
           }
         }
-        // 薄さ対策（第2ラウンド）: Reflection だけがその話題の材料になっている場合、外す前に、
+        // 薄さ対策（第2ラウンド）: Reflection だけがその話題の材料になっている場合、外される前に、
         // その話題の本人の記録（本人の逐語を持つもの、新しいものから最大2件）を補完する。
         // 本人の後の発言が基礎の検索で選ばれていない場面でも、記録が本人の言葉で厚みを保てる。
-        // Reflection 自体は従来どおり外す（補完した記録は下の「裏付け」判定に数えない）ため、
-        // 安全条件（古い AI の解釈を本人の確定した理由として単独で記録しない）は弱まらない。
+        // Reflection 自体は最終確定で従来どおり外れる（補完した記録は最終確定の「裏付け」に
+        // 数えない＝fallbackCompletionIds に記録する）ため、安全条件（古い AI の解釈を本人の
+        // 確定した理由として単独で記録しない）は弱まらない。
         for (const entry of beforeFallback) {
           if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) continue;
           const hasOwnCompany = beforeFallback.some((other) => other.memory.id !== entry.memory.id && !isReflectionMemory(other.memory) && shareThemeKeyword(other.memory, entry.memory));
@@ -1731,26 +1825,14 @@ export async function retrieveRelevantMemoriesImpl(
             .filter((m) => !isReflectionMemory(m) && !scored.some((e) => e.memory.id === m.id) && shareThemeKeyword(m, entry.memory) && (m.evidenceQuotes ?? []).some((q) => typeof q === "string" && q.trim().length > 0))
             .sort((a, b) => memoryTime(b) - memoryTime(a))
             .slice(0, 2);
-          for (const candidate of ownCandidates) addByEviction(candidate);
-        }
-        scored = scored.filter((entry) => {
-          if (!isReflectionMemory(entry.memory) || correctionIndex.has(entry.memory.id)) return true;
-          return beforeFallback.some((other) => other.memory.id !== entry.memory.id && !isReflectionMemory(other.memory) && shareThemeKeyword(other.memory, entry.memory));
-        });
-        for (const entry of beforeFallback) {
-          if (isReflectionMemory(entry.memory) && !correctionIndex.has(entry.memory.id) && !scored.some((e) => e.memory.id === entry.memory.id)) {
-            removedReflections.push({ memoryId: entry.memory.id, why: "記録経路: 同じ話題の本人の記録が無く、訂正情報も無いReflectionは材料にしない" });
+          for (const candidate of ownCandidates) {
+            if (addByEviction(candidate)) fallbackCompletionIds.add(candidate.id);
           }
         }
       }
       if (appendedCorrections.length > 0) {
         const tail = scored.filter((entry) => appendedCorrections.some((m) => m.id === entry.memory.id)).sort((a, b) => memoryTime(a.memory) - memoryTime(b.memory));
         scored = [...scored.filter((entry) => !appendedCorrections.some((m) => m.id === entry.memory.id)), ...tail];
-      }
-      if (deferred && removedReflections.length > 0) {
-        const removedIds = new Set(removedReflections.map((d) => d.memoryId));
-        deferred.trace.deferred = deferred.trace.deferred.filter((id) => !removedIds.has(id));
-        deferred.trace.dropped.push(...removedReflections);
       }
     }
   }
@@ -1800,47 +1882,28 @@ export async function retrieveRelevantMemoriesImpl(
   }
   const capped = results.slice(0, limit + maxLinkedAdditions);
   let withOrigin = options.promptedMemoryId ? await ensureOriginMemoryIncluded(capped, options.promptedMemoryId, context) : capped;
-  // N6 訂正優先（最終強制）: Link経由・起点Memoryで入った打ち消された記録にも、選定へのペアリングと
-  // 同じ不変条件を適用する（打ち消された Reflection を単独で渡さない。Codex レビュー on PR #63）。
-  // 会話の画面だけ（weakGate）。訂正が一緒でない Reflection は、訂正を末尾に足して対にする。
-  if (weakGate) {
-    const finalIndex = correctionIndexOf(all);
-    if (finalIndex.size > 0) {
-      const allByIdFinal = new Map(all.map((memory) => [memory.id, memory] as const));
-      const present = new Set(withOrigin.map((item) => item.id));
-      const kept: RetrievedMemory[] = [];
-      const extra: RetrievedMemory[] = [];
-      for (const item of withOrigin) {
-        const link = finalIndex.get(item.id);
-        const target = link ? allByIdFinal.get(item.id) : undefined;
-        if (!link || !target) { kept.push(item); continue; }
-        if (present.has(link.correcting.id)) { correctionNotes.set(item.id, { quote: link.correction.quote }); kept.push(item); continue; }
-        if (isReflectionMemory(target)) {
-          const correcting = allByIdFinal.get(link.correcting.id);
-          if (!correcting) {
-            if (deferred) deferred.trace.dropped.push({ memoryId: item.id, why: "訂正と対にできないため除外（打ち消された解釈を単独で渡さない）" });
-            continue;
-          }
-          correctionNotes.set(item.id, { quote: link.correction.quote });
-          kept.push(item);
-          extra.push(toRetrievedMemory(correcting, undefined, undefined, context));
-          present.add(correcting.id);
-          continue;
-        }
-        correctionNotes.set(item.id, { quote: link.correction.quote });
-        kept.push(item);
-      }
-      withOrigin = [...kept, ...extra];
-    }
-  }
-  // N6 訂正優先: 打ち消された記録には訂正注記を付けて返す（注記が無ければ従来どおり）
-  const attachCorrectionNotes = (items: RetrievedMemory[]): RetrievedMemory[] =>
-    correctionNotes.size === 0 ? items : items.map((item) => { const note = correctionNotes.get(item.id); return note ? { ...item, correctionNote: note } : item; });
+  // P1-F: 結果全体で、同じ会話の本人の記録がある Reflection を外す。外すだけの処理は
+  // 不変条件を壊さないため、最終確定より前に置く（最終確定の後に結果は変更しない）。
   if (deferred) {
-    const final = await dropReflectionsCoveredByOwnRecords(withOrigin, deferred.trace);
-    report(deferred.trace);
-    return withContext(attachCorrectionNotes(final));
+    withOrigin = await dropReflectionsCoveredByOwnRecords(withOrigin, deferred.trace);
   }
-  if (options.deferReflections) report({ asksAboutReflection: true, deferred: [], dropped: [] });
-  return withContext(attachCorrectionNotes(withOrigin));
+  // N6 訂正優先（案B・最終確定）: 全ての追加・選定（直接一致・補完・Link 追加・起点 Memory・
+  // P1-F の除去）が終わった最終結果に対して、共有の最終確定関数が不変条件（ペアリング・
+  // 注記・記録経路フォールバック）を一括で適用する。会話の画面だけ（weakGate）。
+  const finalized = weakGate
+    ? finalizeCorrectionInvariants(withOrigin, all, {
+        recordRequest: isRecordRequestTurn(trimmed),
+        nonBackingIds: fallbackCompletionIds,
+        context,
+        onRemoved: deferred
+          ? (memoryId, why) => {
+              deferred.trace.deferred = deferred.trace.deferred.filter((id) => id !== memoryId);
+              deferred.trace.dropped.push({ memoryId, why });
+            }
+          : undefined,
+      })
+    : withOrigin;
+  if (deferred) report(deferred.trace);
+  if (options.deferReflections && !deferred) report({ asksAboutReflection: true, deferred: [], dropped: [] });
+  return withContext(finalized);
 }
