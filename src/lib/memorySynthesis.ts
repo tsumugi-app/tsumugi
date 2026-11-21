@@ -24,6 +24,7 @@
 import type { EventTimePrecision, MemoryObject } from "./types";
 import { normalizeAnalyticsKeyword } from "./memoryAnalytics";
 import { isQuestionFormTerm } from "./recallQuestion";
+import { correctionIndexOf } from "./correction";
 
 export type SynthesisKind = "change" | "pattern" | "tension";
 export type SynthesisSupport = "stated" | "derived" | "hypothesis";
@@ -215,6 +216,38 @@ export function buildSynthesisClusters(memories: MemoryObject[], options: { maxC
     if (!(span >= SYNTHESIS_LIMITS.minSpanDays * DAY_MS)) continue;
     candidates.push({ theme: g.theme, evidence: spreadOverTime(sorted, SYNTHESIS_LIMITS.maxEvidencePerCluster) });
   }
+  // N6 訂正優先: 打ち消された記録が根拠に入るときは、訂正した記録も必ず対にする（打ち消された解釈・理由だけで
+  // 新しい仮説を組み立てない）。訂正した記録が話題キーワードを持たず通常のクラスタ化では入らない場合の受け皿。
+  const correctionIndex = correctionIndexOf(memories);
+  if (correctionIndex.size > 0) {
+    const correctingIds = new Set([...correctionIndex.values()].map((link) => link.correcting.id));
+    for (const candidate of candidates) {
+      const ids = new Set(candidate.evidence.map((e) => e.id));
+      for (const e of [...candidate.evidence]) {
+        const link = correctionIndex.get(e.id);
+        if (!link || ids.has(link.correcting.id)) continue;
+        if (!isSynthesisSource(link.correcting)) continue;
+        // 訂正した会話が別の記録で代表されているときは、その代表を訂正した記録に置き換える（会話の代表は
+        // 保ったまま、根拠は本人の言い直しになる。代表が訂正対象・訂正記録そのもののときは置き換えずに追加する。
+        // Codex レビュー on PR #63）
+        const repIdx = candidate.evidence.findIndex((x) => x.conversationId === (link.correcting.conversationId as string) && !correctionIndex.has(x.id) && !correctingIds.has(x.id));
+        if (repIdx >= 0) {
+          ids.delete(candidate.evidence[repIdx].id);
+          candidate.evidence[repIdx] = toEvidence(link.correcting);
+        } else {
+          candidate.evidence.push(toEvidence(link.correcting));
+        }
+        ids.add(link.correcting.id);
+      }
+      candidate.evidence.sort((a, b) => Date.parse(a.statedAt) - Date.parse(b.statedAt));
+      // 上限を超えた分は、訂正ペア（対象・訂正のどちらでもない記録）から落とす
+      while (candidate.evidence.length > SYNTHESIS_LIMITS.maxEvidencePerCluster) {
+        const idx = candidate.evidence.findIndex((e) => !correctionIndex.has(e.id) && !correctingIds.has(e.id));
+        if (idx < 0) break;
+        candidate.evidence.splice(idx, 1);
+      }
+    }
+  }
   candidates.sort((a, b) => b.evidence.length - a.evidence.length || a.theme.localeCompare(b.theme));
   const chosen: SynthesisCluster[] = [];
   for (const c of candidates) {
@@ -355,7 +388,7 @@ function eventStart(eventTime: string): number {
 }
 const RETROSPECTIVE_DAYS = 30;
 
-interface RawPoint { id: string; said: number; eventKey: number; retrospective: boolean; status?: TimelineStatus }
+interface RawPoint { id: string; said: number; eventKey: number; retrospective: boolean; status?: TimelineStatus; /** N6: superseded by the user's later correction — never the basis of the current state */ superseded?: boolean }
 
 /** shared by the chat timeline and the model text: which point is the latest said / latest event / basis of the current state */
 function classifyPoints(points: RawPoint[]): { latestSaid?: RawPoint; latestEvent?: RawPoint; basis?: RawPoint } {
@@ -363,7 +396,8 @@ function classifyPoints(points: RawPoint[]): { latestSaid?: RawPoint; latestEven
   const latestSaid = points.reduce((a, b) => (b.said > a.said ? b : a));
   const present = points.filter((p) => !p.retrospective);
   const latestEvent = (present.length > 0 ? present : points).reduce((a, b) => (b.eventKey > a.eventKey || (b.eventKey === a.eventKey && b.said > a.said) ? b : a));
-  const basis = [...present].sort((a, b) => b.said - a.said).find((p) => p.status !== undefined);
+  // a record the user later corrected was not true as stated: it stays a point of the timeline, but the current state is never taken from it
+  const basis = [...present].filter((p) => !p.superseded).sort((a, b) => b.said - a.said).find((p) => p.status !== undefined);
   return { latestSaid, latestEvent, basis };
 }
 
@@ -385,14 +419,18 @@ export function buildThemeTimeline(theme: string, memories: MemoryObject[]): The
   const onTheme = memories.filter((m) => isSynthesisSource(m) && hasTheme(m, theme));
   if (onTheme.length === 0) return { state: { status: "不明" }, points: [] };
   const subject = [theme.trim()];
+  // N6 訂正優先: 本人に言い直された記録は、今の状態の根拠にも以前の状態にもしない（点としては残す。訂正した記録は全記録から探す）
+  const supersededIds = new Set(correctionIndexOf(memories).keys());
   const rows = onTheme.map((m) => {
     const stated = statedAtOf(m);
     const status = statusOf(m.summary, subject);
-    return { m, stated, raw: rawPoint(m.id, stated.at, m.eventTime, status), status };
+    const raw = rawPoint(m.id, stated.at, m.eventTime, status);
+    if (supersededIds.has(m.id)) raw.superseded = true;
+    return { m, stated, raw, status };
   });
   const { latestSaid, latestEvent, basis } = classifyPoints(rows.map((r) => r.raw));
   const earlierRows: typeof rows = [];
-  for (const r of [...rows].filter((x) => !x.raw.retrospective && x.status && x.m.id !== basis?.id).sort((a, b) => b.raw.said - a.raw.said)) {
+  for (const r of [...rows].filter((x) => !x.raw.retrospective && !x.raw.superseded && x.status && x.m.id !== basis?.id).sort((a, b) => b.raw.said - a.raw.said)) {
     if (r.status === basis?.status || earlierRows.some((e) => e.status === r.status)) continue;
     earlierRows.push(r);
     if (earlierRows.length >= 2) break;

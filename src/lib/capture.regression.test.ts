@@ -1143,6 +1143,57 @@ test("M1+: 敵対的なAI応答（他Conversation・Reflection・存在しない
   assert.equal(new Set(out.conversation.memoryObjectIds).has(foreign.id), false);
 });
 
+test("N6訂正: 本人が過去の理由・AIの解釈を言い直したら、新規Memoryに訂正リンク（corrections）が付く。対象Memoryは書き換えられない", async () => {
+  const reasonTarget = {
+    ...pastMemory({ id: "01TARGETREASON0000000000A", content: "転職はやめた。給料が下がるから", summary: "転職はやめることにした。理由は給料が下がるからだと話した。", keywords: ["転職", "給料"] }),
+    evidenceQuotes: ["転職はやめた。理由は給料が下がるからだ"], statedAt: "2026-09-21T16:42:43.000Z",
+  };
+  const reflectionTarget = pastMemory({ id: "01TARGETREFLECTION000000A", content: "転職をやめたのは、お金への不安が強かったからだろう。", summary: "転職をやめたのは、お金への不安が強かったからだろう。", keywords: ["転職", "お金"] });
+  (reflectionTarget.metadata as Json).source = "system-generated";
+  const snapshots = clone([reasonTarget, reflectionTarget]);
+  const { out } = await runCapture(
+    [user("給料って言ったけど、本当は今のチームを離れたくなかったからなんだ"), ai("そうだったんですね")],
+    [{ ...BASE, topicDecision: "newTopic", summary: "転職をやめた理由を言い直し、本当は今のチームを離れたくなかったからだと話した", content: "転職をやめた理由を言い直した。", keywords: ["転職", "チーム"], evidenceUserMessageIndexes: [0] }],
+    { allMemories: [reasonTarget, reflectionTarget] }
+  );
+  assert.deepEqual([reasonTarget, reflectionTarget], snapshots, "訂正対象のMemoryは一切書き換えられない（リンクは訂正した側にだけ付く）");
+  assert.equal(out.memoryObjects.length, 1);
+  const created = out.memoryObjects[0] as unknown as { corrections?: { targetMemoryId: string; quote: string }[] };
+  assert.ok(created.corrections, "新規Memoryに corrections が保存される");
+  assert.deepEqual(created.corrections.map((c) => c.targetMemoryId).sort(), [reasonTarget.id, reflectionTarget.id].sort(), "本人の理由の記録とAIの振り返りの両方へリンクする");
+  assert.ok(created.corrections.every((c) => c.quote.includes("本当は")), "リンクには本人の訂正の逐語が入る");
+});
+
+test("N6訂正: 時間で気持ちが変わっただけの言い方は、訂正リンクを作らない（過去の記録を無効化しない）", async () => {
+  const reasonTarget = {
+    ...pastMemory({ id: "01TARGETREASON0000000000B", content: "転職はやめた。給料が下がるから", summary: "転職はやめることにした。理由は給料が下がるからだと話した。", keywords: ["転職", "給料"] }),
+    evidenceQuotes: ["転職はやめた。理由は給料が下がるからだ"], statedAt: "2026-09-21T16:42:43.000Z",
+  };
+  const { out } = await runCapture(
+    [user("というより、前は給料のことが気になってたけど、今はチームの雰囲気のほうが気になる"), ai("そうなんですね")],
+    [{ ...BASE, topicDecision: "newTopic", summary: "給料よりチームの雰囲気が気になるようになった", content: "気持ちの変化。", keywords: ["転職", "チーム"], evidenceUserMessageIndexes: [0] }],
+    { allMemories: [reasonTarget] }
+  );
+  assert.equal(out.memoryObjects.length, 1);
+  const created = out.memoryObjects[0] as unknown as { corrections?: unknown[] };
+  assert.equal(created.corrections, undefined, "変化の言い方では corrections は付かない");
+});
+
+test("N6訂正: 理由の追加（〜だけじゃなくて〜も）は、訂正リンクを作らない", async () => {
+  const reasonTarget = {
+    ...pastMemory({ id: "01TARGETREASON0000000000C", content: "転職はやめた。給料が下がるから", summary: "転職はやめることにした。理由は給料が下がるからだと話した。", keywords: ["転職", "給料"] }),
+    evidenceQuotes: ["転職はやめた。理由は給料が下がるからだ"], statedAt: "2026-09-21T16:42:43.000Z",
+  };
+  const { out } = await runCapture(
+    [user("あと、給料だけじゃなくて、通勤時間も長かったからなんだ"), ai("そうなんですね")],
+    [{ ...BASE, topicDecision: "newTopic", summary: "転職をやめた理由に通勤時間も加えた", content: "理由の追加。", keywords: ["転職", "給料", "通勤"], evidenceUserMessageIndexes: [0] }],
+    { allMemories: [reasonTarget] }
+  );
+  assert.equal(out.memoryObjects.length, 1);
+  const created = out.memoryObjects[0] as unknown as { corrections?: unknown[] };
+  assert.equal(created.corrections, undefined, "追加の言い方では corrections は付かない");
+});
+
 test("M1+: 会話境界のCaptureは、このConversation自身のMemoryが無い前提（existingは空）で呼ばれる。この前提を変える変更は、ここで検出されレビューされる", () => {
   const raw = fs.readFileSync(path.join(ROOT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
   const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");   // コメント中の言及は数えない

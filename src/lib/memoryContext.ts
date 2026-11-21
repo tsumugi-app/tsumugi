@@ -145,6 +145,7 @@ export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[], 
     delete out.quote;
     delete out.persons;
     delete out.trait;
+    delete out.correctionNote;
     const quote = typeof memory.quote === "string" ? memory.quote.trim() : "";
     if (quote) out.quote = clip(quote, MEMORY_CONTEXT_QUOTE_MAX_CHARS);
     const persons = Array.isArray(memory.persons)
@@ -153,6 +154,9 @@ export function sanitizeMemoryContext<T extends RetrievedMemory>(memories: T[], 
     if (persons.length > 0) out.persons = persons;
     // the trait of a record (recordRelevance.ts): only the fixed wording, or another person's action named by one of the record's people
     if (isAllowedTrait(memory.trait, persons)) out.trait = memory.trait;
+    // the user's correction of this record (correction.ts): only the verbatim quote survives, clipped like any other quote; the wording around it is fixed in memoryContextLines
+    const correctionQuote = typeof memory.correctionNote?.quote === "string" ? memory.correctionNote.quote.trim() : "";
+    if (correctionQuote) out.correctionNote = { quote: clip(correctionQuote, MEMORY_CONTEXT_QUOTE_MAX_CHARS) };
     return out as T;
   });
   return limitMemoryQuotes(cleaned, question);
@@ -215,8 +219,10 @@ export function withoutOutsideFactQuote<T extends Pick<RetrievedMemory, "quote">
 }
 
 /** the lines under a selected Memory in the prompt ("" when there is nothing to add) */
-export function memoryContextLines(memory: Pick<RetrievedMemory, "persons" | "quote" | "trait">): string {
+export function memoryContextLines(memory: Pick<RetrievedMemory, "persons" | "quote" | "trait" | "correctionNote">): string {
   const lines: string[] = [];
+  // N6 訂正優先: 打ち消された記録には、本人の訂正の逐語とともに、古い理由・解釈を今の理由として単独で使わないことを必ず添える
+  if (memory.correctionNote) lines.push(`  訂正あり：この記録の理由・解釈は、その後本人が言い直している（本人の訂正：「${memory.correctionNote.quote}」）。古い理由・解釈を、今の本人の理由として単独で使わないこと`);
   if (memory.trait) lines.push(`  記録の性質（言い回しからの自動の目安。本人が確かめたものではない）：${memory.trait}`);
   if (memory.persons && memory.persons.length > 0) lines.push(`  話題の人物：${memory.persons.join("、")}`);
   if (memory.quote) lines.push(`  本人の発言（当時の逐語の抜粋）：「${memory.quote}」`);

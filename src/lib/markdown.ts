@@ -25,6 +25,7 @@ import { isValidEventTimePrecision, isValidEventTimeValue } from "./eventTimeRes
 import { sanitizeStoredProfileClaims } from "./profile";
 import { sanitizeStoredPersonMentions } from "./person";
 import { sanitizeStoredTopicEvents } from "./topicEvent";
+import { sanitizeStoredCorrections } from "./correction";
 import { escapeDiaryText, isDiaryDate, unescapeDiaryText } from "./realtimeDiary";
 
 function yamlScalar(value: string): string {
@@ -97,6 +98,8 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
     topicEvents: memoryObject.topicEvents && memoryObject.topicEvents.length > 0 ? JSON.stringify(memoryObject.topicEvents) : undefined,
     // 根拠quote（ユーザー発言の逐語）：`topicEvents`と同じパターン（JSON文字列）。無いMemoryには、キー自体を書かない。
     evidence: memoryObject.evidenceQuotes && memoryObject.evidenceQuotes.length > 0 ? JSON.stringify(memoryObject.evidenceQuotes) : undefined,
+    // N6 訂正リンク（案B）：`evidence`と同じパターン（JSON文字列）。無いMemoryには、キー自体を書かない。
+    corrections: memoryObject.corrections && memoryObject.corrections.length > 0 ? JSON.stringify(memoryObject.corrections) : undefined,
     source: memoryObject.metadata.source,
     sourceType: memoryObject.metadata.sourceType,
     sourceDetail: stringifySourceDetail(memoryObject.metadata.sourceDetail),
@@ -350,6 +353,16 @@ function parseTopicEvents(raw: unknown) {
   }
 }
 
+/** N6 訂正リンク：`evidence`と同じfail-soft（壊れていれば空配列。Memory本体の読み込みは必ず成功させる）。 */
+function parseCorrections(raw: unknown) {
+  if (typeof raw !== "string") return [];
+  try {
+    return sanitizeStoredCorrections(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
 /** 根拠quote：`topicEvents`と同じfail-soft（壊れていれば空配列。Memory本体の読み込みは必ず成功させる）。 */
 function parseEvidenceQuotes(raw: unknown): string[] {
   if (typeof raw !== "string") return [];
@@ -466,6 +479,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
   const personMentions = parsePersonMentions(frontmatter.person);
   const topicEvents = parseTopicEvents(frontmatter.topicEvents);
   const evidenceQuotes = parseEvidenceQuotes(frontmatter.evidence);
+  const corrections = parseCorrections(frontmatter.corrections);
   const statedAt = validStatedAt(frontmatter.statedAt);
 
   return {
@@ -491,6 +505,7 @@ export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
     ...(personMentions.length > 0 ? { personMentions } : {}),
     ...(topicEvents.length > 0 ? { topicEvents } : {}),
     ...(evidenceQuotes.length > 0 ? { evidenceQuotes } : {}),
+    ...(corrections.length > 0 ? { corrections } : {}),
     createdAt,
     updatedAt,
     metadata: {

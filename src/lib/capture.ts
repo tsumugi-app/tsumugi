@@ -33,6 +33,7 @@ import {
   validateTopicEventQuotes,
 } from "./topicEvent";
 import { selectedAiHeaders, type AiRequestOptions } from "./selectedAi";
+import { detectMemoryCorrections } from "./correction";
 import { turnsForAi } from "./aiReplyOutcome";
 import { trustedStatedAt } from "./captureEvidence";
 
@@ -728,6 +729,23 @@ async function captureConversationImpl(
       },
     };
   });
+
+  // N6 訂正優先（案B）: 新規Memoryの本人の発言が、過去の記録の理由・解釈を言い直していれば、訂正リンクを
+  // 付けて保存する（対象の本文は書き換えない。検出はコードのみ＝lib/correction.ts、AIは呼ばない）。
+  // 既存Memoryの読み込みに失敗したら、リンク無し（従来どおり）で Capture 本体を止めない。
+  if (newlyCreatedIds.length > 0) {
+    try {
+      const correctionPool = await getAllMemoryObjects();
+      for (let i = 0; i < memoryObjects.length; i += 1) {
+        const created = memoryObjects[i];
+        if (!newlyCreatedIds.includes(created.id)) continue;
+        const corrections = detectMemoryCorrections(created, correctionPool, { newId: ulid, recordedAt: timestamp });
+        if (corrections.length > 0) memoryObjects[i] = { ...created, corrections };
+      }
+    } catch {
+      // 訂正リンクは付随情報。失敗しても Capture 本体は止めない
+    }
+  }
 
   // 品質の観測用（件数のみ。会話・claimの内容は含めない）
   if (profileProposed > 0) logTimingEvent("Capture profileClaims", { proposed: profileProposed, accepted: profileAccepted });

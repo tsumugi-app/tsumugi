@@ -153,6 +153,9 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (insight fix, owner approval 2026-11-20): the record-mode block gains exactly one bullet — a request that asks for organisation and a view of the stage/change is record + conversation, and the view is returned as a hypothesis inside the conversation. Exact added line only (never a pattern)
   const insightFixLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedInsightFixLines.json"), "utf8")).lines);
   const insightFix = (l: string) => insightFixLines.has(l[0] + l.slice(1).trim());
+  // Reviewed (N6 correction priority, owner approval 2026-11-21): Capture attaches the user's corrections of earlier records to the new Memory (additive `corrections` only; the corrected record's text is never rewritten; detection is code-only in lib/correction.ts). Exact added lines of capture.ts only (never a pattern)
+  const correctionLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedCorrectionLines.json"), "utf8")).lines);
+  const correction = (l: string) => correctionLines.has(l[0] + l.slice(1).trim());
   const chatRouteDiff = git("diff", "-U0", ...range, "--", "src/app/api/chat/route.ts").split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
   // Reviewed (conversation voice): prompt text lives in lib/conversationVoice.ts; the route only resolves it, appends it, and may raise the thinking floor
   const conversationVoiceLine = /conversationVoice|voice\.|Conversation voice|^-\$\{sanitizedExplicitSearch && sanitizedMemoryAnalytics \?/;
@@ -162,7 +165,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Reviewed (startup Memory creation): the Capture result is saved in one transaction and the AI call runs outside the Vault world lock; ChatScreen runs it and marks the open conversation. Exact lines only (never a pattern)
   const startupCaptureLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedStartupCaptureLines.json"), "utf8")).lines);
   const startupCapture = (l: string) => startupCaptureLines.has(l[0] + l.slice(1).trim());
-  for (const l of captureDiff) assert.ok(startupCapture(l) || aiSelection(l) || /turnsForAi|^-\s+conversation\.turns,$|existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
+  for (const l of captureDiff) assert.ok(startupCapture(l) || aiSelection(l) || correction(l) || /turnsForAi|^-\s+conversation\.turns,$|existingMemoryObjects|isSameConversation|putCapturedMemoryWithOutbox|putMemoryObjectWithOutbox|TombstonedRecordError|conversationFailed: true, startBackgroundSync: null|^\+\s*\/\/|^-\s*$|^\+\s*$/.test(l), "unexpected capture.ts change: " + l);
   // ChatScreen: the only allowed change is the reviewed swap of the three restore-from-Vault writers (never replace newer local data with an older Vault copy)
   // Third reviewed change (startup I/O reduction): the projection engine remembers reads inside ONE reconcile pass (cleared by every write; a write / hold / conflict is always decided again
   // from fresh reads), skips writes that would change nothing, and ChatScreen's fixed startup wait became completion detection. Reviewed as one unit; see vaultProjection.test.ts "Pass reuse".

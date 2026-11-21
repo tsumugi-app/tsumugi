@@ -233,6 +233,28 @@ export type ProfileTense = "current" | "former" | "planned";
 export type ProfileChange = "none" | "began" | "ended";
 export type HouseholdRelation = "partner" | "child" | "parent" | "sibling" | "pet" | "other";
 
+/**
+ * N6 訂正優先（案B、オーナー承認 2026-11-21）。この Memory の本人の発言が、過去の別の記録の
+ * 理由・解釈を言い直した（訂正した）という関係。訂正した側の Memory にだけ付く追加情報で、
+ * 対象（targetMemoryId）の本文は一切書き換えない。時間で気持ちが変わっただけの変化や、
+ * 理由の追加は訂正ではない（検出は lib/correction.ts、コードのみ・AI は呼ばない）。
+ */
+export interface MemoryCorrection {
+  /** ULID。Tsumugiが採番する（LLMは採番しない）。 */
+  id: ID;
+  /** 打ち消される過去の記録（このリンクで本文が変わることはない）。 */
+  targetMemoryId: ID;
+  /** 本人の訂正の逐語（evidenceQuotes の一文そのもの）。 */
+  quote: string;
+  /** 訂正が述べられた時刻（訂正した Memory の statedAt。無ければその date）。 */
+  statedAt: ISODateString;
+  /** 訂正が述べられた会話。 */
+  sourceConversationId: ID;
+  /** Tsumugiがこのリンクを保存した時刻。 */
+  recordedAt: ISODateString;
+  schemaVersion: 1;
+}
+
 export interface ProfileClaim {
   /** ULID。Tsumugiが採番する（LLMは採番しない）。 */
   id: ID;
@@ -439,6 +461,13 @@ export interface MemoryObject extends Identifiable, Timestamped {
    * `topicEvents`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・Vault migration不要）。
    */
   evidenceQuotes?: string[];
+  /**
+   * N6 訂正優先（案B）。この Memory の本人の発言による、過去の記録への訂正リンク（追加のみ。
+   * Capture UPDATEでも既存のリンクは削除しない）。訂正が無い会話では未設定（キー自体を持たない）。
+   * `evidenceQuotes`と同じ、追加のみのoptionalフィールド（IndexedDBバージョンアップ・Vault migration不要）。
+   * 古い Vault の Memory には無い（＝従来どおり扱う）。
+   */
+  corrections?: MemoryCorrection[];
   metadata: Metadata;
 }
 
@@ -532,6 +561,12 @@ export interface RetrievedMemory {
    * （「過去の記録を尋ねただけ」など）。本人が確かめた分類ではない。送信用の一時的な値（保存しない）。
    */
   trait?: string;
+  /**
+   * N6 訂正優先（案B 消費側）。この記録の理由・解釈が、その後本人に言い直されているときに付く送信用の一時的な値（保存しない）。
+   * `quote` は訂正した本人の逐語。打ち消された解釈を「今の本人の理由」として単独で使わせないための注記
+   * （memoryContext.ts が固定文で描く）。会話の Retrieval（purposeRelevance）が付け、route が形と長さだけ検証する。
+   */
+  correctionNote?: { quote: string };
 }
 
 export const SCHEMA_VERSION = "0.1";

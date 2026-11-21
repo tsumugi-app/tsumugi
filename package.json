@@ -47,7 +47,9 @@
     "test:ai-selection": "tsc -p tsconfig.ai-selection.json && node --test .test-out/lib/aiSelection.test.js",
     "test:realtime-diary": "tsc -p tsconfig.realtime-diary.json && node --test .test-out/lib/realtimeDiary.test.js .test-out/lib/realtimeDiaryAuto.test.js",
     "test:auto-capture": "tsc -p tsconfig.auto-capture.json && node --test .test-out/lib/autoCapturePolicy.test.js .test-out/lib/autoCaptureRun.test.js .test-out/lib/userKeyOnly.test.js",
-    "test:recovery-memory-diagnostic": "tsc -p tsconfig.recovery-memory-diagnostic.json && node --test .test-out/lib/recoveryMemoryDiagnostic.test.js"
+    "test:recovery-memory-diagnostic": "tsc -p tsconfig.recovery-memory-diagnostic.json && node --test .test-out/lib/recoveryMemoryDiagnostic.test.js",
+    "test:correction": "tsc -p tsconfig.correction.json && node --test .test-out/lib/correction.test.js",
+    "test:correction-delivery": "tsc -p tsconfig.correction-delivery.json && node --test .test-out/lib/correctionDelivery.test.js"
   },
   "dependencies": {
     "@google/genai": "^2.13.0",

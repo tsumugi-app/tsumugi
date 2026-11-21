@@ -103,6 +103,7 @@ function retrievalExtras(m: RetrievedMemory, earlier: EarlierCopy): string[] {
   if (m.quote) why.push("本人の一文");
   if (m.linkReason) why.push("つながりの理由");
   if (m.trait) why.push("記録の性質");
+  if (m.correctionNote) why.push("本人の訂正");
   const shown = `${m.summary ?? ""} ${earlier.where} ${earlier.persons.join(" ")}`;
   const unshownKeywords = (m.keywords ?? []).filter((k) => typeof k === "string" && k.length > 0 && !shown.includes(k));
   if (unshownKeywords.length > 0) why.push(`keywords（${unshownKeywords.join("・")}）`);
