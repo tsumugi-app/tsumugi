@@ -118,7 +118,7 @@ export function shapeDelivery(input: DeliveryShapingInput): DeliveryShapingResul
   if (Array.from(text).length > DELIVERY_SHAPING_MAX_CHARS) return blocked("veto9-not-short");
 
   // ---- Profile P：純粋な気持ちの共有（人物が特定でき、関係・気持ちの話） ----
-  // 対比の足場になる「以前の別の状態」の行を取り、時点は本人が最後に話したものだけにする。
+  // 対比の足場になる「以前の別の状態」の行を取り、時点は本人が最後に話したもの（と、その状態の根拠）だけにする。
   // 状態そのもの（今の状態の行）は残す：今の気持ちへの応答に要るのは今の状態だから。
   const previousUserTurn = input.recentUserTurns.length >= 2 ? input.recentUserTurns[input.recentUserTurns.length - 2] : undefined;
   if (person && isRelationshipTalk(text, previousUserTurn)) {
@@ -131,7 +131,10 @@ export function shapeDelivery(input: DeliveryShapingInput): DeliveryShapingResul
       memoryTimelineContext: input.memoryTimelineContext.map((context) => ({
         ...context,
         state: { ...context.state, earlier: undefined },
-        timeline: context.timeline.filter((point) => point.latestSaid === true),
+        // 状態の根拠の点も残す：サーバー側の sanitizeSynthesisContext は、届いた点から状態を組み直し、
+        // 根拠の点が無ければ状態を「不明」に落とす。P が残すはずの「今の状態の行」まで消えてしまうため。
+        // 根拠と最新の発言が同じ記録なら、結果は従来どおり点1件になる
+        timeline: context.timeline.filter((point) => point.latestSaid === true || point.stateBasis === true),
       })),
     };
   }
@@ -145,8 +148,10 @@ export function shapeDelivery(input: DeliveryShapingInput): DeliveryShapingResul
   const memoryTimelineContext = input.memoryTimelineContext.map((context) => {
     if (!themeOpened(context.theme, input.pool, earlierTurns)) return context;
     shapedAny = true;
-    // 状態ブロック（以前の状態の行を含む）はそのまま。時点は「状態の根拠」と「最後に話したもの」だけ
-    return { ...context, timeline: context.timeline.filter((point) => point.stateBasis === true || point.latestSaid === true) };
+    // 状態ブロック（以前の状態の行を含む）はそのまま。時点は「状態の根拠」「最後に話したもの」に、
+    // 状態ブロックの「以前の状態」の行の材料である点（earlierState）を加えたものだけにする：
+    // サーバー側の sanitizeSynthesisContext は状態を届いた点から組み直すため、材料の点を落とすと行まで消える
+    return { ...context, timeline: context.timeline.filter((point) => point.stateBasis === true || point.latestSaid === true || point.earlierState === true) };
   });
   const topicTimelineContext = input.topicTimelineContext.map((timeline) => {
     if (!topicOpened(timeline.topicId, input.pool, earlierTurns)) return timeline;

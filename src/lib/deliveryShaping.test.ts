@@ -8,6 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DELIVERY_SHAPING_MAX_CHARS, shapeDelivery, type DeliveryShapingInput } from "./deliveryShaping";
 import { asksPastQuestion } from "./recordRelevance";
+import { buildSynthesisSection, sanitizeSynthesisContext } from "./memorySynthesis";
 import type { SynthesisThemeContext, SynthesisTimelinePoint } from "./memorySynthesis";
 import type { TopicTimeline } from "./topicEvent";
 import type { MemoryObject } from "./types";
@@ -66,8 +67,8 @@ const carContext = (): SynthesisThemeContext => ({
   },
   timeline: [
     point("car-1", "2026-04-10"),
-    point("car-2", "2026-06-15", { earlierState: true }),
-    point("car-3", "2026-08-20", { stateBasis: true }),
+    point("car-2", "2026-06-15", { earlierState: true, status: "保留" }),
+    point("car-3", "2026-08-20", { stateBasis: true, status: "検討中" }),
     point("car-4", "2026-10-05", { latestSaid: true, latestEvent: true }),
   ],
   items: [],
@@ -199,14 +200,14 @@ test("veto 9: a long utterance (the deep-consultation shape) keeps full delivery
   assertUnchanged(baseInput({ text, recentUserTurns: [text] }), "veto9-not-short");
 });
 
-test("Profile T: a topic-opening turn keeps the state block, trims points to basis + latest said, and the topic timeline to the latest quote", () => {
+test("Profile T: a topic-opening turn keeps the state block, trims points to basis + latest said + the earlier-state material, and the topic timeline to the latest quote", () => {
   const input = baseInput();
   const snapshot = JSON.stringify({ t: input.topicTimelineContext, m: input.memoryTimelineContext });
   const result = shapeDelivery(input);
   assert.equal(result.profile, "T");
   const memory = result.memoryTimelineContext[0];
   assert.deepEqual(memory.state, carContext().state, "the state block (incl. earlier-state lines) is intact");
-  assert.deepEqual(memory.timeline.map((p) => p.memoryId), ["car-3", "car-4"], "only the state basis and the latest said point remain");
+  assert.deepEqual(memory.timeline.map((p) => p.memoryId), ["car-2", "car-3", "car-4"], "the state basis, the latest said point, and the earlier-state point (the state block's material) remain");
   const topic = result.topicTimelineContext[0];
   assert.equal(topic.events.length, 1);
   assert.equal(topic.events[0].quote, "やっぱり車を買い替えたい");
@@ -249,6 +250,47 @@ test("Profile P: feeling sharing in question form (case 13 shape) still fires P"
   const result = shapeDelivery(saoriInput({ text: "沙織さんとの距離、前より感じる？", recentUserTurns: ["沙織さんとの距離、前より感じる？"] }));
   assert.equal(result.profile, "P");
   assert.equal(result.memoryTimelineContext[0].state.earlier, undefined);
+});
+
+test("shaped contexts through the server sanitizer: T keeps the earlier-state lines; P keeps the current state even when the basis is not the latest said", () => {
+  // /api/chat は sanitizeSynthesisContext で、届いた点から状態を組み直す。整形後の形はクライアント側の
+  // オブジェクトだけでなく、サーバーの組み直しと節の描画まで通して確かめる（Codex レビュー [P2] への対応）
+  const throughServer = (ctxs: readonly SynthesisThemeContext[]) =>
+    buildSynthesisSection(sanitizeSynthesisContext(JSON.parse(JSON.stringify(ctxs))));
+
+  const t = shapeDelivery(baseInput());
+  const tSection = throughServer(t.memoryTimelineContext);
+  assert.ok(tSection.includes("今の状態（記録の言葉から）: 検討中"), "T: the state line survives sanitization");
+  assert.ok(tSection.includes("それより前の別の状態の記録: 保留"), "T: the earlier-state line survives (its material point is kept)");
+
+  // 状態の根拠と「最後に話した記録」が別の記録であるテーマ（P で状態が落ちやすい形）
+  const pContext: SynthesisThemeContext = {
+    theme: "沙織さん",
+    state: {
+      status: "保留",
+      basisMemoryId: "saori-2",
+      basisStatedAt: "2026-07-15T10:00:00.000Z",
+      basisSummary: "沙織さんとの距離を感じて、少しほっとしたと話した",
+      earlier: [{ status: "実施済み", statedAt: "2026-05-10T10:00:00.000Z", summary: "沙織さんと二人で美術館に出かけたと話した", memoryId: "saori-1" }],
+    },
+    timeline: [
+      point("saori-1", "2026-05-10", { earlierState: true, status: "実施済み" }),
+      point("saori-2", "2026-07-15", { stateBasis: true, status: "保留" }),
+      point("saori-3", "2026-10-20", { latestSaid: true }),
+    ],
+    items: [],
+  };
+  const p = shapeDelivery(saoriInput({ memoryTimelineContext: [pContext] }));
+  assert.equal(p.profile, "P");
+  assert.deepEqual(p.memoryTimelineContext[0].timeline.map((x) => x.memoryId), ["saori-2", "saori-3"], "P keeps the latest said point and the state basis point");
+  const pSection = throughServer(p.memoryTimelineContext);
+  assert.ok(pSection.includes("今の状態（記録の言葉から）: 保留"), "P: the current state line survives sanitization");
+  assert.ok(!pSection.includes("それより前の別の状態の記録: 実施済み"), "P: the earlier-state lines are gone (the usage guidance mentions the concept, so the line's own shape is checked)");
+  assert.ok(!pSection.includes("今の状態: 不明"), "P: the state is not lost to the sanitizer");
+
+  // 対照：根拠の点を落とすと、サーバー側で状態が「不明」に組み直される（この形を P は決して作らない）
+  const naive = [{ ...pContext, timeline: pContext.timeline.filter((x) => x.latestSaid) }];
+  assert.ok(throughServer(naive).includes("今の状態: 不明"), "control: without the basis point the sanitizer rebuilds the state as 不明");
 });
 
 test("degenerate inputs: no pool, empty points, empty events, blank text — no errors, no shaping anomalies", () => {
