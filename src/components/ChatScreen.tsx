@@ -5119,8 +5119,9 @@ export default function ChatScreen() {
           ...chatContextRequestFields(assembled, { generationId, contextDedupe: contextDedupeOn }),
         }),
       }).catch(() => {
-        // fetch自体の失敗（オフライン等）: 応答自体が無いので、種類は通信エラーとして扱う。
-        throw new ChatRequestError(0, "network");
+        // fetch自体の失敗（オフライン等）: 応答自体が無く種類は分からないので、付けずに従来の汎用表示へ倒す。
+        // 通信エラーの表示は、サーバー側でAIへ接続できなかった場合にrouteが返す種類（network）で出す。
+        throw new ChatRequestError(0);
       });
 
       if (!res.ok || !res.body) {
