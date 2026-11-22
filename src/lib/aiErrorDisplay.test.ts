@@ -122,6 +122,22 @@ function geminiApiError(status: number, googleStatus: string): Error & { status:
   return error;
 }
 
+/** 無効なAPIキーの 400：canonical status は INVALID_ARGUMENT で、details の reason が API_KEY_INVALID。 */
+function geminiApiKeyInvalidError(): Error & { status: number } {
+  const body = JSON.stringify({
+    error: {
+      code: 400,
+      message: UPSTREAM_DETAIL,
+      status: "INVALID_ARGUMENT",
+      details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "API_KEY_INVALID", domain: "googleapis.com" }],
+    },
+  });
+  const error = new Error(body) as Error & { status: number };
+  error.name = "ApiError";
+  error.status = 400;
+  return error;
+}
+
 async function callRoute(name: string, headers: Record<string, string>, body: unknown) {
   const res = await route(name).POST(
     new Request(`http://localhost/api/${name}`, {
@@ -232,6 +248,7 @@ const geminiKeyTestCases: {
   { name: "403 permission", error: () => geminiApiError(403, "PERMISSION_DENIED"), status: 401, kind: "auth" },
   { name: "400 permission-shaped", error: () => geminiApiError(400, "PERMISSION_DENIED"), status: 401, kind: "auth" },
   { name: "400 invalid argument", error: () => geminiApiError(400, "INVALID_ARGUMENT"), status: 400, kind: "invalidRequest" },
+  { name: "400 api key invalid", error: () => geminiApiKeyInvalidError(), status: 401, kind: "auth" },
   { name: "500 internal", error: () => geminiApiError(500, "INTERNAL"), status: 502, kind: "server" },
   { name: "503 unavailable", error: () => geminiApiError(503, "UNAVAILABLE"), status: 502, kind: "server" },
   { name: "fetch failed (TypeError)", error: () => new TypeError("fetch failed"), status: 502, kind: "network" },
@@ -281,6 +298,7 @@ const geminiChatCases: {
   { name: "402 prepaid balance", error: () => geminiApiError(402, "PERMISSION_DENIED"), status: 402, kind: "billing" },
   { name: "429 quota", error: () => geminiApiError(429, "RESOURCE_EXHAUSTED"), status: 429, kind: "rateLimit" },
   { name: "401 unauthenticated", error: () => geminiApiError(401, "UNAUTHENTICATED"), status: 401, kind: "auth" },
+  { name: "400 api key invalid", error: () => geminiApiKeyInvalidError(), status: 401, kind: "auth" },
   { name: "500 internal", error: () => geminiApiError(500, "INTERNAL"), status: 502, kind: "server" },
   { name: "fetch failed (TypeError)", error: () => new TypeError("fetch failed"), status: 502, kind: "network" },
   { name: "unknown error", error: () => new Error("something odd"), status: 502, kind: "other" },

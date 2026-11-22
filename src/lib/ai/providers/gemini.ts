@@ -116,6 +116,27 @@ function googleErrorStatus(error: unknown): string | undefined {
   }
 }
 
+/**
+ * Google API のエラー詳細（error.details[]）に含まれる reason（例 "API_KEY_INVALID"）を取り出す。
+ * googleErrorStatus と同じく、分類のためだけに読み、表示・ログには一切出さない。
+ */
+function googleErrorReasons(error: unknown): string[] {
+  if (!(error instanceof Error)) return [];
+  try {
+    const parsed = JSON.parse(error.message) as { error?: { details?: unknown } };
+    const details = parsed?.error?.details;
+    if (!Array.isArray(details)) return [];
+    const reasons: string[] = [];
+    for (const detail of details) {
+      const reason = (detail as { reason?: unknown } | null | undefined)?.reason;
+      if (typeof reason === "string") reasons.push(reason);
+    }
+    return reasons;
+  } catch {
+    return [];
+  }
+}
+
 /** fetch 自体の失敗（オフライン・DNS・接続断絶など、HTTP応答が無い失敗）かどうか。 */
 function isNetworkFailure(error: unknown): boolean {
   let current: unknown = error;
@@ -135,7 +156,8 @@ function isNetworkFailure(error: unknown): boolean {
  * - 402：プリペイド残高・利用可能額の不足（billing）
  * - 429：利用上限・レート制限（rateLimit）
  * - 401/403：キー・権限（auth）。400 は内容で分け、権限系
- *   （PERMISSION_DENIED / UNAUTHENTICATED）だけを auth、それ以外は invalidRequest
+ *   （PERMISSION_DENIED / UNAUTHENTICATED）と、無効なキー
+ *   （details の reason が API_KEY_INVALID）だけを auth、それ以外は invalidRequest
  * - 5xx：AIサービス側の障害（server）
  * - HTTP応答の無い fetch 失敗：network
  * - それ以外：other
@@ -152,7 +174,9 @@ function normalizeError(error: unknown): AIProviderError {
     type = "auth";
   } else if (status === 400) {
     const googleStatus = googleErrorStatus(error);
-    type = googleStatus === "PERMISSION_DENIED" || googleStatus === "UNAUTHENTICATED" ? "auth" : "invalidRequest";
+    // 無効なAPIキーは 400 + INVALID_ARGUMENT（details の reason が API_KEY_INVALID）で
+    // 返ることがある。旧来の分類でも認証扱いだったケースなので、リクエスト不正に倒さない。
+    type = googleStatus === "PERMISSION_DENIED" || googleStatus === "UNAUTHENTICATED" || googleErrorReasons(error).includes("API_KEY_INVALID") ? "auth" : "invalidRequest";
   } else if (status !== undefined && status >= 500 && status <= 599) {
     type = "server";
   } else if (status === undefined && isNetworkFailure(error)) {
