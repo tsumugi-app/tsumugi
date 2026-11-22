@@ -27,6 +27,8 @@ import { classifyAutoCaptureFailure, maySendConversationTo, parseAutoCaptureSett
 import { parseRealtimeDiaryAutoSettings, parseRealtimeDiaryAutoState, runRealtimeDiaryAutoFinish, type RealtimeDiaryAutoOutcome } from "@/lib/realtimeDiaryAuto";
 import type { AiRequestOptions } from "@/lib/selectedAi";
 import type { AIProviderName } from "@/lib/ai/types";
+import type { AIErrorType } from "@/lib/ai/errors";
+import { chatSendErrorStatus, parseChatErrorKind, CHAT_SEND_ERROR_TEXT, type ChatSendErrorStatus } from "@/lib/ai/errorResponse";
 import { runAutoCapture, type AutoCaptureDeps } from "@/lib/autoCaptureRun";
 import { NoUserKeyError, isUsableUserKey } from "@/lib/apiKeyHeader";
 import { writeRealtimeDiaryText } from "@/lib/realtimeDiaryText";
@@ -284,7 +286,7 @@ export type VaultLightCheckStatus =
   | { kind: "partial"; message: string }
   | { kind: "error"; message: string };
 
-type SendStatus = "idle" | "error" | "authError" | "emptyReply" | "interrupted";
+type SendStatus = "idle" | ChatSendErrorStatus | "emptyReply" | "interrupted";
 
 /**
  * 「保存先の記録を端末へ追加」（Vault→IndexedDBの追加専用復元）のUI状態。"dry-run"は
@@ -437,9 +439,14 @@ const RECOVERY_RECHECK_DELAY_MS = 30_000;
  */
 const VAULT_SWITCH_SETTLE_TIMEOUT_MS = 20000;
 
-/** Beta C4：/api/chatの失敗時、ステータスだけを見てAPIキー由来かどうかをUI側で分岐するための最小限のエラー型。 */
+/**
+ * /api/chatの失敗をUI側で分岐するための最小限のエラー型。
+ * エラー表示改善：応答本文の errorKind（AIエラーの種類）を保持し、表示は
+ * ステータス番号ではなく種類で分ける。種類が取れなかった場合は
+ * parseChatErrorKind でステータスから従来どおり復元する。
+ */
 class ChatRequestError extends Error {
-  constructor(readonly status: number) {
+  constructor(readonly status: number, readonly kind?: AIErrorType) {
     super(`chat request failed: ${status}`);
   }
 }
@@ -5111,10 +5118,16 @@ export default function ChatScreen() {
           // 過去の文脈の部分（キーの順序・空のときに送らない規則は切り出す前と同じ。chatContextAssembly.ts）
           ...chatContextRequestFields(assembled, { generationId, contextDedupe: contextDedupeOn }),
         }),
+      }).catch(() => {
+        // fetch自体の失敗（オフライン等）: 応答自体が無いので、種類は通信エラーとして扱う。
+        throw new ChatRequestError(0, "network");
       });
 
       if (!res.ok || !res.body) {
-        throw new ChatRequestError(res.status);
+        // エラー応答の本文から種類（errorKind）を復元する。本文が読めない・
+        // 種類が無い場合はステータスからの従来判定に倒す（parseChatErrorKind）。
+        const errorBody: unknown = await res.json().catch(() => null);
+        throw new ChatRequestError(res.status, parseChatErrorKind(errorBody, res.status));
       }
 
       // このAIターンの生成でWeb検索が有効化されていたか（needsWebSearch()の判定結果）。
@@ -5259,7 +5272,11 @@ export default function ChatScreen() {
     } catch (error) {
       if (handleStaleVaultTabError(error)) return;
       console.error("Failed to send message", error);
-      setSendStatus(error instanceof ChatRequestError && error.status === 401 ? "authError" : "error");
+      setSendStatus(
+        chatSendErrorStatus(
+          error instanceof ChatRequestError ? error.kind ?? parseChatErrorKind(null, error.status) : "other"
+        )
+      );
     } finally {
       setBusy(false);
       sendInFlightRef.current = false;
@@ -6455,14 +6472,9 @@ export default function ChatScreen() {
           {captureStatus === "partial" && "一部の記憶を保存できませんでした。会話は続けられます。"}
           {captureStatus === "error" && "記憶の保存に失敗しました。"}
         </p>
-        {sendStatus === "authError" && (
+        {sendStatus !== "idle" && sendStatus !== "emptyReply" && sendStatus !== "interrupted" && (
           <p className="mt-1 text-xs text-red-600 dark:text-red-400">
-            APIキーが無効または期限切れの可能性があります。設定を確認してください。
-          </p>
-        )}
-        {sendStatus === "error" && (
-          <p className="mt-1 text-xs text-red-600 dark:text-red-400">
-            メッセージの送信に失敗しました。しばらくしてからもう一度お試しください。
+            {CHAT_SEND_ERROR_TEXT[sendStatus]}
           </p>
         )}
         {sendStatus === "emptyReply" && (

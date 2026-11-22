@@ -1,4 +1,5 @@
-import { AIProviderError } from "@/lib/ai/errors";
+import { AIProviderError, type AIErrorType } from "@/lib/ai/errors";
+import { apiKeyTestErrorResponse } from "@/lib/ai/errorResponse";
 import { getProvider, resolveApiKey, resolveModel, resolveRequestedProvider } from "@/lib/ai/resolve";
 
 export const runtime = "nodejs";
@@ -29,37 +30,17 @@ export async function POST(request: Request) {
     });
     return Response.json({ ok: true });
   } catch (error) {
-    console.error("[Tsumugi API Key Test] verification failed:", error);
-
-    if (error instanceof AIProviderError && error.type === "auth") {
-      return Response.json(
-        { ok: false, error: "APIキーが正しくないか、権限がありません。" },
-        { status: 401 }
-      );
-    }
-
-    if (error instanceof AIProviderError && error.type === "rateLimit") {
-      // "insufficient_quota"（OpenAI）は請求設定・利用可能額の問題であり、
-      // 時間を置いても自然には解決しない。通常のrate limit（一時的な混雑等）とは
-      // メッセージを分ける。AI provider側の型（AIProviderError自体の構造）は
-      // 変更せず、元のSDKエラー（error.cause）が持つcodeフィールドをここだけで
-      // 直接参照して判定する。
-      const cause = error.cause as { code?: string } | undefined;
-      const isInsufficientQuota = cause?.code === "insufficient_quota";
-      return Response.json(
-        {
-          ok: false,
-          error: isInsufficientQuota
-            ? "APIキーの利用上限に達しています。OpenAIアカウントの請求設定や利用可能額をご確認ください。"
-            : "APIの利用制限に達しています。しばらく時間を置いて再度お試しください。",
-        },
-        { status: 429 }
-      );
-    }
-
-    return Response.json(
-      { ok: false, error: "APIへの接続に失敗しました。時間を置いて再度お試しください。" },
-      { status: 502 }
+    // エラー表示改善：/api/chat と同じ分類（adapterの AIErrorType）で、原因が
+    // 分かる文言を返す（errorResponse.ts）。「insufficient_quota」（OpenAI）は
+    // adapter側で billing に分類されるため、ここで cause を見る必要はない。
+    // ログ・応答ともに、種類と上流ステータス（数値）だけを出し、検証に使った
+    // キーや上流のエラー本文は一切出さない。
+    const kind: AIErrorType = error instanceof AIProviderError ? error.type : "other";
+    const upstreamStatus = error instanceof AIProviderError ? error.status : undefined;
+    console.error(
+      `[Tsumugi API Key Test] verification failed: kind=${kind}${upstreamStatus !== undefined ? ` status=${upstreamStatus}` : ""}`
     );
+    const failure = apiKeyTestErrorResponse(kind, providerName);
+    return Response.json({ ok: false, error: failure.message, errorKind: kind }, { status: failure.status });
   }
 }
