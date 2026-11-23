@@ -8191,13 +8191,16 @@ async function memoryDayConflictSignatureAtPath(
 
 /** 指定pathのConversation/Reflection/Sourceを独立して読み直し、`hashVaultText`
  *  （`handleResyncSingleRecordCandidate`が`contentHash`に使うのと同じ計算）を
- *  返す。読めない場合はnull。 */
+ *  返す。読めない場合はnull。A-02：classification側は読み取り直後にCRLF→LFへ
+ *  正規化してからハッシュを取るため、ここでも同じ正規化をしてからハッシュする
+ *  ——正規化しないと、無変更のCRLFファイルが常時「内容が変わった」
+ *  （conflict-changed）と誤判定される。 */
 async function singleRecordContentHashAtPath(root: FileSystemDirectoryHandle, path: string): Promise<string | null> {
   try {
     const resolved = await resolveVaultRelativePath(root, path);
     const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
     const file = await fileHandle.getFile();
-    const text = await file.text();
+    const text = (await file.text()).replace(/\r\n/g, "\n");
     return hashVaultText(text);
   } catch {
     return null;

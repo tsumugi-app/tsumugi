@@ -28,6 +28,103 @@ mod._load = function (request, parent, isMain) {
   return origLoad.call(this, request, parent, isMain);
 };
 
+// ---------------------------------------------------------------------------
+// navigator.locks のfake（vaultWriteGate.test.tsと同じ実FIFO方式）。
+// CIのNode 22には `navigator.locks` が無い（Web LocksはNode 24で追加）ため、
+// 実物に任せると排他ロック取得が即座に拒否され（`locksSupported()` の安全側の
+// 仕様）、`resyncVaultRegistry` を成功前提で呼ぶテストが環境依存で失敗する。
+// ロック名ごとに独立したFIFOキューを持ち、sharedは同時許可・exclusiveは単独
+// 許可という実物の意味論を保つ（全要求を直列化する単純化はしない：
+// withVaultWorldReadのshared取得が resync の排他区間と競合しない等、
+// 本suiteの前提を実物と揃えるため）。AbortSignal・ifAvailableにも対応する。
+// ---------------------------------------------------------------------------
+
+type FakeLockRequest = {
+  mode: "shared" | "exclusive";
+  grant: () => void;
+  settled: boolean;
+};
+
+class FakeLockManager {
+  private states = new Map<string, { heldShared: number; heldExclusive: boolean; queue: FakeLockRequest[] }>();
+
+  private stateFor(name: string) {
+    let s = this.states.get(name);
+    if (!s) {
+      s = { heldShared: 0, heldExclusive: false, queue: [] };
+      this.states.set(name, s);
+    }
+    return s;
+  }
+
+  private pump(name: string) {
+    const s = this.stateFor(name);
+    for (;;) {
+      const head = s.queue[0];
+      if (!head) return;
+      if (head.mode === "exclusive") {
+        if (s.heldExclusive || s.heldShared > 0) return;
+        s.queue.shift();
+        s.heldExclusive = true;
+        head.grant();
+        return;
+      }
+      if (s.heldExclusive) return;
+      s.queue.shift();
+      s.heldShared += 1;
+      head.grant();
+    }
+  }
+
+  async request<T>(name: string, optionsOrCb: unknown, maybeCb?: (lock: { name: string } | null) => Promise<T>): Promise<T> {
+    const cb = (typeof optionsOrCb === "function" ? optionsOrCb : maybeCb) as (lock: { name: string } | null) => Promise<T>;
+    const options = typeof optionsOrCb === "function" ? {} : (optionsOrCb as { mode?: string; signal?: AbortSignal; ifAvailable?: boolean });
+    const mode = options.mode === "shared" ? "shared" : "exclusive";
+    const s = this.stateFor(name);
+    if (options.ifAvailable) {
+      const canGrant = mode === "exclusive" ? !s.heldExclusive && s.heldShared === 0 && s.queue.length === 0 : !s.heldExclusive;
+      if (!canGrant) return cb(null);
+    }
+    let req!: FakeLockRequest;
+    const granted = new Promise<void>((resolve) => {
+      req = { mode, settled: false, grant: () => { req.settled = true; resolve(); } };
+    });
+    s.queue.push(req);
+    this.pump(name);
+    if (!req.settled && options.signal) {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        options.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      });
+      try {
+        await Promise.race([granted, aborted]);
+      } catch (e) {
+        const i = s.queue.indexOf(req);
+        if (i >= 0) s.queue.splice(i, 1);
+        this.pump(name);
+        throw e;
+      }
+    } else {
+      await granted;
+    }
+    try {
+      return await cb({ name });
+    } finally {
+      if (mode === "exclusive") s.heldExclusive = false;
+      else s.heldShared -= 1;
+      this.pump(name);
+    }
+  }
+
+  async query(): Promise<{ held: never[]; pending: never[] }> {
+    return { held: [], pending: [] };
+  }
+}
+
+// Node 22はグローバルに読み取り専用の`navigator`を持つため、definePropertyで差し替える
+// （vaultWriteGate.test.tsと同じ方法）。実物のLockManagerがある環境（Node 24等）でも
+// fakeへ統一し、本suiteの結果がNodeバージョンに依存しないようにする。
+Object.defineProperty(globalThis, "navigator", { value: { locks: new FakeLockManager() }, configurable: true, writable: true });
+
 import type { Conversation, MemoryObject, Source } from "./types";
 import type { PersonRecord } from "./personAlias";
 import type { PeopleState, PeopleStoreEnv, PeopleVaultEnv } from "./personAliasStore";
@@ -462,6 +559,32 @@ test("A-02 integration: a CRLF conversation is equivalent-existing in the Recove
   assert.equal(p.records[0].classification, "equivalent-existing");
 });
 
+test("A-02 regression (Codex P2): an unchanged CRLF duplicate conflict passes revalidation and is recorded in the Registry", async () => {
+  const dup = crlf(markdown.conversationToMarkdown(conversation("c-dup")));
+  const v = new MemVault({
+    "Conversations/a.md": dup,
+    "Conversations/b.md": dup,
+    ...emptyShardFilesFor(["c-dup"]),
+  });
+  const root = v.dir();
+  await prepareResyncWorld();
+  const light = await runLightCheck(v);
+  const record = light.records.find((r) => r.registryKey === "c-dup");
+  assert.ok(record, "the duplicate is classified");
+  assert.equal(record.outcome, "conflict");
+  assert.deepEqual([...(record.allObservedPaths ?? [])].sort(), ["Conversations/a.md", "Conversations/b.md"]);
+  const outcome = await vault.applyVaultLightCheckCandidates(root, light.records, light.localSnapshots);
+  assert.equal(outcome.timedOut, false);
+  // 修正前は、再検証側だけが生テキストのハッシュを取るため、無変更のCRLF
+  // duplicateが常時 conflict-changed としてskipされ、Registryへ記録されなかった。
+  assert.deepEqual(outcome.staleSkipped, []);
+  assert.equal(outcome.counts.conflict, 1);
+  // conflictがRegistryへ記録される（anchor＝観測pathの辞書順最小へ、status "conflict"）。
+  const shard = await vault.readVaultRegistryShard(root, vault.vaultRegistryBucketOf("c-dup"));
+  assert.equal(shard.records["c-dup"], "Conversations/a.md");
+  assert.equal(shard.files["Conversations/a.md"]?.status, "conflict");
+});
+
 // ---------------------------------------------------------------------------
 // A-01：day-file内の破損entryの無言脱落
 // ---------------------------------------------------------------------------
@@ -878,6 +1001,37 @@ test("A-05 rebuild safety: while any vault file is unreadable, the rebuild is he
   const second = await vault.resyncVaultRegistry(v.dir());
   assert.equal(second.scanCompleted, true);
   const shard = await vault.readVaultRegistryShard(v.dir(), bucket);
+  assert.equal(shard.records[k1], "Conversations/a.md");
+  assert.equal(shard.records[k2], "Conversations/b.md");
+});
+
+test("A-05 rebuild safety: a transient shard read failure plus an unreadable record file preserves the healthy shard exactly (Codex P1 scenario)", async () => {
+  const { bucket, k1, k2 } = twoKeysSameBucket();
+  const shardPath = shardPathOf(bucket);
+  const v = new MemVault({
+    "Conversations/a.md": markdown.conversationToMarkdown(conversation(k1)),
+    "Conversations/b.md": markdown.conversationToMarkdown(conversation(k2)),
+  });
+  const root = v.dir();
+  // まず健全なshardを実在させる（2件とも登録済み）。
+  await upsert(root, k1, "Conversations/a.md");
+  await upsert(root, k2, "Conversations/b.md");
+  const healthyBytes = v.text(shardPath);
+  // shardの読み取りが一時的に失敗し、同時にk2のMarkdownも読めない状態で
+  // resyncする。snapshotはbucketを「読めなかった」bucketとして扱い、walkは
+  // k2をunreadableとして記録する。この不完全な観測のままshardを空へ初期化
+  // すると健全なエントリが恒久的に失われるため、shardは無傷でなければ
+  // ならない（再構築の保留はこの形でも働く）。
+  v.failReads.add(shardPath);
+  v.failReads.add("Conversations/b.md");
+  await prepareResyncWorld();
+  const result = await vault.resyncVaultRegistry(root);
+  assert.equal(result.scanCompleted, true);
+  assert.equal(result.unreadableFiles.length, 1);
+  v.failReads.delete(shardPath);
+  v.failReads.delete("Conversations/b.md");
+  assert.equal(v.text(shardPath), healthyBytes);
+  const shard = await vault.readVaultRegistryShard(root, bucket);
   assert.equal(shard.records[k1], "Conversations/a.md");
   assert.equal(shard.records[k2], "Conversations/b.md");
 });
