@@ -539,6 +539,18 @@ export default function SettingsPanel({
                           ・{line}
                         </span>
                       ))}
+                      {vaultStatusCheck.findings.attention.length > 12 && (
+                        <details className="text-stone-600 dark:text-stone-300">
+                          <summary className="cursor-pointer">ほか{vaultStatusCheck.findings.attention.length - 12}件を表示</summary>
+                          <div className="mt-1 flex flex-col gap-0.5">
+                            {vaultStatusCheck.findings.attention.slice(12).map((line) => (
+                              <span key={line} className="break-all text-stone-500 dark:text-stone-400">
+                                ・{line}
+                              </span>
+                            ))}
+                          </div>
+                        </details>
+                      )}
                     </div>
                   )}
                   <div className="flex flex-wrap gap-2">
