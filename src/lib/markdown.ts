@@ -115,6 +115,27 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
   return `${frontmatter}\n${body}`;
 }
 
+/**
+ * A-06（保存・復旧システム監査P1）：turn本文の2行目以降に、turn区切りと見分けがつかない
+ * 行（`**User:** ` / `**Tsumugi:** ` で始まる行、および既に `\` で始まる同形の行）が
+ * ある場合、先頭へ `\` を1つ付けてescapeする。付けないと、保存→読み戻しの往復で
+ * 本文中の行が新しいturnの開始と誤認され、turnが分裂し発言者まで変わってしまう。
+ * 1行目はturnマーカーと同じ行に続くため対象外。マーカーに似ていない行は一切変えない
+ * （従来形式のまま）。parse側（`parseTranscript`）は、`\` + マーカー形の継続行から
+ * `\` を1つだけ取り除く。旧形式ファイルに `\**User:** ` のような行が元々書かれて
+ * いた場合は、その `\` が1つ取り除かれる（発言者が変わることはない。本文の
+ * バックスラッシュが1つ減るだけ）——旧形式の曖昧さとして許容する設計制約。
+ */
+const TURN_MARKER_LIKE_LINE = /^\\*\*\*(?:User|Tsumugi):\*\*/;
+const ESCAPED_TURN_MARKER_LINE = /^\\+\*\*(?:User|Tsumugi):\*\*/;
+
+function escapeTurnBodyLines(content: string): string {
+  return content
+    .split("\n")
+    .map((line, index) => (index > 0 && TURN_MARKER_LIKE_LINE.test(line) ? `\\${line}` : line))
+    .join("\n");
+}
+
 export function conversationToMarkdown(conversation: Conversation): string {
   const frontmatter = toFrontmatter({
     id: conversation.id,
@@ -147,7 +168,7 @@ export function conversationToMarkdown(conversation: Conversation): string {
   });
 
   const transcript = conversation.turns
-    .map((turn) => `**${turn.role === "user" ? "User" : "Tsumugi"}:** ${turn.content}`)
+    .map((turn) => `**${turn.role === "user" ? "User" : "Tsumugi"}:** ${escapeTurnBodyLines(turn.content)}`)
     .join("\n\n");
 
   // リアルタイム日記の本文は会話記録の前に置く（会話記録の読み取りは`## Transcript`以降だけを読むので、日記の無い読み手にも会話は同じに見える）
@@ -243,7 +264,11 @@ export interface ParsedNote {
  * （新しいMarkdown仕様を発明しない。Tsumugi独自の`---`区切りfrontmatterの読み取りだけを共通化する）。
  */
 export function parseFrontmatter(raw: string): ParsedNote | null {
-  const match = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  // A-02（保存・復旧システム監査P1）：CRLFで保存されたMarkdownもLFと同一に読む。
+  // 行末の違いだけで会話が読めなくなったり、本文・発言者が変わったりしてはならないため、
+  // parse入口でCRLFをLFへ正規化する（LFファイルでは恒等変換）。
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return null;
   const [, frontmatterText, body] = match;
 
@@ -432,13 +457,33 @@ export function serializeMemoryDayFile(memoryObjects: MemoryObject[]): string {
  * tsumugi:trueが無い・idが読めないエントリは呼び出し側でスキップできるよう、単純に除外して返す
  * （件数を数えたい場合は呼び出し側でsplit数と結果件数の差を見る）。
  */
-export function parseMemoryDayFile(raw: string): MemoryObject[] {
-  return raw
+/**
+ * A-01（保存・復旧システム監査P1）：day-fileのparseを、読めたエントリと
+ * 「読めなかったエントリの件数」に分けて返す。従来の`parseMemoryDayFile`は
+ * 読めないエントリを無言で除外していたため、呼び出し側（resync／復元scan／
+ * Recovery）が「1件欠けた正常なファイル」と区別できなかった。件数を返すことで、
+ * 呼び出し側は欠落をconflict・件数として表面化できる（読めたエントリ自体は
+ * 従来どおり返す）。空でないブロックがparseできない場合だけを欠落として数える。
+ * CRLFのday-fileもLFと同一に読む（A-02：区切り文字列で分割する前に正規化する）。
+ */
+export function parseMemoryDayFileWithDiagnostics(raw: string): { memories: MemoryObject[]; droppedEntries: number } {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const blocks = normalized
     .split(MEMORY_ENTRY_SEPARATOR)
     .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-    .map((entry) => parseMemoryObjectMarkdown(entry))
-    .filter((memory): memory is MemoryObject => memory !== null);
+    .filter((entry) => entry.length > 0);
+  const memories: MemoryObject[] = [];
+  let droppedEntries = 0;
+  for (const block of blocks) {
+    const parsed = parseMemoryObjectMarkdown(block);
+    if (parsed) memories.push(parsed);
+    else droppedEntries += 1;
+  }
+  return { memories, droppedEntries };
+}
+
+export function parseMemoryDayFile(raw: string): MemoryObject[] {
+  return parseMemoryDayFileWithDiagnostics(raw).memories;
 }
 
 export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
@@ -657,7 +702,9 @@ function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (st
         currentRole = "ai";
         currentLines = [line.slice(AI_PREFIX.length)];
       } else {
-        currentLines.push(line);
+        // A-06：serializerがescapeした継続行（`\**User:** ` 等）は、turnの開始では
+        // なく本文の一部として、`\` を1つ取り除いて戻す。
+        currentLines.push(ESCAPED_TURN_MARKER_LINE.test(line) ? line.slice(1) : line);
       }
     }
     flush();

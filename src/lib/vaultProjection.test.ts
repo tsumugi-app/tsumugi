@@ -1401,7 +1401,8 @@ test("no-op Registry uses untouched raw day-file hash, preserving all member met
   const hashes = Object.fromEntries(members.map(m => [m.id, vaultMod.hashVaultText(markdownMod.memoryObjectToMarkdown(m))]));
   const key = vaultMod.dayFileRegistryKey(day);
   vault.put(memoryShardPathFor(day), JSON.stringify({ schemaVersion: 1, records: { [key]: path }, files: {
-    [path]: { recordType: "memory-day", contentHash: vaultMod.hashVaultText(serialized), memberIds: members.map(m => m.id), memberHashes: hashes, status: "ok" },
+    // mtime/sizeは実shardでは常にある必須field（A-05の厳密な構造検証が前提とする形に合わせる）。
+    [path]: { recordType: "memory-day", mtime: 1, size: raw.length, contentHash: vaultMod.hashVaultText(serialized), memberIds: members.map(m => m.id), memberHashes: hashes, status: "ok" },
   } }));
   // Any Markdown write would fail: a passing reconcile proves the no-op branch.
   vault.writeShouldFail.add(path);

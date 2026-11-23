@@ -56,6 +56,7 @@ import {
   parseConversationMarkdown,
   parseFrontmatter,
   parseMemoryDayFile,
+  parseMemoryDayFileWithDiagnostics,
   parseMemoryObjectMarkdown,
   parseSourceMarkdown,
   serializeMemoryDayFile,
@@ -76,6 +77,7 @@ import {
   checkOpfsWriter,
   getOpfsWriterState,
   hasNativeWritable,
+  verifyWrittenFileContent,
   writeViaWorker,
 } from "./vaultWriter";
 import { diagnosePersonMarkdown, type PersonMarkdownFailure } from "./personAlias";
@@ -620,10 +622,15 @@ function logSyncStep(label: string, durationMs: number): void {
 async function writeFileInDir(dir: FileSystemDirectoryHandle, name: string, content: string, label = "file") {
   const fileHandle = await timedIOStep(`${label} fileHandle`, () => dir.getFileHandle(name, { create: true }));
   if (hasNativeWritable(fileHandle)) {
-    // Android・PC・createWritableのあるSafari：従来どおり（Worker・読み戻し・ロックは使わない）。
+    // Android・PC・createWritableのあるSafari：Worker・ロックは使わない。
     const writable = await timedIOStep(`${label} createWritable`, () => fileHandle.createWritable());
     await timedIOStep(`${label} write`, () => writable.write(content));
     await timedIOStep(`${label} close`, () => writable.close());
+    // A-04（保存・復旧システム監査P1）：native書き込みは例外が出なくても部分的にしか
+    // 着地していないことがある（監査で再現）。読み戻して実体を検証し、一致しない・
+    // 読み戻せない場合は例外にする——呼び出し元がledger／Registryを「成功」として
+    // 確定させず、Outbox等の再試行可能な状態を残すため。
+    await timedIOStep(`${label} verify`, () => verifyWrittenFileContent(fileHandle, content));
     return;
   }
   // createWritableが無いOPFS（iPhone Safari等）：Dedicated Worker + createSyncAccessHandle（vaultWriter.ts）。
@@ -1689,27 +1696,40 @@ export async function readHistoryMonthIndex(root: FileSystemDirectoryHandle, mon
  * `dayFileRegistryKey(day)`（day-file container単位。個々のMemory idではない）。
  */
 export async function readMemoriesForDay(root: FileSystemDirectoryHandle, day: string): Promise<MemoryObject[]> {
+  return (await readMemoriesForDayWithDiagnostics(root, day)).memories;
+}
+
+/**
+ * A-01：`readMemoriesForDay`と同じ読み取りを、day-file内で読めなかったエントリの
+ * 件数とともに返す。従来の読み取りは読めた分だけを返すため、呼び出し側は
+ * 「その日の記録が全部読めた」のか「一部が欠けている」のかを区別できなかった。
+ * 欠落を件数で表面化するための診断付き経路（読み取り自体の契約は変えない）。
+ */
+export async function readMemoriesForDayWithDiagnostics(
+  root: FileSystemDirectoryHandle,
+  day: string
+): Promise<{ memories: MemoryObject[]; droppedEntries: number }> {
   const registryKey = dayFileRegistryKey(day);
   const lookup = await lookupVaultRegistryRecord(root, registryKey);
 
   if (lookup.entry === undefined) {
     try {
       const dir = await root.getDirectoryHandle("Memories", { create: false });
-      return await readDayFileEntries(dir, dayFileNameFor(day));
+      return await readDayFileEntriesWithDiagnostics(dir, dayFileNameFor(day));
     } catch {
-      return [];
+      return { memories: [], droppedEntries: 0 };
     }
   }
 
   if (lookup.entry.status !== "ok") {
-    return [];
+    return { memories: [], droppedEntries: 0 };
   }
 
   try {
     const resolved = await resolveVaultRelativePath(root, lookup.path as string);
-    return await readDayFileEntries(resolved.dir, resolved.fileName);
+    return await readDayFileEntriesWithDiagnostics(resolved.dir, resolved.fileName);
   } catch {
-    return [];
+    return { memories: [], droppedEntries: 0 };
   }
 }
 
@@ -2100,13 +2120,21 @@ async function readDayFileEntries(
   dir: FileSystemDirectoryHandle,
   fileName: string
 ): Promise<MemoryObject[]> {
+  return (await readDayFileEntriesWithDiagnostics(dir, fileName)).memories;
+}
+
+/** A-01：`readDayFileEntries`の診断付き版。読めなかったエントリの件数も返す。 */
+async function readDayFileEntriesWithDiagnostics(
+  dir: FileSystemDirectoryHandle,
+  fileName: string
+): Promise<{ memories: MemoryObject[]; droppedEntries: number }> {
   try {
     const fileHandle = await dir.getFileHandle(fileName, { create: false });
     const file = await fileHandle.getFile();
     const text = await file.text();
-    return parseMemoryDayFile(text);
+    return parseMemoryDayFileWithDiagnostics(text);
   } catch {
-    return [];
+    return { memories: [], droppedEntries: 0 };
   }
 }
 
@@ -2631,7 +2659,10 @@ const TSUMUGI_PROBE_BYTES = 1024;
  */
 async function isLikelyTsumugiFile(file: File): Promise<boolean> {
   const head = await file.slice(0, TSUMUGI_PROBE_BYTES).text();
-  return head.startsWith("---\ntsumugi: true\n") || head.includes("\ntsumugi: true\n");
+  // A-02：CRLFで保存されたファイルもLFと同一に判定する（行末だけでTsumugiファイル
+  // ではないことになると、走査から無言で消えてしまう）。
+  const normalized = head.replace(/\r\n/g, "\n");
+  return normalized.startsWith("---\ntsumugi: true\n") || normalized.includes("\ntsumugi: true\n");
 }
 
 /**
@@ -2808,8 +2839,14 @@ export interface VaultScanResult {
   memoryObjects: MemoryObject[];
   /** Source基盤（最小構成）。他の2つと同じくid重複はupdatedAtが新しい方を採用する。 */
   sources: Source[];
-  /** frontmatterが読めない、`tsumugi: true`が無い等で復元対象外だったファイルの数。 */
+  /** frontmatterが読めない、`tsumugi: true`が無い等で復元対象外だったファイルの数。
+   *  day-file内で読めなかったエントリも、欠落が無言にならないようここへ数える。 */
   skippedCount: number;
+  /**
+   * A-01：day-fileの中で読めなかったエントリの総数。0でない復元は「欠けたエントリが
+   * ある」ことが呼び出し側に伝わる（健全なエントリは従来どおり復元される）。
+   */
+  droppedEntryCount: number;
   /**
    * 同じidが複数のファイル（旧1record1file形式とday-file、または重複・手動コピー）に
    * 存在し、1件へ絞り込んだ回数（採用されなかった側の件数）。
@@ -2940,11 +2977,16 @@ export async function scanVaultForRestore(
     }
   }
 
+  let droppedEntryCount = 0;
   const memoryObjectsById = new Map<string, { value: MemoryObject; meta: RestoreCandidateMeta }>();
   for (const file of memoryFiles) {
-    const parsedEntries = parseMemoryDayFile(file.text);
+    // A-01：読めなかったエントリを件数として表面化する（従来は読めた分だけが
+    // 返り、欠落があっても「完全な復元」に見えていた）。
+    const { memories: parsedEntries, droppedEntries } = parseMemoryDayFileWithDiagnostics(file.text);
+    droppedEntryCount += droppedEntries;
+    skippedCount += droppedEntries;
     if (parsedEntries.length === 0) {
-      skippedCount += 1;
+      if (droppedEntries === 0) skippedCount += 1;
       continue;
     }
     const rank = isMemoryDayFileName(file.name) ? 0 : 1;
@@ -2980,6 +3022,7 @@ export async function scanVaultForRestore(
     memoryObjects: [...memoryObjectsById.values()].map((entry) => entry.value),
     sources: [...sourcesById.values()].map((entry) => entry.value),
     skippedCount,
+    droppedEntryCount,
     duplicatesResolved,
   };
 }
@@ -3250,6 +3293,49 @@ export async function readVaultRegistryShard(root: FileSystemDirectoryHandle, bu
   } catch {
     return emptyVaultRegistryShard(bucket);
   }
+}
+
+/**
+ * A-05（保存・復旧システム監査P1）：Registry shardが「読めない／壊れている」ために
+ * read-modify-writeを安全に行えないことを表すエラー。`readVaultRegistryShard`の
+ * lenientな読み込みは、壊れたshard・読み取り失敗を「空のshard」へfallbackするため、
+ * その結果をそのまま書き戻すと既存エントリを消してしまう（監査で再現）。更新系の
+ * 経路はこのエラーで安全に停止し、shard自体には一切触れない。復旧は、Vault全体を
+ * 走査したresyncが「壊れたbucket」を再構築する経路だけが行う
+ * （`applyVaultResyncScanResult`の事前修復を参照）。
+ */
+export class VaultRegistryShardUnreadableError extends Error {
+  constructor(
+    readonly bucket: number,
+    readonly reason: string
+  ) {
+    super(`[Tsumugi] registry shard ${bucket} is unreadable (${reason}); refusing to rewrite it from an incomplete read`);
+    this.name = "VaultRegistryShardUnreadableError";
+  }
+}
+
+/**
+ * read-modify-write専用のshard読み込み。「本当に存在しない（未作成）」場合だけ
+ * 空shardを返し、読み取り失敗・JSON破損・構造不正は
+ * `VaultRegistryShardUnreadableError` を投げる（「壊れている」を「空」と
+ * 取り違えて書き戻さないため）。純粋な読み取り経路（lookup等）は従来どおり
+ * lenientな`readVaultRegistryShard`を使う。
+ */
+async function readVaultRegistryShardForUpdate(root: FileSystemDirectoryHandle, bucket: number): Promise<VaultRegistryShard> {
+  let registryDir: FileSystemDirectoryHandle | null;
+  try {
+    const tsumugiDir = await getDirIfExists(root, ".tsumugi");
+    registryDir = tsumugiDir ? await getDirIfExists(tsumugiDir, "registry") : null;
+  } catch {
+    throw new VaultRegistryShardUnreadableError(bucket, "registry directory could not be resolved");
+  }
+  if (!registryDir) return emptyVaultRegistryShard(bucket);
+  const read = await readJsonStrict(registryDir, vaultRegistryBucketFileName(bucket));
+  if (read.status === "absent") return emptyVaultRegistryShard(bucket);
+  if (read.status === "error") throw new VaultRegistryShardUnreadableError(bucket, "shard could not be read or parsed");
+  const shard = validateVaultRegistryShardStructure(read.value);
+  if (!shard) throw new VaultRegistryShardUnreadableError(bucket, "shard structure is invalid");
+  return shard;
 }
 
 export async function readVaultRegistryMeta(root: FileSystemDirectoryHandle): Promise<VaultRegistryMeta> {
@@ -3812,7 +3898,7 @@ async function upsertVaultRegistryRecord(root: FileSystemDirectoryHandle, input:
   }
   const bucket = vaultRegistryBucketOf(input.registryKey);
   await withVaultRegistryLock(async () => {
-    const shard = await readVaultRegistryShard(root, bucket);
+    const shard = await readVaultRegistryShardForUpdate(root, bucket);
     shard.bucket = bucket;
     shard.records[input.registryKey] = input.path;
     shard.files[input.path] = {
@@ -3844,7 +3930,7 @@ async function upsertVaultRegistryRecord(root: FileSystemDirectoryHandle, input:
 async function markVaultRegistryNeedsResync(root: FileSystemDirectoryHandle, registryKey: string): Promise<void> {
   const bucket = vaultRegistryBucketOf(registryKey);
   await withVaultRegistryLock(async () => {
-    const shard = await readVaultRegistryShard(root, bucket);
+    const shard = await readVaultRegistryShardForUpdate(root, bucket);
     const path = shard.records[registryKey];
     if (path === undefined) return;
     const entry = shard.files[path];
@@ -4128,6 +4214,16 @@ interface VaultResyncScanResult {
    * 一切影響しない。
    */
   previousSnapshotCompleted: boolean;
+  /**
+   * A-05：Phase 0で「実在するのに読めなかった／構造が壊れていた」Registry shardの
+   * bucket集合。snapshot上これらのbucketは空として扱われているが、「本当に空」と
+   * 区別するため apply へ伝える。`applyVaultResyncScanResult`は、scan全体が完了
+   * した場合に限り、これらのbucketを空shardとして再構築してから record 単位の
+   * commitを行う（実在するrecordのエントリは、その後のcommitで実ファイルの
+   * 観測に基づいて再登録される）。scanが完了していない場合は再構築しない
+   * （不完全な観測でRegistryを書き換えない）。
+   */
+  corruptRegistryBuckets: Set<number>;
 }
 
 type VaultResyncSingleKind = "conversation" | "source" | "reflection";
@@ -4136,7 +4232,7 @@ type VaultResyncParsedCandidate =
   | { kind: "conversation"; id: string; record: Conversation }
   | { kind: "source"; id: string; record: Source }
   | { kind: "reflection"; id: string; record: MemoryObject }
-  | { kind: "memory-day"; day: string; members: MemoryObject[] }
+  | { kind: "memory-day"; day: string; members: MemoryObject[]; droppedEntries: number }
   // People（人物メモ）はRegistryのrecordではない。専用parserで検証が通ったこと
   // だけを表す分類結果であり、呼び出し側はrecord化せず「分類済み」として終える。
   | { kind: "person"; id: string };
@@ -4204,7 +4300,9 @@ function parseTsumugiResyncCandidate(text: string): VaultResyncParsedCandidate |
     }
   }
   if (bodyKind === "memory-like") {
-    const members = parseMemoryDayFile(text);
+    // A-01：読めなかったエントリの件数も一緒に返す。day-fileとして分類できた場合、
+    // 欠落は呼び出し側（handleResyncMemoryDayCandidate）がconflictとして表面化する。
+    const { memories: members, droppedEntries } = parseMemoryDayFileWithDiagnostics(text);
     if (members.length === 0) return null;
     const reflectionCount = members.filter((m) => m.metadata.source === "system-generated").length;
     if (reflectionCount > 0 && members.length > 1) return null;
@@ -4214,7 +4312,7 @@ function parseTsumugiResyncCandidate(text: string): VaultResyncParsedCandidate |
     const days = new Set(members.map((m) => m.date.slice(0, 10)));
     if (days.size !== 1) return null;
     const [day] = days;
-    return { kind: "memory-day", day, members };
+    return { kind: "memory-day", day, members, droppedEntries };
   }
   return null;
 }
@@ -4756,7 +4854,8 @@ async function handleResyncMemoryDayCandidate(
   members: MemoryObject[],
   mtime: number,
   size: number,
-  text: string
+  text: string,
+  droppedEntries = 0
 ): Promise<void> {
   const registryKey = dayFileRegistryKey(day);
   const alreadySeenPaths = state.seenPathsByKey.get(registryKey);
@@ -4789,6 +4888,30 @@ async function handleResyncMemoryDayCandidate(
       note: "同一day-fileが複数pathに存在します（重複）",
       parsed: null,
       allObservedPaths: [...(state.seenPathsByKey.get(registryKey) ?? [])],
+    });
+    return;
+  }
+
+  // A-01：day-file内に読めないエントリがある場合、そのエントリは「存在しない」の
+  // ではなく「読めない」のであり、読めた分だけでadded／edited／unchangedと確定
+  // させてはならない（確定させると、読めないエントリがRegistryからも無言で
+  // 消える）。Registryに前回エントリが無い場合も含め、常に対象全体をconflictにし、
+  // 前回のcontentHash等は保持する（member removalと同じ安全側の扱い）。
+  if (droppedEntries > 0) {
+    state.recordsByKey.set(registryKey, {
+      registryKey,
+      recordType: "memory-day",
+      outcome: "conflict",
+      previousPath,
+      currentPath: path,
+      contentHash: previousEntry?.contentHash ?? contentHash,
+      mtime: previousEntry?.mtime ?? mtime,
+      size: previousEntry?.size ?? size,
+      members: await classifyResyncMembers(members, previousMemberHashes),
+      addedIndexedDbEquivalent: null,
+      note: `day-file内に読み取れないエントリがあります（${droppedEntries} unreadable entries）`,
+      parsed: null,
+      allObservedPaths: null,
     });
     return;
   }
@@ -4978,7 +5101,9 @@ async function processVaultResyncCandidate(
 
   let text: string;
   try {
-    text = await file.text();
+    // A-02：CRLFのファイルもLFと同一に分類する。本文の正規化後の形で
+    // contentHashも計算するため、行末だけの違いは「編集」とも判定されない。
+    text = (await file.text()).replace(/\r\n/g, "\n");
   } catch (error) {
     state.unreadableFiles.push({ path, reason: `read failed: ${String(error)}` });
     return;
@@ -5004,7 +5129,7 @@ async function processVaultResyncCandidate(
   const size = file.size;
 
   if (candidate.kind === "memory-day") {
-    await handleResyncMemoryDayCandidate(root, state, path, candidate.day, candidate.members, mtime, size, text);
+    await handleResyncMemoryDayCandidate(root, state, path, candidate.day, candidate.members, mtime, size, text, candidate.droppedEntries);
   } else {
     await handleResyncSingleRecordCandidate(root, state, path, candidate.kind, candidate.id, candidate.record, mtime, size, text);
   }
@@ -5297,13 +5422,17 @@ async function readVaultRegistryShardFromDirForResyncSnapshot(
  */
 async function buildVaultRegistrySnapshotForResync(
   root: FileSystemDirectoryHandle
-): Promise<VaultRegistrySnapshot & { completed: boolean }> {
+): Promise<VaultRegistrySnapshot & { completed: boolean; failedBuckets: Set<number> }> {
   const snapshotStart = Date.now();
   const previousByKey = new Map<string, string>();
   const previousEntries = new Map<string, VaultRegistryFileEntry>();
   const previousRegistryKeyByPath = new Map<string, string>();
   let shardCount = 0;
   let completed = true;
+  // A-05：実在するのに読めなかった／構造が壊れていたshardのbucket。snapshot上は
+  // 空として扱われるが、「本当に空」とは区別して apply 側へ伝える（applyが
+  // 走査の裏付けをもって再構築できるのは、この集合に入ったbucketだけ）。
+  const failedBuckets = new Set<number>();
 
   let registryDir: FileSystemDirectoryHandle | null = null;
   try {
@@ -5327,7 +5456,10 @@ async function buildVaultRegistrySnapshotForResync(
         const bucket = Number.parseInt(name.replace(/\.json$/, ""), 16);
         if (!Number.isFinite(bucket)) continue;
         const { shard, readFailed } = await readVaultRegistryShardFromDirForResyncSnapshot(registryDir, bucket);
-        if (readFailed) completed = false;
+        if (readFailed) {
+          completed = false;
+          failedBuckets.add(bucket);
+        }
         for (const [key, path] of Object.entries(shard.records)) {
           previousByKey.set(key, path);
           previousRegistryKeyByPath.set(path, key);
@@ -5347,7 +5479,7 @@ async function buildVaultRegistrySnapshotForResync(
     durationMs: Date.now() - snapshotStart,
     completed: completed ? 1 : 0,
   });
-  return { previousByKey, previousEntries, previousRegistryKeyByPath, completed };
+  return { previousByKey, previousEntries, previousRegistryKeyByPath, completed, failedBuckets };
 }
 
 async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<VaultResyncScanResult> {
@@ -5421,6 +5553,7 @@ async function performVaultResyncScan(root: FileSystemDirectoryHandle): Promise<
     previousByKey: state.previousByKey,
     previousEntries: state.previousEntries,
     previousSnapshotCompleted: snapshot.completed,
+    corruptRegistryBuckets: snapshot.failedBuckets,
   };
 }
 
@@ -5854,7 +5987,7 @@ async function setVaultRegistryEntryStatus(
 ): Promise<void> {
   const bucket = vaultRegistryBucketOf(registryKey);
   await withVaultRegistryLock(async () => {
-    const shard = await readVaultRegistryShard(root, bucket);
+    const shard = await readVaultRegistryShardForUpdate(root, bucket);
     const path = shard.records[registryKey];
     if (path === undefined) return;
     const entry = shard.files[path];
@@ -5886,7 +6019,7 @@ export async function commitVaultRegistrySingleRecordOk(
 ): Promise<void> {
   const bucket = vaultRegistryBucketOf(registryKey);
   await withVaultRegistryLock(async () => {
-    const shard = await readVaultRegistryShard(root, bucket);
+    const shard = await readVaultRegistryShardForUpdate(root, bucket);
     if (oldPathToRemove !== null && oldPathToRemove !== newPath) {
       delete shard.files[oldPathToRemove];
     }
@@ -5918,7 +6051,7 @@ export async function commitVaultRegistryMemoryDayOk(
 ): Promise<void> {
   const bucket = vaultRegistryBucketOf(registryKey);
   await withVaultRegistryLock(async () => {
-    const shard = await readVaultRegistryShard(root, bucket);
+    const shard = await readVaultRegistryShardForUpdate(root, bucket);
     if (oldPathToRemove !== null && oldPathToRemove !== newPath) {
       delete shard.files[oldPathToRemove];
     }
@@ -6036,7 +6169,7 @@ async function createVaultRegistryConflictAnchor(
 
   const bucket = vaultRegistryBucketOf(record.registryKey);
   return await withVaultRegistryLock(async (): Promise<VaultRegistryConflictAnchorCommit> => {
-    const shard = await readVaultRegistryShard(root, bucket);
+    const shard = await readVaultRegistryShardForUpdate(root, bucket);
     const existingPath = shard.records[record.registryKey];
     if (existingPath !== undefined) {
       // Codexレビュー再指摘・High 1対応：既にこのkeyがregistryへ登録済み
@@ -6713,6 +6846,27 @@ async function applyVaultResyncScanResult(
   const conflictDetails: VaultResyncConflictDetail[] = [];
   const missingDetails: VaultResyncMissingDetail[] = [];
   const recordOutcomes: VaultResyncApplyRecordOutcome[] = [];
+
+  // A-05：壊れたshardの事前修復。更新系のcommitは壊れたshardへのread-modify-writeを
+  // 拒否する（`readVaultRegistryShardForUpdate`）ため、放置すると壊れたbucketは
+  // 永遠に直らない。ここでは「Vault全体の走査が完了した」場合に限り、壊れたbucketを
+  // 空shardとして再構築してから record 単位のcommitへ進む——再構築の根拠は
+  // 個々のrecordの推測ではなく今回の完全な走査結果であり、実在するrecordの
+  // エントリは直後のcommitが実ファイルの観測に基づいて再登録する。走査が完了して
+  // いない場合は再構築せず、commit側の拒否がapplyErrorsとして表面化する
+  // （不完全な観測でRegistryを書き換えない）。
+  if (scan.scanCompleted && scan.corruptRegistryBuckets.size > 0) {
+    for (const bucket of scan.corruptRegistryBuckets) {
+      try {
+        await writeVaultRegistryShard(root, bucket, emptyVaultRegistryShard(bucket));
+      } catch (error) {
+        applyErrors.push({
+          registryKey: `__registry_shard_${bucket}__`,
+          reason: `failed to rebuild unreadable registry shard ${bucket}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
+  }
 
   for (const record of scan.records) {
     let finalOutcome: VaultResyncOutcome;
@@ -8405,6 +8559,11 @@ export async function applyVaultLightCheckCandidates(
       previousByKey: new Map(),
       previousEntries: new Map(),
       previousSnapshotCompleted: true,
+      // A-05：壊れたshardの再構築は「Vault全体の走査が完了した」full resyncだけが
+      // 行う。L4は個別candidateの適用のみで走査の裏付けが無いため、常に空集合
+      // （＝再構築しない）を渡す。壊れたbucketへのcommitはcommit側の拒否により
+      // applyErrorsとして表面化する。
+      corruptRegistryBuckets: new Set<number>(),
     });
 
     return { counts: applyResult.counts, applyErrors: applyResult.applyErrors, staleSkipped };

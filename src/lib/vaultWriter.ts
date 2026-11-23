@@ -6,8 +6,8 @@
  * （main threadには無い）。そこで、`createWritable`が無いときだけ、Workerでの書き込みに切り替える。
  *
  * 【経路】
- * - `createWritable`がある（Android・PC・新しいSafari等）：従来どおり`createWritable → write → close`。
- *   Worker・読み戻し・ロックは使わない（従来の挙動を変えない）。
+ * - `createWritable`がある（Android・PC・新しいSafari等）：`createWritable → write → close` の後、
+ *   読み戻してサイズ＋全バイトを照合する（A-04：部分着地を成功と誤判定しないため。Worker・ロックは使わない）。
  * - `createWritable`が無い（OPFSのみ）：`root.resolve(fileHandle)`でrootからのpathを求め、pathだけをWorkerへ渡す
  *   （`FileSystemHandle`のpostMessage転送はiPhone Safariで`DataCloneError`になるため使わない）。Workerは
  *   `navigator.storage.getDirectory()`からpathをたどり、`createSyncAccessHandle → write → truncate → flush → close`。
@@ -375,13 +375,51 @@ export function writeViaWorker(file: FileSystemFileHandle, content: WriteContent
 }
 
 /**
- * ファイル1つ分の書き込みの共通入口。`createWritable`があれば従来どおり（Worker・読み戻し・ロックを使わない）。
+ * A-04（保存・復旧システム監査P1）：書き込み後の実体検証。native経路
+ * （`createWritable`）は、例外が出なくても部分的にしか着地していないことがある
+ * （監査で再現）。「例外が無い＝成功」とせず、読み戻して実体が意図した内容と
+ * 一致した場合だけ成功とする。一致しない・読み戻せない場合は
+ * `VaultWriteVerificationError`（rollback未実施）を投げ、呼び出し元が
+ * ledger／Registryを成功として確定させないようにする。
+ *
+ * 照合方法：実ブラウザの`File`は必ず`arrayBuffer()`を持つため、通常は
+ * サイズ＋全バイトで照合する。`arrayBuffer()`を持たないFile実装（テスト用の
+ * double等）では`text()`で照合する——部分着地は文字列の欠け・文字化けとして
+ * 必ず現れるため、検出目的は果たせる。
+ */
+export async function verifyWrittenFileContent(file: FileSystemFileHandle, content: WriteContent): Promise<void> {
+  const expected = toBytes(content);
+  try {
+    const stored = await file.getFile();
+    if (typeof stored.arrayBuffer === "function") {
+      const actual = new Uint8Array(await stored.arrayBuffer());
+      if (actual.byteLength !== expected.byteLength) {
+        throw new Error(`read-back size mismatch: ${actual.byteLength} != ${expected.byteLength}`);
+      }
+      for (let i = 0; i < expected.byteLength; i++) {
+        if (actual[i] !== expected[i]) throw new Error(`read-back content mismatch at byte ${i}`);
+      }
+      return;
+    }
+    const actualText = await stored.text();
+    if (actualText !== new TextDecoder().decode(expected)) {
+      throw new Error("read-back content mismatch (text comparison)");
+    }
+  } catch (error) {
+    throw new VaultWriteVerificationError(`vault write could not be verified (${errText(error)})`, "not-attempted", error);
+  }
+}
+
+/**
+ * ファイル1つ分の書き込みの共通入口。`createWritable`があれば従来の書き込み手順の後、
+ * A-04対応として読み戻し検証まで行う（検証できない状態を成功とはしない）。
  */
 export async function writeFileHandleContent(file: FileSystemFileHandle, content: WriteContent): Promise<void> {
   if (hasNativeWritable(file)) {
     const writable = await file.createWritable();
     await writable.write(content as FileSystemWriteChunkType);
     await writable.close();
+    await verifyWrittenFileContent(file, content);
     return;
   }
   await writeViaWorker(file, content);

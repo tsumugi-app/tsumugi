@@ -218,6 +218,12 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
   // Exact added / removed lines of vault.ts only (never a pattern).
   const peopleClassifierLines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedPeopleClassifierLines.json"), "utf8")).lines);
   const peopleClassifier = (l: string) => peopleClassifierLines.has(l[0] + l.slice(1).trim());
+  // Reviewed (storage P1 fixes, owner approval 2026-11-23): the six audit P1 defects — day-file dropped entries surface as
+  // conflict/counts instead of silently vanishing, CRLF files are classified like LF, native writes are verified by read-back,
+  // Registry read-modify-write refuses corrupt shards, and a completed resync rebuilds corrupt Registry buckets.
+  // Exact added / removed lines of vault.ts only (never a pattern).
+  const storageP1Lines = new Set<string>(JSON.parse(fs.readFileSync(path.join(SRC, "lib", "maintenance", "reviewedStorageP1Lines.json"), "utf8")).lines);
+  const storageP1 = (l: string) => storageP1Lines.has(l[0] + l.slice(1).trim());
   // Reviewed storage safety extension: exact lines only, never a blanket exemption.
   const deletionGuardLines = new Set([
     'async () => {', '},', 'hasDeletedMemoryReferences,',
@@ -230,7 +236,7 @@ test("normal operation is untouched: ChatScreen, startup, layout, API routes, PW
     'await writeConversationMarkdownImpl(root, conversation, dirHandleCache, options);',
     'await writeMemoryObjectMarkdownImpl(root, memoryObject, dirHandleCache, options);',
   ]);
-  for (const l of vaultDiff) assert.ok(vaultDiagnostics(l) || peopleClassifier(l) || autoCaptureSafety(l) || writeSafety(l) || realtimeDiary(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
+  for (const l of vaultDiff) assert.ok(vaultDiagnostics(l) || peopleClassifier(l) || storageP1(l) || autoCaptureSafety(l) || writeSafety(l) || realtimeDiary(l) || deletionGuardLines.has(l.slice(1).trim()) || /skipLedger|markVaultSynced|isTombstoned|isMemoryBlockedByTombstone|ユーザーが削除した記録|inserted\b|let inserted = true;|^-\s+\} else \{\s*$|^\+\s+allSucceeded = false;|^-\s+await (addConversationIfAbsentAndMarkSynced|addMemoryObjectIfAbsentAndMarkSynced)\(|(putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey, existing\)|^\+\s*(\/\*\*|\*|\*\/)|^\+\s*$/.test(l) || /^-\s+await markVaultSynced|^-\s+await (putConversation|putMemoryObject)AndMarkSynced\(merged, syncKey\);/.test(l) || /^\+\s*(\/\/|\*)/.test(l) || startupIoVault.test(l), "unexpected vault.ts change: " + l);
 });
 
 /**

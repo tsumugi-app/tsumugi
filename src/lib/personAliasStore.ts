@@ -130,6 +130,24 @@ export interface PeopleSyncResult {
   stillPending: number;
 }
 
+/**
+ * A-03（保存・復旧システム監査P1）：parseできないファイルが「人物メモらしい」かを判定する。
+ * 従来は `type: person` 行が見える場合だけを unreadable と数えていたため、`type:` 行より
+ * 前で切断された人物メモが「人物メモではない」と誤認され、同期がその人物を
+ * 「Vaultから削除された」と解釈して端末キャッシュから消してしまった（監査で removed=1 を再現）。
+ * 人物メモらしい兆候が1つでもあれば unreadable として扱い、削除とは解釈しない。
+ * 兆候の無い通常のメモ（People/ に置かれた無関係なMarkdown）は従来どおり無視する。
+ */
+function looksLikePersonNote(f: PeopleFile): boolean {
+  const text = f.text.replace(/\r\n/g, "\n");
+  if (/^type:\s*person\s*$/m.test(text)) return true;
+  // frontmatterが `tsumugi: true` を宣言している（＝Tsumugi管理ファイルらしい）が人物として読めない。
+  if (/^---\n[\s\S]{0,1024}?^tsumugi:\s*true\s*$/m.test(text)) return true;
+  // アプリが生成する人物ファイル名（`<名前> (<id末尾6文字>).md`）を占めている。
+  if (/\([0-9a-z]{6}\)\.md$/i.test(f.fileName)) return true;
+  return false;
+}
+
 /** the Vault copies of each person: one per id (conflicted copies of a sync tool merged), with the file that the app writes to */
 export function readVaultPeople(files: PeopleFile[]): { people: Map<string, { person: PersonRecord; files: string[] }>; unreadable: string[] } {
   const people = new Map<string, { person: PersonRecord; files: string[] }>();
@@ -137,7 +155,7 @@ export function readVaultPeople(files: PeopleFile[]): { people: Map<string, { pe
   for (const f of [...files].sort((a, b) => a.fileName.localeCompare(b.fileName))) {
     const parsed = parsePersonMarkdown(f.text, f.fileName);
     if (!parsed) {
-      if (/^type:\s*person\s*$/m.test(f.text)) unreadable.push(f.fileName);
+      if (looksLikePersonNote(f)) unreadable.push(f.fileName);
       continue;
     }
     const seen = people.get(parsed.id);
@@ -204,6 +222,16 @@ export async function syncPeopleWithVault(store: PeopleStoreEnv, vault: PeopleVa
     }
   }
 
+  // A-03（二重の防御）：削除の確定には、その人物のメモファイル自体がPeople/ の一覧に
+  // 「存在しない」ことを必須とする。ファイル名が一致する、またはファイル名にその人物の
+  // id末尾6文字を含むファイルが1つでも残っている限り、内容が読めなくても「削除された」
+  // とは解釈せず、キャッシュを保持する（破損・読み取り失敗を削除と取り違えない）。
+  const presentNames = [...listing.files.map((f) => f.fileName), ...listing.unreadable];
+  const noteFilePresent = (person: PersonRecord): boolean => {
+    const suffix = `(${person.id.slice(-6).toLowerCase()})`;
+    return presentNames.some((name) => name === person.fileName || name.toLowerCase().includes(suffix));
+  };
+
   // the device cache: the Vault copy, merged with whatever was decided here (also meanwhile); pending = a decision the Vault does not hold
   return store.updateState((state) => {
     const people: PersonRecord[] = [];
@@ -214,7 +242,7 @@ export async function syncPeopleWithVault(store: PeopleStoreEnv, vault: PeopleVa
       const mine = state.people.find((p) => p.id === id);
       const theirs = vaultNow.get(id);
       const notInVault = mine && !theirs && !state.pending.includes(id) && !local.pending.includes(id);
-      if (notInVault && listing.complete && result.unreadable.length === 0) { removed += 1; continue; }
+      if (notInVault && listing.complete && result.unreadable.length === 0 && !(mine && noteFilePresent(mine))) { removed += 1; continue; }
       const merged = mine && theirs ? mergePerson(mine, theirs) : (mine ?? theirs)!;
       people.push(merged);
       // a person kept only because People/ could not be read whole is not made pending (that would write a removed note back)
