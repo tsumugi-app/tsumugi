@@ -9,6 +9,7 @@ import type { Conversation, MemoryObject, Source } from "./types";
 import { conversationToMarkdown, parseConversationMarkdown, parseFrontmatter, parseMemoryObjectMarkdown, parseSourceMarkdown } from "./markdown";
 import { conversationsSemanticEqual, memoryObjectsSemanticEqual, sourcesSemanticEqual,
   isReflectionSummary, dayFileRegistryKey, vaultRegistryBucketOf, fileNameFor, dayFileNameFor } from "./vault";
+import { parsePersonMarkdown } from "./personAlias";
 
 /** 他の全走査系関数（vault.ts/vaultLegacyCleanup.ts等）と共通の規約：`.`で始まる
  *  ディレクトリ・ファイルは隠し領域（`.tsumugi`本体・`.tsumugi-archive`等）として
@@ -290,6 +291,16 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
             // 影響しない）。tsumugi:trueを宣言した後のid不正等は、従来通りTsumugi
             // 所有recordの破損としてissue化する（下のthrowはそのまま維持）。
             if (!parsed || parsed.frontmatter.tsumugi !== true) continue;
+            // People（人物メモ）はRecoveryのrecordではない（保存・同期は専用経路
+            // personAliasStoreの責務）。専用parserで検証だけを行い、正常ならrecord化も
+            // issue化もせずにこのblockを終える——正常なPeopleファイルを
+            // unsupported-recordとして数えると、Recovery計画全体が安全側に停止して
+            // しまうため。専用parserが受け付けないPeopleファイルは、他のTsumugi所有
+            // recordの破損と同様にthrowしてissue化する（安全側の扱いは変えない）。
+            if (parsed.frontmatter.type === "person") {
+              if (!parsePersonMarkdown(block, path.split("/").pop() ?? path)) throw new Error("invalid-person-record");
+              continue;
+            }
             if (typeof parsed.frontmatter.id !== "string") throw new Error("unrecognized-markdown");
             const { frontmatter: fm, body } = parsed;
             for (const field of ["links", "profile", "person", "topicEvents"]) {

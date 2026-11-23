@@ -198,27 +198,55 @@ const isDecision = (x: unknown): x is PersonDecision => {
 };
 
 /**
+ * Why a People/ note can not be read, as a closed set of shapes (so the Vault-wide classifiers can tell a broken person note from a healthy one
+ * and report the shape without ever leaking file content or exception text):
+ * - `invalid-frontmatter`: no frontmatter at all, or the `type: person` / `tsumugi: true` declaration does not match.
+ * - `missing-required`: a required piece is absent or malformed (`id`, `createdAt`, or the decisions comment itself).
+ * - `truncated`: the frontmatter never closes, or the decisions comment never closes (the file ends early).
+ * - `invalid-decisions`: the decisions payload is not readable JSON, has the wrong shape, or repeats a decision id.
+ */
+export type PersonMarkdownFailure = "invalid-frontmatter" | "missing-required" | "truncated" | "invalid-decisions";
+
+export type PersonMarkdownDiagnosis = { ok: true; person: PersonRecord } | { ok: false; failure: PersonMarkdownFailure };
+
+/**
+ * A People/ note back to a person, with the failure shape when it can not be read. The judgement is exactly `parsePersonMarkdown`'s; this
+ * variant exists for the Vault-wide classifiers (resync / light-check / Recovery scan), which must recognise a healthy person note as a valid
+ * managed file without ever turning it into one of their own records, and must still surface a broken one instead of passing it as healthy.
+ * Classification only: nothing here writes, repairs, or registers anything.
+ */
+export function diagnosePersonMarkdown(text: string, fileName: string): PersonMarkdownDiagnosis {
+  const fm = /^---\n([\s\S]*?)\n---/.exec(text.replace(/\r\n/g, "\n"));
+  if (!fm) {
+    // Starts with the frontmatter fence but never closes it: the file ends inside the frontmatter.
+    return { ok: false, failure: text.replace(/\r\n/g, "\n").startsWith("---") ? "truncated" : "invalid-frontmatter" };
+  }
+  const field = (name: string) => new RegExp(`^${name}:\\s*(.+)$`, "m").exec(fm[1])?.[1].trim();
+  if (field("type") !== "person" || field("tsumugi") !== "true") return { ok: false, failure: "invalid-frontmatter" };
+  const id = field("id");
+  const createdAt = field("createdAt");
+  if (!id || !/^[0-9A-Za-z_-]{6,64}$/.test(id) || !createdAt || !Number.isFinite(Date.parse(createdAt))) {
+    return { ok: false, failure: "missing-required" };
+  }
+  const open = text.lastIndexOf(DECISIONS_OPEN);
+  if (open < 0) return { ok: false, failure: "missing-required" };
+  const close = text.indexOf(DECISIONS_CLOSE, open + DECISIONS_OPEN.length);
+  if (close < 0) return { ok: false, failure: "truncated" };
+  let raw: unknown;
+  try { raw = JSON.parse(text.slice(open + DECISIONS_OPEN.length, close).trim()); } catch { return { ok: false, failure: "invalid-decisions" }; }
+  if (!Array.isArray(raw) || !raw.every(isDecision)) return { ok: false, failure: "invalid-decisions" };
+  const ids = new Set(raw.map((d) => d.id));
+  if (ids.size !== raw.length) return { ok: false, failure: "invalid-decisions" };
+  return { ok: true, person: { id, fileName, createdAt, decisions: (raw as PersonDecision[]).map((d) => ({ id: d.id, at: d.at, kind: d.kind, name: d.name })).sort(byTime) } };
+}
+
+/**
  * A People/ note back to a person. `null` when the file is not a Tsumugi person note, or when its decisions can not be read whole (then the app never
  * writes over it: a decision would be lost).
  */
 export function parsePersonMarkdown(text: string, fileName: string): PersonRecord | null {
-  const fm = /^---\n([\s\S]*?)\n---/.exec(text.replace(/\r\n/g, "\n"));
-  if (!fm) return null;
-  const field = (name: string) => new RegExp(`^${name}:\\s*(.+)$`, "m").exec(fm[1])?.[1].trim();
-  if (field("type") !== "person" || field("tsumugi") !== "true") return null;
-  const id = field("id");
-  const createdAt = field("createdAt");
-  if (!id || !/^[0-9A-Za-z_-]{6,64}$/.test(id) || !createdAt || !Number.isFinite(Date.parse(createdAt))) return null;
-  const open = text.lastIndexOf(DECISIONS_OPEN);
-  if (open < 0) return null;
-  const close = text.indexOf(DECISIONS_CLOSE, open + DECISIONS_OPEN.length);
-  if (close < 0) return null;
-  let raw: unknown;
-  try { raw = JSON.parse(text.slice(open + DECISIONS_OPEN.length, close).trim()); } catch { return null; }
-  if (!Array.isArray(raw) || !raw.every(isDecision)) return null;
-  const ids = new Set(raw.map((d) => d.id));
-  if (ids.size !== raw.length) return null;
-  return { id, fileName, createdAt, decisions: (raw as PersonDecision[]).map((d) => ({ id: d.id, at: d.at, kind: d.kind, name: d.name })).sort(byTime) };
+  const diagnosis = diagnosePersonMarkdown(text, fileName);
+  return diagnosis.ok ? diagnosis.person : null;
 }
 
 /** a person read from storage (the device cache): shape checked, anything else dropped */

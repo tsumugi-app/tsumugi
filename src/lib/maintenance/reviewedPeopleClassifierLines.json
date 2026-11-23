@@ -1,0 +1,29 @@
+{
+  "note": "People classifier fix (owner approval 2026-11-23): the resync / light-check classifier recognises the People file type. A healthy People file (validated by the dedicated parser, diagnosePersonMarkdown in personAlias.ts) is classified as a valid managed file and never becomes a Registry record; a broken People file is reported unreadable with a fixed reason prefix plus the closed PersonMarkdownFailure shape only (no file content, no exception text), mapped to the existing safe diagnostic kind parse. Registry registration, record parsing and all write paths are unchanged. Exact added / removed lines of src/lib/vault.ts only (never a pattern); comment and blank added lines pass the boundary test by its standing rule and are not listed here.",
+  "lines": [
+    "+import { diagnosePersonMarkdown, type PersonMarkdownFailure } from \"./personAlias\";",
+    "+const UNREADABLE_REASON_PERSON_PARSE_PREFIX = \"tsumugi person file could not be parsed: \";",
+    "+if (reason.startsWith(UNREADABLE_REASON_PERSON_PARSE_PREFIX)) return \"parse\";",
+    "+export function vaultPersonFileFailureOf(text: string): PersonMarkdownFailure | null {",
+    "+const parsedFrontmatter = parseFrontmatter(text);",
+    "+if (!parsedFrontmatter || parsedFrontmatter.frontmatter.type !== \"person\") return null;",
+    "+const diagnosis = diagnosePersonMarkdown(text, \"\");",
+    "+return diagnosis.ok ? null : diagnosis.failure;",
+    "+}",
+    "-| { kind: \"memory-day\"; day: string; members: MemoryObject[] };",
+    "+| { kind: \"memory-day\"; day: string; members: MemoryObject[] }",
+    "+| { kind: \"person\"; id: string };",
+    "+if (frontmatter.type === \"person\") {",
+    "+return diagnosis.ok ? { kind: \"person\", id: diagnosis.person.id } : null;",
+    "-state.unreadableFiles.push({ path, reason: \"tsumugi:true is present but content could not be classified/parsed\" });",
+    "+const personFailure = vaultPersonFileFailureOf(text);",
+    "+state.unreadableFiles.push({",
+    "+path,",
+    "+reason: personFailure ? `${UNREADABLE_REASON_PERSON_PARSE_PREFIX}${personFailure}` : UNREADABLE_REASON_PARSE,",
+    "+});",
+    "+return;",
+    "+if (candidate.kind === \"person\") {",
+    "+throw new Error(`anchor file at ${anchorPath} is a People file, which is never a Registry record`);",
+    "+if (parsed.kind === \"person\") return null; // PeopleはRegistryに登録されないため、registryKeyは無い。"
+  ]
+}
