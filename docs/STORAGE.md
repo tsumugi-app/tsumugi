@@ -204,6 +204,31 @@ vault/
 - `id → path` の対応は常に `.tsumugi/index.json` が持つため、**ファイル名のリネームは記憶の同一性を壊さない**
   （`DATA_MODEL.md` §0.3 のID戦略をそのまま踏襲）。
 
+## 3.1 管理ファイル種別 × 検査・復旧経路（実装現況、2026-11-23）
+
+コードから棚卸しした、現在サポートされる管理ファイル種別と各経路の対応。
+「対象外」は未対応ではなく、その経路の責務ではないことが意図された状態を指す。
+正常な形式のファイルがどの検査系でも「壊れている」と誤判定されないこと、
+各種別に適切な保護経路があることが、この表の満たすべき条件である。
+
+| 種別 | 生成・更新 | 専用parser | light-check／resync分類 | Recovery走査 | 整合性チェック | バックアップ | 復旧・同期 |
+|---|---|---|---|---|---|---|---|
+| Conversation | ✓（Registry管理） | ✓ `parseConversationMarkdown` | ✓ recordとして分類 | ✓ record | ✓ | ✓ | ✓ Registry＋Recovery |
+| Memory（day-file） | ✓ `serializeMemoryDayFile`（Registry管理） | ✓ `parseMemoryDayFile` | ✓ day-fileとして分類 | ✓ record（member単位） | ✓ | ✓ | ✓ Registry＋Recovery |
+| Reflection | ✓ `memoryObjectToMarkdown`（Registry管理） | ✓ Memory parser＋`isReflectionSummary`で細分 | ✓ recordとして分類 | ✓ record | ✓ | ✓ | ✓ Registry＋Recovery |
+| Source | ✓ `sourceToMarkdown`（Registry管理） | ✓ `parseSourceMarkdown` | ✓ recordとして分類 | ✓ record | ✓ | ✓ | ✓ Registry＋Recovery |
+| People | ✓ `personToMarkdown`（専用経路。Registry登録は意図的に対象外） | ✓ `parsePersonMarkdown`／`diagnosePersonMarkdown` | ✓ 検証のみ（record化しない） | ✓ 検証のみ（record化しない） | ✓ 正常時は所見なし | ✓ | ✓ 専用同期 `syncPeopleWithVault`（Registry／Recoveryとは責務分離） |
+| `.tsumugi/`管理JSON（registry shard／meta／index、history月別index等） | ✓ | ✓ 専用JSON reader | 対象外（隠し領域はwalk対象外。分類器ではなくmetadataとして個別に読む） | ✓ metadataとして個別に読む | ✓ baseline等の出所 | ✓ バイト単位で含む | ✓ resyncで再構築（index系） |
+| Themes／Emotions／Goals／Ideas／Events／Attachments | 対象外（フォルダの雛形のみ。現在のwriterが管理ファイルとして書き出す種別は無い） | ― | ―（Tsumugi形式でなければ無視） | ―（同左） | ― | ✓ 可視フォルダの`.md`は含む | ― |
+
+Peopleは2026-11-11に専用経路で追加されたが、当時この表の「light-check／resync
+分類」「Recovery走査」「整合性チェック」の3経路がPeopleを知らず、正常な
+Peopleファイルを解析失敗として誤判定していた（Recoveryではその1件が計画
+全体を安全側に停止させていた）。2026-11-23の修正で、両検査系が専用parserで
+Peopleを検証するようになった。検証は分類のみであり、PeopleがRegistryや
+Recoveryのrecordになることはない。壊れたPeopleファイルは従来通り安全側に
+扱われる（light-checkでは解析失敗の診断、Recoveryではissue）。
+
 ---
 
 # 4. Markdown Format

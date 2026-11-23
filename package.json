@@ -36,6 +36,7 @@
     "test:vault-consistency": "tsc -p tsconfig.vault-consistency.json && node --test .test-out/lib/vaultConsistency.test.js",
     "test:vault-backup": "tsc -p tsconfig.vault-backup.json && node --test .test-out/lib/vaultBackup.test.js",
     "test:vault-unreadable-diagnostics": "tsc -p tsconfig.vault-unreadable-diagnostics.json && node --test .test-out/lib/vaultUnreadableDiagnostics.test.js",
+    "test:people-classifier": "tsc -p tsconfig.people-classifier.json && node --test .test-out/lib/vaultPeopleClassifier.test.js",
     "test:vault-auto-repair": "tsc -p tsconfig.vault-auto-repair.json && node --test .test-out/lib/vaultAutoRepair.test.js",
     "test:vault-conflict": "tsc -p tsconfig.vault-conflict.json && node --test .test-out/lib/vaultConflictResolution.test.js",
     "test:recovery-ui-text": "tsc -p tsconfig.recovery-ui-text.json && node --test .test-out/lib/vaultRecoveryUiText.test.js .test-out/lib/vaultRecoveryUserView.test.js",

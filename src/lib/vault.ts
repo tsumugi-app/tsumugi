@@ -78,6 +78,7 @@ import {
   hasNativeWritable,
   writeViaWorker,
 } from "./vaultWriter";
+import { diagnosePersonMarkdown, type PersonMarkdownFailure } from "./personAlias";
 
 /**
  * B1（軽量Registry index・多tab安全性設計）：このpage load（session）固有の
@@ -3972,6 +3973,8 @@ export interface VaultUnreadableFileDiagnostic {
 }
 
 const UNREADABLE_REASON_PARSE = "tsumugi:true is present but content could not be classified/parsed";
+/** 壊れたPeopleファイル用の固定prefix。後続は`PersonMarkdownFailure`の閉じた列挙だけを付け、ファイル内容・例外文字列は一切含めない。 */
+const UNREADABLE_REASON_PERSON_PARSE_PREFIX = "tsumugi person file could not be parsed: ";
 const UNREADABLE_REASON_REGISTRY_UNCONFIRMED =
   "light check: registry state for this record's actual content identity could not be confirmed";
 const UNREADABLE_READ_REASON_PREFIXES = ["probe failed:", "read failed:", "light check re-read failed:", "light check candidate read failed:"] as const;
@@ -3983,6 +3986,7 @@ const UNREADABLE_READ_REASON_PREFIXES = ["probe failed:", "read failed:", "light
  */
 export function vaultUnreadableFileKindOf(reason: string): VaultUnreadableFileKind {
   if (reason === UNREADABLE_REASON_PARSE) return "parse";
+  if (reason.startsWith(UNREADABLE_REASON_PERSON_PARSE_PREFIX)) return "parse";
   if (reason === UNREADABLE_REASON_REGISTRY_UNCONFIRMED) return "registry-unconfirmed";
   for (const prefix of UNREADABLE_READ_REASON_PREFIXES) {
     if (reason.startsWith(prefix)) return "read";
@@ -4012,6 +4016,20 @@ export function toVaultUnreadableDiagnostics(files: readonly VaultResyncUnreadab
     out.push({ path: file.path, kind: vaultUnreadableFileKindOf(file.reason) });
   }
   return out;
+}
+
+/**
+ * frontmatterで`type: person`を宣言したファイルについて、専用parser
+ * （`diagnosePersonMarkdown`）の失敗形状を返す（純粋関数）。person宣言でない、
+ * または正常に読める場合は`null`。resync／light-checkの分類が、壊れたPeople
+ * ファイルを汎用のparse失敗と区別しつつ同じ診断分類（kind: parse）へ載せるため
+ * に使う。判定は分類のみで、record生成・登録は一切しない。
+ */
+export function vaultPersonFileFailureOf(text: string): PersonMarkdownFailure | null {
+  const parsedFrontmatter = parseFrontmatter(text);
+  if (!parsedFrontmatter || parsedFrontmatter.frontmatter.type !== "person") return null;
+  const diagnosis = diagnosePersonMarkdown(text, "");
+  return diagnosis.ok ? null : diagnosis.failure;
 }
 
 /** 1回のresync scanで得られる、1つのrecord/containerについての分類結果
@@ -4118,7 +4136,10 @@ type VaultResyncParsedCandidate =
   | { kind: "conversation"; id: string; record: Conversation }
   | { kind: "source"; id: string; record: Source }
   | { kind: "reflection"; id: string; record: MemoryObject }
-  | { kind: "memory-day"; day: string; members: MemoryObject[] };
+  | { kind: "memory-day"; day: string; members: MemoryObject[] }
+  // People（人物メモ）はRegistryのrecordではない。専用parserで検証が通ったこと
+  // だけを表す分類結果であり、呼び出し側はrecord化せず「分類済み」として終える。
+  | { kind: "person"; id: string };
 
 /**
  * body（frontmatter直後の本文）に含まれる固定の見出し文字列から種別を判定する
@@ -4156,6 +4177,16 @@ function parseTsumugiResyncCandidate(text: string): VaultResyncParsedCandidate |
   if (!parsedFrontmatter) return null;
   const { frontmatter, body } = parsedFrontmatter;
   if (frontmatter.tsumugi !== true) return null;
+
+  // People（人物メモ）は本文マーカー（Transcript/Content/Summary）を持たないため、
+  // frontmatterの`type: person`宣言を入口に、専用parserでのみ検証する。検証は
+  // 分類のみ：正常でもRegistryのrecordにはしない（保存・同期は専用経路
+  // personAliasStoreの責務）。受け付けない場合はnullを返し、呼び出し側が
+  // `vaultPersonFileFailureOf`で失敗形状を付けたunreadableとして扱う。
+  if (frontmatter.type === "person") {
+    const diagnosis = diagnosePersonMarkdown(text, "");
+    return diagnosis.ok ? { kind: "person", id: diagnosis.person.id } : null;
+  }
 
   const bodyKind = classifyResyncBodyMarker(body);
   if (bodyKind === "conversation") {
@@ -4955,7 +4986,17 @@ async function processVaultResyncCandidate(
 
   const candidate = parseTsumugiResyncCandidate(text);
   if (!candidate) {
-    state.unreadableFiles.push({ path, reason: "tsumugi:true is present but content could not be classified/parsed" });
+    const personFailure = vaultPersonFileFailureOf(text);
+    state.unreadableFiles.push({
+      path,
+      reason: personFailure ? `${UNREADABLE_REASON_PERSON_PARSE_PREFIX}${personFailure}` : UNREADABLE_REASON_PARSE,
+    });
+    return;
+  }
+
+  if (candidate.kind === "person") {
+    // 正常なPeopleファイル：専用parserで検証済み。Registryのrecordにはせず、
+    // unreadableにも数えない（管理は専用同期personAliasStoreの責務）。
     return;
   }
 
@@ -5950,6 +5991,10 @@ async function readAnchorFileEntry(
       memberHashes[m.id] = hashVaultText(memoryObjectToMarkdown(m));
     }
     return { recordType: "memory-day", mtime, size, contentHash, memberIds, memberHashes };
+  }
+
+  if (candidate.kind === "person") {
+    throw new Error(`anchor file at ${anchorPath} is a People file, which is never a Registry record`);
   }
 
   if (candidate.kind !== expectedRecordType) {
@@ -7487,6 +7532,7 @@ async function peekTsumugiResyncCandidateRegistryKey(file: File): Promise<string
     const text = await file.text();
     const parsed = parseTsumugiResyncCandidate(text);
     if (!parsed) return null;
+    if (parsed.kind === "person") return null; // PeopleはRegistryに登録されないため、registryKeyは無い。
     return parsed.kind === "memory-day" ? dayFileRegistryKey(parsed.day) : parsed.id;
   } catch {
     return null;
