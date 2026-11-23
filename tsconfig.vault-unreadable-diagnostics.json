@@ -1,0 +1,1 @@
+{"compilerOptions":{"incremental":false,"isolatedModules":false,"module":"commonjs","moduleResolution":"node","noEmit":false,"outDir":".test-out","plugins":[],"rootDir":"src"},"extends":"./tsconfig.json","files":["src/lib/vaultUnreadableDiagnostics.test.ts","src/lib/vault.ts","src/lib/vaultStatus.ts","src/lib/fakeIdb.ts"],"include":[]}

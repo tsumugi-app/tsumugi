@@ -534,7 +534,7 @@ export default function SettingsPanel({
                       <span className="text-stone-700 dark:text-stone-200">
                         確認が必要な記録があります（今回は変更しません）
                       </span>
-                      {vaultStatusCheck.findings.attention.slice(0, 8).map((line) => (
+                      {vaultStatusCheck.findings.attention.slice(0, 12).map((line) => (
                         <span key={line} className="break-all text-stone-500 dark:text-stone-400">
                           ・{line}
                         </span>

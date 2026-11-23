@@ -3956,6 +3956,64 @@ export interface VaultResyncUnreadableFile {
   reason: string;
 }
 
+/**
+ * 「読み込めないファイル」の、表示に出してよい安全な分類。内部の`reason`は
+ * `String(error)`（例外の文字列化）を含み得るため、例外由来の文字列・ファイル
+ * 内容の断片・絶対pathが混ざる可能性があり、そのままUI／ログへは出さない。
+ * 分類の境界（light-checkの結果を組み立てる場所）で、既知の固定prefix／固定文
+ * だけからこの列挙へ写像し、未知の形式は`unknown`へ倒す。
+ */
+export type VaultUnreadableFileKind = "read" | "parse" | "registry-unconfirmed" | "unknown";
+
+/** 表示用の診断情報。`path`はVault相対pathのみ（後述の安全側の検証を通したもの）。 */
+export interface VaultUnreadableFileDiagnostic {
+  path: string;
+  kind: VaultUnreadableFileKind;
+}
+
+const UNREADABLE_REASON_PARSE = "tsumugi:true is present but content could not be classified/parsed";
+const UNREADABLE_REASON_REGISTRY_UNCONFIRMED =
+  "light check: registry state for this record's actual content identity could not be confirmed";
+const UNREADABLE_READ_REASON_PREFIXES = ["probe failed:", "read failed:", "light check re-read failed:", "light check candidate read failed:"] as const;
+
+/**
+ * 内部の`reason`文字列を安全な分類へ写像する（純粋関数）。分類に使うのは、この
+ * モジュール自身が付けた固定prefix／固定文だけで、例外由来の後続文字列は一切
+ * 参照しない。どの形式にも一致しない場合は`unknown`（安全側）。
+ */
+export function vaultUnreadableFileKindOf(reason: string): VaultUnreadableFileKind {
+  if (reason === UNREADABLE_REASON_PARSE) return "parse";
+  if (reason === UNREADABLE_REASON_REGISTRY_UNCONFIRMED) return "registry-unconfirmed";
+  for (const prefix of UNREADABLE_READ_REASON_PREFIXES) {
+    if (reason.startsWith(prefix)) return "read";
+  }
+  return "unknown";
+}
+
+/**
+ * 診断表示へ渡してよいpathか（Vault相対pathの安全条件。`isSafeVaultRelativePath`
+ * と同じ条件＋表示用に長さの上限）。候補pathはVault走査・Registry由来で相対path
+ * のはずだが、境界で再検証し、絶対pathやVault外を指すものは表示へ渡さない。
+ */
+export function isSafeVaultDiagnosticPath(path: string): boolean {
+  return path.length <= 1024 && isSafeVaultRelativePath(path);
+}
+
+/**
+ * light-check内部の`unreadableFiles`（生の`reason`付き）を、表示用の安全な
+ * 診断情報へ変換する（純粋関数）。安全でないpathは診断から落とす——件数
+ * （`counts.unreadable`）は内部の配列長そのもので不変のため、落とした場合は
+ * 呼び出し側が「一部は表示できない」ことを件数との差で明示できる。
+ */
+export function toVaultUnreadableDiagnostics(files: readonly VaultResyncUnreadableFile[]): VaultUnreadableFileDiagnostic[] {
+  const out: VaultUnreadableFileDiagnostic[] = [];
+  for (const file of files) {
+    if (!isSafeVaultDiagnosticPath(file.path)) continue;
+    out.push({ path: file.path, kind: vaultUnreadableFileKindOf(file.reason) });
+  }
+  return out;
+}
+
 /** 1回のresync scanで得られる、1つのrecord/containerについての分類結果
  *  （resync engine内部専用、外部へはexportしない）。 */
 type VaultResyncOutcome = "unchanged" | "moved" | "edited" | "added" | "missing" | "conflict" | "unreadable";
@@ -7226,6 +7284,13 @@ export interface VaultLightCheckClassifyResult {
     conflict: number;
     unreadable: number;
   };
+  /**
+   * 「読み込めないファイル」の表示用診断（安全な分類のみ。生の理由文・例外
+   * 文字列は含まない）。`counts.unreadable`と同じ内部配列から導出するため、
+   * 件数と一覧は同じ出所になる。安全でないpathは一覧から落ちるため、一覧の
+   * 件数が`counts.unreadable`より少なくなり得る（その場合も件数は変えない）。
+   */
+  unreadableDiagnostics: VaultUnreadableFileDiagnostic[];
 }
 
 /**
@@ -7727,7 +7792,14 @@ export async function classifyVaultLightCheckCandidates(
     durationMs: Date.now() - l3Start,
   });
 
-  return { records, localSnapshots, level2Completed: discovery.level2Completed, counts };
+  return {
+    records,
+    localSnapshots,
+    level2Completed: discovery.level2Completed,
+    counts,
+    // 診断は件数と同じ内部配列（state.unreadableFiles）から導出する（単一の出所）。
+    unreadableDiagnostics: toVaultUnreadableDiagnostics(state.unreadableFiles),
+  };
 }
 
 /**

@@ -36,6 +36,8 @@ import type {
   VaultLightCheckClassifyResult,
   VaultLightCheckDiscoveryResult,
   VaultResyncRecordResult,
+  VaultUnreadableFileDiagnostic,
+  VaultUnreadableFileKind,
 } from "./vault";
 import { executeLegacyCleanup, planLegacyCleanup } from "./vaultLegacyCleanup";
 import type { LegacyCleanupPlan, LegacyCleanupResult } from "./vaultLegacyCleanup";
@@ -77,6 +79,47 @@ export const EMPTY_LIGHT_CHECK_COUNTS: LightCheckCounts = {
   conflict: 0,
   unreadable: 0,
 };
+
+// ---------------------------------------------------------------------------
+// 「読み込めないファイル」の診断表示（読み取り専用・安全な分類のみ）
+// ---------------------------------------------------------------------------
+
+/**
+ * 安全な分類ごとの、利用者向けの短い理由と説明。内部の理由文・例外文字列・
+ * ファイル内容は一切含まない（分類は`vault.ts`の境界で固定の列挙へ写像済み）。
+ */
+export const VAULT_UNREADABLE_KIND_TEXT: Record<VaultUnreadableFileKind, { label: string; description: string }> = {
+  read: { label: "読み取り失敗", description: "ファイルを開く・読み取ることができませんでした" },
+  parse: { label: "解析失敗", description: "Tsumugiの記録として内容を解釈できませんでした" },
+  "registry-unconfirmed": { label: "管理情報の確認不能", description: "保存先の管理情報の状態を確認できなかったため、このファイルは分類できませんでした" },
+  unknown: { label: "理由を特定できませんでした", description: "読み込めなかった理由を安全に分類できませんでした" },
+};
+
+/** 診断1件の表示行（相対パスのみ・安全な分類のみ）。 */
+export function vaultUnreadableDiagnosticLine(diagnostic: VaultUnreadableFileDiagnostic): string {
+  const text = VAULT_UNREADABLE_KIND_TEXT[diagnostic.kind];
+  return `${diagnostic.path}（${text.label}：${text.description}）`;
+}
+
+/**
+ * 「読み込めないファイル」の注意表示を作る（純粋関数）。件数と一覧は分類結果の
+ * 同じ出所（`counts.unreadable`と`unreadableDiagnostics`）から作るため、件数と
+ * 一覧の長さは原則一致する。一覧が取得できない（null）場合や、安全でないpathが
+ * 一覧から落ちて件数と合わない場合は、その旨を明示する行を返す（空欄にはしない）。
+ */
+export function unreadableAttentionLines(unreadableCount: number, diagnostics: VaultUnreadableFileDiagnostic[] | null): string[] {
+  if (unreadableCount <= 0) return [];
+  const lines = [`読み込めないファイルが${unreadableCount}件あります`];
+  if (diagnostics === null) {
+    lines.push("問題ファイルの詳細（場所と理由）を取得できませんでした");
+    return lines;
+  }
+  for (const diagnostic of diagnostics) lines.push(vaultUnreadableDiagnosticLine(diagnostic));
+  if (diagnostics.length < unreadableCount) {
+    lines.push(`このほかに、詳細を表示できないファイルが${unreadableCount - diagnostics.length}件あります`);
+  }
+  return lines;
+}
 
 /** discoveryと（あれば）分類結果から、測定結果を作る（純粋関数）。 */
 export function lightCheckMeasureFrom(
@@ -235,6 +278,12 @@ export interface VaultStatusFindings {
   updatableRecords: VaultResyncRecordResult[];
   /** 本体が無く、端末にも記録が無い（整理の候補）light-checkの記録（`missing`）。 */
   missingCleanupRecords: VaultResyncRecordResult[];
+  /**
+   * 「読み込めないファイル」の診断（分類結果と同じ出所）。分類を実行していない
+   * 経路では取得できないためnull（その場合は表示側で「取得できませんでした」と
+   * 明示する）。0件のときは空配列。
+   */
+  unreadableDiagnostics: VaultUnreadableFileDiagnostic[] | null;
   /** 表示用の1行の要約（例：「保存先に新しい記録が2件あります」）。 */
   summary: string[];
   /** 「内容を確認」で表示する内訳。 */
@@ -267,10 +316,19 @@ function recordLabel(record: VaultResyncRecordResult): string {
 export async function collectVaultStatusFindings(root: FileSystemDirectoryHandle, signal?: AbortSignal): Promise<VaultStatusFindings> {
   const discovery = await performVaultLightCheckDiscovery(root);
   const candidateCount = countVaultLightCheckCandidates(discovery);
-  const result: VaultLightCheckClassifyResult =
-    candidateCount > 0 || discovery.readFailedCandidates.length > 0
-      ? await classifyVaultLightCheckCandidates(root, discovery)
-      : { records: [], localSnapshots: new Map(), level2Completed: discovery.level2Completed, counts: { ...EMPTY_LIGHT_CHECK_COUNTS } };
+  const classified = candidateCount > 0 || discovery.readFailedCandidates.length > 0;
+  const result: VaultLightCheckClassifyResult = classified
+    ? await classifyVaultLightCheckCandidates(root, discovery)
+    : {
+        records: [],
+        localSnapshots: new Map(),
+        level2Completed: discovery.level2Completed,
+        counts: { ...EMPTY_LIGHT_CHECK_COUNTS },
+        unreadableDiagnostics: [],
+      };
+  // 診断は分類結果からそのまま受け取る（件数と同じ出所）。分類していない経路
+  // では診断は得られないためnullにし、表示側で明示する。
+  const unreadableDiagnostics: VaultUnreadableFileDiagnostic[] | null = classified ? result.unreadableDiagnostics : null;
   const measure = lightCheckMeasureFrom(discovery, result.counts);
   const counts = result.counts;
 
@@ -333,7 +391,7 @@ export async function collectVaultStatusFindings(root: FileSystemDirectoryHandle
   for (const item of orphanPlan.others) attention.push(`${item.title}：${item.message}`);
   for (const item of appendPlan.blocked) attention.push(`${item.record.day}　${item.record.title}：${item.block?.message ?? ""}`);
   for (const r of missingKept) attention.push(`保存先で本体が見つかりません（この端末には記録が残っています）：${recordLabel(r)}`);
-  if (counts.unreadable > 0) attention.push(`読み込めないファイルが${counts.unreadable}件あります`);
+  attention.push(...unreadableAttentionLines(counts.unreadable, unreadableDiagnostics));
   if (!legacyExecutable) {
     if (counts.conflict > 0) attention.push(`保存先で内容の重複・食い違いが見つかった記録が${counts.conflict}件あります。どのファイルも変更していません。同じ記録が複数のファイルにある場合は、移動やコピーをしたファイルのうち余分なものを外してから、もう一度確認してください`);
     for (const p of diff.problems) {
@@ -372,6 +430,7 @@ export async function collectVaultStatusFindings(root: FileSystemDirectoryHandle
     legacyPlan,
     updatableRecords,
     missingCleanupRecords,
+    unreadableDiagnostics,
     summary,
     details,
     attention: uniqueAttention,
