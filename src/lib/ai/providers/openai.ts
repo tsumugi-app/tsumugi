@@ -18,6 +18,7 @@
  * 設定されないため、常にChat Completions APIのまま。
  */
 import OpenAI, {
+  APIConnectionError,
   AuthenticationError,
   BadRequestError,
   InternalServerError,
@@ -93,11 +94,17 @@ function toOpenAISchema(schema: AISchema): Record<string, unknown> {
 
 function normalizeError(error: unknown): AIProviderError {
   const message = error instanceof Error ? error.message : String(error);
+  const rawStatus = (error as { status?: unknown } | null | undefined)?.status;
+  const status = typeof rawStatus === "number" && Number.isFinite(rawStatus) ? rawStatus : undefined;
   let type: AIErrorType = "other";
   if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
     type = "auth";
   } else if (error instanceof RateLimitError) {
-    type = "rateLimit";
+    // "insufficient_quota" は一時的な混雑ではなく請求・利用可能額の問題であり、
+    // Gemini の 402 と同じ billing として扱う（表示側で文言を分けるため）。
+    type = (error as { code?: unknown }).code === "insufficient_quota" ? "billing" : "rateLimit";
+  } else if (error instanceof APIConnectionError) {
+    type = "network";
   } else if (
     error instanceof BadRequestError ||
     error instanceof NotFoundError ||
@@ -107,7 +114,7 @@ function normalizeError(error: unknown): AIProviderError {
   } else if (error instanceof InternalServerError) {
     type = "server";
   }
-  return new AIProviderError(type, message, { cause: error });
+  return new AIProviderError(type, message, { cause: error, status });
 }
 
 function normalizeFinishReason(reason: string | null | undefined): StreamChunk["finishReason"] {

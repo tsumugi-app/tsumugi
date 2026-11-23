@@ -9,7 +9,7 @@
  * ここでは「呼び方」だけを差し替える）。
  */
 import { GoogleGenAI, Type } from "@google/genai";
-import { AIProviderError } from "../errors";
+import { AIProviderError, type AIErrorType } from "../errors";
 import type { AISchema } from "../schema";
 import type {
   AIProvider,
@@ -95,12 +95,94 @@ function toGeminiSchema(schema: AISchema): unknown {
   }
 }
 
-/** 既存route.ts（api-key/test）がやっていたstatus判定をそのまま踏襲する。 */
+/** 上流のHTTPステータス（数値）を取り出す。@google/genai の ApiError が持つ。 */
+function upstreamStatus(error: unknown): number | undefined {
+  const status = (error as { status?: unknown } | null | undefined)?.status;
+  return typeof status === "number" && Number.isFinite(status) ? status : undefined;
+}
+
+/**
+ * Google API の canonical なステータス文字列（例 "RESOURCE_EXHAUSTED"）を取り出す。
+ * ApiError の message はエラー本文の JSON（{"error":{...,"status":"..."}}）であり、
+ * ここでの分類にだけ使い、表示・ログには一切出さない。取れなければ undefined。
+ */
+function googleErrorStatus(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  try {
+    const parsed = JSON.parse(error.message) as { error?: { status?: unknown } };
+    return typeof parsed?.error?.status === "string" ? parsed.error.status : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Google API のエラー詳細（error.details[]）に含まれる reason（例 "API_KEY_INVALID"）を取り出す。
+ * googleErrorStatus と同じく、分類のためだけに読み、表示・ログには一切出さない。
+ */
+function googleErrorReasons(error: unknown): string[] {
+  if (!(error instanceof Error)) return [];
+  try {
+    const parsed = JSON.parse(error.message) as { error?: { details?: unknown } };
+    const details = parsed?.error?.details;
+    if (!Array.isArray(details)) return [];
+    const reasons: string[] = [];
+    for (const detail of details) {
+      const reason = (detail as { reason?: unknown } | null | undefined)?.reason;
+      if (typeof reason === "string") reasons.push(reason);
+    }
+    return reasons;
+  } catch {
+    return [];
+  }
+}
+
+/** fetch 自体の失敗（オフライン・DNS・接続断絶など、HTTP応答が無い失敗）かどうか。 */
+function isNetworkFailure(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 3; depth++) {
+    if (!current || typeof current !== "object") return false;
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && /^(?:ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|UND_ERR)/.test(code)) return true;
+    const message = current instanceof Error ? current.message : "";
+    if (/fetch failed|failed to fetch|network ?error|socket hang up/i.test(message)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * 上流エラーを provider 非依存の種類へ分類する：
+ * - 402：プリペイド残高・利用可能額の不足（billing）
+ * - 429：利用上限・レート制限（rateLimit）
+ * - 401/403：キー・権限（auth）。400 は内容で分け、権限系
+ *   （PERMISSION_DENIED / UNAUTHENTICATED）と、無効なキー
+ *   （details の reason が API_KEY_INVALID）だけを auth、それ以外は invalidRequest
+ * - 5xx：AIサービス側の障害（server）
+ * - HTTP応答の無い fetch 失敗：network
+ * - それ以外：other
+ */
 function normalizeError(error: unknown): AIProviderError {
-  const status = (error as { status?: number } | undefined)?.status;
-  const isAuthError = status === 400 || status === 401 || status === 403;
+  const status = upstreamStatus(error);
   const message = error instanceof Error ? error.message : String(error);
-  return new AIProviderError(isAuthError ? "auth" : "other", message, { cause: error });
+  let type: AIErrorType = "other";
+  if (status === 402) {
+    type = "billing";
+  } else if (status === 429) {
+    type = "rateLimit";
+  } else if (status === 401 || status === 403) {
+    type = "auth";
+  } else if (status === 400) {
+    const googleStatus = googleErrorStatus(error);
+    // 無効なAPIキーは 400 + INVALID_ARGUMENT（details の reason が API_KEY_INVALID）で
+    // 返ることがある。旧来の分類でも認証扱いだったケースなので、リクエスト不正に倒さない。
+    type = googleStatus === "PERMISSION_DENIED" || googleStatus === "UNAUTHENTICATED" || googleErrorReasons(error).includes("API_KEY_INVALID") ? "auth" : "invalidRequest";
+  } else if (status !== undefined && status >= 500 && status <= 599) {
+    type = "server";
+  } else if (status === undefined && isNetworkFailure(error)) {
+    type = "network";
+  }
+  return new AIProviderError(type, message, { cause: error, status });
 }
 
 async function generateText(req: GenerateTextRequest): Promise<GenerateTextResult> {

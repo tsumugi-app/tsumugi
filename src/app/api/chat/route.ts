@@ -18,7 +18,8 @@ import { DEBUG_ENVELOPE_DELIMITER, type GenerationDebugEnvelope } from "@/lib/ge
 import { buildContextProvenance } from "@/lib/chatContextProvenance";
 import { dedupeExactContext, serverDedupeReport } from "@/lib/contextDedupe";
 import { serverReasonReport } from "@/lib/explicitReason";
-import { AIProviderError } from "@/lib/ai/errors";
+import { AIProviderError, type AIErrorType } from "@/lib/ai/errors";
+import { chatErrorResponse } from "@/lib/ai/errorResponse";
 import {
   getProvider,
   resolveApiKey,
@@ -918,7 +919,7 @@ export async function POST(request: Request) {
   const apiKey = resolveApiKey(request, providerName);
   if (!apiKey) {
     return Response.json(
-      { error: "APIキーが設定されていません。" },
+      { error: "APIキーが設定されていません。", errorKind: "auth" },
       { status: 401 }
     );
   }
@@ -1170,22 +1171,18 @@ ${sanitizedExplicitSearch && sanitizedMemoryAnalytics ? "このセクション�
       abortSignal: request.signal,
     });
   } catch (error) {
-    console.error("[Tsumugi Chat] generateContentStream failed:", error);
-
-    // Beta C4：AIProviderErrorのtype（gemini.tsのnormalizeError／api-key/test/route.tsと同じ
-    // 分類）を使い、APIキー由来のエラーだけ原因が分かるメッセージを返す。それ以外は
-    // 従来通りの汎用メッセージ・502のまま（内部エラー詳細やAPIキー自体は返さない）。
-    if (error instanceof AIProviderError && error.type === "auth") {
-      return Response.json(
-        { error: "APIキーが無効または期限切れの可能性があります。設定を確認してください。" },
-        { status: 401 }
-      );
-    }
-
-    return Response.json(
-      { error: "Failed to start a response from the AI model." },
-      { status: 502 }
+    // エラー表示改善：AIProviderErrorの種類（adapterの分類）ごとに、原因が分かる
+    // 文言とステータスを返す（errorResponse.ts）。本文には種類の安定コード
+    // （errorKind）も併記し、クライアントはステータス番号ではなく種類で
+    // 表示を分ける。ログ・応答ともに、種類と上流ステータス（数値）だけを出し、
+    // 上流のエラー本文やAPIキー等の内部詳細は一切出さない。
+    const kind: AIErrorType = error instanceof AIProviderError ? error.type : "other";
+    const upstreamStatus = error instanceof AIProviderError ? error.status : undefined;
+    console.error(
+      `[Tsumugi Chat] generateContentStream failed: kind=${kind}${upstreamStatus !== undefined ? ` status=${upstreamStatus}` : ""}`
     );
+    const failure = chatErrorResponse(kind);
+    return Response.json({ error: failure.message, errorKind: kind }, { status: failure.status });
   }
 
   const encoder = new TextEncoder();
