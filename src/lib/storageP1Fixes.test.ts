@@ -78,6 +78,8 @@ class MemVault {
   failText = new Set<string>();
   /** ここに含まれるpathへのgetFileは失敗する（読み取り失敗の注入。A-05）。 */
   failReads = new Set<string>();
+  /** ここに含まれるpathへのcreateWritableは例外で失敗する（書き込み失敗の注入。A-05深掘り）。 */
+  failWrites = new Set<string>();
   /** ここに含まれるpathへのcreateWritable書き込みは、close時に半分だけ着地する（例外は出ない）。 */
   partialWrites = new Set<string>();
   written: string[] = [];
@@ -127,6 +129,7 @@ class MemVault {
         };
       },
       async createWritable() {
+        if (self.failWrites.has(p)) throw new Error("injected write failure");
         let buffer = new Uint8Array(0);
         const partial = self.partialWrites.has(p);
         return {
@@ -317,6 +320,100 @@ test("A-06 integration: the restore scan returns the marker conversation with it
     scan.conversations[0].turns.map((t) => ({ role: t.role, content: t.content })),
     MARKER_TURNS.map((t) => ({ role: t.role, content: t.content })),
   );
+});
+
+// ---------------------------------------------------------------------------
+// A-06深掘り：旧形式ファイルの後方互換（読むだけで保存済み本文が変わらないこと）
+// ---------------------------------------------------------------------------
+
+/** 旧形式（escapeも `transcriptFormat` マーカーも無い）Conversation Markdownを組み立てる。 */
+function legacyConversationMd(id: string, turns: { role: "User" | "Tsumugi"; content: string }[]): string {
+  return [
+    "---", `id: ${id}`, "tsumugi: true", "persona: companion", "status: captured",
+    `startedAt: ${T}`, `createdAt: ${T}`, `updatedAt: ${T}`, "---", "",
+    "# Conversation 2026-10-20", "", "## Transcript", "",
+    turns.map((t) => `**${t.role}:** ${t.content}`).join("\n\n"), "",
+  ].join("\n");
+}
+
+// 旧形式の利用者本文そのもの：バックスラッシュで始まるマーカーそっくりの行を含む。
+const LEGACY_USER_CONTENT = "引用します\n\\**Tsumugi:** これは引用行です\n以上です";
+const LEGACY_AI_CONTENT = "了解です\n\\**User:** こちらも引用\n\\\\**Tsumugi:** 二重バックスラッシュの引用\n終わりです";
+const legacyEscapeLikeMd = (id: string) =>
+  legacyConversationMd(id, [
+    { role: "User", content: LEGACY_USER_CONTENT },
+    { role: "Tsumugi", content: LEGACY_AI_CONTENT },
+  ]);
+
+test("A-06 compat: a legacy file's backslash marker-like lines are read verbatim — reading never mutates saved body text", () => {
+  const parsed = markdown.parseConversationMarkdown(legacyEscapeLikeMd("c-legacy-bs"));
+  assert.ok(parsed);
+  assert.deepEqual(parsed.turns.map((t) => ({ role: t.role, content: t.content })), [
+    { role: "user", content: LEGACY_USER_CONTENT },
+    { role: "ai", content: LEGACY_AI_CONTENT },
+  ]);
+});
+
+test("A-06 compat: an unknown transcriptFormat value is treated as legacy (fail-closed, never guessed)", () => {
+  const unknown = legacyEscapeLikeMd("c-legacy-bs").replace("---\n\n# Conversation", "transcriptFormat: 99\n---\n\n# Conversation");
+  const parsed = markdown.parseConversationMarkdown(unknown);
+  assert.ok(parsed);
+  assert.deepEqual(parsed.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT]);
+});
+
+test("A-06 compat: legacy → save upgrades the format marker and preserves the body exactly; the upgraded form is a fixpoint", () => {
+  const parsed = markdown.parseConversationMarkdown(legacyEscapeLikeMd("c-legacy-bs"));
+  assert.ok(parsed);
+  const upgraded = markdown.conversationToMarkdown(parsed);
+  assert.ok(upgraded.includes("transcriptFormat: 2"), "saving a legacy conversation writes the new-format marker");
+  const reparsed = markdown.parseConversationMarkdown(upgraded);
+  assert.ok(reparsed);
+  assert.deepEqual(reparsed.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT]);
+  // 固定点：その後の保存・読み戻しでは本文もMarkdownも変わらない。
+  assert.equal(markdown.conversationToMarkdown(reparsed), upgraded);
+  const third = markdown.parseConversationMarkdown(markdown.conversationToMarkdown(reparsed));
+  assert.deepEqual(third?.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT]);
+});
+
+const ESCAPE_LIKE_TURNS: Conversation["turns"] = [
+  { role: "user", content: "先頭は普通の行\n**User:** 区切りそっくり行\n\\**User:** バックスラッシュ付き\n\\\\**Tsumugi:** 二重バックスラッシュ\n終わり", timestamp: T },
+  { role: "ai", content: "\\**Tsumugi:** 先頭行自体がバックスラッシュ付き\n通常の二行目", timestamp: T2 },
+];
+
+test("A-06 compat: new-format escape-like content survives repeated save/load cycles unchanged (LF and CRLF)", () => {
+  let current: Conversation | null = conversation("c-escape-like", ESCAPE_LIKE_TURNS);
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const md = markdown.conversationToMarkdown(current);
+    if (cycle === 0) assert.ok(md.includes("transcriptFormat: 2"), "new saves carry the format marker");
+    current = markdown.parseConversationMarkdown(md);
+    assert.ok(current);
+    assert.deepEqual(
+      current.turns.map((t) => ({ role: t.role, content: t.content })),
+      ESCAPE_LIKE_TURNS.map((t) => ({ role: t.role, content: t.content })),
+    );
+    // CRLFで保存された同内容も同一に読み取れる。
+    const crlfParsed = markdown.parseConversationMarkdown(crlf(md));
+    assert.deepEqual(
+      crlfParsed?.turns.map((t) => ({ role: t.role, content: t.content })),
+      ESCAPE_LIKE_TURNS.map((t) => ({ role: t.role, content: t.content })),
+    );
+  }
+});
+
+test("A-06 compat: a CRLF legacy file's backslash lines are also read verbatim", () => {
+  const parsed = markdown.parseConversationMarkdown(crlf(legacyEscapeLikeMd("c-legacy-bs")));
+  assert.deepEqual(parsed?.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT]);
+});
+
+test("A-06 compat integration: legacy and new-format conversations coexist in one vault — each is read by its own format", async () => {
+  const v = new MemVault({
+    "Conversations/legacy.md": legacyEscapeLikeMd("c-legacy-bs"),
+    "Conversations/fresh.md": markdown.conversationToMarkdown(conversation("c-escape-like", ESCAPE_LIKE_TURNS)),
+  });
+  const scan = await vault.scanVaultForRestore(v.dir());
+  const byId = new Map(scan.conversations.map((c) => [c.id, c]));
+  assert.deepEqual(byId.get("c-legacy-bs")?.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT]);
+  assert.deepEqual(byId.get("c-escape-like")?.turns.map((t) => t.content), ESCAPE_LIKE_TURNS.map((t) => t.content));
 });
 
 // ---------------------------------------------------------------------------
@@ -738,6 +835,113 @@ test("A-05 integration: a completed full resync rebuilds a corrupt shard from th
   assert.equal(shard.records[k1], "Conversations/a.md");
   // 再構築の後は通常の更新も再び機能する。
   await upsert(v.dir(), k1, "Conversations/a.md");
+});
+
+// ---------------------------------------------------------------------------
+// A-05深掘り：Registry再構築の安全条件（不完全な情報では再構築を確定しない）
+// ---------------------------------------------------------------------------
+
+/** `resyncVaultRegistry` を通常運用と同じ条件で呼べるよう、有効な世界を用意する。 */
+async function prepareResyncWorld() {
+  await db.clearMemoryData();
+  await db.putVaultIdentityRecord({ id: "current", vaultId: null, activeVaultEpoch: null, registryGeneration: null, pairedAt: null, pendingCandidateVaultId: null, updatedAt: T });
+  await db.markVaultEpochCommitted(0);
+  await db.markVaultWorldJournalMigrated();
+  worldLock.setTabVaultEpoch(0);
+}
+
+test("A-05 rebuild safety: while any vault file is unreadable, the rebuild is held and the corrupt shard is left byte-identical", async () => {
+  const { bucket, k1, k2 } = twoKeysSameBucket();
+  const shardPath = shardPathOf(bucket);
+  const v = new MemVault({
+    "Conversations/a.md": markdown.conversationToMarkdown(conversation(k1)),
+    "Conversations/b.md": markdown.conversationToMarkdown(conversation(k2)),
+    [shardPath]: "{broken json, torn write",
+  });
+  // b.mdは実在するが読めない。走査自体は完了しても、そのrecordが壊れたbucketの
+  // ものかどうかはファイルが読めない以上判別できない。ここでbucketを空へ初期化
+  // すると、再登録されないエントリが失われるため、再構築は保留されなければ
+  // ならない（「空として初期化」と「完全な情報からの再構築」の混同の禁止）。
+  v.failReads.add("Conversations/b.md");
+  await prepareResyncWorld();
+  const result = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(result.scanCompleted, true);
+  assert.equal(result.unreadableFiles.length, 1);
+  assert.equal(v.text(shardPath), "{broken json, torn write");
+  assert.ok(
+    result.applyErrors.some((e) => e.registryKey === `__registry_shard_${bucket}__` && /held/.test(e.reason)),
+    "the hold is surfaced in applyErrors, not silent",
+  );
+  // 読めないファイルが解消すれば、次のresyncで再構築が完了し、両方のrecordが
+  // 実ファイルの観測から再登録される（保留は恒久的な停止ではない）。
+  v.failReads.delete("Conversations/b.md");
+  const second = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(second.scanCompleted, true);
+  const shard = await vault.readVaultRegistryShard(v.dir(), bucket);
+  assert.equal(shard.records[k1], "Conversations/a.md");
+  assert.equal(shard.records[k2], "Conversations/b.md");
+});
+
+test("A-05 rebuild safety: a record whose file is absent while its shard is corrupt is not resurrected; healthy records are rebuilt", async () => {
+  const { bucket, k1, k2 } = twoKeysSameBucket();
+  const shardPath = shardPathOf(bucket);
+  // k2のファイルはVaultに存在しない（shardが壊れている間に消えた等）。壊れた
+  // shardの中身は再取得できないため、k2のエントリは再構築後も存在しない
+  // （推測で復活させない）。実在するk1は実ファイルの観測から再登録される。
+  const v = new MemVault({
+    "Conversations/a.md": markdown.conversationToMarkdown(conversation(k1)),
+    [shardPath]: "{broken json, torn write",
+  });
+  await prepareResyncWorld();
+  const result = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(result.scanCompleted, true);
+  const shard = await vault.readVaultRegistryShard(v.dir(), bucket);
+  assert.equal(shard.records[k1], "Conversations/a.md");
+  assert.equal(shard.records[k2], undefined);
+});
+
+test("A-05 rebuild safety: a write failure during the rebuild leaves the corrupt shard untouched, and a re-run completes the rebuild", async () => {
+  const { bucket, k1 } = twoKeysSameBucket();
+  const shardPath = shardPathOf(bucket);
+  const v = new MemVault({
+    "Conversations/a.md": markdown.conversationToMarkdown(conversation(k1)),
+    [shardPath]: "{broken json, torn write",
+  });
+  v.failWrites.add(shardPath);
+  await prepareResyncWorld();
+  const first = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(first.scanCompleted, true);
+  assert.equal(v.text(shardPath), "{broken json, torn write");
+  assert.ok(
+    first.applyErrors.some((e) => e.registryKey === `__registry_shard_${bucket}__`),
+    "the failed rebuild is surfaced in applyErrors, not silent",
+  );
+  // 再実行可能：書き込みが回復すれば、次のresyncで再構築が完了する。
+  v.failWrites.delete(shardPath);
+  const second = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(second.scanCompleted, true);
+  const shard = await vault.readVaultRegistryShard(v.dir(), bucket);
+  assert.equal(shard.records[k1], "Conversations/a.md");
+});
+
+test("A-05 rebuild safety: when the scan itself cannot complete, the corrupt shard is never touched", async () => {
+  const { bucket, k1 } = twoKeysSameBucket();
+  const shardPath = shardPathOf(bucket);
+  const v = new MemVault({
+    "Conversations/a.md": markdown.conversationToMarkdown(conversation(k1)),
+    [shardPath]: "{broken json, torn write",
+  });
+  const inner = v.dir();
+  const root = {
+    ...inner,
+    entries: async function* () {
+      throw new Error("injected enumeration failure");
+    },
+  } as unknown as FileSystemDirectoryHandle;
+  await prepareResyncWorld();
+  const result = await vault.resyncVaultRegistry(root);
+  assert.equal(result.scanCompleted, false);
+  assert.equal(v.text(shardPath), "{broken json, torn write");
 });
 
 // ---------------------------------------------------------------------------

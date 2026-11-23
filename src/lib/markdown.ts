@@ -120,11 +120,17 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
  * 行（`**User:** ` / `**Tsumugi:** ` で始まる行、および既に `\` で始まる同形の行）が
  * ある場合、先頭へ `\` を1つ付けてescapeする。付けないと、保存→読み戻しの往復で
  * 本文中の行が新しいturnの開始と誤認され、turnが分裂し発言者まで変わってしまう。
- * 1行目はturnマーカーと同じ行に続くため対象外。マーカーに似ていない行は一切変えない
- * （従来形式のまま）。parse側（`parseTranscript`）は、`\` + マーカー形の継続行から
- * `\` を1つだけ取り除く。旧形式ファイルに `\**User:** ` のような行が元々書かれて
- * いた場合は、その `\` が1つ取り除かれる（発言者が変わることはない。本文の
- * バックスラッシュが1つ減るだけ）——旧形式の曖昧さとして許容する設計制約。
+ * 1行目はturnマーカーと同じ行に続くため対象外。マーカーに似ていない行は一切変えない。
+ *
+ * 後方互換（A-06深掘り）：escapeの解除は、frontmatterに `transcriptFormat: 2` が
+ * あるファイル（＝このescapeを書き込むserializerが書いたファイル）に対してだけ行う。
+ * マーカーの無い旧形式ファイルでは、`\**User:** ` のような行は利用者が実際に書いた
+ * 本文そのものなので、旧parserと完全に同じく1文字も変えずに読み取る（読むだけで
+ * 保存済み本文が変わることは決してない）。旧形式の会話が次に保存される時点で
+ * マーカー付きの新形式へ移行し、その際もescapeは双方向の対応（マーカー形の行へ
+ * `\` を1つ足し、parseで1つだけ戻す）なので、本文は保存・読み戻しを何度繰り返しても
+ * 変わらない。旧形式の本文中で行頭の `**User:** ` がturn区切りに読まれる曖昧さは
+ * 旧parserでも同じであり、推測で解釈を変えることはしない。
  */
 const TURN_MARKER_LIKE_LINE = /^\\*\*\*(?:User|Tsumugi):\*\*/;
 const ESCAPED_TURN_MARKER_LINE = /^\\+\*\*(?:User|Tsumugi):\*\*/;
@@ -156,6 +162,11 @@ export function conversationToMarkdown(conversation: Conversation): string {
     turnTimes: conversation.turns.length > 0 ? JSON.stringify(conversation.turns.map((turn) => turn.timestamp)) : undefined,
     // 途中で止まった応答の時刻（`turnTimes`と同じ形）。本文の形式は変えない。該当が無い会話にはキー自体を書かない。
     interruptedTurns: conversation.turns.some((turn) => turn.interrupted) ? JSON.stringify(conversation.turns.filter((turn) => turn.interrupted).map((turn) => turn.timestamp)) : undefined,
+    // A-06：本文のescape（`escapeTurnBodyLines`）を書き込んだことを示す形式マーカー。
+    // parse側はこのマーカーがあるファイルでのみescapeを解除し、マーカーの無い
+    // 旧形式ファイルの本文は旧parserと完全に同じに読み取る（後方互換）。turnが無い
+    // Conversationにはキー自体を書かない（`turnTimes`と同じ既存の空値省略ルール）。
+    transcriptFormat: conversation.turns.length > 0 ? 2 : undefined,
     // リアルタイム日記の対象日（発言時刻とは別）。通常の会話・日記にはキー自体を書かない。
     diaryDate: conversation.realtimeDiary && isDiaryDate(conversation.realtimeDiary.date) ? conversation.realtimeDiary.date : undefined,
     diaryWrittenAt: conversation.realtimeDiary?.text ? conversation.realtimeDiary.writtenAt : undefined,
@@ -635,6 +646,10 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
   const turnTimes = parseTurnTimes(frontmatter.turnTimes);
   const interruptedTurns = new Set(parseTurnTimes(frontmatter.interruptedTurns));
+  // A-06：本文escapeの形式マーカー。`2`（数値）の場合だけescape済み形式として
+  // 読み取る。マーカーが無い・想定外の値のファイルは旧形式として読み、本文の
+  // `\` を一切取り除かない（fail-closed：不明な形式を新形式と推測しない）。
+  const transcriptEscaped = frontmatter.transcriptFormat === 2;
   const diaryDate = frontmatter.diaryDate;
   const diaryText = isDiaryDate(diaryDate) ? readDiarySection(body) : undefined;
   const diaryWrittenAt = asString(frontmatter.diaryWrittenAt);
@@ -645,7 +660,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
     entryType,
     startedAt,
     endedAt: asString(frontmatter.endedAt),
-    turns: parseTranscript(body, startedAt, turnTimes).map((turn) => (turn.role === "ai" && interruptedTurns.has(turn.timestamp) ? { ...turn, interrupted: true } : turn)),
+    turns: parseTranscript(body, startedAt, turnTimes, transcriptEscaped).map((turn) => (turn.role === "ai" && interruptedTurns.has(turn.timestamp) ? { ...turn, interrupted: true } : turn)),
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
     title: asString(frontmatter.title),
@@ -664,7 +679,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   };
 }
 
-function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[]): ConversationTurn[] {
+function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[], transcriptEscaped: boolean): ConversationTurn[] {
   // 行頭の見出しだけ（リアルタイム日記の本文中の`\## Transcript`のように、エスケープした行の途中は会話記録の始まりではない）
   const marker = "## Transcript\n\n";
   const markerMatch = /(^|\n)## Transcript\n\n/.exec(body);
@@ -703,8 +718,10 @@ function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (st
         currentLines = [line.slice(AI_PREFIX.length)];
       } else {
         // A-06：serializerがescapeした継続行（`\**User:** ` 等）は、turnの開始では
-        // なく本文の一部として、`\` を1つ取り除いて戻す。
-        currentLines.push(ESCAPED_TURN_MARKER_LINE.test(line) ? line.slice(1) : line);
+        // なく本文の一部として、`\` を1つ取り除いて戻す。ただし解除は
+        // `transcriptFormat: 2` のファイルだけ——旧形式ファイルの同形の行は
+        // 利用者の本文そのものなので、旧parserと同じく一切変えない。
+        currentLines.push(transcriptEscaped && ESCAPED_TURN_MARKER_LINE.test(line) ? line.slice(1) : line);
       }
     }
     flush();

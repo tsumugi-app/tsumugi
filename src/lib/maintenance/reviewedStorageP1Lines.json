@@ -1,5 +1,5 @@
 {
-  "note": "Storage P1 fixes (owner approval 2026-11-23): the six audit P1 defects in vault.ts — A-01 day-file dropped entries surface as resync conflict / restore-scan droppedEntryCount / readMemoriesForDayWithDiagnostics; A-02 CRLF files are probed and classified like LF (text normalized before hashing); A-04 native writes through writeFileInDir are verified by read-back (verifyWrittenFileContent); A-05 Registry read-modify-write uses the strict shard read (VaultRegistryShardUnreadableError / readVaultRegistryShardForUpdate) and a completed resync rebuilds corrupt Registry buckets before committing; VaultResyncScanResult carries corruptRegistryBuckets (L4 passes an empty set). Exact added / removed lines of vault.ts only.",
+  "note": "Storage P1 fixes (owner approval 2026-11-23): the six audit P1 defects in vault.ts — A-01 day-file dropped entries surface as resync conflict / restore-scan droppedEntryCount / readMemoriesForDayWithDiagnostics; A-02 CRLF files are probed and classified like LF (text normalized before hashing); A-04 native writes through writeFileInDir are verified by read-back (verifyWrittenFileContent); A-05 Registry read-modify-write uses the strict shard read (VaultRegistryShardUnreadableError / readVaultRegistryShardForUpdate) and a completed resync rebuilds corrupt Registry buckets before committing; VaultResyncScanResult carries corruptRegistryBuckets (L4 passes an empty set). Exact added / removed lines of vault.ts only. Deep-dive addition (owner approval 2026-11-23 19:53 JST): the resync rebuild of a corrupt bucket is HELD while the completed scan still has unreadable files (their records cannot be re-observed, so an incomplete scan must not finalize the rebuild); the hold surfaces in applyErrors and the corrupt shard is left untouched.",
   "lines": [
     "+parseMemoryDayFileWithDiagnostics,",
     "+verifyWrittenFileContent,",
@@ -171,6 +171,18 @@
     "+// 行う。L4は個別candidateの適用のみで走査の裏付けが無いため、常に空集合",
     "+// （＝再構築しない）を渡す。壊れたbucketへのcommitはcommit側の拒否により",
     "+// applyErrorsとして表面化する。",
-    "+corruptRegistryBuckets: new Set<number>(),"
+    "+corruptRegistryBuckets: new Set<number>(),",
+    "+//",
+    "+// 1件でもある場合、そのファイルのrecordは走査結果に現れない（unreadableは",
+    "+// A-05深掘り（再構築の安全条件）：走査は完了していても、読めなかったファイルが",
+    "+// applyErrorsで表面化させ、読めないファイルが解消した後の再resyncで再構築する。",
+    "+// records化されない）。読めなかったファイルが壊れたbucketのrecordだった場合、",
+    "+// unreadableFilesが残る走査では再構築を保留し、壊れたshardには一切触れない",
+    "+// ここでbucketを空へ初期化すると、そのエントリは再登録されることなく失われる",
+    "+// （「空として初期化」と「完全な情報から安全に再構築」を混同しない）。保留は",
+    "+// （どのbucketのrecordかは、ファイル自体が読めない以上特定できない）。そのため",
+    "+if (scan.unreadableFiles.length > 0) {",
+    "+reason: `registry shard ${bucket} rebuild held: the completed scan still has ${scan.unreadableFiles.length} unreadable file(s), so the scan cannot prove it re-observed every record of this bucket; the corrupt shard was left untouched and the rebuild will be retried by a later resync`,",
+    "+} else {"
   ]
 }

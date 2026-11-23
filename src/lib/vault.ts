@@ -6855,15 +6855,33 @@ async function applyVaultResyncScanResult(
   // エントリは直後のcommitが実ファイルの観測に基づいて再登録する。走査が完了して
   // いない場合は再構築せず、commit側の拒否がapplyErrorsとして表面化する
   // （不完全な観測でRegistryを書き換えない）。
+  //
+  // A-05深掘り（再構築の安全条件）：走査は完了していても、読めなかったファイルが
+  // 1件でもある場合、そのファイルのrecordは走査結果に現れない（unreadableは
+  // records化されない）。読めなかったファイルが壊れたbucketのrecordだった場合、
+  // ここでbucketを空へ初期化すると、そのエントリは再登録されることなく失われる
+  // （どのbucketのrecordかは、ファイル自体が読めない以上特定できない）。そのため
+  // unreadableFilesが残る走査では再構築を保留し、壊れたshardには一切触れない
+  // （「空として初期化」と「完全な情報から安全に再構築」を混同しない）。保留は
+  // applyErrorsで表面化させ、読めないファイルが解消した後の再resyncで再構築する。
   if (scan.scanCompleted && scan.corruptRegistryBuckets.size > 0) {
-    for (const bucket of scan.corruptRegistryBuckets) {
-      try {
-        await writeVaultRegistryShard(root, bucket, emptyVaultRegistryShard(bucket));
-      } catch (error) {
+    if (scan.unreadableFiles.length > 0) {
+      for (const bucket of scan.corruptRegistryBuckets) {
         applyErrors.push({
           registryKey: `__registry_shard_${bucket}__`,
-          reason: `failed to rebuild unreadable registry shard ${bucket}: ${error instanceof Error ? error.message : String(error)}`,
+          reason: `registry shard ${bucket} rebuild held: the completed scan still has ${scan.unreadableFiles.length} unreadable file(s), so the scan cannot prove it re-observed every record of this bucket; the corrupt shard was left untouched and the rebuild will be retried by a later resync`,
         });
+      }
+    } else {
+      for (const bucket of scan.corruptRegistryBuckets) {
+        try {
+          await writeVaultRegistryShard(root, bucket, emptyVaultRegistryShard(bucket));
+        } catch (error) {
+          applyErrors.push({
+            registryKey: `__registry_shard_${bucket}__`,
+            reason: `failed to rebuild unreadable registry shard ${bucket}: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
       }
     }
   }
