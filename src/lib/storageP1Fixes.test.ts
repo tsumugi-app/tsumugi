@@ -586,6 +586,139 @@ test("A-02 regression (Codex P2): an unchanged CRLF duplicate conflict passes re
 });
 
 // ---------------------------------------------------------------------------
+// A-02 ラウンド3（Codex [P2]）：write前検証（verifyVaultRegistryEntryBeforeWrite）
+// のハッシュ正規化。分類側が登録する基準ハッシュはLF正規化済みテキストのもの
+// なのに、検証側が生テキストをハッシュすると、mtime/sizeのメタデータだけが
+// ずれた無変更のCRLFファイルが常時「変わった」と誤判定され、保存が繰り返し
+// 拒否される。検証側も同じ正規化規則で比較しなければならない。逆に、本当に
+// 本文が変わったファイルはCRLFでも従来どおり拒否されなければならない
+// （検出を弱めない）。
+// ---------------------------------------------------------------------------
+
+/** Registryに「status ok」のentryを直接種付けする（分類が登録した状態の再現）。 */
+function seedRegistryEntry(
+  v: MemVault,
+  registryKey: string,
+  path: string,
+  entry: { recordType: string; mtime: number; size: number; contentHash: string; memberIds: string[]; memberHashes?: Record<string, string> },
+): void {
+  const bucket = vault.vaultRegistryBucketOf(registryKey);
+  const shard = {
+    schemaVersion: 1,
+    bucket,
+    records: { [registryKey]: path },
+    files: { [path]: { ...entry, status: "ok" } },
+  };
+  v.put(`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`, bytes(JSON.stringify(shard)));
+}
+
+test("A-02 round3 (Codex P2): an unchanged CRLF conversation with only metadata drift is not refused on save", async () => {
+  await prepareResyncWorld();
+  const conv = conversation("c-crlf-verify");
+  const lfText = markdown.conversationToMarkdown(conv);
+  const path = `Conversations/${vault.fileNameFor(conv.id, conv.startedAt)}`;
+  const v = new MemVault({ [path]: crlf(lfText) });
+  // 基準は分類側の登録どおり：LF正規化済みハッシュ＋LFサイズ。実ファイルは
+  // CRLF版（サイズが大きい）で、mtimeもentryの値とずれている＝メタデータ
+  // だけの差。この状態で保存が通らなければならない（修正前は常時拒否）。
+  seedRegistryEntry(v, conv.id, path, {
+    recordType: "conversation",
+    mtime: 12345,
+    size: bytes(lfText).length,
+    contentHash: vault.hashVaultText(lfText),
+    memberIds: [conv.id],
+  });
+  const updated: Conversation = { ...conv, updatedAt: T2 };
+  await vault.writeConversationMarkdown(v.dir(), updated);
+  assert.equal(v.text(path), markdown.conversationToMarkdown(updated));
+  const shard = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(conv.id));
+  assert.equal(shard.files[path]?.status, "ok");
+  assert.equal(shard.files[path]?.contentHash, vault.hashVaultText(markdown.conversationToMarkdown(updated)));
+});
+
+test("A-02 round3: a genuinely edited CRLF conversation is still refused — conflict detection is not weakened", async () => {
+  await prepareResyncWorld();
+  const conv = conversation("c-crlf-edited");
+  const lfText = markdown.conversationToMarkdown(conv);
+  const editedLf = markdown.conversationToMarkdown({
+    ...conv,
+    turns: [...conv.turns, { role: "user", content: "外部で書き換えられた架空の行", timestamp: T }],
+  });
+  const path = `Conversations/${vault.fileNameFor(conv.id, conv.startedAt)}`;
+  const v = new MemVault({ [path]: crlf(editedLf) });
+  seedRegistryEntry(v, conv.id, path, {
+    recordType: "conversation",
+    mtime: 12345,
+    size: bytes(lfText).length,
+    contentHash: vault.hashVaultText(lfText),
+    memberIds: [conv.id],
+  });
+  await assert.rejects(
+    vault.writeConversationMarkdown(v.dir(), conv),
+    (e: unknown) => e instanceof vault.VaultRecordNeedsResyncError,
+  );
+  // ファイルは1バイトも変えず、状態はneeds-resyncとして表面化する（無言でない）。
+  assert.equal(v.text(path), crlf(editedLf));
+  const shard = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(conv.id));
+  assert.equal(shard.files[path]?.status, "needs-resync");
+});
+
+test("A-02 round3: an unchanged LF conversation with the same metadata drift behaves identically", async () => {
+  await prepareResyncWorld();
+  const conv = conversation("c-lf-verify");
+  const lfText = markdown.conversationToMarkdown(conv);
+  const path = `Conversations/${vault.fileNameFor(conv.id, conv.startedAt)}`;
+  const v = new MemVault({ [path]: lfText });
+  seedRegistryEntry(v, conv.id, path, {
+    recordType: "conversation",
+    mtime: 12345,
+    size: bytes(lfText).length + 7,
+    contentHash: vault.hashVaultText(lfText),
+    memberIds: [conv.id],
+  });
+  const updated: Conversation = { ...conv, updatedAt: T2 };
+  await vault.writeConversationMarkdown(v.dir(), updated);
+  assert.equal(v.text(path), markdown.conversationToMarkdown(updated));
+});
+
+test("A-02 round3 integration: a CRLF day-file passes the same pre-write verification — an unchanged member write is a no-op (memory-day path)", async () => {
+  await prepareResyncWorld();
+  // parserが推定するsourceTypeまで含めて、端末側canonicalとファイル側の版が
+  // 一致する形にする（本番の分類がmemberHashesをparse済みmemberから取るのと
+  // 同じ前提）。
+  const memMeta = { ...meta, sourceType: "chat" };
+  const m1: MemoryObject = { ...memory("m-crlf-1"), metadata: { ...memMeta } } as MemoryObject;
+  const m2: MemoryObject = { ...memory("m-crlf-2"), metadata: { ...memMeta } } as MemoryObject;
+  const day = m1.date.slice(0, 10);
+  const lfDay = markdown.serializeMemoryDayFile([m1, m2]);
+  const key = vault.dayFileRegistryKey(day);
+  const path = `Memories/${vault.dayFileNameFor(m1.date)}`;
+  const v = new MemVault({ [path]: crlf(lfDay) });
+  // memberHashesは本番の分類と同じく「parse済みmemberの直列化」から取る。
+  const parsedSeed = markdown.parseMemoryDayFile(lfDay);
+  seedRegistryEntry(v, key, path, {
+    recordType: "memory-day",
+    mtime: 999,
+    size: bytes(lfDay).length,
+    contentHash: vault.hashVaultText(lfDay),
+    memberIds: [m1.id, m2.id],
+    memberHashes: Object.fromEntries(parsedSeed.map((m) => [m.id, vault.hashVaultText(markdown.memoryObjectToMarkdown(m))])),
+  });
+  // 無変更memberの保存：検証もmerge計画も通り、no-opとしてファイルには
+  // 一切触れない（CRLFのバイト列がそのまま残る）。
+  await vault.writeMemoryObjectMarkdown(v.dir(), m1);
+  assert.equal(v.text(path), crlf(lfDay), "an unchanged member write leaves the CRLF file byte-identical");
+  // 内容を変える更新も、CRLFファイルに対してLFと同じく通る（対象memberの
+  // 版だけが置き換わり、他memberの内容は保たれる）。
+  const updatedM1: MemoryObject = { ...m1, content: "更新された架空の記録 m-crlf-1", summary: "更新された架空の記録 m-crlf-1", updatedAt: T2 };
+  await vault.writeMemoryObjectMarkdown(v.dir(), updatedM1);
+  const parsed = markdown.parseMemoryDayFile(v.text(path));
+  assert.equal(parsed.length, 2, "both members survive the update");
+  assert.equal(parsed.find((m) => m.id === m1.id)?.content, updatedM1.content);
+  assert.equal(parsed.find((m) => m.id === m2.id)?.content, m2.content);
+});
+
+// ---------------------------------------------------------------------------
 // A-01：day-file内の破損entryの無言脱落
 // ---------------------------------------------------------------------------
 

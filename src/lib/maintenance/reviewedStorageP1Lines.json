@@ -1,5 +1,5 @@
 {
-  "note": "Storage P1 fixes (owner approval 2026-11-23): the six audit P1 defects in vault.ts — A-01 day-file dropped entries surface as resync conflict / restore-scan droppedEntryCount / readMemoriesForDayWithDiagnostics; A-02 CRLF files are probed and classified like LF (text normalized before hashing); A-04 native writes through writeFileInDir are verified by read-back (verifyWrittenFileContent); A-05 Registry read-modify-write uses the strict shard read (VaultRegistryShardUnreadableError / readVaultRegistryShardForUpdate) and a completed resync rebuilds corrupt Registry buckets before committing; VaultResyncScanResult carries corruptRegistryBuckets (L4 passes an empty set). Exact added / removed lines of vault.ts only. Deep-dive addition (owner approval 2026-11-23 19:53 JST): the resync rebuild of a corrupt bucket is HELD while the completed scan still has unreadable files (their records cannot be re-observed, so an incomplete scan must not finalize the rebuild); the hold surfaces in applyErrors and the corrupt shard is left untouched. Codex re-review addition (PR #68): singleRecordContentHashAtPath normalizes CRLF->LF before hashing, matching the classification-side convention (A-02), so unchanged CRLF duplicate conflicts are not misjudged as conflict-changed.",
+  "note": "Storage P1 fixes (owner approval 2026-11-23): the six audit P1 defects in vault.ts — A-01 day-file dropped entries surface as resync conflict / restore-scan droppedEntryCount / readMemoriesForDayWithDiagnostics; A-02 CRLF files are probed and classified like LF (text normalized before hashing); A-04 native writes through writeFileInDir are verified by read-back (verifyWrittenFileContent); A-05 Registry read-modify-write uses the strict shard read (VaultRegistryShardUnreadableError / readVaultRegistryShardForUpdate) and a completed resync rebuilds corrupt Registry buckets before committing; VaultResyncScanResult carries corruptRegistryBuckets (L4 passes an empty set). Exact added / removed lines of vault.ts only. Deep-dive addition (owner approval 2026-11-23 19:53 JST): the resync rebuild of a corrupt bucket is HELD while the completed scan still has unreadable files (their records cannot be re-observed, so an incomplete scan must not finalize the rebuild); the hold surfaces in applyErrors and the corrupt shard is left untouched. Codex re-review addition (PR #68): singleRecordContentHashAtPath normalizes CRLF->LF before hashing, matching the classification-side convention (A-02), so unchanged CRLF duplicate conflicts are not misjudged as conflict-changed. Round 3 addition (owner approval 2026-11-23 22:15 JST): verifyVaultRegistryEntryBeforeWrite hashes the CRLF->LF normalized text before comparing with the stored baseline contentHash (Codex [P2] on 6de74cf: an unchanged CRLF conversation file with only mtime/size drift was repeatedly refused on save), and readAnchorFileEntry normalizes the text it reads the same way (its only consumers are parsers and the classification hash). The text returned by verifyVaultRegistryEntryBeforeWrite stays raw — the day-file merge reuses it and must preserve untouched sections byte-for-byte.",
   "lines": [
     "+parseMemoryDayFileWithDiagnostics,",
     "+verifyWrittenFileContent,",
@@ -190,6 +190,17 @@
     "+*  （conflict-changed）と誤判定される。 */",
     "+const text = (await file.text()).replace(/\\r\\n/g, \"\\n\");",
     "-*  返す。読めない場合はnull。 */",
-    "-const text = await file.text();"
+    "-const text = await file.text();",
+    "-const actualHash = hashVaultText(actualText);",
+    "+// A-02（ラウンド3・Codex [P2]）：基準のcontentHashは分類側がLF正規化済み",
+    "+// テキストから計算したもの（processVaultResyncCandidateが読み取り直後に",
+    "+// CRLF→LF正規化する）。ここでも同じ正規化をしてから比較しないと、mtime/",
+    "+// sizeのメタデータだけがずれた無変更のCRLFファイルが常時不一致になり、",
+    "+// 保存が繰り返し拒否される。呼び出し元へ返す本文は生のまま（day-fileの",
+    "+// mergeが対象外部分のバイトを保存する契約を変えない）。",
+    "+const actualHash = hashVaultText(actualText.replace(/\\r\\n/g, \"\\n\"));",
+    "+// A-02（ラウンド3監査）：contentHashは分類側と同じくLF正規化済みテキスト",
+    "+// から計算する（生テキストのままだとCRLFのanchorが分類時の基準ハッシュと",
+    "+// 常時不一致になる）。この後の利用はparseだけなので正規化して問題ない。"
   ]
 }

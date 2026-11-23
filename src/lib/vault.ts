@@ -3993,7 +3993,13 @@ async function verifyVaultRegistryEntryBeforeWrite(
   }
 
   const actualText = await file.text();
-  const actualHash = hashVaultText(actualText);
+  // A-02（ラウンド3・Codex [P2]）：基準のcontentHashは分類側がLF正規化済み
+  // テキストから計算したもの（processVaultResyncCandidateが読み取り直後に
+  // CRLF→LF正規化する）。ここでも同じ正規化をしてから比較しないと、mtime/
+  // sizeのメタデータだけがずれた無変更のCRLFファイルが常時不一致になり、
+  // 保存が繰り返し拒否される。呼び出し元へ返す本文は生のまま（day-fileの
+  // mergeが対象外部分のバイトを保存する契約を変えない）。
+  const actualHash = hashVaultText(actualText.replace(/\r\n/g, "\n"));
   if (actualHash === entry.contentHash) {
     return { actualText };
   }
@@ -6104,7 +6110,10 @@ async function readAnchorFileEntry(
   const resolved = await resolveVaultRelativePath(root, anchorPath);
   const fileHandle = await resolved.dir.getFileHandle(resolved.fileName, { create: false });
   const file = await fileHandle.getFile();
-  const text = await file.text();
+  // A-02（ラウンド3監査）：contentHashは分類側と同じくLF正規化済みテキスト
+  // から計算する（生テキストのままだとCRLFのanchorが分類時の基準ハッシュと
+  // 常時不一致になる）。この後の利用はparseだけなので正規化して問題ない。
+  const text = (await file.text()).replace(/\r\n/g, "\n");
   const mtime = file.lastModified;
   const size = file.size;
   const contentHash = hashVaultText(text);

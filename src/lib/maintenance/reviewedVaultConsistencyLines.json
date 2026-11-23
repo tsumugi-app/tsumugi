@@ -1,5 +1,5 @@
 {
-  "review": "Vault consistency check (PR 1): the background check reads the save progress (Outbox + ledger) before and after the READ ONLY scan, keeps saving / unsettled results unrecorded with a bounded automatic re-check, shows the classified report, and the normal 修復する no longer starts the 2026-10-03 narrow repair (it only resumes an interrupted one; otherwise only records the current version can fix go through the existing Recovery Apply). Exact +/- lines of ChatScreen.tsx; no Memory / Retrieval / Timeline / Synthesis / prompt change. PR 3 (auto repair): handleUserRepair runs runProductionVaultAutoRepair (backup, re-verification right before, exclusive section, re-check) for the report's repairTargets; the outcome is kept (cleared on a Vault switch) and passed to Settings. Empty or cut AI reply: a reply with no words is not added as a turn (the user's message stays and is saved); a cut reply keeps the words that came and is marked (frontmatter interruptedTurns, additive); もう一度試す asks again for the same message without adding a user turn; after a reload the home screen offers the open conversation that ends in a cut reply, read from the list the startup check already loads, and the startup Capture leaves that one alone until the user decides. No Memory / Retrieval / Vault rule change.",
+  "review": "Vault consistency check (PR 1): the background check reads the save progress (Outbox + ledger) before and after the READ ONLY scan, keeps saving / unsettled results unrecorded with a bounded automatic re-check, shows the classified report, and the normal 修復する no longer starts the 2026-10-03 narrow repair (it only resumes an interrupted one; otherwise only records the current version can fix go through the existing Recovery Apply). Exact +/- lines of ChatScreen.tsx; no Memory / Retrieval / Timeline / Synthesis / prompt change. PR 3 (auto repair): handleUserRepair runs runProductionVaultAutoRepair (backup, re-verification right before, exclusive section, re-check) for the report's repairTargets; the outcome is kept (cleared on a Vault switch) and passed to Settings. Empty or cut AI reply: a reply with no words is not added as a turn (the user's message stays and is saved); a cut reply keeps the words that came and is marked (frontmatter interruptedTurns, additive); もう一度試す asks again for the same message without adding a user turn; after a reload the home screen offers the open conversation that ends in a cut reply, read from the list the startup check already loads, and the startup Capture leaves that one alone until the user decides. No Memory / Retrieval / Vault rule change. Round 3 addition (PR #68, owner approval 2026-11-23 22:15 JST): handleCheckVaultStatus no longer returns silently when another Vault operation holds the operation lock (the background consistency check's re-check wait could hold it past the click, so the 「確認する」 button appeared to do nothing and the review UI never appeared); it waits for the lock to be released, bounded by the existing waitUntilIdle (60s), then proceeds — the same wait-then-start pattern handleResolveConflict already uses. No other behavior changes.",
   "lines": [
     "-planRecoveryApply,",
     "+type RecoveryConfirmedSet,",
@@ -488,6 +488,17 @@
     "+もう一度試す",
     "-function TurnBubble({ turn }: { turn: ConversationTurn }) {",
     "+function TurnBubble({ turn, superseded }: { turn: ConversationTurn; superseded?: boolean }) {",
-    "+if (turn.interrupted) return <InterruptedTurn content={turn.content} superseded={!!superseded} />;"
+    "+if (turn.interrupted) return <InterruptedTurn content={turn.content} superseded={!!superseded} />;",
+    "-if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;",
+    "+if (!vaultHandle || isVaultSwitchingRef.current || crossTabStale) return;",
+    "+// 別のVault操作（背景の整合性確認の再確認待ち等）がロックを保持している間は、",
+    "+// 無言で諦めず、解放されるまで有限時間待ってから始める。黙ってreturnすると、",
+    "+// ボタンを押しても何も起きず、利用者は「確認する」を押し直すしかなくなる。",
+    "+if (vaultOperationLockRef.current) {",
+    "+const waited = await waitUntilIdle(",
+    "+() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current,",
+    "+() => vaultGenerationRef.current !== vaultGenerationRef.current",
+    "+);",
+    "+if (waited !== \"idle\" || !vaultHandle || crossTabStale) return;"
   ]
 }

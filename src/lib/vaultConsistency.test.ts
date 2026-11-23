@@ -206,6 +206,42 @@ test("保存待ちが長期間解消されなくても無期限に待たない�
   assert.equal(deriveRecoveryUserView({ kind: "plan" }, report).kind, "saving");
 });
 
+test("保存待ちの進行が止まっている（指紋が変わらない）場合は、上限まで待たずに走査へ進む", async () => {
+  // pendingのまま進行状況が一切変わらない＝保存を駆動する処理が既に終わっている。
+  // この状態でdrainWaitMsいっぱい待っても解消しないため、指紋が2回連続で同じに
+  // なった時点で走査へ進む（走査は保存待ちをsavingとして表示するだけで、異常とは
+  // 断定しない）。
+  const h = harness({ pendingPolls: Number.MAX_SAFE_INTEGER });
+  const { report } = await runConsistencyCheck(h.deps, { drainWaitMs: 60_000, pollMs: 1_000 });
+  assert.equal(h.stats().slept, 10_000, "stops waiting once the save progress has been unchanged for the stall window (10s at 1s polls)");
+  assert.equal(h.stats().scans, 1);
+  assert.equal(report.state, "saving");
+});
+
+test("保存待ちの進行が動いている間は、従来どおり解消を待ってから走査する", async () => {
+  // pollのたびに進行状況（updatedAt）が変わる＝保存処理が実際に進んでいる。
+  // その間は静止判定で早く切り上げず、解消するまで待つ。
+  let polls = 0;
+  let frozenAt: number | null = null;
+  const deps = {
+    readProgress: async () => {
+      polls++;
+      // 保存処理が進んでいる間は、保存対象の記録自身の進行状況が変わる
+      // （attempts・updatedAt）。attemptsが変わる＝指紋が変わるため、静止判定には当たらない。
+      // 解消した後は進行状況は止まる（走査の前後比較が確定できるように）。
+      if (polls > 4 && frozenAt === null) frozenAt = polls;
+      const n = frozenAt ?? polls;
+      return progress([entry("memory:m1", polls <= 4 ? "pending" : "done", { attempts: n, updatedAt: `t-${n}` })]);
+    },
+    plan: async () => plan({ records: [rec("memory", "m1", "equivalent-existing")] }),
+    sleep: async (_ms: number) => {},
+    isCancelled: () => false,
+  };
+  const { report } = await runConsistencyCheck(deps, { drainWaitMs: 60_000, pollMs: 1_000, attempts: 1 });
+  assert.equal(report.state, "clean");
+  assert.equal(polls >= 5, true, "kept waiting while the save progress kept changing");
+});
+
 test("保存処理と重なった走査は有限回やり直す。落ち着けば確定、落ち着かなければ未確定のまま返す", async () => {
   const settles = harness({ unsettledScans: 1 });
   const first = await runConsistencyCheck(settles.deps, { attempts: 3, retryDelayMs: 10 });

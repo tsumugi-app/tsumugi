@@ -45,7 +45,12 @@ export async function withMemoryDayFileLock<T>(day: string, fn: () => Promise<T>
 // 比較
 // ---------------------------------------------------------------------------
 
-const sections = (note: string) => note.trim().match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+// CRLFのファイルもLFと同一に判定する（A-02の分類側と同じ正規化規則）。
+// 行末の違いは「内容が変わった」ことではないため、frontmatter/bodyの比較は
+// 正規化後の形で行う。呼び出し側が書き戻す内容そのものは正規化しない
+// （対象外部分のバイト保存は呼び出し側の契約）。
+const normalizeForCompare = (text: string) => text.replace(/\r\n/g, "\n");
+const sections = (note: string) => normalizeForCompare(note).trim().match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
 const keyOf = (line: string) => line.slice(0, line.indexOf(":")).trim();
 
 /** Tsumugiが版を進めるたびに変わる項目。これ以外のfrontmatterの行は、置き換えた後にも残っていなければ「元の内容が残る」とは言えない */
@@ -141,7 +146,11 @@ export function planDayFileMemberWrite(raw: string | null, canonical: MemoryObje
   const entry = memoryObjectToMarkdown(canonical);
   if (raw === null || raw.trim().length === 0) return { kind: "write", verdict: "create", content: entry, members: [canonical] };
 
-  const segments = raw.split(MEMORY_ENTRY_SEPARATOR);
+  // A-02：CRLFのday-fileもLFと同一に扱う。区切り文字列はLF形のため、分割は
+  // 正規化後のテキストで行う（parseMemoryDayFileと同じ規則）。no-op判定の
+  // 場合は元のrawをそのまま返すのでCRLFファイルのバイトは変わらない。
+  // write時は正規化後の形で書き戻る（内容は同一で、行末だけがLFへ揃う）。
+  const segments = normalizeForCompare(raw).split(MEMORY_ENTRY_SEPARATOR);
   const parsed = segments.map((segment) => (segment.trim().length > 0 ? parseMemoryObjectMarkdown(segment.trim()) : null));
   const existing = parsed.filter((m): m is MemoryObject => m !== null);
   // 1件も読めない：このファイルは日別ファイルではないかもしれない（ユーザー自身のノート等）
@@ -180,7 +189,7 @@ export function planDayFileMemberWrite(raw: string | null, canonical: MemoryObje
 /** 修復の事前確認用：この日別ファイルにこの記録を入れられる見込みがあるか（保存の時点で`planDayFileMemberWrite`がもう一度判定する） */
 export function dayFileCanTakeMember(raw: string, memberId: string): boolean {
   if (raw.trim().length === 0) return true;
-  const segments = raw.split(MEMORY_ENTRY_SEPARATOR);
+  const segments = normalizeForCompare(raw).split(MEMORY_ENTRY_SEPARATOR);
   const parsed = segments.map((segment) => (segment.trim().length > 0 ? parseMemoryObjectMarkdown(segment.trim()) : null));
   if (!parsed.some((m) => m !== null)) return false;
   return !segments.some((segment, i) => parsed[i] === null && segment.includes(memberId));

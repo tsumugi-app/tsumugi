@@ -4174,7 +4174,17 @@ export default function ChatScreen() {
   }
 
   async function handleCheckVaultStatus() {
-    if (!vaultHandle || isVaultSwitchingRef.current || vaultOperationLockRef.current || crossTabStale) return;
+    if (!vaultHandle || isVaultSwitchingRef.current || crossTabStale) return;
+    // 別のVault操作（背景の整合性確認の再確認待ち等）がロックを保持している間は、
+    // 無言で諦めず、解放されるまで有限時間待ってから始める。黙ってreturnすると、
+    // ボタンを押しても何も起きず、利用者は「確認する」を押し直すしかなくなる。
+    if (vaultOperationLockRef.current) {
+      const waited = await waitUntilIdle(
+        () => !vaultOperationLockRef.current && !isVaultSwitchingRef.current,
+        () => vaultGenerationRef.current !== vaultGenerationRef.current
+      );
+      if (waited !== "idle" || !vaultHandle || crossTabStale) return;
+    }
     const generation = vaultGenerationRef.current;
     vaultOperationLockRef.current = true;
     const endTask = beginMemoryTask();
