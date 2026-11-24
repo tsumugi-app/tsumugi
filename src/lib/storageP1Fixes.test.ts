@@ -139,6 +139,7 @@ const personStore = require("./personAliasStore") as typeof import("./personAlia
 const markdown = require("./markdown") as typeof import("./markdown");
 const vaultWriter = require("./vaultWriter") as typeof import("./vaultWriter");
 const vaultRestore = require("./vaultRestore") as typeof import("./vaultRestore");
+const safety = require("./vaultRewriteSafety") as typeof import("./vaultRewriteSafety");
 
 const T = "2026-10-20T00:00:00.000Z";
 const T2 = "2026-10-21T00:00:00.000Z";
@@ -511,6 +512,138 @@ test("A-06 compat integration: legacy and new-format conversations coexist in on
   const byId = new Map(scan.conversations.map((c) => [c.id, c]));
   assert.deepEqual(byId.get("c-legacy-bs")?.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT]);
   assert.deepEqual(byId.get("c-escape-like")?.turns.map((t) => t.content), ESCAPE_LIKE_TURNS.map((t) => t.content));
+});
+
+// ---------------------------------------------------------------------------
+// A-06 guard（PR #68 Codex [P2]）：旧形式transcriptの無損失アップグレードと再書き込みガード
+// 旧形式ファイルに `\**Tsumugi:** ` のような継続行があると、新形式serializerの
+// escapeで登録ハッシュが一致しなくなり、turnの追記だけでも
+// `singleFileRewriteIsSafe` が拒否して、その会話のOutbox保存が止まっていた。
+// 修正前（head d06d779）では下の「受け入れる」系テストがすべて失敗し、
+// 「拒否する」系は修正前後とも拒否のままであることを確認済み。
+// ---------------------------------------------------------------------------
+
+/** A-06以前のserializerが出力した形：現行の直列化から `transcriptFormat` 行を取り除き、transcriptの継続行のescapeを1段だけ戻したもの（frontmatterの引用形・turnTimes等は現行と同一）。 */
+function toLegacyForm(newMd: string): string {
+  const withoutMarker = newMd.replace("transcriptFormat: 2\n", "");
+  const marker = "## Transcript\n\n";
+  const at = withoutMarker.indexOf(marker);
+  const head = withoutMarker.slice(0, at + marker.length);
+  let inTurn = false;
+  const lines = withoutMarker
+    .slice(at + marker.length)
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("**User:** ") || line.startsWith("**Tsumugi:** ")) {
+        inTurn = true;
+        return line;
+      }
+      if (inTurn && /^\\+\*\*(?:User|Tsumugi):\*\*/.test(line)) return line.slice(1);
+      return line;
+    });
+  return head + lines.join("\n");
+}
+
+const GUARD_TURNS: Conversation["turns"] = [
+  { role: "user", content: LEGACY_USER_CONTENT, timestamp: T },
+  { role: "ai", content: LEGACY_AI_CONTENT, timestamp: T },
+];
+const guardLegacyMd = () => toLegacyForm(markdown.conversationToMarkdown(conversation("c-guard", GUARD_TURNS)));
+const guardAppended = (base: Conversation): Conversation => ({
+  ...base,
+  turns: [...base.turns, { role: "ai", content: "追記された応答です", timestamp: T2 }],
+  updatedAt: T2,
+});
+/** `decideMarkdown`（vaultProjection）と同じ配線でガードを呼ぶ：hashは生の `hashVaultText`、reserializedは現在のファイルをparseして書き直した内容。 */
+const guardCall = (current: string, canonical: Conversation, registeredHash: unknown): boolean => {
+  const parsed = markdown.parseConversationMarkdown(current);
+  assert.ok(parsed);
+  return safety.singleFileRewriteIsSafe(current, markdown.conversationToMarkdown(canonical), {
+    hash: vault.hashVaultText,
+    registeredHash,
+    evolvingKeys: safety.CONVERSATION_EVOLVING_KEYS,
+    body: "extends",
+    reserialized: markdown.conversationToMarkdown(parsed),
+  });
+};
+
+test("A-06 guard: a registered legacy file accepts an append-only save (LF)", () => {
+  const current = guardLegacyMd();
+  const parsed = markdown.parseConversationMarkdown(current);
+  assert.ok(parsed);
+  assert.deepEqual(parsed.turns.map((t) => t.content), [LEGACY_USER_CONTENT, LEGACY_AI_CONTENT], "前提：旧形式は本文をそのまま読む");
+  const canonical = guardAppended(parsed);
+  assert.equal(guardCall(current, canonical, vault.hashVaultText(current)), true, "登録ハッシュが一致し変更が追記だけなら、形式アップグレードを理由に拒否しない");
+  // 書き込まれる内容は、旧turnの本文・発言者・順序を正確に保ち、追記turnが末尾に付く。
+  const written = markdown.parseConversationMarkdown(markdown.conversationToMarkdown(canonical));
+  assert.deepEqual(written?.turns.map((t) => ({ role: t.role, content: t.content })), [
+    { role: "user", content: LEGACY_USER_CONTENT },
+    { role: "ai", content: LEGACY_AI_CONTENT },
+    { role: "ai", content: "追記された応答です" },
+  ]);
+});
+
+test("A-06 guard: a registered legacy file accepts an append-only save (CRLF)", () => {
+  const lf = guardLegacyMd();
+  const current = crlf(lf);
+  const parsed = markdown.parseConversationMarkdown(current);
+  assert.ok(parsed);
+  // resyncが登録するハッシュはLF正規化形（分類側の規則）。decideMarkdownのhashは生テキスト側。
+  assert.equal(guardCall(current, guardAppended(parsed), vault.hashVaultText(lf)), true, "CRLFでもLFと同一に受け入れる");
+});
+
+test("A-06 guard: an unregistered legacy file accepts an append-only save", () => {
+  const current = guardLegacyMd();
+  const parsed = markdown.parseConversationMarkdown(current);
+  assert.ok(parsed);
+  assert.equal(guardCall(current, guardAppended(parsed), undefined), true, "登録ハッシュが無くても、内容がすべて残る追記は拒否しない");
+});
+
+test("A-06 guard: a genuine external edit of body text is still refused", () => {
+  const original = guardLegacyMd();
+  const edited = original.replace("以上です", "書き換えられた結び");
+  const canonical = guardAppended(markdown.parseConversationMarkdown(original) as Conversation);
+  assert.equal(guardCall(edited, canonical, vault.hashVaultText(original)), false, "外部編集された本文を、追記の保存で上書きしてはならない");
+});
+
+test("A-06 guard: a genuine external edit of the marker-like line itself is still refused", () => {
+  const original = guardLegacyMd();
+  const edited = original.replace("\\**Tsumugi:** これは引用行です", "\\**Tsumugi:** 書き換えられた引用行");
+  assert.notEqual(edited, original, "前提：対象の行が実際に書き換わっている");
+  const canonical = guardAppended(markdown.parseConversationMarkdown(original) as Conversation);
+  assert.equal(guardCall(edited, canonical, vault.hashVaultText(original)), false, "アップグレード変換が触れる行そのものの編集も、変換でごまかされず検出される");
+});
+
+test("A-06 guard: a hand-added frontmatter line is still refused even when the edited file itself is registered", () => {
+  const foreign = guardLegacyMd().replace("persona: companion", "persona: companion\nhandNote: 手で足した項目");
+  const canonical = guardAppended(markdown.parseConversationMarkdown(guardLegacyMd()) as Conversation);
+  assert.equal(guardCall(foreign, canonical, vault.hashVaultText(foreign)), false, "parseで落ちる知らない項目を含むファイルは、登録済みでも書き換えない");
+});
+
+test("A-06 guard: hand-added text before the transcript is still refused", () => {
+  const foreign = guardLegacyMd().replace("## Transcript", "手で足した段落\n\n## Transcript");
+  const canonical = guardAppended(markdown.parseConversationMarkdown(guardLegacyMd()) as Conversation);
+  assert.equal(guardCall(foreign, canonical, vault.hashVaultText(foreign)), false, "transcript外の手書きはアップグレード変換の対象外であり、失われる書き換えは拒否する");
+});
+
+test("A-06 guard: new-format files keep their existing behavior (append accepted, edit refused)", () => {
+  const marked = markdown.conversationToMarkdown(conversation("c-guard-new", GUARD_TURNS));
+  const parsed = markdown.parseConversationMarkdown(marked);
+  assert.ok(parsed);
+  assert.equal(guardCall(marked, guardAppended(parsed), vault.hashVaultText(marked)), true);
+  const edited = marked.replace("以上です", "書き換えられた結び");
+  assert.equal(guardCall(edited, guardAppended(parsed), vault.hashVaultText(marked)), false);
+});
+
+test("A-06 guard: legacyTranscriptUpgradeForm only bridges the format upgrade, nothing else", () => {
+  const current = guardLegacyMd();
+  const upgraded = markdown.legacyTranscriptUpgradeForm(current);
+  assert.ok(upgraded, "旧形式＋escapeが要る行がある場合はアップグレード形を返す");
+  assert.ok(upgraded.includes("\\\\**Tsumugi:** これは引用行です"), "継続行へ \\ が1つだけ足される");
+  assert.equal(toLegacyForm(upgraded), current, "escapeを1段戻すと元の旧形式に正確に戻る（変換はそれ以外を変えない）");
+  assert.equal(markdown.legacyTranscriptUpgradeForm(markdown.conversationToMarkdown(conversation("c-guard-new", GUARD_TURNS))), null, "新形式ファイルには適用しない");
+  assert.equal(markdown.legacyTranscriptUpgradeForm(legacyConversationMd("c-plain-guard", [{ role: "User", content: "普通の発言です" }])), null, "escapeが要る行が無い旧形式には適用しない");
+  assert.equal(markdown.legacyTranscriptUpgradeForm(markdown.memoryObjectToMarkdown(memory("m-guard"))), null, "Conversationでないファイルには適用しない");
 });
 
 // ---------------------------------------------------------------------------

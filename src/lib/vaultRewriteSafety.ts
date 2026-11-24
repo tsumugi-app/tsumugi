@@ -9,7 +9,7 @@
  * 日別ファイルは丸ごと書き直さない：対象の記録の部分だけを置き換える・足す。他の部分（他の記録・手書きの追記・読めない部分）は1バイトも変えない。
  * このモジュールはファイルに触れない（読み書きは呼び出し側）。
  */
-import { MEMORY_ENTRY_SEPARATOR, memoryObjectToMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown } from "./markdown";
+import { MEMORY_ENTRY_SEPARATOR, legacyTranscriptUpgradeForm, memoryObjectToMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown } from "./markdown";
 import type { Conversation, MemoryObject } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -114,10 +114,27 @@ function serializedKeepsEverything(section: string, serialized: string): boolean
 /**
  * `reserialized`は今のファイルを読んで書き直した内容。Registryのハッシュが一致しても、読み書きで失われる部分（知らない項目・手書きの文）があれば
  * Tsumugiが書いた版とは言えない（復旧がファイルの実体からハッシュを記録した場合に、手で足された文を上書きしない）。
+ *
+ * 旧形式transcriptの無損失アップグレード（PR #68 Codex [P2]）：`transcriptFormat`
+ * マーカーの無い旧形式の会話では、利用者の本文そのものである `\**Tsumugi:** ` の
+ * ような継続行を、新形式のserializerがescapeして `\` を1つ足す。そのため登録
+ * ハッシュが一致し実際の変更がturnの追記だけでも、素のバイト比較では「元の内容が
+ * 残っていない」と誤判定され、その会話の保存が止まってしまう。そこで、旧形式
+ * ファイルに限っては、形式アップグレードだけを先回りして適用した形
+ * （`legacyTranscriptUpgradeForm`）でも同じ厳密な比較を行う。アップグレードは
+ * parseの観点で無損失（旧形式として読んだ会話＝新形式として読んだ会話）であり、
+ * 変換が触れるのはマーカーそっくりの継続行だけなので、それ以外の本文・知らない
+ * 項目・手書きの文はアップグレード後の形にもそのまま残り、従来どおり検出される。
+ * ガードの条件そのものは緩めていない（比較対象の片方を、形式の版に合わせて
+ * そろえているだけであり、証明の要求水準は変えていない）。
  */
 export function singleFileRewriteIsSafe(current: string, next: string, opts: { hash: (text: string) => string; registeredHash: unknown; evolvingKeys: ReadonlySet<string>; body: "same" | "extends"; reserialized: string }): boolean {
   if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash && serializedKeepsEverything(current, opts.reserialized)) return true;
-  return rewriteKeepsContent(current, next, opts.evolvingKeys, opts.body);
+  if (rewriteKeepsContent(current, next, opts.evolvingKeys, opts.body)) return true;
+  const upgraded = legacyTranscriptUpgradeForm(current);
+  if (upgraded === null) return false;
+  if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash && serializedKeepsEverything(upgraded, opts.reserialized)) return true;
+  return rewriteKeepsContent(upgraded, next, opts.evolvingKeys, opts.body);
 }
 
 // ---------------------------------------------------------------------------

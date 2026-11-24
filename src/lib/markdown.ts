@@ -679,6 +679,56 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   };
 }
 
+/**
+ * 旧形式（`transcriptFormat: 2` マーカーの無い）Conversationファイルについて、現在の
+ * serializerが同じ会話を書き直すときに生じる「形式アップグレード」だけを先回りして
+ * 適用したテキストを返す。**比較専用**であり、返したテキストをファイルへ書いたり
+ * そのままparseして使うことは想定していない（書き込みガード
+ * `singleFileRewriteIsSafe` が、旧形式ファイルと新形式の直列化結果を比べるために使う）。
+ *
+ * アップグレードで変わるのは、transcript内の継続行のうち turnマーカーそっくりの行
+ * （`TURN_MARKER_LIKE_LINE` に一致する行）へ `\` を1つ足すことだけであり、これは
+ * `escapeTurnBodyLines` が行う変換と正確に同じである。parseの観点では無損失：
+ * 旧形式として読んだ会話と、アップグレード後の形を新形式として読んだ会話は
+ * turn・発言者・本文が完全に一致する（A-06の固定点設計）。frontmatterや
+ * transcript以外の部分には一切触れないため、外から書き加えられた内容は
+ * アップグレード後の形にもそのまま残り、ガード側の厳密な比較で引き続き検出できる。
+ *
+ * 対象は「Conversationとして読める・マーカーの無い・実際にescapeが要る行を含む」
+ * ファイルだけ。それ以外（新形式、Conversationでない、transcriptが無い、
+ * 変換が要らない）では null を返し、呼び出し側は従来の判定だけを行う。
+ */
+export function legacyTranscriptUpgradeForm(raw: string): string | null {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const fmMatch = normalized.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!fmMatch) return null;
+  const parsed = parseFrontmatter(normalized);
+  if (!parsed || parsed.frontmatter.tsumugi !== true || typeof parsed.frontmatter.id !== "string" || !parsed.frontmatter.id) return null;
+  if (parsed.frontmatter.transcriptFormat === 2) return null;
+  const body = parsed.body;
+  const markerMatch = /(^|\n)## Transcript\n\n/.exec(body);
+  if (!markerMatch) return null;
+  const transcriptStartInBody = markerMatch.index + markerMatch[1].length + "## Transcript\n\n".length;
+  let inTurn = false;
+  let changed = false;
+  const lines = body
+    .slice(transcriptStartInBody)
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("**User:** ") || line.startsWith("**Tsumugi:** ")) {
+        inTurn = true;
+        return line;
+      }
+      if (inTurn && TURN_MARKER_LIKE_LINE.test(line)) {
+        changed = true;
+        return `\\${line}`;
+      }
+      return line;
+    });
+  if (!changed) return null;
+  return normalized.slice(0, fmMatch[0].length + transcriptStartInBody) + lines.join("\n");
+}
+
 function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[], transcriptEscaped: boolean): ConversationTurn[] {
   // 行頭の見出しだけ（リアルタイム日記の本文中の`\## Transcript`のように、エスケープした行の途中は会話記録の始まりではない）
   const marker = "## Transcript\n\n";
