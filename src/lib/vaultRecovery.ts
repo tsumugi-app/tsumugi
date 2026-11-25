@@ -278,44 +278,62 @@ export async function buildVaultRecoveryPlan(root: FileSystemDirectoryHandle, lo
         try { raw = await (await (handle as FileSystemFileHandle).getFile()).text(); }
         catch (e) { issues.push({ path, status: "read-error", error: errorName(e) }); continue; }
         try {
+          // A-02（保存・復旧システム監査P1）：CRLFのMarkdownもLFと同一に読む
+          // （エントリ区切り・frontmatter・本文見出しの判定を改行コードで変えない）。
+          const text = raw.replace(/\r\n/g, "\n");
           // Check each member, rather than parseMemoryDayFile's fail-soft filter.
-          const blocks = raw.split("\n<!-- tsumugi:entry -->\n\n").map(s => s.trim()).filter(Boolean);
+          const blocks = text.split("\n<!-- tsumugi:entry -->\n\n").map(s => s.trim()).filter(Boolean);
           if (blocks.length === 0) throw new Error("empty-markdown");
           const fileRecords: Observed[] = [];
+          // A-01：Tsumugi所有と分かるが読めないblockが1つでもあれば、このファイルは
+          // issueとして表面化する。ただし読めた兄弟エントリの観測は維持する
+          // （従来は1件の破損でファイル全体の観測を捨て、健全なエントリまで
+          // 「Vaultに無いかもしれない」扱いになっていた）。
+          let brokenOwnedBlock = false;
           for (const block of blocks) {
             const parsed = parseFrontmatter(block);
             // Tsumugi所有物かどうかの判定（frontmatterが無い、またはtsumugi!==true）は
             // 「不正」ではなく「対象外」——Obsidian等、Tsumugiが生成していない任意の
             // Markdownがこの位置に存在してもissue化せず、単にこのblockを無視する
             // （所有権が確認できないrecordとして無視するだけで、他recordには一切
-            // 影響しない）。tsumugi:trueを宣言した後のid不正等は、従来通りTsumugi
-            // 所有recordの破損としてissue化する（下のthrowはそのまま維持）。
-            if (!parsed || parsed.frontmatter.tsumugi !== true) continue;
-            // People（人物メモ）はRecoveryのrecordではない（保存・同期は専用経路
-            // personAliasStoreの責務）。専用parserで検証だけを行い、正常ならrecord化も
-            // issue化もせずにこのblockを終える——正常なPeopleファイルを
-            // unsupported-recordとして数えると、Recovery計画全体が安全側に停止して
-            // しまうため。専用parserが受け付けないPeopleファイルは、他のTsumugi所有
-            // recordの破損と同様にthrowしてissue化する（安全側の扱いは変えない）。
-            if (parsed.frontmatter.type === "person") {
-              if (!parsePersonMarkdown(block, path.split("/").pop() ?? path)) throw new Error("invalid-person-record");
+            // 影響しない）。ただし、frontmatterが閉じていない等でparse自体できない
+            // blockでも、先頭に `tsumugi: true` の宣言が見える場合はTsumugi所有の
+            // 破損として数える（無言で読み飛ばさない）。
+            if (!parsed) {
+              if (block.startsWith("---") && /^tsumugi:\s*true\s*$/m.test(block.slice(0, 1024))) brokenOwnedBlock = true;
               continue;
             }
-            if (typeof parsed.frontmatter.id !== "string") throw new Error("unrecognized-markdown");
-            const { frontmatter: fm, body } = parsed;
-            for (const field of ["links", "profile", "person", "topicEvents"]) {
-              if (fm[field] !== undefined && (typeof fm[field] !== "string" || !Array.isArray(JSON.parse(fm[field] as string)))) throw new Error("invalid-encoded-field");
+            if (parsed.frontmatter.tsumugi !== true) continue;
+            try {
+              // People（人物メモ）はRecoveryのrecordではない（保存・同期は専用経路
+              // personAliasStoreの責務）。専用parserで検証だけを行い、正常ならrecord化も
+              // issue化もせずにこのblockを終える——正常なPeopleファイルを
+              // unsupported-recordとして数えると、Recovery計画全体が安全側に停止して
+              // しまうため。専用parserが受け付けないPeopleファイルは、他のTsumugi所有
+              // recordの破損と同様にissue化する（安全側の扱いは変えない）。
+              if (parsed.frontmatter.type === "person") {
+                if (!parsePersonMarkdown(block, path.split("/").pop() ?? path)) throw new Error("invalid-person-record");
+                continue;
+              }
+              if (typeof parsed.frontmatter.id !== "string") throw new Error("unrecognized-markdown");
+              const { frontmatter: fm, body } = parsed;
+              for (const field of ["links", "profile", "person", "topicEvents"]) {
+                if (fm[field] !== undefined && (typeof fm[field] !== "string" || !Array.isArray(JSON.parse(fm[field] as string)))) throw new Error("invalid-encoded-field");
+              }
+              let type: RecordType, data: Data | null;
+              if (body.includes("## Transcript\n\n")) { type = "conversation"; data = parseConversationMarkdown(block); }
+              else if (body.includes("## Summary\n")) { data = parseRecoveryMemoryMarkdown(block); type = data && isReflectionSummary(data) ? "reflection" : "memory"; }
+              else if (body.includes("## Content\n") && typeof fm.sourceType === "string") { type = "source"; data = parseSourceMarkdown(block); }
+              else throw new Error("unsupported-record");
+              if (!data || !data.id || !dateOK(data.createdAt) || !dateOK(data.updatedAt) || !dateOK(recordDate(type, data))) throw new Error("invalid-record");
+              fileRecords.push({ type, data, path, day: recordDate(type, data).slice(0, 10), text: block });
+            } catch {
+              brokenOwnedBlock = true;
             }
-            let type: RecordType, data: Data | null;
-            if (body.includes("## Transcript\n\n")) { type = "conversation"; data = parseConversationMarkdown(block); }
-            else if (body.includes("## Summary\n")) { data = parseRecoveryMemoryMarkdown(block); type = data && isReflectionSummary(data) ? "reflection" : "memory"; }
-            else if (body.includes("## Content\n") && typeof fm.sourceType === "string") { type = "source"; data = parseSourceMarkdown(block); }
-            else throw new Error("unsupported-record");
-            if (!data || !data.id || !dateOK(data.createdAt) || !dateOK(data.updatedAt) || !dateOK(recordDate(type, data))) throw new Error("invalid-record");
-            fileRecords.push({ type, data, path, day: recordDate(type, data).slice(0, 10), text: block });
           }
           if (fileRecords.length > 1 && (fileRecords.some(r => r.type !== "memory") || new Set(fileRecords.map(r => r.day)).size !== 1)) throw new Error("mixed-day-file");
           observed.push(...fileRecords);
+          if (brokenOwnedBlock) issues.push({ path, status: "invalid", error: "markdown-parse-or-shape-failure" });
         } catch { issues.push({ path, status: "invalid", error: "markdown-parse-or-shape-failure" }); }
       }
     } catch (e) { signal?.throwIfAborted(); scanCompleted = false; issues.push({ path: prefix || "/", status: "read-error", error: errorName(e) }); }

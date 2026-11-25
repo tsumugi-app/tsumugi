@@ -17,3 +17,20 @@ export async function waitUntilIdle(
     await sleep(pollMs);
   }
 }
+
+/**
+ * Like `waitUntilIdle`, but cancellation is derived from a generation counter:
+ * the generation is captured HERE, when the wait starts, and the wait is
+ * "cancelled" as soon as `currentGeneration()` returns a different value.
+ * Capturing inside this helper makes it impossible for a caller to build a
+ * predicate that can never fire (e.g. one that compares the counter to
+ * itself, which silently disables cancellation — the N-1 defect).
+ */
+export async function waitUntilIdleOrGenerationChange(
+  isIdle: () => boolean,
+  currentGeneration: () => number,
+  options: { pollMs?: number; maxWaitMs?: number; sleep?: (ms: number) => Promise<void> } = {}
+): Promise<"idle" | "cancelled" | "timeout"> {
+  const generation = currentGeneration();
+  return waitUntilIdle(isIdle, () => currentGeneration() !== generation, options);
+}

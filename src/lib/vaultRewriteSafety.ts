@@ -9,7 +9,7 @@
  * 日別ファイルは丸ごと書き直さない：対象の記録の部分だけを置き換える・足す。他の部分（他の記録・手書きの追記・読めない部分）は1バイトも変えない。
  * このモジュールはファイルに触れない（読み書きは呼び出し側）。
  */
-import { MEMORY_ENTRY_SEPARATOR, memoryObjectToMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown } from "./markdown";
+import { MEMORY_ENTRY_SEPARATOR, legacyTranscriptUpgradeForm, memoryObjectToMarkdown, parseMemoryDayFile, parseMemoryObjectMarkdown } from "./markdown";
 import type { Conversation, MemoryObject } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,12 @@ export async function withMemoryDayFileLock<T>(day: string, fn: () => Promise<T>
 // 比較
 // ---------------------------------------------------------------------------
 
-const sections = (note: string) => note.trim().match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+// CRLFのファイルもLFと同一に判定する（A-02の分類側と同じ正規化規則）。
+// 行末の違いは「内容が変わった」ことではないため、frontmatter/bodyの比較は
+// 正規化後の形で行う。呼び出し側が書き戻す内容そのものは正規化しない
+// （対象外部分のバイト保存は呼び出し側の契約）。
+const normalizeForCompare = (text: string) => text.replace(/\r\n/g, "\n");
+const sections = (note: string) => normalizeForCompare(note).trim().match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
 const keyOf = (line: string) => line.slice(0, line.indexOf(":")).trim();
 
 /** Tsumugiが版を進めるたびに変わる項目。これ以外のfrontmatterの行は、置き換えた後にも残っていなければ「元の内容が残る」とは言えない */
@@ -109,10 +114,37 @@ function serializedKeepsEverything(section: string, serialized: string): boolean
 /**
  * `reserialized`は今のファイルを読んで書き直した内容。Registryのハッシュが一致しても、読み書きで失われる部分（知らない項目・手書きの文）があれば
  * Tsumugiが書いた版とは言えない（復旧がファイルの実体からハッシュを記録した場合に、手で足された文を上書きしない）。
+ *
+ * 旧形式transcriptの無損失アップグレード（PR #68 Codex [P2]）：`transcriptFormat`
+ * マーカーの無い旧形式の会話では、利用者の本文そのものである `\**Tsumugi:** ` の
+ * ような継続行を、新形式のserializerがescapeして `\` を1つ足す。そのため登録
+ * ハッシュが一致し実際の変更がturnの追記だけでも、素のバイト比較では「元の内容が
+ * 残っていない」と誤判定され、その会話の保存が止まってしまう。そこで、旧形式
+ * ファイルに限っては、形式アップグレードだけを先回りして適用した形
+ * （`legacyTranscriptUpgradeForm`）でも同じ厳密な比較を行う。アップグレードは
+ * parseの観点で無損失（旧形式として読んだ会話＝新形式として読んだ会話）であり、
+ * 変換が触れるのはマーカーそっくりの継続行だけなので、それ以外の本文・知らない
+ * 項目・手書きの文はアップグレード後の形にもそのまま残り、従来どおり検出される。
+ * ガードの条件そのものは緩めていない（比較対象の片方を、形式の版に合わせて
+ * そろえているだけであり、証明の要求水準は変えていない）。
  */
 export function singleFileRewriteIsSafe(current: string, next: string, opts: { hash: (text: string) => string; registeredHash: unknown; evolvingKeys: ReadonlySet<string>; body: "same" | "extends"; reserialized: string }): boolean {
-  if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash && serializedKeepsEverything(current, opts.reserialized)) return true;
-  return rewriteKeepsContent(current, next, opts.evolvingKeys, opts.body);
+  // 登録済み版の判定（原則(1)）は、Registryの規則に合わせてLF正規化形のハッシュで
+  // 行う（PR #68 Codex [P2] N-3）。登録ハッシュは分類・保存の各経路で正規化形から
+  // 計算されるため、生テキストのハッシュと比べるとCRLFのファイルは内容が同一でも
+  // 永遠に一致せず、日記挿入のように本文の接頭辞拡張でも救えない保存が止まる。
+  // `opts.hash` の用途はこの登録判定の2箇所だけであり、正規化するのはその入力だけ：
+  // 本文・frontmatterの比較（`serializedKeepsEverything`/`rewriteKeepsContent`）は
+  // 元々 `sections()` 経由で正規化済みで、生バイトの一致が要る処理には触れない。
+  // 行末だけの違いは内容の違いではない（A-02の規則）ため、この変更で外部編集の
+  // 検出は弱まらない：実際の編集は正規化後のハッシュも変える。
+  const registeredHashOfCurrent = opts.hash(normalizeForCompare(current));
+  if (typeof opts.registeredHash === "string" && registeredHashOfCurrent === opts.registeredHash && serializedKeepsEverything(current, opts.reserialized)) return true;
+  if (rewriteKeepsContent(current, next, opts.evolvingKeys, opts.body)) return true;
+  const upgraded = legacyTranscriptUpgradeForm(current);
+  if (upgraded === null) return false;
+  if (typeof opts.registeredHash === "string" && registeredHashOfCurrent === opts.registeredHash && serializedKeepsEverything(upgraded, opts.reserialized)) return true;
+  return rewriteKeepsContent(upgraded, next, opts.evolvingKeys, opts.body);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +173,11 @@ export function planDayFileMemberWrite(raw: string | null, canonical: MemoryObje
   const entry = memoryObjectToMarkdown(canonical);
   if (raw === null || raw.trim().length === 0) return { kind: "write", verdict: "create", content: entry, members: [canonical] };
 
-  const segments = raw.split(MEMORY_ENTRY_SEPARATOR);
+  // A-02：CRLFのday-fileもLFと同一に扱う。区切り文字列はLF形のため、分割は
+  // 正規化後のテキストで行う（parseMemoryDayFileと同じ規則）。no-op判定の
+  // 場合は元のrawをそのまま返すのでCRLFファイルのバイトは変わらない。
+  // write時は正規化後の形で書き戻る（内容は同一で、行末だけがLFへ揃う）。
+  const segments = normalizeForCompare(raw).split(MEMORY_ENTRY_SEPARATOR);
   const parsed = segments.map((segment) => (segment.trim().length > 0 ? parseMemoryObjectMarkdown(segment.trim()) : null));
   const existing = parsed.filter((m): m is MemoryObject => m !== null);
   // 1件も読めない：このファイルは日別ファイルではないかもしれない（ユーザー自身のノート等）
@@ -180,7 +216,7 @@ export function planDayFileMemberWrite(raw: string | null, canonical: MemoryObje
 /** 修復の事前確認用：この日別ファイルにこの記録を入れられる見込みがあるか（保存の時点で`planDayFileMemberWrite`がもう一度判定する） */
 export function dayFileCanTakeMember(raw: string, memberId: string): boolean {
   if (raw.trim().length === 0) return true;
-  const segments = raw.split(MEMORY_ENTRY_SEPARATOR);
+  const segments = normalizeForCompare(raw).split(MEMORY_ENTRY_SEPARATOR);
   const parsed = segments.map((segment) => (segment.trim().length > 0 ? parseMemoryObjectMarkdown(segment.trim()) : null));
   if (!parsed.some((m) => m !== null)) return false;
   return !segments.some((segment, i) => parsed[i] === null && segment.includes(memberId));

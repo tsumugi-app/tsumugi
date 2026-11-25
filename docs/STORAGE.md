@@ -48,15 +48,25 @@ Tsumugiの保存設計は、次の4つの原則の上に成り立つ。
 
 ## 1.2 Markdown First
 
-**記憶の正はMarkdownファイルであり、それ以外（IndexedDB、JSON索引）はすべて派生物である。**
+**記憶の永続形式はMarkdownファイルである。アプリが無くなっても読める形で、記憶はファイルとして残る。**
 
-- `DATA_MODEL.md` §0.1 の通り、Markdownが source of truth、JSON/IndexedDBはindex/cache。
 - Markdownを選ぶ理由は「読みやすいから」ではない。
   **プレーンテキストは、特定のアプリ・特定のパーサー・特定のバージョンに依存しない**からである。
   バイナリ形式やアプリ固有のDB形式は、そのアプリが無くなった瞬間に読めなくなる。
   UTF-8のテキストファイルは、10年後、どんなエディタでも開ける。
-- この原則の実装上の帰結：**IndexedDBを消しても、記憶は一切失われてはならない。**
-  IndexedDBはいつでもMarkdownから再構築できる状態を保つ（§2.4 Rebuildability Guarantee）。
+- ただし「書き込み経路の正本」については、実装は本節の当初の記述と異なる
+  （2026-11-23の保存・復旧システム監査で確認し、本書を実装に合わせて修正した）。
+  現在の実装で書き込みの正本（canonical）は **IndexedDB上のrecordとOutbox**
+  （Save Foundation）であり、MarkdownはそこからVaultへ射影（projection）される
+  永続形式である。順序は「IndexedDBへrecord＋Outboxを1トランザクションで確定 →
+  VaultへMarkdownを書き、Registryへ記録」であり、射影が終わっていない状態は
+  Outboxのpendingとして残り、次回起動時に再試行される。
+- 例外は **People（人物メモ）だけ** で、こちらはVaultのMarkdownが正本であり、
+  端末のIndexedDBはキャッシュである（専用同期 `syncPeopleWithVault`、§3.1）。
+- IndexedDBを失った場合の復元は、VaultのMarkdownから「追加専用」で行われる
+  （既存のidには一切触れない）。復元できる範囲と限界は§2.4に明記する。
+  「IndexedDBを消しても記憶は一切失われない」という当初の強い保証は、
+  現在の実装ではそのままでは成立しない（§2.4参照）。
 
 ## 1.3 AI Replaceable
 
@@ -86,9 +96,9 @@ Tsumugiは4つの保存レイヤーを持つ。それぞれ役割が異なり、
 
 | レイヤー | 役割 | 保存されるデータ | 正本か派生か |
 |---|---|---|---|
-| Markdown Files | 人間可読な記憶そのもの | Conversation本文、MemoryObject本文、Entity（People/Themes/…）ノート | **正本（source of truth）** |
-| `.tsumugi/`（JSON） | 構造化された補助情報 | `index.json`（id→path）、`links.json`（Link全量）、`schema-version.json` | 正本に準ずる（§2.3参照） |
-| IndexedDB | 高速検索・結合のための実行時キャッシュ | 全Record/Entity/Linkのミラー、全文検索インデックス | **完全な派生（いつでも再構築可）** |
+| IndexedDB（Save Foundation） | 書き込み経路の正本。record本体と、Vault射影の状態を持つOutboxを同一トランザクションで確定する | 全Record、Vault Outbox（射影状態）、同期台帳（vaultSyncState） | **正本（canonical）**。Conversation／Memory／Sourceについてはこちらが正 |
+| Markdown Files | 人間可読な永続形式。IndexedDBからの射影先であり、IndexedDB喪失時の復元元 | Conversation本文、MemoryObject本文（day-file）、Source、Peopleノート | 射影（projection）かつ復元元。**Peopleだけは例外で、こちらが正本**（端末IndexedDBはキャッシュ） |
+| `.tsumugi/`（JSON） | Vault側の構造化された管理情報 | Registry shard（id→path＋ファイル実体メタデータ）、`registry-meta.json`、`registry-index.json`、History Index（月別）、旧 `index.json`（書くのみ） | Markdown実体の所在台帳。Registryはresync（全走査）で再構築可能 |
 | Attachments | バイナリの原本 | 画像・PDF・音声・動画ファイル | **正本** |
 | Settings | アプリ・端末固有の設定 | テーマ、既定Persona、AIプロバイダ選択、APIキー | Vaultの外（§2.5） |
 
@@ -117,8 +127,12 @@ Markdown単体では表現しづらい情報を、Vault内の隠しディレク�
 
 ## 2.3 IndexedDB
 
-- ブラウザ内で完結する実行時データベース。役割は**検索・結合・フィルタリングの高速化のみ**。
-- 起動時、Vault（Markdown + `.tsumugi/`）から全量を読み込み、IndexedDBへ展開する。
+- ブラウザ内で完結する実行時データベース。検索・結合・フィルタリングの高速化に加え、
+  現在の実装では **Conversation／Memory／Sourceの書き込み経路の正本**でもある
+  （§1.2の実装現況を参照。PeopleだけはVaultが正本で、IndexedDBはキャッシュ）。
+- 通常の読み取りはIndexedDBから行う。VaultのMarkdownは起動時の軽量チェック
+  （light-check）や明示的な再同期（resync）で検査され、外部変更があれば
+  分類のうえで取り込まれる。
 - オブジェクトストア構成（例）
 
 ```
@@ -134,18 +148,34 @@ fulltext            (全文検索用の転置インデックス。MemoryObject.c
   * = multiEntry index
 ```
 
-- **書き込みは常にMarkdown/`.tsumugi/`が先、IndexedDBが後**。
-  逆方向（IndexedDBにだけ先に書いてMarkdownへの反映が後回しになる）は禁止する。
-  これはMarkdown Firstを実装レベルで担保する唯一のルールである。
+- **書き込みの順序は「IndexedDBが先、Vaultが後」**（Save Foundation）。
+  record本体とOutboxエントリを同一トランザクションでIndexedDBへ確定してから、
+  VaultへMarkdownを射影し、成功した場合だけRegistryと台帳を進める。
+  射影に失敗したrecordはOutboxにpendingとして残り、次回起動時の調整
+  （reconcile）で再試行される。Markdownだけが先に進んでIndexedDBに無い状態は
+  作らない（外部編集でVault側だけが変わった場合は、light-check／resyncが
+  「Vault側の変更」として検出して取り込む）。
 
 ## 2.4 Rebuildability Guarantee（再構築可能性の保証）
 
-> IndexedDBを含む `.tsumugi/index.json` / `.tsumugi/schema-version.json` を全て消しても、
-> `vault/**/*.md` と `vault/.tsumugi/links.json` と `vault/Attachments/**` さえ残っていれば、
-> Tsumugiは記憶を一切失わずに動作を再開できる。
+> IndexedDBを失っても、VaultのMarkdownが残っていれば、読める形式のrecordは
+> 「追加専用」の復元でIndexedDBへ戻せる。ただし復元には下記の範囲と限界がある。
 
-これがLocal First（§1.1）とMarkdown First（§1.2）を、実装として検証可能な形にしたものである。
-実装時のテスト項目として明示する：「IndexedDBを空にしてアプリを再起動し、全記憶・全リンクが復元されること」。
+IndexedDB喪失時の復元（`scanVaultForRestore`＋追加専用restore）の実装上の範囲と限界
+（2026-11-23監査・修正後の現況）：
+
+- 復元は **追加専用**：IndexedDBに既に存在するidのrecordは上書き・更新・削除しない。
+- 対象は、Markdownとして読める Conversation／Memory（day-file含む）／Source。
+  読めないファイル・読めないエントリは復元されず、**件数として表面化する**
+  （ファイル単位の `skippedCount`、day-file内エントリ単位の `droppedEntryCount`）。
+  「欠けたエントリのある復元」を完全な復元として扱ってはならない。
+- Peopleは復元scanの対象ではなく、専用同期（`syncPeopleWithVault`）が
+  Vault正本から端末キャッシュを再構築する。
+- Registry／History Indexは復元の対象ではない。再同期（resync：Vault全走査）と
+  射影の調整によって再構築される。壊れたRegistry shardは、更新系の経路では
+  「空」と取り違えて書き戻さず、走査が完了したresyncだけが再構築する（§3.2）。
+- Markdownに存在しない情報（例：Memoryの `revisitPrompt`、Connectの内部状態）は
+  復元されない。必要なものは復元後に各機能が再生成する。
 
 ## 2.5 Settings
 
@@ -228,6 +258,22 @@ Peopleファイルを解析失敗として誤判定していた（Recoveryでは
 Peopleを検証するようになった。検証は分類のみであり、PeopleがRegistryや
 Recoveryのrecordになることはない。壊れたPeopleファイルは従来通り安全側に
 扱われる（light-checkでは解析失敗の診断、Recoveryではissue）。
+
+## 3.2 破損形状 × 経路の扱い（2026-11-23監査・修正後の実装現況）
+
+保存・復旧システム監査で再現された破損形状について、各経路の扱いを固定する。
+共通の安全原則：**読めないことは「削除された」ことではない。破損は「空」ではない。
+未完了の書き込みは「成功」ではない。判定できない場合は、推測で埋めず保持・停止する。**
+
+| 破損形状 | 検出・分類経路の扱い | データ保全 |
+|---|---|---|
+| day-file内の一部エントリ破損（frontmatter不全・途中切断） | resync／light-check：day-file全体を `conflict`（Registryに前回エントリが無い場合も）。Recovery：健全なmemberを観測しつつファイル自体をissue化。復元scan：健全なエントリを復元し、欠落を `droppedEntryCount`／`skippedCount` に数える。通常の読み取り（`readMemoriesForDayWithDiagnostics`）も欠落件数を返す | 読めたエントリは保護される。読めないエントリは「不在」として扱わず、Registryからも消さない |
+| 会話・day-file等のCRLF化 | 全経路（parser／探査probe／resync／Recovery／復元scan）でLFと同一に判定・分類する。正規化はparse入口で行い、内容・発言者は変わらない。基準ハッシュとの比較もすべて同じ規則：書き込み前検証（`verifyVaultRegistryEntryBeforeWrite`）・anchor読み取り・重複conflict再検証・day-fileのmember計画（区切り文字列での分割を含む）は、比較・分割の前にCRLF→LF正規化する（検証が返す本文自体は生のまま——day-file mergeが対象外部分のバイトを保存する契約は変えない） | 行末の違いだけでrecordが消えたり「編集」と誤判定されたりしない。メタデータ（mtime/size）だけがずれた無変更のCRLFファイルが、保存のたびに拒否され続けることもない |
+| Peopleメモの切断（`type:` 行より前／後） | 専用同期：人物メモらしい兆候（`type: person` 行、`tsumugi: true` 宣言、生成ファイル名のいずれか）があれば unreadable として報告。さらに、ファイル名・id末尾が一致するファイルが残っている限り削除と解釈しない。light-check／Recovery：解析失敗として表面化 | 端末キャッシュの人物は保持される。本当にファイルが無い場合だけ、従来どおり削除として同期される |
+| native書き込みの部分着地（例外なし） | 書き込み後に読み戻して実体（サイズ＋全バイト、実装によりtext）を検証し、不一致・読み戻し不可は失敗として例外にする（`VaultWriteVerificationError`） | 台帳・Registryは成功として確定しない。Outbox等の再試行可能な状態が残り、再試行で正しい内容へ収束する |
+| Registry shardの破損（JSON破損・構造不正・読み取り失敗） | 更新系（upsert／commit／status変更／conflict anchor）は厳密読み込みで停止し、診断可能なエラー（`VaultRegistryShardUnreadableError`）を返す。純粋な読み取り経路のlenient読みは従来どおり。resync：走査が完了し、かつ読めなかったファイルが1件も無い場合だけ、壊れたbucketを再構築し、実在recordを実ファイルの観測から再登録する。読めないファイルが残る走査では再構築を保留し（applyErrorsで表面化）、壊れたshardには一切触れない——読めないファイルのrecordを再観測できない不完全な情報で再構築を確定しないため | 壊れたshardは「空」と取り違えて書き戻さない。健全な既存エントリは失われない。再構築の書き込み自体が失敗してもshardは元のまま残り、次のresyncで再実行できる |
+| 会話本文中のturn区切り類似行（`**User:** `／`**Tsumugi:** ` で始まる本文行） | serializerが該当行を `\` でescapeし、あわせて frontmatter に形式マーカー `transcriptFormat: 2` を書く。parserはマーカーのあるファイルでのみescapeを解除する。保存→読み戻しでturn数・順序・本文・発言者が保存され、繰り返しても本文は変わらない。マーカーの無い旧形式ファイルは旧parserと完全に同じに読み取り、本文の `\` を一切取り除かない（読むだけで保存済み本文が変わることはない）。旧形式の会話は次に保存される時点でマーカー付きの新形式へ移行し、その際も本文は変わらない（既存ファイルの一括変換はしない） | 発言者の推測はしない。旧形式の本文中で行頭の `**User:** ` がturn区切りに読まれる曖昧さは旧parserでも同じであり、推測で解釈を変えることはしない |
+| Registry shardの不在（本当に未作成） | 「破損」と区別し、空shardとして扱う（upsertが新規作成する） | 正常系。破損との混同だけを避ける |
 
 ---
 

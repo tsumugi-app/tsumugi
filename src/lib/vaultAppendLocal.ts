@@ -594,7 +594,7 @@ export async function appendLocalRecordsToVault(
         let dir = root;
         for (const segment of segments.slice(0, -1)) dir = await dir.getDirectoryHandle(segment, { create: false });
         const text = await (await (await dir.getFileHandle(segments[segments.length - 1], { create: false })).getFile()).text();
-        if (hashVaultText(text) !== lookup.entry!.contentHash) {
+        if (hashVaultText(text.replace(/\r\n/g, "\n")) !== lookup.entry!.contentHash) {
           ok = false;
           detail = "Registryのhashがファイルと一致しません";
         } else if (written.conversation) {

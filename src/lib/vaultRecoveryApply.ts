@@ -258,9 +258,11 @@ function contentOfCreate(type: RecoveryRecordType, records: LocalRecord[]): { co
   return { content: serializeMemoryDayFile(members), fileMembers: members };
 }
 
-/** 実ファイルのday-fileを厳密にparseする（1つでも読めないmemberがあれば失敗＝null。黙って捨てない）。 */
+/** 実ファイルのday-fileを厳密にparseする（1つでも読めないmemberがあれば失敗＝null。黙って捨てない）。
+ * CRLFのday-fileもLFと同一に読む：分割前に正規化しないと区切りが見つからず、先頭memberだけを
+ * 全体と誤認して残りを黙って捨てる（parseMemoryDayFileと同じ規則）。 */
 function parseDayFileStrict(text: string): MemoryObject[] | null {
-  const blocks = text.split("\n<!-- tsumugi:entry -->\n\n").map((s) => s.trim()).filter(Boolean);
+  const blocks = text.replace(/\r\n/g, "\n").split("\n<!-- tsumugi:entry -->\n\n").map((s) => s.trim()).filter(Boolean);
   if (blocks.length === 0) return null;
   const members: MemoryObject[] = [];
   try {
@@ -286,7 +288,12 @@ async function unprovenMembers(env: RecoveryApplyEnv, members: MemoryObject[]): 
 }
 
 function registryExpectation(op: RecoveryJournalOp, ctx: OpContext) {
-  const contentHash = hashVaultText(ctx.content);
+  // Registryへ記録するcontentHashは、分類・write前検証と同じくLF正規化済み
+  // テキストのハッシュにする（ラウンド5監査）。repairではctx.contentが既存
+  // ファイルの生テキストになるため、そのままではCRLFファイルの基準が生
+  // ハッシュになり、後続の保存がwrite前検証と一致せず止まる。createでは
+  // 元々LFの直列化なので正規化は無変化。
+  const contentHash = hashVaultText(ctx.content.replace(/\r\n/g, "\n"));
   const isDay = op.recordType === "memory";
   const memberIds = isDay ? (ctx.fileMembers ?? []).map((m) => m.id) : [op.members[0].id];
   // ファイルから読んだ記録を、手で編集されたまま「Tsumugiが書いた版」として記録しない（端末の版と一致しない記録のハッシュは書かない）

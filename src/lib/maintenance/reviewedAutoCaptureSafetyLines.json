@@ -5,6 +5,10 @@
 "+chatProviders: chatProvidersAfterAdopting(l, f.turns),",
 "-import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, withMemoryDayFileLock } from \"./vaultRewriteSafety\";",
 "+import { CONVERSATION_EVOLVING_KEYS, MEMORY_EVOLVING_KEYS, nextMemberHashes, planDayFileMemberWrite, readVaultFileText, singleFileRewriteIsSafe, takesBackFinishedConversation, withMemoryDayFileLock } from \"./vaultRewriteSafety\";",
-"+if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError(\"markdown-conflict\");"
+"+if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError(\"markdown-conflict\");",
+"-if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError(\"markdown-conflict\");",
+"+if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text.replace(/\\r\\n/g, \"\\n\")) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError(\"markdown-conflict\");",
+"-const expected = { recordType: \"memory-day\" as const, mtime: 0, size: 0, contentHash: hashVaultText(finalContent), memberIds, memberHashes, status: \"ok\" as const };",
+"+const expected = { recordType: \"memory-day\" as const, mtime: 0, size: 0, contentHash: hashVaultText(finalContent.replace(/\\r\\n/g, \"\\n\")), memberIds, memberHashes, status: \"ok\" as const };"
 ]
 }

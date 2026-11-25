@@ -153,7 +153,12 @@ test("malformed shard/history/legacy index prevents local-only-safe", async () =
 test("day-file partial parse failure does not silently drop bad member", async () => {
   const text = memoryObjectToMarkdown(memory()) + "\n<!-- tsumugi:entry -->\n\n---\ntsumugi: true\n---\nbroken";
   const p = await plan(new ReadOnlyVault({ "day.md": text }), local([], [memory()]));
-  assert.equal(p.records[0].classification, "unreadable / indeterminate"); assert.equal(p.records[0].vaultMarkdownExists, null);
+  assert.equal(p.records[0].classification, "unreadable / indeterminate");
+  // A-01（保存・復旧システム監査P1）で変更：壊れたmemberはissueとして表面化し、
+  // 読めた健全なmemberの観測は維持される（以前はファイル全体の観測を捨てていたため
+  // 健全なmemberまで「在るか分からない」＝nullになっていた）。
+  assert.equal(p.records[0].vaultMarkdownExists, true);
+  assert.ok(p.issues.some((i) => i.path === "day.md" && i.status === "invalid"));
 });
 test("moved Markdown in an unconventional (but visible) folder is scanned; Source and Reflection supported", async () => {
   const m = memory(); m.metadata.source = "system-generated";

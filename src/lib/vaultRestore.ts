@@ -49,6 +49,12 @@ export interface VaultRestoreCounts {
   vaultUnique: { memories: number; conversations: number; sources: number };
   /** frontmatterが読めない・Tsumugi管理外等で対象外だったファイル数。 */
   unreadableFiles: number;
+  /**
+   * A-01：day-fileの中で読めなかったエントリの数。0でない場合、その復元は
+   * 「欠けたエントリがある」不完全な復元であり、完全な復元として扱ってはならない
+   * （健全なエントリは従来どおり追加される）。
+   */
+  droppedEntries: number;
 }
 
 export interface VaultRestorePlan {
@@ -96,6 +102,7 @@ export function computeVaultRestorePlan(scan: VaultScanResult, existing: Existin
         sources: scan.sources.length,
       },
       unreadableFiles: scan.skippedCount,
+      droppedEntries: scan.droppedEntryCount,
     },
   };
 }

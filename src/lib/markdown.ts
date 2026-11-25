@@ -115,6 +115,33 @@ export function memoryObjectToMarkdown(memoryObject: MemoryObject): string {
   return `${frontmatter}\n${body}`;
 }
 
+/**
+ * A-06（保存・復旧システム監査P1）：turn本文の2行目以降に、turn区切りと見分けがつかない
+ * 行（`**User:** ` / `**Tsumugi:** ` で始まる行、および既に `\` で始まる同形の行）が
+ * ある場合、先頭へ `\` を1つ付けてescapeする。付けないと、保存→読み戻しの往復で
+ * 本文中の行が新しいturnの開始と誤認され、turnが分裂し発言者まで変わってしまう。
+ * 1行目はturnマーカーと同じ行に続くため対象外。マーカーに似ていない行は一切変えない。
+ *
+ * 後方互換（A-06深掘り）：escapeの解除は、frontmatterに `transcriptFormat: 2` が
+ * あるファイル（＝このescapeを書き込むserializerが書いたファイル）に対してだけ行う。
+ * マーカーの無い旧形式ファイルでは、`\**User:** ` のような行は利用者が実際に書いた
+ * 本文そのものなので、旧parserと完全に同じく1文字も変えずに読み取る（読むだけで
+ * 保存済み本文が変わることは決してない）。旧形式の会話が次に保存される時点で
+ * マーカー付きの新形式へ移行し、その際もescapeは双方向の対応（マーカー形の行へ
+ * `\` を1つ足し、parseで1つだけ戻す）なので、本文は保存・読み戻しを何度繰り返しても
+ * 変わらない。旧形式の本文中で行頭の `**User:** ` がturn区切りに読まれる曖昧さは
+ * 旧parserでも同じであり、推測で解釈を変えることはしない。
+ */
+const TURN_MARKER_LIKE_LINE = /^\\*\*\*(?:User|Tsumugi):\*\*/;
+const ESCAPED_TURN_MARKER_LINE = /^\\+\*\*(?:User|Tsumugi):\*\*/;
+
+function escapeTurnBodyLines(content: string): string {
+  return content
+    .split("\n")
+    .map((line, index) => (index > 0 && TURN_MARKER_LIKE_LINE.test(line) ? `\\${line}` : line))
+    .join("\n");
+}
+
 export function conversationToMarkdown(conversation: Conversation): string {
   const frontmatter = toFrontmatter({
     id: conversation.id,
@@ -135,6 +162,11 @@ export function conversationToMarkdown(conversation: Conversation): string {
     turnTimes: conversation.turns.length > 0 ? JSON.stringify(conversation.turns.map((turn) => turn.timestamp)) : undefined,
     // 途中で止まった応答の時刻（`turnTimes`と同じ形）。本文の形式は変えない。該当が無い会話にはキー自体を書かない。
     interruptedTurns: conversation.turns.some((turn) => turn.interrupted) ? JSON.stringify(conversation.turns.filter((turn) => turn.interrupted).map((turn) => turn.timestamp)) : undefined,
+    // A-06：本文のescape（`escapeTurnBodyLines`）を書き込んだことを示す形式マーカー。
+    // parse側はこのマーカーがあるファイルでのみescapeを解除し、マーカーの無い
+    // 旧形式ファイルの本文は旧parserと完全に同じに読み取る（後方互換）。turnが無い
+    // Conversationにはキー自体を書かない（`turnTimes`と同じ既存の空値省略ルール）。
+    transcriptFormat: conversation.turns.length > 0 ? 2 : undefined,
     // リアルタイム日記の対象日（発言時刻とは別）。通常の会話・日記にはキー自体を書かない。
     diaryDate: conversation.realtimeDiary && isDiaryDate(conversation.realtimeDiary.date) ? conversation.realtimeDiary.date : undefined,
     diaryWrittenAt: conversation.realtimeDiary?.text ? conversation.realtimeDiary.writtenAt : undefined,
@@ -147,7 +179,7 @@ export function conversationToMarkdown(conversation: Conversation): string {
   });
 
   const transcript = conversation.turns
-    .map((turn) => `**${turn.role === "user" ? "User" : "Tsumugi"}:** ${turn.content}`)
+    .map((turn) => `**${turn.role === "user" ? "User" : "Tsumugi"}:** ${escapeTurnBodyLines(turn.content)}`)
     .join("\n\n");
 
   // リアルタイム日記の本文は会話記録の前に置く（会話記録の読み取りは`## Transcript`以降だけを読むので、日記の無い読み手にも会話は同じに見える）
@@ -243,7 +275,11 @@ export interface ParsedNote {
  * （新しいMarkdown仕様を発明しない。Tsumugi独自の`---`区切りfrontmatterの読み取りだけを共通化する）。
  */
 export function parseFrontmatter(raw: string): ParsedNote | null {
-  const match = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  // A-02（保存・復旧システム監査P1）：CRLFで保存されたMarkdownもLFと同一に読む。
+  // 行末の違いだけで会話が読めなくなったり、本文・発言者が変わったりしてはならないため、
+  // parse入口でCRLFをLFへ正規化する（LFファイルでは恒等変換）。
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return null;
   const [, frontmatterText, body] = match;
 
@@ -432,13 +468,33 @@ export function serializeMemoryDayFile(memoryObjects: MemoryObject[]): string {
  * tsumugi:trueが無い・idが読めないエントリは呼び出し側でスキップできるよう、単純に除外して返す
  * （件数を数えたい場合は呼び出し側でsplit数と結果件数の差を見る）。
  */
-export function parseMemoryDayFile(raw: string): MemoryObject[] {
-  return raw
+/**
+ * A-01（保存・復旧システム監査P1）：day-fileのparseを、読めたエントリと
+ * 「読めなかったエントリの件数」に分けて返す。従来の`parseMemoryDayFile`は
+ * 読めないエントリを無言で除外していたため、呼び出し側（resync／復元scan／
+ * Recovery）が「1件欠けた正常なファイル」と区別できなかった。件数を返すことで、
+ * 呼び出し側は欠落をconflict・件数として表面化できる（読めたエントリ自体は
+ * 従来どおり返す）。空でないブロックがparseできない場合だけを欠落として数える。
+ * CRLFのday-fileもLFと同一に読む（A-02：区切り文字列で分割する前に正規化する）。
+ */
+export function parseMemoryDayFileWithDiagnostics(raw: string): { memories: MemoryObject[]; droppedEntries: number } {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const blocks = normalized
     .split(MEMORY_ENTRY_SEPARATOR)
     .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-    .map((entry) => parseMemoryObjectMarkdown(entry))
-    .filter((memory): memory is MemoryObject => memory !== null);
+    .filter((entry) => entry.length > 0);
+  const memories: MemoryObject[] = [];
+  let droppedEntries = 0;
+  for (const block of blocks) {
+    const parsed = parseMemoryObjectMarkdown(block);
+    if (parsed) memories.push(parsed);
+    else droppedEntries += 1;
+  }
+  return { memories, droppedEntries };
+}
+
+export function parseMemoryDayFile(raw: string): MemoryObject[] {
+  return parseMemoryDayFileWithDiagnostics(raw).memories;
 }
 
 export function parseMemoryObjectMarkdown(raw: string): MemoryObject | null {
@@ -590,6 +646,10 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   const sourceType = asString(frontmatter.sourceType) ?? inferSourceType(source);
   const turnTimes = parseTurnTimes(frontmatter.turnTimes);
   const interruptedTurns = new Set(parseTurnTimes(frontmatter.interruptedTurns));
+  // A-06：本文escapeの形式マーカー。`2`（数値）の場合だけescape済み形式として
+  // 読み取る。マーカーが無い・想定外の値のファイルは旧形式として読み、本文の
+  // `\` を一切取り除かない（fail-closed：不明な形式を新形式と推測しない）。
+  const transcriptEscaped = frontmatter.transcriptFormat === 2;
   const diaryDate = frontmatter.diaryDate;
   const diaryText = isDiaryDate(diaryDate) ? readDiarySection(body) : undefined;
   const diaryWrittenAt = asString(frontmatter.diaryWrittenAt);
@@ -600,7 +660,7 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
     entryType,
     startedAt,
     endedAt: asString(frontmatter.endedAt),
-    turns: parseTranscript(body, startedAt, turnTimes).map((turn) => (turn.role === "ai" && interruptedTurns.has(turn.timestamp) ? { ...turn, interrupted: true } : turn)),
+    turns: parseTranscript(body, startedAt, turnTimes, transcriptEscaped).map((turn) => (turn.role === "ai" && interruptedTurns.has(turn.timestamp) ? { ...turn, interrupted: true } : turn)),
     status,
     memoryObjectIds: asStringArray(frontmatter.memoryObjectIds),
     title: asString(frontmatter.title),
@@ -619,7 +679,57 @@ export function parseConversationMarkdown(raw: string): Conversation | null {
   };
 }
 
-function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[]): ConversationTurn[] {
+/**
+ * 旧形式（`transcriptFormat: 2` マーカーの無い）Conversationファイルについて、現在の
+ * serializerが同じ会話を書き直すときに生じる「形式アップグレード」だけを先回りして
+ * 適用したテキストを返す。**比較専用**であり、返したテキストをファイルへ書いたり
+ * そのままparseして使うことは想定していない（書き込みガード
+ * `singleFileRewriteIsSafe` が、旧形式ファイルと新形式の直列化結果を比べるために使う）。
+ *
+ * アップグレードで変わるのは、transcript内の継続行のうち turnマーカーそっくりの行
+ * （`TURN_MARKER_LIKE_LINE` に一致する行）へ `\` を1つ足すことだけであり、これは
+ * `escapeTurnBodyLines` が行う変換と正確に同じである。parseの観点では無損失：
+ * 旧形式として読んだ会話と、アップグレード後の形を新形式として読んだ会話は
+ * turn・発言者・本文が完全に一致する（A-06の固定点設計）。frontmatterや
+ * transcript以外の部分には一切触れないため、外から書き加えられた内容は
+ * アップグレード後の形にもそのまま残り、ガード側の厳密な比較で引き続き検出できる。
+ *
+ * 対象は「Conversationとして読める・マーカーの無い・実際にescapeが要る行を含む」
+ * ファイルだけ。それ以外（新形式、Conversationでない、transcriptが無い、
+ * 変換が要らない）では null を返し、呼び出し側は従来の判定だけを行う。
+ */
+export function legacyTranscriptUpgradeForm(raw: string): string | null {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const fmMatch = normalized.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!fmMatch) return null;
+  const parsed = parseFrontmatter(normalized);
+  if (!parsed || parsed.frontmatter.tsumugi !== true || typeof parsed.frontmatter.id !== "string" || !parsed.frontmatter.id) return null;
+  if (parsed.frontmatter.transcriptFormat === 2) return null;
+  const body = parsed.body;
+  const markerMatch = /(^|\n)## Transcript\n\n/.exec(body);
+  if (!markerMatch) return null;
+  const transcriptStartInBody = markerMatch.index + markerMatch[1].length + "## Transcript\n\n".length;
+  let inTurn = false;
+  let changed = false;
+  const lines = body
+    .slice(transcriptStartInBody)
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("**User:** ") || line.startsWith("**Tsumugi:** ")) {
+        inTurn = true;
+        return line;
+      }
+      if (inTurn && TURN_MARKER_LIKE_LINE.test(line)) {
+        changed = true;
+        return `\\${line}`;
+      }
+      return line;
+    });
+  if (!changed) return null;
+  return normalized.slice(0, fmMatch[0].length + transcriptStartInBody) + lines.join("\n");
+}
+
+function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (string | undefined)[], transcriptEscaped: boolean): ConversationTurn[] {
   // 行頭の見出しだけ（リアルタイム日記の本文中の`\## Transcript`のように、エスケープした行の途中は会話記録の始まりではない）
   const marker = "## Transcript\n\n";
   const markerMatch = /(^|\n)## Transcript\n\n/.exec(body);
@@ -657,7 +767,11 @@ function parseTranscript(body: string, fallbackTimestamp: string, turnTimes: (st
         currentRole = "ai";
         currentLines = [line.slice(AI_PREFIX.length)];
       } else {
-        currentLines.push(line);
+        // A-06：serializerがescapeした継続行（`\**User:** ` 等）は、turnの開始では
+        // なく本文の一部として、`\` を1つ取り除いて戻す。ただし解除は
+        // `transcriptFormat: 2` のファイルだけ——旧形式ファイルの同形の行は
+        // 利用者の本文そのものなので、旧parserと同じく一切変えない。
+        currentLines.push(transcriptEscaped && ESCAPED_TURN_MARKER_LINE.test(line) ? line.slice(1) : line);
       }
     }
     flush();

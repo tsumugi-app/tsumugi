@@ -29,7 +29,10 @@ export function conversationFileState(root: FileSystemDirectoryHandle, conversat
       const held = entry.status !== "ok";
       if (!held && file.lastModified === entry.mtime && file.size === entry.size) return "same";
       const text = await file.text();
-      if (hashVaultText(text) === entry.contentHash) return held ? "unknown" : "same";
+      // Registryの基準ハッシュはLF正規化済みテキストのもの（分類側の規則）。
+      // 生テキストと比較するとCRLFファイルが常時「不一致」になり、後段の
+      // parse比較まで進んでしまうため、ここでも同じ正規化をしてから比べる。
+      if (hashVaultText(text.replace(/\r\n/g, "\n")) === entry.contentHash) return held ? "unknown" : "same";
       const parsed = parseConversationMarkdown(text);
       if (!parsed || !conversationTurnsEqual(parsed.turns, conversation.turns)) return "edited";
       return takesBackFinishedConversation(parsed, conversation) ? "processed" : "same";

@@ -372,9 +372,23 @@ export class ConsistencyCheckCancelledError extends Error {
 export async function runConsistencyCheck<P extends ConsistencyPlanLike>(deps: ConsistencyCheckDeps<P>, options: ConsistencyCheckOptions = {}): Promise<{ report: ConsistencyReport; plan: P }> {
   const drainWaitMs = options.drainWaitMs ?? 20_000, pollMs = options.pollMs ?? 1_000;
   const attempts = Math.max(1, options.attempts ?? 3), retryDelayMs = options.retryDelayMs ?? 3_000;
+  // 保存待ちの解消を待つのは、保存の進行が実際に動いている間だけ。進行状況（指紋）が
+  // 十分な回数連続で同じなら、保存処理は止まっている（例：Outboxがpendingのまま、
+  // 保存を駆動する処理が既に終わっている）——その場合は上限まで待ち続けずに走査へ
+  // 進む。走査自体は保存待ちを異常と断定しない（savingとして表示する）ため、早く
+  // 進んでも安全側の扱いは変わらない。進行が動いている間は従来どおり上限まで待つ。
+  // 静止とみなすまでの猶予は、保存1件の処理が進行状況へ現れるまでの間隔より長く取る。
+  const drainStallPolls = Math.max(2, Math.ceil(10_000 / pollMs));
+  let lastDrainFingerprint: string | null = null;
+  let drainUnchangedPolls = 0;
   for (let waited = 0; waited < drainWaitMs; waited += pollMs) {
     if (deps.isCancelled()) throw new ConsistencyCheckCancelledError();
-    if (!hasPendingSaves(await deps.readProgress())) break;
+    const progress = await deps.readProgress();
+    if (!hasPendingSaves(progress)) break;
+    const fingerprint = saveProgressFingerprint(progress);
+    drainUnchangedPolls = fingerprint === lastDrainFingerprint ? drainUnchangedPolls + 1 : 0;
+    lastDrainFingerprint = fingerprint;
+    if (drainUnchangedPolls >= drainStallPolls) break;
     await deps.sleep(pollMs);
   }
   let last: { report: ConsistencyReport; plan: P } | null = null;
