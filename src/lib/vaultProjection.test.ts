@@ -445,6 +445,84 @@ test("Projection R5b: a genuine external edit in a CRLF file is still held (dete
   assert.equal(vault.get(path), edited, "外部データは一切書き換えられない");
 });
 
+test("Projection R7 (N-3): a CRLF realtime-diary conversation accepts a diary-insert save through the real projection path", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  // リアルタイム日記（本文はまだ無い）が対象の会話を、まず通常の保存で登録する。
+  const c1 = conversation("proj-r7-1", { realtimeDiary: { date: "2026-03-01" } });
+  const entry1 = await seedCanonical(c1);
+  const first = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry1);
+  assert.equal(first.status, "done");
+  const path = `Conversations/${vaultMod.fileNameFor(c1.id, c1.startedAt)}`;
+  const lfContent = vault.get(path)!;
+  // 登録の規則の確認：RegistryのcontentHashはLF形のハッシュであり、CRLF化した
+  // ファイルについては「正規化形のハッシュ」と一致し「生ハッシュ」とは一致しない。
+  const shard = JSON.parse(vault.get(shardPath(c1.id))!);
+  const registered = shard.files[path].contentHash as string;
+  assert.equal(registered, vaultMod.hashVaultText(lfContent), "登録ハッシュはLF形のハッシュ");
+  const crlfContent = lfContent.replace(/\n/g, "\r\n");
+  assert.notEqual(vaultMod.hashVaultText(crlfContent), registered, "生ハッシュ≠登録ハッシュ（登録分岐が失敗する直接原因）");
+  assert.equal(vaultMod.hashVaultText(crlfContent.replace(/\r\n/g, "\n")), registered, "正規化ハッシュ＝登録ハッシュ");
+  // 外部ツールがファイル全体をCRLF化した（内容は同一、行末だけが違う）。
+  vault.put(path, crlfContent);
+  // 日記本文が生成され、会話へ挿入される（## Diaryが## Transcriptの前に置かれる形）。
+  const c2: Conversation = {
+    ...c1,
+    realtimeDiary: { date: "2026-03-01", text: "架空の日記本文です", writtenAt: "2026-03-01T21:00:00.000Z" },
+    updatedAt: "2026-03-01T21:00:00.000Z",
+  };
+  const entry2 = await seedCanonical(c2);
+  const second = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry2);
+  // 修正前は、ガードの登録分岐が生ハッシュで比較するため一致せず、フォールバック
+  // （本文の接頭辞拡張）でも日記挿入は救えず、markdown-edited-conflictでheldになる。
+  assert.equal(second.status, "done", "a CRLF registered file must accept the diary-insert save");
+  assert.equal(vault.get(path), markdownMod.conversationToMarkdown(c2));
+  const written = markdownMod.parseConversationMarkdown(vault.get(path)!);
+  assert.equal(written?.realtimeDiary?.text, "架空の日記本文です", "日記本文が書かれている");
+  assert.deepEqual(written?.turns.map((t) => t.content), ["ユーザー発言"], "既存のturnが保持される");
+});
+
+test("Projection R7b (N-3): the LF twin accepts the same diary-insert save", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const c1 = conversation("proj-r7-2", { realtimeDiary: { date: "2026-03-01" } });
+  const entry1 = await seedCanonical(c1);
+  const first = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry1);
+  assert.equal(first.status, "done");
+  const path = `Conversations/${vaultMod.fileNameFor(c1.id, c1.startedAt)}`;
+  const c2: Conversation = {
+    ...c1,
+    realtimeDiary: { date: "2026-03-01", text: "架空の日記本文です", writtenAt: "2026-03-01T21:00:00.000Z" },
+    updatedAt: "2026-03-01T21:00:00.000Z",
+  };
+  const entry2 = await seedCanonical(c2);
+  const second = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry2);
+  assert.equal(second.status, "done");
+  assert.equal(vault.get(path), markdownMod.conversationToMarkdown(c2));
+});
+
+test("Projection R7c (N-3 control): a CRLF file with a genuine external edit is still held on the diary-insert save", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const c1 = conversation("proj-r7-3", { realtimeDiary: { date: "2026-03-01" } });
+  const entry1 = await seedCanonical(c1);
+  const first = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry1);
+  assert.equal(first.status, "done");
+  const path = `Conversations/${vaultMod.fileNameFor(c1.id, c1.startedAt)}`;
+  // CRLF化した上で、turn本文を外部で書き換える。
+  const edited = vault.get(path)!.replace(/\n/g, "\r\n").replace("ユーザー発言", "外部で書き換えられた内容");
+  vault.put(path, edited);
+  const c2: Conversation = {
+    ...c1,
+    realtimeDiary: { date: "2026-03-01", text: "架空の日記本文です", writtenAt: "2026-03-01T21:00:00.000Z" },
+    updatedAt: "2026-03-01T21:00:00.000Z",
+  };
+  const entry2 = await seedCanonical(c2);
+  const second = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry2);
+  assert.equal(second.status, "held", "外部編集は日記挿入の保存でも拒否される");
+  assert.equal(vault.get(path), edited, "外部データは一切書き換えられない");
+});
+
 test("Projection K: Markdown unreadable（parse不能）はheldになり、上書きしない", async () => {
   const vault = new FakeVault();
   seedVaultIdentityFile(vault);
@@ -617,6 +695,33 @@ test("Projection Memory B: day-fileに既にA（同一内容）がある場合�
   const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), doneEntry);
   assert.equal(second.status, "done");
   assert.equal(vault.writeCount, writesBefore, "既に正しいため何も書き込まれない");
+});
+
+test("Projection Memory R7 (N-4): a no-op reconcile over a CRLF day-file keeps the normalized Registry baseline (no raw-hash re-registration)", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const day = "2026-04-03";
+  const a = memory("mem-r7-1", day);
+  const entry = await seedMemoryCanonical(a);
+  const first = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), entry);
+  assert.equal(first.status, "done");
+  const path = memoryDayPath(day);
+  const lfContent = vault.get(path)!;
+  const registeredHash = () => (JSON.parse(vault.get(memoryShardPathFor(day))!).files[path] as { contentHash: string }).contentHash;
+  assert.equal(registeredHash(), vaultMod.hashVaultText(lfContent), "登録直後の基準はLF形のハッシュ");
+  // 外部ツールがday-file全体をCRLF化した（内容は同一、行末だけが違う）。
+  const crlfContent = lfContent.replace(/\n/g, "\r\n");
+  vault.put(path, crlfContent);
+  // 同じmemberの再reconcile：planはno-op（memberは同一）で、day-fileは書き換えられない。
+  const doneEntry = (await dbMod.getVaultOutboxEntry(entry.id))!;
+  const second = await projectionMod.reconcileMemoryOutboxEntry(makeEnv(vault), doneEntry);
+  assert.equal(second.status, "done");
+  assert.equal(vault.get(path), crlfContent, "day-file自体は書き換えられない（no-op）");
+  // 修正前は、decideAndProjectMemoryRegistryがno-opのfinalContent（実ファイルの生の
+  // CRLFテキスト）をそのままハッシュして登録し直すため、基準がLF正規化形から
+  // 生ハッシュへ置き換わる（N-2と同型の汚染：以降の保存がneeds-resyncで拒否される）。
+  assert.equal(registeredHash(), vaultMod.hashVaultText(lfContent), "Registryの基準はLF正規化形のまま保たれる");
+  assert.notEqual(registeredHash(), vaultMod.hashVaultText(crlfContent), "生ハッシュが基準になってはならない");
 });
 
 test("Projection Memory C: day-fileに未知member Xがある状態でAを追加しても、Xが保持される", async () => {

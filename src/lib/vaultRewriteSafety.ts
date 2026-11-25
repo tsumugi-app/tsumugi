@@ -129,11 +129,21 @@ function serializedKeepsEverything(section: string, serialized: string): boolean
  * そろえているだけであり、証明の要求水準は変えていない）。
  */
 export function singleFileRewriteIsSafe(current: string, next: string, opts: { hash: (text: string) => string; registeredHash: unknown; evolvingKeys: ReadonlySet<string>; body: "same" | "extends"; reserialized: string }): boolean {
-  if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash && serializedKeepsEverything(current, opts.reserialized)) return true;
+  // 登録済み版の判定（原則(1)）は、Registryの規則に合わせてLF正規化形のハッシュで
+  // 行う（PR #68 Codex [P2] N-3）。登録ハッシュは分類・保存の各経路で正規化形から
+  // 計算されるため、生テキストのハッシュと比べるとCRLFのファイルは内容が同一でも
+  // 永遠に一致せず、日記挿入のように本文の接頭辞拡張でも救えない保存が止まる。
+  // `opts.hash` の用途はこの登録判定の2箇所だけであり、正規化するのはその入力だけ：
+  // 本文・frontmatterの比較（`serializedKeepsEverything`/`rewriteKeepsContent`）は
+  // 元々 `sections()` 経由で正規化済みで、生バイトの一致が要る処理には触れない。
+  // 行末だけの違いは内容の違いではない（A-02の規則）ため、この変更で外部編集の
+  // 検出は弱まらない：実際の編集は正規化後のハッシュも変える。
+  const registeredHashOfCurrent = opts.hash(normalizeForCompare(current));
+  if (typeof opts.registeredHash === "string" && registeredHashOfCurrent === opts.registeredHash && serializedKeepsEverything(current, opts.reserialized)) return true;
   if (rewriteKeepsContent(current, next, opts.evolvingKeys, opts.body)) return true;
   const upgraded = legacyTranscriptUpgradeForm(current);
   if (upgraded === null) return false;
-  if (typeof opts.registeredHash === "string" && opts.hash(current) === opts.registeredHash && serializedKeepsEverything(upgraded, opts.reserialized)) return true;
+  if (typeof opts.registeredHash === "string" && registeredHashOfCurrent === opts.registeredHash && serializedKeepsEverything(upgraded, opts.reserialized)) return true;
   return rewriteKeepsContent(upgraded, next, opts.evolvingKeys, opts.body);
 }
 

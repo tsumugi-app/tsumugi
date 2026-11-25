@@ -651,6 +651,112 @@ test("A-06 guard: legacyTranscriptUpgradeForm only bridges the format upgrade, n
 });
 
 // ---------------------------------------------------------------------------
+// N-3（PR #68 Codex [P2]、ラウンド7）：再書き込みガードの「登録済み版」判定が、
+// 呼び出し側から渡される生ハッシュでCRLFの現在ファイルを計算していたため、
+// Registryの正規化規則（LF正規化形のハッシュ）で登録されたCRLFファイルは
+// 登録分岐に一致せず、日記挿入のようにフォールバック（本文の接頭辞拡張）でも
+// 救えない保存が markdown-edited-conflict で止まっていた。
+// 修正前（head 41650232）では下の「受け入れる」系（CRLF）が失敗し、
+// 「拒否する」系とLFの双子は修正前後とも同じ結果であることを確認済み。
+// ---------------------------------------------------------------------------
+
+const DIARY_DATE = "2026-10-20";
+const diaryBase = (): Conversation => ({
+  ...conversation("c-diary-guard", [
+    { role: "user", content: "今日の出来事を話します", timestamp: T },
+    { role: "ai", content: "聞かせてください", timestamp: T },
+  ]),
+  realtimeDiary: { date: DIARY_DATE },
+});
+const diaryInserted = (base: Conversation): Conversation => ({
+  ...base,
+  realtimeDiary: { date: DIARY_DATE, text: "架空の日記本文です", writtenAt: T2 },
+  updatedAt: T2,
+});
+/** `decideMarkdown`（vaultProjection）と同じ配線でガードを呼ぶ：hashは生の `hashVaultText`、registeredHashはresync分類が登録するLF正規化形のハッシュ。 */
+const diaryGuardCall = (current: string, canonical: Conversation, registeredHash: unknown): boolean => {
+  const parsed = markdown.parseConversationMarkdown(current);
+  assert.ok(parsed);
+  return safety.singleFileRewriteIsSafe(current, markdown.conversationToMarkdown(canonical), {
+    hash: vault.hashVaultText,
+    registeredHash,
+    evolvingKeys: safety.CONVERSATION_EVOLVING_KEYS,
+    body: "extends",
+    reserialized: markdown.conversationToMarkdown(parsed),
+  });
+};
+
+test("N-3 branch analysis: why each guard branch fails for a CRLF diary-insert save", () => {
+  const base = diaryBase();
+  const lfCurrent = markdown.conversationToMarkdown(base);
+  const current = crlf(lfCurrent);
+  const canonical = diaryInserted(base);
+  const next = markdown.conversationToMarkdown(canonical);
+  // resync分類（vault.ts processVaultResyncCandidate）が登録する形：LF正規化形のハッシュ。
+  const registered = vault.hashVaultText(lfCurrent);
+  // 登録分岐のハッシュ比較：生ハッシュは登録値と一致しない（登録分岐が失敗する直接原因）。
+  assert.notEqual(vault.hashVaultText(current), registered, "生ハッシュ≠登録ハッシュ");
+  assert.equal(vault.hashVaultText(current.replace(/\r\n/g, "\n")), registered, "正規化ハッシュ＝登録ハッシュ");
+  // フォールバック分岐：日記節の挿入（## Diaryが## Transcriptの前）だけが接頭辞拡張にならない。
+  assert.equal(safety.rewriteKeepsContent(current, next, safety.CONVERSATION_EVOLVING_KEYS, "extends"), false, "日記挿入つきのnextはフォールバックでも救えない");
+  const withoutDiary = markdown.conversationToMarkdown({ ...canonical, realtimeDiary: { date: DIARY_DATE } });
+  assert.equal(safety.rewriteKeepsContent(current, withoutDiary, safety.CONVERSATION_EVOLVING_KEYS, "extends"), true, "日記本文が無ければ同じ更新はフォールバックで通る＝失敗要因は日記挿入の本文形状だけ");
+  // アップグレード分岐：新形式ファイルには適用されない。
+  assert.equal(markdown.legacyTranscriptUpgradeForm(current), null, "新形式ファイルに旧形式アップグレード分岐は無い");
+});
+
+test("N-3 guard: a CRLF realtime-diary conversation accepts a diary-insert save", () => {
+  const base = diaryBase();
+  const lfCurrent = markdown.conversationToMarkdown(base);
+  const current = crlf(lfCurrent);
+  assert.equal(diaryGuardCall(current, diaryInserted(base), vault.hashVaultText(lfCurrent)), true, "登録済み版（CRLF）への日記挿入は、登録分岐で受け入れる");
+  // 書き込まれる内容は、既存turnと日記本文を正確に保つ。
+  const written = markdown.parseConversationMarkdown(markdown.conversationToMarkdown(diaryInserted(base)));
+  assert.deepEqual(written?.turns.map((t) => t.content), ["今日の出来事を話します", "聞かせてください"]);
+  assert.equal(written?.realtimeDiary?.text, "架空の日記本文です");
+});
+
+test("N-3 guard: the LF twin accepts the same diary-insert save", () => {
+  const base = diaryBase();
+  const lfCurrent = markdown.conversationToMarkdown(base);
+  assert.equal(diaryGuardCall(lfCurrent, diaryInserted(base), vault.hashVaultText(lfCurrent)), true);
+});
+
+test("N-3 guard: a CRLF file with a genuine external edit is still refused (the diary insert does not launder it)", () => {
+  const base = diaryBase();
+  const lfCurrent = markdown.conversationToMarkdown(base);
+  const edited = crlf(lfCurrent).replace("今日の出来事を話します", "外部で書き換えられた発言");
+  assert.notEqual(edited, crlf(lfCurrent), "前提：対象の発言が実際に書き換わっている");
+  assert.equal(diaryGuardCall(edited, diaryInserted(base), vault.hashVaultText(lfCurrent)), false, "外部編集されたファイルは、正規化しても登録版とは一致せず拒否される");
+});
+
+test("N-3 guard: hand-added text in a CRLF file is still refused even when that file itself is registered", () => {
+  const base = diaryBase();
+  const lfCurrent = markdown.conversationToMarkdown(base);
+  const foreignLf = lfCurrent.replace("## Transcript", "手で足した段落\n\n## Transcript");
+  const foreign = crlf(foreignLf);
+  // 手書き入りのファイル自体が登録済みでも、parse→再直列化で落ちる手書きは失われる書き換えとして拒否する
+  // （登録分岐のもう一方の条件 serializedKeepsEverything が効くことの確認）。
+  assert.equal(diaryGuardCall(foreign, diaryInserted(base), vault.hashVaultText(foreignLf)), false, "手書きを含むファイルは、登録済みでも日記挿入の保存で上書きしない");
+});
+
+test("N-3 guard: the single-record wiring (body: \"same\", MEMORY_EVOLVING_KEYS) shares the same registered-version judgment", () => {
+  const s = source("s-diary-guard");
+  const lfCurrent = markdown.sourceToMarkdown(s);
+  const current = crlf(lfCurrent);
+  const retitled = { ...s, title: "書き換え後のタイトル", updatedAt: T2 } as typeof s;
+  const parsed = markdown.parseSourceMarkdown(current);
+  const ok = safety.singleFileRewriteIsSafe(current, markdown.sourceToMarkdown(retitled), {
+    hash: vault.hashVaultText,
+    registeredHash: vault.hashVaultText(lfCurrent),
+    evolvingKeys: safety.MEMORY_EVOLVING_KEYS,
+    body: "same",
+    reserialized: markdown.sourceToMarkdown(parsed),
+  });
+  assert.equal(ok, true, "登録済み版そのもの（CRLF）からの置き換えは、単一記録側の配線でも登録分岐で受け入れる");
+});
+
+// ---------------------------------------------------------------------------
 // A-02：Conversation等のCRLF非対応
 // ---------------------------------------------------------------------------
 
