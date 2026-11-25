@@ -237,6 +237,12 @@ function isDuplicateCopyName(name: string): boolean {
   return name.endsWith("+.md");
 }
 
+/** RegistryのcontentHashは「LF正規化済みテキストのハッシュ」が規則（分類・
+ * write前検証と同じ。ラウンド5監査）。ファイルの生テキストを基準と照合・
+ * 記録するときは必ずこの形にする——生のままではCRLFファイルが常時不一致
+ * になり、再確定が進まない／生ハッシュの基準を新たに作ってしまう。 */
+const registryHashOfFileText = (text: string) => hashVaultText(text.replace(/\r\n/g, "\n"));
+
 function sameIds(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   const sortedA = [...a].sort();
@@ -392,7 +398,7 @@ export function computeLegacyCleanupPlan(
       .map((file) => ({ file, parsed: file.text.includes(key) ? parseConversationMarkdown(file.text) : null }))
       .filter((c): c is { file: LegacyCleanupVaultFile; parsed: Conversation } => c.parsed !== null && c.parsed.id === key);
     const canonicalCandidates = claimants.filter(
-      (c) => hashVaultText(c.file.text) === entry.contentHash && !isDuplicateCopyName(c.file.name)
+      (c) => registryHashOfFileText(c.file.text) === entry.contentHash && !isDuplicateCopyName(c.file.name)
     );
     const canonical = canonicalCandidates.length === 1 ? canonicalCandidates[0] : undefined;
     const copies = canonical ? claimants.filter((c) => c !== canonical) : [];
@@ -494,7 +500,7 @@ export function computeLegacyCleanupPlan(
       { name: "登録pathがday-fileで、実在する", ok: file !== undefined && isMemoryDayFileName(file.name), detail: path },
       {
         name: "ファイルが登録時から変わっていない（hash一致）",
-        ok: file !== undefined && hashVaultText(file.text) === entry.contentHash,
+        ok: file !== undefined && registryHashOfFileText(file.text) === entry.contentHash,
       },
       {
         name: "全メンバーが通常Memory（同じ日）",
@@ -886,7 +892,7 @@ export async function executeLegacyCleanup(
         item.path,
         stat.mtime,
         stat.size,
-        hashVaultText(file.text),
+        registryHashOfFileText(file.text),
         members.map((member) => member.id),
         memberHashes
       );
@@ -914,7 +920,7 @@ export async function executeLegacyCleanup(
         item.registeredPath,
         stat.mtime,
         stat.size,
-        hashVaultText(file.text)
+        registryHashOfFileText(file.text)
       );
       result.conversationsCommitted += 1;
     } catch (error) {
@@ -973,7 +979,7 @@ async function runPostCheck(
     const registered = registryByKey.get(key);
     if (!registered || registered.entry.status !== "ok") return true;
     const file = finalByPath.get(registered.path);
-    return file === undefined || hashVaultText(file.text) !== registered.entry.contentHash;
+    return file === undefined || registryHashOfFileText(file.text) !== registered.entry.contentHash;
   });
   checks.push({
     name: "再確定した全keyがRegistry ok（pathとhashがファイルと一致）",

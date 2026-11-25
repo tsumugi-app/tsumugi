@@ -127,6 +127,130 @@ test("physical deletion uses the restore parser's exact day boundary and never s
   await deletion.applyVaultDeletionEdits(v.root(), p); assert.equal(v.snapshot()["talk.md"], undefined);
 });
 
+// ---------------------------------------------------------------------------
+// CRLF day-fileのエントリ分割（ラウンド6）：LF固定の区切りで割ると全体が
+// 1エントリになり、先頭memberの削除でファイル全体が消え、末尾memberの
+// 削除が無言で起きない。復元parserと同じ境界（改行形式に寛容）で割り、
+// 残るエントリの生バイトは一切書き換えない。
+// ---------------------------------------------------------------------------
+
+const crlfOf = (s: string) => s.replace(/\n/g, "\r\n");
+function crlfDayWorld() {
+  const v = new testSupport.FakeVault();
+  const hash = require(path.join(OUT, "lib/vault.js")).hashVaultText as (t: string) => string;
+  const DAY = "Memories/2026-08-20.md";
+  const ser = (id: string) => md.memoryObjectToMarkdown(memory(id));
+  const midRaw = ser("del-mid") + "\n<!-- external annotation: KEEP EXACTLY -->\n";
+  const lfFile = [ser("del-first"), midRaw, ser("del-last")].join(md.MEMORY_ENTRY_SEPARATOR);
+  v.put(DAY, crlfOf(lfFile));
+  v.put(".tsumugi/index.json", JSON.stringify({ "del-first": DAY, "del-mid": DAY, "del-last": DAY }));
+  v.put(".tsumugi/registry-meta.json", JSON.stringify({ schemaVersion: 1, registryGeneration: "old-generation", dirtyOwnerInstanceId: null }));
+  // Registryの基準はresyncが残す形（LF正規化済みcontentHash）。
+  v.put(".tsumugi/registry/00.json", JSON.stringify({ schemaVersion: 1, bucket: 0, records: { day: DAY }, files: { [DAY]: { recordType: "memory-day", contentHash: hash(lfFile), memberIds: ["del-first", "del-mid", "del-last"], memberHashes: { "del-first": hash(ser("del-first")), "del-mid": hash(ser("del-mid")), "del-last": hash(ser("del-last")) }, status: "ok" } } }));
+  v.put(".tsumugi/history/2026-08.json", JSON.stringify({ version: 2, month: "2026-08", days: { "2026-08-20": { conversations: [], normalMemories: [{ id: "del-first" }, { id: "del-mid" }, { id: "del-last" }], reflections: [] } } }));
+  v.put(".tsumugi/history-meta.json", JSON.stringify({ version: 1, months: { "2026-08": { conversations: 0, memories: 3 } }, totalConversations: 0, totalMemories: 3 }));
+  return { v, DAY, ser, midRaw, lfFile };
+}
+const crlfPlan = (w: ReturnType<typeof crlfDayWorld>, id: string) => deletion.buildVaultDeletionPlan(new Map(Object.entries(w.v.snapshot())), tomb("memory", id), "delete-vault", 0);
+
+test("physical deletion: a CRLF day-file deletes only the target member (first / middle / last); survivors stay byte-identical", async () => {
+  const cases: { target: string; survivorsLf: string[]; survivorIds: string[] }[] = [
+    { target: "del-first", survivorsLf: ["mid", "last"], survivorIds: ["del-mid", "del-last"] },
+    { target: "del-mid", survivorsLf: ["first", "last"], survivorIds: ["del-first", "del-last"] },
+    { target: "del-last", survivorsLf: ["first", "mid"], survivorIds: ["del-first", "del-mid"] },
+  ];
+  for (const c of cases) {
+    const w = crlfDayWorld();
+    const rawOf = (name: string) => (name === "mid" ? w.midRaw : w.ser(`del-${name}`));
+    const expected = crlfOf(c.survivorsLf.map(rawOf).join(md.MEMORY_ENTRY_SEPARATOR));
+    const plan = crlfPlan(w, c.target);
+    const edit = plan.edits.find((e) => e.path === w.DAY);
+    assert.ok(edit, `${c.target}: the day-file must be edited`);
+    assert.equal(edit!.after, expected, `${c.target}: only the target segment is removed, survivors keep their exact CRLF bytes`);
+    await deletion.applyVaultDeletionEdits(w.v.root(), plan);
+    const final = w.v.snapshot();
+    assert.equal(final[w.DAY], expected, c.target);
+    const row = JSON.parse(final[".tsumugi/registry/00.json"]).files[w.DAY];
+    assert.deepEqual(row.memberIds, c.survivorIds, `${c.target}: registry members follow the file`);
+    assert.notEqual(row.status, "ok", `${c.target}: a CRLF survivor container is not left as a dangling ok`);
+    assert.equal(row.memberHashes[c.target], undefined, c.target);
+    assert.deepEqual(JSON.parse(final[".tsumugi/history/2026-08.json"]).days["2026-08-20"].normalMemories.map((r: { id: string }) => r.id), c.survivorIds, c.target);
+  }
+});
+
+test("physical deletion: an LF day-file deletes only the target member (control — unchanged behavior)", async () => {
+  const w = crlfDayWorld();
+  w.v.put(w.DAY, w.lfFile);
+  const plan = crlfPlan(w, "del-mid");
+  const edit = plan.edits.find((e) => e.path === w.DAY);
+  assert.equal(edit!.after, [w.ser("del-first"), w.ser("del-last")].join(md.MEMORY_ENTRY_SEPARATOR));
+  await deletion.applyVaultDeletionEdits(w.v.root(), plan);
+  assert.equal(w.v.snapshot()[w.DAY], edit!.after);
+});
+
+test("physical deletion: deleting the only member of a CRLF day-file removes the file and its registry row", async () => {
+  const v = new testSupport.FakeVault();
+  const hash = require(path.join(OUT, "lib/vault.js")).hashVaultText as (t: string) => string;
+  const DAY = "Memories/2026-08-20.md";
+  const lfFile = md.memoryObjectToMarkdown(memory("del-only"));
+  v.put(DAY, crlfOf(lfFile));
+  v.put(".tsumugi/index.json", JSON.stringify({ "del-only": DAY }));
+  v.put(".tsumugi/registry/00.json", JSON.stringify({ schemaVersion: 1, bucket: 0, records: { day: DAY }, files: { [DAY]: { recordType: "memory-day", contentHash: hash(lfFile), memberIds: ["del-only"], memberHashes: { "del-only": hash(lfFile) }, status: "ok" } } }));
+  v.put(".tsumugi/history/2026-08.json", JSON.stringify({ version: 2, month: "2026-08", days: { "2026-08-20": { conversations: [], normalMemories: [{ id: "del-only" }], reflections: [] } } }));
+  v.put(".tsumugi/history-meta.json", JSON.stringify({ version: 1, months: { "2026-08": { conversations: 0, memories: 1 } }, totalConversations: 0, totalMemories: 1 }));
+  const plan = deletion.buildVaultDeletionPlan(new Map(Object.entries(v.snapshot())), tomb("memory", "del-only"), "delete-vault", 0);
+  assert.equal(plan.edits.find((e) => e.path === DAY)!.after, null, "the emptied file is removed, not left blank");
+  await deletion.applyVaultDeletionEdits(v.root(), plan);
+  const final = v.snapshot();
+  assert.equal(final[DAY], undefined);
+  const shard = JSON.parse(final[".tsumugi/registry/00.json"]);
+  assert.equal(shard.files[DAY], undefined, "no registry row is left pointing at the deleted file");
+  assert.deepEqual(Object.values(shard.records), [], "no registry key is left pointing at the deleted file");
+  assert.equal(JSON.parse(final[".tsumugi/history-meta.json"]).totalMemories, 0);
+});
+
+test("physical deletion: a CRLF target that cannot be identified safely changes no file (absent id / prose mention / not-owned)", async () => {
+  const w = crlfDayWorld();
+  const absent = crlfPlan(w, "del-absent");
+  assert.equal(absent.edits.find((e) => e.path === w.DAY), undefined, "an id that is not in the file produces no day-file edit");
+  await deletion.applyVaultDeletionEdits(w.v.root(), absent);
+  assert.equal(w.v.snapshot()[w.DAY], crlfOf(w.lfFile), "the file is byte-identical");
+
+  // frontmatterの無い散文セグメントは、本文にidが書かれていても削除の根拠にならず、生バイトのまま残る。
+  const v = new testSupport.FakeVault();
+  const prose = "ただの手書きメモ\nid: del-first と書いてあるが、これは記録ではない\n";
+  const file = crlfOf([w.ser("del-first"), prose, w.ser("del-last")].join(md.MEMORY_ENTRY_SEPARATOR));
+  v.put(w.DAY, file);
+  const plan = deletion.buildVaultDeletionPlan(new Map(Object.entries(v.snapshot())), tomb("memory", "del-first"), "delete-vault", 0);
+  assert.equal(plan.edits.find((e) => e.path === w.DAY)!.after, crlfOf([prose, w.ser("del-last")].join(md.MEMORY_ENTRY_SEPARATOR)), "the prose segment survives byte-identical");
+
+  // idは一致するがTsumugiの記録でないものは、明示的なエラーで止まる（LFと同じ）。
+  const foreign = new testSupport.FakeVault();
+  foreign.put("foreign.md", crlfOf("---\nid: del-first\ndate: 2026-08-20\n---\nuser text"));
+  assert.throws(() => deletion.buildVaultDeletionPlan(new Map(Object.entries(foreign.snapshot())), tomb("memory", "del-first"), "delete-vault", 0), /not-owned/);
+});
+
+test("physical deletion: a CRLF day-file edited after confirmation aborts the apply; nothing is written", async () => {
+  const w = crlfDayWorld(); const plan = crlfPlan(w, "del-first");
+  w.v.put(w.DAY, crlfOf(w.lfFile) + "external edit");
+  const before = w.v.snapshot();
+  await assert.rejects(deletion.applyVaultDeletionEdits(w.v.root(), plan), /content-changed/);
+  assert.deepEqual(w.v.snapshot(), before, "preflight catches the drift before any deletion");
+});
+
+test("physical deletion: a hand-edited CRLF survivor keeps its exact bytes and is not blessed as a safe baseline", async () => {
+  const w = crlfDayWorld();
+  const editedMid = w.ser("del-mid").replace("本文", "手で直した架空の本文");
+  const lfFile = [w.ser("del-first"), editedMid, w.ser("del-last")].join(md.MEMORY_ENTRY_SEPARATOR);
+  w.v.put(w.DAY, crlfOf(lfFile));
+  await deletion.applyVaultDeletionEdits(w.v.root(), crlfPlan(w, "del-first"));
+  const final = w.v.snapshot();
+  assert.equal(final[w.DAY], crlfOf([editedMid, w.ser("del-last")].join(md.MEMORY_ENTRY_SEPARATOR)), "the hand edit survives byte-identical");
+  const row = JSON.parse(final[".tsumugi/registry/00.json"]).files[w.DAY];
+  assert.deepEqual(row.memberIds, ["del-mid", "del-last"]);
+  assert.notEqual(row.status, "ok", "the externally edited container is downgraded, never blessed");
+});
+
 test("physical deletion: a surviving member's hash advances only if Tsumugi wrote the previous version; a hand-edited member never gains a hash", () => {
   const hash = require(path.join(OUT, "lib/vault.js")).hashVaultText as (t: string) => string;
   const sep = md.MEMORY_ENTRY_SEPARATOR, DAY = "Memories/2026-08-20.md";

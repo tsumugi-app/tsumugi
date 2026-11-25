@@ -499,6 +499,7 @@
     "+() => !vaultOperationLockRef.current && !isVaultSwitchingRef.current,",
     "+() => vaultGenerationRef.current !== vaultGenerationRef.current",
     "+);",
-    "+if (waited !== \"idle\" || !vaultHandle || crossTabStale) return;"
+    "+if (waited !== \"idle\" || !vaultHandle || crossTabStale) return;",
+    "+() => vaultGenerationRef.current"
   ]
 }

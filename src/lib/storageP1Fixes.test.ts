@@ -13,6 +13,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import Module from "node:module";
 
@@ -140,6 +141,9 @@ const markdown = require("./markdown") as typeof import("./markdown");
 const vaultWriter = require("./vaultWriter") as typeof import("./vaultWriter");
 const vaultRestore = require("./vaultRestore") as typeof import("./vaultRestore");
 const safety = require("./vaultRewriteSafety") as typeof import("./vaultRewriteSafety");
+const legacyCleanup = require("./vaultLegacyCleanup") as typeof import("./vaultLegacyCleanup");
+const appendLocal = require("./vaultAppendLocal") as typeof import("./vaultAppendLocal");
+const deletion = require("./vaultDeletion") as typeof import("./vaultDeletion");
 
 const T = "2026-10-20T00:00:00.000Z";
 const T2 = "2026-10-21T00:00:00.000Z";
@@ -1440,4 +1444,437 @@ test("integration: multiple simultaneous corruptions surface independently in on
   assert.equal(result.records.find((r) => r.registryKey === DAY_KEY)?.outcome, "conflict");
   // 切断されたPeopleはunreadable（parse）として表面化する。
   assert.ok(result.unreadableDiagnostics.some((d) => d.path === `People/${person.fileName}` && d.kind === "parse"));
+});
+
+// ---------------------------------------------------------------------------
+// A-02 ラウンド5（Codex [P2] N-2）：ハッシュ「生成側」の正規化漏れ。
+// 分類・write前検証など比較側はLF正規化済みテキストのハッシュを基準にする
+// 規則で統一された（ラウンド3）が、day-fileの保存がRegistryへ記録する
+// contentHashは、planが返したテキストをそのままハッシュしていた。無変更
+// memberのno-op保存ではplanは元の生テキスト（CRLFファイルではCRLFのまま）
+// を返すため、正規化済みだった基準が生ハッシュに置き換わる。その後mtime
+// だけが変わると、write前検証の正規化比較と一致せず保存が止まる。
+// 生成側も比較側と同じ規則でなければならない。
+// ---------------------------------------------------------------------------
+
+/** CRLF day-file＋分類が登録した状態（LF正規化済み基準）の種付け。 */
+function seedCrlfDayFile(m1: MemoryObject, m2: MemoryObject) {
+  const day = m1.date.slice(0, 10);
+  const lfDay = markdown.serializeMemoryDayFile([m1, m2]);
+  const key = vault.dayFileRegistryKey(day);
+  const path = `Memories/${vault.dayFileNameFor(m1.date)}`;
+  const v = new MemVault({ [path]: crlf(lfDay) });
+  const parsedSeed = markdown.parseMemoryDayFile(lfDay);
+  seedRegistryEntry(v, key, path, {
+    recordType: "memory-day",
+    mtime: 999,
+    size: bytes(lfDay).length,
+    contentHash: vault.hashVaultText(lfDay),
+    memberIds: [m1.id, m2.id],
+    memberHashes: Object.fromEntries(parsedSeed.map((m) => [m.id, vault.hashVaultText(markdown.memoryObjectToMarkdown(m))])),
+  });
+  return { v, key, path, lfDay, day };
+}
+
+/** entryのmtimeだけをずらす（実ファイルのmtimeだけが変わった状態の再現）。 */
+async function driftEntryMtime(v: MemVault, key: string, path: string) {
+  const shard = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(key));
+  const entry = shard.files[path];
+  assert.ok(entry, "the Registry entry exists");
+  seedRegistryEntry(v, key, path, {
+    recordType: entry.recordType,
+    mtime: 424242,
+    size: entry.size,
+    contentHash: entry.contentHash,
+    memberIds: entry.memberIds,
+    memberHashes: entry.memberHashes,
+  });
+}
+
+test("A-02 round5 (Codex P2 N-2): a no-op save of a CRLF day-file keeps the normalized Registry baseline — an mtime-only change does not block the next save", async () => {
+  await prepareResyncWorld();
+  const memMeta = { ...meta, sourceType: "chat" };
+  const m1: MemoryObject = { ...memory("m-r5-1"), metadata: { ...memMeta } } as MemoryObject;
+  const m2: MemoryObject = { ...memory("m-r5-2"), metadata: { ...memMeta } } as MemoryObject;
+  const { v, key, path, lfDay } = seedCrlfDayFile(m1, m2);
+  // 無変更memberのno-op保存：ファイルには一切触れない。
+  await vault.writeMemoryObjectMarkdown(v.dir(), m1);
+  assert.equal(v.text(path), crlf(lfDay), "a no-op save leaves the CRLF file byte-identical");
+  // 生成側の規則：記録されるcontentHashは分類が作るLF正規化済み基準と同じ
+  // でなければならない（修正前は生CRLFテキストのハッシュに置き換わる）。
+  const afterNoop = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(key));
+  assert.equal(
+    afterNoop.files[path]?.contentHash,
+    vault.hashVaultText(lfDay),
+    `the Registry baseline must stay the LF-normalized hash (recorded: ${afterNoop.files[path]?.contentHash}; LF-normalized: ${vault.hashVaultText(lfDay)}; raw CRLF: ${vault.hashVaultText(crlf(lfDay))})`
+  );
+  // mtimeだけが変わった後でも、内容のある保存が通らなければならない
+  // （修正前はVaultRecordNeedsResyncErrorで拒否される）。
+  await driftEntryMtime(v, key, path);
+  const updatedM1: MemoryObject = { ...m1, content: "更新された架空の記録 m-r5-1", summary: "更新された架空の記録 m-r5-1", updatedAt: T2 };
+  await vault.writeMemoryObjectMarkdown(v.dir(), updatedM1);
+  const parsed = markdown.parseMemoryDayFile(v.text(path));
+  assert.equal(parsed.length, 2, "both members survive the save after the mtime-only change");
+  assert.equal(parsed.find((m) => m.id === m1.id)?.content, updatedM1.content);
+  assert.equal(parsed.find((m) => m.id === m2.id)?.content, m2.content);
+});
+
+test("A-02 round5: a genuine external edit after the no-op save is still refused — the N-2 fix does not weaken detection", async () => {
+  await prepareResyncWorld();
+  const memMeta = { ...meta, sourceType: "chat" };
+  const m1: MemoryObject = { ...memory("m-r5x-1"), metadata: { ...memMeta } } as MemoryObject;
+  const m2: MemoryObject = { ...memory("m-r5x-2"), metadata: { ...memMeta } } as MemoryObject;
+  const { v, key, path, lfDay } = seedCrlfDayFile(m1, m2);
+  await vault.writeMemoryObjectMarkdown(v.dir(), m1); // no-op保存
+  // 外部編集：CRLFのままm2の本文を書き換える（行末は変えない）。
+  const edited = crlf(lfDay).replace("架空の記録 m-r5x-2 です", "外部で書き換えられた架空の記録");
+  assert.notEqual(edited, crlf(lfDay));
+  v.put(path, bytes(edited));
+  await driftEntryMtime(v, key, path);
+  const updatedM1: MemoryObject = { ...m1, content: "更新された架空の記録 m-r5x-1", summary: "更新された架空の記録 m-r5x-1", updatedAt: T2 };
+  await assert.rejects(
+    vault.writeMemoryObjectMarkdown(v.dir(), updatedM1),
+    (e: unknown) => e instanceof vault.VaultRecordNeedsResyncError,
+  );
+  // ファイルは1バイトも変えず、状態はneeds-resyncとして表面化する。
+  assert.equal(v.text(path), edited);
+  const shard = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(key));
+  assert.equal(shard.files[path]?.status, "needs-resync");
+});
+
+// ---------------------------------------------------------------------------
+// A-02 ラウンド5（横断監査）：legacy cleanupの計画計算も、Registry基準との
+// 比較はLF正規化済みハッシュの規則に従わなければならない。生テキストの
+// ハッシュで照合すると、無変更のCRLFファイルが「正本を特定できない」
+// 「登録時から変わっている」と誤判定され、再確定が黙って進まなくなる。
+// ---------------------------------------------------------------------------
+
+test("A-02 round5 audit: the legacy cleanup plan identifies a CRLF conversation's canonical copy against the normalized Registry baseline", () => {
+  const conv = conversation("c-legacy-r5");
+  const lfText = markdown.conversationToMarkdown(conv);
+  const fileOf = (p: string, text: string) => ({
+    path: p, name: p.split("/").pop()!, area: "Conversations" as const, text, sha256: `sha-${p}`, size: bytes(text).length,
+  });
+  const snapshot = {
+    files: [fileOf("Conversations/a.md", crlf(lfText)), fileOf("Conversations/a+.md", lfText)],
+    registry: [{
+      key: conv.id, path: "Conversations/a.md",
+      entry: { recordType: "conversation", mtime: 1, size: bytes(lfText).length, contentHash: vault.hashVaultText(lfText), memberIds: [conv.id], status: "conflict" },
+    }],
+    manifest: { schemaVersion: 1, entries: [] },
+    manifestError: null,
+    archiveSha: new Map(),
+    idb: { memories: new Map(), conversations: new Map([[conv.id, conv]]), sourceCount: 0 },
+    baselineEstablishedAt: null,
+  } as unknown as Parameters<typeof legacyCleanup.computeLegacyCleanupPlan>[0];
+  const plan = legacyCleanup.computeLegacyCleanupPlan(snapshot);
+  const item = plan.conversations.find((c) => c.key === conv.id);
+  assert.ok(item, `the conflicted conversation is planned (skipped instead: ${JSON.stringify(plan.skippedConflicts)})`);
+  assert.equal(item.canonicalPath, "Conversations/a.md", "the CRLF file is identified as the canonical copy");
+  assert.equal(item.ok, true, `all checks pass (failed: ${item.checks.filter((c) => !c.ok).map((c) => c.name).join(" / ")})`);
+});
+
+test("A-02 round5 audit: the legacy cleanup plan treats an unchanged CRLF day-file as unchanged against the normalized Registry baseline", () => {
+  const memMeta = { ...meta, sourceType: "chat" };
+  const m1: MemoryObject = { ...memory("m-leg-1"), metadata: { ...memMeta } } as MemoryObject;
+  const m2: MemoryObject = { ...memory("m-leg-2"), metadata: { ...memMeta } } as MemoryObject;
+  const day = m1.date.slice(0, 10);
+  const lfDay = markdown.serializeMemoryDayFile([m1, m2]);
+  const key = vault.dayFileRegistryKey(day);
+  const path = `Memories/${day}.md`;
+  const parsedMembers = markdown.parseMemoryDayFile(lfDay);
+  const snapshot = {
+    files: [{ path, name: `${day}.md`, area: "Memories" as const, text: crlf(lfDay), sha256: "sha-day", size: bytes(crlf(lfDay)).length }],
+    registry: [{
+      key, path,
+      entry: {
+        recordType: "memory-day", mtime: 1, size: bytes(lfDay).length, contentHash: vault.hashVaultText(lfDay),
+        memberIds: [m1.id, m2.id],
+        memberHashes: Object.fromEntries(parsedMembers.map((m) => [m.id, vault.hashVaultText(markdown.memoryObjectToMarkdown(m))])),
+        status: "conflict",
+      },
+    }],
+    manifest: {
+      schemaVersion: 1,
+      entries: [{ originalPath: path, archivePath: `.tsumugi-archive/legacy/${day}.md`, sha256: "sha-day", size: 1, archivedAt: T, kind: "legacy-memory" as const, recordId: m1.id, day }],
+    },
+    manifestError: null,
+    archiveSha: new Map(),
+    idb: { memories: new Map(parsedMembers.map((m) => [m.id, m])), conversations: new Map(), sourceCount: 0 },
+    baselineEstablishedAt: null,
+  } as unknown as Parameters<typeof legacyCleanup.computeLegacyCleanupPlan>[0];
+  const plan = legacyCleanup.computeLegacyCleanupPlan(snapshot);
+  const item = plan.memoryDays.find((d) => d.key === key);
+  assert.ok(item, "the conflicted day-file is planned");
+  assert.equal(item.ok, true, `all checks pass (failed: ${item.checks.filter((c) => !c.ok).map((c) => c.name).join(" / ")})`);
+});
+
+// ---------------------------------------------------------------------------
+// ラウンド5（Codex [P2] N-1）：「確認する」の待機取り消し述語が
+// `vaultGenerationRef.current !== vaultGenerationRef.current`（自己比較・
+// 常時false）になっており、待機中のVault切替を検出できなかった。世代の
+// 捕捉はwaitUntilIdleOrGenerationChange（捕捉はヘルパー内）へ移し、
+// この形の述語が component に残っていないことを固定する。ヘルパー自体の
+// 意味論（同一世代→idle／切替→cancelled）はwaitUntilIdle.test.tsで検証する。
+// ---------------------------------------------------------------------------
+
+test("round5 (Codex P2 N-1): the vault-status check wait cannot spin on a self-comparing generation predicate", () => {
+  const src = fs.readFileSync(path.join(OUT, "..", "src", "components", "ChatScreen.tsx"), "utf8");
+  assert.ok(
+    !src.includes("vaultGenerationRef.current !== vaultGenerationRef.current"),
+    "the self-comparing cancellation predicate (always false) is gone"
+  );
+  const start = src.indexOf("async function handleCheckVaultStatus()");
+  assert.ok(start >= 0, "handleCheckVaultStatus exists");
+  const body = src.slice(start, start + 1600);
+  assert.ok(body.includes("waitUntilIdleOrGenerationChange"), "the check waits via the generation-capturing helper");
+});
+
+// ---------------------------------------------------------------------------
+// A-02 ラウンド5追加検証（append-local post-check の到達可能性と実経路回帰）。
+// §U row 12 の vaultAppendLocal:597 修正は「テストの足場が無い」ことが残存
+// リスクだった。実経路（planAppendLocalRecords → appendLocalRecordsToVault）
+// を実際に駆動して検証する。
+//
+// 到達可能性の確定事実（プローブで確認済み）：
+// - 書き込み前に保存先へCRLFファイルが存在する形状は、planの痕跡チェック
+//   （conversation: vault-trace／day-file: day-has-vault-files）と書き込み側の
+//   assertAdoptTargetAbsent（バイト完全一致のみ許可）の両方で、post-checkに
+//   到達する前にレビュー可能な形で拒否される（下の到達可能性テストで固定）。
+// - post-checkがCRLFテキストを実際に読むのは、書き込みとpost-checkの間に
+//   行末変換が着地した場合（同期フォルダ等で起こり得る）。これはファイル
+//   ハンドル層で「Registry shardのcommit以後、対象ファイルの読み取りだけを
+//   変換済みテキストで返す」ラッパーにより再現する（MemVault自体がハンドル
+//   層のfakeであることと同種の注入。保存バイト自体は変えない）。
+// ---------------------------------------------------------------------------
+
+const APPEND_LOCAL_BASELINE_META = JSON.stringify({ schemaVersion: 1, updatedAt: T, lastFullResyncAt: T2, baselineEstablishedAt: T2 });
+
+/**
+ * Registry shardのcommit（createWritableのclose）を観測した後、targetPathの
+ * 読み取りだけを serve() の結果で返すrootラッパー。書き込み側の検証読み戻し・
+ * stat読みはcommit前に終わるため、差し替えが効くのはpost-check以降の読みだけ。
+ * servedCountで「実際に差し替えが読まれた」ことをテスト側が確認できる。
+ */
+function wrapRootForPostCommitServe(v: MemVault, targetPath: string, serve: (genuine: string) => string) {
+  let committed = false;
+  let served = 0;
+  const wrapFile = (handle: FileSystemFileHandle, p: string): FileSystemFileHandle =>
+    ({
+      kind: "file",
+      name: handle.name,
+      async getFile() {
+        const file = await handle.getFile();
+        if (!committed || p !== targetPath) return file;
+        served++;
+        const doctored = serve(await file.text());
+        const data = bytes(doctored);
+        return {
+          size: file.size,
+          lastModified: file.lastModified,
+          slice(start = 0, end = data.byteLength) {
+            const part = data.slice(start, end);
+            return { size: part.byteLength, async text() { return textOf(part); } };
+          },
+          async text() { return doctored; },
+          async arrayBuffer() { return data.slice().buffer as ArrayBuffer; },
+        } as unknown as File;
+      },
+      async createWritable() {
+        const writable = await (handle as unknown as { createWritable: () => Promise<{ write: (d: string | Uint8Array) => Promise<void>; close: () => Promise<void>; abort: () => Promise<void> }> }).createWritable();
+        const origClose = writable.close.bind(writable);
+        writable.close = async () => {
+          await origClose();
+          if (/^\.tsumugi\/registry\/[0-9a-f]{2}\.json$/.test(p)) committed = true;
+        };
+        return writable;
+      },
+    }) as unknown as FileSystemFileHandle;
+  const wrapDir = (dir: FileSystemDirectoryHandle, prefix: string): FileSystemDirectoryHandle =>
+    ({
+      kind: "directory",
+      name: dir.name,
+      async getDirectoryHandle(name: string, options?: { create?: boolean }) {
+        return wrapDir(await dir.getDirectoryHandle(name, options), prefix ? `${prefix}/${name}` : name);
+      },
+      async getFileHandle(name: string, options?: { create?: boolean }) {
+        return wrapFile(await dir.getFileHandle(name, options), prefix ? `${prefix}/${name}` : name);
+      },
+      async *entries() {
+        for await (const [name, h] of dir.entries()) {
+          const p = prefix ? `${prefix}/${name}` : name;
+          yield [name, h.kind === "file" ? wrapFile(h as FileSystemFileHandle, p) : wrapDir(h as FileSystemDirectoryHandle, p)];
+        }
+      },
+    }) as unknown as FileSystemDirectoryHandle;
+  return { root: wrapDir(v.dir(), ""), servedCount: () => served };
+}
+
+test("A-02 round5 follow-up (append-local reachability): a pre-existing CRLF copy of the record's own file is refused at plan time — it never reaches the post-check", async () => {
+  await prepareResyncWorld();
+  // Conversation版：自分のファイルのCRLFコピーは vault-trace で計画段階拒否。
+  const conv = conversation("c-append-crlf-plan");
+  await db.putConversation(conv);
+  const convPath = `Conversations/${vault.fileNameFor(conv.id, conv.startedAt)}`;
+  const v1 = new MemVault({ [convPath]: crlf(markdown.conversationToMarkdown(conv)), ".tsumugi/registry-meta.json": APPEND_LOCAL_BASELINE_META });
+  const plan1 = await appendLocal.planAppendLocalRecords(v1.dir());
+  const blocked1 = plan1.blocked.find((i) => i.record.key === `conversation:${conv.id}`);
+  assert.equal(blocked1?.block?.code, "vault-trace");
+  const result1 = await appendLocal.appendLocalRecordsToVault(v1.dir(), [{ key: `conversation:${conv.id}`, updatedAt: conv.updatedAt }]);
+  assert.equal(result1.items[0]?.outcome, "skipped");
+  assert.equal(v1.text(convPath), crlf(markdown.conversationToMarkdown(conv)), "the CRLF file is left byte-identical for review");
+  // day-file版（§U row 12の形状）：CRLF day-fileに含まれるmemberは vault-trace、
+  // 同じ日の（ファイルに無い）memberは day-has-vault-files で計画段階拒否。
+  const memMeta = { ...meta, sourceType: "chat" };
+  const m1 = { ...memory("m-append-crlf-plan"), metadata: { ...memMeta } } as MemoryObject;
+  const m2 = { ...memory("m-append-crlf-plan-2"), metadata: { ...memMeta } } as MemoryObject;
+  await db.putMemoryObject(m1);
+  await db.putMemoryObject(m2);
+  const dayPath = `Memories/${vault.dayFileNameFor(m1.date)}`;
+  const v2 = new MemVault({ [dayPath]: crlf(markdown.serializeMemoryDayFile([m1])), ".tsumugi/registry-meta.json": APPEND_LOCAL_BASELINE_META });
+  const plan2 = await appendLocal.planAppendLocalRecords(v2.dir());
+  const blocked2 = plan2.blocked.find((i) => i.record.key === `memory:${m1.id}`);
+  assert.equal(blocked2?.block?.code, "vault-trace");
+  const blocked3 = plan2.blocked.find((i) => i.record.key === `memory:${m2.id}`);
+  assert.equal(blocked3?.block?.code, "day-has-vault-files");
+});
+
+test("A-02 round5 follow-up (append-local post-check): a CRLF conversion landing after the write is not falsely refused — the post-check compares in the Registry convention (real execute path)", async () => {
+  await prepareResyncWorld();
+  const conv = conversation("c-append-post-crlf");
+  await db.putConversation(conv);
+  const path = `Conversations/${vault.fileNameFor(conv.id, conv.startedAt)}`;
+  // 前回の中断で残った自分のファイル（LF・内容完全一致）＝own-partial形状。
+  const v = new MemVault({ [path]: markdown.conversationToMarkdown(conv), ".tsumugi/registry-meta.json": APPEND_LOCAL_BASELINE_META });
+  // 書き込みのcommit後、post-checkが読む時点でのみ行末変換が着地した状態を再現する。
+  const { root, servedCount } = wrapRootForPostCommitServe(v, path, (genuine) => crlf(genuine));
+  const result = await appendLocal.appendLocalRecordsToVault(root, [{ key: `conversation:${conv.id}`, updatedAt: conv.updatedAt }]);
+  assert.ok(servedCount() >= 1, "the converted text was actually served to a post-commit read (the fixture is not vacuous)");
+  assert.equal(result.items[0]?.outcome, "written");
+  assert.equal(result.status, "complete", `all post-checks pass (failed: ${result.postChecks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`).join(" / ")})`);
+  assert.ok(result.postChecks.every((c) => c.ok));
+  // 保存先の実バイトは書き込みが残したLFのまま（post-checkは読み取り専用）。
+  assert.equal(v.text(path), markdown.conversationToMarkdown(conv));
+  // 変異検証済み：vaultAppendLocal:597の正規化を戻すと、このテストは
+  // post-check不一致（status "partial"）で失敗する（手作業で確認済み）。
+});
+
+test("A-02 round5 follow-up (append-local post-check): a genuine edit landing after the write is still caught — the post-check is not a no-op (real execute path)", async () => {
+  await prepareResyncWorld();
+  const conv = conversation("c-append-post-edit");
+  await db.putConversation(conv);
+  const path = `Conversations/${vault.fileNameFor(conv.id, conv.startedAt)}`;
+  const v = new MemVault({ [path]: markdown.conversationToMarkdown(conv), ".tsumugi/registry-meta.json": APPEND_LOCAL_BASELINE_META });
+  const { root, servedCount } = wrapRootForPostCommitServe(v, path, (genuine) => genuine.replace("架空の会話です", "外部で書き換えられた会話"));
+  const result = await appendLocal.appendLocalRecordsToVault(root, [{ key: `conversation:${conv.id}`, updatedAt: conv.updatedAt }]);
+  assert.ok(servedCount() >= 1, "the edited text was actually served to a post-commit read (the fixture is not vacuous)");
+  assert.equal(result.items[0]?.outcome, "written");
+  const recordCheck = result.postChecks.find((c) => c.name.startsWith("保存できた記録を保存先から確認"));
+  assert.equal(recordCheck?.ok, false, "the divergence between the written file and the Registry baseline is caught");
+  assert.equal(recordCheck?.detail, "Registryのhashがファイルと一致しません");
+  assert.equal(result.status, "partial");
+  // このテストは修正前後とも成功する（保存系の振る舞い保存テスト）：編集の
+  // 検出自体は従来から機能しており、:597の正規化はそれを弱めていない。
+});
+
+// ---------------------------------------------------------------------------
+// A-02 ラウンド5追加検証（汚染済み端末の復旧）：修正前のno-op保存が、生の
+// CRLFハッシュをRegistry基準として記録してしまった端末が既に存在し得る。
+// その状態から通常のresyncで安全に正常化できることを固定する。
+// なおresync側の正規化自体はラウンド5以前（監査row 1–2）から存在するため、
+// このテストは「ラウンド5の回帰」ではなく「既に汚染された端末の復旧保証」
+// であり、修正前コードでも成功する見込みの性質のもの（人為的に失敗させる
+// ことはしない）。
+// ---------------------------------------------------------------------------
+
+test("A-02 round5 follow-up (poisoned device): a raw-CRLF Registry baseline left by the pre-fix no-op save is safely normalized by a normal resync — no loss, no overwrite, no continuing blockage", async () => {
+  await prepareResyncWorld();
+  const memMeta = { ...meta, sourceType: "chat" };
+  const m1: MemoryObject = { ...memory("m-poison-1"), metadata: { ...memMeta } } as MemoryObject;
+  const m2: MemoryObject = { ...memory("m-poison-2"), metadata: { ...memMeta } } as MemoryObject;
+  const { v, key, path, lfDay } = seedCrlfDayFile(m1, m2);
+  // 汚染の再現：entryのcontentHashだけを、修正前のno-op保存が記録した
+  // 生CRLFハッシュへ差し替える（ファイル自体は無傷のCRLF day-file）。
+  const seeded = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(key));
+  const healthy = seeded.files[path]!;
+  assert.ok(healthy);
+  seedRegistryEntry(v, key, path, {
+    recordType: healthy.recordType, mtime: healthy.mtime, size: healthy.size,
+    contentHash: vault.hashVaultText(crlf(lfDay)),
+    memberIds: healthy.memberIds, memberHashes: healthy.memberHashes,
+  });
+  const poisoned = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(key));
+  assert.equal(poisoned.files[path]?.contentHash, vault.hashVaultText(crlf(lfDay)), "the poisoned state is actually seeded");
+  // 通常のresyncで正常化される。
+  const result = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(result.scanCompleted, true);
+  assert.deepEqual(result.applyErrors, []);
+  const after = await vault.readVaultRegistryShard(v.dir(), vault.vaultRegistryBucketOf(key));
+  assert.equal(after.files[path]?.contentHash, vault.hashVaultText(lfDay), "the baseline is re-registered in the LF-normalized form");
+  assert.equal(after.files[path]?.status, "ok");
+  assert.deepEqual(after.files[path]?.memberIds, [m1.id, m2.id], "no member is lost");
+  // ファイル内容は1バイトも書き換えられない。
+  assert.equal(v.text(path), crlf(lfDay), "resync never rewrites the file content");
+  // 正常化の後に保存阻害は続かない：mtimeだけの変化＋内容のある保存が通る。
+  await driftEntryMtime(v, key, path);
+  const updatedM1: MemoryObject = { ...m1, content: "更新された架空の記録 m-poison-1", summary: "更新された架空の記録 m-poison-1", updatedAt: T2 };
+  await vault.writeMemoryObjectMarkdown(v.dir(), updatedM1);
+  const parsed = markdown.parseMemoryDayFile(v.text(path));
+  assert.equal(parsed.length, 2, "both members survive the save after normalization");
+  assert.equal(parsed.find((m) => m.id === m1.id)?.content, updatedM1.content);
+  assert.equal(parsed.find((m) => m.id === m2.id)?.content, m2.content);
+});
+
+// ---------------------------------------------------------------------------
+// ラウンド6（vaultDeletionのCRLF分割修正）：CRLF化されたday-fileから先頭
+// memberを物理削除しても、残るmemberのVaultコピーは失われず、削除後の
+// resync／復元スキャン／復旧計画でも、消したmemberが蘇ったり残るmemberが
+// 失われたりしないことを、実経路（plan→apply→resync→scan→recovery plan）で固定する。
+// ---------------------------------------------------------------------------
+
+test("round6 (vaultDeletion CRLF): deleting the first member of a CRLF day-file keeps the survivor through deletion, resync, restore scan and recovery planning", async () => {
+  const lfDay = healthyDay();
+  const crlfDay = crlf(lfDay);
+  const v = new MemVault({ [DAY_PATH]: crlfDay });
+  seedRegistryEntry(v, DAY_KEY, DAY_PATH, {
+    recordType: "memory-day",
+    mtime: 0,
+    size: bytes(crlfDay).length,
+    contentHash: vault.hashVaultText(lfDay),
+    memberIds: ["m1", "m2"],
+    memberHashes: { m1: vault.hashVaultText(markdown.memoryObjectToMarkdown(memory("m1"))), m2: vault.hashVaultText(markdown.memoryObjectToMarkdown(memory("m2"))) },
+  });
+  const bucket = vault.vaultRegistryBucketOf(DAY_KEY);
+  const shardPath = `.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`;
+  const files = new Map<string, string>([[DAY_PATH, crlfDay], [shardPath, v.text(shardPath)]]);
+  const tomb = { v: 1, kind: "memory", id: "m1", deletedAt: T, date: T, vault: "unverified" } as unknown as Parameters<typeof deletion.buildVaultDeletionPlan>[1];
+  const plan = deletion.buildVaultDeletionPlan(files, tomb, "delete-vault", 0);
+  const dayEdit = plan.edits.find((e) => e.path === DAY_PATH);
+  assert.ok(dayEdit, "the day-file is edited (not removed wholesale)");
+  assert.equal(dayEdit!.after, crlf(markdown.memoryObjectToMarkdown(memory("m2"))), "only m1's segment is removed; m2 keeps its exact CRLF bytes");
+  await deletion.applyVaultDeletionEdits(v.dir(), plan);
+  assert.equal(v.text(DAY_PATH), crlf(markdown.memoryObjectToMarkdown(memory("m2"))));
+  const rowAfterDelete = (await vault.readVaultRegistryShard(v.dir(), bucket)).files[DAY_PATH];
+  assert.deepEqual(rowAfterDelete?.memberIds, ["m2"], "the registry row follows the file immediately after deletion");
+  // resync：走査は完走し、ファイルは書き換えられない。状態はokには戻らない：
+  // 削除側が安全側に倒した行（needs-resync＋基準は未検証のまま）に対して、
+  // resyncは無言で基準を張り直さず conflict として表面化させるのが既存の
+  // 意味論（削除を経ていない同じ行状態でも同じ結果になることを別途確認済み）。
+  // memberIdsは現実どおり[m2]で、消えたm1が戻ることはない。
+  const resync = await vault.resyncVaultRegistry(v.dir());
+  assert.equal(resync.scanCompleted, true);
+  assert.deepEqual(resync.applyErrors, []);
+  const row = (await vault.readVaultRegistryShard(v.dir(), bucket)).files[DAY_PATH];
+  assert.equal(row?.status, "conflict", "the downgraded CRLF container is surfaced for resolution, never silently blessed");
+  assert.deepEqual(row?.memberIds, ["m2"]);
+  assert.equal(v.text(DAY_PATH), crlf(markdown.memoryObjectToMarkdown(memory("m2"))), "resync never rewrites the file");
+  // 復元スキャン：消したm1は蘇らず、残ったm2だけが見える。
+  const scan = await vault.scanVaultForRestore(v.dir());
+  assert.deepEqual(scan.memoryObjects.map((m) => m.id), ["m2"], "no resurrection of the deleted member");
+  // 復旧計画：ローカルにm2しか無い前提で、m1に関する不足・競合を一切挙げない。
+  const recoveryPlan = await recovery.buildVaultRecoveryPlan(v.dir(), local([], [memory("m2")]));
+  assert.equal(recoveryPlan.records.some((r) => r.recordId === "m1"), false, "the deleted member is not planned for recovery");
+  const m2Record = recoveryPlan.records.find((r) => r.recordId === "m2");
+  assert.equal(m2Record?.memoryDay?.memberExists, true, "the survivor is still present as a member of the day-file");
+  assert.equal(m2Record?.memoryDay?.memberSemanticEqual, true, "the survivor's content is intact");
 });

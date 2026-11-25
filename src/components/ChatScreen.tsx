@@ -4,7 +4,7 @@ import { contextDedupeEnabled } from "@/lib/contextDedupeFlag";
 import { assembleChatContext, chatContextRequestFields } from "@/lib/chatContextAssembly";
 import { deviceChatContextFlags, deviceChatContextSources } from "@/lib/chatContextSources";
 import { runSynthesisAfterSession } from "@/lib/synthesisChat";
-import { waitUntilIdle } from "@/lib/waitUntilIdle";
+import { waitUntilIdle, waitUntilIdleOrGenerationChange } from "@/lib/waitUntilIdle";
 import { logRecoveryArchiveDiagnostic } from "@/lib/vaultRecoveryArchiveDebug";
 import { requestFullWipe } from "@/lib/dataWipe";
 import { getJstTodayDateString } from "@/lib/jstDate";
@@ -4178,10 +4178,12 @@ export default function ChatScreen() {
     // 別のVault操作（背景の整合性確認の再確認待ち等）がロックを保持している間は、
     // 無言で諦めず、解放されるまで有限時間待ってから始める。黙ってreturnすると、
     // ボタンを押しても何も起きず、利用者は「確認する」を押し直すしかなくなる。
+    // 待機中にVaultが切り替わったら取り消す（世代の捕捉はヘルパー側で行う。
+    // 古いVaultの確認結果を、新しいVaultの表示に出さないため）。
     if (vaultOperationLockRef.current) {
-      const waited = await waitUntilIdle(
+      const waited = await waitUntilIdleOrGenerationChange(
         () => !vaultOperationLockRef.current && !isVaultSwitchingRef.current,
-        () => vaultGenerationRef.current !== vaultGenerationRef.current
+        () => vaultGenerationRef.current
       );
       if (waited !== "idle" || !vaultHandle || crossTabStale) return;
     }

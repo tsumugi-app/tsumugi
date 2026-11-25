@@ -11,7 +11,7 @@ import { isRecoveryBlockingNormalWrites } from "./vaultRecoveryJournal";
 import { withVaultSaveLock } from "./vaultSaveLock";
 import { writeFileHandleContent } from "./vaultWriter";
 import type { MemoryObject } from "./types";
-import { parseFrontmatter, parseMemoryDayFile, memoryObjectToMarkdown, MEMORY_ENTRY_SEPARATOR } from "./markdown";
+import { parseFrontmatter, parseMemoryDayFile, memoryObjectToMarkdown } from "./markdown";
 import { computeMonthAggregate, getVaultBackend, hashVaultText, dayFileRegistryKey, vaultRegistryBucketOf, type HistoryMonthIndex } from "./vault";
 
 export interface DeletionEdit { path: string; before: string | null; after: string | null }
@@ -70,11 +70,20 @@ async function inventory(root: FileSystemDirectoryHandle): Promise<Map<string, s
   await walk(root); return files;
 }
 interface Entry { raw: string; separator: string; fm?: Record<string, unknown> }
+/** エントリ区切りは改行形式に寛容に分割する（復元parserと同じ境界）。CRLFのday-fileをLF固定の文字列で
+ * 分割すると全体が1エントリになり、削除対象の特定を誤る（残るはずの記録まで消す／対象が消えない）。
+ * 各エントリの生バイトと、実際に前にあった区切り文字列そのものを保持し、残すエントリは一切書き換えない。 */
+const ENTRY_SEPARATOR_SPLIT = /(\r?\n<!-- tsumugi:entry -->\r?\n\r?\n)/;
 function entries(text: string): Entry[] {
   const first = parseFrontmatter(text.trim())?.frontmatter;
   // Conversations and Reflections are single records, even when their prose contains a day separator.
   if (typeof first?.startedAt === "string" || first?.source === "system-generated") return [{ raw: text, separator: "", fm: first }];
-  return text.split(MEMORY_ENTRY_SEPARATOR).map((raw, i) => ({ raw, separator: i === 0 ? "" : MEMORY_ENTRY_SEPARATOR, fm: parseFrontmatter(raw.trim())?.frontmatter }));
+  const parts = text.split(ENTRY_SEPARATOR_SPLIT);
+  const result: Entry[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    result.push({ raw: parts[i], separator: i === 0 ? "" : parts[i - 1], fm: parseFrontmatter(parts[i].trim())?.frontmatter });
+  }
+  return result;
 }
 function target(f: Record<string, unknown> | undefined, t: Tombstone): boolean {
   if (!f || (f.id !== t.id && !(t.kind === "conversation" && t.cascade && f.conversationId === t.id))) return false;

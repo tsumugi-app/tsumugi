@@ -397,6 +397,54 @@ test("Projection J: 同一ID・外部変更/conflict（turn内容が食い違う
   assert.equal(vault.get(path), externallyEdited, "外部データは一切書き換えられない");
 });
 
+test("Projection R5 (hash audit): a CRLF-only difference does not turn a legitimate newer version into a markdown-conflict (takesBack shape)", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  // 他端末でMemory化されたidを持つ版が正本として登録されている状態
+  // （takesBackFinishedConversationがtrueになる組み合わせ）。
+  const c1 = conversation("proj-r5-1", { memoryObjectIds: ["m-other-device"] });
+  const entry1 = await seedCanonical(c1);
+  const first = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry1);
+  assert.equal(first.status, "done");
+  const path = `Conversations/${vaultMod.fileNameFor(c1.id, c1.startedAt)}`;
+  // 外部ツールがファイル全体をCRLF化した（内容は同一、行末だけが違う）。
+  vault.put(path, vault.get(path)!.replace(/\n/g, "\r\n"));
+  // この端末のcanonicalはturnを追加し、memoryObjectIdsは巻き戻し形状。
+  const c2: Conversation = {
+    ...c1, memoryObjectIds: [],
+    turns: [...c1.turns, { role: "ai", content: "返信", timestamp: "2026-03-01T09:00:05.000Z" }],
+    updatedAt: "2026-03-01T09:00:05.000Z",
+  };
+  const entry2 = await seedCanonical(c2);
+  const second = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry2);
+  // 修正前は、登録hashとの比較が生テキストで行われるため、この正当な更新が
+  // markdown-conflictでheldになる（LFの双子ではdoneになる）。
+  assert.equal(second.status, "done", "a CRLF-only difference must not refuse a legitimate update");
+  assert.equal(vault.get(path), markdownMod.conversationToMarkdown(c2));
+});
+
+test("Projection R5b: a genuine external edit in a CRLF file is still held (detection is not weakened)", async () => {
+  const vault = new FakeVault();
+  seedVaultIdentityFile(vault);
+  const c1 = conversation("proj-r5-2", { memoryObjectIds: ["m-other-device"] });
+  const entry1 = await seedCanonical(c1);
+  const first = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry1);
+  assert.equal(first.status, "done");
+  const path = `Conversations/${vaultMod.fileNameFor(c1.id, c1.startedAt)}`;
+  // CRLF化した上で、turn本文を外部で書き換える。
+  const edited = vault.get(path)!.replace(/\n/g, "\r\n").replace("ユーザー発言", "外部で書き換えられた内容");
+  vault.put(path, edited);
+  const c2: Conversation = {
+    ...c1, memoryObjectIds: [],
+    turns: [...c1.turns, { role: "ai", content: "返信", timestamp: "2026-03-01T09:00:05.000Z" }],
+    updatedAt: "2026-03-01T09:00:05.000Z",
+  };
+  const entry2 = await seedCanonical(c2);
+  const second = await projectionMod.reconcileConversationOutboxEntry(makeEnv(vault), entry2);
+  assert.equal(second.status, "held");
+  assert.equal(vault.get(path), edited, "外部データは一切書き換えられない");
+});
+
 test("Projection K: Markdown unreadable（parse不能）はheldになり、上書きしない", async () => {
   const vault = new FakeVault();
   seedVaultIdentityFile(vault);

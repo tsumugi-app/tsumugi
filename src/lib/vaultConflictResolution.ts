@@ -155,12 +155,15 @@ type Located =
   | { kind: "whole"; version: string }
   | { kind: "segment"; version: string; index: number; segments: string[] };
 
-function locateVersion(type: ConflictRecordType, fileText: string, id: string): Located | ConflictBlockReason | "absent" {
+/** テスト用に公開する（day-file内の版の特定と置き換え。純粋関数）。 */
+export function locateVersion(type: ConflictRecordType, fileText: string, id: string): Located | ConflictBlockReason | "absent" {
   if (type !== "memory") {
     const parsed = parseVersion(type, fileText);
     return !parsed ? "unparseable" : parsed.id !== id ? "stored-elsewhere" : { kind: "whole", version: fileText };
   }
-  const segments = fileText.split(MEMORY_ENTRY_SEPARATOR);
+  // CRLFのday-fileもLFと同一に分割する：生テキストをLF固定の区切りで割ると全体が1セグメントになり、
+  // 先頭memberの版としてファイル全体を返してしまう（解決の書き込みで他のmemberが消える）。
+  const segments = fileText.replace(/\r\n/g, "\n").split(MEMORY_ENTRY_SEPARATOR);
   const parsed = segments.map((s) => (s.trim().length > 0 ? parseMemoryObjectMarkdown(s.trim()) : null));
   const indexes = parsed.flatMap((m, i) => (m?.id === id ? [i] : []));
   if (indexes.length > 1) return "duplicate-in-file";
@@ -169,7 +172,7 @@ function locateVersion(type: ConflictRecordType, fileText: string, id: string): 
 }
 
 /** 対象の版だけを置き換えたファイルの内容。読み直して、他の部分がそのままで対象が読めることを確かめる（確かめられなければnull） */
-function fileWithVersion(located: Located, id: string, next: string): string | null {
+export function fileWithVersion(located: Located, id: string, next: string): string | null {
   if (located.kind === "whole") return next;
   const content = located.segments.map((s, i) => (i === located.index ? next : s)).join(MEMORY_ENTRY_SEPARATOR);
   const before = located.segments.filter((s) => s.trim().length > 0 && parseMemoryObjectMarkdown(s.trim()) !== null).length;

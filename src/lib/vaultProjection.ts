@@ -221,7 +221,8 @@ async function decideMarkdown(env: ProjectionEnv, canonical: Conversation, regis
   const parsed = parseConversationMarkdown(read.text);
   if (!parsed) throw new ProjectionConflictError("markdown-unreadable");
   if (!isLegitimatePredecessor(parsed, canonical)) throw new ProjectionConflictError("markdown-conflict");
-  if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError("markdown-conflict");
+  // 登録hashとの比較は、Registry基準の規則（LF正規化済みテキストのハッシュ）で行う（ラウンド5監査）。生テキストのままだと、CRLF化されただけの登録済みファイルが「登録版ではない」と誤判定され、正当な更新までmarkdown-conflictになる。
+  if (takesBackFinishedConversation(parsed, canonical) && hashVaultText(read.text.replace(/\r\n/g, "\n")) !== (await registeredContentHash(env, canonical.id, path)) && takesBackFinishedConversation(parsed, (await getConversation(canonical.id)) ?? canonical)) throw new ProjectionConflictError("markdown-conflict");
   if (!singleFileRewriteIsSafe(read.text, expectedContent, { hash: hashVaultText, registeredHash: await registeredContentHash(env, canonical.id, path), evolvingKeys: CONVERSATION_EVOLVING_KEYS, body: "extends", reserialized: conversationToMarkdown(parsed) })) throw new ProjectionConflictError("markdown-edited-conflict");
   return { kind: "update", path };
 }

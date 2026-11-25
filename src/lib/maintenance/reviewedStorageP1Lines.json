@@ -201,6 +201,8 @@
     "+const actualHash = hashVaultText(actualText.replace(/\\r\\n/g, \"\\n\"));",
     "+// A-02（ラウンド3監査）：contentHashは分類側と同じくLF正規化済みテキスト",
     "+// から計算する（生テキストのままだとCRLFのanchorが分類時の基準ハッシュと",
-    "+// 常時不一致になる）。この後の利用はparseだけなので正規化して問題ない。"
+    "+// 常時不一致になる）。この後の利用はparseだけなので正規化して問題ない。",
+    "-contentHash: hashVaultText(serialized),",
+    "+contentHash: hashVaultText(serialized.replace(/\\r\\n/g, \"\\n\")),"
   ]
 }

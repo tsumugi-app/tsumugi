@@ -102,3 +102,39 @@ test("再同期：呼び出しは起動時の確立の2か所だけ（手編集�
     "vault.ts: const result = await resyncVaultRegistry(root, { requireEmptyVault: true });",
   ]);
 });
+
+const markdown = require("./markdown") as typeof import("./markdown");
+import type { MemoryObject } from "./types";
+
+const CT = "2026-10-20T00:00:00.000Z";
+const crlfOf = (s: string) => s.replace(/\n/g, "\r\n");
+const conflictMemory = (id: string): MemoryObject => ({
+  id, date: CT, content: `本文 ${id}`, summary: `要約 ${id}`, types: ["event"], conversationId: "c1", keywords: [],
+  links: [], themeIds: [], personIds: [], emotionIds: [], goalIds: [], ideaIds: [], eventIds: [],
+  createdAt: CT, updatedAt: CT, metadata: { id: "meta", source: "ai-capture", schemaVersion: "1", createdAt: CT, updatedAt: CT },
+}) as unknown as MemoryObject;
+
+test("版の特定：CRLFのday-fileでも対象memberだけを特定し、他のmemberを巻き込まない", () => {
+  const m1 = conflictMemory("cm1"), m2 = conflictMemory("cm2");
+  const lf = markdown.serializeMemoryDayFile([m1, m2]);
+  const crlfText = crlfOf(lf);
+  // 先頭member：版はファイル全体ではなく、そのmemberのセグメントだけ（全体を版にすると、
+  // 解決の書き込みで他のmemberが消える）。
+  const first = conflict.locateVersion("memory", crlfText, "cm1");
+  assert.ok(typeof first === "object" && first.kind === "segment", "the first member is located as its own segment");
+  if (typeof first === "object" && first.kind === "segment") {
+    assert.equal(first.version, markdown.memoryObjectToMarkdown(m1));
+    assert.notEqual(first.version, crlfText);
+    const replaced = conflict.fileWithVersion(first, "cm1", markdown.memoryObjectToMarkdown({ ...m1, content: "差し替え後の本文", summary: "差し替え後の本文" }));
+    assert.ok(replaced, "the replacement content passes the module's own re-read checks");
+    const parsed = markdown.parseMemoryDayFile(replaced!);
+    assert.deepEqual(parsed.map((m) => m.id), ["cm1", "cm2"], "the other member survives the replacement");
+    assert.equal(parsed.find((m) => m.id === "cm2")?.content, m2.content);
+  }
+  // 末尾member：「不在」と誤認しない。
+  const second = conflict.locateVersion("memory", crlfText, "cm2");
+  assert.ok(typeof second === "object" && second.kind === "segment" && second.index === 1, "the second member is found, not absent");
+  // LFは従来どおり。
+  const lfSecond = conflict.locateVersion("memory", lf, "cm2");
+  assert.ok(typeof lfSecond === "object" && lfSecond.kind === "segment" && lfSecond.index === 1);
+});

@@ -2338,7 +2338,12 @@ async function writeMemoryObjectMarkdownImpl(
     recordType: "memory-day",
     mtime: stat.mtime,
     size: stat.size,
-    contentHash: hashVaultText(serialized),
+    // A-02（ラウンド5・Codex [P2] N-2）：contentHashは分類・write前検証と
+    // 同じくLF正規化済みテキストから計算する。no-op保存ではserializedが
+    // 元の生テキスト（CRLFファイルではCRLFのまま）になるため、そのまま
+    // ハッシュすると正規化済みの基準が生ハッシュに置き換わり、mtimeだけの
+    // 変化で以降の保存が一致せず止まる。生成側も比較側と同じ規則にする。
+    contentHash: hashVaultText(serialized.replace(/\r\n/g, "\n")),
     memberIds: merged.map((m) => m.id),
     memberHashes,
   });

@@ -1692,6 +1692,33 @@ test("M3c: 複数memberの既存day-fileで、月ファイル・対象日エン�
   assert.equal(vault.get(dayPath), beforeContent);
 });
 
+test("M3c CRLF variant: the same multi-member day-file converted to CRLF is still held out-of-scope (the strict parse must count every member)", async () => {
+  const db = new FakeDb(); const vault = new FakeVault();
+  const m1 = memory("m1", { date: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z" });
+  const m2 = memory("m2", { summary: "別のmember", date: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z" });
+  db.memories.set("m1", m1); db.memories.set("m2", m2);
+  const bootstrap = await applyOnce(db, vault);
+  assert.equal(bootstrap.recovered, 2);
+  const month = T.slice(0, 7), day = T.slice(0, 10);
+  const historyPath = `.tsumugi/history/${month}.json`;
+  const history = JSON.parse(vault.get(historyPath)!);
+  history.days[day].normalMemories = history.days[day].normalMemories.filter((r: { id: string }) => r.id !== "m1");
+  vault.put(historyPath, JSON.stringify(history));
+  const dayPath = `Memories/${vaultMod.dayFileNameFor(T)}`;
+  // 外部ツール等でファイル全体がCRLF化された状態（Registryの基準はLF正規化済みのまま一致する）。
+  const crlfContent = vault.get(dayPath)!.replace(/\n/g, "\r\n");
+  vault.put(dayPath, crlfContent);
+  const applyPlan = await applyMod.planRecoveryApply(makeEnv(db, vault));
+  const m1Held = applyPlan.held.find((h) => h.recordId === "m1");
+  assert.ok(m1Held, "a CRLF multi-member day-file must not bypass the out-of-scope guard via an undercounted parse");
+  assert.equal(m1Held?.reason, "history-missing-for-multi-member-dayfile-out-of-scope-v1");
+  const result = await applyOnce(db, vault);
+  assert.equal(result.recovered, 0, "no repair runs on the CRLF multi-member file");
+  assert.equal(vault.get(dayPath), crlfContent, "the day-file is untouched");
+  const historyAfter = JSON.parse(vault.get(historyPath)!);
+  assert.deepEqual(historyAfter.days[day].normalMemories.map((r: { id: string }) => r.id), ["m2"], "history is untouched");
+});
+
 test("M3d: single-member（Reflection）の従来のsafe repairは、multi-member用のout-of-scope guardの影響を受けない", async () => {
   const db = new FakeDb(); const vault = new FakeVault();
   const r = reflection("r1");
@@ -1709,6 +1736,31 @@ test("M3d: single-member（Reflection）の従来のsafe repairは、multi-membe
   const result = await applyOnce(db, vault);
   assert.equal(result.status, "completed");
   assert.equal(result.recovered, 1);
+});
+
+test("R5 (hash audit): a repair that re-registers a CRLF file records the LF-normalized contentHash baseline, not the raw CRLF hash", async () => {
+  const db = new FakeDb(); const vault = new FakeVault();
+  const r = reflection("r5-crlf");
+  const path = `Memories/${vaultMod.fileNameFor("r5-crlf", r.date)}`;
+  const lfText = markdownMod.memoryObjectToMarkdown(r);
+  const crlfText = lfText.replace(/\n/g, "\r\n");
+  vault.put(path, crlfText);
+  // Registry entryが丸ごと不足している（repairが登録し直す）。indexは既にある。
+  vault.put(".tsumugi/index.json", JSON.stringify({ "r5-crlf": path }));
+  db.memories.set("r5-crlf", r);
+  db.ledger.set("memory:r5-crlf", r.updatedAt);
+  const result = await applyOnce(db, vault);
+  assert.equal(result.status, "completed");
+  assert.equal(result.recovered, 1);
+  // repairはMarkdownを書かない：CRLFファイルはそのまま残る。
+  assert.equal(vault.get(path), crlfText);
+  // 登録されるcontentHashは、分類・write前検証と同じLF正規化済みの規則で
+  // なければならない（修正前は生CRLFテキストのハッシュが登録され、その後の
+  // 保存がwrite前検証で一致せずneeds-resyncになる）。
+  const bucket = vaultMod.vaultRegistryBucketOf("r5-crlf");
+  const shard = JSON.parse(vault.get(`.tsumugi/registry/${bucket.toString(16).padStart(2, "0")}.json`)!);
+  assert.equal(shard.files[path].contentHash, vaultMod.hashVaultText(lfText), "the recorded baseline follows the LF-normalized convention");
+  assert.notEqual(shard.files[path].contentHash, vaultMod.hashVaultText(crlfText));
 });
 
 // Explicit narrow repair uses the actual production Plan/parser/verifiers above.
