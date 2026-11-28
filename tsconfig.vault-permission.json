@@ -1,0 +1,1 @@
+{"compilerOptions":{"incremental":false,"isolatedModules":false,"module":"commonjs","moduleResolution":"node","noEmit":false,"outDir":".test-out","plugins":[],"rootDir":"src"},"extends":"./tsconfig.json","files":["src/lib/vaultPermission.test.ts","src/lib/vault.ts","src/lib/fakeIdb.ts"],"include":[]}

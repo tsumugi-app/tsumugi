@@ -2359,8 +2359,9 @@ export default function ChatScreen() {
       // 解放された後（withStartupSharedLockが返すPromiseが解決した後）にのみ
       // 実行される。ここでresyncVaultRegistry（exclusiveロックを要求する）を
       // 呼んでも、上の共有ロックとは競合しない。fn（上のasyncコールバック）が
-      // 例外を投げていた場合はこのthenごとskipされ、既存の（catchしていない）
-      // rejectionの伝播はそのまま維持される。baseline確立が完了するまでの間に
+      // 例外を投げていた場合はこの成功時コールバックごとskipされ、下の
+      // rejectionハンドラがvaultStatusを復旧可能な状態へ確定させる（baseline
+      // 確立は行わない）。baseline確立が完了するまでの間に
       // 他のVault write（flush等）が新規recordを対象にしても、C1の既存
       // fail-closedガードにより無害にHOLDされ、次回flush時に自然に再試行される
       // だけである（IndexedDBは一切変更されない）。
@@ -2370,6 +2371,18 @@ export default function ChatScreen() {
 
       // createdAtレース対応：詳細は`refreshUnusedConversationAfterBaseline`のコメント参照。
       refreshUnusedConversationAfterBaseline(baseline.baselineEstablishedAt);
+    }, (error) => {
+      // Issue #71対応：起動時Vault復元の想定外の失敗（restoreVaultHandleが
+      // queryPermissionの例外等を伝播してきた場合）でも、vaultStatusが
+      // "checking"のまま固着しないようにする。以前はこのrejectionを受ける
+      // ハンドラが無く、「保存先を準備しています…」から二度と進めなかった。
+      // journal baseline確立に失敗したときの既存分岐と同じ倒し方（未接続の
+      // 状態として、保存先の再接続で復旧できる状態）にする。tabVaultEpochは
+      // 設定しない（既存の失敗分岐と同じ安全側の扱い）。
+      if (cancelled) return;
+      console.error("[Tsumugi] vault startup failed unexpectedly; leaving the vault disconnected so the user can reconnect.", error);
+      setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
+      markBootPhaseDone();
     }).finally(() => {
       endStartupTask();
     });

@@ -195,18 +195,61 @@ function opfsBackendIfWritable(): VaultBackend | null {
   return getOpfsWriterState() === "unavailable" ? null : "opfs";
 }
 
-async function verifyPermission(handle: FileSystemDirectoryHandle, forWrite: boolean): Promise<boolean> {
+/**
+ * 起動時の保存先復元（Issue #71）対応：`queryPermission()`の応答を待つ上限。
+ *
+ * 健全なブラウザではqueryPermission()はミリ秒単位で返る（実機のdebugLogでも、
+ * 起動時の他の処理は全てミリ秒単位で完了していた）。一方でChrome側のPromiseが
+ * 永遠に返らない事象が実機で確認されており（2026-11-28、本番・Mac Chrome。
+ * 停止点は`Vault queryPermission:start`の直後と特定）、タイムアウトが無いと
+ * 起動画面が「保存先を準備しています…」のまま固着し、ユーザーは保存先の
+ * 選び直しにも進めなくなる。
+ *
+ * 値の根拠：起動経路のもう一つの待ち（排他ロック取得）のフェイルセーフ
+ * `EXCLUSIVE_LOCK_TIMEOUT_MS`（vaultWorldLock.ts）と同じ15000msに揃える。
+ * 健全な応答に対して十分な余裕があり、詰まった場合でもユーザーの待ちを
+ * 既存フェイルセーフと同じオーダーに抑える。
+ *
+ * タイムアウトした場合は「許可が確認できなかった」としてfalseを返す
+ * （許可されたとは決して言わない）。呼び出し元（restoreVaultHandle）は
+ * falseを"needs-permission"として扱うため、起動は設計済みの再許可UIへ進み、
+ * ユーザーは同じフォルダへの再許可・選び直しで復旧できる。
+ */
+export const QUERY_PERMISSION_TIMEOUT_MS = 15000;
+
+export async function verifyPermission(
+  handle: FileSystemDirectoryHandle,
+  forWrite: boolean,
+  timeoutMs: number = QUERY_PERMISSION_TIMEOUT_MS
+): Promise<boolean> {
   const options: FileSystemHandlePermissionDescriptor = { mode: forWrite ? "readwrite" : "read" };
   // TEMP-TEST：Android実機でのVault復元停止事象の原因切り分け用。queryPermission自体が
-  // 例外を投げるケースを観測するためのログのみを追加する（try/catch追加後も、例外は
-  // 必ず再throwし、呼び出し元から見た挙動は一切変えない）。
+  // 例外を投げるケースを観測するためのログ（例外は必ず再throwし、呼び出し元へ伝播する）。
+  // Issue #71対応で、応答が無い場合のログ（queryPermission:timeout）を追加した。
   logTimingEvent("Vault queryPermission:start");
   let result: PermissionState;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    result = await handle.queryPermission(options);
+    const outcome = await Promise.race([
+      handle.queryPermission(options).then((value) => ({ kind: "result" as const, value })),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+      }),
+    ]);
+    if (outcome.kind === "timeout") {
+      // Chrome側の応答が無い。許可の有無は不明なため、安全側（未確認＝false）へ倒す。
+      // 裏でqueryPermissionが後から返っても、この確認では使わない（Promise.raceの
+      // 敗者は無視される。後発の例外も、raceが購読済みのためunhandled rejectionには
+      // ならない）。
+      logTimingEvent("Vault queryPermission:timeout");
+      return false;
+    }
+    result = outcome.value;
   } catch (error) {
     logTimingEvent("Vault queryPermission:error");
     throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
   logTimingEvent("Vault queryPermission:result", { result });
   return result === "granted";
@@ -244,7 +287,7 @@ export type VaultRestoreResult =
  * 読み込み（loadVaultHandle）は行わない。初回アクセス時はensureVaultSkeleton()で
  * 骨組みを作る（既に存在する場合は何もしない、以後の起動でも安全に呼べる）。
  */
-export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
+export async function restoreVaultHandle(permissionTimeoutMs: number = QUERY_PERMISSION_TIMEOUT_MS): Promise<VaultRestoreResult> {
   // TEMP-TEST：Android実機でのVault復元停止事象の原因切り分け用。観測のみを目的とした
   // ログ追加であり、既存の分岐・戻り値・エラー伝播は一切変更しない（catchは全て
   // ログ出力後に必ず同じ例外を再throwする）。
@@ -288,7 +331,7 @@ export async function restoreVaultHandle(): Promise<VaultRestoreResult> {
       logTimingEvent("Vault restoreVaultHandle:result", { result: "none" });
       return { status: "none" };
     }
-    const granted = await verifyPermission(handle, true);
+    const granted = await verifyPermission(handle, true, permissionTimeoutMs);
     logTimingEvent("Vault restoreVaultHandle:result", { result: granted ? "connected" : "needs-permission" });
     return granted ? { status: "connected", handle } : { status: "needs-permission", handle };
   } catch (error) {
