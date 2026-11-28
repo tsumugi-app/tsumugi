@@ -83,6 +83,7 @@ type VaultStatusForDebug =
   | "needs-permission"
   | "incomplete-switch"
   | "unsupported-journal-version"
+  | "startup-failed"
   | "metadata-corrupt";
 
 function debugLogEnabled(): boolean {
