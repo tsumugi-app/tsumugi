@@ -6,7 +6,10 @@
  *  1. `verifyPermission`（vault.ts）が`handle.queryPermission()`をタイムアウト無しで待ち、
  *     Chrome側のPromiseが返らないと起動が無期限に止まる。
  *  2. queryPermissionが例外を投げると、ChatScreenの起動チェーンにrejectionを受ける
- *     ハンドラが無く、vaultStatusが"checking"のまま確定しない。
+ *     ハンドラが無く、vaultStatusが"checking"のまま確定しない。倒し先は専用状態
+ *     "startup-failed"（復旧は再読み込みのみ）——"not-connected"ではtabVaultEpochが
+ *     nullのままとなり、再接続（commit guard）も通常操作（withVaultWorldRead）も
+ *     全て拒否されて復旧できない（Codexレビュー指摘 PR #72 P2）。
  *
  * ここでは (1) を実コード（verifyPermission／restoreVaultHandle）で、(2) を実コードの
  * 起動ロック（withStartupSharedLock）と復元を、ChatScreenのeffectと同じ
@@ -120,10 +123,13 @@ test("restoreVaultHandle: queryPermissionが例外を投げる保存先は、rej
   assert.ok(Date.now() - started < 3000, "rejectionが速やかに返らなかった");
 });
 
-test("起動チェーン: 復元が例外を投げても、rejectionハンドラがvaultStatusを復旧可能な状態へ確定させ、チェーン全体が解決する", async () => {
+test("起動チェーン: 復元が例外を投げても、rejectionハンドラがvaultStatusを再読み込みでのみ復旧できる専用状態へ確定させ、チェーン全体が解決する", async () => {
   // ChatScreenの起動effectと同じ合成（withStartupSharedLock → .then(成功時, rejection時) → .finally）。
   // 成功時コールバック（baseline確立）はrejection時はskipされ、rejectionハンドラが
-  // 既存の失敗分岐と同じ倒し方で状態を確定させることを確かめる。
+  // 状態を確定させることを確かめる。倒し先は"startup-failed"でなければならない：
+  // tabVaultEpochが未設定（null）のまま"not-connected"へ倒すと、再接続フローは
+  // commit guardに、通常操作はwithVaultWorldReadに全て拒否され、復旧できない
+  // （Codexレビュー指摘 PR #72 P2）。復旧は再読み込みによる起動のやり直しのみ。
   await db.saveVaultHandle(rejectingHandle(new Error("fictional startup restore failure")));
   let successCallbackRan = false;
   let settledStatus: string | null = null;
@@ -137,14 +143,15 @@ test("起動チェーン: 復元が例外を投げても、rejectionハンドラ
         successCallbackRan = true;
       },
       () => {
-        settledStatus = vault.isVaultSupported() ? "not-connected" : "unsupported";
+        settledStatus = vault.isVaultSupported() ? "startup-failed" : "unsupported";
       }
     )
     .finally(() => {
       finallyRan = true;
     });
   assert.equal(successCallbackRan, false);
-  assert.equal(settledStatus, "not-connected");
+  assert.equal(settledStatus, "startup-failed");
+  assert.notEqual(settledStatus, "not-connected");
   assert.equal(finallyRan, true);
 });
 

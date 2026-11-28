@@ -221,6 +221,16 @@ export type SupportedChatProvider = "gemini" | "openai";
  * ため。今のコードが理解できないデータを誤って現行version扱いにしないようにする）。
  * 通常の保存先再選択・専用recoveryのいずれからも復旧できない、真に読み取り専用の
  * fail-closed状態（再読み込みを促すメッセージのみ表示する）。
+ *
+ * "startup-failed"：Codexレビュー指摘（PR #72 P2）対応。起動時のVault復元
+ * （restoreVaultHandle）が想定外の例外（queryPermissionの例外等）で失敗した状態。
+ * tabVaultEpochは意図的に設定しない（fail-closed）ため、epochがnullのままでは
+ * 通常の保存先再接続（handleConnectVaultのcommit guardがtabEpochAtStart===nullを
+ * staleとして拒否）も通常のMemory操作（withVaultWorldRead）も全て拒否され、
+ * "not-connected"へ倒しても「選べるが復旧できない」状態になる。唯一の復旧は
+ * ページの再読み込み（ロック付き起動処理全体を最初からやり直すこと）であり、
+ * "unsupported-journal-version"と同様、再読み込みだけが復旧手段の読み取り専用
+ * fail-closed状態として区別する（バナー／設定画面で再読み込みを促す）。
  */
 export type VaultStatus =
   | "checking"
@@ -230,6 +240,7 @@ export type VaultStatus =
   | "needs-permission"
   | "incomplete-switch"
   | "unsupported-journal-version"
+  | "startup-failed"
   /** 保存先の管理ファイル（.tsumugi/schema-version.json・index.json）が壊れている。自動では上書きせず、接続しない（fail-closed）。 */
   | "metadata-corrupt";
 /** Beta C3対応：フォルダ選択のキャンセル／接続失敗を、vaultStatusを汚さずに一時的なメッセージとして出す。 */
@@ -2376,12 +2387,16 @@ export default function ChatScreen() {
       // queryPermissionの例外等を伝播してきた場合）でも、vaultStatusが
       // "checking"のまま固着しないようにする。以前はこのrejectionを受ける
       // ハンドラが無く、「保存先を準備しています…」から二度と進めなかった。
-      // journal baseline確立に失敗したときの既存分岐と同じ倒し方（未接続の
-      // 状態として、保存先の再接続で復旧できる状態）にする。tabVaultEpochは
-      // 設定しない（既存の失敗分岐と同じ安全側の扱い）。
+      // Codexレビュー指摘（PR #72 P2）対応：倒し先は"not-connected"にしない。
+      // tabVaultEpochを設定しない（fail-closed）以上、epochがnullのままでは
+      // 通常の保存先再接続はcommit guard（tabEpochAtStart===null→stale）に、
+      // 通常のMemory操作はwithVaultWorldReadに全て拒否され、再接続フローへ
+      // 誘導しても復旧できない。復旧は再読み込み（ロック付き起動処理全体を
+      // 最初からやり直し、正常ならepochを通常どおり確定させる）に一本化し、
+      // 専用状態"startup-failed"のバナーから促す。
       if (cancelled) return;
-      console.error("[Tsumugi] vault startup failed unexpectedly; leaving the vault disconnected so the user can reconnect.", error);
-      setVaultStatus(isVaultSupported() ? "not-connected" : "unsupported");
+      console.error("[Tsumugi] vault startup failed unexpectedly; a page reload is required to retry startup.", error);
+      setVaultStatus(isVaultSupported() ? "startup-failed" : "unsupported");
       markBootPhaseDone();
     }).finally(() => {
       endStartupTask();
@@ -5717,6 +5732,25 @@ export default function ChatScreen() {
       {vaultStatus === "unsupported-journal-version" && (
         <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
           <span>保存データのバージョンを確認できません。再読み込みしてください。</span>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="shrink-0 rounded-full border border-amber-400/60 px-3 py-1 text-xs transition hover:bg-amber-200/60 dark:border-amber-600/60 dark:hover:bg-amber-900/60"
+          >
+            再読み込み
+          </button>
+        </div>
+      )}
+      {/*
+        Codexレビュー指摘（PR #72 P2）対応：起動時のVault復元が想定外の例外で
+        失敗した状態専用のバナー。tabVaultEpochが未設定（fail-closed）のため、
+        通常の保存先再接続では復旧できない（commit guardがtabEpochAtStart===nullを
+        staleとして拒否する）。"unsupported-journal-version"と同じく、復旧は
+        再読み込み（ロック付き起動処理全体のやり直し）に一本化する。
+      */}
+      {vaultStatus === "startup-failed" && (
+        <div className="flex shrink-0 items-center justify-between gap-3 bg-amber-100 px-4 py-2 text-xs text-amber-900 dark:bg-amber-950/60 dark:text-amber-200">
+          <span>保存先の確認中に問題が発生しました。再読み込みしてください。</span>
           <button
             type="button"
             onClick={() => window.location.reload()}

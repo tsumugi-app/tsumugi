@@ -463,6 +463,18 @@ export default function SettingsPanel({
           )}
 
           {/*
+            起動時のVault復元が想定外の例外で失敗した状態。"unsupported-journal-version"と
+            同じく、通常の保存先再接続では復旧できない（tabVaultEpoch未設定＝fail-closedの
+            ため、再接続はcommit guardに拒否される）ため、再読み込みを促すだけの
+            読み取り専用表示にする（再読み込みボタン自体はChatScreen側のバナーにある）。
+          */}
+          {vaultStatus === "startup-failed" && (
+            <div className="rounded-xl bg-amber-50/60 px-3 py-2 text-sm text-stone-700 dark:bg-amber-950/20 dark:text-stone-300">
+              保存先の確認中に問題が発生しました。ページを再読み込みしてください。
+            </div>
+          )}
+
+          {/*
             保存先の統合表示（通常のUI）。基本は「✓ 最新の状態です」か「外部の変更がある可能性があります
             ［確認する］」。「確認する」を押した後だけ、実際に必要な対応を意味で説明する。内部用語
             （Registry・baseline・missing・conflict・IDB・Vault・legacy・orphan・resync）は出さない。
